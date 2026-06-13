@@ -876,20 +876,22 @@ func (s *Store) GetUsageSessionCounts(
 // messages by content_length. Mirrors the SQLite implementation;
 // PG uses $1/$2 placeholders.
 func (s *Store) GetLongestUserPrompts(
-	ctx context.Context, limit int,
+	ctx context.Context, limit int, project string,
 ) ([]db.LongestUserPrompt, error) {
 	if limit <= 0 {
 		limit = 20
 	}
 	const previewChars = 200
 
-	rows, err := s.pg.QueryContext(ctx, `
+	pb := &paramBuilder{}
+	query := `
 		SELECT
 			m.session_id,
 			COALESCE(sess.project, '') AS project,
 			m.ordinal,
 			m.content_length,
-			substring(m.content FROM 1 FOR $1) AS preview,
+			substring(m.content FROM 1 FOR ` +
+		pb.add(previewChars) + `) AS preview,
 			COALESCE(m.timestamp, '') AS timestamp
 		FROM messages m
 		JOIN sessions sess ON sess.id = m.session_id
@@ -900,11 +902,31 @@ func (s *Store) GetLongestUserPrompts(
 		  AND m.content NOT LIKE '<task-notification>%'
 		  AND m.content NOT LIKE '<system-reminder>%'
 		  AND m.content NOT LIKE '<command-name>%'
-		  AND m.content NOT LIKE '<local-command-stdout>%'
-		ORDER BY m.content_length DESC, m.id DESC
-		LIMIT $2`,
-		previewChars, limit,
-	)
+		  AND m.content NOT LIKE '<local-command-stdout>%'`
+
+	if project != "" {
+		var projects []string
+		for _, p := range strings.Split(project, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				projects = append(projects, p)
+			}
+		}
+		if len(projects) == 1 {
+			query += " AND sess.project = " + pb.add(projects[0])
+		} else if len(projects) > 1 {
+			parts := make([]string, len(projects))
+			for i, p := range projects {
+				parts[i] = pb.add(p)
+			}
+			query += " AND sess.project IN (" +
+				strings.Join(parts, ",") + ")"
+		}
+	}
+
+	query += " ORDER BY m.content_length DESC, m.id DESC LIMIT " +
+		pb.add(limit)
+
+	rows, err := s.pg.QueryContext(ctx, query, pb.args...)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"querying longest user prompts: %w", err,

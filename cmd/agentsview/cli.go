@@ -311,6 +311,7 @@ func newUsageLongestPromptsCommand() *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&cfg.JSON, "json", false, "Output as JSON")
 	cmd.Flags().IntVar(&cfg.Limit, "limit", 20, "How many prompts to show (max 200)")
+	cmd.Flags().StringVar(&cfg.Project, "project", "", "Restrict to one or more projects (comma-separated)")
 	cmd.Flags().BoolVar(&cfg.NoSync, "no-sync", false, "Skip on-demand sync before querying")
 	return cmd
 }

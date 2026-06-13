@@ -266,9 +266,10 @@ func printProjectsTable(r usageProjectsResult) {
 }
 
 type UsageLongestPromptsConfig struct {
-	JSON   bool
-	Limit  int
-	NoSync bool
+	JSON    bool
+	Limit   int
+	Project string
+	NoSync  bool
 }
 
 func runUsageLongestPrompts(cfg UsageLongestPromptsConfig) {
@@ -283,7 +284,7 @@ func runUsageLongestPrompts(cfg UsageLongestPromptsConfig) {
 	}
 
 	rows, err := database.GetLongestUserPrompts(
-		context.Background(), limit,
+		context.Background(), limit, cfg.Project,
 	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)

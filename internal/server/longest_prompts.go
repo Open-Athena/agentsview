@@ -8,7 +8,8 @@ import (
 
 // handleLongestPrompts serves GET /api/v1/messages/longest, the
 // top-N longest user-role messages by content_length. `limit`
-// defaults to 20 and is capped at 200.
+// defaults to 20 and is capped at 200. `project`, if present,
+// accepts a comma-separated list to restrict results.
 func (s *Server) handleLongestPrompts(
 	w http.ResponseWriter, r *http.Request,
 ) {
@@ -29,7 +30,9 @@ func (s *Server) handleLongestPrompts(
 		limit = 200
 	}
 
-	rows, err := s.db.GetLongestUserPrompts(r.Context(), limit)
+	project := r.URL.Query().Get("project")
+
+	rows, err := s.db.GetLongestUserPrompts(r.Context(), limit, project)
 	if err != nil {
 		if handleContextError(w, err) {
 			return
