@@ -2,6 +2,7 @@
   import { usage } from "../../stores/usage.svelte.js";
   import { router } from "../../stores/router.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
+  import { ui } from "../../stores/ui.svelte.js";
 
   function truncatePreview(s: string, max = 100): string {
     const oneLine = s.replace(/\s+/g, " ").trim();
@@ -9,8 +10,12 @@
     return oneLine.slice(0, max - 1) + "…";
   }
 
-  function handleRowClick(sessionId: string) {
+  // Navigate then queue a scroll-to-ordinal: the session view
+  // mounts, reads ui.pendingScrollOrdinal, and jumps to the
+  // matching message. Same machinery the in-session search uses.
+  function handleRowClick(sessionId: string, ordinal: number) {
     router.navigateToSession(sessionId);
+    ui.scrollToOrdinal(ordinal, sessionId);
   }
 
   function fmtChars(n: number): string {
@@ -50,7 +55,7 @@
         <div
           class="prompt-row"
           title={row.preview}
-          onclick={() => handleRowClick(row.session_id)}
+          onclick={() => handleRowClick(row.session_id, row.ordinal)}
         >
           <span class="rank">{i + 1}</span>
           <span class="chars">{fmtChars(row.content_length)}</span>

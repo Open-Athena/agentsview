@@ -4,7 +4,10 @@
     type GroupBy,
     type AttributionView,
   } from "../../stores/usage.svelte.js";
-  import { projectColor } from "../../utils/projectColor.js";
+  import {
+    projectColor,
+    disambiguateColors,
+  } from "../../utils/projectColor.js";
   import Treemap from "./Treemap.svelte";
 
   function fmtCost(v: number): string {
@@ -61,11 +64,17 @@
     items.sort((a, b) => b.cost - a.cost);
     const total = items.reduce((s, d) => s + d.cost, 0);
 
-    return items.map((d) => ({
+    // disambiguateColors guarantees the top-N (by cost) tiles all
+    // get distinct hues, so adjacent same-color blobs don't read
+    // as one giant tile in the treemap. Past the window, items
+    // fall back to the stable hash-based projectColor() so they
+    // stay consistent across renderings.
+    const colors = disambiguateColors(items);
+    return items.map((d, i) => ({
       id: d.id,
       label: d.label,
       cost: d.cost,
-      color: projectColor(d.id),
+      color: colors[i] ?? projectColor(d.id),
       pct: total > 0 ? d.cost / total : 0,
     }));
   });
