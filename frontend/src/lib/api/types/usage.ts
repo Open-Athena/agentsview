@@ -143,3 +143,23 @@ export interface UsageParams {
 export interface UsageTopSessionsParams extends UsageParams {
   limit?: number;
 }
+
+// LongestUserPrompt mirrors db.LongestUserPrompt. Preview is
+// already truncated server-side (~200 chars).
+export interface LongestUserPrompt {
+  session_id: string;
+  project: string;
+  ordinal: number;
+  content_length: number;
+  preview: string;
+  timestamp?: string;
+}
+
+export type LongestUserPromptsResponse = LongestUserPrompt[];
+
+// Only `project` and `limit` are honored server-side, but the
+// component reuses baseParams() which carries the full filter
+// set; extra keys are accepted and ignored.
+export interface LongestUserPromptsParams extends UsageParams {
+  limit?: number;
+}

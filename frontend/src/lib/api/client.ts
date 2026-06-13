@@ -40,6 +40,8 @@ import type {
   TopUsageSessionsResponse,
   UsageParams,
   UsageTopSessionsParams,
+  LongestUserPromptsResponse,
+  LongestUserPromptsParams,
 } from "./types.js";
 import type { SessionActivityResponse } from "./types/session-activity.js";
 import type { SessionTiming } from "./types/timing.js";
@@ -1398,4 +1400,10 @@ export function getUsageTopSessions(
   params: UsageTopSessionsParams,
 ): Promise<TopUsageSessionsResponse> {
   return fetchJSON(`/usage/top-sessions${buildQuery({ ...params })}`);
+}
+
+export function getLongestUserPrompts(
+  params: LongestUserPromptsParams,
+): Promise<LongestUserPromptsResponse> {
+  return fetchJSON(`/messages/longest${buildQuery({ ...params })}`);
 }

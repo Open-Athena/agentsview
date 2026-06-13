@@ -18,6 +18,7 @@
   import CostTimeSeriesChart from "./CostTimeSeriesChart.svelte";
   import AttributionPanel from "./AttributionPanel.svelte";
   import TopSessionsTable from "./TopSessionsTable.svelte";
+  import LongestPromptsPanel from "./LongestPromptsPanel.svelte";
   import CacheEfficiencyPanel from "./CacheEfficiencyPanel.svelte";
   import DateRangeSelector from "../shared/DateRangeSelector.svelte";
   import SessionFilterControl from "../filters/SessionFilterControl.svelte";
@@ -339,6 +340,10 @@
       <div class="chart-panel">
         <CacheEfficiencyPanel />
       </div>
+    </div>
+
+    <div class="chart-panel wide">
+      <LongestPromptsPanel />
     </div>
   </div>
 </div>

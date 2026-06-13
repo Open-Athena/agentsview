@@ -1,11 +1,13 @@
 import type {
   UsageSummaryResponse,
   TopUsageSessionsResponse,
+  LongestUserPromptsResponse,
   UsageParams,
 } from "../api/types/usage.js";
 import {
   getUsageSummary,
   getUsageTopSessions,
+  getLongestUserPrompts,
 } from "../api/client.js";
 import { sessions } from "./sessions.svelte.js";
 
@@ -154,7 +156,7 @@ function joinCsvParts(...parts: string[]): string {
   return out.join(",");
 }
 
-type Endpoint = "summary" | "topSessions";
+type Endpoint = "summary" | "topSessions" | "longestPrompts";
 
 class UsageStore {
   from: string = $state(daysAgo(DEFAULT_WINDOW_DAYS));
@@ -180,11 +182,15 @@ class UsageStore {
 
   summary = $state<UsageSummaryResponse | null>(null);
   topSessions = $state<TopUsageSessionsResponse | null>(null);
+  longestPrompts = $state<LongestUserPromptsResponse | null>(null);
 
-  loading = $state({ summary: false, topSessions: false });
+  loading = $state({
+    summary: false, topSessions: false, longestPrompts: false,
+  });
   errors = $state<Record<Endpoint, string | null>>({
     summary: null,
     topSessions: null,
+    longestPrompts: null,
   });
 
   toggles: Toggles = $state(loadToggles());
@@ -192,6 +198,7 @@ class UsageStore {
   private versions: Record<Endpoint, number> = {
     summary: 0,
     topSessions: 0,
+    longestPrompts: 0,
   };
 
   private get timezone(): string {
@@ -386,6 +393,7 @@ class UsageStore {
     await Promise.all([
       this.fetchSummary(),
       this.fetchTopSessions(),
+      this.fetchLongestPrompts(),
     ]);
   }
 
@@ -447,6 +455,39 @@ class UsageStore {
     } finally {
       if (this.versions.topSessions === v) {
         this.loading.topSessions = false;
+      }
+    }
+  }
+
+  async fetchLongestPrompts() {
+    const v = ++this.versions.longestPrompts;
+    const isFirstLoad = this.longestPrompts === null;
+    if (isFirstLoad) this.loading.longestPrompts = true;
+    if (isFirstLoad) this.errors.longestPrompts = null;
+    try {
+      // Only project + limit are honored server-side, but we
+      // pass the full baseParams() so the project filter from
+      // the session filter dropdown flows through naturally.
+      const data = await getLongestUserPrompts({
+        ...this.baseParams(),
+        limit: 10,
+      });
+      if (this.versions.longestPrompts === v) {
+        this.longestPrompts = data ?? [];
+        this.errors.longestPrompts = null;
+      }
+    } catch (e) {
+      if (this.versions.longestPrompts === v) {
+        if (this.longestPrompts === null) {
+          this.errors.longestPrompts =
+            e instanceof Error ? e.message : "Failed to load";
+        } else {
+          console.warn("usage.fetchLongestPrompts refetch failed:", e);
+        }
+      }
+    } finally {
+      if (this.versions.longestPrompts === v) {
+        this.loading.longestPrompts = false;
       }
     }
   }
