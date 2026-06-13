@@ -292,7 +292,31 @@ func newUsageCommand() *cobra.Command {
 		},
 	}
 	cmd.AddCommand(newUsageDailyCommand())
+	cmd.AddCommand(newUsageProjectsCommand())
 	cmd.AddCommand(newUsageStatuslineCommand())
+	return cmd
+}
+
+func newUsageProjectsCommand() *cobra.Command {
+	var cfg UsageProjectsConfig
+	cmd := &cobra.Command{
+		Use:          "projects",
+		Short:        "Cost breakdown by project",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		Run: func(cmd *cobra.Command, args []string) {
+			runUsageProjects(cfg)
+		},
+	}
+	cmd.Flags().BoolVar(&cfg.JSON, "json", false, "Output as JSON")
+	cmd.Flags().StringVar(&cfg.Since, "since", "", "Start date (YYYY-MM-DD)")
+	cmd.Flags().StringVar(&cfg.Until, "until", "", "End date (YYYY-MM-DD)")
+	cmd.Flags().BoolVar(&cfg.All, "all", false, "Include all history (overrides default 30-day window)")
+	cmd.Flags().StringVar(&cfg.Agent, "agent", "", "Filter by agent name")
+	cmd.Flags().IntVar(&cfg.Limit, "limit", 0, "Show top-N projects only (0 = all)")
+	cmd.Flags().BoolVar(&cfg.Offline, "offline", false, "Use fallback pricing only")
+	cmd.Flags().BoolVar(&cfg.NoSync, "no-sync", false, "Skip on-demand sync before querying")
+	cmd.Flags().StringVar(&cfg.Timezone, "timezone", "", "IANA timezone for date bucketing")
 	return cmd
 }
 

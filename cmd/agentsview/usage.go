@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -104,6 +105,164 @@ func runUsageDaily(cfg UsageDailyConfig) {
 	}
 
 	printDailyTable(result, cfg.Breakdown)
+}
+
+type UsageProjectsConfig struct {
+	JSON     bool
+	Since    string
+	Until    string
+	All      bool
+	Agent    string
+	Limit    int
+	Offline  bool
+	NoSync   bool
+	Timezone string
+}
+
+type usageProjectTotal struct {
+	Project             string  `json:"project"`
+	InputTokens         int     `json:"inputTokens"`
+	OutputTokens        int     `json:"outputTokens"`
+	CacheCreationTokens int     `json:"cacheCreationTokens"`
+	CacheReadTokens     int     `json:"cacheReadTokens"`
+	Cost                float64 `json:"cost"`
+}
+
+type usageProjectsResult struct {
+	From     string              `json:"from"`
+	To       string              `json:"to"`
+	Projects []usageProjectTotal `json:"projects"`
+	Total    usageProjectTotal   `json:"total"`
+}
+
+func runUsageProjects(cfg UsageProjectsConfig) {
+	database, appCfg := openUsageDB()
+	defer database.Close()
+
+	ensureFreshData(appCfg, database, cfg.NoSync)
+	ensurePricing(database, cfg.Offline)
+
+	tz := cfg.Timezone
+	if tz == "" {
+		tz = localTimezone()
+	}
+
+	effectiveSince := resolveDefaultSince(
+		cfg.Since, cfg.Until, cfg.All, time.Now(), tz,
+	)
+
+	filter := db.UsageFilter{
+		From:       effectiveSince,
+		To:         cfg.Until,
+		Agent:      cfg.Agent,
+		Timezone:   tz,
+		Breakdowns: true,
+	}
+
+	result, err := database.GetDailyUsage(
+		context.Background(), filter,
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	projects := foldProjectsFromDaily(result.Daily)
+
+	if cfg.Limit > 0 && len(projects) > cfg.Limit {
+		projects = projects[:cfg.Limit]
+	}
+
+	out := usageProjectsResult{
+		From:     filter.From,
+		To:       filter.To,
+		Projects: projects,
+		Total: usageProjectTotal{
+			Project:             "TOTAL",
+			InputTokens:         result.Totals.InputTokens,
+			OutputTokens:        result.Totals.OutputTokens,
+			CacheCreationTokens: result.Totals.CacheCreationTokens,
+			CacheReadTokens:     result.Totals.CacheReadTokens,
+			Cost:                result.Totals.TotalCost,
+		},
+	}
+
+	if cfg.JSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(out); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	printProjectsTable(out)
+}
+
+// foldProjectsFromDaily aggregates per-day project breakdowns
+// from GetDailyUsage into range-wide per-project totals,
+// sorted by cost descending. Mirrors server.foldProjectTotals
+// without depending on the server package.
+func foldProjectsFromDaily(
+	daily []db.DailyUsageEntry,
+) []usageProjectTotal {
+	m := make(map[string]*usageProjectTotal)
+	for _, d := range daily {
+		for _, pb := range d.ProjectBreakdowns {
+			pt, ok := m[pb.Project]
+			if !ok {
+				pt = &usageProjectTotal{Project: pb.Project}
+				m[pb.Project] = pt
+			}
+			pt.InputTokens += pb.InputTokens
+			pt.OutputTokens += pb.OutputTokens
+			pt.CacheCreationTokens += pb.CacheCreationTokens
+			pt.CacheReadTokens += pb.CacheReadTokens
+			pt.Cost += pb.Cost
+		}
+	}
+	out := make([]usageProjectTotal, 0, len(m))
+	for _, v := range m {
+		out = append(out, *v)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Cost != out[j].Cost {
+			return out[i].Cost > out[j].Cost
+		}
+		return out[i].Project < out[j].Project
+	})
+	return out
+}
+
+func printProjectsTable(r usageProjectsResult) {
+	w := tabwriter.NewWriter(
+		os.Stdout, 0, 4, 2, ' ', 0,
+	)
+	fmt.Fprintln(w,
+		"PROJECT\tINPUT\tOUTPUT\tCACHE_CR\tCACHE_RD\tCOST")
+	fmt.Fprintln(w,
+		"-------\t-----\t------\t--------\t--------\t----")
+	for _, p := range r.Projects {
+		fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%d\t%s\n",
+			p.Project,
+			p.InputTokens,
+			p.OutputTokens,
+			p.CacheCreationTokens,
+			p.CacheReadTokens,
+			fmtCost(p.Cost),
+		)
+	}
+	fmt.Fprintln(w,
+		"-------\t-----\t------\t--------\t--------\t----")
+	fmt.Fprintf(w, "TOTAL\t%d\t%d\t%d\t%d\t%s\n",
+		r.Total.InputTokens,
+		r.Total.OutputTokens,
+		r.Total.CacheCreationTokens,
+		r.Total.CacheReadTokens,
+		fmtCost(r.Total.Cost),
+	)
+	w.Flush()
 }
 
 type UsageStatuslineConfig struct {
