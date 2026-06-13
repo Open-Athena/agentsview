@@ -15,13 +15,27 @@ const litellmURL = "https://raw.githubusercontent.com/" +
 // ModelPricing holds per-model token pricing in cost per
 // million tokens. Separate from db.ModelPricing — the CLI
 // command converts between the two.
+//
+// CacheCreationPerMTok is the 5-minute ephemeral cache write rate
+// (Anthropic: 1.25x input). CacheCreation1hPerMTok is the 1-hour
+// ephemeral cache write rate (Anthropic: 2x input, ~1.6x the 5m
+// rate). LiteLLM's catalog currently exposes only the 5m rate;
+// 1h is derived as 1.6x the 5m rate when populated from LiteLLM,
+// or set explicitly for fallback entries.
 type ModelPricing struct {
-	ModelPattern         string
-	InputPerMTok         float64
-	OutputPerMTok        float64
-	CacheCreationPerMTok float64
-	CacheReadPerMTok     float64
+	ModelPattern           string
+	InputPerMTok           float64
+	OutputPerMTok          float64
+	CacheCreationPerMTok   float64
+	CacheCreation1hPerMTok float64
+	CacheReadPerMTok       float64
 }
+
+// cache1hRatio is the Anthropic-documented ratio of 1h cache write
+// rate to 5m cache write rate (1h = 2x input, 5m = 1.25x input).
+// Used to synthesize a 1h rate from upstream catalogs (LiteLLM)
+// that only expose the 5m rate.
+const cache1hRatio = 2.0 / 1.25
 
 type litellmEntry struct {
 	InputCost         *float64 `json:"input_cost_per_token"`
@@ -84,6 +98,8 @@ func ParseLiteLLMPricing(
 		if entry.CacheCreationCost != nil {
 			p.CacheCreationPerMTok =
 				*entry.CacheCreationCost * perMTok
+			p.CacheCreation1hPerMTok =
+				p.CacheCreationPerMTok * cache1hRatio
 		}
 		if entry.CacheReadCost != nil {
 			p.CacheReadPerMTok = *entry.CacheReadCost * perMTok

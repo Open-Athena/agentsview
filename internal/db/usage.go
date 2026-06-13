@@ -288,6 +288,12 @@ func scanUsageRow(rows *sql.Rows) (usageScanRow, error) {
 func usageAmounts(
 	r usageScanRow, pricing map[string]modelRates,
 ) (inputTok, outputTok, cacheCrTok, cacheRdTok int, cost, savings float64) {
+	// cacheCr5m and cacheCr1h split the cache_creation total so
+	// the two ephemeral TTLs can be priced at their separate
+	// rates. For sources with no breakdown, everything stays in
+	// the 5m bucket so the bill falls back to the legacy rate.
+	var cacheCr5m, cacheCr1h int
+
 	if r.usageSource == "message" {
 		usage := gjson.Parse(r.tokenJSON)
 		inputTok = int(usage.Get("input_tokens").Int())
@@ -296,11 +302,25 @@ func usageAmounts(
 			usage.Get("cache_creation_input_tokens").Int())
 		cacheRdTok = int(
 			usage.Get("cache_read_input_tokens").Int())
+		cacheCr5m = int(usage.Get(
+			"cache_creation.ephemeral_5m_input_tokens").Int())
+		cacheCr1h = int(usage.Get(
+			"cache_creation.ephemeral_1h_input_tokens").Int())
+		// Older session logs (pre-1h-cache rollout) report only
+		// the aggregate field; treat those entirely as 5m so the
+		// bill matches the rate that was actually charged.
+		if cacheCr5m+cacheCr1h == 0 {
+			cacheCr5m = cacheCrTok
+		}
 	} else {
 		inputTok = r.inputTokens
 		outputTok = r.outputTokens
 		cacheCrTok = r.cacheCreationInputTokens
 		cacheRdTok = r.cacheReadInputTokens
+		// usage_events sources (Codex, etc.) lack the TTL split;
+		// bill the whole bucket at the 5m rate, matching the
+		// pre-split behavior.
+		cacheCr5m = cacheCrTok
 	}
 
 	rates := pricing[r.model]
@@ -309,15 +329,18 @@ func usageAmounts(
 	} else {
 		cost = (float64(inputTok)*rates.input +
 			float64(outputTok)*rates.output +
-			float64(cacheCrTok)*rates.cacheCreation +
+			float64(cacheCr5m)*rates.cacheCreation +
+			float64(cacheCr1h)*rates.cacheCreation1h +
 			float64(cacheRdTok)*rates.cacheRead) / 1_000_000
 	}
 
 	readDelta := float64(cacheRdTok) *
 		(rates.input - rates.cacheRead) / 1_000_000
-	crDelta := float64(cacheCrTok) *
+	cr5mDelta := float64(cacheCr5m) *
 		(rates.input - rates.cacheCreation) / 1_000_000
-	savings = readDelta + crDelta
+	cr1hDelta := float64(cacheCr1h) *
+		(rates.input - rates.cacheCreation1h) / 1_000_000
+	savings = readDelta + cr5mDelta + cr1hDelta
 	return
 }
 
@@ -389,11 +412,17 @@ type DailyUsageResult struct {
 }
 
 // modelRates holds per-model pricing in rate-per-token form.
+// cacheCreation is the 5m ephemeral cache write rate; cacheCreation1h
+// is the 1h ephemeral cache write rate. Per-message usage rows
+// (Claude assistant messages) carry the 5m/1h split inside the
+// token_usage JSON blob and are priced separately; aggregate-only
+// sources (usage_events) fall back to the 5m rate.
 type modelRates struct {
-	input         float64
-	output        float64
-	cacheCreation float64
-	cacheRead     float64
+	input           float64
+	output          float64
+	cacheCreation   float64
+	cacheCreation1h float64
+	cacheRead       float64
 }
 
 // loadPricingMap reads the model_pricing table into a map for
@@ -406,7 +435,9 @@ func (db *DB) loadPricingMap(
 	rows, err := db.getReader().QueryContext(ctx,
 		`SELECT model_pattern,
 			input_per_mtok, output_per_mtok,
-			cache_creation_per_mtok, cache_read_per_mtok
+			cache_creation_per_mtok,
+			cache_creation_1h_per_mtok,
+			cache_read_per_mtok
 		 FROM model_pricing
 		 WHERE model_pattern NOT LIKE '\_%' ESCAPE '\'`)
 	if err != nil {
@@ -423,9 +454,19 @@ func (db *DB) loadPricingMap(
 		if err := rows.Scan(
 			&pattern,
 			&rates.input, &rates.output,
-			&rates.cacheCreation, &rates.cacheRead,
+			&rates.cacheCreation,
+			&rates.cacheCreation1h,
+			&rates.cacheRead,
 		); err != nil {
 			return nil, err
+		}
+		// Defensive: if the 1h column is unpopulated (older
+		// LiteLLM rows from before the column was added, or
+		// rows pushed by an older PG sync client), fall back
+		// to the 5m rate so we still bill cache creation
+		// rather than dropping it to zero.
+		if rates.cacheCreation1h == 0 && rates.cacheCreation > 0 {
+			rates.cacheCreation1h = rates.cacheCreation
 		}
 		out[pattern] = rates
 	}
@@ -435,10 +476,11 @@ func (db *DB) loadPricingMap(
 
 	for model, cp := range db.customPricing {
 		out[model] = modelRates{
-			input:         cp.Input,
-			output:        cp.Output,
-			cacheCreation: cp.CacheCreation,
-			cacheRead:     cp.CacheRead,
+			input:           cp.Input,
+			output:          cp.Output,
+			cacheCreation:   cp.CacheCreation,
+			cacheCreation1h: cp.CacheCreation,
+			cacheRead:       cp.CacheRead,
 		}
 	}
 

@@ -635,6 +635,10 @@ func (db *DB) migrateColumns() error {
 			"sessions", "secrets_rules_version",
 			"ALTER TABLE sessions ADD COLUMN secrets_rules_version TEXT NOT NULL DEFAULT ''",
 		},
+		{
+			"model_pricing", "cache_creation_1h_per_mtok",
+			"ALTER TABLE model_pricing ADD COLUMN cache_creation_1h_per_mtok REAL NOT NULL DEFAULT 0",
+		},
 	}
 
 	for _, m := range migrations {

@@ -6,13 +6,20 @@ import (
 )
 
 // ModelPricing holds per-model token pricing (per million tokens).
+// CacheCreationPerMTok is the 5-minute ephemeral cache write rate.
+// CacheCreation1hPerMTok is the 1-hour ephemeral cache write rate
+// (Anthropic charges ~1.6x the 5m rate, or 2x input rate). Usage
+// rows with the per-TTL split — Claude assistant messages —
+// price 5m and 1h tokens separately. Aggregate-only sources
+// (Codex usage_events) fall back to the 5m rate.
 type ModelPricing struct {
-	ModelPattern         string  `json:"model_pattern"`
-	InputPerMTok         float64 `json:"input_per_mtok"`
-	OutputPerMTok        float64 `json:"output_per_mtok"`
-	CacheCreationPerMTok float64 `json:"cache_creation_per_mtok"`
-	CacheReadPerMTok     float64 `json:"cache_read_per_mtok"`
-	UpdatedAt            string  `json:"updated_at"`
+	ModelPattern           string  `json:"model_pattern"`
+	InputPerMTok           float64 `json:"input_per_mtok"`
+	OutputPerMTok          float64 `json:"output_per_mtok"`
+	CacheCreationPerMTok   float64 `json:"cache_creation_per_mtok"`
+	CacheCreation1hPerMTok float64 `json:"cache_creation_1h_per_mtok"`
+	CacheReadPerMTok       float64 `json:"cache_read_per_mtok"`
+	UpdatedAt              string  `json:"updated_at"`
 }
 
 // UpsertModelPricing inserts or replaces pricing rows in a
@@ -32,15 +39,16 @@ func (db *DB) UpsertModelPricing(
 	stmt, err := tx.Prepare(`
 		INSERT INTO model_pricing
 			(model_pattern, input_per_mtok, output_per_mtok,
-			 cache_creation_per_mtok, cache_read_per_mtok,
-			 updated_at)
-		VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+			 cache_creation_per_mtok, cache_creation_1h_per_mtok,
+			 cache_read_per_mtok, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 		ON CONFLICT(model_pattern) DO UPDATE SET
-			input_per_mtok          = excluded.input_per_mtok,
-			output_per_mtok         = excluded.output_per_mtok,
-			cache_creation_per_mtok = excluded.cache_creation_per_mtok,
-			cache_read_per_mtok     = excluded.cache_read_per_mtok,
-			updated_at              = excluded.updated_at`)
+			input_per_mtok             = excluded.input_per_mtok,
+			output_per_mtok            = excluded.output_per_mtok,
+			cache_creation_per_mtok    = excluded.cache_creation_per_mtok,
+			cache_creation_1h_per_mtok = excluded.cache_creation_1h_per_mtok,
+			cache_read_per_mtok        = excluded.cache_read_per_mtok,
+			updated_at                 = excluded.updated_at`)
 	if err != nil {
 		return fmt.Errorf("preparing pricing upsert: %w", err)
 	}
@@ -52,6 +60,7 @@ func (db *DB) UpsertModelPricing(
 			p.InputPerMTok,
 			p.OutputPerMTok,
 			p.CacheCreationPerMTok,
+			p.CacheCreation1hPerMTok,
 			p.CacheReadPerMTok,
 		); err != nil {
 			return fmt.Errorf(
@@ -124,9 +133,9 @@ func (db *DB) InsertMissingModelPricing(
 	stmt, err := tx.Prepare(`
 		INSERT INTO model_pricing
 			(model_pattern, input_per_mtok, output_per_mtok,
-			 cache_creation_per_mtok, cache_read_per_mtok,
-			 updated_at)
-		VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+			 cache_creation_per_mtok, cache_creation_1h_per_mtok,
+			 cache_read_per_mtok, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 		ON CONFLICT(model_pattern) DO NOTHING`)
 	if err != nil {
 		return fmt.Errorf("preparing pricing insert: %w", err)
@@ -139,6 +148,7 @@ func (db *DB) InsertMissingModelPricing(
 			p.InputPerMTok,
 			p.OutputPerMTok,
 			p.CacheCreationPerMTok,
+			p.CacheCreation1hPerMTok,
 			p.CacheReadPerMTok,
 		); err != nil {
 			return fmt.Errorf(
@@ -158,6 +168,7 @@ func (db *DB) GetModelPricing(
 	err := db.getReader().QueryRow(
 		`SELECT model_pattern, input_per_mtok,
 			output_per_mtok, cache_creation_per_mtok,
+			cache_creation_1h_per_mtok,
 			cache_read_per_mtok, updated_at
 		 FROM model_pricing
 		 WHERE model_pattern = ?`,
@@ -167,6 +178,7 @@ func (db *DB) GetModelPricing(
 		&p.InputPerMTok,
 		&p.OutputPerMTok,
 		&p.CacheCreationPerMTok,
+		&p.CacheCreation1hPerMTok,
 		&p.CacheReadPerMTok,
 		&p.UpdatedAt,
 	)

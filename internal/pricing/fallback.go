@@ -2,7 +2,7 @@ package pricing
 
 // FallbackVersion must be bumped whenever FallbackPricing
 // rates change so the startup seeder knows to re-upsert.
-const FallbackVersion = "2026-05-28"
+const FallbackVersion = "2026-06-12"
 
 // FallbackPricing returns hardcoded pricing for key Claude
 // models. Used when the LiteLLM fetch fails.
@@ -11,35 +11,39 @@ func FallbackPricing() []ModelPricing {
 	return []ModelPricing{
 		// Current model names (used by Claude Code / Codex)
 		{
-			ModelPattern:         "claude-sonnet-4-6",
-			InputPerMTok:         3.0,
-			OutputPerMTok:        15.0,
-			CacheCreationPerMTok: 3.75,
-			CacheReadPerMTok:     0.30,
+			ModelPattern:           "claude-sonnet-4-6",
+			InputPerMTok:           3.0,
+			OutputPerMTok:          15.0,
+			CacheCreationPerMTok:   3.75,
+			CacheCreation1hPerMTok: 6.0,
+			CacheReadPerMTok:       0.30,
 		},
 		{
-			ModelPattern:         "claude-opus-4-6",
-			InputPerMTok:         5.0,
-			OutputPerMTok:        25.0,
-			CacheCreationPerMTok: 6.25,
-			CacheReadPerMTok:     0.50,
+			ModelPattern:           "claude-opus-4-6",
+			InputPerMTok:           5.0,
+			OutputPerMTok:          25.0,
+			CacheCreationPerMTok:   6.25,
+			CacheCreation1hPerMTok: 10.0,
+			CacheReadPerMTok:       0.50,
 		},
 		{
 			// Opus 4.8 launched at the Opus 4.6/4.7 rates and is
 			// not yet in the LiteLLM catalog, so it ships here so
 			// usage is priced until LiteLLM adds it.
-			ModelPattern:         "claude-opus-4-8",
-			InputPerMTok:         5.0,
-			OutputPerMTok:        25.0,
-			CacheCreationPerMTok: 6.25,
-			CacheReadPerMTok:     0.50,
+			ModelPattern:           "claude-opus-4-8",
+			InputPerMTok:           5.0,
+			OutputPerMTok:          25.0,
+			CacheCreationPerMTok:   6.25,
+			CacheCreation1hPerMTok: 10.0,
+			CacheReadPerMTok:       0.50,
 		},
 		{
-			ModelPattern:         "claude-haiku-4-5-20251001",
-			InputPerMTok:         1.0,
-			OutputPerMTok:        5.0,
-			CacheCreationPerMTok: 1.25,
-			CacheReadPerMTok:     0.10,
+			ModelPattern:           "claude-haiku-4-5-20251001",
+			InputPerMTok:           1.0,
+			OutputPerMTok:          5.0,
+			CacheCreationPerMTok:   1.25,
+			CacheCreation1hPerMTok: 2.0,
+			CacheReadPerMTok:       0.10,
 		},
 		// Codex / OpenAI models
 		{
@@ -74,32 +78,36 @@ func FallbackPricing() []ModelPricing {
 		},
 		// Older model names (still in some session logs)
 		{
-			ModelPattern:         "claude-sonnet-4-20250514",
-			InputPerMTok:         3.0,
-			OutputPerMTok:        15.0,
-			CacheCreationPerMTok: 3.75,
-			CacheReadPerMTok:     0.30,
+			ModelPattern:           "claude-sonnet-4-20250514",
+			InputPerMTok:           3.0,
+			OutputPerMTok:          15.0,
+			CacheCreationPerMTok:   3.75,
+			CacheCreation1hPerMTok: 6.0,
+			CacheReadPerMTok:       0.30,
 		},
 		{
-			ModelPattern:         "claude-sonnet-4-5-20250514",
-			InputPerMTok:         3.0,
-			OutputPerMTok:        15.0,
-			CacheCreationPerMTok: 3.75,
-			CacheReadPerMTok:     0.30,
+			ModelPattern:           "claude-sonnet-4-5-20250514",
+			InputPerMTok:           3.0,
+			OutputPerMTok:          15.0,
+			CacheCreationPerMTok:   3.75,
+			CacheCreation1hPerMTok: 6.0,
+			CacheReadPerMTok:       0.30,
 		},
 		{
-			ModelPattern:         "claude-opus-4-20250514",
-			InputPerMTok:         15.0,
-			OutputPerMTok:        75.0,
-			CacheCreationPerMTok: 18.75,
-			CacheReadPerMTok:     1.50,
+			ModelPattern:           "claude-opus-4-20250514",
+			InputPerMTok:           15.0,
+			OutputPerMTok:          75.0,
+			CacheCreationPerMTok:   18.75,
+			CacheCreation1hPerMTok: 30.0,
+			CacheReadPerMTok:       1.50,
 		},
 		{
-			ModelPattern:         "claude-haiku-3-5-20241022",
-			InputPerMTok:         0.80,
-			OutputPerMTok:        4.0,
-			CacheCreationPerMTok: 1.0,
-			CacheReadPerMTok:     0.08,
+			ModelPattern:           "claude-haiku-3-5-20241022",
+			InputPerMTok:           0.80,
+			OutputPerMTok:          4.0,
+			CacheCreationPerMTok:   1.0,
+			CacheCreation1hPerMTok: 1.60,
+			CacheReadPerMTok:       0.08,
 		},
 	}
 }

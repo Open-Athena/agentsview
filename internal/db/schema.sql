@@ -332,8 +332,14 @@ CREATE TABLE IF NOT EXISTS model_pricing (
     model_pattern    TEXT PRIMARY KEY,
     input_per_mtok   REAL NOT NULL DEFAULT 0,
     output_per_mtok  REAL NOT NULL DEFAULT 0,
-    cache_creation_per_mtok REAL NOT NULL DEFAULT 0,
-    cache_read_per_mtok     REAL NOT NULL DEFAULT 0,
+    -- cache_creation_per_mtok is the 5-minute ephemeral cache write rate
+    -- (Anthropic: 1.25x input). cache_creation_1h_per_mtok is the
+    -- 1-hour ephemeral cache write rate (2x input). Per-message usage
+    -- reports the split via usage.cache_creation.ephemeral_{5m,1h}_input_tokens;
+    -- aggregated sources (Codex usage_events) fall back to the 5m rate.
+    cache_creation_per_mtok    REAL NOT NULL DEFAULT 0,
+    cache_creation_1h_per_mtok REAL NOT NULL DEFAULT 0,
+    cache_read_per_mtok        REAL NOT NULL DEFAULT 0,
     updated_at       TEXT NOT NULL
         DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );

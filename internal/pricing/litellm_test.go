@@ -36,6 +36,11 @@ func TestParseLiteLLMPricing(t *testing.T) {
 	assertClose(t, "OutputPerMTok", found.OutputPerMTok, 15.0)
 	assertClose(t, "CacheCreationPerMTok",
 		found.CacheCreationPerMTok, 3.75)
+	// LiteLLM only exposes the 5m cache write rate; the 1h rate
+	// is derived as 1.6x the 5m rate (Anthropic's documented ratio:
+	// 5m = 1.25x input, 1h = 2x input, 2/1.25 = 1.6).
+	assertClose(t, "CacheCreation1hPerMTok",
+		found.CacheCreation1hPerMTok, 6.0)
 	assertClose(t, "CacheReadPerMTok",
 		found.CacheReadPerMTok, 0.30)
 }
