@@ -126,6 +126,20 @@ const usageMessageEligibility = `
     AND m.model != '<synthetic>'
     AND s.deleted_at IS NULL`
 
+// rollupProjectExpr returns the project to attribute a row to:
+// subagent sessions are rolled up into their parent's project so
+// the cost of an Agent-spawned subturn shows up under the project
+// the parent was running in, not under a path-derived sibling
+// bucket. Sessions without a parent fall through to their own
+// project field. The correlated subquery is fast because it hits
+// sessions' primary key, not the parent_session_id index.
+const rollupProjectExpr = `COALESCE(
+	NULLIF((SELECT ps.project FROM sessions ps
+	        WHERE ps.id = s.parent_session_id
+	          AND s.relationship_type = 'subagent'), ''),
+	s.project
+)`
+
 const usageRowsSQL = `
 SELECT
 	m.session_id,
@@ -145,7 +159,7 @@ SELECT
 	m.claude_message_id,
 	m.claude_request_id,
 	'' AS usage_dedup_key,
-	s.project,
+	` + rollupProjectExpr + ` AS project,
 	s.agent,
 	s.machine,
 	s.user_message_count,
@@ -180,7 +194,7 @@ SELECT
 		WHEN ue.dedup_key != '' THEN ue.session_id || ':' || ue.source || ':' || ue.dedup_key
 		ELSE ue.session_id || ':' || ue.source || ':id:' || ue.id
 	END AS usage_dedup_key,
-	s.project,
+	` + rollupProjectExpr + ` AS project,
 	s.agent,
 	s.machine,
 	s.user_message_count,

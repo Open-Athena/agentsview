@@ -2210,3 +2210,79 @@ func TestGetSessionUsage_NotFound(t *testing.T) {
 	requireNoError(t, err, "GetSessionUsage")
 	assert.Nil(t, u, "usage")
 }
+
+// TestGetDailyUsage_RollsUpSubagentToParentProject pins the
+// contract: a subagent session's usage shows up under its
+// parent's project in the per-project breakdown, not under
+// whatever path-derived project string the subagent itself
+// carries. Without rollup, an `Agent`-spawned subturn would
+// silo its cost into a sibling bucket and the user has to
+// mentally add the two back together.
+func TestGetDailyUsage_RollsUpSubagentToParentProject(t *testing.T) {
+	d := testDB(t)
+	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
+		ModelPattern:         "claude-opus-4-6",
+		InputPerMTok:         5.0,
+		OutputPerMTok:        25.0,
+		CacheCreationPerMTok: 6.25,
+		CacheReadPerMTok:     0.50,
+	}}), "seed pricing")
+
+	mustExec := func(q string, args ...any) {
+		t.Helper()
+		_, err := d.getWriter().Exec(q, args...)
+		require.NoError(t, err, "exec %q", q)
+	}
+
+	// Parent's project differs from subagent's project on purpose:
+	// the parser sets parent.project from display_name ("display")
+	// but the subagent JSONL lives a level deeper so its project
+	// falls back to a path-derived sibling ("path_sibling").
+	mustExec(`INSERT INTO sessions (id, project, machine, agent, started_at, ended_at)
+	          VALUES ('s-parent', 'display', 'local', 'claude', ?, ?)`,
+		"2026-04-10T10:00:00Z", "2026-04-10T10:05:00Z")
+	mustExec(`INSERT INTO sessions (id, project, machine, agent, started_at, ended_at,
+	          parent_session_id, relationship_type)
+	          VALUES ('s-sub', 'path_sibling', 'local', 'claude', ?, ?, 's-parent', 'subagent')`,
+		"2026-04-10T10:01:00Z", "2026-04-10T10:04:00Z")
+
+	usage := `{"input_tokens":10,"output_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}`
+	for _, row := range []struct {
+		sid, mid, rid string
+	}{
+		{"s-parent", "msg_p", "req_p"},
+		{"s-sub", "msg_s", "req_s"},
+	} {
+		mustExec(`INSERT INTO messages
+			(session_id, ordinal, role, content, timestamp,
+			 model, token_usage,
+			 claude_message_id, claude_request_id,
+			 has_output_tokens, has_context_tokens)
+			VALUES (?, 0, 'assistant', '', '2026-04-10T10:02:00Z',
+			        'claude-opus-4-6', ?, ?, ?, 1, 1)`,
+			row.sid, usage, row.mid, row.rid)
+	}
+
+	result, err := d.GetDailyUsage(context.Background(), UsageFilter{
+		From: "2026-04-10", To: "2026-04-10", Timezone: "UTC",
+		Breakdowns: true,
+	})
+	require.NoError(t, err, "GetDailyUsage")
+	require.Len(t, result.Daily, 1, "daily entries =")
+
+	// Both messages bucketed under the parent's display project;
+	// the subagent's "path_sibling" project must not appear.
+	pbs := result.Daily[0].ProjectBreakdowns
+	projects := make(map[string]ProjectBreakdown, len(pbs))
+	for _, pb := range pbs {
+		projects[pb.Project] = pb
+	}
+	require.Contains(t, projects, "display",
+		"expected parent's project in breakdown, got %v", pbs)
+	require.NotContains(t, projects, "path_sibling",
+		"subagent project leaked into breakdown, got %v", pbs)
+	assert.Equal(t, 20, projects["display"].InputTokens,
+		"rollup input tokens")
+	assert.Equal(t, 200, projects["display"].OutputTokens,
+		"rollup output tokens")
+}
