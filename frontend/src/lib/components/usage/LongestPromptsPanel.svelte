@@ -2,7 +2,6 @@
   import { usage } from "../../stores/usage.svelte.js";
   import { router } from "../../stores/router.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
-  import { ui } from "../../stores/ui.svelte.js";
 
   function truncatePreview(s: string, max = 100): string {
     const oneLine = s.replace(/\s+/g, " ").trim();
@@ -10,12 +9,15 @@
     return oneLine.slice(0, max - 1) + "…";
   }
 
-  // Navigate then queue a scroll-to-ordinal: the session view
-  // mounts, reads ui.pendingScrollOrdinal, and jumps to the
-  // matching message. Same machinery the in-session search uses.
+  // Navigate via the URL's `?msg=N` deep-link param. App.svelte's
+  // session deep-link effect (the same one that handles bookmarked
+  // /sessions/<id>?msg=N links) reads the param and calls
+  // ui.scrollToOrdinal. Writing it through the URL — instead of
+  // calling scrollToOrdinal here directly — means a panel-row
+  // click is fully shareable: copy the URL and the recipient
+  // lands on the same prompt.
   function handleRowClick(sessionId: string, ordinal: number) {
-    router.navigateToSession(sessionId);
-    ui.scrollToOrdinal(ordinal, sessionId);
+    router.navigateToSession(sessionId, { msg: String(ordinal) });
   }
 
   function fmtChars(n: number): string {

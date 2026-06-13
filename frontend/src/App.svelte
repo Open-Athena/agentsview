@@ -306,6 +306,29 @@
     });
   });
 
+  // Sync ui.selectedOrdinal -> URL ?msg=N when inside a session,
+  // so in-session search jumps (and any other scroll-to-message
+  // path) produce a shareable URL. Uses replaceParams to avoid
+  // polluting browser history with one entry per search keystroke.
+  // Skips the write when the URL already matches, breaking the
+  // URL -> scrollToOrdinal -> selectedOrdinal -> URL feedback loop.
+  $effect(() => {
+    const selected = ui.selectedOrdinal;
+    const sid = router.sessionId;
+    untrack(() => {
+      if (router.route !== "sessions" || !sid) return;
+      const currentMsg = router.params["msg"] ?? null;
+      const wantMsg = selected === null ? null : String(selected);
+      if (currentMsg === wantMsg) return;
+      const next: Record<string, string> = {};
+      for (const [k, v] of Object.entries(router.params)) {
+        if (k !== "msg") next[k] = v;
+      }
+      if (wantMsg !== null) next["msg"] = wantMsg;
+      router.replaceParams(next);
+    });
+  });
+
   // Compare only filter keys so sticky params (e.g. desktop)
   // don't cause spurious replaceParams calls.
   function filterParamsEqual(
