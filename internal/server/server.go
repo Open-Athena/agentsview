@@ -271,6 +271,8 @@ func (s *Server) routes() {
 		s.withTimeout(s.handleUsageSummary))
 	s.mux.Handle("GET /api/v1/usage/top-sessions",
 		s.withTimeout(s.handleUsageTopSessions))
+	s.mux.Handle("GET /api/v1/messages/longest",
+		s.withTimeout(s.handleLongestPrompts))
 
 	s.mux.Handle("GET /api/v1/insights", s.withTimeout(s.handleListInsights))
 	s.mux.Handle("GET /api/v1/insights/{id}", s.withTimeout(s.handleGetInsight))

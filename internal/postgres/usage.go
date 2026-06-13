@@ -871,3 +871,64 @@ func (s *Store) GetUsageSessionCounts(
 	}
 	return out, nil
 }
+
+// GetLongestUserPrompts returns the top `limit` longest user-role
+// messages by content_length. Mirrors the SQLite implementation;
+// PG uses $1/$2 placeholders.
+func (s *Store) GetLongestUserPrompts(
+	ctx context.Context, limit int,
+) ([]db.LongestUserPrompt, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	const previewChars = 200
+
+	rows, err := s.pg.QueryContext(ctx, `
+		SELECT
+			m.session_id,
+			COALESCE(sess.project, '') AS project,
+			m.ordinal,
+			m.content_length,
+			substring(m.content FROM 1 FOR $1) AS preview,
+			COALESCE(m.timestamp, '') AS timestamp
+		FROM messages m
+		JOIN sessions sess ON sess.id = m.session_id
+		WHERE m.role = 'user'
+		  AND m.is_system = false
+		  AND sess.deleted_at IS NULL
+		  AND COALESCE(sess.relationship_type, '') != 'subagent'
+		  AND m.content NOT LIKE '<task-notification>%'
+		  AND m.content NOT LIKE '<system-reminder>%'
+		  AND m.content NOT LIKE '<command-name>%'
+		  AND m.content NOT LIKE '<local-command-stdout>%'
+		ORDER BY m.content_length DESC, m.id DESC
+		LIMIT $2`,
+		previewChars, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"querying longest user prompts: %w", err,
+		)
+	}
+	defer rows.Close()
+
+	var out []db.LongestUserPrompt
+	for rows.Next() {
+		var p db.LongestUserPrompt
+		if err := rows.Scan(
+			&p.SessionID, &p.Project, &p.Ordinal,
+			&p.ContentLength, &p.Preview, &p.Timestamp,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"scanning longest prompt row: %w", err,
+			)
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"iterating longest prompt rows: %w", err,
+		)
+	}
+	return out, nil
+}

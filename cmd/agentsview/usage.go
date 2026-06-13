@@ -265,6 +265,61 @@ func printProjectsTable(r usageProjectsResult) {
 	w.Flush()
 }
 
+type UsageLongestPromptsConfig struct {
+	JSON   bool
+	Limit  int
+	NoSync bool
+}
+
+func runUsageLongestPrompts(cfg UsageLongestPromptsConfig) {
+	database, appCfg := openUsageDB()
+	defer database.Close()
+
+	ensureFreshData(appCfg, database, cfg.NoSync)
+
+	limit := cfg.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+
+	rows, err := database.GetLongestUserPrompts(
+		context.Background(), limit,
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if cfg.JSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(rows); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w,
+		"CHARS\tPROJECT\tSESSION\tORDINAL\tPREVIEW")
+	fmt.Fprintln(w,
+		"-----\t-------\t-------\t-------\t-------")
+	for _, p := range rows {
+		preview := strings.ReplaceAll(p.Preview, "\n", " ")
+		if len(preview) > 100 {
+			preview = preview[:97] + "..."
+		}
+		short := p.SessionID
+		if len(short) > 8 {
+			short = short[:8]
+		}
+		fmt.Fprintf(w, "%d\t%s\t%s\t%d\t%s\n",
+			p.ContentLength, p.Project, short, p.Ordinal, preview)
+	}
+	w.Flush()
+}
+
 type UsageStatuslineConfig struct {
 	Agent   string
 	Offline bool

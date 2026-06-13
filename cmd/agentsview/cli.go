@@ -293,7 +293,25 @@ func newUsageCommand() *cobra.Command {
 	}
 	cmd.AddCommand(newUsageDailyCommand())
 	cmd.AddCommand(newUsageProjectsCommand())
+	cmd.AddCommand(newUsageLongestPromptsCommand())
 	cmd.AddCommand(newUsageStatuslineCommand())
+	return cmd
+}
+
+func newUsageLongestPromptsCommand() *cobra.Command {
+	var cfg UsageLongestPromptsConfig
+	cmd := &cobra.Command{
+		Use:          "longest-prompts",
+		Short:        "Show your N longest user prompts by character count",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		Run: func(cmd *cobra.Command, args []string) {
+			runUsageLongestPrompts(cfg)
+		},
+	}
+	cmd.Flags().BoolVar(&cfg.JSON, "json", false, "Output as JSON")
+	cmd.Flags().IntVar(&cfg.Limit, "limit", 20, "How many prompts to show (max 200)")
+	cmd.Flags().BoolVar(&cfg.NoSync, "no-sync", false, "Skip on-demand sync before querying")
 	return cmd
 }
 
