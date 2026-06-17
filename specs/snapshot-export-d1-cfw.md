@@ -225,8 +225,17 @@ means reads are unchanged).
   the analytics stance + a smallest end-to-end (one project, sessions+messages+
   search live on D1 behind a hand-written Worker, SPA pointed at it) and the
   large-content loader decision.
-- **P1 — exporter**: `export-snapshot` emitting `d1.sql` + `dist` + wrangler
-  scaffold for sessions/messages/search/projects/stats.
+- **P1 — exporter + Worker read path** (in progress):
+  - `export-snapshot` (Go) emits schema.sql + sessions/messages NDJSON +
+    manifest — DONE.
+  - `snapshot-site/` Worker + bound-param loader + `parity.mjs` harness
+    (compares Worker vs live Go server route-by-route) — DONE.
+  - Worker route parity vs Go (project `awair`): sessions-list, session-detail,
+    messages MATCH. `session-search` and global `search` DIFFER — both because
+    Go searches `tool_calls.result_content` (session-search) / a broader corpus
+    (global), which the snapshot omits. **Next: add `tool_calls` to the exporter
+    + Worker search** to close both. Then projects/stats/version stubs and the
+    SPA-on-load routes.
 - **P2 — FE snapshot mode**: flag + guards hiding mutations/SSE/auth.
 - **P3 — analytics/usage**: per the (a)/(b) decision; wire the remaining panels.
 - **P4 — DX**: one-command publish (`export-snapshot` + `wrangler deploy`),

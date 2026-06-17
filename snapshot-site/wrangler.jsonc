@@ -1,0 +1,21 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "agentsview-snapshot",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-01",
+  // Local dev uses a placeholder database_id; `wrangler dev` and
+  // `wrangler d1 execute --local` share the .wrangler/state D1 by name.
+  // A real database_id is filled in only when deploying a snapshot.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "agentsview-snapshot",
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  // ALLOW_LOAD gates the /admin/load ingestion endpoint. It is set for
+  // local development only; a deployed read-only snapshot must NOT set it.
+  "vars": {
+    "ALLOW_LOAD": "1"
+  }
+}
