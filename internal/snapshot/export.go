@@ -31,8 +31,9 @@ import (
 const idChunkSize = 400
 
 // baseTables are dumped as data; their DDL plus the FTS objects make up
-// schema.sql. Order matters: sessions before messages (FK reference).
-var baseTables = []string{"sessions", "messages"}
+// schema.sql. Order matters for FK references: sessions before messages,
+// and tool_calls last (it references both).
+var baseTables = []string{"sessions", "messages", "tool_calls"}
 
 // ftsObjects are emitted as DDL only (no data) — the messages_ai trigger
 // rebuilds the index as the loader inserts message rows.
@@ -56,11 +57,12 @@ type Options struct {
 
 // Manifest summarizes an export; also written to manifest.json.
 type Manifest struct {
-	Projects     []string `json:"projects"`
-	GeneratedAt  string   `json:"generatedAt"`
-	SessionCount int      `json:"sessionCount"`
-	MessageCount int      `json:"messageCount"`
-	Tables       []string `json:"tables"`
+	Projects      []string `json:"projects"`
+	GeneratedAt   string   `json:"generatedAt"`
+	SessionCount  int      `json:"sessionCount"`
+	MessageCount  int      `json:"messageCount"`
+	ToolCallCount int      `json:"toolCallCount"`
+	Tables        []string `json:"tables"`
 }
 
 // Export reads a project-scoped slice of srcPath and writes the snapshot
@@ -115,12 +117,22 @@ func Export(
 		return nil, fmt.Errorf("snapshot: dump messages: %w", err)
 	}
 
+	toolCallCount, err := dumpToFile(
+		ctx, src, filepath.Join(outDir, "tool_calls.ndjson"),
+		"SELECT * FROM tool_calls WHERE session_id IN (%s) ORDER BY session_id, id",
+		ids,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot: dump tool_calls: %w", err)
+	}
+
 	m := &Manifest{
-		Projects:     append([]string(nil), opts.Projects...),
-		GeneratedAt:  opts.GeneratedAt,
-		SessionCount: sessionCount,
-		MessageCount: messageCount,
-		Tables:       append(append([]string(nil), baseTables...), "messages_fts"),
+		Projects:      append([]string(nil), opts.Projects...),
+		GeneratedAt:   opts.GeneratedAt,
+		SessionCount:  sessionCount,
+		MessageCount:  messageCount,
+		ToolCallCount: toolCallCount,
+		Tables:        append(append([]string(nil), baseTables...), "messages_fts"),
 	}
 	if err := writeManifest(filepath.Join(outDir, "manifest.json"), m); err != nil {
 		return nil, err

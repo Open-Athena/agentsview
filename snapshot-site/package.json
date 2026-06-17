@@ -8,6 +8,8 @@
     "dev": "wrangler dev --port 8799",
     "schema": "wrangler d1 execute agentsview-snapshot --local --file",
     "load": "node scripts/load.mjs",
+    "snapshot:local": "bash scripts/snapshot-local.sh",
+    "parity": "node scripts/parity.mjs",
     "deploy": "wrangler deploy"
   },
   "devDependencies": {

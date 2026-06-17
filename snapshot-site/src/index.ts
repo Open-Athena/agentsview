@@ -160,34 +160,46 @@ async function handleSessionSearch(
   if (!q.trim()) return json({ ordinals: [] });
 
   // In-session search uses LIKE substring semantics (browser find-bar UX),
-  // matching the Go SearchSession. NOTE: Go also searches
-  // tool_calls.result_content; until the snapshot includes the tool_calls
-  // table, hits that occur only inside tool results are not surfaced here.
+  // matching the Go SearchSession: message content OR tool_calls result.
+  const like = `%${escapeLike(q)}%`;
   const rows = await env.DB.prepare(
     `SELECT DISTINCT m.ordinal AS ordinal
        FROM messages m
+       LEFT JOIN tool_calls tc ON tc.message_id = m.id
       WHERE m.session_id = ? AND m.is_system = 0
-        AND m.content LIKE ? ESCAPE '\\'
+        AND (m.content LIKE ? ESCAPE '\\'
+             OR tc.result_content LIKE ? ESCAPE '\\')
       ORDER BY m.ordinal ASC`,
   )
-    .bind(id, `%${escapeLike(q)}%`)
+    .bind(id, like, like)
     .all<{ ordinal: number }>();
 
   return json({ ordinals: rows.results.map((r) => r.ordinal) });
 }
 
+/** Wrap case-insensitive occurrences of q in <mark> for name-branch snippets. */
+function markName(name: string, q: string): string {
+  const i = name.toLowerCase().indexOf(q.toLowerCase());
+  if (i < 0) return name;
+  return `${name.slice(0, i)}<mark>${name.slice(i, i + q.length)}</mark>${name.slice(i + q.length)}`;
+}
+
 async function handleSearch(env: Env, url: URL): Promise<Response> {
   const q = url.searchParams.get("q") ?? "";
+  const project = url.searchParams.get("project");
   const limit = clampInt(url.searchParams.get("limit"), 20, 1, 200);
   const offset = clampInt(url.searchParams.get("offset"), 0, 0, Number.MAX_SAFE_INTEGER);
   if (!q.trim()) return json({ query: q, results: [], count: 0 });
 
-  // FTS5 snippet()/bm25() are only usable in a flat query against the FTS
-  // table (not inside a wrapping subquery/window). So rank in SQL, then
-  // dedup to the best-ranked hit per session in JS — mirroring the Go
-  // global search's one-result-per-session behavior.
+  const projClause = project ? "AND s.project = ?" : "";
+  const projArgs = project ? [project] : [];
+
+  // FTS branch: snippet()/bm25() are only usable in a flat query against the
+  // FTS table (not inside a wrapping subquery/window), so rank in SQL and
+  // dedup to the best-ranked hit per session in JS — mirroring the Go global
+  // search's one-result-per-session behavior.
   const cap = Math.min(2000, (offset + limit) * 25 + 50);
-  const rows = await env.DB.prepare(
+  const fts = await env.DB.prepare(
     `SELECT m.session_id AS session_id, s.project AS project, s.agent AS agent,
             COALESCE(NULLIF(s.display_name, ''), s.first_message, '') AS name,
             m.ordinal AS ordinal, s.ended_at AS session_ended_at,
@@ -197,27 +209,66 @@ async function handleSearch(env: Env, url: URL): Promise<Response> {
        JOIN messages m ON m.id = messages_fts.rowid
        JOIN sessions s ON s.id = m.session_id
       WHERE messages_fts MATCH ? AND m.is_system = 0
-        AND s.deleted_at IS NULL
+        AND s.deleted_at IS NULL ${projClause}
       ORDER BY bm25(messages_fts), m.ordinal LIMIT ?`,
   )
-    .bind(ftsQuery(q), cap)
+    .bind(ftsQuery(q), ...projArgs, cap)
     .all<Row>();
 
   const seen = new Set<unknown>();
-  const deduped: Row[] = [];
-  for (const r of rows.results) {
+  const results: Row[] = [];
+  for (const r of fts.results) {
     if (seen.has(r.session_id)) continue;
     seen.add(r.session_id);
-    deduped.push(r);
+    results.push(r);
   }
-  const page = deduped.slice(offset, offset + limit);
 
+  // Name branch: sessions whose title matches but had no content hit (Go
+  // appends these with ordinal -1). Ordered after FTS hits by recency.
+  const like = `%${escapeLike(q)}%`;
+  const names = await env.DB.prepare(
+    `SELECT s.id AS session_id, s.project AS project, s.agent AS agent,
+            COALESCE(NULLIF(s.display_name, ''), s.first_message, '') AS name,
+            s.ended_at AS session_ended_at
+       FROM sessions s
+      WHERE s.deleted_at IS NULL
+        AND (s.display_name LIKE ? ESCAPE '\\'
+             OR s.first_message LIKE ? ESCAPE '\\') ${projClause}
+      ORDER BY julianday(s.ended_at) DESC`,
+  )
+    .bind(like, like, ...projArgs)
+    .all<Row>();
+  for (const r of names.results) {
+    if (seen.has(r.session_id)) continue;
+    seen.add(r.session_id);
+    results.push({
+      ...r,
+      ordinal: -1,
+      snippet: markName(String(r.name ?? ""), q),
+      rank: 0,
+    });
+  }
+
+  // Match Go's outer ordering: rank ASC, then recency, then id. (Go also
+  // tiebreaks on match position within the message, which we don't track —
+  // so deep-tie orderings can still differ slightly.)
+  results.sort((a, b) => {
+    const ra = Number(a.rank ?? 0);
+    const rb = Number(b.rank ?? 0);
+    if (ra !== rb) return ra - rb;
+    const ea = String(a.session_ended_at ?? "");
+    const eb = String(b.session_ended_at ?? "");
+    if (ea !== eb) return ea < eb ? 1 : -1;
+    return String(a.session_id) < String(b.session_id) ? -1 : 1;
+  });
+
+  const page = results.slice(offset, offset + limit);
   const body: Record<string, unknown> = {
     query: q,
     results: page,
     count: page.length,
   };
-  if (deduped.length > offset + limit) body.next = offset + limit;
+  if (results.length > offset + limit) body.next = offset + limit;
   return json(body);
 }
 
@@ -228,8 +279,12 @@ async function handleAdminLoad(
 ): Promise<Response> {
   if (env.ALLOW_LOAD !== "1") return errorJSON(403, "load disabled");
   const table = url.searchParams.get("table");
-  if (table !== "sessions" && table !== "messages") {
-    return errorJSON(400, "table must be sessions or messages");
+  if (
+    table !== "sessions" &&
+    table !== "messages" &&
+    table !== "tool_calls"
+  ) {
+    return errorJSON(400, "table must be sessions, messages, or tool_calls");
   }
 
   const text = await req.text();

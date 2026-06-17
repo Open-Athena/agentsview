@@ -58,7 +58,7 @@ const routes = [
   },
   {
     name: "global-search",
-    path: `/api/v1/search?q=${q}&limit=3`,
+    path: `/api/v1/search?q=${q}&limit=3&project=${project}`,
     pick: (r) => ({
       results: r.results.map((x) => [x.session_id, x.ordinal]),
       allMarked: r.results.every((x) => x.snippet.includes("<mark>")),

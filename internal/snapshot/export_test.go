@@ -47,9 +47,17 @@ func seedSource(t *testing.T) string {
 			ContentLength: len(content),
 		}
 	}
-	require.NoError(t, d.ReplaceSessionMessages("s-main", []db.Message{
-		msg("s-main", 0, "hello from main"), msg("s-main", 1, "second main message"),
-	}), "messages s-main")
+	mainMsgs := []db.Message{
+		msg("s-main", 0, "hello from main"),
+		msg("s-main", 1, "second main message"),
+	}
+	mainMsgs[1].HasToolUse = true
+	mainMsgs[1].ToolCalls = []db.ToolCall{{
+		ToolName: "Bash", Category: "exec",
+		ResultContent: "tool result text", ResultContentLength: 16,
+	}}
+	require.NoError(t, d.ReplaceSessionMessages("s-main", mainMsgs),
+		"messages s-main")
 	require.NoError(t, d.ReplaceSessionMessages("s-sub", []db.Message{
 		msg("s-sub", 0, "subagent message"),
 	}), "messages s-sub")
@@ -107,13 +115,15 @@ func TestExportProjectScope(t *testing.T) {
 	})
 	require.NoError(t, err, "Export")
 
-	// Manifest: s-main + s-sub (rollup), 3 messages total, s-other excluded.
+	// Manifest: s-main + s-sub (rollup), 3 messages total, 1 tool call,
+	// s-other excluded.
 	assert.Equal(t, &Manifest{
-		Projects:     []string{"alpha"},
-		GeneratedAt:  "2026-06-17T00:00:00Z",
-		SessionCount: 2,
-		MessageCount: 3,
-		Tables:       []string{"sessions", "messages", "messages_fts"},
+		Projects:      []string{"alpha"},
+		GeneratedAt:   "2026-06-17T00:00:00Z",
+		SessionCount:  2,
+		MessageCount:  3,
+		ToolCallCount: 1,
+		Tables:        []string{"sessions", "messages", "tool_calls", "messages_fts"},
 	}, m)
 
 	// Sessions NDJSON: exactly the rolled-up set, deterministically ordered.
@@ -124,10 +134,14 @@ func TestExportProjectScope(t *testing.T) {
 	msgSessions := readNDJSONIDs(t, filepath.Join(out, "messages.ndjson"), "session_id")
 	assert.Equal(t, []string{"s-main", "s-main", "s-sub"}, msgSessions)
 
-	// Schema: base tables + FTS virtual table and its three triggers.
+	// tool_calls NDJSON: the single tool call belongs to s-main.
+	assert.Equal(t, []string{"s-main"},
+		readNDJSONIDs(t, filepath.Join(out, "tool_calls.ndjson"), "session_id"))
+
+	// Schema: base tables (incl. tool_calls) + FTS virtual table and triggers.
 	assert.Equal(t, []string{
 		"messages", "messages_ad", "messages_ai", "messages_au",
-		"messages_fts", "sessions",
+		"messages_fts", "sessions", "tool_calls",
 	}, schemaObjects(t, filepath.Join(out, "schema.sql")))
 }
 
