@@ -17,5 +17,12 @@
   // local development only; a deployed read-only snapshot must NOT set it.
   "vars": {
     "ALLOW_LOAD": "1"
+  },
+  // The built Svelte SPA. Real asset files are served before the Worker
+  // runs; unmatched navigations fall through to the Worker, which returns
+  // index.html (SPA routing). Populated by copying frontend/dist -> public.
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
   }
 }

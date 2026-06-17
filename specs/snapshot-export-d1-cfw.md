@@ -239,8 +239,18 @@ means reads are unchanged).
     search (FTS branch deduped per session + name branch + rank/recency/id
     tiebreak). Minor: Worker bm25 magnitudes differ from Go's (~0 vs ~-8) while
     ordering is identical — cosmetic.
-  - **Next**: projects/stats/version + the SPA-on-load stub routes so the actual
-    UI renders against a snapshot, then the SPA Static Assets binding.
+  - SPA now served by the Worker: a Static Assets binding (`public/` <-
+    `frontend/dist`) serves the built Svelte SPA; the Worker is the SPA
+    fallback (real assets served first; unmatched GET navigations -> index.html;
+    `/api/*` and SSE -> Worker). On-load routes implemented: projects/agents/
+    machines/stats/sidebar-index/children derived from snapshot data;
+    version/settings(empty agent_dirs, no path leak)/starred/pins/sync-status/
+    update-check/config.* and per-session timing/activity as static stubs. All
+    on-load endpoints + assets return 200; deep-link client routes fall back to
+    index.html. (Rendered-pixel check still pending — verify in browser.)
+  - **Next**: FE snapshot-mode polish (hide mutation/sync/SSE affordances;
+    landing on session-list instead of the analytics page that 404s in P1);
+    then P3 analytics/usage routes, then P4 deploy.
 - **P2 — FE snapshot mode**: flag + guards hiding mutations/SSE/auth.
 - **P3 — analytics/usage**: per the (a)/(b) decision; wire the remaining panels.
 - **P4 — DX**: one-command publish (`export-snapshot` + `wrangler deploy`),

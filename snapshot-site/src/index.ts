@@ -12,6 +12,7 @@
 
 interface Env {
   DB: D1Database;
+  ASSETS: Fetcher;
   ALLOW_LOAD?: string;
 }
 
@@ -312,6 +313,128 @@ async function handleAdminLoad(
   return json({ table, inserted });
 }
 
+// Default top-level list filter, matching the Go session list's default
+// (no children, no automated, no one-shot sessions).
+const LIST_FILTER =
+  "deleted_at IS NULL AND relationship_type NOT IN ('subagent', 'fork')" +
+  " AND is_automated = 0 AND user_message_count > 1";
+
+async function handleProjects(env: Env): Promise<Response> {
+  const rows = await env.DB.prepare(
+    `SELECT project AS name, count(*) AS session_count
+       FROM sessions WHERE ${LIST_FILTER}
+      GROUP BY project ORDER BY project`,
+  ).all<Row>();
+  return json({ projects: rows.results });
+}
+
+async function handleAgents(env: Env): Promise<Response> {
+  const rows = await env.DB.prepare(
+    `SELECT agent AS name, count(*) AS session_count
+       FROM sessions WHERE ${LIST_FILTER}
+      GROUP BY agent ORDER BY agent`,
+  ).all<Row>();
+  return json({ agents: rows.results });
+}
+
+async function handleMachines(env: Env): Promise<Response> {
+  const rows = await env.DB.prepare(
+    `SELECT DISTINCT machine FROM sessions WHERE ${LIST_FILTER}
+      ORDER BY machine`,
+  ).all<{ machine: string }>();
+  return json({ machines: rows.results.map((r) => r.machine) });
+}
+
+async function handleStats(env: Env): Promise<Response> {
+  const row = await env.DB.prepare(
+    `SELECT count(*) AS session_count,
+            count(DISTINCT project) AS project_count,
+            count(DISTINCT machine) AS machine_count,
+            min(started_at) AS earliest_session
+       FROM sessions WHERE ${LIST_FILTER}`,
+  ).first<Row>();
+  const msgs = await env.DB.prepare(
+    "SELECT count(*) AS n FROM messages",
+  ).first<{ n: number }>();
+  return json({
+    session_count: row?.session_count ?? 0,
+    message_count: msgs?.n ?? 0,
+    project_count: row?.project_count ?? 0,
+    machine_count: row?.machine_count ?? 0,
+    earliest_session: row?.earliest_session ?? null,
+  });
+}
+
+async function handleSidebarIndex(env: Env, url: URL): Promise<Response> {
+  const project = url.searchParams.get("project");
+  const where = [LIST_FILTER];
+  const args: unknown[] = [];
+  if (project) {
+    where.push("project = ?");
+    args.push(project);
+  }
+  const rows = await env.DB.prepare(
+    `SELECT id, project, machine, agent, started_at, ended_at, created_at,
+            termination_status, message_count, user_message_count,
+            is_automated
+       FROM sessions WHERE ${where.join(" AND ")}
+      ORDER BY ended_at DESC`,
+  )
+    .bind(...args)
+    .all<Row>();
+  return json({
+    sessions: rows.results.map((r) => ({
+      ...coerceBools(r, SESSION_BOOLS),
+      is_teammate: false,
+    })),
+  });
+}
+
+async function handleChildren(env: Env, id: string): Promise<Response> {
+  const rows = await env.DB.prepare(
+    `SELECT * FROM sessions
+      WHERE parent_session_id = ? AND deleted_at IS NULL
+      ORDER BY started_at ASC`,
+  )
+    .bind(id)
+    .all<Row>();
+  return json(rows.results.map((r) => coerceBools(r, SESSION_BOOLS)));
+}
+
+// Static stubs for endpoints that have no meaning in a frozen snapshot.
+// agent_dirs is intentionally empty so a published snapshot leaks no local
+// filesystem paths.
+function snapshotStub(path: string): Response | null {
+  switch (path) {
+    case "/api/v1/version":
+      return json({ version: "snapshot", commit: "snapshot", build_date: "" });
+    case "/api/v1/settings":
+      return json({ agent_dirs: {} });
+    case "/api/v1/starred":
+      return json({ session_ids: [] });
+    case "/api/v1/pins":
+      return json({ pins: [] });
+    case "/api/v1/sync/status":
+      return json({
+        last_sync: null,
+        stats: { total_sessions: 0, synced: 0, skipped: 0, failed: 0 },
+      });
+    case "/api/v1/update/check":
+      return json({
+        update_available: false,
+        current_version: "snapshot",
+        latest_version: "snapshot",
+        is_dev_build: false,
+      });
+    case "/api/v1/config/github":
+      return json({ configured: false });
+    case "/api/v1/config/terminal":
+      return json({ mode: "auto" });
+    default:
+      return null;
+  }
+}
+
 function clampInt(
   raw: string | null,
   dflt: number,
@@ -337,8 +460,24 @@ export default {
       return errorJSON(405, "method not allowed (snapshot is read-only)");
     }
 
+    // Non-API GET that reached the Worker means no static asset matched —
+    // serve the SPA shell for client-side routing.
+    if (!path.startsWith("/api/")) {
+      return env.ASSETS.fetch(new URL("/index.html", url.origin));
+    }
+
+    const stub = snapshotStub(path);
+    if (stub) return stub;
+
     if (path === "/api/v1/sessions") return handleSessions(env, url);
+    if (path === "/api/v1/sessions/sidebar-index") {
+      return handleSidebarIndex(env, url);
+    }
     if (path === "/api/v1/search") return handleSearch(env, url);
+    if (path === "/api/v1/projects") return handleProjects(env);
+    if (path === "/api/v1/agents") return handleAgents(env);
+    if (path === "/api/v1/machines") return handleMachines(env);
+    if (path === "/api/v1/stats") return handleStats(env);
 
     const sess = path.match(/^\/api\/v1\/sessions\/([^/]+)$/);
     if (sess) return handleSession(env, decodeURIComponent(sess[1]));
@@ -349,6 +488,31 @@ export default {
     const ssearch = path.match(/^\/api\/v1\/sessions\/([^/]+)\/search$/);
     if (ssearch) {
       return handleSessionSearch(env, decodeURIComponent(ssearch[1]), url);
+    }
+
+    const children = path.match(/^\/api\/v1\/sessions\/([^/]+)\/children$/);
+    if (children) return handleChildren(env, decodeURIComponent(children[1]));
+
+    // Per-session endpoints with no snapshot data: empty-but-valid shapes.
+    const spins = path.match(/^\/api\/v1\/sessions\/([^/]+)\/pins$/);
+    if (spins) return json({ pins: [] });
+
+    const timing = path.match(/^\/api\/v1\/sessions\/([^/]+)\/timing$/);
+    if (timing) {
+      return json({
+        session_id: decodeURIComponent(timing[1]),
+        total_duration_ms: 0,
+        tool_duration_ms: 0,
+        turn_count: 0,
+        tool_call_count: 0,
+        subagent_count: 0,
+        slowest_call: null,
+      });
+    }
+
+    const activity = path.match(/^\/api\/v1\/sessions\/([^/]+)\/activity$/);
+    if (activity) {
+      return json({ buckets: [], interval_seconds: 60, total_messages: 0 });
     }
 
     return errorJSON(404, "not found");
