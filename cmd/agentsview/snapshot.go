@@ -14,6 +14,7 @@ import (
 // ExportSnapshotConfig holds flags for the export-snapshot command.
 type ExportSnapshotConfig struct {
 	Out           string
+	View          string
 	FullProjects  []string
 	StatsProjects []string
 	AllStats      bool
@@ -25,16 +26,27 @@ func runExportSnapshot(cfg ExportSnapshotConfig) {
 		log.Fatalf("loading config: %v", err)
 	}
 
+	generatedAt := time.Now().UTC().Format(time.RFC3339)
+	opts := snapshot.Options{
+		FullProjects:  cfg.FullProjects,
+		StatsProjects: cfg.StatsProjects,
+		AllStats:      cfg.AllStats,
+		GeneratedAt:   generatedAt,
+	}
+	// A --view config file overrides the tier flags.
+	if cfg.View != "" {
+		v, err := snapshot.LoadViewConfig(cfg.View)
+		if err != nil {
+			log.Fatalf("export-snapshot: %v", err)
+		}
+		opts = v.Options(generatedAt)
+	}
+
 	m, err := snapshot.Export(
 		context.Background(),
 		appCfg.DBPath,
 		cfg.Out,
-		snapshot.Options{
-			FullProjects:  cfg.FullProjects,
-			StatsProjects: cfg.StatsProjects,
-			AllStats:      cfg.AllStats,
-			GeneratedAt:   time.Now().UTC().Format(time.RFC3339),
-		},
+		opts,
 	)
 	if err != nil {
 		log.Fatalf("export-snapshot: %v", err)

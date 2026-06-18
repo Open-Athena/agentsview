@@ -510,6 +510,9 @@ export default {
     if (path === "/api/v1/messages/longest") {
       return handleAnalytics(env, "messages/longest");
     }
+    if (path === "/api/v1/view/meta") {
+      return handleAnalytics(env, "view/meta");
+    }
 
     const sess = path.match(/^\/api\/v1\/sessions\/([^/]+)$/);
     if (sess) return handleSession(env, decodeURIComponent(sess[1]));

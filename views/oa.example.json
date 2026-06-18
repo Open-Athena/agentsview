@@ -1,0 +1,14 @@
+{
+  "name": "oa",
+  "title": "OA agent activity",
+  "full": [
+    "oa/tomato",
+    "oa/elvis"
+  ],
+  "stats": [
+    "personal/budget"
+  ],
+  "blurbs": {
+    "personal/budget": "Personal budgeting tool — aggregate stats only, no session content."
+  }
+}

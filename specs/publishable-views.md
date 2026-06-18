@@ -151,7 +151,15 @@ Reuse existing pieces: `export-snapshot`, the bound-param loader, the
   aggregates render. Still TODO in P1: per-project MD blurbs; FE handling of
   stats-only projects (no drill-down).
 - **P2 — View configs** (`views/<name>.json`) + `agentsview publish <view>`
-  scaffolding (local/build half).
+  scaffolding (local/build half). **DONE (config + build half)**:
+  `ViewConfig` (name/title/full/stats/allStats/blurbs) loads via
+  `export-snapshot --view <file>` (overrides the tier flags). The export emits a
+  `view/meta` route (title, statsOnly flag, per-project blurbs) into
+  analytics_cache, served by the Worker at `/api/v1/view/meta` so a deployed view
+  is self-describing. Examples in `views/public.json` and `views/oa.example.json`.
+  TODO: the `agentsview publish <view>` deploy command (folds into P4); FE
+  consumption of `view/meta` (title banner, blurbs, disable drill-down when
+  statsOnly).
 - **P3 — Auth** (grants/sessions tables, token→cookie, ADMIN_SECRET, public
   flag) grafted onto the Worker.
 - **P4 — Infra orchestration**: provision D1 + upload assets + manage grants;

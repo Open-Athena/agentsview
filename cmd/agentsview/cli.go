@@ -270,6 +270,8 @@ func newExportSnapshotCommand() *cobra.Command {
 		"Full-tier project: data + analytics (repeatable)")
 	cmd.Flags().StringArrayVarP(&cfg.StatsProjects, "stats-project", "s", nil,
 		"Stats-tier project: analytics aggregates only (repeatable)")
+	cmd.Flags().StringVarP(&cfg.View, "view", "V", "",
+		"Load tiers/title/blurbs from a view config JSON file (overrides tier flags)")
 	_ = cmd.MarkFlagRequired("out")
 	return cmd
 }

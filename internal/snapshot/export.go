@@ -66,9 +66,23 @@ type Options struct {
 	// AllStats treats every non-full project as stats tier (the "public
 	// stats" view: aggregates for everything, raw prompts for nothing).
 	AllStats bool
+	// Title is a human-readable heading for the published view.
+	Title string
+	// Blurbs maps a project to a Markdown summary surfaced in the UI.
+	Blurbs map[string]string
 	// GeneratedAt is an RFC3339 timestamp stamped into the manifest. Passed
 	// in by the caller so the export stays deterministic/testable.
 	GeneratedAt string
+}
+
+// viewMeta is the published view's self-description, served by the Worker at
+// /api/v1/view/meta so the SPA knows its title, whether it's stats-only (no
+// drill-down), and any per-project Markdown blurbs.
+type viewMeta struct {
+	Title       string            `json:"title,omitempty"`
+	StatsOnly   bool              `json:"statsOnly"`
+	Blurbs      map[string]string `json:"blurbs,omitempty"`
+	GeneratedAt string            `json:"generatedAt"`
 }
 
 // Manifest summarizes an export; also written to manifest.json.
@@ -191,6 +205,22 @@ func Export(
 	if err != nil {
 		return nil, err
 	}
+
+	// view/meta: served by the Worker so the SPA knows the view's title,
+	// whether it has any drillable sessions, and per-project blurbs.
+	meta := viewMeta{
+		Title:       opts.Title,
+		StatsOnly:   sessionCount == 0,
+		Blurbs:      opts.Blurbs,
+		GeneratedAt: opts.GeneratedAt,
+	}
+	metaBody, err := json.Marshal(meta)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot: marshal view meta: %w", err)
+	}
+	analyticsRoutes = append(analyticsRoutes,
+		analyticsRoute{Route: "view/meta", Body: string(metaBody)})
+
 	if err := writeAnalyticsCache(
 		filepath.Join(outDir, "analytics_cache.ndjson"),
 		analyticsRoutes,

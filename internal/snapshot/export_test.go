@@ -143,7 +143,7 @@ func TestExportProjectScope(t *testing.T) {
 		SessionCount:    2,
 		MessageCount:    3,
 		ToolCallCount:   1,
-		AnalyticsRoutes: 13,
+		AnalyticsRoutes: 14,
 		Tables: []string{
 			"sessions", "messages", "tool_calls",
 			"messages_fts", "analytics_cache",
@@ -151,11 +151,11 @@ func TestExportProjectScope(t *testing.T) {
 	}, m)
 
 	// Precomputed routes, in emission order: aggregate routes first, then the
-	// session-detail routes (top-sessions, usage/top-sessions, messages/longest).
+	// session-detail routes, then the view/meta self-description.
 	assert.Equal(t, []string{
 		"summary", "activity", "heatmap", "projects", "hour-of-week",
 		"sessions", "tools", "velocity", "signals", "usage/summary",
-		"top-sessions", "usage/top-sessions", "messages/longest",
+		"top-sessions", "usage/top-sessions", "messages/longest", "view/meta",
 	}, readNDJSONIDs(t, filepath.Join(out, "analytics_cache.ndjson"), "route"))
 
 	// Sessions NDJSON: exactly the rolled-up set, deterministically ordered.
@@ -233,7 +233,7 @@ func TestExportAllStatsNoData(t *testing.T) {
 	assert.True(t, m.AllStats)
 	assert.Equal(t, 0, m.SessionCount, "no raw sessions exported")
 	assert.Equal(t, 0, m.MessageCount, "no raw messages exported")
-	assert.Equal(t, 13, m.AnalyticsRoutes, "analytics still precomputed")
+	assert.Equal(t, 14, m.AnalyticsRoutes, "analytics still precomputed")
 	assert.Empty(t,
 		readNDJSONIDs(t, filepath.Join(out, "sessions.ndjson"), "id"),
 		"sessions.ndjson must be empty")
@@ -251,4 +251,50 @@ func TestExportAllStatsNoData(t *testing.T) {
 	// Aggregate cost is still present.
 	assert.Contains(t, routeBody(t, cache, "usage/summary"), "totalCost",
 		"aggregate cost is preserved")
+}
+
+func TestViewConfigExport(t *testing.T) {
+	src := seedSource(t)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "public.json")
+	require.NoError(t, os.WriteFile(cfgPath, []byte(`{
+		"name": "public",
+		"title": "All projects (public)",
+		"allStats": true,
+		"blurbs": {"alpha": "Alpha **summary**."}
+	}`), 0o644), "write view config")
+
+	vc, err := LoadViewConfig(cfgPath)
+	require.NoError(t, err, "LoadViewConfig")
+	assert.Equal(t, "public", vc.Name)
+
+	out := filepath.Join(dir, "snap")
+	m, err := Export(context.Background(), src, out,
+		vc.Options("2026-06-18T00:00:00Z"))
+	require.NoError(t, err, "Export (view)")
+	assert.True(t, m.AllStats)
+	assert.Equal(t, 0, m.SessionCount, "all-stats: no raw sessions")
+
+	// view/meta carries the title, statsOnly flag, and per-project blurbs.
+	var meta map[string]any
+	require.NoError(t, json.Unmarshal(
+		[]byte(routeBody(t, filepath.Join(out, "analytics_cache.ndjson"), "view/meta")),
+		&meta), "parse view/meta")
+	assert.Equal(t, "All projects (public)", meta["title"])
+	assert.Equal(t, true, meta["statsOnly"])
+	blurbs, _ := meta["blurbs"].(map[string]any)
+	assert.Equal(t, "Alpha **summary**.", blurbs["alpha"])
+}
+
+func TestLoadViewConfigErrors(t *testing.T) {
+	dir := t.TempDir()
+	missingName := filepath.Join(dir, "a.json")
+	require.NoError(t, os.WriteFile(missingName, []byte(`{"allStats": true}`), 0o644))
+	_, err := LoadViewConfig(missingName)
+	assert.ErrorContains(t, err, "name is required")
+
+	unknownField := filepath.Join(dir, "b.json")
+	require.NoError(t, os.WriteFile(unknownField, []byte(`{"name":"x","bogus":1}`), 0o644))
+	_, err = LoadViewConfig(unknownField)
+	require.Error(t, err, "unknown field should error")
 }
