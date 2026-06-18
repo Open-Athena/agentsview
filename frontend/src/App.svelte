@@ -31,6 +31,7 @@
   import { starred } from "./lib/stores/starred.svelte.js";
   import { pins } from "./lib/stores/pins.svelte.js";
   import { settings } from "./lib/stores/settings.svelte.js";
+  import { viewMeta } from "./lib/stores/viewMeta.svelte.js";
   import { setAuthToken, getAuthToken, setServerUrl, getBase } from "./lib/api/client.js";
   import { setupVisibilityHealthCheck } from "./lib/utils/health.js";
   import { registerShortcuts } from "./lib/utils/keyboard.js";
@@ -364,6 +365,7 @@
 
   onMount(() => {
     globalAuthToken = getAuthToken();
+    viewMeta.load();
     settings.load();
     starred.load();
     sync.loadStatus();

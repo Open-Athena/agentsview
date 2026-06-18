@@ -312,6 +312,18 @@ export function getVersion(): Promise<VersionInfo> {
   return fetchJSON("/version");
 }
 
+/** Published-snapshot self-description (title, stats-only, project blurbs). */
+export interface ViewMeta {
+  title?: string;
+  statsOnly: boolean;
+  blurbs?: Record<string, string>;
+  generatedAt: string;
+}
+
+export function getViewMeta(): Promise<ViewMeta> {
+  return fetchJSON("/view/meta");
+}
+
 export function checkForUpdate(): Promise<UpdateCheck> {
   return fetchJSON("/update/check");
 }
