@@ -89,6 +89,26 @@ func readNDJSONIDs(t *testing.T, path, idField string) []string {
 	return ids
 }
 
+// routeBody returns the JSON body of one precomputed analytics_cache route.
+func routeBody(t *testing.T, path, route string) string {
+	t.Helper()
+	f, err := os.Open(path)
+	require.NoError(t, err, "open %s", path)
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 1<<20), 1<<24)
+	for sc.Scan() {
+		var obj map[string]any
+		require.NoError(t, json.Unmarshal(sc.Bytes(), &obj), "parse cache line")
+		if obj["route"] == route {
+			body, _ := obj["body"].(string)
+			return body
+		}
+	}
+	t.Fatalf("route %q not found in %s", route, path)
+	return ""
+}
+
 var createObjectRe = regexp.MustCompile(
 	`CREATE (?:VIRTUAL TABLE|TABLE|TRIGGER)(?: IF NOT EXISTS)? "?([a-z_]+)"?`,
 )
@@ -130,11 +150,12 @@ func TestExportProjectScope(t *testing.T) {
 		},
 	}, m)
 
-	// Precomputed dashboard + usage routes, in emission order.
+	// Precomputed routes, in emission order: aggregate routes first, then the
+	// session-detail routes (top-sessions, usage/top-sessions, messages/longest).
 	assert.Equal(t, []string{
 		"summary", "activity", "heatmap", "projects", "hour-of-week",
-		"sessions", "tools", "velocity", "top-sessions", "signals",
-		"usage/summary", "usage/top-sessions", "messages/longest",
+		"sessions", "tools", "velocity", "signals", "usage/summary",
+		"top-sessions", "usage/top-sessions", "messages/longest",
 	}, readNDJSONIDs(t, filepath.Join(out, "analytics_cache.ndjson"), "route"))
 
 	// Sessions NDJSON: exactly the rolled-up set, deterministically ordered.
@@ -216,4 +237,18 @@ func TestExportAllStatsNoData(t *testing.T) {
 	assert.Empty(t,
 		readNDJSONIDs(t, filepath.Join(out, "sessions.ndjson"), "id"),
 		"sessions.ndjson must be empty")
+
+	// Session-detail routes must carry no session-level content (names,
+	// first-messages, prompts) in a stats-only export.
+	cache := filepath.Join(out, "analytics_cache.ndjson")
+	for _, route := range []string{"messages/longest", "usage/top-sessions"} {
+		var entries []any
+		require.NoError(t,
+			json.Unmarshal([]byte(routeBody(t, cache, route)), &entries),
+			"parse %s", route)
+		assert.Empty(t, entries, "%s must have no session-level entries", route)
+	}
+	// Aggregate cost is still present.
+	assert.Contains(t, routeBody(t, cache, "usage/summary"), "totalCost",
+		"aggregate cost is preserved")
 }

@@ -35,29 +35,19 @@ type analyticsRoute struct {
 func precomputeAnalytics(
 	ctx context.Context,
 	srcPath string,
-	ids []string,
+	analyticsIDs, dataIDs []string,
 ) ([]analyticsRoute, error) {
-	tmpDir, err := os.MkdirTemp("", "agentsview-snap-analytics")
+	// Aggregate routes run over the analytics scope (full + stats tier).
+	aDB, aPath, aClean, err := openScopedTemp(ctx, srcPath, analyticsIDs)
 	if err != nil {
-		return nil, fmt.Errorf("snapshot: temp dir: %w", err)
-	}
-	defer os.RemoveAll(tmpDir)
-	tmpPath := filepath.Join(tmpDir, "analytics.db")
-
-	if err := copySnapshotSubset(ctx, tmpPath, srcPath, ids); err != nil {
 		return nil, err
 	}
-
-	tdb, err := db.Open(tmpPath)
-	if err != nil {
-		return nil, fmt.Errorf("snapshot: open analytics db: %w", err)
-	}
-	defer tdb.Close()
+	defer aClean()
 
 	// Bound the filter to the snapshot's data span. The calendar heatmap
 	// needs explicit From/To to build its grid (an empty range yields no
 	// entries); other panels are unaffected since the span covers all data.
-	from, to, err := snapshotDateRange(ctx, tmpPath)
+	from, to, err := snapshotDateRange(ctx, aPath)
 	if err != nil {
 		return nil, err
 	}
@@ -84,49 +74,47 @@ func precomputeAnalytics(
 		return nil
 	}
 
-	summary, err := tdb.GetAnalyticsSummary(ctx, f)
+	// --- Aggregate routes: no session-level identifying content, so they
+	// safely span full + stats-tier projects. ---
+	summary, err := aDB.GetAnalyticsSummary(ctx, f)
 	if err := add("summary", summary, err); err != nil {
 		return nil, err
 	}
-	activity, err := tdb.GetAnalyticsActivity(ctx, f, "day")
+	activity, err := aDB.GetAnalyticsActivity(ctx, f, "day")
 	if err := add("activity", activity, err); err != nil {
 		return nil, err
 	}
-	heatmap, err := tdb.GetAnalyticsHeatmap(ctx, f, "messages")
+	heatmap, err := aDB.GetAnalyticsHeatmap(ctx, f, "messages")
 	if err := add("heatmap", heatmap, err); err != nil {
 		return nil, err
 	}
-	projects, err := tdb.GetAnalyticsProjects(ctx, f)
+	projects, err := aDB.GetAnalyticsProjects(ctx, f)
 	if err := add("projects", projects, err); err != nil {
 		return nil, err
 	}
-	how, err := tdb.GetAnalyticsHourOfWeek(ctx, f)
+	how, err := aDB.GetAnalyticsHourOfWeek(ctx, f)
 	if err := add("hour-of-week", how, err); err != nil {
 		return nil, err
 	}
-	shape, err := tdb.GetAnalyticsSessionShape(ctx, f)
+	shape, err := aDB.GetAnalyticsSessionShape(ctx, f)
 	if err := add("sessions", shape, err); err != nil {
 		return nil, err
 	}
-	tools, err := tdb.GetAnalyticsTools(ctx, f)
+	tools, err := aDB.GetAnalyticsTools(ctx, f)
 	if err := add("tools", tools, err); err != nil {
 		return nil, err
 	}
-	velocity, err := tdb.GetAnalyticsVelocity(ctx, f)
+	velocity, err := aDB.GetAnalyticsVelocity(ctx, f)
 	if err := add("velocity", velocity, err); err != nil {
 		return nil, err
 	}
-	top, err := tdb.GetAnalyticsTopSessions(ctx, f, "messages")
-	if err := add("top-sessions", top, err); err != nil {
-		return nil, err
-	}
-	signals, err := tdb.GetAnalyticsSignals(ctx, f)
+	signals, err := aDB.GetAnalyticsSignals(ctx, f)
 	if err := add("signals", signals, err); err != nil {
 		return nil, err
 	}
-
-	// Usage/cost panels. Usage defaults differ from analytics: include
-	// one-shot, exclude automated, with per-day breakdowns.
+	// Usage defaults differ: include one-shot, exclude automated, per-day
+	// breakdowns. usage/summary is aggregate (totals + per-project/model/agent
+	// breakdowns), no session names.
 	uf := db.UsageFilter{
 		Timezone:         analyticsTZ,
 		From:             from,
@@ -134,21 +122,67 @@ func precomputeAnalytics(
 		ExcludeAutomated: true,
 		Breakdowns:       true,
 	}
-	usageSummary, err := server.BuildUsageSummary(ctx, tdb, uf)
+	usageSummary, err := server.BuildUsageSummary(ctx, aDB, uf)
 	if err := add("usage/summary", usageSummary, err); err != nil {
+		return nil, err
+	}
+
+	// --- Session-detail routes expose session names/first-messages/prompts.
+	// They must cover only the data scope (full tier); for a stats-only
+	// project the underlying sessions are absent here, so nothing leaks. ---
+	dDB := aDB
+	if len(dataIDs) != len(analyticsIDs) { // dataIDs is always a subset
+		var dClean func()
+		dDB, _, dClean, err = openScopedTemp(ctx, srcPath, dataIDs)
+		if err != nil {
+			return nil, err
+		}
+		defer dClean()
+	}
+
+	top, err := dDB.GetAnalyticsTopSessions(ctx, f, "messages")
+	if err := add("top-sessions", top, err); err != nil {
 		return nil, err
 	}
 	ufTop := uf
 	ufTop.Breakdowns = false
-	topCost, err := tdb.GetTopSessionsByCost(ctx, ufTop, 20)
+	topCost, err := dDB.GetTopSessionsByCost(ctx, ufTop, 20)
 	if err := add("usage/top-sessions", topCost, err); err != nil {
 		return nil, err
 	}
-	longest, err := tdb.GetLongestUserPrompts(ctx, 50, "")
+	longest, err := dDB.GetLongestUserPrompts(ctx, 50, "")
 	if err := add("messages/longest", longest, err); err != nil {
 		return nil, err
 	}
 	return routes, nil
+}
+
+// openScopedTemp builds a temporary DB containing only the given sessions'
+// rows (via copySnapshotSubset) and opens it. The returned cleanup closes the
+// DB and removes the temp directory.
+func openScopedTemp(
+	ctx context.Context, srcPath string, ids []string,
+) (tdb *db.DB, tmpPath string, cleanup func(), err error) {
+	tmpDir, err := os.MkdirTemp("", "agentsview-snap-analytics")
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("snapshot: temp dir: %w", err)
+	}
+	cleanup = func() {
+		if tdb != nil {
+			tdb.Close()
+		}
+		os.RemoveAll(tmpDir)
+	}
+	tmpPath = filepath.Join(tmpDir, "analytics.db")
+	if err = copySnapshotSubset(ctx, tmpPath, srcPath, ids); err != nil {
+		cleanup()
+		return nil, "", nil, err
+	}
+	if tdb, err = db.Open(tmpPath); err != nil {
+		cleanup()
+		return nil, "", nil, fmt.Errorf("snapshot: open analytics db: %w", err)
+	}
+	return tdb, tmpPath, cleanup, nil
 }
 
 // snapshotDateRange returns the snapshot's data span as inclusive

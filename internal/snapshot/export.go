@@ -187,7 +187,7 @@ func Export(
 		return nil, fmt.Errorf("snapshot: dump tool_calls: %w", err)
 	}
 
-	analyticsRoutes, err := precomputeAnalytics(ctx, srcPath, analyticsIDs)
+	analyticsRoutes, err := precomputeAnalytics(ctx, srcPath, analyticsIDs, dataIDs)
 	if err != nil {
 		return nil, err
 	}

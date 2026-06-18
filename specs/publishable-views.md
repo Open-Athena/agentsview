@@ -142,8 +142,14 @@ Reuse existing pieces: `export-snapshot`, the bound-param loader, the
   (stats), `--all-stats` (everything stats); data NDJSON is written only for the
   full-tier data scope while analytics precompute runs over full+stats. Unit
   tests assert the redaction guarantee (stats/all-stats projects' sessions and
-  messages are absent from the exported data). Still TODO in P1: per-project MD
-  blurbs; FE handling of stats-only projects (no drill-down).
+  messages are absent from the exported data). **Also split the analytics
+  precompute**: aggregate routes (summary, cost totals, treemap, heatmaps) run
+  over full+stats scope, but the *session-detail* routes that carry session
+  names/first-messages/prompts (`top-sessions`, `usage/top-sessions`,
+  `messages/longest`) run over the *data* scope only — verified in-browser that a
+  public all-stats view shows "No sessions/prompts in range" while all cost
+  aggregates render. Still TODO in P1: per-project MD blurbs; FE handling of
+  stats-only projects (no drill-down).
 - **P2 — View configs** (`views/<name>.json`) + `agentsview publish <view>`
   scaffolding (local/build half).
 - **P3 — Auth** (grants/sessions tables, token→cookie, ADMIN_SECRET, public
