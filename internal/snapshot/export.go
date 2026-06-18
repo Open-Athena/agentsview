@@ -44,26 +44,80 @@ var ftsObjects = []string{
 	"messages_au",
 }
 
-// Options configures an export.
+// Options configures an export and its per-project exposure tiers.
+//
+// Tiers (see specs/publishable-views.md):
+//   - full  (FullProjects): sessions/messages/tool_calls are exported AND the
+//     project is counted in analytics/usage aggregates.
+//   - stats (StatsProjects, or all non-full when AllStats): counted in
+//     analytics/usage aggregates only — no raw sessions/messages reach the
+//     published data, so redacted prompts cannot leak.
+//   - excluded: any project named in neither tier (when any tier is set).
+//
+// With no tiers set at all, the export is a full, unfiltered dump (every
+// project is full tier).
 type Options struct {
-	// Projects to include. A session is selected if its project is in
-	// this set, or if it is a subagent whose parent session's project
-	// is in this set (honoring the usage-rollup semantics).
-	Projects []string
-	// GeneratedAt is an RFC3339 timestamp stamped into the manifest.
-	// Passed in by the caller so the export stays deterministic/testable.
+	// FullProjects get both data and analytics. A session is selected if its
+	// project is in the set, or it is a subagent whose parent's project is
+	// (honoring the usage-rollup semantics).
+	FullProjects []string
+	// StatsProjects contribute to analytics aggregates only.
+	StatsProjects []string
+	// AllStats treats every non-full project as stats tier (the "public
+	// stats" view: aggregates for everything, raw prompts for nothing).
+	AllStats bool
+	// GeneratedAt is an RFC3339 timestamp stamped into the manifest. Passed
+	// in by the caller so the export stays deterministic/testable.
 	GeneratedAt string
 }
 
 // Manifest summarizes an export; also written to manifest.json.
 type Manifest struct {
-	Projects        []string `json:"projects"`
+	FullProjects    []string `json:"fullProjects,omitempty"`
+	StatsProjects   []string `json:"statsProjects,omitempty"`
+	AllStats        bool     `json:"allStats,omitempty"`
 	GeneratedAt     string   `json:"generatedAt"`
 	SessionCount    int      `json:"sessionCount"`
 	MessageCount    int      `json:"messageCount"`
 	ToolCallCount   int      `json:"toolCallCount"`
 	AnalyticsRoutes int      `json:"analyticsRoutes"`
 	Tables          []string `json:"tables"`
+}
+
+// scope identifies a set of projects to select sessions for: all of them,
+// or a specific (possibly empty) list.
+type scope struct {
+	all      bool
+	projects []string
+}
+
+// resolveScopes derives the data scope (sessions/messages exported) and the
+// analytics scope (sessions counted in aggregates) from the tier options.
+func resolveScopes(opts Options) (data, analytics scope) {
+	if !opts.AllStats && len(opts.FullProjects) == 0 && len(opts.StatsProjects) == 0 {
+		return scope{all: true}, scope{all: true} // full unfiltered dump
+	}
+	if opts.AllStats {
+		// Everything in analytics; data only for explicit full projects.
+		return scope{projects: opts.FullProjects}, scope{all: true}
+	}
+	return scope{projects: opts.FullProjects},
+		scope{projects: unionProjects(opts.FullProjects, opts.StatsProjects)}
+}
+
+// unionProjects returns the de-duplicated, sorted union of two project lists.
+func unionProjects(a, b []string) []string {
+	seen := make(map[string]struct{}, len(a)+len(b))
+	var out []string
+	for _, p := range append(append([]string(nil), a...), b...) {
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Export reads a project-scoped slice of srcPath and writes the snapshot
@@ -89,7 +143,15 @@ func Export(
 		return nil, fmt.Errorf("snapshot: create out dir: %w", err)
 	}
 
-	ids, err := selectSessionIDs(ctx, src, opts.Projects)
+	dataScope, analyticsScope := resolveScopes(opts)
+
+	// Data scope: only full-tier sessions get raw content exported.
+	dataIDs, err := selectSessionIDs(ctx, src, dataScope)
+	if err != nil {
+		return nil, err
+	}
+	// Analytics scope: full + stats tier sessions feed the aggregates.
+	analyticsIDs, err := selectSessionIDs(ctx, src, analyticsScope)
 	if err != nil {
 		return nil, err
 	}
@@ -101,7 +163,7 @@ func Export(
 	sessionCount, err := dumpToFile(
 		ctx, src, filepath.Join(outDir, "sessions.ndjson"),
 		"SELECT * FROM sessions WHERE id IN (%s) ORDER BY id",
-		ids,
+		dataIDs,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot: dump sessions: %w", err)
@@ -110,7 +172,7 @@ func Export(
 	messageCount, err := dumpToFile(
 		ctx, src, filepath.Join(outDir, "messages.ndjson"),
 		"SELECT * FROM messages WHERE session_id IN (%s) ORDER BY session_id, ordinal",
-		ids,
+		dataIDs,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot: dump messages: %w", err)
@@ -119,13 +181,13 @@ func Export(
 	toolCallCount, err := dumpToFile(
 		ctx, src, filepath.Join(outDir, "tool_calls.ndjson"),
 		"SELECT * FROM tool_calls WHERE session_id IN (%s) ORDER BY session_id, id",
-		ids,
+		dataIDs,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot: dump tool_calls: %w", err)
 	}
 
-	analyticsRoutes, err := precomputeAnalytics(ctx, srcPath, ids)
+	analyticsRoutes, err := precomputeAnalytics(ctx, srcPath, analyticsIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -138,7 +200,9 @@ func Export(
 
 	tables := append(append([]string(nil), baseTables...), "messages_fts", "analytics_cache")
 	m := &Manifest{
-		Projects:        append([]string(nil), opts.Projects...),
+		FullProjects:    append([]string(nil), opts.FullProjects...),
+		StatsProjects:   append([]string(nil), opts.StatsProjects...),
+		AllStats:        opts.AllStats,
 		GeneratedAt:     opts.GeneratedAt,
 		SessionCount:    sessionCount,
 		MessageCount:    messageCount,
@@ -158,16 +222,20 @@ func Export(
 func selectSessionIDs(
 	ctx context.Context,
 	src *sql.DB,
-	projects []string,
+	sc scope,
 ) ([]string, error) {
+	if !sc.all && len(sc.projects) == 0 {
+		return nil, nil // empty scope selects no sessions
+	}
+
 	query := "SELECT id FROM sessions WHERE deleted_at IS NULL"
 	var args []any
-	if len(projects) > 0 {
-		ph := placeholders(len(projects))
-		for _, p := range projects {
+	if !sc.all {
+		ph := placeholders(len(sc.projects))
+		for _, p := range sc.projects {
 			args = append(args, p)
 		}
-		for _, p := range projects {
+		for _, p := range sc.projects {
 			args = append(args, p)
 		}
 		// Direct project members, plus subagent children whose parent is a

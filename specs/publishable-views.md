@@ -137,9 +137,13 @@ Reuse existing pieces: `export-snapshot`, the bound-param loader, the
 
 ## Phases
 
-- **P1 — Redaction tiers** in the exporter (full/stats-only/excluded; view
-  config; MD blurbs). Highest value + security-critical; unblocks the public
-  stats view.
+- **P1 — Redaction tiers** in the exporter (full/stats-only/excluded). **Exporter
+  half DONE**: `export-snapshot` takes `--project` (full), `--stats-project`
+  (stats), `--all-stats` (everything stats); data NDJSON is written only for the
+  full-tier data scope while analytics precompute runs over full+stats. Unit
+  tests assert the redaction guarantee (stats/all-stats projects' sessions and
+  messages are absent from the exported data). Still TODO in P1: per-project MD
+  blurbs; FE handling of stats-only projects (no drill-down).
 - **P2 — View configs** (`views/<name>.json`) + `agentsview publish <view>`
   scaffolding (local/build half).
 - **P3 — Auth** (grants/sessions tables, token→cookie, ADMIN_SECRET, public

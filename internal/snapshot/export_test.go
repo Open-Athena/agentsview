@@ -110,15 +110,15 @@ func TestExportProjectScope(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "snap")
 
 	m, err := Export(context.Background(), src, out, Options{
-		Projects:    []string{"alpha"},
-		GeneratedAt: "2026-06-17T00:00:00Z",
+		FullProjects: []string{"alpha"},
+		GeneratedAt:  "2026-06-17T00:00:00Z",
 	})
 	require.NoError(t, err, "Export")
 
 	// Manifest: s-main + s-sub (rollup), 3 messages total, 1 tool call,
-	// 10 precomputed analytics routes, s-other excluded.
+	// 13 precomputed routes, s-other excluded.
 	assert.Equal(t, &Manifest{
-		Projects:        []string{"alpha"},
+		FullProjects:    []string{"alpha"},
 		GeneratedAt:     "2026-06-17T00:00:00Z",
 		SessionCount:    2,
 		MessageCount:    3,
@@ -168,8 +168,52 @@ func TestExportAllProjects(t *testing.T) {
 	require.NoError(t, err, "Export (all)")
 	assert.Equal(t, 3, m.SessionCount, "all three sessions")
 	assert.Equal(t, 4, m.MessageCount, "all four messages")
-	assert.Empty(t, m.Projects, "no project scope recorded")
+	assert.Empty(t, m.FullProjects, "no project scope recorded")
 
 	assert.Equal(t, []string{"s-main", "s-other", "s-sub"},
 		readNDJSONIDs(t, filepath.Join(out, "sessions.ndjson"), "id"))
+}
+
+func TestExportStatsTierRedacted(t *testing.T) {
+	src := seedSource(t)
+	out := filepath.Join(t.TempDir(), "snap")
+
+	// alpha is full; gamma (s-other) is stats-only — its sessions/messages
+	// must NOT appear in the exported data, but it still feeds analytics.
+	m, err := Export(context.Background(), src, out, Options{
+		FullProjects:  []string{"alpha"},
+		StatsProjects: []string{"gamma"},
+		GeneratedAt:   "2026-06-17T00:00:00Z",
+	})
+	require.NoError(t, err, "Export (tiered)")
+	assert.Equal(t, []string{"alpha"}, m.FullProjects)
+	assert.Equal(t, []string{"gamma"}, m.StatsProjects)
+
+	// Data scope: only full-tier sessions (alpha + its subagent rollup).
+	// The stats-only gamma session (s-other) is redacted from raw data.
+	assert.Equal(t, []string{"s-main", "s-sub"},
+		readNDJSONIDs(t, filepath.Join(out, "sessions.ndjson"), "id"))
+	assert.NotContains(t,
+		readNDJSONIDs(t, filepath.Join(out, "messages.ndjson"), "session_id"),
+		"s-other", "redacted project's messages must be absent")
+}
+
+func TestExportAllStatsNoData(t *testing.T) {
+	src := seedSource(t)
+	out := filepath.Join(t.TempDir(), "snap")
+
+	// Public stats view: every project stats-only — analytics over all, but
+	// zero raw sessions/messages exported.
+	m, err := Export(context.Background(), src, out, Options{
+		AllStats:    true,
+		GeneratedAt: "2026-06-17T00:00:00Z",
+	})
+	require.NoError(t, err, "Export (all-stats)")
+	assert.True(t, m.AllStats)
+	assert.Equal(t, 0, m.SessionCount, "no raw sessions exported")
+	assert.Equal(t, 0, m.MessageCount, "no raw messages exported")
+	assert.Equal(t, 13, m.AnalyticsRoutes, "analytics still precomputed")
+	assert.Empty(t,
+		readNDJSONIDs(t, filepath.Join(out, "sessions.ndjson"), "id"),
+		"sessions.ndjson must be empty")
 }

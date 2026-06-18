@@ -244,13 +244,17 @@ func newImportCommand() *cobra.Command {
 func newExportSnapshotCommand() *cobra.Command {
 	var cfg ExportSnapshotConfig
 	cmd := &cobra.Command{
-		Use:   "export-snapshot -o <dir> [-p <project>...]",
+		Use:   "export-snapshot -o <dir> [-p <project>...] [-s <project>...] [-A]",
 		Short: "Export a snapshot for D1/Worker publishing",
 		Long: "Write a read-only slice of the database (schema.sql, NDJSON " +
 			"data, precomputed analytics, manifest.json) for loading into a " +
-			"Cloudflare D1 snapshot. With no --project, exports everything; " +
-			"--project (repeatable) restricts to those projects, rolling " +
-			"subagent sessions up into their parent's project.",
+			"Cloudflare D1 snapshot.\n\n" +
+			"Exposure tiers (see specs/publishable-views.md):\n" +
+			"  --project   full tier: sessions/messages exported + counted in analytics\n" +
+			"  --stats-project  stats tier: counted in analytics aggregates only\n" +
+			"  --all-stats every (non-full) project is stats tier (public stats view)\n\n" +
+			"With no flags, exports everything (all projects full). Subagent " +
+			"sessions roll up into their parent's project.",
 		GroupID:      groupData,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
@@ -258,10 +262,14 @@ func newExportSnapshotCommand() *cobra.Command {
 			runExportSnapshot(cfg)
 		},
 	}
+	cmd.Flags().BoolVarP(&cfg.AllStats, "all-stats", "A", false,
+		"Treat every non-full project as stats-only (no raw prompts)")
 	cmd.Flags().StringVarP(&cfg.Out, "out", "o", "",
 		"Output directory for snapshot artifacts")
-	cmd.Flags().StringArrayVarP(&cfg.Projects, "project", "p", nil,
-		"Project to include (repeatable; omit to export all)")
+	cmd.Flags().StringArrayVarP(&cfg.FullProjects, "project", "p", nil,
+		"Full-tier project: data + analytics (repeatable)")
+	cmd.Flags().StringArrayVarP(&cfg.StatsProjects, "stats-project", "s", nil,
+		"Stats-tier project: analytics aggregates only (repeatable)")
 	_ = cmd.MarkFlagRequired("out")
 	return cmd
 }
