@@ -32,6 +32,7 @@
   import { sessions } from "../../stores/sessions.svelte.js";
   import { sync } from "../../stores/sync.svelte.js";
   import { router } from "../../stores/router.svelte.js";
+  import { SNAPSHOT } from "../../utils/snapshot.js";
   import {
     downloadExport,
     getMarkdownExportUrl,
@@ -266,6 +267,7 @@
       <span class="nav-label">Sessions</span>
     </button>
 
+    {#if !SNAPSHOT}
     <button
       class="nav-btn"
       class:active={router.route === "usage"}
@@ -315,6 +317,7 @@
         </div>
       {/if}
     </div>
+    {/if}
   </div>
 
   <button

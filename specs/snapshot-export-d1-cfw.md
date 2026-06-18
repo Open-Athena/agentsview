@@ -248,9 +248,15 @@ means reads are unchanged).
     update-check/config.* and per-session timing/activity as static stubs. All
     on-load endpoints + assets return 200; deep-link client routes fall back to
     index.html. (Rendered-pixel check still pending — verify in browser.)
-  - **Next**: FE snapshot-mode polish (hide mutation/sync/SSE affordances;
-    landing on session-list instead of the analytics page that 404s in P1);
-    then P3 analytics/usage routes, then P4 deploy.
+  - FE snapshot mode (`VITE_SNAPSHOT=1` baked into the snapshot's dist build;
+    same `frontend/dist` source, Go-embedded build unaffected): lands on the
+    most-recent session instead of the analytics page (which 404s in P1),
+    suppresses the version-mismatch warning, and hides the Usage/More nav.
+    Verified in-browser against the awair snapshot: clean render, full
+    transcript, no console errors.
+  - **Next**: wire the dist build (`VITE_SNAPSHOT=1`) + `public/` copy into the
+    exporter/wrapper; then P3 analytics/usage routes (re-enable those tabs),
+    then P4 deploy to CF.
 - **P2 — FE snapshot mode**: flag + guards hiding mutations/SSE/auth.
 - **P3 — analytics/usage**: per the (a)/(b) decision; wire the remaining panels.
 - **P4 — DX**: one-command publish (`export-snapshot` + `wrangler deploy`),

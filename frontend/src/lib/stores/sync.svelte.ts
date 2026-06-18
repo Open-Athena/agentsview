@@ -7,6 +7,7 @@ import type {
   UpdateCheck,
 } from "../api/types.js";
 import type { SessionTiming } from "../api/types/timing.js";
+import { SNAPSHOT } from "../utils/snapshot.js";
 
 type SyncCompleteListener = () => void;
 
@@ -151,10 +152,11 @@ class SyncStore {
     try {
       this.serverVersion = await api.getVersion();
       this.markRemoteReachable(true);
-      this.versionMismatch = commitsDisagree(
-        this.buildCommit,
-        this.serverVersion.commit,
-      );
+      // A snapshot's version stub never matches the baked FE commit;
+      // there's no backend to reload against, so don't warn.
+      this.versionMismatch = SNAPSHOT
+        ? false
+        : commitsDisagree(this.buildCommit, this.serverVersion.commit);
     } catch (error) {
       this.markRemoteReachable(false);
       console.warn("Failed to load version info:", error);

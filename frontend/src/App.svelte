@@ -35,6 +35,7 @@
   import { setupVisibilityHealthCheck } from "./lib/utils/health.js";
   import { registerShortcuts } from "./lib/utils/keyboard.js";
   import { shouldAutoSwitchTranscriptModeToNormal } from "./lib/utils/transcript-mode.js";
+  import { SNAPSHOT } from "./lib/utils/snapshot.js";
 
   let globalAuthToken: string = $state("");
 
@@ -277,6 +278,24 @@
     });
   });
 
+  // Snapshot mode has no analytics backend, so the empty analytics
+  // landing is useless. Land on the most recent session instead (once,
+  // so the user can still deselect to browse the list).
+  let snapshotAutoSelected = false;
+  $effect(() => {
+    if (!SNAPSHOT) return;
+    const route = router.route;
+    const sid = router.sessionId;
+    const list = sessions.sessions;
+    untrack(() => {
+      if (snapshotAutoSelected) return;
+      if (route === "sessions" && !sid && list.length > 0) {
+        snapshotAutoSelected = true;
+        void sessions.navigateToSession(list[0]!.id);
+      }
+    });
+  });
+
   // Resolve msg=last once messages are loaded.
   $effect(() => {
     const pending = ui.pendingScrollOrdinal;
@@ -466,6 +485,10 @@
           onBack={() => sessions.deselectSession()}
         />
         <MessageList bind:this={messageListRef} />
+      {:else if SNAPSHOT}
+        <div class="snapshot-empty">
+          Select a session from the sidebar.
+        </div>
       {:else}
         <AnalyticsPage />
       {/if}
@@ -541,6 +564,15 @@
     flex: 1;
     min-height: 0;
     overflow-y: auto;
+  }
+
+  .snapshot-empty {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted);
+    font-size: 14px;
   }
 
 
