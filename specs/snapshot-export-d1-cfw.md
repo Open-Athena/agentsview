@@ -261,10 +261,18 @@ means reads are unchanged).
     (params ignored — frozen all-time view). FE snapshot mode lands on the
     dashboard again. Verified in-browser: tiles, both heatmaps, and Top Sessions
     render real data, no console errors.
+  - Usage/cost overview restored: extracted a shared `server.BuildUsageSummary`
+    (handler refactored to use it), exporter copies usage_events + model_pricing
+    into the temp DB (name-matched columns — `SELECT *` misaligned a
+    migration-appended pricing column) and precomputes usage/summary,
+    usage/top-sessions, messages/longest; Worker serves them; FE un-hides the
+    Usage tab. Verified in-browser: full Cost Over Time chart + Cost Attribution
+    treemap, all-time totalCost $27k across 86 projects (the live server 503s on
+    that same all-time query — the snapshot serves cost it can't).
   - **Next**: wire the `VITE_SNAPSHOT=1` dist build + `public/` copy into the
-    exporter/wrapper (one-command bundle); USAGE precompute (usage/summary,
-    usage/top-sessions, messages/longest — need usage_events + model_pricing in
-    the temp DB) to re-enable the Usage tab; then P4 deploy to CF.
+    exporter/wrapper (one-command bundle); make the loader robust to transient
+    non-JSON responses (analytics_cache load crashed once mid-bulk-load, fine on
+    retry); then P4 deploy to CF.
 - **P2 — FE snapshot mode**: flag + guards hiding mutations/SSE/auth.
 - **P3 — analytics/usage**: per the (a)/(b) decision; wire the remaining panels.
 - **P4 — DX**: one-command publish (`export-snapshot` + `wrangler deploy`),

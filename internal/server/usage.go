@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"sort"
@@ -317,6 +318,40 @@ func (s *Server) computeComparison(
 	return c
 }
 
+// BuildUsageSummary assembles the usage summary response (totals, daily
+// breakdowns, folded per-project/model/agent totals, session counts, and
+// cache stats) for a store and filter. It omits the period-over-period
+// comparison, which needs the HTTP request. Shared by the HTTP handler and
+// the snapshot exporter so both produce the identical shape.
+func BuildUsageSummary(
+	ctx context.Context, store db.Store, f db.UsageFilter,
+) (UsageSummaryResponse, error) {
+	result, err := store.GetDailyUsage(ctx, f)
+	if err != nil {
+		return UsageSummaryResponse{}, err
+	}
+
+	// Session counts don't use breakdowns.
+	scFilter := f
+	scFilter.Breakdowns = false
+	sessionCounts, err := store.GetUsageSessionCounts(ctx, scFilter)
+	if err != nil {
+		return UsageSummaryResponse{}, err
+	}
+
+	return UsageSummaryResponse{
+		From:          f.From,
+		To:            f.To,
+		Totals:        result.Totals,
+		Daily:         result.Daily,
+		ProjectTotals: foldProjectTotals(result.Daily),
+		ModelTotals:   foldModelTotals(result.Daily),
+		AgentTotals:   foldAgentTotals(result.Daily),
+		SessionCounts: sessionCounts,
+		CacheStats:    computeCacheStats(result.Totals),
+	}, nil
+}
+
 func (s *Server) handleUsageSummary(
 	w http.ResponseWriter, r *http.Request,
 ) {
@@ -325,9 +360,7 @@ func (s *Server) handleUsageSummary(
 		return
 	}
 
-	ctx := r.Context()
-
-	result, err := s.db.GetDailyUsage(ctx, f)
+	resp, err := BuildUsageSummary(r.Context(), s.db, f)
 	if err != nil {
 		if handleContextError(w, err) {
 			return
@@ -341,43 +374,9 @@ func (s *Server) handleUsageSummary(
 		return
 	}
 
-	// Session counts don't use breakdowns.
-	scFilter := f
-	scFilter.Breakdowns = false
-	sessionCounts, err := s.db.GetUsageSessionCounts(
-		ctx, scFilter,
+	resp.Comparison = s.computeComparison(
+		r, f, resp.Totals.TotalCost,
 	)
-	if err != nil {
-		if handleContextError(w, err) {
-			return
-		}
-		if handleReadOnly(w, err) {
-			return
-		}
-		log.Printf("usage session counts error: %v", err)
-		writeError(w, http.StatusInternalServerError,
-			"internal server error")
-		return
-	}
-
-	cacheStats := computeCacheStats(result.Totals)
-
-	comparison := s.computeComparison(
-		r, f, result.Totals.TotalCost,
-	)
-
-	resp := UsageSummaryResponse{
-		From:          f.From,
-		To:            f.To,
-		Totals:        result.Totals,
-		Daily:         result.Daily,
-		ProjectTotals: foldProjectTotals(result.Daily),
-		ModelTotals:   foldModelTotals(result.Daily),
-		AgentTotals:   foldAgentTotals(result.Daily),
-		SessionCounts: sessionCounts,
-		CacheStats:    cacheStats,
-		Comparison:    comparison,
-	}
 
 	writeJSON(w, http.StatusOK, resp)
 }

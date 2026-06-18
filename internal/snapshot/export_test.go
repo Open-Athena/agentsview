@@ -123,17 +123,18 @@ func TestExportProjectScope(t *testing.T) {
 		SessionCount:    2,
 		MessageCount:    3,
 		ToolCallCount:   1,
-		AnalyticsRoutes: 10,
+		AnalyticsRoutes: 13,
 		Tables: []string{
 			"sessions", "messages", "tool_calls",
 			"messages_fts", "analytics_cache",
 		},
 	}, m)
 
-	// Precomputed dashboard routes, in emission order.
+	// Precomputed dashboard + usage routes, in emission order.
 	assert.Equal(t, []string{
 		"summary", "activity", "heatmap", "projects", "hour-of-week",
 		"sessions", "tools", "velocity", "top-sessions", "signals",
+		"usage/summary", "usage/top-sessions", "messages/longest",
 	}, readNDJSONIDs(t, filepath.Join(out, "analytics_cache.ndjson"), "route"))
 
 	// Sessions NDJSON: exactly the rolled-up set, deterministically ordered.

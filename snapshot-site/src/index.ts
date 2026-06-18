@@ -500,6 +500,17 @@ export default {
     const analytics = path.match(/^\/api\/v1\/analytics\/([a-z-]+)$/);
     if (analytics) return handleAnalytics(env, analytics[1]);
 
+    // Usage/cost routes are precomputed under slash-keyed cache rows.
+    if (path === "/api/v1/usage/summary") {
+      return handleAnalytics(env, "usage/summary");
+    }
+    if (path === "/api/v1/usage/top-sessions") {
+      return handleAnalytics(env, "usage/top-sessions");
+    }
+    if (path === "/api/v1/messages/longest") {
+      return handleAnalytics(env, "messages/longest");
+    }
+
     const sess = path.match(/^\/api\/v1\/sessions\/([^/]+)$/);
     if (sess) return handleSession(env, decodeURIComponent(sess[1]));
 

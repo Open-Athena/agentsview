@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/server"
 )
 
 // analyticsTZ is the timezone used for day/hour bucketing in precomputed
@@ -122,6 +124,30 @@ func precomputeAnalytics(
 	if err := add("signals", signals, err); err != nil {
 		return nil, err
 	}
+
+	// Usage/cost panels. Usage defaults differ from analytics: include
+	// one-shot, exclude automated, with per-day breakdowns.
+	uf := db.UsageFilter{
+		Timezone:         analyticsTZ,
+		From:             from,
+		To:               to,
+		ExcludeAutomated: true,
+		Breakdowns:       true,
+	}
+	usageSummary, err := server.BuildUsageSummary(ctx, tdb, uf)
+	if err := add("usage/summary", usageSummary, err); err != nil {
+		return nil, err
+	}
+	ufTop := uf
+	ufTop.Breakdowns = false
+	topCost, err := tdb.GetTopSessionsByCost(ctx, ufTop, 20)
+	if err := add("usage/top-sessions", topCost, err); err != nil {
+		return nil, err
+	}
+	longest, err := tdb.GetLongestUserPrompts(ctx, 50, "")
+	if err := add("messages/longest", longest, err); err != nil {
+		return nil, err
+	}
 	return routes, nil
 }
 
@@ -195,19 +221,72 @@ func copySnapshotSubset(
 		}
 	}
 
+	// Copy by explicit, name-matched column lists (not SELECT *): the
+	// source's column order can differ from db.Open's current schema (e.g.
+	// migration-appended columns), which would misalign a positional copy.
 	copies := []struct{ table, key string }{
 		{"sessions", "id"},
 		{"messages", "session_id"},
 		{"tool_calls", "session_id"},
+		{"usage_events", "session_id"},
 	}
 	for _, c := range copies {
+		cols, err := tableColumns(ctx, raw, c.table)
+		if err != nil {
+			return err
+		}
 		q := fmt.Sprintf(
-			"INSERT INTO %s SELECT * FROM src.%s WHERE %s IN (SELECT id FROM _ids)",
-			c.table, c.table, c.key,
+			"INSERT INTO %s (%s) SELECT %s FROM src.%s WHERE %s IN (SELECT id FROM _ids)",
+			c.table, cols, cols, c.table, c.key,
 		)
 		if _, err := raw.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("snapshot: copy %s: %w", c.table, err)
 		}
 	}
+
+	// model_pricing is a small global table (no session scope); copy it in
+	// full so usage cost computations use the source's synced rates,
+	// replacing any defaults db.Open may have seeded.
+	pricingCols, err := tableColumns(ctx, raw, "model_pricing")
+	if err != nil {
+		return err
+	}
+	if _, err := raw.ExecContext(ctx, "DELETE FROM model_pricing"); err != nil {
+		return fmt.Errorf("snapshot: clear model_pricing: %w", err)
+	}
+	if _, err := raw.ExecContext(ctx, fmt.Sprintf(
+		"INSERT INTO model_pricing (%s) SELECT %s FROM src.model_pricing",
+		pricingCols, pricingCols,
+	)); err != nil {
+		return fmt.Errorf("snapshot: copy model_pricing: %w", err)
+	}
 	return nil
+}
+
+// tableColumns returns table's column names as a quoted, comma-separated
+// list (e.g. `"a", "b"`) for use in INSERT/SELECT, read from the local DB
+// so the copy is matched by name rather than position.
+func tableColumns(ctx context.Context, raw *sql.DB, table string) (string, error) {
+	rows, err := raw.QueryContext(
+		ctx, fmt.Sprintf("PRAGMA table_info(%s)", table),
+	)
+	if err != nil {
+		return "", fmt.Errorf("snapshot: columns for %s: %w", table, err)
+	}
+	defer rows.Close()
+
+	var cols []string
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return "", err
+		}
+		cols = append(cols, `"`+name+`"`)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	return strings.Join(cols, ", "), nil
 }

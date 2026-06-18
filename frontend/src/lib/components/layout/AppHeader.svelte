@@ -267,7 +267,6 @@
       <span class="nav-label">Sessions</span>
     </button>
 
-    {#if !SNAPSHOT}
     <button
       class="nav-btn"
       class:active={router.route === "usage"}
@@ -279,6 +278,7 @@
       <span class="nav-label">Usage</span>
     </button>
 
+    {#if !SNAPSHOT}
     <div class="more-wrap">
       <button
         class="nav-btn"
