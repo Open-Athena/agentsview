@@ -73,9 +73,7 @@ func Export(
 	srcPath, outDir string,
 	opts Options,
 ) (*Manifest, error) {
-	if len(opts.Projects) == 0 {
-		return nil, fmt.Errorf("snapshot: at least one project is required")
-	}
+	// No projects means a full, unfiltered export (all sessions).
 
 	dsn := fmt.Sprintf("file:%s?mode=ro&_busy_timeout=5000", srcPath)
 	src, err := sql.Open("sqlite3", dsn)
@@ -162,23 +160,28 @@ func selectSessionIDs(
 	src *sql.DB,
 	projects []string,
 ) ([]string, error) {
-	ph := placeholders(len(projects))
-	args := make([]any, 0, len(projects)*2)
-	for _, p := range projects {
-		args = append(args, p)
+	query := "SELECT id FROM sessions WHERE deleted_at IS NULL"
+	var args []any
+	if len(projects) > 0 {
+		ph := placeholders(len(projects))
+		for _, p := range projects {
+			args = append(args, p)
+		}
+		for _, p := range projects {
+			args = append(args, p)
+		}
+		// Direct project members, plus subagent children whose parent is a
+		// member (honoring the usage-rollup semantics).
+		query = fmt.Sprintf(`
+			SELECT id FROM sessions
+			  WHERE deleted_at IS NULL AND project IN (%s)
+			UNION
+			SELECT s.id FROM sessions s
+			  JOIN sessions p ON s.parent_session_id = p.id
+			  WHERE s.deleted_at IS NULL
+			    AND s.relationship_type = 'subagent'
+			    AND p.project IN (%s)`, ph, ph)
 	}
-	for _, p := range projects {
-		args = append(args, p)
-	}
-	query := fmt.Sprintf(`
-		SELECT id FROM sessions
-		  WHERE deleted_at IS NULL AND project IN (%s)
-		UNION
-		SELECT s.id FROM sessions s
-		  JOIN sessions p ON s.parent_session_id = p.id
-		  WHERE s.deleted_at IS NULL
-		    AND s.relationship_type = 'subagent'
-		    AND p.project IN (%s)`, ph, ph)
 
 	rows, err := src.QueryContext(ctx, query, args...)
 	if err != nil {

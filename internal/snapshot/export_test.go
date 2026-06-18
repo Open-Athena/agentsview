@@ -156,10 +156,19 @@ func TestExportProjectScope(t *testing.T) {
 	}, schemaObjects(t, filepath.Join(out, "schema.sql")))
 }
 
-func TestExportRequiresProject(t *testing.T) {
+func TestExportAllProjects(t *testing.T) {
 	src := seedSource(t)
 	out := filepath.Join(t.TempDir(), "snap")
-	_, err := Export(context.Background(), src, out, Options{})
-	require.Error(t, err, "expected error with no projects")
-	assert.ErrorContains(t, err, "at least one project")
+
+	// No projects => full, unfiltered export of every session.
+	m, err := Export(context.Background(), src, out, Options{
+		GeneratedAt: "2026-06-17T00:00:00Z",
+	})
+	require.NoError(t, err, "Export (all)")
+	assert.Equal(t, 3, m.SessionCount, "all three sessions")
+	assert.Equal(t, 4, m.MessageCount, "all four messages")
+	assert.Empty(t, m.Projects, "no project scope recorded")
+
+	assert.Equal(t, []string{"s-main", "s-other", "s-sub"},
+		readNDJSONIDs(t, filepath.Join(out, "sessions.ndjson"), "id"))
 }

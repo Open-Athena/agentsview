@@ -36,9 +36,13 @@ func runExportSnapshot(cfg ExportSnapshotConfig) {
 		log.Fatalf("export-snapshot: %v", err)
 	}
 
+	scope := "all"
+	if len(m.Projects) > 0 {
+		scope = fmt.Sprintf("%v", m.Projects)
+	}
 	fmt.Fprintf(
 		os.Stderr,
-		"Wrote snapshot to %s: %d sessions, %d messages (projects: %v)\n",
-		cfg.Out, m.SessionCount, m.MessageCount, m.Projects,
+		"Wrote snapshot to %s: %d sessions, %d messages (projects: %s)\n",
+		cfg.Out, m.SessionCount, m.MessageCount, scope,
 	)
 }

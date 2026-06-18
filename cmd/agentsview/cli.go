@@ -244,12 +244,13 @@ func newImportCommand() *cobra.Command {
 func newExportSnapshotCommand() *cobra.Command {
 	var cfg ExportSnapshotConfig
 	cmd := &cobra.Command{
-		Use:   "export-snapshot -o <dir> -p <project>...",
-		Short: "Export a project-scoped snapshot for D1/Worker publishing",
-		Long: "Write a read-only, project-scoped slice of the database " +
-			"(schema.sql, sessions.ndjson, messages.ndjson, manifest.json) " +
-			"for loading into a Cloudflare D1 snapshot. Subagent sessions " +
-			"roll up into their parent's project.",
+		Use:   "export-snapshot -o <dir> [-p <project>...]",
+		Short: "Export a snapshot for D1/Worker publishing",
+		Long: "Write a read-only slice of the database (schema.sql, NDJSON " +
+			"data, precomputed analytics, manifest.json) for loading into a " +
+			"Cloudflare D1 snapshot. With no --project, exports everything; " +
+			"--project (repeatable) restricts to those projects, rolling " +
+			"subagent sessions up into their parent's project.",
 		GroupID:      groupData,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
@@ -260,9 +261,8 @@ func newExportSnapshotCommand() *cobra.Command {
 	cmd.Flags().StringVarP(&cfg.Out, "out", "o", "",
 		"Output directory for snapshot artifacts")
 	cmd.Flags().StringArrayVarP(&cfg.Projects, "project", "p", nil,
-		"Project to include (repeatable)")
+		"Project to include (repeatable; omit to export all)")
 	_ = cmd.MarkFlagRequired("out")
-	_ = cmd.MarkFlagRequired("project")
 	return cmd
 }
 
