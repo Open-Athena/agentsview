@@ -280,12 +280,14 @@ async function handleAdminLoad(
 ): Promise<Response> {
   if (env.ALLOW_LOAD !== "1") return errorJSON(403, "load disabled");
   const table = url.searchParams.get("table");
-  if (
-    table !== "sessions" &&
-    table !== "messages" &&
-    table !== "tool_calls"
-  ) {
-    return errorJSON(400, "table must be sessions, messages, or tool_calls");
+  const LOADABLE = new Set([
+    "sessions",
+    "messages",
+    "tool_calls",
+    "analytics_cache",
+  ]);
+  if (!table || !LOADABLE.has(table)) {
+    return errorJSON(400, `table must be one of ${[...LOADABLE].join(", ")}`);
   }
 
   const text = await req.text();
@@ -362,6 +364,22 @@ async function handleStats(env: Env): Promise<Response> {
     project_count: row?.project_count ?? 0,
     machine_count: row?.machine_count ?? 0,
     earliest_session: row?.earliest_session ?? null,
+  });
+}
+
+// Serve a precomputed dashboard response verbatim. Snapshots freeze the
+// all-time view, so query params (date range, metric/granularity toggles)
+// are ignored — the precomputed default is returned.
+async function handleAnalytics(env: Env, routeKey: string): Promise<Response> {
+  const row = await env.DB.prepare(
+    "SELECT body FROM analytics_cache WHERE route = ?",
+  )
+    .bind(routeKey)
+    .first<{ body: string }>();
+  if (!row) return errorJSON(404, "analytics route not precomputed");
+  return new Response(row.body, {
+    status: 200,
+    headers: { "content-type": "application/json; charset=utf-8" },
   });
 }
 
@@ -478,6 +496,9 @@ export default {
     if (path === "/api/v1/agents") return handleAgents(env);
     if (path === "/api/v1/machines") return handleMachines(env);
     if (path === "/api/v1/stats") return handleStats(env);
+
+    const analytics = path.match(/^\/api\/v1\/analytics\/([a-z-]+)$/);
+    if (analytics) return handleAnalytics(env, analytics[1]);
 
     const sess = path.match(/^\/api\/v1\/sessions\/([^/]+)$/);
     if (sess) return handleSession(env, decodeURIComponent(sess[1]));

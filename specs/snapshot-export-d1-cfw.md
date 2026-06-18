@@ -254,9 +254,17 @@ means reads are unchanged).
     suppresses the version-mismatch warning, and hides the Usage/More nav.
     Verified in-browser against the awair snapshot: clean render, full
     transcript, no console errors.
-  - **Next**: wire the dist build (`VITE_SNAPSHOT=1`) + `public/` copy into the
-    exporter/wrapper; then P3 analytics/usage routes (re-enable those tabs),
-    then P4 deploy to CF.
+  - Analytics overview restored (P3, analytics half): the exporter precomputes
+    the dashboard panels into `analytics_cache` (temp-DB + real Store SQL,
+    all-time, dashboard default filters; heatmap bounded to the data span so its
+    calendar populates); the Worker serves them verbatim at `/api/v1/analytics/*`
+    (params ignored — frozen all-time view). FE snapshot mode lands on the
+    dashboard again. Verified in-browser: tiles, both heatmaps, and Top Sessions
+    render real data, no console errors.
+  - **Next**: wire the `VITE_SNAPSHOT=1` dist build + `public/` copy into the
+    exporter/wrapper (one-command bundle); USAGE precompute (usage/summary,
+    usage/top-sessions, messages/longest — need usage_events + model_pricing in
+    the temp DB) to re-enable the Usage tab; then P4 deploy to CF.
 - **P2 — FE snapshot mode**: flag + guards hiding mutations/SSE/auth.
 - **P3 — analytics/usage**: per the (a)/(b) decision; wire the remaining panels.
 - **P4 — DX**: one-command publish (`export-snapshot` + `wrangler deploy`),

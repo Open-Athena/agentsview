@@ -52,10 +52,20 @@ func precomputeAnalytics(
 	}
 	defer tdb.Close()
 
-	// Match the dashboard's defaults: all-time, exclude one-shot and
-	// automated sessions (the page only includes them when toggled on).
+	// Bound the filter to the snapshot's data span. The calendar heatmap
+	// needs explicit From/To to build its grid (an empty range yields no
+	// entries); other panels are unaffected since the span covers all data.
+	from, to, err := snapshotDateRange(ctx, tmpPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Match the dashboard's defaults: exclude one-shot and automated
+	// sessions (the page only includes them when toggled on).
 	f := db.AnalyticsFilter{
 		Timezone:         analyticsTZ,
+		From:             from,
+		To:               to,
 		ExcludeOneShot:   true,
 		ExcludeAutomated: true,
 	}
@@ -113,6 +123,30 @@ func precomputeAnalytics(
 		return nil, err
 	}
 	return routes, nil
+}
+
+// snapshotDateRange returns the snapshot's data span as inclusive
+// YYYY-MM-DD bounds (empty strings if there are no sessions).
+func snapshotDateRange(ctx context.Context, tmpPath string) (string, string, error) {
+	raw, err := sql.Open(
+		"sqlite3",
+		fmt.Sprintf("file:%s?mode=ro", tmpPath),
+	)
+	if err != nil {
+		return "", "", fmt.Errorf("snapshot: open for date range: %w", err)
+	}
+	defer raw.Close()
+
+	var from, to sql.NullString
+	err = raw.QueryRowContext(ctx, `
+		SELECT min(substr(started_at, 1, 10)),
+		       max(substr(COALESCE(ended_at, started_at), 1, 10))
+		  FROM sessions WHERE started_at IS NOT NULL`,
+	).Scan(&from, &to)
+	if err != nil {
+		return "", "", fmt.Errorf("snapshot: date range: %w", err)
+	}
+	return from.String, to.String, nil
 }
 
 // copySnapshotSubset creates a fresh DB at tmpPath (full schema via db.Open)

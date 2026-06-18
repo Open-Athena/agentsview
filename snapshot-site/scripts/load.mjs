@@ -18,7 +18,7 @@ if (!snapDir) {
   process.exit(1);
 }
 
-for (const table of ["sessions", "messages", "tool_calls"]) {
+for (const table of ["sessions", "messages", "tool_calls", "analytics_cache"]) {
   const body = readFileSync(join(snapDir, `${table}.ndjson`), "utf8");
   const res = await fetch(`${base}/admin/load?table=${table}`, {
     method: "POST",
