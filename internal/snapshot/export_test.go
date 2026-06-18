@@ -116,15 +116,25 @@ func TestExportProjectScope(t *testing.T) {
 	require.NoError(t, err, "Export")
 
 	// Manifest: s-main + s-sub (rollup), 3 messages total, 1 tool call,
-	// s-other excluded.
+	// 10 precomputed analytics routes, s-other excluded.
 	assert.Equal(t, &Manifest{
-		Projects:      []string{"alpha"},
-		GeneratedAt:   "2026-06-17T00:00:00Z",
-		SessionCount:  2,
-		MessageCount:  3,
-		ToolCallCount: 1,
-		Tables:        []string{"sessions", "messages", "tool_calls", "messages_fts"},
+		Projects:        []string{"alpha"},
+		GeneratedAt:     "2026-06-17T00:00:00Z",
+		SessionCount:    2,
+		MessageCount:    3,
+		ToolCallCount:   1,
+		AnalyticsRoutes: 10,
+		Tables: []string{
+			"sessions", "messages", "tool_calls",
+			"messages_fts", "analytics_cache",
+		},
 	}, m)
+
+	// Precomputed dashboard routes, in emission order.
+	assert.Equal(t, []string{
+		"summary", "activity", "heatmap", "projects", "hour-of-week",
+		"sessions", "tools", "velocity", "top-sessions", "signals",
+	}, readNDJSONIDs(t, filepath.Join(out, "analytics_cache.ndjson"), "route"))
 
 	// Sessions NDJSON: exactly the rolled-up set, deterministically ordered.
 	assert.Equal(t, []string{"s-main", "s-sub"},
@@ -138,10 +148,11 @@ func TestExportProjectScope(t *testing.T) {
 	assert.Equal(t, []string{"s-main"},
 		readNDJSONIDs(t, filepath.Join(out, "tool_calls.ndjson"), "session_id"))
 
-	// Schema: base tables (incl. tool_calls) + FTS virtual table and triggers.
+	// Schema: base tables (incl. tool_calls), the FTS virtual table and its
+	// triggers, and the snapshot-only analytics_cache.
 	assert.Equal(t, []string{
-		"messages", "messages_ad", "messages_ai", "messages_au",
-		"messages_fts", "sessions", "tool_calls",
+		"analytics_cache", "messages", "messages_ad", "messages_ai",
+		"messages_au", "messages_fts", "sessions", "tool_calls",
 	}, schemaObjects(t, filepath.Join(out, "schema.sql")))
 }
 

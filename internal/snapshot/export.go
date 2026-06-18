@@ -57,12 +57,13 @@ type Options struct {
 
 // Manifest summarizes an export; also written to manifest.json.
 type Manifest struct {
-	Projects      []string `json:"projects"`
-	GeneratedAt   string   `json:"generatedAt"`
-	SessionCount  int      `json:"sessionCount"`
-	MessageCount  int      `json:"messageCount"`
-	ToolCallCount int      `json:"toolCallCount"`
-	Tables        []string `json:"tables"`
+	Projects        []string `json:"projects"`
+	GeneratedAt     string   `json:"generatedAt"`
+	SessionCount    int      `json:"sessionCount"`
+	MessageCount    int      `json:"messageCount"`
+	ToolCallCount   int      `json:"toolCallCount"`
+	AnalyticsRoutes int      `json:"analyticsRoutes"`
+	Tables          []string `json:"tables"`
 }
 
 // Export reads a project-scoped slice of srcPath and writes the snapshot
@@ -126,13 +127,26 @@ func Export(
 		return nil, fmt.Errorf("snapshot: dump tool_calls: %w", err)
 	}
 
+	analyticsRoutes, err := precomputeAnalytics(ctx, srcPath, ids)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeAnalyticsCache(
+		filepath.Join(outDir, "analytics_cache.ndjson"),
+		analyticsRoutes,
+	); err != nil {
+		return nil, err
+	}
+
+	tables := append(append([]string(nil), baseTables...), "messages_fts", "analytics_cache")
 	m := &Manifest{
-		Projects:      append([]string(nil), opts.Projects...),
-		GeneratedAt:   opts.GeneratedAt,
-		SessionCount:  sessionCount,
-		MessageCount:  messageCount,
-		ToolCallCount: toolCallCount,
-		Tables:        append(append([]string(nil), baseTables...), "messages_fts"),
+		Projects:        append([]string(nil), opts.Projects...),
+		GeneratedAt:     opts.GeneratedAt,
+		SessionCount:    sessionCount,
+		MessageCount:    messageCount,
+		ToolCallCount:   toolCallCount,
+		AnalyticsRoutes: len(analyticsRoutes),
+		Tables:          tables,
 	}
 	if err := writeManifest(filepath.Join(outDir, "manifest.json"), m); err != nil {
 		return nil, err
@@ -214,6 +228,30 @@ func writeSchema(ctx context.Context, src *sql.DB, path string) error {
 			return fmt.Errorf("snapshot: read DDL for %q: %w", name, err)
 		}
 		if _, err := fmt.Fprintf(f, "%s;\n", strings.TrimSpace(ddl.String)); err != nil {
+			return err
+		}
+	}
+
+	// analytics_cache is snapshot-only (precomputed dashboard responses),
+	// so its DDL is emitted directly rather than read from sqlite_master.
+	if _, err := fmt.Fprintln(f,
+		"CREATE TABLE IF NOT EXISTS analytics_cache (route TEXT PRIMARY KEY, body TEXT NOT NULL);",
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
+// writeAnalyticsCache writes one NDJSON line per precomputed dashboard route.
+func writeAnalyticsCache(path string, routes []analyticsRoute) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	for _, r := range routes {
+		if err := enc.Encode(r); err != nil {
 			return err
 		}
 	}
