@@ -171,9 +171,9 @@ func TestExportProjectScope(t *testing.T) {
 		readNDJSONIDs(t, filepath.Join(out, "tool_calls.ndjson"), "session_id"))
 
 	// Schema: base tables (incl. tool_calls), the FTS virtual table and its
-	// triggers, and the snapshot-only analytics_cache.
+	// triggers, and the snapshot-only analytics_cache + grants tables.
 	assert.Equal(t, []string{
-		"analytics_cache", "messages", "messages_ad", "messages_ai",
+		"analytics_cache", "grants", "messages", "messages_ad", "messages_ai",
 		"messages_au", "messages_fts", "sessions", "tool_calls",
 	}, schemaObjects(t, filepath.Join(out, "schema.sql")))
 }

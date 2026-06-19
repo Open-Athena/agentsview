@@ -453,6 +453,67 @@ function snapshotStub(path: string): Response | null {
   }
 }
 
+// --- Auth: token-gated views ---------------------------------------------
+//
+// A gated view (view/meta.gated === true) requires a grant token on every
+// API read except view/meta. Tokens are minted by the local admin (never the
+// deployed Worker) and stored hashed in the `grants` table. The token arrives
+// as the `x-view-token` header or a `?t=` query param.
+
+let gatedCache: boolean | undefined;
+
+async function viewIsGated(env: Env): Promise<boolean> {
+  if (gatedCache !== undefined) return gatedCache;
+  const row = await env.DB.prepare(
+    "SELECT body FROM analytics_cache WHERE route = 'view/meta'",
+  ).first<{ body: string }>();
+  try {
+    gatedCache = JSON.parse(row?.body ?? "{}").gated === true;
+  } catch {
+    gatedCache = false;
+  }
+  return gatedCache;
+}
+
+async function sha256b64url(s: string): Promise<string> {
+  const buf = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(s),
+  );
+  let bin = "";
+  for (const b of new Uint8Array(buf)) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function tokenIsValid(env: Env, token: string): Promise<boolean> {
+  const hash = await sha256b64url(token);
+  const row = await env.DB.prepare(
+    `SELECT 1 FROM grants
+      WHERE token_hash = ? AND revoked_at IS NULL
+        AND (expires_at IS NULL OR expires_at > ?)`,
+  )
+    .bind(hash, new Date().toISOString())
+    .first();
+  return row !== null;
+}
+
+// enforceGate returns a 401 Response if the view is gated and the request
+// lacks a valid token, or null to allow the request.
+async function enforceGate(
+  req: Request,
+  env: Env,
+  url: URL,
+): Promise<Response | null> {
+  if (!(await viewIsGated(env))) return null;
+  const token =
+    req.headers.get("x-view-token") || url.searchParams.get("t") || "";
+  if (!token) return errorJSON(401, "this view requires an access token");
+  if (!(await tokenIsValid(env, token))) {
+    return errorJSON(401, "invalid or revoked access token");
+  }
+  return null;
+}
+
 function clampInt(
   raw: string | null,
   dflt: number,
@@ -482,6 +543,13 @@ export default {
     // serve the SPA shell for client-side routing.
     if (!path.startsWith("/api/")) {
       return env.ASSETS.fetch(new URL("/index.html", url.origin));
+    }
+
+    // Gated views require a valid grant token for every API read except
+    // view/meta (which the SPA needs to render the login prompt).
+    if (path !== "/api/v1/view/meta") {
+      const denied = await enforceGate(req, env, url);
+      if (denied) return denied;
     }
 
     const stub = snapshotStub(path);

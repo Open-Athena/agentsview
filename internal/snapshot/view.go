@@ -22,6 +22,9 @@ type ViewConfig struct {
 	Stats []string `json:"stats,omitempty"`
 	// AllStats treats every non-full project as stats tier (public view).
 	AllStats bool `json:"allStats,omitempty"`
+	// Access is "public" (default) or "token" (gated: a grant token is
+	// required to read anything beyond the view's metadata).
+	Access string `json:"access,omitempty"`
 	// Blurbs maps a project name to a Markdown summary, surfaced in the UI
 	// in lieu of (redacted) session content for stats-only projects.
 	Blurbs map[string]string `json:"blurbs,omitempty"`
@@ -46,6 +49,12 @@ func LoadViewConfig(path string) (*ViewConfig, error) {
 		return nil, fmt.Errorf(
 			"view config %s: allStats and stats are mutually exclusive", path)
 	}
+	switch v.Access {
+	case "", "public", "token":
+	default:
+		return nil, fmt.Errorf(
+			"view config %s: access must be \"public\" or \"token\"", path)
+	}
 	return &v, nil
 }
 
@@ -56,6 +65,7 @@ func (v *ViewConfig) Options(generatedAt string) Options {
 		FullProjects:  v.Full,
 		StatsProjects: v.Stats,
 		AllStats:      v.AllStats,
+		Gated:         v.Access == "token",
 		Title:         v.Title,
 		Blurbs:        v.Blurbs,
 		GeneratedAt:   generatedAt,

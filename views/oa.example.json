@@ -1,6 +1,7 @@
 {
   "name": "oa",
   "title": "OA agent activity",
+  "access": "token",
   "full": [
     "oa/tomato",
     "oa/elvis"

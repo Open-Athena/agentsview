@@ -66,6 +66,9 @@ type Options struct {
 	// AllStats treats every non-full project as stats tier (the "public
 	// stats" view: aggregates for everything, raw prompts for nothing).
 	AllStats bool
+	// Gated marks the view as token-required: the Worker serves only
+	// view/meta without a valid grant token.
+	Gated bool
 	// Title is a human-readable heading for the published view.
 	Title string
 	// Blurbs maps a project to a Markdown summary surfaced in the UI.
@@ -81,6 +84,7 @@ type Options struct {
 type viewMeta struct {
 	Title       string            `json:"title,omitempty"`
 	StatsOnly   bool              `json:"statsOnly"`
+	Gated       bool              `json:"gated"`
 	Blurbs      map[string]string `json:"blurbs,omitempty"`
 	GeneratedAt string            `json:"generatedAt"`
 }
@@ -211,6 +215,7 @@ func Export(
 	meta := viewMeta{
 		Title:       opts.Title,
 		StatsOnly:   sessionCount == 0,
+		Gated:       opts.Gated,
 		Blurbs:      opts.Blurbs,
 		GeneratedAt: opts.GeneratedAt,
 	}
@@ -337,6 +342,16 @@ func writeSchema(ctx context.Context, src *sql.DB, path string) error {
 	// so its DDL is emitted directly rather than read from sqlite_master.
 	if _, err := fmt.Fprintln(f,
 		"CREATE TABLE IF NOT EXISTS analytics_cache (route TEXT PRIMARY KEY, body TEXT NOT NULL);",
+	); err != nil {
+		return err
+	}
+	// grants gates a token-required view. Empty for public views; the local
+	// admin mints rows (hashed tokens) for gated ones. Never populated by the
+	// exporter — access control is minted separately, post-deploy.
+	if _, err := fmt.Fprintln(f,
+		"CREATE TABLE IF NOT EXISTS grants ("+
+			"id TEXT PRIMARY KEY, token_hash TEXT NOT NULL, name TEXT, "+
+			"created_at TEXT NOT NULL, expires_at TEXT, revoked_at TEXT);",
 	); err != nil {
 		return err
 	}

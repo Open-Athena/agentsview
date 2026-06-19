@@ -160,8 +160,17 @@ Reuse existing pieces: `export-snapshot`, the bound-param loader, the
   TODO: the `agentsview publish <view>` deploy command (folds into P4); FE
   consumption of `view/meta` (title banner, blurbs, disable drill-down when
   statsOnly).
-- **P3 — Auth** (grants/sessions tables, token→cookie, ADMIN_SECRET, public
-  flag) grafted onto the Worker.
+- **P3 — Auth** (capability tokens). **Core (P3a) DONE**: no admin secret —
+  admin is localhost-only and the deployed Worker has no mutation/admin surface.
+  A view config `"access": "token"` marks it gated (-> view/meta.gated). The
+  Worker gates every API read except view/meta behind a valid grant token
+  (`x-view-token` header or `?t=`), validated (hash, not revoked, not expired)
+  against a `grants` table in the view's D1. `scripts/mint-token.mjs` mints
+  tokens locally (hashes + inserts; plaintext shown once). Verified by curl:
+  meta public, data 401 without / with a bad token, 200 with a valid token.
+  **TODO (P3c, FE)**: resolve `?t=` -> scrub to localStorage -> send as header;
+  a "visible views" drawer of unlocked views (with monikers) to browse/switch;
+  a login prompt when gated + no token.
 - **P4 — Infra orchestration**: provision D1 + upload assets + manage grants;
   one-command publish.
 - **P5 — Org/tag theming.**
