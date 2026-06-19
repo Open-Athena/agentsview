@@ -2,6 +2,7 @@ import { mount } from "svelte";
 import App from "./App.svelte";
 import { resolveViewToken } from "./lib/utils/viewToken.js";
 import { SNAPSHOT } from "./lib/utils/snapshot.js";
+import { viewMeta } from "./lib/stores/viewMeta.svelte.js";
 import "./app.css";
 
 // Resolve a snapshot view's ?t= grant token before any component (and its
@@ -24,4 +25,11 @@ if (!target) {
   throw new Error("Root element 'app' not found. Cannot mount application.");
 }
 
-mount(App, { target });
+async function start(): Promise<void> {
+  // Load the view's metadata (title + org color theme) before mount in
+  // snapshot mode, so charts color projects by org on the first render.
+  if (SNAPSHOT) await viewMeta.load();
+  mount(App, { target: target! });
+}
+
+void start();

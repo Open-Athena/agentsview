@@ -73,6 +73,8 @@ type Options struct {
 	Title string
 	// Blurbs maps a project to a Markdown summary surfaced in the UI.
 	Blurbs map[string]string
+	// Orgs groups projects for color-coding (see OrgConfig).
+	Orgs []OrgConfig
 	// GeneratedAt is an RFC3339 timestamp stamped into the manifest. Passed
 	// in by the caller so the export stays deterministic/testable.
 	GeneratedAt string
@@ -86,6 +88,7 @@ type viewMeta struct {
 	StatsOnly   bool              `json:"statsOnly"`
 	Gated       bool              `json:"gated"`
 	Blurbs      map[string]string `json:"blurbs,omitempty"`
+	Orgs        []OrgConfig       `json:"orgs,omitempty"`
 	GeneratedAt string            `json:"generatedAt"`
 }
 
@@ -217,6 +220,7 @@ func Export(
 		StatsOnly:   sessionCount == 0,
 		Gated:       opts.Gated,
 		Blurbs:      opts.Blurbs,
+		Orgs:        opts.Orgs,
 		GeneratedAt: opts.GeneratedAt,
 	}
 	metaBody, err := json.Marshal(meta)

@@ -28,6 +28,16 @@ type ViewConfig struct {
 	// Blurbs maps a project name to a Markdown summary, surfaced in the UI
 	// in lieu of (redacted) session content for stats-only projects.
 	Blurbs map[string]string `json:"blurbs,omitempty"`
+	// Orgs groups projects by GitHub org / tag for color-coding: each org has
+	// a base color and its projects render as shades of it.
+	Orgs []OrgConfig `json:"orgs,omitempty"`
+}
+
+// OrgConfig colors a group of projects by a shared base color.
+type OrgConfig struct {
+	Name     string   `json:"name"`
+	Color    string   `json:"color"` // named (e.g. "orange") or "hN" hue
+	Projects []string `json:"projects"`
 }
 
 // LoadViewConfig reads and validates a view config JSON file.
@@ -68,6 +78,7 @@ func (v *ViewConfig) Options(generatedAt string) Options {
 		Gated:         v.Access == "token",
 		Title:         v.Title,
 		Blurbs:        v.Blurbs,
+		Orgs:          v.Orgs,
 		GeneratedAt:   generatedAt,
 	}
 }

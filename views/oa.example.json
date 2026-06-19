@@ -11,5 +11,9 @@
   ],
   "blurbs": {
     "personal/budget": "Personal budgeting tool — aggregate stats only, no session content."
-  }
+  },
+  "orgs": [
+    { "name": "OA", "color": "orange", "projects": ["oa/tomato", "oa/elvis"] },
+    { "name": "HCCS", "color": "green", "projects": ["personal/budget"] }
+  ]
 }

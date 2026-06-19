@@ -1,5 +1,6 @@
 import { getViewMeta, type ViewMeta } from "../api/client.js";
 import { SNAPSHOT } from "../utils/snapshot.js";
+import { setOrgTheme } from "../utils/projectColor.js";
 
 // Holds a published snapshot's self-description (served at /api/v1/view/meta).
 // Only loaded in snapshot mode; null otherwise.
@@ -11,6 +12,7 @@ class ViewMetaStore {
     try {
       this.meta = await getViewMeta();
       if (this.meta?.title) document.title = this.meta.title;
+      setOrgTheme(this.meta?.orgs);
     } catch {
       // Older snapshots / non-snapshot servers have no view/meta; ignore.
     }

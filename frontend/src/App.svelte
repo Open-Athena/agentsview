@@ -366,7 +366,6 @@
 
   onMount(() => {
     globalAuthToken = getAuthToken();
-    viewMeta.load();
     settings.load();
     starred.load();
     sync.loadStatus();

@@ -316,7 +316,9 @@ export function getVersion(): Promise<VersionInfo> {
 export interface ViewMeta {
   title?: string;
   statsOnly: boolean;
+  gated?: boolean;
   blurbs?: Record<string, string>;
+  orgs?: { name: string; color: string; projects: string[] }[];
   generatedAt: string;
 }
 
