@@ -135,6 +135,21 @@ Reuse existing pieces: `export-snapshot`, the bound-param loader, the
   `frontend/src/lib/utils/projectColor.ts` (added earlier on this branch) to be
   org-aware. Applies to the treemap, charts, and session list.
 
+## Testing
+
+- **Go unit tests** (`internal/snapshot`): exposure tiers + the redaction
+  guarantee (stats/all-stats sessions+messages absent from data; session-detail
+  routes empty), view configs.
+- **Snapshot e2e** (`make e2e-snapshot`, separate from the main app's `make
+  e2e`): `scripts/e2e-snapshot-server.sh` seeds a fixture, exports a *gated*
+  view, loads it into a local D1 (schema+data via SQL before the port opens, so
+  Playwright never races the load), mints a deterministic grant, and serves it
+  on :8799. `frontend/e2e-snapshot/auth.spec.ts` drives the browser: tokenless ->
+  private prompt; `?t=` -> loads + scrubs the URL; reload -> LS persistence;
+  bad token -> rejected. This run caught a **fail-open bug**: the Worker cached
+  `gated=false` on a transient missing-meta read — now fails closed (deny +
+  don't cache) when view/meta is unavailable.
+
 ## Phases
 
 - **P1 — Redaction tiers** in the exporter (full/stats-only/excluded). **Exporter

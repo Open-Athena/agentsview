@@ -467,10 +467,14 @@ async function viewIsGated(env: Env): Promise<boolean> {
   const row = await env.DB.prepare(
     "SELECT body FROM analytics_cache WHERE route = 'view/meta'",
   ).first<{ body: string }>();
+  // Fail closed: while view/meta is unavailable (e.g. data still loading)
+  // deny access and do NOT cache, so a transient miss can't permanently
+  // un-gate a private view. Only a successfully-read meta is cached.
+  if (!row) return true;
   try {
-    gatedCache = JSON.parse(row?.body ?? "{}").gated === true;
+    gatedCache = JSON.parse(row.body).gated === true;
   } catch {
-    gatedCache = false;
+    gatedCache = true;
   }
   return gatedCache;
 }

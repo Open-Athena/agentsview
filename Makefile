@@ -265,6 +265,10 @@ test-ssh-ci: ensure-embed-dir
 e2e:
 	cd frontend && npx playwright test
 
+# Snapshot/publishable-views e2e (exporter -> D1 -> Worker -> SPA)
+e2e-snapshot:
+	cd frontend && npm run e2e:snapshot
+
 # Vet
 vet: ensure-embed-dir
 	go vet -tags fts5 ./...
