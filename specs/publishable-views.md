@@ -191,8 +191,16 @@ Reuse existing pieces: `export-snapshot`, the bound-param loader, the
   -> private overlay; `?t=<token>` -> full dashboard, URL scrubbed, no errors.
   **TODO**: a "visible views" drawer of unlocked views (with monikers) to
   browse/switch — deferred until multi-view hosting (P4).
-- **P4 — Infra orchestration**: provision D1 + upload assets + manage grants;
-  one-command publish.
+- **P4 — Infra orchestration.** Dry-run DONE: `snapshot-site/scripts/publish.mjs
+  <view-config>` (`npm run publish`) builds a self-contained, reviewable deploy
+  bundle (`dist/publish/<name>/`): the exported snapshot, the SPA, the Worker
+  source, a generated `wrangler.jsonc` (D1 binding, NO ALLOW_LOAD — no ingestion
+  surface in prod), and a `deploy.sh` with the exact `wrangler d1 create /
+  execute / deploy` commands (conditional grant minting for gated views). It
+  provisions nothing — running `deploy.sh` is the resource-creating step. TODO:
+  the one-Worker/multi-D1 path-routing for `claude.rbw.sh/<view>`; a bound-param
+  loader for views with messages over the 100 KB inline-SQL limit; `--deploy`
+  to run it.
 - **P5 — Theming. DONE.** Dark-by-default for snapshots (ui store defaults to
   dark in SNAPSHOT mode; main.ts pre-applies the class before mount; explicit
   stored preference wins). Org/tag color-coding: a view config `orgs` field

@@ -10,7 +10,8 @@
     "load": "node scripts/load.mjs",
     "snapshot:local": "bash scripts/snapshot-local.sh",
     "parity": "node scripts/parity.mjs",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "publish": "node scripts/publish.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260617.1",
