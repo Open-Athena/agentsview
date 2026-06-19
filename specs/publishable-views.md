@@ -168,9 +168,14 @@ Reuse existing pieces: `export-snapshot`, the bound-param loader, the
   against a `grants` table in the view's D1. `scripts/mint-token.mjs` mints
   tokens locally (hashes + inserts; plaintext shown once). Verified by curl:
   meta public, data 401 without / with a bad token, 200 with a valid token.
-  **TODO (P3c, FE)**: resolve `?t=` -> scrub to localStorage -> send as header;
-  a "visible views" drawer of unlocked views (with monikers) to browse/switch;
-  a login prompt when gated + no token.
+  **P3c (FE) core DONE**: `resolveViewToken()` runs in main.ts before the app
+  mounts — moves `?t=` into the auth-token store (sent as `Authorization:
+  Bearer`, which the Worker now also accepts), scrubs it from the URL. The
+  existing auth overlay, re-skinned for snapshots ("This view is private — enter
+  your access token"), handles the tokenless case. Verified in-browser: no token
+  -> private overlay; `?t=<token>` -> full dashboard, URL scrubbed, no errors.
+  **TODO**: a "visible views" drawer of unlocked views (with monikers) to
+  browse/switch — deferred until multi-view hosting (P4).
 - **P4 — Infra orchestration**: provision D1 + upload assets + manage grants;
   one-command publish.
 - **P5 — Org/tag theming.**

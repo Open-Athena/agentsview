@@ -505,8 +505,13 @@ async function enforceGate(
   url: URL,
 ): Promise<Response | null> {
   if (!(await viewIsGated(env))) return null;
+  const auth = req.headers.get("authorization") ?? "";
+  const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : "";
   const token =
-    req.headers.get("x-view-token") || url.searchParams.get("t") || "";
+    req.headers.get("x-view-token") ||
+    bearer ||
+    url.searchParams.get("t") ||
+    "";
   if (!token) return errorJSON(401, "this view requires an access token");
   if (!(await tokenIsValid(env, token))) {
     return errorJSON(401, "invalid or revoked access token");

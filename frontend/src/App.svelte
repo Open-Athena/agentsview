@@ -32,6 +32,7 @@
   import { pins } from "./lib/stores/pins.svelte.js";
   import { settings } from "./lib/stores/settings.svelte.js";
   import { viewMeta } from "./lib/stores/viewMeta.svelte.js";
+  import { SNAPSHOT } from "./lib/utils/snapshot.js";
   import { setAuthToken, getAuthToken, setServerUrl, getBase } from "./lib/api/client.js";
   import { setupVisibilityHealthCheck } from "./lib/utils/health.js";
   import { registerShortcuts } from "./lib/utils/keyboard.js";
@@ -392,16 +393,22 @@
 {#if settings.needsAuth && router.route !== "settings"}
   <div class="auth-overlay">
     <div class="auth-card">
-      <h2 class="auth-card-title">Authentication Required</h2>
+      <h2 class="auth-card-title">
+        {SNAPSHOT ? (viewMeta.title ?? "Private view") : "Authentication Required"}
+      </h2>
       <p class="auth-card-desc">
-        This server requires an auth token to access. Enter the token
-        shown on the server's console or settings page.
+        {#if SNAPSHOT}
+          This view is private. Enter your access token to view it.
+        {:else}
+          This server requires an auth token to access. Enter the token
+          shown on the server's console or settings page.
+        {/if}
       </p>
       <div class="auth-card-field">
         <input
           class="auth-card-input"
           type="password"
-          placeholder="Paste auth token"
+          placeholder={SNAPSHOT ? "Paste access token" : "Paste auth token"}
           bind:value={globalAuthToken}
           onkeydown={(e) => { if (e.key === "Enter") handleGlobalAuth(); }}
         />
