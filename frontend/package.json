@@ -13,7 +13,8 @@
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "test": "vitest run",
     "e2e": "playwright test",
-    "e2e:snapshot": "playwright test -c playwright.snapshot.config.ts"
+    "e2e:snapshot": "playwright test -c playwright.snapshot.config.ts",
+    "e2e:snapshot-public": "playwright test -c playwright.snapshot-public.config.ts"
   },
   "dependencies": {
     "@lucide/svelte": "1.3.0",

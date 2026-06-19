@@ -267,7 +267,7 @@ e2e:
 
 # Snapshot/publishable-views e2e (exporter -> D1 -> Worker -> SPA)
 e2e-snapshot:
-	cd frontend && npm run e2e:snapshot
+	cd frontend && npm run e2e:snapshot && npm run e2e:snapshot-public
 
 # Vet
 vet: ensure-embed-dir
