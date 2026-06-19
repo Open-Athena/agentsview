@@ -3,6 +3,7 @@ import {
   SIDEBAR_WIDTH_KEY,
   clampStoredSidebarWidth,
 } from "../components/layout/sidebar-width.js";
+import { SNAPSHOT } from "../utils/snapshot.js";
 
 type Theme = "light" | "dark";
 export type MessageLayout = "default" | "compact" | "stream";
@@ -156,7 +157,9 @@ function readStoredBool(key: string, fallback: boolean): boolean {
   return fallback;
 }
 class UIStore {
-  theme: Theme = $state(readStoredTheme() || "light");
+  // Published snapshots default to dark; the local app stays light. An
+  // explicit stored preference always wins.
+  theme: Theme = $state(readStoredTheme() || (SNAPSHOT ? "dark" : "light"));
   sortNewestFirst: boolean = $state(false);
   messageLayout: MessageLayout = $state(readStoredLayout());
   transcriptMode: TranscriptMode = $state(

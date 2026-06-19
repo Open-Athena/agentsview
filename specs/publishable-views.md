@@ -193,7 +193,11 @@ Reuse existing pieces: `export-snapshot`, the bound-param loader, the
   browse/switch — deferred until multi-view hosting (P4).
 - **P4 — Infra orchestration**: provision D1 + upload assets + manage grants;
   one-command publish.
-- **P5 — Org/tag theming.**
+- **P5 — Theming.** Dark-by-default for snapshots DONE (ui store defaults to
+  dark in SNAPSHOT mode; main.ts pre-applies the class before mount to avoid a
+  flash; an explicit stored preference still wins). TODO: org/tag color-coding
+  (project -> org base hue + per-project shades), and an optional per-view
+  `theme` config field.
 
 A sensible first milestone: **P1 + a single public stats view deployed to
 `claude.rbw.sh/public`** (no auth) — proves redaction + remote hosting end to
