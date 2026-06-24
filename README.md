@@ -7,6 +7,31 @@ accounts, everything local.
   <img src="https://agentsview.io/screenshots/dashboard.png" alt="Analytics dashboard" width="720">
 </p>
 
+## About this fork
+
+This is [`runsascoded/agentsview`](https://github.com/runsascoded/agentsview), a
+fork of [`kenn-io/agentsview`](https://github.com/kenn-io/agentsview) that tracks
+upstream and adds:
+
+- **Publishable views** -- export a redacted, tiered snapshot of your sessions
+  (per project: full / stats-only / excluded) and host it on Cloudflare (D1 +
+  Worker), optionally gated behind capability tokens. Published views are served
+  under `claude.rbw.sh/<view>`. Redaction is enforced at export time, so a
+  stats-only project's raw prompts never leave your machine. See
+  [`specs/publishable-views.md`](specs/publishable-views.md).
+- **Analytics caching + per-project filtering** across the dashboard and usage
+  views.
+- **Dark mode by default** for published snapshots, with org/tag color-coding.
+
+The fork also leans on agentsview's "the database is a persistent archive"
+contract: synced sessions survive in the local DB even after the agent deletes
+the original source files, so a periodic sync is a durable backup of your
+session history.
+
+> The install methods below pull **upstream** release binaries, which do not
+> include these fork features -- build from source (`make build`) to get them.
+> Everything else in this README is upstream's documentation.
+
 ## Install
 
 ```bash
