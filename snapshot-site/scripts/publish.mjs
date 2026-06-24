@@ -94,9 +94,9 @@ cd "$(dirname "$0")"
 wrangler d1 create ${dbName}
 
 # 2. Load schema + data into the REMOTE D1.
-#    NOTE: data.sql uses inline INSERTs (fine for small/medium views). A view
-#    with messages over ~100 KB needs a bound-param loader instead (see
-#    specs/snapshot-export-d1-cfw.md, loader open question).
+#    data.sql chunks any oversized row (large analytics bodies / message content)
+#    into INSERT + 'col = col || ...' appends so every statement stays under
+#    D1's 100 KB limit (see scripts/ndjson-to-sql.mjs).
 wrangler d1 execute ${dbName} --remote --file snap/schema.sql
 wrangler d1 execute ${dbName} --remote --file data.sql
 ${gated ? `

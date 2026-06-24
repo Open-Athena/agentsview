@@ -197,10 +197,13 @@ Reuse existing pieces: `export-snapshot`, the bound-param loader, the
   source, a generated `wrangler.jsonc` (D1 binding, NO ALLOW_LOAD — no ingestion
   surface in prod), and a `deploy.sh` with the exact `wrangler d1 create /
   execute / deploy` commands (conditional grant minting for gated views). It
-  provisions nothing — running `deploy.sh` is the resource-creating step. TODO:
-  the one-Worker/multi-D1 path-routing for `claude.rbw.sh/<view>`; a bound-param
-  loader for views with messages over the 100 KB inline-SQL limit; `--deploy`
-  to run it.
+  provisions nothing — running `deploy.sh` is the resource-creating step. The
+  100 KB inline-SQL limit is handled: `ndjson-to-sql.mjs` chunks any oversized
+  row (large analytics bodies, message content) into INSERT + `col = col || ...`
+  appends, each statement under the limit, so `wrangler d1 execute --file` loads
+  it with no API token or Worker ingestion surface (verified byte-for-byte on the
+  public view's 258 KB `usage/summary` row). TODO: the one-Worker/multi-D1
+  path-routing for `claude.rbw.sh/<view>`; `--deploy` to run `deploy.sh`.
 - **P5 — Theming. DONE.** Dark-by-default for snapshots (ui store defaults to
   dark in SNAPSHOT mode; main.ts pre-applies the class before mount; explicit
   stored preference wins). Org/tag color-coding: a view config `orgs` field
