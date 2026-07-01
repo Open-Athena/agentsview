@@ -219,6 +219,107 @@ func TestExportStatsTierRedacted(t *testing.T) {
 		"s-other", "redacted project's messages must be absent")
 }
 
+// readNDJSONObjs returns each NDJSON line of path parsed into a map.
+func readNDJSONObjs(t *testing.T, path string) []map[string]any {
+	t.Helper()
+	f, err := os.Open(path)
+	require.NoError(t, err, "open %s", path)
+	defer f.Close()
+	var objs []map[string]any
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 1<<20), 1<<24)
+	for sc.Scan() {
+		var obj map[string]any
+		require.NoError(t, json.Unmarshal(sc.Bytes(), &obj), "parse ndjson")
+		objs = append(objs, obj)
+	}
+	require.NoError(t, sc.Err(), "scan %s", path)
+	return objs
+}
+
+// longestPromptSessionIDs parses the messages/longest route body (an array of
+// {session_id, ...}) and returns the session IDs whose prompts it surfaces.
+// This route sorts by content length, so it is independent of session
+// timestamps (unlike top-sessions, which the date-bounded filter would drop for
+// timestamp-less fixtures).
+func longestPromptSessionIDs(t *testing.T, cachePath string) []string {
+	t.Helper()
+	var entries []struct {
+		SessionID string `json:"session_id"`
+	}
+	require.NoError(t, json.Unmarshal(
+		[]byte(routeBody(t, cachePath, "messages/longest")), &entries),
+		"parse messages/longest")
+	ids := make([]string, 0, len(entries))
+	for _, e := range entries {
+		ids = append(ids, e.SessionID)
+	}
+	return ids
+}
+
+func TestExportPrivateSessionElided(t *testing.T) {
+	src := seedSource(t)
+	opts := Options{FullProjects: []string{"alpha"}, GeneratedAt: "2026-06-17T00:00:00Z"}
+
+	// Baseline: export with nothing marked private.
+	base := filepath.Join(t.TempDir(), "base")
+	_, err := Export(context.Background(), src, base, opts)
+	require.NoError(t, err, "baseline export")
+	baseCache := filepath.Join(base, "analytics_cache.ndjson")
+	// s-main's prompts appear in messages/longest here, making the "absent
+	// after redaction" assertion below non-vacuous.
+	require.Contains(t, longestPromptSessionIDs(t, baseCache), "s-main",
+		"baseline longest-prompts includes s-main")
+
+	// Now flag s-main private via the DB and re-export.
+	d, err := db.Open(src)
+	require.NoError(t, err, "reopen source")
+	require.NoError(t, d.SetSessionPrivate("s-main", true), "flag private")
+	require.NoError(t, d.Close(), "close source")
+
+	out := filepath.Join(t.TempDir(), "snap")
+	m, err := Export(context.Background(), src, out, opts)
+	require.NoError(t, err, "Export")
+	assert.Equal(t, 1, m.PrivateCount, "one private session")
+	// The ghost row is still counted as an exported session.
+	assert.Equal(t, 2, m.SessionCount, "s-main ghost + s-sub")
+	// Only s-sub's single message survives; s-main's two are elided.
+	assert.Equal(t, 1, m.MessageCount, "private session's messages elided")
+
+	// sessions.ndjson still lists both, but s-main is scrubbed + marked.
+	byID := map[string]map[string]any{}
+	for _, o := range readNDJSONObjs(t, filepath.Join(out, "sessions.ndjson")) {
+		byID[o["id"].(string)] = o
+	}
+	require.Contains(t, byID, "s-main", "private ghost row present")
+	assert.Equal(t, "[redacted]", byID["s-main"]["first_message"],
+		"private title scrubbed")
+	assert.Equal(t, "[redacted]", byID["s-main"]["display_name"],
+		"private display_name scrubbed")
+	assert.Equal(t, float64(1), byID["s-main"]["private"], "marked private")
+	// The non-private session keeps its real content.
+	assert.NotEqual(t, "[redacted]", byID["s-sub"]["first_message"],
+		"non-private session unscrubbed")
+
+	// messages.ndjson: nothing from the private session.
+	assert.Equal(t, []string{"s-sub"},
+		readNDJSONIDs(t, filepath.Join(out, "messages.ndjson"), "session_id"),
+		"private session's messages absent")
+
+	// Detail routes: the private session must not appear (its prompts/title
+	// would otherwise surface there).
+	cache := filepath.Join(out, "analytics_cache.ndjson")
+	assert.NotContains(t, longestPromptSessionIDs(t, cache), "s-main",
+		"private session's prompts absent from messages/longest")
+
+	// But it still feeds aggregate analytics: the aggregate summary route is
+	// byte-identical to the baseline (privacy only affects data + detail scope).
+	assert.Equal(t, routeBody(t, baseCache, "summary"), routeBody(t, cache, "summary"),
+		"aggregate summary unchanged by redaction")
+	assert.Equal(t, routeBody(t, baseCache, "usage/summary"), routeBody(t, cache, "usage/summary"),
+		"aggregate usage summary unchanged by redaction")
+}
+
 func TestExportAllStatsNoData(t *testing.T) {
 	src := seedSource(t)
 	out := filepath.Join(t.TempDir(), "snap")

@@ -66,6 +66,11 @@ type Options struct {
 	// AllStats treats every non-full project as stats tier (the "public
 	// stats" view: aggregates for everything, raw prompts for nothing).
 	AllStats bool
+	// PrivateSessions are session IDs to redact at session granularity: the
+	// session stays in aggregate analytics (a ghost row with scrubbed title
+	// and no messages), but its transcript is elided. Combined with any session
+	// flagged private in the DB. See specs/per-session-redaction.md.
+	PrivateSessions []string
 	// Gated marks the view as token-required: the Worker serves only
 	// view/meta without a valid grant token.
 	Gated bool
@@ -99,6 +104,7 @@ type Manifest struct {
 	AllStats        bool     `json:"allStats,omitempty"`
 	GeneratedAt     string   `json:"generatedAt"`
 	SessionCount    int      `json:"sessionCount"`
+	PrivateCount    int      `json:"privateCount,omitempty"`
 	MessageCount    int      `json:"messageCount"`
 	ToolCallCount   int      `json:"toolCallCount"`
 	AnalyticsRoutes int      `json:"analyticsRoutes"`
@@ -177,14 +183,39 @@ func Export(
 		return nil, err
 	}
 
+	// Private sessions (DB-flagged or explicitly listed) within the data scope
+	// are elided: their row is still exported (a ghost with scrubbed title) so
+	// they show in aggregates and click-through, but their messages/tool_calls
+	// and detail-route entries are omitted. contentIDs = data scope − private.
+	privateIDs, err := selectPrivateIDs(ctx, src, dataIDs, opts.PrivateSessions)
+	if err != nil {
+		return nil, err
+	}
+	privateSet := make(map[string]struct{}, len(privateIDs))
+	for _, id := range privateIDs {
+		privateSet[id] = struct{}{}
+	}
+	contentIDs := subtractIDs(dataIDs, privateSet)
+
 	if err := writeSchema(ctx, src, filepath.Join(outDir, "schema.sql")); err != nil {
 		return nil, err
 	}
 
+	// sessions.ndjson: every data-scope session (including private ghosts). For
+	// a private row, scrub the human-readable fields and mark it redacted.
+	scrubPrivate := func(obj map[string]any) {
+		id, _ := obj["id"].(string)
+		if _, ok := privateSet[id]; !ok {
+			return
+		}
+		obj["first_message"] = "[redacted]"
+		obj["display_name"] = "[redacted]"
+		obj["private"] = int64(1)
+	}
 	sessionCount, err := dumpToFile(
 		ctx, src, filepath.Join(outDir, "sessions.ndjson"),
 		"SELECT * FROM sessions WHERE id IN (%s) ORDER BY id",
-		dataIDs,
+		dataIDs, scrubPrivate,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot: dump sessions: %w", err)
@@ -193,7 +224,7 @@ func Export(
 	messageCount, err := dumpToFile(
 		ctx, src, filepath.Join(outDir, "messages.ndjson"),
 		"SELECT * FROM messages WHERE session_id IN (%s) ORDER BY session_id, ordinal",
-		dataIDs,
+		contentIDs, nil,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot: dump messages: %w", err)
@@ -202,13 +233,16 @@ func Export(
 	toolCallCount, err := dumpToFile(
 		ctx, src, filepath.Join(outDir, "tool_calls.ndjson"),
 		"SELECT * FROM tool_calls WHERE session_id IN (%s) ORDER BY session_id, id",
-		dataIDs,
+		contentIDs, nil,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot: dump tool_calls: %w", err)
 	}
 
-	analyticsRoutes, err := precomputeAnalytics(ctx, srcPath, analyticsIDs, dataIDs)
+	// Detail routes (top-sessions, longest-prompts) run over contentIDs so a
+	// private session's scrubbed title / prompts never surface; aggregates
+	// still span analyticsIDs (private sessions included).
+	analyticsRoutes, err := precomputeAnalytics(ctx, srcPath, analyticsIDs, contentIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -244,6 +278,7 @@ func Export(
 		AllStats:        opts.AllStats,
 		GeneratedAt:     opts.GeneratedAt,
 		SessionCount:    sessionCount,
+		PrivateCount:    len(privateIDs),
 		MessageCount:    messageCount,
 		ToolCallCount:   toolCallCount,
 		AnalyticsRoutes: len(analyticsRoutes),
@@ -309,6 +344,66 @@ func selectSessionIDs(
 	}
 	sort.Strings(ids)
 	return ids, nil
+}
+
+// selectPrivateIDs returns the sorted set of data-scope session IDs to elide:
+// those flagged private in the DB plus any explicitly listed, intersected with
+// dataIDs (private only matters where content would otherwise be exported).
+func selectPrivateIDs(
+	ctx context.Context,
+	src *sql.DB,
+	dataIDs, explicit []string,
+) ([]string, error) {
+	dataSet := make(map[string]struct{}, len(dataIDs))
+	for _, id := range dataIDs {
+		dataSet[id] = struct{}{}
+	}
+	out := make(map[string]struct{})
+
+	rows, err := src.QueryContext(ctx, "SELECT id FROM sessions WHERE private = 1")
+	if err != nil {
+		return nil, fmt.Errorf("snapshot: select private ids: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("snapshot: scan private id: %w", err)
+		}
+		if _, ok := dataSet[id]; ok {
+			out[id] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for _, id := range explicit {
+		if _, ok := dataSet[id]; ok {
+			out[id] = struct{}{}
+		}
+	}
+
+	ids := make([]string, 0, len(out))
+	for id := range out {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
+
+// subtractIDs returns the elements of ids not present in remove, order
+// preserved.
+func subtractIDs(ids []string, remove map[string]struct{}) []string {
+	if len(remove) == 0 {
+		return ids
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := remove[id]; !ok {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // writeSchema emits base-table DDL followed by the FTS virtual table and
@@ -379,13 +474,15 @@ func writeAnalyticsCache(path string, routes []analyticsRoute) error {
 }
 
 // dumpToFile runs queryTmpl (a single %s for the ID placeholders) over the
-// IDs in chunks, writing each result row as one NDJSON line. Returns the
-// total row count.
+// IDs in chunks, writing each result row as one NDJSON line. hook, if non-nil,
+// is applied to each row object before it is written (used to scrub private
+// ghost rows). Returns the total row count.
 func dumpToFile(
 	ctx context.Context,
 	src *sql.DB,
 	path, queryTmpl string,
 	ids []string,
+	hook func(map[string]any),
 ) (int, error) {
 	f, err := os.Create(path)
 	if err != nil {
@@ -400,7 +497,7 @@ func dumpToFile(
 		for i, id := range chunk {
 			args[i] = id
 		}
-		n, err := dumpRows(ctx, src, query, args, f)
+		n, err := dumpRows(ctx, src, query, args, f, hook)
 		if err != nil {
 			return 0, err
 		}
@@ -410,13 +507,15 @@ func dumpToFile(
 }
 
 // dumpRows writes each result row of query as a single-line JSON object.
-// BLOB/TEXT values arrive as []byte and are emitted as strings.
+// BLOB/TEXT values arrive as []byte and are emitted as strings. hook, if
+// non-nil, may mutate each row object before it is encoded.
 func dumpRows(
 	ctx context.Context,
 	src *sql.DB,
 	query string,
 	args []any,
 	w io.Writer,
+	hook func(map[string]any),
 ) (int, error) {
 	rows, err := src.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -446,6 +545,9 @@ func dumpRows(
 			} else {
 				obj[c] = vals[i]
 			}
+		}
+		if hook != nil {
+			hook(obj)
 		}
 		if err := enc.Encode(obj); err != nil {
 			return 0, err
