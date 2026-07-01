@@ -948,6 +948,35 @@ func upsertSessionArgs(s Session) []any {
 	}
 }
 
+// SetSessionPrivate marks (or unmarks) a session as private. A private session
+// still contributes to aggregate analytics, but its transcript is elided from
+// published snapshot exports (see specs/per-session-redaction.md). The flag is
+// user/system-managed and is preserved across re-syncs (it is not written by
+// UpsertSession). Returns an error if no session with the given id exists.
+func (db *DB) SetSessionPrivate(id string, private bool) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	v := 0
+	if private {
+		v = 1
+	}
+	res, err := db.getWriter().Exec(
+		"UPDATE sessions SET private = ? WHERE id = ?", v, id,
+	)
+	if err != nil {
+		return fmt.Errorf("set session private: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("set session private: rows affected: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("set session private: session %q not found", id)
+	}
+	return nil
+}
+
 // UpsertSession inserts or updates a session.
 // Sessions that were permanently deleted (in excluded_sessions)
 // or currently in the trash are rejected.

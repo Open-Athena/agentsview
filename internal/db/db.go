@@ -436,6 +436,10 @@ func (db *DB) migrateColumns() error {
 			"ALTER TABLE sessions ADD COLUMN deleted_at TEXT",
 		},
 		{
+			"sessions", "private",
+			"ALTER TABLE sessions ADD COLUMN private INTEGER NOT NULL DEFAULT 0",
+		},
+		{
 			"messages", "is_system",
 			"ALTER TABLE messages ADD COLUMN is_system INTEGER NOT NULL DEFAULT 0",
 		},

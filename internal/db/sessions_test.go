@@ -187,6 +187,41 @@ func TestUpsertSession_DisplayNameInsertOnly(t *testing.T) {
 	assert.Equal(t, 2, s.MessageCount, "MessageCount")
 }
 
+func sessionPrivate(t *testing.T, d *DB, id string) int {
+	t.Helper()
+	var p int
+	require.NoError(t,
+		d.getWriter().QueryRow("SELECT private FROM sessions WHERE id = ?", id).Scan(&p),
+		"read private for %s", id)
+	return p
+}
+
+// TestSetSessionPrivatePreservedAcrossUpsert verifies the private flag is a
+// user/system-managed column: SetSessionPrivate toggles it, and a subsequent
+// re-sync (UpsertSession) does NOT clobber it -- the same durability contract
+// as deleted_at/display_name.
+func TestSetSessionPrivatePreservedAcrossUpsert(t *testing.T) {
+	d := testDB(t)
+	base := Session{ID: "s1", Project: "p", Machine: "local", Agent: "claude", MessageCount: 1}
+	require.NoError(t, d.UpsertSession(base), "initial upsert")
+	assert.Equal(t, 0, sessionPrivate(t, d, "s1"), "defaults to not-private")
+
+	require.NoError(t, d.SetSessionPrivate("s1", true), "mark private")
+	assert.Equal(t, 1, sessionPrivate(t, d, "s1"), "flag set")
+
+	// Re-sync the session (as the file watcher would): private must survive.
+	base.MessageCount = 2
+	require.NoError(t, d.UpsertSession(base), "re-upsert")
+	assert.Equal(t, 1, sessionPrivate(t, d, "s1"), "private preserved across re-sync")
+
+	require.NoError(t, d.SetSessionPrivate("s1", false), "unmark private")
+	assert.Equal(t, 0, sessionPrivate(t, d, "s1"), "flag cleared")
+
+	assert.EqualError(t, d.SetSessionPrivate("nope", true),
+		`set session private: session "nope" not found`,
+		"unknown id is an error")
+}
+
 // TestUpsertSessionDoesNotAdvanceDataVersion guards the
 // invariant that data_version is never touched by
 // UpsertSession -- it must only advance via
