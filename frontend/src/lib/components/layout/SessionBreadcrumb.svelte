@@ -39,6 +39,7 @@
   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
   import { messages as messagesStore } from "../../stores/messages.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
+  import { SNAPSHOT } from "../../utils/snapshot.js";
 
   interface Props {
     session: Session | undefined;
@@ -202,6 +203,16 @@
       await sessions.deleteSession(session.id);
     } catch {
       // silently fail
+    }
+  }
+
+  async function togglePrivate() {
+    if (!session) return;
+    closeMenu();
+    try {
+      await sessions.setPrivate(session.id, !session.private);
+    } catch {
+      // flag reverts in UI
     }
   }
 
@@ -628,6 +639,14 @@
             >
               Rename
             </button>
+            {#if !SNAPSHOT}
+              <button
+                class="actions-menu-item"
+                onclick={togglePrivate}
+              >
+                {session?.private ? "Unmark private" : "Mark private"}
+              </button>
+            {/if}
             <button
               class="actions-menu-item danger"
               onclick={handleDelete}

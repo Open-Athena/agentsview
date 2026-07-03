@@ -990,6 +990,14 @@ class SessionsStore {
     }
   }
 
+  async setPrivate(id: string, isPrivate: boolean) {
+    const updated = await api.setSessionPrivate(id, isPrivate);
+    const idx = this.sessions.findIndex((s) => s.id === id);
+    if (idx !== -1) {
+      this.sessions[idx] = { ...this.sessions[idx]!, ...updated };
+    }
+  }
+
   private startLiveRefresh() {
     if (this.liveRefreshStarted) return;
     this.liveRefreshStarted = true;

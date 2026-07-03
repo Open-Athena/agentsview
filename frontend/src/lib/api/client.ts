@@ -1206,6 +1206,17 @@ export function renameSession(
   });
 }
 
+export function setSessionPrivate(
+  id: string,
+  isPrivate: boolean,
+): Promise<Session> {
+  return fetchJSON(`/sessions/${id}/private`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ private: isPrivate }),
+  });
+}
+
 export async function deleteSession(id: string): Promise<void> {
   const res = await fetch(`${getBase()}/sessions/${id}`, authHeaders({
     method: "DELETE",

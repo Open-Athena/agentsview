@@ -30,6 +30,8 @@ export interface Session {
   has_total_output_tokens?: boolean;
   has_peak_context_tokens?: boolean;
   is_automated: boolean;
+  /** Redacted from published exports (transcript elided, kept in aggregates). */
+  private?: boolean;
   is_teammate?: boolean;
   /** True when populated from the skinny sidebar index and not yet hydrated. */
   is_index_only?: boolean;

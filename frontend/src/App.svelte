@@ -473,7 +473,18 @@
           session={session}
           onBack={() => sessions.deselectSession()}
         />
-        <MessageList bind:this={messageListRef} />
+        {#if SNAPSHOT && session?.private}
+          <div class="redacted-transcript">
+            <p class="redacted-title">Transcript redacted</p>
+            <p class="redacted-body">
+              This session is included in the aggregate statistics, but its
+              transcript is private and has been elided from this published
+              view.
+            </p>
+          </div>
+        {:else}
+          <MessageList bind:this={messageListRef} />
+        {/if}
       {:else}
         <AnalyticsPage />
       {/if}
@@ -549,6 +560,27 @@
     flex: 1;
     min-height: 0;
     overflow-y: auto;
+  }
+
+  .redacted-transcript {
+    margin: 2rem auto;
+    max-width: 32rem;
+    padding: 1.5rem;
+    text-align: center;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-default);
+    border-radius: 8px;
+  }
+  .redacted-title {
+    margin: 0 0 0.5rem;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+  .redacted-body {
+    margin: 0;
+    font-size: 0.875rem;
+    line-height: 1.5;
+    color: var(--text-muted);
   }
 
 
