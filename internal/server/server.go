@@ -316,6 +316,7 @@ func (s *Server) routes() {
 
 	// Session management
 	s.mux.Handle("PATCH /api/v1/sessions/{id}/rename", s.withTimeout(s.handleRenameSession))
+	s.mux.Handle("PATCH /api/v1/sessions/{id}/private", s.withTimeout(s.handleSetSessionPrivate))
 	s.mux.Handle("DELETE /api/v1/sessions/{id}", s.withTimeout(s.handleDeleteSession))
 	s.mux.Handle("POST /api/v1/sessions/{id}/restore", s.withTimeout(s.handleRestoreSession))
 	s.mux.Handle("DELETE /api/v1/sessions/{id}/permanent", s.withTimeout(s.handlePermanentDeleteSession))

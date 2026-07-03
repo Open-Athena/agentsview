@@ -111,6 +111,11 @@ func (s *Store) RenameSession(
 	return db.ErrReadOnly
 }
 
+// SetSessionPrivate is not supported in read-only mode.
+func (s *Store) SetSessionPrivate(_ string, _ bool) error {
+	return db.ErrReadOnly
+}
+
 // SoftDeleteSession is not supported in read-only mode.
 func (s *Store) SoftDeleteSession(_ string) error {
 	return db.ErrReadOnly

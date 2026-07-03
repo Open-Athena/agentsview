@@ -89,6 +89,7 @@ type Store interface {
 
 	// Session management (local-only; PG returns ErrReadOnly).
 	RenameSession(id string, displayName *string) error
+	SetSessionPrivate(id string, private bool) error
 	SoftDeleteSession(id string) error
 	RestoreSession(id string) (int64, error)
 	DeleteSessionIfTrashed(id string) (int64, error)

@@ -48,7 +48,7 @@ const sessionBaseCols = `id, project, machine, agent,
 	data_version,
 	cwd, git_branch, source_session_id, source_version,
 	parser_malformed_lines, is_truncated,
-	deleted_at, termination_status, created_at`
+	deleted_at, termination_status, created_at, private`
 
 // sessionPruneCols extends sessionBaseCols with file metadata
 // needed by FindPruneCandidates.
@@ -138,6 +138,7 @@ func scanSessionRow(rs rowScanner) (Session, error) {
 		&s.SourceSessionID, &s.SourceVersion,
 		&s.ParserMalformedLines, &s.IsTruncated,
 		&s.DeletedAt, &s.TerminationStatus, &s.CreatedAt,
+		&s.Private,
 	)
 	return s, err
 }
@@ -180,14 +181,17 @@ type Session struct {
 	HasToolCalls           bool     `json:"-"`
 	HasContextData         bool     `json:"-"`
 	SecretLeakCount        int      `json:"secret_leak_count"`
-	SecretsRulesVersion    string   `json:"-"`
-	DataVersion            int      `json:"-"`
-	Cwd                    string   `json:"cwd,omitempty"`
-	GitBranch              string   `json:"git_branch,omitempty"`
-	SourceSessionID        string   `json:"source_session_id,omitempty"`
-	SourceVersion          string   `json:"source_version,omitempty"`
-	ParserMalformedLines   int      `json:"parser_malformed_lines,omitempty"`
-	IsTruncated            bool     `json:"is_truncated,omitempty"`
+	// Private elides this session's transcript from published exports while
+	// keeping it in aggregates (see specs/per-session-redaction.md).
+	Private              bool   `json:"private"`
+	SecretsRulesVersion  string `json:"-"`
+	DataVersion          int    `json:"-"`
+	Cwd                  string `json:"cwd,omitempty"`
+	GitBranch            string `json:"git_branch,omitempty"`
+	SourceSessionID      string `json:"source_session_id,omitempty"`
+	SourceVersion        string `json:"source_version,omitempty"`
+	ParserMalformedLines int    `json:"parser_malformed_lines,omitempty"`
+	IsTruncated          bool   `json:"is_truncated,omitempty"`
 
 	DeletedAt         *string `json:"deleted_at,omitempty"`
 	TerminationStatus *string `json:"termination_status,omitempty"`

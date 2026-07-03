@@ -6,6 +6,64 @@ import (
 	"net/http"
 )
 
+// --- Private (redaction) ---
+
+type privateRequest struct {
+	Private bool `json:"private"`
+}
+
+// handleSetSessionPrivate toggles a session's private flag. A private session
+// stays in aggregate analytics but its transcript is elided from published
+// snapshot exports (see specs/per-session-redaction.md). Local/admin only: the
+// deployed snapshot Worker exposes no such mutation.
+func (s *Server) handleSetSessionPrivate(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	session, err := s.db.GetSession(r.Context(), id)
+	if err != nil {
+		if handleContextError(w, err) {
+			return
+		}
+		log.Printf("set-private lookup: %v", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if session == nil {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+
+	var req privateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	if err := s.db.SetSessionPrivate(id, req.Private); err != nil {
+		if handleReadOnly(w, err) {
+			return
+		}
+		log.Printf("set session private: %v", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	updated, err := s.db.GetSession(r.Context(), id)
+	if err != nil {
+		if handleContextError(w, err) {
+			return
+		}
+		log.Printf("set-private readback: %v", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if updated == nil {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
 // --- Rename ---
 
 type renameRequest struct {
