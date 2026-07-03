@@ -69,12 +69,16 @@ auto-redacted.
 - **P2 — exporter elision.** `privateIDs` / `contentIDs`; ghost-row scrub in
   sessions.ndjson; detail routes over `contentIDs`; `Options.PrivateSessions`;
   `Manifest.PrivateCount`. DONE.
-- **P3 — server API.** `POST /api/v1/sessions/:id/private` (local/admin only);
-  `private` on session list/detail responses; a redaction-suggestions endpoint.
-  TODO.
-- **P4 — Worker.** Passes `private` through (SELECT * already carries it);
-  session-detail for a ghost returns metadata + `private:true`, empty messages.
-  Mostly free. TODO.
-- **P5 — FE.** "Redacted" placeholder on a private session's detail view; a
-  "mark private" toggle in local/admin mode; a suggested-redactions surface.
-  TODO.
+- **P3 — server API. Core DONE.** `PATCH /api/v1/sessions/:id/private` (local
+  only; read-only PG store returns ErrReadOnly, so pg-serve has no mutation
+  surface); `private` on session list/detail responses (appended to
+  sessionBaseCols + scanSessionRow). Mirrors rename. TODO: a
+  redaction-suggestions endpoint (seeded from secret_leak_count / topic scan).
+- **P4 — Worker. DONE.** `SELECT *` carries `private` through; added to
+  SESSION_BOOLS so it coerces to a real boolean. A ghost row has no messages, so
+  detail returns metadata + `private:true`, empty transcript.
+- **P5 — FE. Core DONE.** SessionBreadcrumb actions menu has a
+  "Mark private / Unmark private" toggle (hidden in snapshot mode); a private
+  session in snapshot mode renders a "Transcript redacted" placeholder instead
+  of MessageList. Verified in-browser (toggle round-trips through the API).
+  TODO: a suggested-redactions surface.

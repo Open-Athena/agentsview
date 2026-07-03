@@ -25,6 +25,7 @@ const SESSION_BOOLS = new Set([
   "has_tool_calls",
   "has_context_data",
   "is_truncated",
+  "private",
 ]);
 const MESSAGE_BOOLS = new Set([
   "has_thinking",
