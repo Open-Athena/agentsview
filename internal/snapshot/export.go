@@ -80,6 +80,20 @@ type Options struct {
 	Blurbs map[string]string
 	// Orgs groups projects for color-coding (see OrgConfig).
 	Orgs []OrgConfig
+	// From and To bound the precomputed *usage* panels to a window
+	// (inclusive YYYY-MM-DD). Empty means "the snapshot's full data span".
+	//
+	// Scope is deliberately narrow on two axes:
+	//
+	//   - Data: session/message rows are still exported whole, so drill-down
+	//     keeps working. Filtering the data selection by date would drop any
+	//     session that started before the window — for a long-running session
+	//     (months of work under one id) that discards the entire project.
+	//   - Panels: usage only. The analytics panels select sessions by
+	//     started_at, so the same window would zero them out while usage
+	//     stayed non-zero. They keep the full span (see analytics.go).
+	From string
+	To   string
 	// GeneratedAt is an RFC3339 timestamp stamped into the manifest. Passed
 	// in by the caller so the export stays deterministic/testable.
 	GeneratedAt string
@@ -102,6 +116,8 @@ type Manifest struct {
 	FullProjects    []string `json:"fullProjects,omitempty"`
 	StatsProjects   []string `json:"statsProjects,omitempty"`
 	AllStats        bool     `json:"allStats,omitempty"`
+	From            string   `json:"from,omitempty"`
+	To              string   `json:"to,omitempty"`
 	GeneratedAt     string   `json:"generatedAt"`
 	SessionCount    int      `json:"sessionCount"`
 	PrivateCount    int      `json:"privateCount,omitempty"`
@@ -242,7 +258,9 @@ func Export(
 	// Detail routes (top-sessions, longest-prompts) run over contentIDs so a
 	// private session's scrubbed title / prompts never surface; aggregates
 	// still span analyticsIDs (private sessions included).
-	analyticsRoutes, err := precomputeAnalytics(ctx, srcPath, analyticsIDs, contentIDs)
+	analyticsRoutes, err := precomputeAnalytics(
+		ctx, srcPath, analyticsIDs, contentIDs, opts.From, opts.To,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -276,6 +294,8 @@ func Export(
 		FullProjects:    append([]string(nil), opts.FullProjects...),
 		StatsProjects:   append([]string(nil), opts.StatsProjects...),
 		AllStats:        opts.AllStats,
+		From:            opts.From,
+		To:              opts.To,
 		GeneratedAt:     opts.GeneratedAt,
 		SessionCount:    sessionCount,
 		PrivateCount:    len(privateIDs),

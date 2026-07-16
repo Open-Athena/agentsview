@@ -18,6 +18,8 @@ type ExportSnapshotConfig struct {
 	FullProjects  []string
 	StatsProjects []string
 	AllStats      bool
+	Since         string
+	Until         string
 }
 
 func runExportSnapshot(cfg ExportSnapshotConfig) {
@@ -41,6 +43,9 @@ func runExportSnapshot(cfg ExportSnapshotConfig) {
 		}
 		opts = v.Options(generatedAt)
 	}
+	// Applied after the view override so the window composes with a view
+	// config rather than being dropped by it.
+	opts.From, opts.To = cfg.Since, cfg.Until
 
 	m, err := snapshot.Export(
 		context.Background(),

@@ -399,3 +399,125 @@ func TestLoadViewConfigErrors(t *testing.T) {
 	_, err = LoadViewConfig(unknownField)
 	require.Error(t, err, "unknown field should error")
 }
+
+// seedDatedSource builds a source DB with one long-running session whose
+// messages straddle a date boundary, each carrying priced token_usage.
+// This mirrors the real shape that motivated --since/--until: a session
+// started months before the window it is being reported on.
+func seedDatedSource(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "source.db")
+	d, err := db.Open(path)
+	require.NoError(t, err, "open source db")
+
+	require.NoError(t, d.UpsertModelPricing([]db.ModelPricing{{
+		ModelPattern: "claude-test", InputPerMTok: 1000, OutputPerMTok: 1000,
+	}}), "seed pricing")
+
+	started := "2026-01-01T00:00:00Z"
+	ended := "2026-03-31T00:00:00Z"
+	// MessageCount/UserMessageCount are session-row counters maintained by the
+	// sync engine, not by ReplaceSessionMessages — the analytics panels read
+	// them, so seed them to match the messages written below.
+	require.NoError(t, d.UpsertSession(db.Session{
+		ID: "s-long", Project: "alpha", Machine: "local", Agent: "claude",
+		StartedAt: &started, EndedAt: &ended,
+		MessageCount: 8, UserMessageCount: 4,
+	}), "upsert s-long")
+
+	// Each date gets a user turn (so the session registers in the analytics
+	// panels) plus a priced assistant turn: 1M input + 1M output tokens =>
+	// $2000/day at the seeded rate, so each in-window day is worth $2000.
+	var msgs []db.Message
+	for _, ts := range []string{
+		"2026-01-05T12:00:00Z", // before window
+		"2026-02-10T12:00:00Z", // in window
+		"2026-02-11T12:00:00Z", // in window
+		"2026-03-20T12:00:00Z", // after window
+	} {
+		msgs = append(msgs, db.Message{
+			SessionID: "s-long", Ordinal: len(msgs), Role: "user",
+			Content: "ask " + ts, ContentLength: 8, Timestamp: ts,
+		}, db.Message{
+			SessionID: "s-long", Ordinal: len(msgs) + 1, Role: "assistant",
+			Content: "ans " + ts, ContentLength: 8, Timestamp: ts,
+			Model: "claude-test",
+			TokenUsage: json.RawMessage(
+				`{"input_tokens":1000000,"output_tokens":1000000}`),
+		})
+	}
+	require.NoError(t, d.ReplaceSessionMessages("s-long", msgs),
+		"messages s-long")
+
+	require.NoError(t, d.Close(), "close source db")
+	return path
+}
+
+// usageTotalCost reads the precomputed usage/summary total out of an
+// export directory.
+func usageTotalCost(t *testing.T, outDir string) float64 {
+	t.Helper()
+	var body struct {
+		Totals struct {
+			TotalCost float64 `json:"totalCost"`
+		} `json:"totals"`
+	}
+	cachePath := filepath.Join(outDir, "analytics_cache.ndjson")
+	require.NoError(t, json.Unmarshal(
+		[]byte(routeBody(t, cachePath, "usage/summary")), &body),
+		"parse usage/summary")
+	return body.Totals.TotalCost
+}
+
+// analyticsSessionCount reads the precomputed analytics summary's session
+// count out of an export directory.
+func analyticsSessionCount(t *testing.T, outDir string) int {
+	t.Helper()
+	var body struct {
+		TotalSessions int `json:"total_sessions"`
+	}
+	cachePath := filepath.Join(outDir, "analytics_cache.ndjson")
+	require.NoError(t, json.Unmarshal(
+		[]byte(routeBody(t, cachePath, "summary")), &body), "parse summary")
+	return body.TotalSessions
+}
+
+func TestExportDateWindowScopesUsage(t *testing.T) {
+	src := seedDatedSource(t)
+
+	fullOut := t.TempDir()
+	_, err := Export(context.Background(), src, fullOut, Options{
+		GeneratedAt: "2026-04-01T00:00:00Z",
+	})
+	require.NoError(t, err, "export full span")
+
+	winOut := t.TempDir()
+	m, err := Export(context.Background(), src, winOut, Options{
+		From: "2026-02-01", To: "2026-02-28",
+		GeneratedAt: "2026-04-01T00:00:00Z",
+	})
+	require.NoError(t, err, "export windowed")
+
+	// All four messages are priced when the span is unbounded; only the
+	// two February ones fall inside the window.
+	assert.Equal(t, 8000.0, usageTotalCost(t, fullOut))
+	assert.Equal(t, 4000.0, usageTotalCost(t, winOut))
+
+	// The window must not reach the analytics panels. Their From/To select
+	// sessions by started_at, and s-long started 2026-01-01 — before the
+	// window — so passing the window through would report zero sessions
+	// next to a non-zero usage cost.
+	assert.Equal(t, 1, analyticsSessionCount(t, winOut),
+		"analytics keep the full span under a usage window")
+	assert.Equal(t, 1, analyticsSessionCount(t, fullOut))
+
+	// The window bounds the aggregate, not the data: the session started
+	// 2026-01-01, well before the window, and must still be exported whole
+	// so drill-down keeps working.
+	assert.Equal(t, "2026-02-01", m.From)
+	assert.Equal(t, "2026-02-28", m.To)
+	assert.Equal(t, 1, m.SessionCount)
+	assert.Equal(t, []string{"s-long"},
+		readNDJSONIDs(t, filepath.Join(winOut, "sessions.ndjson"), "id"))
+	assert.Equal(t, 8, m.MessageCount)
+}

@@ -29,13 +29,20 @@ type analyticsRoute struct {
 // results are correctly scoped to the snapshot (no project-filter edge
 // cases) and reuse the exact Go SQL. Returns one row per dashboard route.
 //
-// Only the homepage analytics/* panels are precomputed here; they need just
-// sessions/messages/tool_calls. Usage panels (which also need usage_events
-// and model_pricing) are a separate follow-up.
+// The homepage analytics/* panels and the usage/* panels are precomputed
+// here. Usage is priced from each message's token_usage JSON blob plus
+// model_pricing, so it needs no usage_events rows (those carry usage for
+// agents that report it out-of-band, and for the PG push path).
+//
+// wantFrom/wantTo optionally bound the *usage* panels to a window (inclusive
+// YYYY-MM-DD); empty falls back to the snapshot's full data span. See the
+// note at the filter construction below for why the analytics panels do not
+// take the same window.
 func precomputeAnalytics(
 	ctx context.Context,
 	srcPath string,
 	analyticsIDs, dataIDs []string,
+	wantFrom, wantTo string,
 ) ([]analyticsRoute, error) {
 	// Aggregate routes run over the analytics scope (full + stats tier).
 	aDB, aPath, aClean, err := openScopedTemp(ctx, srcPath, analyticsIDs)
@@ -50,6 +57,21 @@ func precomputeAnalytics(
 	from, to, err := snapshotDateRange(ctx, aPath)
 	if err != nil {
 		return nil, err
+	}
+
+	// The window applies to the usage panels only. AnalyticsFilter's From/To
+	// select sessions by started_at (see db/analytics.go: the bounds ride the
+	// started_at index), while UsageFilter's select priced messages by their
+	// own timestamp. Handing the same window to both looks consistent and is
+	// not: a session started before the window contributes usage inside it but
+	// is not itself "started" in it, so the analytics panels would report zero
+	// next to a non-zero cost. Analytics keep the full span.
+	usageFrom, usageTo := from, to
+	if wantFrom != "" {
+		usageFrom = wantFrom
+	}
+	if wantTo != "" {
+		usageTo = wantTo
 	}
 
 	// Match the dashboard's defaults: exclude one-shot and automated
@@ -117,8 +139,8 @@ func precomputeAnalytics(
 	// breakdowns), no session names.
 	uf := db.UsageFilter{
 		Timezone:         analyticsTZ,
-		From:             from,
-		To:               to,
+		From:             usageFrom,
+		To:               usageTo,
 		ExcludeAutomated: true,
 		Breakdowns:       true,
 	}

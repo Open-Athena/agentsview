@@ -254,7 +254,11 @@ func newExportSnapshotCommand() *cobra.Command {
 			"  --stats-project  stats tier: counted in analytics aggregates only\n" +
 			"  --all-stats every (non-full) project is stats tier (public stats view)\n\n" +
 			"With no flags, exports everything (all projects full). Subagent " +
-			"sessions roll up into their parent's project.",
+			"sessions roll up into their parent's project.\n\n" +
+			"--since/--until bound the precomputed usage panels to a window " +
+			"(the analytics panels select sessions by start date, so they keep " +
+			"the full span). Session and message rows are still exported " +
+			"whole, so drill-down keeps working.",
 		GroupID:      groupData,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
@@ -270,6 +274,10 @@ func newExportSnapshotCommand() *cobra.Command {
 		"Full-tier project: data + analytics (repeatable)")
 	cmd.Flags().StringArrayVarP(&cfg.StatsProjects, "stats-project", "s", nil,
 		"Stats-tier project: analytics aggregates only (repeatable)")
+	cmd.Flags().StringVar(&cfg.Since, "since", "",
+		"Bound usage panels to dates >= YYYY-MM-DD")
+	cmd.Flags().StringVar(&cfg.Until, "until", "",
+		"Bound usage panels to dates <= YYYY-MM-DD")
 	cmd.Flags().StringVarP(&cfg.View, "view", "V", "",
 		"Load tiers/title/blurbs from a view config JSON file (overrides tier flags)")
 	_ = cmd.MarkFlagRequired("out")
