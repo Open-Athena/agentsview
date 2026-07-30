@@ -67,6 +67,7 @@ const (
 	AgentIcodemate      AgentType = "icodemate"
 	AgentRooCode        AgentType = "roocode"
 	AgentPoolside       AgentType = "poolside"
+	AgentOmnigent       AgentType = "omnigent"
 )
 
 // AgentDef describes a supported coding agent's filesystem
@@ -84,11 +85,18 @@ type AgentDef struct {
 	FileBased         bool     // false for DB-backed agents
 	Usage             UsageCapabilities
 
-	// PeriodicReconcile opts the agent into the scheduled scoped
-	// reconciliation because its declared watch coverage is shallow and
-	// subdirectory changes are invisible to the watcher. Expensive
-	// scheduling inputs default to unsupported.
+	// PeriodicReconcile opts the agent into scheduled scoped reconciliation
+	// when its declared watcher coverage is deliberately non-authoritative,
+	// such as shallow directory watches or bounded database change cursors.
+	// Expensive scheduling inputs default to unsupported.
 	PeriodicReconcile bool
+
+	// RemoteSyncExcluded keeps every path under the agent's roots out of
+	// remote sync artifacts: resolve scripts, manifests, archives, delta
+	// roots, and tar commands. Set for stores that co-locate transcripts
+	// with secrets or state that cannot be copied safely; each artifact
+	// seam checks it so exclusion fails closed.
+	RemoteSyncExcluded bool
 
 	// WatchRootsFunc resolves the directories to watch for live
 	// updates under a configured root, for agents whose watch
@@ -377,6 +385,10 @@ var Registry = []AgentDef{
 		WatchSubdirs: []string{"workspaceStorage", "globalStorage"},
 		FileBased:    true,
 		Usage:        UsageCapabilities{NoPerMessageTokenData: true},
+		// Trae's modern layout stores sessions as encrypted state that a
+		// remote machine cannot read; shipping it would copy opaque
+		// encrypted blobs.
+		RemoteSyncExcluded: true,
 	},
 	{
 		Type:        AgentVSCopilot,
@@ -816,6 +828,24 @@ var Registry = []AgentDef{
 		IDPrefix:  "poolside:",
 		FileBased: true,
 	},
+	{
+		// Omnigent stores every conversation in one shared SQLite database
+		// (chat.db); the provider fans it out into one session per conversation
+		// addressed by a "<db>#<id>" virtual path.
+		Type:              AgentOmnigent,
+		DisplayName:       "Omnigent",
+		EnvVar:            "OMNIGENT_DIR",
+		ConfigKey:         "omnigent_dirs",
+		DefaultDirs:       []string{".omnigent"},
+		IDPrefix:          "omnigent:",
+		FileBased:         true,
+		PeriodicReconcile: true,
+		// chat.db co-locates transcripts with authentication secrets, and
+		// copying or sanitizing the source database can retain deleted
+		// pages. Remote sync stays disabled until Omnigent has a fresh,
+		// allowlisted export schema.
+		RemoteSyncExcluded: true,
+	},
 }
 
 // NonFileBackedAgents returns agent types where FileBased is false.
@@ -837,6 +867,13 @@ func AgentByType(t AgentType) (AgentDef, bool) {
 		}
 	}
 	return AgentDef{}, false
+}
+
+// RemoteSyncExcludedAgent reports whether the agent's raw source tree must
+// stay out of every remote sync artifact. Unknown agents are not excluded.
+func RemoteSyncExcludedAgent(agent AgentType) bool {
+	def, ok := AgentByType(agent)
+	return ok && def.RemoteSyncExcluded
 }
 
 // AgentNameLacksPerMessageTokenData reports whether the named agent

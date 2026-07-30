@@ -51,6 +51,53 @@ func setupTestEnv(t *testing.T) string {
 	return dir
 }
 
+func TestChartPaletteDefaultsAndLoads(t *testing.T) {
+	tests := []struct {
+		name string
+		toml string
+		want ChartPalette
+	}{
+		{name: "omitted", want: ChartPaletteAgentsview},
+		{name: "agentsview", toml: `chart_palette = "agentsview"`, want: ChartPaletteAgentsview},
+		{name: "matplotlib", toml: `chart_palette = "matplotlib"`, want: ChartPaletteMatplotlib},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := Default()
+			require.NoError(t, err)
+			require.NoError(t, cfg.applyConfigTOML(tt.toml))
+			assert.Equal(t, tt.want, cfg.ResolvedChartPalette())
+		})
+	}
+}
+
+func TestChartPaletteRejectsInvalidValue(t *testing.T) {
+	tests := []struct {
+		name string
+		toml string
+		want string
+	}{
+		{
+			name: "unknown",
+			toml: `chart_palette = "neon"`,
+			want: `chart_palette must be "agentsview" or "matplotlib" (got "neon")`,
+		},
+		{
+			name: "explicit empty",
+			toml: `chart_palette = ""`,
+			want: `chart_palette must be "agentsview" or "matplotlib" (got "")`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := Default()
+			require.NoError(t, err)
+			err = cfg.applyConfigTOML(tt.toml)
+			require.EqualError(t, err, tt.want)
+		})
+	}
+}
+
 func setTestHome(t *testing.T, home string) {
 	t.Helper()
 	t.Setenv("HOME", home)
@@ -931,6 +978,16 @@ func TestResolveDataDir_DefaultAndEnvOverride(t *testing.T) {
 	dir, err = ResolveDataDir()
 	require.NoError(t, err)
 	assert.Equal(t, custom, dir)
+}
+
+func TestResolveDataDir_ExpandsHome(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	t.Setenv("AGENTSVIEW_DATA_DIR", "~/agentsview-data")
+
+	dir, err := ResolveDataDir()
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(home, "agentsview-data"), dir)
 }
 
 // TestDataDir_LegacyEnvFallback verifies that the legacy AGENT_VIEWER_DATA_DIR
@@ -1863,6 +1920,49 @@ func TestLoadFile_SyncIncludeCwdPrefixesDefaultsEmpty(t *testing.T) {
 	cfg := f.LoadMinimal(t)
 
 	assert.Empty(t, cfg.SyncIncludeCwdPrefixes)
+}
+
+func TestLoadMinimal_ExpandsUserSuppliedLocalPaths(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	f := newConfigFixture(t)
+	f.WriteConfigText(t, `sync_include_cwd_prefixes = ["~/work"]
+codex_sessions_dirs = ["~/codex-sessions"]
+
+[duckdb]
+path = "~/sessions.duckdb"
+
+[vector]
+db_path = "~/vectors.db"
+
+[recall.extract.prompts]
+dir = "~/recall-prompts"
+
+[terminal]
+mode = "custom"
+custom_bin = "~/bin/terminal"
+
+[agent.codex]
+binary = "~/bin/codex"
+sandbox = "~/bin/sandbox"
+`)
+
+	cfg := f.LoadMinimal(t)
+
+	assert.Equal(t, []string{filepath.Join(home, "work")},
+		cfg.SyncIncludeCwdPrefixes)
+	assert.Equal(t, []string{filepath.Join(home, "codex-sessions")},
+		cfg.ResolveDirs(parser.AgentCodex))
+	assert.Equal(t, filepath.Join(home, "sessions.duckdb"), cfg.DuckDB.Path)
+	assert.Equal(t, filepath.Join(home, "vectors.db"), cfg.Vector.DBPath)
+	assert.Equal(t, filepath.Join(home, "recall-prompts"),
+		cfg.Recall.Extract.Prompts.Dir)
+	assert.Equal(t, filepath.Join(home, "bin", "terminal"),
+		cfg.Terminal.CustomBin)
+	assert.Equal(t, filepath.Join(home, "bin", "codex"),
+		cfg.Agent["codex"].Binary)
+	assert.Equal(t, filepath.Join(home, "bin", "sandbox"),
+		cfg.Agent["codex"].Sandbox)
 }
 
 func TestIsDefaultAgentsviewDBPath(t *testing.T) {
