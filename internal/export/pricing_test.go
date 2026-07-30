@@ -29,7 +29,7 @@ func TestPricingResolverBuildBlockUsesRecordedLookup(t *testing.T) {
 	require.True(t, lookup.OK)
 	require.Equal(t, "claude-test", lookup.Pattern)
 	cost, err := lookup.Rates.CostForTokens(
-		1_000_000, 2_000_000, 500_000, 3_000_000, 4_000_000)
+		1_000_000, 2_000_000, 500_000, 3_000_000, 0, 4_000_000)
 	require.NoError(t, err)
 
 	resolver.RecordComputed("claude-test-20260703", lookup)
@@ -53,10 +53,35 @@ func TestModelRatesCostForTokensTreatsReasoningAsOutputBreakdown(t *testing.T) {
 		OutputPerMTok: money.MustParseDollars("10"),
 	}
 
-	cost, err := rates.CostForTokens(1_000_000, 2_000_000, 500_000, 0, 0)
+	cost, err := rates.CostForTokens(1_000_000, 2_000_000, 500_000, 0, 0, 0)
 	require.NoError(t, err)
 
 	assert.Equal(t, money.MustParseDollars("21"), cost)
+}
+
+func TestModelRatesCostForTokensSplitsEphemeralCacheWrites(t *testing.T) {
+	rates := ModelRates{
+		InputPerMTok:        money.MustParseDollars("1"),
+		CacheWritePerMTok:   money.MustParseDollars("1.25"),
+		CacheWrite1hPerMTok: money.MustParseDollars("2"),
+	}
+
+	// 1M tokens at the 5m rate and 1M at the 1h rate: 1.25 + 2.00.
+	cost, err := rates.CostForTokens(0, 0, 0, 1_000_000, 1_000_000, 0)
+	require.NoError(t, err)
+	assert.Equal(t, money.MustParseDollars("3.25"), cost)
+}
+
+func TestModelRatesCostForTokens1hFallsBackToWriteRate(t *testing.T) {
+	// A pricing store without the 1h column leaves CacheWrite1hPerMTok zero;
+	// 1h tokens must still bill at the 5m rate, never at zero.
+	rates := ModelRates{
+		CacheWritePerMTok: money.MustParseDollars("1.25"),
+	}
+
+	cost, err := rates.CostForTokens(0, 0, 0, 0, 1_000_000, 0)
+	require.NoError(t, err)
+	assert.Equal(t, money.MustParseDollars("1.25"), cost)
 }
 
 func TestModelRatesCostForTokensBillsReasoningOnlyRowsAsOutput(t *testing.T) {
@@ -64,7 +89,7 @@ func TestModelRatesCostForTokensBillsReasoningOnlyRowsAsOutput(t *testing.T) {
 		OutputPerMTok: money.MustParseDollars("10"),
 	}
 
-	cost, err := rates.CostForTokens(0, 0, 500_000, 0, 0)
+	cost, err := rates.CostForTokens(0, 0, 500_000, 0, 0, 0)
 	require.NoError(t, err)
 
 	assert.Equal(t, money.MustParseDollars("5"), cost)
@@ -75,7 +100,7 @@ func TestModelRatesCostForTokensReturnsOverflow(t *testing.T) {
 		InputPerMTok: money.Money{Microdollars: math.MaxInt64},
 	}
 
-	_, err := rates.CostForTokens(2_000_000, 0, 0, 0, 0)
+	_, err := rates.CostForTokens(2_000_000, 0, 0, 0, 0, 0)
 
 	require.ErrorIs(t, err, money.ErrOverflow)
 }

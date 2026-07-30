@@ -534,15 +534,18 @@ func sqliteActivityReportRowStatus(
 	r dailyUsageScanRow, pricing *export.PricingResolver,
 ) (cost money.Money, priced, contributes bool, err error) {
 	var inTok, outTok, crTok, rdTok int
+	var cr5m, cr1h int
 	reasoningTok := r.reasoningTokens
 	if r.usageSource == "message" {
 		inTok, outTok, crTok, rdTok, reasoningTok =
 			clampedUsageTokenCountersWithReasoning(r.tokenJSON)
+		cr5m, cr1h = cacheWriteSplit(r.tokenJSON, crTok)
 	} else {
 		inTok, outTok, crTok, rdTok = usageEventRowTokens(
 			r.usageSource,
 			r.inputTokens, r.outputTokens,
 			r.cacheCreationInputTokens, r.cacheReadInputTokens)
+		cr5m = crTok
 	}
 
 	if r.cost.Valid {
@@ -559,7 +562,7 @@ func sqliteActivityReportRowStatus(
 		return money.Money{}, false, true, nil
 	}
 	cost, err = lookup.Rates.CostForTokens(
-		inTok, outTok, reasoningTok, crTok, rdTok)
+		inTok, outTok, reasoningTok, cr5m, cr1h, rdTok)
 	if err != nil {
 		return money.Money{}, false, false,
 			fmt.Errorf("pricing activity usage for model %q: %w", r.model, err)

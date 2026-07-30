@@ -34,8 +34,16 @@ type ModelRates struct {
 	Source              PricingRowSource
 }
 
+// CostForTokens prices a token breakdown. Ephemeral cache writes are split into
+// two buckets: 5-minute-TTL writes bill at CacheWritePerMTok (1.25x input) and
+// 1-hour-TTL writes bill at CacheWrite1hPerMTok (2x input). Callers that cannot
+// distinguish the two TTLs pass the aggregate cache-write count as
+// cacheWrite5mTokens and 0 as cacheWrite1hTokens, which reproduces the prior
+// (all-5m) behavior. CacheWrite1hPerMTok defensively falls back to the 5m rate
+// when a pricing store lacks the 1h column, so passing a real 1h split never
+// prices those tokens at zero.
 func (r ModelRates) CostForTokens(
-	inputTokens, outputTokens, reasoningTokens, cacheWriteTokens, cacheReadTokens int,
+	inputTokens, outputTokens, reasoningTokens, cacheWrite5mTokens, cacheWrite1hTokens, cacheReadTokens int,
 ) (money.Money, error) {
 	// reasoningTokens is a breakdown of outputTokens for current sources, not
 	// additional billable output. Reasoning-only rows still bill at output rate.
@@ -43,10 +51,15 @@ func (r ModelRates) CostForTokens(
 	if billableOutputTokens == 0 {
 		billableOutputTokens = reasoningTokens
 	}
+	cacheWrite1hRate := r.CacheWrite1hPerMTok
+	if cacheWrite1hRate == (money.Money{}) {
+		cacheWrite1hRate = r.CacheWritePerMTok
+	}
 	return money.CostPerMillion([]money.RatedTokens{
 		{Tokens: int64(inputTokens), Rate: r.InputPerMTok},
 		{Tokens: int64(billableOutputTokens), Rate: r.OutputPerMTok},
-		{Tokens: int64(cacheWriteTokens), Rate: r.CacheWritePerMTok},
+		{Tokens: int64(cacheWrite5mTokens), Rate: r.CacheWritePerMTok},
+		{Tokens: int64(cacheWrite1hTokens), Rate: cacheWrite1hRate},
 		{Tokens: int64(cacheReadTokens), Rate: r.CacheReadPerMTok},
 	})
 }

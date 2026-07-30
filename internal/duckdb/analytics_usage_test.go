@@ -242,7 +242,7 @@ func TestDuckUsageAggregateCostRecordsMixedReportedAndComputed(t *testing.T) {
 	cost, _, priced, contributes, err := duckUsageAggregateCost(
 		"mixed-model",
 		1000, 2000, 3000, 4000,
-		100, 200, 300, 400, 500,
+		100, 200, 300, 400, 0, 500,
 		250_000,
 		true,
 		resolver,
@@ -264,7 +264,7 @@ func TestDuckUsageAggregateCostKeepsMixedUnpricedComputedTokensUnpriced(t *testi
 	cost, _, priced, contributes, err := duckUsageAggregateCost(
 		"unknown-model",
 		1000, 2000, 0, 0,
-		1000, 2000, 0, 0, 0,
+		1000, 2000, 0, 0, 0, 0,
 		250_000,
 		true,
 		resolver,
@@ -296,7 +296,7 @@ func TestDuckUsageAggregateCostIncludesReasoningOnlyRows(t *testing.T) {
 	cost, _, priced, contributes, err := duckUsageAggregateCost(
 		"reasoning-model",
 		0, 0, 0, 0,
-		0, 0, 300, 0, 0,
+		0, 0, 300, 0, 0, 0,
 		0,
 		false,
 		resolver,
@@ -326,7 +326,7 @@ func TestDuckUsageAggregateCostRecordsZeroTokenModelProvenance(t *testing.T) {
 	cost, _, priced, contributes, err := duckUsageAggregateCost(
 		"zero-model",
 		0, 0, 0, 0,
-		0, 0, 0, 0, 0,
+		0, 0, 0, 0, 0, 0,
 		0,
 		false,
 		resolver,
@@ -341,6 +341,98 @@ func TestDuckUsageAggregateCostRecordsZeroTokenModelProvenance(t *testing.T) {
 	require.Contains(t, block.Models, "zero-model")
 	assert.Equal(t, export.CostSourceComputed,
 		block.Models["zero-model"].CostSource)
+}
+
+func TestDuckUsageAggregateCostSplitsEphemeralCacheWrites(t *testing.T) {
+	// Both the cost split (5m = billable total - 1h, at CacheWrite/CacheWrite1h
+	// rates) and the savings split (5m = raw total - 1h, at Input-CacheWrite /
+	// Input-CacheWrite1h rates) use the single raw 1h count. Pre-split rows bill
+	// entirely at 5m and a malformed 1h count exceeding the total falls back to
+	// 5m rather than going negative. Rates are chosen so the 1h rate differs from
+	// the 5m rate for both cost and savings, so mispricing 1h fails the assert.
+	newResolver := func() *export.PricingResolver {
+		return export.NewPricingResolver([]export.EffectivePricingRow{{
+			ModelPattern: "split-model",
+			Rates: export.ModelRates{
+				InputPerMTok:        money.MustParseDollars("10"),
+				OutputPerMTok:       money.MustParseDollars("2"),
+				CacheWritePerMTok:   money.MustParseDollars("3"),
+				CacheWrite1hPerMTok: money.MustParseDollars("8"),
+				CacheReadPerMTok:    money.MustParseDollars("1"),
+				Source:              export.PricingRowSourceFetched,
+			},
+		}})
+	}
+
+	// Computed row (no explicit/reported cost), so billable == raw. inputTok=100,
+	// outputTok=200, cacheRd=500 are fixed; only the cache-creation split varies.
+	// Cost = 100*$10 + 200*$2 + cr5m*$3 + cr1h*$8 + 500*$1.
+	// Savings = 500*(10-1) + sCr5m*(10-3) + sCr1h*(10-8).
+	tests := []struct {
+		name        string
+		cacheCr     int
+		cacheCr1h   int
+		wantCost    int64
+		wantSavings int64
+	}{
+		{
+			// cr split 600/400: cost 1000+400+1800+3200+500=6900;
+			// savings 4500 + 600*7 + 400*2 = 9500 (1h at $2, not $7).
+			name: "explicit 1h split", cacheCr: 1000, cacheCr1h: 400,
+			wantCost: 6_900, wantSavings: 9_500,
+		},
+		{
+			// No 1h: all 1000 at 5m. cost 1000+400+3000+0+500=4900;
+			// savings 4500 + 1000*7 = 11500.
+			name: "no 1h bills all at 5m", cacheCr: 1000, cacheCr1h: 0,
+			wantCost: 4_900, wantSavings: 11_500,
+		},
+		{
+			// Malformed: 1h>total, guard bills all 100 at 5m. cost
+			// 1000+400+300+0+500=2200; savings 4500 + 100*7 = 5200.
+			name: "malformed 1h exceeds total", cacheCr: 100, cacheCr1h: 500,
+			wantCost: 2_200, wantSavings: 5_200,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolver := newResolver()
+			cost, savings, priced, contributes, err := duckUsageAggregateCost(
+				"split-model",
+				100, 200, tt.cacheCr, 500,
+				100, 200, 0, tt.cacheCr, tt.cacheCr1h, 500,
+				0,
+				false,
+				resolver,
+			)
+			require.NoError(t, err)
+			require.True(t, priced)
+			require.True(t, contributes)
+			assert.Equal(t, money.Money{Microdollars: tt.wantCost}, cost)
+			assert.Equal(t, money.Money{Microdollars: tt.wantSavings}, savings)
+		})
+	}
+}
+
+func TestDuckCacheWrite1hRateFallsBackToFiveMinute(t *testing.T) {
+	fiveMinute := money.MustParseDollars("3")
+	oneHour := money.MustParseDollars("8")
+	tests := []struct {
+		name       string
+		fiveMinute money.Money
+		oneHour    money.Money
+		want       money.Money
+	}{
+		{"populated 1h kept", fiveMinute, oneHour, oneHour},
+		{"zero 1h falls back to 5m", fiveMinute, money.Money{}, fiveMinute},
+		{"zero both stays zero", money.Money{}, money.Money{}, money.Money{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want,
+				duckCacheWrite1hRate(tt.fiveMinute, tt.oneHour))
+		})
+	}
 }
 
 func TestDuckUsageAutomatedScopeOneShotExemption(t *testing.T) {

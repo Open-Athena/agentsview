@@ -239,6 +239,7 @@ CREATE TABLE IF NOT EXISTS model_pricing (
     input_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
     output_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
     cache_creation_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+    cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
     cache_read_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT ''
 );
@@ -1043,6 +1044,11 @@ func EnsureSchema(
 			"source_project_identity_observations", "remote_candidate_count",
 			`remote_candidate_count INT NOT NULL DEFAULT 0`,
 			"adding source_project_identity_observations.remote_candidate_count",
+		},
+		{
+			"model_pricing", "cache_creation_1h_microdollars_per_mtok",
+			`cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0`,
+			"adding model_pricing.cache_creation_1h_microdollars_per_mtok",
 		},
 	}
 	step = time.Now()
@@ -2233,6 +2239,7 @@ func CheckSchemaCompat(
 		`SELECT input_microdollars_per_mtok,
 			output_microdollars_per_mtok,
 			cache_creation_microdollars_per_mtok,
+			cache_creation_1h_microdollars_per_mtok,
 			cache_read_microdollars_per_mtok
 		 FROM model_pricing LIMIT 0`)
 	if err != nil {

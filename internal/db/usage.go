@@ -1227,6 +1227,18 @@ func parseEphemeralCacheSplit(tokenJSON string) (cr5m, cr1h int) {
 		scanNestedTokenInt(tokenJSON, "ephemeral_1h_input_tokens")
 }
 
+// cacheWriteSplit returns the 5m/1h ephemeral cache-write token split parsed
+// from a message token_usage blob, falling back to the aggregate count in the
+// 5m bucket when the source predates the 1h-TTL breakdown (older logs report
+// only the aggregate). The returned buckets always sum to aggregate.
+func cacheWriteSplit(tokenJSON string, aggregate int) (cr5m, cr1h int) {
+	cr5m, cr1h = parseEphemeralCacheSplit(tokenJSON)
+	if cr5m+cr1h == 0 {
+		cr5m = aggregate
+	}
+	return
+}
+
 func scanNestedTokenInt(tokenJSON, key string) int {
 	needle := `"` + key + `"`
 	idx := strings.Index(tokenJSON, needle)
@@ -1504,12 +1516,7 @@ func dailyUsageAmounts(
 	if r.usageSource == "message" {
 		inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok =
 			clampedUsageTokenCountersWithReasoning(r.tokenJSON)
-		cacheCr5m, cacheCr1h = parseEphemeralCacheSplit(r.tokenJSON)
-		// Older session logs (pre-1h-cache rollout) report only the
-		// aggregate; bill those entirely at the 5m rate.
-		if cacheCr5m+cacheCr1h == 0 {
-			cacheCr5m = cacheCrTok
-		}
+		cacheCr5m, cacheCr1h = cacheWriteSplit(r.tokenJSON, cacheCrTok)
 	} else {
 		inputTok, outputTok, cacheCrTok, cacheRdTok =
 			usageEventRowTokens(
@@ -1526,20 +1533,8 @@ func dailyUsageAmounts(
 		cost = money.Money{Microdollars: r.cost.Int64}
 		pricing.RecordReported(r.model, lookup)
 	} else {
-		// Money-native cost with the 5m/1h cache-write split: the two
-		// ephemeral buckets bill at their separate rates. billableOutput
-		// mirrors CostForTokens' reasoning-as-output fallback.
-		billableOutput := outputTok
-		if billableOutput == 0 {
-			billableOutput = reasoningTok
-		}
-		cost, err = money.CostPerMillion([]money.RatedTokens{
-			{Tokens: int64(inputTok), Rate: rates.InputPerMTok},
-			{Tokens: int64(billableOutput), Rate: rates.OutputPerMTok},
-			{Tokens: int64(cacheCr5m), Rate: rates.CacheWritePerMTok},
-			{Tokens: int64(cacheCr1h), Rate: rates.CacheWrite1hPerMTok},
-			{Tokens: int64(cacheRdTok), Rate: rates.CacheReadPerMTok},
-		})
+		cost, err = rates.CostForTokens(
+			inputTok, outputTok, reasoningTok, cacheCr5m, cacheCr1h, cacheRdTok)
 		if err != nil {
 			return 0, 0, 0, 0, money.Money{}, money.Money{},
 				fmt.Errorf("pricing usage row for model %q: %w", r.model, err)
@@ -2805,11 +2800,7 @@ func sessionRowCost(
 	if r.usageSource == "message" {
 		inTok, outTok, crTok, rdTok, reasoningTok =
 			clampedUsageTokenCountersWithReasoning(r.tokenJSON)
-		cr5m, cr1h = parseEphemeralCacheSplit(r.tokenJSON)
-		// Pre-TTL-split logs report only the aggregate; bill it at 5m.
-		if cr5m+cr1h == 0 {
-			cr5m = crTok
-		}
+		cr5m, cr1h = cacheWriteSplit(r.tokenJSON, crTok)
 	} else {
 		inTok, outTok, crTok, rdTok = usageEventRowTokens(
 			r.usageSource,
@@ -2832,17 +2823,8 @@ func sessionRowCost(
 		return money.Money{}, false, true, nil
 	}
 	rates := lookup.Rates
-	billableOutput := outTok
-	if billableOutput == 0 {
-		billableOutput = reasoningTok
-	}
-	cost, err = money.CostPerMillion([]money.RatedTokens{
-		{Tokens: int64(inTok), Rate: rates.InputPerMTok},
-		{Tokens: int64(billableOutput), Rate: rates.OutputPerMTok},
-		{Tokens: int64(cr5m), Rate: rates.CacheWritePerMTok},
-		{Tokens: int64(cr1h), Rate: rates.CacheWrite1hPerMTok},
-		{Tokens: int64(rdTok), Rate: rates.CacheReadPerMTok},
-	})
+	cost, err = rates.CostForTokens(
+		inTok, outTok, reasoningTok, cr5m, cr1h, rdTok)
 	if err != nil {
 		return money.Money{}, false, false,
 			fmt.Errorf("pricing session usage for model %q: %w", r.model, err)

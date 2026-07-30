@@ -122,6 +122,7 @@ func (c *pricingProbeConn) QueryContext(
 			"input_microdollars_per_mtok",
 			"output_microdollars_per_mtok",
 			"cache_creation_microdollars_per_mtok",
+			"cache_creation_1h_microdollars_per_mtok",
 			"cache_read_microdollars_per_mtok",
 			"updated_at",
 		},
@@ -235,7 +236,7 @@ func TestLoadPricingMapSharesConcurrentDBRows(t *testing.T) {
 	block := make(chan struct{})
 	state := &pricingProbeState{
 		rows: [][]driver.Value{{
-			"db-model", int64(1000000), int64(2000000), int64(3000000), int64(4000000), "2026-06-08",
+			"db-model", int64(1000000), int64(2000000), int64(3000000), int64(5000000), int64(4000000), "2026-06-08",
 		}},
 		block: block,
 	}
@@ -277,7 +278,7 @@ func TestLoadPricingMapSharesConcurrentDBRows(t *testing.T) {
 func TestLoadPricingMapUsesDBRowsAsEffectiveTable(t *testing.T) {
 	state := &pricingProbeState{
 		rows: [][]driver.Value{{
-			"db-model", int64(1000000), int64(2000000), int64(3000000), int64(4000000), "2026-06-08",
+			"db-model", int64(1000000), int64(2000000), int64(3000000), int64(5000000), int64(4000000), "2026-06-08",
 		}},
 	}
 	pg := newPricingProbeDB(t, state)
@@ -290,6 +291,9 @@ func TestLoadPricingMapUsesDBRowsAsEffectiveTable(t *testing.T) {
 	require.Len(t, byPattern, 1,
 		"explicit DB rows should define the effective pricing table")
 	assert.Equal(t, money.MustParseDollars("1"), byPattern["db-model"].InputPerMTok)
+	assert.Equal(t, money.MustParseDollars("5"),
+		byPattern["db-model"].CacheWrite1hPerMTok,
+		"1h cache-write rate should flow from the DB column")
 }
 
 func TestLoadPricingMapKeepsSharedDBRowsForActiveCaller(t *testing.T) {
@@ -299,7 +303,7 @@ func TestLoadPricingMapKeepsSharedDBRowsForActiveCaller(t *testing.T) {
 	defer unblock()
 	state := &pricingProbeState{
 		rows: [][]driver.Value{{
-			"db-model", int64(1000000), int64(2000000), int64(3000000), int64(4000000), "2026-06-08",
+			"db-model", int64(1000000), int64(2000000), int64(3000000), int64(5000000), int64(4000000), "2026-06-08",
 		}},
 		block: block,
 	}
@@ -347,7 +351,7 @@ func TestLoadPricingMapCancelsDBRowsWithCaller(t *testing.T) {
 	defer close(block)
 	state := &pricingProbeState{
 		rows: [][]driver.Value{{
-			"db-model", int64(1000000), int64(2000000), int64(3000000), int64(4000000), "2026-06-08",
+			"db-model", int64(1000000), int64(2000000), int64(3000000), int64(5000000), int64(4000000), "2026-06-08",
 		}},
 		block: block,
 		done:  make(chan struct{}),
@@ -384,7 +388,7 @@ func TestLoadPricingMapStartsFreshLoadAfterAllWaitersCancel(t *testing.T) {
 	defer close(releaseCanceledQuery)
 	state := &pricingProbeState{
 		rows: [][]driver.Value{{
-			"db-model", int64(1000000), int64(2000000), int64(3000000), int64(4000000), "2026-06-08",
+			"db-model", int64(1000000), int64(2000000), int64(3000000), int64(5000000), int64(4000000), "2026-06-08",
 		}},
 		block:            block,
 		afterCancelBlock: releaseCanceledQuery,
@@ -423,7 +427,7 @@ func TestSetCustomPricingForgetsInFlightPricingLoad(t *testing.T) {
 	defer close(block)
 	state := &pricingProbeState{
 		rows: [][]driver.Value{{
-			"db-model", int64(1000000), int64(2000000), int64(3000000), int64(4000000), "2026-06-08",
+			"db-model", int64(1000000), int64(2000000), int64(3000000), int64(5000000), int64(4000000), "2026-06-08",
 		}},
 		block: block,
 	}
@@ -459,7 +463,7 @@ func TestSetCustomPricingForgetsInFlightPricingLoad(t *testing.T) {
 func TestLoadPricingMapReloadsAfterCompletedDBRows(t *testing.T) {
 	state := &pricingProbeState{
 		rows: [][]driver.Value{{
-			"db-model", int64(1000000), int64(2000000), int64(3000000), int64(4000000), "2026-06-08",
+			"db-model", int64(1000000), int64(2000000), int64(3000000), int64(5000000), int64(4000000), "2026-06-08",
 		}},
 	}
 	pg := newPricingProbeDB(t, state)
@@ -468,7 +472,7 @@ func TestLoadPricingMapReloadsAfterCompletedDBRows(t *testing.T) {
 	first, err := store.loadPricingMap(context.Background())
 	require.NoError(t, err, "first loadPricingMap")
 	state.setRows([][]driver.Value{{
-		"db-model", int64(7000000), int64(2000000), int64(3000000), int64(4000000), "2026-06-08",
+		"db-model", int64(7000000), int64(2000000), int64(3000000), int64(5000000), int64(4000000), "2026-06-08",
 	}})
 	second, err := store.loadPricingMap(context.Background())
 	require.NoError(t, err, "second loadPricingMap")
@@ -508,35 +512,44 @@ func TestLoadPricingMapDoesNotCacheMissingTableFallback(t *testing.T) {
 func TestPGPricingUpsertStatementBatchesRows(t *testing.T) {
 	query, args := pgPricingUpsertStatement([]db.ModelPricing{
 		{
-			ModelPattern:         "model-a",
-			InputPerMTok:         money.MustParseDollars("1"),
-			OutputPerMTok:        money.MustParseDollars("2"),
-			CacheCreationPerMTok: money.MustParseDollars("3"),
-			CacheReadPerMTok:     money.MustParseDollars("4"),
+			ModelPattern:           "model-a",
+			InputPerMTok:           money.MustParseDollars("1"),
+			OutputPerMTok:          money.MustParseDollars("2"),
+			CacheCreationPerMTok:   money.MustParseDollars("3"),
+			CacheCreation1hPerMTok: money.MustParseDollars("3.5"),
+			CacheReadPerMTok:       money.MustParseDollars("4"),
 		},
 		{
-			ModelPattern:         "model-b",
-			InputPerMTok:         money.MustParseDollars("5"),
-			OutputPerMTok:        money.MustParseDollars("6"),
-			CacheCreationPerMTok: money.MustParseDollars("7"),
-			CacheReadPerMTok:     money.MustParseDollars("8"),
-			UpdatedAt:            "source-time",
+			ModelPattern:           "model-b",
+			InputPerMTok:           money.MustParseDollars("5"),
+			OutputPerMTok:          money.MustParseDollars("6"),
+			CacheCreationPerMTok:   money.MustParseDollars("7"),
+			CacheCreation1hPerMTok: money.MustParseDollars("7.5"),
+			CacheReadPerMTok:       money.MustParseDollars("8"),
+			UpdatedAt:              "source-time",
 		},
 	}, "call-time")
 
 	assert.Contains(t, query,
-		"VALUES ($1, $2, $3, $4, $5, $6), "+
-			"($7, $8, $9, $10, $11, $12)")
+		"VALUES ($1, $2, $3, $4, $5, $6, $7), "+
+			"($8, $9, $10, $11, $12, $13, $14)")
 	assert.Contains(t, query,
 		"model_pricing.input_microdollars_per_mtok IS DISTINCT FROM")
 	assert.Contains(t, query, "EXCLUDED.input_microdollars_per_mtok")
+	assert.Contains(t, query,
+		"model_pricing.cache_creation_1h_microdollars_per_mtok IS DISTINCT FROM")
+	assert.Contains(t, query,
+		"cache_creation_1h_microdollars_per_mtok = "+
+			"EXCLUDED.cache_creation_1h_microdollars_per_mtok")
 	assert.NotContains(t, query,
 		"model_pricing.updated_at IS DISTINCT FROM")
-	require.Len(t, args, 12)
+	require.Len(t, args, 14)
 	assert.Equal(t, "model-a", args[0])
-	assert.Equal(t, "call-time", args[5])
-	assert.Equal(t, "model-b", args[6])
-	assert.Equal(t, "source-time", args[11])
+	assert.Equal(t, money.MustParseDollars("3.5"), args[4])
+	assert.Equal(t, "call-time", args[6])
+	assert.Equal(t, "model-b", args[7])
+	assert.Equal(t, money.MustParseDollars("7.5"), args[11])
+	assert.Equal(t, "source-time", args[13])
 }
 
 func TestPGPricingFilterMatchesUpsertSemantics(t *testing.T) {
@@ -629,7 +642,7 @@ func TestSyncModelPricingSkipsWriteWhenRemoteRowsUnchanged(t *testing.T) {
 
 	state := &pricingProbeState{
 		rows: [][]driver.Value{{
-			"same-model", int64(1000000), int64(2000000), int64(3000000), int64(4000000), "old",
+			"same-model", int64(1000000), int64(2000000), int64(3000000), int64(0), int64(4000000), "old",
 		}},
 	}
 	pg := newPricingProbeDB(t, state)

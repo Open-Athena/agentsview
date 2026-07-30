@@ -903,6 +903,19 @@ func pgTokenJSONCount(usage gjson.Result, key string) int {
 	return db.ClampPlausibleTokens(usage.Get(key).Int())
 }
 
+// pgCacheWriteSplit extracts the 5m/1h ephemeral cache-write token split from a
+// message-source usage JSON blob. Pre-TTL-split logs report only the aggregate
+// cache_creation_input_tokens count; when neither TTL bucket is present the
+// whole aggregate bills at the 5m rate (matching prior all-5m behavior).
+func pgCacheWriteSplit(usage gjson.Result, aggregate int) (cr5m, cr1h int) {
+	cr5m = int(usage.Get("cache_creation.ephemeral_5m_input_tokens").Int())
+	cr1h = int(usage.Get("cache_creation.ephemeral_1h_input_tokens").Int())
+	if cr5m+cr1h == 0 {
+		cr5m = aggregate
+	}
+	return cr5m, cr1h
+}
+
 func pgClampedUsageRowTokens(
 	inputTokens, outputTokens, cacheCreationInputTokens,
 	cacheReadInputTokens int,
@@ -944,6 +957,7 @@ func pgDailyUsageAmounts(
 	err error,
 ) {
 	reasoningTok := r.reasoningTokens
+	var cacheWr5mTok, cacheWr1hTok int
 	if r.usageSource == "message" {
 		usage := gjson.Parse(r.tokenJSON)
 		inputTok = pgTokenJSONCount(usage, "input_tokens")
@@ -952,12 +966,14 @@ func pgDailyUsageAmounts(
 			usage, "cache_creation_input_tokens")
 		cacheRdTok = pgTokenJSONCount(usage, "cache_read_input_tokens")
 		reasoningTok = pgTokenJSONCount(usage, "reasoning_tokens")
+		cacheWr5mTok, cacheWr1hTok = pgCacheWriteSplit(usage, cacheCrTok)
 	} else {
 		inputTok, outputTok, cacheCrTok, cacheRdTok =
 			pgUsageEventRowTokens(
 				r.usageSource,
 				r.inputTokens, r.outputTokens,
 				r.cacheCreationInputTokens, r.cacheReadInputTokens)
+		cacheWr5mTok, cacheWr1hTok = cacheCrTok, 0
 	}
 
 	lookup := pricing.Lookup(r.model)
@@ -967,7 +983,8 @@ func pgDailyUsageAmounts(
 		pricing.RecordReported(r.model, lookup)
 	} else {
 		cost, err = rates.CostForTokens(
-			inputTok, outputTok, reasoningTok, cacheCrTok, cacheRdTok)
+			inputTok, outputTok, reasoningTok,
+			cacheWr5mTok, cacheWr1hTok, cacheRdTok)
 		if err != nil {
 			return 0, 0, 0, 0, money.Money{}, money.Money{},
 				fmt.Errorf("pricing pg usage row for model %q: %w", r.model, err)
@@ -979,14 +996,20 @@ func pgDailyUsageAmounts(
 		return 0, 0, 0, 0, money.Money{}, money.Money{},
 			fmt.Errorf("deriving pg cache read rate for model %q: %w", r.model, err)
 	}
-	creationRate, err := money.Sub(rates.InputPerMTok, rates.CacheWritePerMTok)
+	cr5mRate, err := money.Sub(rates.InputPerMTok, rates.CacheWritePerMTok)
 	if err != nil {
 		return 0, 0, 0, 0, money.Money{}, money.Money{},
-			fmt.Errorf("deriving pg cache creation rate for model %q: %w", r.model, err)
+			fmt.Errorf("deriving pg 5m cache creation rate for model %q: %w", r.model, err)
+	}
+	cr1hRate, err := money.Sub(rates.InputPerMTok, rates.CacheWrite1hPerMTok)
+	if err != nil {
+		return 0, 0, 0, 0, money.Money{}, money.Money{},
+			fmt.Errorf("deriving pg 1h cache creation rate for model %q: %w", r.model, err)
 	}
 	savings, err = money.SignedCostPerMillion([]money.RatedTokens{
 		{Tokens: int64(cacheRdTok), Rate: readRate},
-		{Tokens: int64(cacheCrTok), Rate: creationRate},
+		{Tokens: int64(cacheWr5mTok), Rate: cr5mRate},
+		{Tokens: int64(cacheWr1hTok), Rate: cr1hRate},
 	})
 	if err != nil {
 		return 0, 0, 0, 0, money.Money{}, money.Money{},
@@ -1029,6 +1052,7 @@ func pgSessionRowCost(
 ) (cost money.Money, priced, contributes bool, err error) {
 	var inTok, outTok, crTok, rdTok int
 	reasoningTok := r.reasoningTokens
+	var cr5mTok, cr1hTok int
 	if r.usageSource == "message" {
 		usage := gjson.Parse(r.tokenJSON)
 		inTok = pgTokenJSONCount(usage, "input_tokens")
@@ -1036,11 +1060,13 @@ func pgSessionRowCost(
 		crTok = pgTokenJSONCount(usage, "cache_creation_input_tokens")
 		rdTok = pgTokenJSONCount(usage, "cache_read_input_tokens")
 		reasoningTok = pgTokenJSONCount(usage, "reasoning_tokens")
+		cr5mTok, cr1hTok = pgCacheWriteSplit(usage, crTok)
 	} else {
 		inTok, outTok, crTok, rdTok = pgUsageEventRowTokens(
 			r.usageSource,
 			r.inputTokens, r.outputTokens,
 			r.cacheCreationInputTokens, r.cacheReadInputTokens)
+		cr5mTok, cr1hTok = crTok, 0
 	}
 
 	if r.cost.Valid {
@@ -1057,7 +1083,7 @@ func pgSessionRowCost(
 		return money.Money{}, false, true, nil
 	}
 	cost, err = lookup.Rates.CostForTokens(
-		inTok, outTok, reasoningTok, crTok, rdTok)
+		inTok, outTok, reasoningTok, cr5mTok, cr1hTok, rdTok)
 	if err != nil {
 		return money.Money{}, false, false,
 			fmt.Errorf("pricing pg session usage for model %q: %w", r.model, err)

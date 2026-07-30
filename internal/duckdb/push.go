@@ -70,19 +70,21 @@ func duckPricingUpsertStatement(prices []db.ModelPricing) (string, []any) {
 	var b strings.Builder
 	b.WriteString(`INSERT INTO model_pricing (
 		model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
-		cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok, updated_at
+		cache_creation_microdollars_per_mtok, cache_creation_1h_microdollars_per_mtok,
+		cache_read_microdollars_per_mtok, updated_at
 	) VALUES `)
-	args := make([]any, 0, len(prices)*6)
+	args := make([]any, 0, len(prices)*7)
 	for i, p := range prices {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		b.WriteString("(?, ?, ?, ?, ?, ?)")
+		b.WriteString("(?, ?, ?, ?, ?, ?, ?)")
 		args = append(args,
 			p.ModelPattern,
 			p.InputPerMTok.Microdollars,
 			p.OutputPerMTok.Microdollars,
 			p.CacheCreationPerMTok.Microdollars,
+			p.CacheCreation1hPerMTok.Microdollars,
 			p.CacheReadPerMTok.Microdollars,
 			p.UpdatedAt,
 		)
@@ -92,6 +94,7 @@ func duckPricingUpsertStatement(prices []db.ModelPricing) (string, []any) {
 		input_microdollars_per_mtok = excluded.input_microdollars_per_mtok,
 		output_microdollars_per_mtok = excluded.output_microdollars_per_mtok,
 		cache_creation_microdollars_per_mtok = excluded.cache_creation_microdollars_per_mtok,
+		cache_creation_1h_microdollars_per_mtok = excluded.cache_creation_1h_microdollars_per_mtok,
 		cache_read_microdollars_per_mtok = excluded.cache_read_microdollars_per_mtok,
 		updated_at = excluded.updated_at`)
 	return b.String(), args
@@ -102,6 +105,7 @@ func (s *Sync) listDuckModelPricing(ctx context.Context) ([]db.ModelPricing, err
 		ctx,
 		`SELECT model_pattern, input_microdollars_per_mtok,
 			output_microdollars_per_mtok, cache_creation_microdollars_per_mtok,
+			cache_creation_1h_microdollars_per_mtok,
 			cache_read_microdollars_per_mtok, updated_at
 		 FROM model_pricing`,
 	)
@@ -118,6 +122,7 @@ func (s *Sync) listDuckModelPricing(ctx context.Context) ([]db.ModelPricing, err
 			&p.InputPerMTok,
 			&p.OutputPerMTok,
 			&p.CacheCreationPerMTok,
+			&p.CacheCreation1hPerMTok,
 			&p.CacheReadPerMTok,
 			&p.UpdatedAt,
 		); err != nil {
@@ -398,12 +403,13 @@ func duckFallbackPricingRows() []db.ModelPricing {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	for i, p := range src {
 		out[i] = db.ModelPricing{
-			ModelPattern:         p.ModelPattern,
-			InputPerMTok:         p.InputPerMTok,
-			OutputPerMTok:        p.OutputPerMTok,
-			CacheCreationPerMTok: p.CacheCreationPerMTok,
-			CacheReadPerMTok:     p.CacheReadPerMTok,
-			UpdatedAt:            now,
+			ModelPattern:           p.ModelPattern,
+			InputPerMTok:           p.InputPerMTok,
+			OutputPerMTok:          p.OutputPerMTok,
+			CacheCreationPerMTok:   p.CacheCreationPerMTok,
+			CacheCreation1hPerMTok: p.CacheCreation1hPerMTok,
+			CacheReadPerMTok:       p.CacheReadPerMTok,
+			UpdatedAt:              now,
 		}
 	}
 	return out

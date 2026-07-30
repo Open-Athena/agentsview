@@ -402,6 +402,7 @@ var mirrorTables = []tableSpec{
 			input_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
 			output_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
 			cache_creation_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+			cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
 			cache_read_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
 			updated_at TEXT NOT NULL DEFAULT ''
 		)`,
@@ -410,6 +411,7 @@ var mirrorTables = []tableSpec{
 			{"input_microdollars_per_mtok", "input_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
 			{"output_microdollars_per_mtok", "output_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
 			{"cache_creation_microdollars_per_mtok", "cache_creation_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
+			{"cache_creation_1h_microdollars_per_mtok", "cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
 			{"cache_read_microdollars_per_mtok", "cache_read_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
 			{"updated_at", "updated_at TEXT NOT NULL DEFAULT ''"},
 		},

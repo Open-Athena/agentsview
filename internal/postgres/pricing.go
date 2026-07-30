@@ -26,11 +26,12 @@ func fallbackPricingRows() []db.ModelPricing {
 	out := make([]db.ModelPricing, len(src))
 	for i, p := range src {
 		out[i] = db.ModelPricing{
-			ModelPattern:         p.ModelPattern,
-			InputPerMTok:         p.InputPerMTok,
-			OutputPerMTok:        p.OutputPerMTok,
-			CacheCreationPerMTok: p.CacheCreationPerMTok,
-			CacheReadPerMTok:     p.CacheReadPerMTok,
+			ModelPattern:           p.ModelPattern,
+			InputPerMTok:           p.InputPerMTok,
+			OutputPerMTok:          p.OutputPerMTok,
+			CacheCreationPerMTok:   p.CacheCreationPerMTok,
+			CacheCreation1hPerMTok: p.CacheCreation1hPerMTok,
+			CacheReadPerMTok:       p.CacheReadPerMTok,
 		}
 	}
 	return out
@@ -55,14 +56,29 @@ func pgFallbackRateMap() map[string]export.ModelRates {
 	out := make(map[string]export.ModelRates, len(src))
 	for _, p := range src {
 		out[p.ModelPattern] = export.ModelRates{
-			InputPerMTok:      p.InputPerMTok,
-			OutputPerMTok:     p.OutputPerMTok,
-			CacheWritePerMTok: p.CacheCreationPerMTok,
-			CacheReadPerMTok:  p.CacheReadPerMTok,
-			Source:            export.PricingRowSourceEmbedded,
+			InputPerMTok:        p.InputPerMTok,
+			OutputPerMTok:       p.OutputPerMTok,
+			CacheWritePerMTok:   p.CacheCreationPerMTok,
+			CacheWrite1hPerMTok: cacheWrite1hRate(p.CacheCreation1hPerMTok, p.CacheCreationPerMTok),
+			CacheReadPerMTok:    p.CacheReadPerMTok,
+			Source:              export.PricingRowSourceEmbedded,
 		}
 	}
 	return out
+}
+
+// cacheWrite1hRate returns the 1h ephemeral cache-write rate, falling back to
+// the 5m rate when the 1h column is unpopulated (older LiteLLM rows from before
+// the column existed, or rows pushed by an older sync client) so 1h writes are
+// still billed rather than dropped to zero. Mirrors the SQLite loader in
+// internal/db (loadPricingMap); the savings calc reads CacheWrite1hPerMTok
+// directly, so it must be populated here rather than relying on the fallback
+// baked into ModelRates.CostForTokens.
+func cacheWrite1hRate(oneHour, fiveMinute money.Money) money.Money {
+	if oneHour == (money.Money{}) && fiveMinute.Microdollars > 0 {
+		return fiveMinute
+	}
+	return oneHour
 }
 
 func pgModelPricingRates(p db.ModelPricing) export.ModelRates {
@@ -74,11 +90,12 @@ func pgModelPricingRates(p db.ModelPricing) export.ModelRates {
 		}
 	}
 	return export.ModelRates{
-		InputPerMTok:      p.InputPerMTok,
-		OutputPerMTok:     p.OutputPerMTok,
-		CacheWritePerMTok: p.CacheCreationPerMTok,
-		CacheReadPerMTok:  p.CacheReadPerMTok,
-		UpdatedAt:         updatedAt,
+		InputPerMTok:        p.InputPerMTok,
+		OutputPerMTok:       p.OutputPerMTok,
+		CacheWritePerMTok:   p.CacheCreationPerMTok,
+		CacheWrite1hPerMTok: cacheWrite1hRate(p.CacheCreation1hPerMTok, p.CacheCreationPerMTok),
+		CacheReadPerMTok:    p.CacheReadPerMTok,
+		UpdatedAt:           updatedAt,
 	}
 }
 
@@ -216,6 +233,7 @@ func (s *Store) mergeDBPricing(
 		ctx,
 		`SELECT model_pattern, input_microdollars_per_mtok,
 			output_microdollars_per_mtok, cache_creation_microdollars_per_mtok,
+			cache_creation_1h_microdollars_per_mtok,
 			cache_read_microdollars_per_mtok, updated_at
 		 FROM model_pricing`,
 	)
@@ -235,6 +253,7 @@ func (s *Store) mergeDBPricing(
 			&p.InputPerMTok,
 			&p.OutputPerMTok,
 			&p.CacheCreationPerMTok,
+			&p.CacheCreation1hPerMTok,
 			&p.CacheReadPerMTok,
 			&p.UpdatedAt,
 		); err != nil {
@@ -291,19 +310,21 @@ func pgPricingUpsertStatement(
 	var b strings.Builder
 	b.WriteString(`INSERT INTO model_pricing
 		(model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
-		 cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok,
+		 cache_creation_microdollars_per_mtok,
+		 cache_creation_1h_microdollars_per_mtok,
+		 cache_read_microdollars_per_mtok,
 		 updated_at)
 	VALUES `)
-	args := make([]any, 0, len(prices)*6)
+	args := make([]any, 0, len(prices)*7)
 	for i, p := range prices {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		base := i*6 + 1
+		base := i*7 + 1
 		fmt.Fprintf(
 			&b,
-			"($%d, $%d, $%d, $%d, $%d, $%d)",
-			base, base+1, base+2, base+3, base+4, base+5,
+			"($%d, $%d, $%d, $%d, $%d, $%d, $%d)",
+			base, base+1, base+2, base+3, base+4, base+5, base+6,
 		)
 		updatedAt := p.UpdatedAt
 		if updatedAt == "" {
@@ -314,6 +335,7 @@ func pgPricingUpsertStatement(
 			p.InputPerMTok,
 			p.OutputPerMTok,
 			p.CacheCreationPerMTok,
+			p.CacheCreation1hPerMTok,
 			p.CacheReadPerMTok,
 			sanitizePG(updatedAt),
 		)
@@ -323,6 +345,7 @@ func pgPricingUpsertStatement(
 		input_microdollars_per_mtok = EXCLUDED.input_microdollars_per_mtok,
 		output_microdollars_per_mtok = EXCLUDED.output_microdollars_per_mtok,
 		cache_creation_microdollars_per_mtok = EXCLUDED.cache_creation_microdollars_per_mtok,
+		cache_creation_1h_microdollars_per_mtok = EXCLUDED.cache_creation_1h_microdollars_per_mtok,
 		cache_read_microdollars_per_mtok = EXCLUDED.cache_read_microdollars_per_mtok,
 		updated_at = EXCLUDED.updated_at
 	WHERE model_pricing.input_microdollars_per_mtok IS DISTINCT FROM
@@ -331,6 +354,8 @@ func pgPricingUpsertStatement(
 			EXCLUDED.output_microdollars_per_mtok
 		OR model_pricing.cache_creation_microdollars_per_mtok IS DISTINCT FROM
 			EXCLUDED.cache_creation_microdollars_per_mtok
+		OR model_pricing.cache_creation_1h_microdollars_per_mtok IS DISTINCT FROM
+			EXCLUDED.cache_creation_1h_microdollars_per_mtok
 		OR model_pricing.cache_read_microdollars_per_mtok IS DISTINCT FROM
 			EXCLUDED.cache_read_microdollars_per_mtok`)
 	return b.String(), args
@@ -342,6 +367,7 @@ func listPGModelPricing(
 	rows, err := pg.QueryContext(ctx,
 		`SELECT model_pattern, input_microdollars_per_mtok,
 			output_microdollars_per_mtok, cache_creation_microdollars_per_mtok,
+			cache_creation_1h_microdollars_per_mtok,
 			cache_read_microdollars_per_mtok, updated_at
 		 FROM model_pricing`,
 	)
@@ -358,6 +384,7 @@ func listPGModelPricing(
 			&p.InputPerMTok,
 			&p.OutputPerMTok,
 			&p.CacheCreationPerMTok,
+			&p.CacheCreation1hPerMTok,
 			&p.CacheReadPerMTok,
 			&p.UpdatedAt,
 		); err != nil {

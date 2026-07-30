@@ -1135,6 +1135,7 @@ func addMessageToCacheTotals(
 ) error {
 	inputTok, outputTok, cacheCrTok, cacheRdTok :=
 		clampedUsageTokenCounters(tokenJSON)
+	cacheCr5m, cacheCr1h := cacheWriteSplit(tokenJSON, cacheCrTok)
 
 	totals, ok := perSession[sessionID]
 	if !ok {
@@ -1147,7 +1148,7 @@ func addMessageToCacheTotals(
 
 	rates := pricing.Lookup(model).Rates
 	spent, err := rates.CostForTokens(
-		inputTok, outputTok, 0, cacheCrTok, cacheRdTok)
+		inputTok, outputTok, 0, cacheCr5m, cacheCr1h, cacheRdTok)
 	if err != nil {
 		return fmt.Errorf("pricing cache usage for model %q: %w", model, err)
 	}
@@ -1162,7 +1163,7 @@ func addMessageToCacheTotals(
 	// (see internal/db/usage.go and the savings calculation in
 	// frontend/src/lib/utils/usageSavings.ts).
 	uncached, err := rates.CostForTokens(
-		inputTok+cacheCrTok+cacheRdTok, outputTok, 0, 0, 0)
+		inputTok+cacheCrTok+cacheRdTok, outputTok, 0, 0, 0, 0)
 	if err != nil {
 		return fmt.Errorf("pricing uncached usage for model %q: %w", model, err)
 	}

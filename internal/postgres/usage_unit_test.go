@@ -13,6 +13,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
@@ -97,11 +98,12 @@ func (c *usageProbeConn) QueryContext(
 				"input_microdollars_per_mtok",
 				"output_microdollars_per_mtok",
 				"cache_creation_microdollars_per_mtok",
+				"cache_creation_1h_microdollars_per_mtok",
 				"cache_read_microdollars_per_mtok",
 				"updated_at",
 			},
 			values: [][]driver.Value{{
-				"claude-sonnet", int64(3000000), int64(15000000), int64(3750000), int64(300000), "2026-06-08",
+				"claude-sonnet", int64(3000000), int64(15000000), int64(3750000), int64(6000000), int64(300000), "2026-06-08",
 			}},
 		}, nil
 	}
@@ -546,4 +548,154 @@ func TestPGUsageAmountsIncludeMessageReasoningTokens(t *testing.T) {
 	assert.True(t, priced)
 	assert.True(t, contributes)
 	assert.Equal(t, money.MustParseDollars("0.002"), sessionCost)
+}
+
+func TestPGCacheWriteSplit(t *testing.T) {
+	tests := []struct {
+		name      string
+		tokenJSON string
+		aggregate int
+		wantCr5m  int
+		wantCr1h  int
+	}{
+		{
+			name: "explicit 5m and 1h split",
+			tokenJSON: `{"cache_creation_input_tokens":300,` +
+				`"cache_creation":{"ephemeral_5m_input_tokens":200,` +
+				`"ephemeral_1h_input_tokens":100}}`,
+			aggregate: 300,
+			wantCr5m:  200,
+			wantCr1h:  100,
+		},
+		{
+			name: "only 1h bucket present",
+			tokenJSON: `{"cache_creation_input_tokens":100,` +
+				`"cache_creation":{"ephemeral_1h_input_tokens":100}}`,
+			aggregate: 100,
+			wantCr5m:  0,
+			wantCr1h:  100,
+		},
+		{
+			name:      "pre-split log falls back to aggregate at 5m",
+			tokenJSON: `{"cache_creation_input_tokens":250}`,
+			aggregate: 250,
+			wantCr5m:  250,
+			wantCr1h:  0,
+		},
+		{
+			name:      "no cache write",
+			tokenJSON: `{"input_tokens":10}`,
+			aggregate: 0,
+			wantCr5m:  0,
+			wantCr1h:  0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cr5m, cr1h := pgCacheWriteSplit(
+				gjson.Parse(tt.tokenJSON), tt.aggregate)
+			assert.Equal(t, tt.wantCr5m, cr5m, "5m cache-write tokens")
+			assert.Equal(t, tt.wantCr1h, cr1h, "1h cache-write tokens")
+		})
+	}
+}
+
+func TestPGUsageAmountsSplitEphemeralCacheWrites(t *testing.T) {
+	resolver := export.NewPricingResolver(
+		[]export.EffectivePricingRow{{
+			ModelPattern: "claude-split",
+			Rates: export.ModelRates{
+				InputPerMTok:        money.MustParseDollars("1"),
+				OutputPerMTok:       money.MustParseDollars("2"),
+				CacheWritePerMTok:   money.MustParseDollars("10"),
+				CacheWrite1hPerMTok: money.MustParseDollars("20"),
+			},
+		}},
+	)
+	tokenJSON := `{"cache_creation_input_tokens":300,` +
+		`"cache_creation":{"ephemeral_5m_input_tokens":200,` +
+		`"ephemeral_1h_input_tokens":100}}`
+	row := pgDailyUsageScanRow{
+		usageSource: "message",
+		model:       "claude-split",
+		tokenJSON:   tokenJSON,
+	}
+
+	_, _, cacheCr, _, cost, savings, err := pgDailyUsageAmounts(row, resolver)
+	require.NoError(t, err)
+	assert.Equal(t, 300, cacheCr,
+		"aggregate cache-write count is surfaced from the flat field")
+	// 200 @ $10/Mtok + 100 @ $20/Mtok = $0.002 + $0.002 = $0.004
+	assert.Equal(t, money.MustParseDollars("0.004"), cost)
+	// Savings splits the same way: 5m writes save Input-5m = $1-$10 = -$9/Mtok,
+	// 1h writes save Input-1h = $1-$20 = -$19/Mtok. 200 @ -$9 + 100 @ -$19 =
+	// -$0.0018 - $0.0019 = -$0.0037 (more negative than the -$0.0027 an
+	// unsplit all-5m calc would report, since 1h writes cost more).
+	assert.Equal(t, money.MustParseDollars("-0.0037"), savings)
+
+	sessionCost, priced, contributes, err := pgSessionRowCost(pgUsageScanRow{
+		usageSource: "message",
+		model:       "claude-split",
+		tokenJSON:   tokenJSON,
+	}, resolver)
+	require.NoError(t, err)
+	assert.True(t, priced)
+	assert.True(t, contributes)
+	assert.Equal(t, money.MustParseDollars("0.004"), sessionCost)
+
+	activityCost, priced, contributes, err := pgActivityReportRowStatus(
+		row, resolver)
+	require.NoError(t, err)
+	assert.True(t, priced)
+	assert.True(t, contributes)
+	assert.Equal(t, money.MustParseDollars("0.004"), activityCost)
+}
+
+func TestPGUsageAmountsFallBackTo5mRateWithoutColumn(t *testing.T) {
+	resolver := export.NewPricingResolver(
+		[]export.EffectivePricingRow{{
+			ModelPattern: "claude-no1h",
+			Rates: export.ModelRates{
+				CacheWritePerMTok: money.MustParseDollars("10"),
+			},
+		}},
+	)
+	row := pgDailyUsageScanRow{
+		usageSource: "message",
+		model:       "claude-no1h",
+		tokenJSON: `{"cache_creation_input_tokens":300,` +
+			`"cache_creation":{"ephemeral_5m_input_tokens":200,` +
+			`"ephemeral_1h_input_tokens":100}}`,
+	}
+
+	_, _, _, _, cost, _, err := pgDailyUsageAmounts(row, resolver)
+	require.NoError(t, err)
+	// The store lacks a distinct 1h rate, so all 300 bill at the 5m rate:
+	// 300 @ $10/Mtok = $0.003
+	assert.Equal(t, money.MustParseDollars("0.003"), cost)
+}
+
+func TestPGActivityReportAggregateSourceBillsCacheWriteAt5m(t *testing.T) {
+	resolver := export.NewPricingResolver(
+		[]export.EffectivePricingRow{{
+			ModelPattern: "claude-agg",
+			Rates: export.ModelRates{
+				CacheWritePerMTok:   money.MustParseDollars("10"),
+				CacheWrite1hPerMTok: money.MustParseDollars("20"),
+			},
+		}},
+	)
+	// Non-message sources carry no TTL split, so the whole aggregate bills at
+	// the 5m rate: 300 @ $10/Mtok = $0.003, never the $20 1h rate.
+	cost, priced, contributes, err := pgActivityReportRowStatus(
+		pgDailyUsageScanRow{
+			usageSource:              "provider",
+			model:                    "claude-agg",
+			cacheCreationInputTokens: 300,
+		}, resolver)
+	require.NoError(t, err)
+	assert.True(t, priced)
+	assert.True(t, contributes)
+	assert.Equal(t, money.MustParseDollars("0.003"), cost)
 }

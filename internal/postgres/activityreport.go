@@ -529,6 +529,7 @@ func pgActivityReportRowStatus(
 ) (cost money.Money, priced, contributes bool, err error) {
 	var inTok, outTok, crTok, rdTok int
 	reasoningTok := r.reasoningTokens
+	var cr5mTok, cr1hTok int
 	if r.usageSource == "message" {
 		usage := gjson.Parse(r.tokenJSON)
 		inTok = pgTokenJSONCount(usage, "input_tokens")
@@ -536,11 +537,13 @@ func pgActivityReportRowStatus(
 		crTok = pgTokenJSONCount(usage, "cache_creation_input_tokens")
 		rdTok = pgTokenJSONCount(usage, "cache_read_input_tokens")
 		reasoningTok = pgTokenJSONCount(usage, "reasoning_tokens")
+		cr5mTok, cr1hTok = pgCacheWriteSplit(usage, crTok)
 	} else {
 		inTok, outTok, crTok, rdTok = pgUsageEventRowTokens(
 			r.usageSource,
 			r.inputTokens, r.outputTokens,
 			r.cacheCreationInputTokens, r.cacheReadInputTokens)
+		cr5mTok, cr1hTok = crTok, 0
 	}
 
 	if r.cost.Valid {
@@ -557,7 +560,7 @@ func pgActivityReportRowStatus(
 		return money.Money{}, false, true, nil
 	}
 	cost, err = lookup.Rates.CostForTokens(
-		inTok, outTok, reasoningTok, crTok, rdTok)
+		inTok, outTok, reasoningTok, cr5mTok, cr1hTok, rdTok)
 	if err != nil {
 		return money.Money{}, false, false,
 			fmt.Errorf("pricing pg activity usage for model %q: %w", r.model, err)

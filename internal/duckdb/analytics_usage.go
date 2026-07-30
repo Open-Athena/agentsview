@@ -2853,18 +2853,20 @@ func (s *Store) GetTrendsTerms(
 }
 
 type duckRates struct {
-	input         money.Money
-	output        money.Money
-	cacheCreation money.Money
-	cacheRead     money.Money
-	updatedAt     *time.Time
-	source        export.PricingRowSource
+	input           money.Money
+	output          money.Money
+	cacheCreation   money.Money
+	cacheCreation1h money.Money
+	cacheRead       money.Money
+	updatedAt       *time.Time
+	source          export.PricingRowSource
 }
 
 func (s *Store) loadPricing(ctx context.Context) (map[string]duckRates, error) {
 	rows, err := s.queryContext(ctx, `
 		SELECT model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
-			cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok, updated_at
+			cache_creation_microdollars_per_mtok, cache_creation_1h_microdollars_per_mtok,
+			cache_read_microdollars_per_mtok, updated_at
 		FROM model_pricing`)
 	if err != nil {
 		return nil, err
@@ -2878,7 +2880,7 @@ func (s *Store) loadPricing(ctx context.Context) (map[string]duckRates, error) {
 		var updatedAt string
 		if err := rows.Scan(
 			&model, &rates.input, &rates.output,
-			&rates.cacheCreation, &rates.cacheRead, &updatedAt,
+			&rates.cacheCreation, &rates.cacheCreation1h, &rates.cacheRead, &updatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -2906,6 +2908,9 @@ func (s *Store) loadPricing(ctx context.Context) (map[string]duckRates, error) {
 			cacheCreation: money.Money{
 				Microdollars: custom.CacheCreationMicrodollarsPerMTok,
 			},
+			// Custom rates carry no separate 1h value. Leaving it zero makes
+			// CostForTokens defensively bill 1h tokens at the custom 5m
+			// cache-write rate, matching the SQLite backend's behavior.
 			cacheRead: money.Money{
 				Microdollars: custom.CacheReadMicrodollarsPerMTok,
 			},
@@ -2928,11 +2933,12 @@ func duckFallbackPricingMap() map[string]duckRates {
 			continue
 		}
 		out[p.ModelPattern] = duckRates{
-			input:         p.InputPerMTok,
-			output:        p.OutputPerMTok,
-			cacheCreation: p.CacheCreationPerMTok,
-			cacheRead:     p.CacheReadPerMTok,
-			source:        export.PricingRowSourceEmbedded,
+			input:           p.InputPerMTok,
+			output:          p.OutputPerMTok,
+			cacheCreation:   p.CacheCreationPerMTok,
+			cacheCreation1h: p.CacheCreation1hPerMTok,
+			cacheRead:       p.CacheReadPerMTok,
+			source:          export.PricingRowSourceEmbedded,
 		}
 	}
 	return out
@@ -2950,6 +2956,19 @@ func duckPricingSource(model string, rates duckRates) export.PricingRowSource {
 	return export.PricingRowSourceFetched
 }
 
+// duckCacheWrite1hRate resolves the 1-hour ephemeral cache-write rate. The 1h
+// value falls back to the 5m rate when the column is unpopulated, so 1h writes
+// are billed rather than dropped to zero; mirrors internal/db loadPricingMap.
+// The savings path reads CacheWrite1hPerMTok directly (not via CostForTokens),
+// so it must be populated here rather than relying on CostForTokens' internal
+// fallback.
+func duckCacheWrite1hRate(fiveMinute, oneHour money.Money) money.Money {
+	if oneHour == (money.Money{}) && fiveMinute.Microdollars > 0 {
+		return fiveMinute
+	}
+	return oneHour
+}
+
 func duckPricingRows(
 	in map[string]duckRates,
 ) []export.EffectivePricingRow {
@@ -2965,9 +2984,11 @@ func duckPricingRows(
 				InputPerMTok:      rates.input,
 				OutputPerMTok:     rates.output,
 				CacheWritePerMTok: rates.cacheCreation,
-				CacheReadPerMTok:  rates.cacheRead,
-				UpdatedAt:         rates.updatedAt,
-				Source:            source,
+				CacheWrite1hPerMTok: duckCacheWrite1hRate(
+					rates.cacheCreation, rates.cacheCreation1h),
+				CacheReadPerMTok: rates.cacheRead,
+				UpdatedAt:        rates.updatedAt,
+				Source:           source,
 			},
 		})
 	}
@@ -3485,9 +3506,13 @@ type duckUsageAggregateRow struct {
 	billableInput int
 	// Output-rate billable tokens. SQL folds reasoning-only rows into this
 	// value before grouping because reasoning is otherwise a row-level choice.
-	billableOutput        int
-	billableReason        int
-	billableCacheCr       int
+	billableOutput  int
+	billableReason  int
+	billableCacheCr int
+	// cacheCr1h is the RAW (ungated) 1-hour ephemeral cache-write count. The
+	// cost split reconciles it against billableCacheCr; the savings split
+	// reconciles it against the raw cacheCr, matching SQLite's dailyUsageAmounts.
+	cacheCr1h             int
 	billableCacheRd       int
 	explicitCost          int64
 	reportedCostRows      int
@@ -3513,7 +3538,7 @@ type duckSessionUsageRow struct {
 func duckUsageAggregateCost(
 	model string,
 	inputTok, outputTok, cacheCr, cacheRd int,
-	billableInput, billableOutput, billableReasoning, billableCacheCr, billableCacheRd int,
+	billableInput, billableOutput, billableReasoning, billableCacheCr, cacheCr1h, billableCacheRd int,
 	explicitCost int64,
 	hasReportedCost bool,
 	pricing *export.PricingResolver,
@@ -3529,9 +3554,21 @@ func duckUsageAggregateCost(
 	}
 	lookup := pricing.Lookup(model)
 	rates := lookup.Rates
+	// Split the billable cache-creation total into 5m/1h ephemeral buckets. The
+	// raw 1h count is extracted from JSON; the 5m bucket is the remainder so the
+	// two always sum to the billable aggregate and pre-split rows land entirely
+	// in 5m. For reported-cost rows billableCacheCr is 0, so the guard zeroes
+	// both buckets (explicitCost already covers the row). The guard also defends
+	// against malformed data where the 1h count exceeds the billable total.
+	cr1h := cacheCr1h
+	cr5m := billableCacheCr - cr1h
+	if cr5m < 0 {
+		cr5m = billableCacheCr
+		cr1h = 0
+	}
 	computed, err := rates.CostForTokens(
 		billableInput, billableOutput, billableReasoning,
-		billableCacheCr, billableCacheRd)
+		cr5m, cr1h, billableCacheRd)
 	if err != nil {
 		return money.Money{}, money.Money{}, false, false,
 			fmt.Errorf("pricing duckdb usage for model %q: %w", model, err)
@@ -3553,14 +3590,30 @@ func duckUsageAggregateCost(
 		return money.Money{}, money.Money{}, false, false,
 			fmt.Errorf("deriving duckdb cache read rate for model %q: %w", model, err)
 	}
-	creationRate, err := money.Sub(rates.InputPerMTok, rates.CacheWritePerMTok)
+	cr5mRate, err := money.Sub(rates.InputPerMTok, rates.CacheWritePerMTok)
 	if err != nil {
 		return money.Money{}, money.Money{}, false, false,
-			fmt.Errorf("deriving duckdb cache creation rate for model %q: %w", model, err)
+			fmt.Errorf("deriving duckdb 5m cache creation rate for model %q: %w", model, err)
+	}
+	cr1hRate, err := money.Sub(rates.InputPerMTok, rates.CacheWrite1hPerMTok)
+	if err != nil {
+		return money.Money{}, money.Money{}, false, false,
+			fmt.Errorf("deriving duckdb 1h cache creation rate for model %q: %w", model, err)
+	}
+	// Split the RAW cache-creation total into 5m/1h so savings mirror SQLite's
+	// dailyUsageAmounts: 1h writes save less (Input - 2x rate) than 5m writes
+	// (Input - 1.25x rate). Uses raw counts regardless of reported cost. The
+	// guard defends against a 1h count exceeding the raw total.
+	sCr1h := cacheCr1h
+	sCr5m := cacheCr - sCr1h
+	if sCr5m < 0 {
+		sCr5m = cacheCr
+		sCr1h = 0
 	}
 	savings, err := money.SignedCostPerMillion([]money.RatedTokens{
 		{Tokens: int64(cacheRd), Rate: readRate},
-		{Tokens: int64(cacheCr), Rate: creationRate},
+		{Tokens: int64(sCr5m), Rate: cr5mRate},
+		{Tokens: int64(sCr1h), Rate: cr1hRate},
 	})
 	if err != nil {
 		return money.Money{}, money.Money{}, false, false,
@@ -3675,6 +3728,7 @@ func (s *Store) forEachDailyUsageAggregateRow(
 			END AS billable_output_tokens,
 			CAST(0 AS BIGINT) AS billable_reasoning_tokens,
 			CASE WHEN cost_microdollars IS NULL OR cost_source = 'copilot-reported' THEN cache_create_norm ELSE 0 END AS billable_cache_creation_tokens,
+			CASE WHEN source = 'message' THEN COALESCE(TRY_CAST(json_extract_string(token_json, '$.cache_creation.ephemeral_1h_input_tokens') AS BIGINT), 0) ELSE 0 END AS cache_creation_1h_tokens,
 			CASE WHEN cost_microdollars IS NULL OR cost_source = 'copilot-reported' THEN cache_read_norm ELSE 0 END AS billable_cache_read_tokens,
 			CASE WHEN cost_microdollars IS NOT NULL AND cost_source != 'copilot-reported' THEN cost_microdollars ELSE 0 END AS explicit_cost,
 			CASE WHEN cost_microdollars IS NOT NULL AND cost_source != 'copilot-reported' THEN 1 ELSE 0 END AS reported_cost_rows,
@@ -3693,7 +3747,7 @@ func (s *Store) forEachDailyUsageAggregateRow(
 			&r.sessionID, &r.date, &r.project, &r.agent, &r.machine, &r.model,
 			&r.inputTok, &r.outputTok, &r.cacheCr, &r.cacheRd,
 			&r.billableInput, &r.billableOutput, &r.billableReason,
-			&r.billableCacheCr, &r.billableCacheRd,
+			&r.billableCacheCr, &r.cacheCr1h, &r.billableCacheRd,
 			&r.explicitCost, &r.reportedCostRows,
 			&r.authoritativeCost, &r.authoritativeCostRows,
 		); err != nil {
@@ -3760,7 +3814,7 @@ func (s *Store) GetDailyUsage(
 			r.model,
 			r.inputTok, r.outputTok, r.cacheCr, r.cacheRd,
 			r.billableInput, r.billableOutput, r.billableReason,
-			r.billableCacheCr, r.billableCacheRd,
+			r.billableCacheCr, r.cacheCr1h, r.billableCacheRd,
 			r.explicitCost,
 			r.reportedCostRows > 0,
 			rateResolver,
@@ -4069,6 +4123,7 @@ func (s *Store) forEachSessionUsageAggregateRow(
 			END AS billable_output_tokens,
 			CAST(0 AS BIGINT) AS billable_reasoning_tokens,
 			CASE WHEN cost_microdollars IS NULL OR cost_source = 'copilot-reported' THEN cache_create_norm ELSE 0 END AS billable_cache_creation_tokens,
+			CASE WHEN source = 'message' THEN COALESCE(TRY_CAST(json_extract_string(token_json, '$.cache_creation.ephemeral_1h_input_tokens') AS BIGINT), 0) ELSE 0 END AS cache_creation_1h_tokens,
 			CASE WHEN cost_microdollars IS NULL OR cost_source = 'copilot-reported' THEN cache_read_norm ELSE 0 END AS billable_cache_read_tokens,
 			CASE WHEN cost_microdollars IS NOT NULL AND cost_source != 'copilot-reported' THEN cost_microdollars ELSE 0 END AS explicit_cost,
 			CASE WHEN cost_microdollars IS NOT NULL AND cost_source != 'copilot-reported' THEN 1 ELSE 0 END AS reported_cost_rows,
@@ -4090,7 +4145,7 @@ func (s *Store) forEachSessionUsageAggregateRow(
 			&r.displayName, &startedAt,
 			&r.inputTok, &r.outputTok, &r.cacheCr, &r.cacheRd,
 			&r.billableInput, &r.billableOutput, &r.billableReason,
-			&r.billableCacheCr, &r.billableCacheRd,
+			&r.billableCacheCr, &r.cacheCr1h, &r.billableCacheRd,
 			&r.explicitCost, &r.reportedCostRows,
 			&r.authoritativeCost, &r.authoritativeCostRows,
 		); err != nil {
@@ -4201,7 +4256,7 @@ func (s *Store) GetTopSessionsByCost(
 				r.model,
 				r.inputTok, r.outputTok, r.cacheCr, r.cacheRd,
 				r.billableInput, r.billableOutput, r.billableReason,
-				r.billableCacheCr, r.billableCacheRd,
+				r.billableCacheCr, r.cacheCr1h, r.billableCacheRd,
 				r.explicitCost,
 				r.reportedCostRows > 0,
 				rateResolver,
@@ -4409,7 +4464,7 @@ func (s *Store) GetSessionUsage(
 				r.model,
 				r.inputTok, r.outputTok, r.cacheCr, r.cacheRd,
 				r.billableInput, r.billableOutput, r.billableReason,
-				r.billableCacheCr, r.billableCacheRd,
+				r.billableCacheCr, r.cacheCr1h, r.billableCacheRd,
 				r.explicitCost,
 				r.reportedCostRows > 0,
 				rateResolver,
