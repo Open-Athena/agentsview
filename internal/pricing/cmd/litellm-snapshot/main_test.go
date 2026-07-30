@@ -201,7 +201,10 @@ func TestRestoreSnapshotFileFetchesPinnedArtifactAfterBranchAdvances(t *testing.
 	branch := runGit(t, remote, "branch", "--show-current")
 
 	clone := filepath.Join(t.TempDir(), "clone")
-	runGit(t, "", "clone", "--depth=1", fileURLForPath(remote), clone)
+	// Force the remote name to "origin": restoreSnapshotFile fetches from
+	// "origin", but a developer's global clone.defaultRemoteName would
+	// otherwise name it something else and break the fetch.
+	runGit(t, "", "clone", "--origin", "origin", "--depth=1", fileURLForPath(remote), clone)
 	cwd, err := os.Getwd()
 	require.NoError(t, err)
 	require.NoError(t, os.Chdir(clone))
