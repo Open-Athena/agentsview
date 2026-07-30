@@ -6,6 +6,7 @@ export type DbWorktreeProjectMapping = {
   created_at: string;
   enabled: boolean;
   id: number;
+  layout: string;
   machine: string;
   path_prefix: string;
   project: string;

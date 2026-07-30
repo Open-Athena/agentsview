@@ -61,12 +61,13 @@ docker run --rm -p 127.0.0.1:8080:8080 \
 ## Quick Start
 
 ```bash
-agentsview serve               # start foreground server
-agentsview serve --background  # start server and return to the shell
-agentsview serve status        # show whether a server is running
-agentsview serve stop          # stop the running server
-agentsview session list        # read from the daemon if warm, otherwise SQLite
-agentsview usage daily         # print daily cost summary
+agentsview serve           # start the server in the foreground
+agentsview daemon start    # start the writable SQLite daemon
+agentsview daemon status   # show daemon status
+agentsview daemon restart  # restart from current configuration
+agentsview daemon stop     # stop the writable daemon
+agentsview session list    # read from the daemon if warm, otherwise SQLite
+agentsview usage daily     # print daily cost summary
 ```
 
 On first run, agentsview discovers sessions from every supported agent on your
@@ -93,11 +94,16 @@ back to direct read-only SQLite on a cold archive so one-off scripts stay fast.
 Commands that need fresh data or need to write, such as `sync`, `usage`,
 `token-use`, `pg push`, and `duckdb push`, auto-start the daemon when needed.
 
-Use `agentsview serve --background` when you want to start the daemon
-explicitly. The command prints the server URL, process ID, and log path
-(`~/.agentsview/serve.log`). Check on it with `agentsview serve status` and shut
-it down with `agentsview serve stop`. Background daemons self-exit after an idle
-period unless a client request or daemon-owned job is active.
+Use `agentsview daemon start` when you want to start the writable SQLite daemon
+explicitly. It loads the normal effective configuration from `config.toml` and
+supported environment variables; `daemon start` and `daemon restart` accept no
+serve-specific flags. Background daemons self-exit after an idle period unless a
+client request or daemon-owned job is active.
+
+The existing `agentsview serve --background`, `agentsview serve status`, and
+`agentsview serve stop` commands remain available. Use `serve --background` when
+a one-off daemon needs a serve-only flag, such as `--no-sync` or an
+unauthenticated non-loopback `--host` override.
 
 ## Remote / forwarded access
 
@@ -187,10 +193,13 @@ docker run --rm -p 127.0.0.1:9494:9494 \
     --allow-insecure
 
 # Serve the web UI from a remote Quack endpoint.
+# The client url uses the native quack:HOST:PORT form; the Quack extension
+# does not accept quack:http:// or quack:https:// urls. A non-loopback host
+# needs --allow-insecure.
 docker run --rm -p 127.0.0.1:8080:8080 \
-  -e AGENTSVIEW_DUCKDB_URL='quack:https://duckdb.example.com' \
+  -e AGENTSVIEW_DUCKDB_URL='quack:duckdb.example.com:9494' \
   -e AGENTSVIEW_DUCKDB_TOKEN="$QUACK_TOKEN" \
-  ghcr.io/kenn-io/agentsview:latest duckdb serve
+  ghcr.io/kenn-io/agentsview:latest duckdb serve --allow-insecure
 ```
 
 Keep Quack on loopback or behind TLS. Plain HTTP Quack on a non-loopback bind
@@ -223,6 +232,7 @@ agentsview usage statusline
 Features:
 
 - Automatic pricing via LiteLLM rates (with offline fallback)
+- Authoritative Copilot CLI billing totals when session logs provide them
 - Prompt-caching-aware cost calculation (cache creation / read tokens)
 - Per-model breakdown with `--breakdown`
 - Date filtering (`--since`, `--until`, `--all`), agent filtering (`--agent`)
@@ -234,9 +244,9 @@ Features:
 
 `agentsview session usage <id>` prints per-session token statistics plus a cost
 estimate for a single session. The output reports the session's total output
-tokens and peak context tokens, plus a cost estimate in USD (`cost_usd`) when
-pricing is available for the session's model(s) (`has_cost`). Cost is computed
-from input/output and cache tokens internally, but only the output-token and
+tokens and peak context tokens, plus a cost estimate (`cost`) when pricing is
+available for the session's model(s) (`has_cost`). Cost is computed from
+input/output and cache tokens internally, but only the output-token and
 peak-context totals are reported alongside the cost.
 
 ```bash
@@ -254,10 +264,13 @@ GET /api/v1/sessions/{id}/usage
 ```
 
 The response includes the `session_id`, `agent`, `project`,
-`total_output_tokens`, `peak_context_tokens`, `has_token_data`, `cost_usd`,
+`total_output_tokens`, `peak_context_tokens`, `has_token_data`, `cost`,
 `has_cost`, `models`, and `unpriced_models` fields from the CLI JSON schema.
-HTTP responses also include `server_running: true`. Existing sessions return
-`200` even when token or cost data is absent; missing sessions return `404`.
+Machine-readable money is always an integer microdollar object, for example
+`{"cost":{"microdollars":2410000}}`; CLI tables and labels render that value as
+ordinary dollars. HTTP responses also include `server_running: true`. Existing
+sessions return `200` even when token or cost data is absent; missing sessions
+return `404`.
 
 The deprecated alias `agentsview token-use <id>` remains available for
 compatibility and now also reports cost estimates.
@@ -302,6 +315,11 @@ agentsview stats --include-git-outcomes
 | ![Search](https://agentsview.io/assets/generated/screenshots/search-results.png) | ![Heatmap](https://agentsview.io/assets/generated/screenshots/heatmap.png) |
 
 - **Full-text search** across all message content (FTS5)
+- **Semantic search** (opt-in) -- index session content with any
+  OpenAI-compatible embeddings endpoint and search by meaning with
+  `agentsview session search --semantic` or `--hybrid`; every content-search
+  match cites the conversation unit it came from
+  ([docs](https://agentsview.io/semantic-search/))
 - **Token usage and cost dashboard** -- per-session and per-model cost
   breakdowns, daily spend charts, all in the web UI
 - **Analytics dashboard** -- activity heatmaps, tool usage, velocity metrics,
@@ -340,9 +358,11 @@ thread JSON files.
 | Forge                 | `~/.forge/`                                                                                                                                                             |
 | Gemini CLI            | `~/.gemini/`                                                                                                                                                            |
 | gptme                 | `~/.local/share/gptme/logs/`                                                                                                                                            |
+| Grok                  | `~/.grok/sessions/`                                                                                                                                                     |
 | Hermes Agent          | `~/.hermes/sessions/`                                                                                                                                                   |
 | iFlow                 | `~/.iflow/projects/`                                                                                                                                                    |
 | Kilo                  | `~/.local/share/kilo/`                                                                                                                                                  |
+| Kilo (legacy)         | `~/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code/` (macOS), `~/.config/Code/User/globalStorage/kilocode.kilo-code/` (Linux)                     |
 | Kimi                  | `~/.kimi/sessions/`                                                                                                                                                     |
 | Kiro CLI              | `~/.kiro/sessions/cli/`, `~/.local/share/kiro-cli/`                                                                                                                     |
 | Kiro IDE              | `~/Library/Application Support/Kiro/` (macOS)                                                                                                                           |
@@ -353,18 +373,32 @@ thread JSON files.
 | OpenHands CLI         | `~/.openhands/conversations/`                                                                                                                                           |
 | OhMyPi                | `~/.omp/agent/sessions/`                                                                                                                                                |
 | Pi                    | `~/.pi/agent/sessions/`                                                                                                                                                 |
+| Poolside              | `~/Library/Application Support/poolside/trajectories/` (macOS), `~/.local/state/poolside/trajectories/` (Linux), `%APPDATA%\\poolside\\trajectories\\` (Windows) |
 | Piebald               | `~/.local/share/piebald/`                                                                                                                                               |
+| Posit Assistant       | `~/.posit/assistant/workspaces/`                                                                                                                                        |
 | Positron Assistant    | `~/Library/Application Support/Positron/User/` (macOS)                                                                                                                  |
 | QClaw                 | `~/.qclaw/agents/`                                                                                                                                                      |
+| Qoder                 | `~/.qoder/projects/`, `~/.qoderwork/projects/`                                                                                                                          |
 | Qwen Code             | `~/.qwen/projects/`                                                                                                                                                     |
 | QwenPaw               | `~/.copaw/workspaces/`, `~/.qwenpaw/workspaces/`                                                                                                                        |
 | Reasonix              | `~/.reasonix/`, `%APPDATA%\\reasonix\\` (Windows)                                                                                                                       |
+| RooCode               | `~/Library/Application Support/Code/User/globalStorage/rooveterinaryinc.roo-cline/` (macOS), `~/.config/Code/User/globalStorage/rooveterinaryinc.roo-cline/` (Linux), `%APPDATA%\\Code\\User\\globalStorage\\rooveterinaryinc.roo-cline\\` (Windows) |
 | VSCode Copilot        | `~/Library/Application Support/Code/User/` (macOS)                                                                                                                      |
 | Visual Studio Copilot | `%LOCALAPPDATA%\\Temp\\VSGitHubCopilotLogs\\traces\\` (Windows), `~/Library/Caches/VSGitHubCopilotLogs/traces/` (macOS), `~/.cache/VSGitHubCopilotLogs/traces/` (Linux) |
+| Windsurf              | `~/Library/Application Support/Windsurf/User/` (macOS), `~/.config/Windsurf/User/` (Linux), `%APPDATA%\\Windsurf\\User\\` (Windows)                                     |
+| Trae                  | `%APPDATA%\\Trae\\User\\` (Windows), `~/Library/Application Support/Trae/User/` (macOS), `~/.config/Trae/User/` (Linux)                                                                                             |
 | Warp                  | `~/.warp/` (platform-dependent)                                                                                                                                         |
 | WorkBuddy             | `~/.workbuddy/projects/`                                                                                                                                                |
+| ZCode                 | `~/.zcode/cli/db/`, `~/.zcode/cli/`                                                                                                                                     |
 | Zed                   | `~/Library/Application Support/Zed/` (macOS)                                                                                                                            |
 | Zencoder              | `~/.zencoder/sessions/`                                                                                                                                                 |
+
+Grok sessions are read from `summary.json` (title, timestamps, project),
+optional `signals.json` (token counters), and `chat_history.jsonl` when present
+for the full transcript (user turns, assistant replies, thinking, and tool
+calls). If `chat_history.jsonl` is missing, AgentsView falls back to
+summary-only mode. Set `GROK_DIR` or `grok_dirs` to override the default
+directory.
 
 Each directory can be overridden with an environment variable. See the
 [configuration docs](https://agentsview.io/configuration/) for details. Cursor
@@ -460,6 +494,13 @@ port and exporting `ANTIGRAVITY_DAEMON_URL` manually.
 Sidecars stay on your machine. agentsview makes no outbound request to produce
 or read them, and treats sidecars as untrusted structured input -- see
 [SECURITY.md](SECURITY.md) for the trust model.
+
+### Kilo vs Kilo (legacy).
+
+*Kilo* is the OpenCode-based CLI/editor core (`~/.local/share/kilo/kilo.db`); 
+it covers both the Kilo CLI and the rebuilt Kilo Code VS Code extension (after 
+March 2026), which shares that same database. *Kilo (legacy)* is the legacy RooCode-derived
+VS Code extension that wrote per-task JSON under `kilocode.kilo-code/tasks/`.
 
 ## PostgreSQL Sync
 

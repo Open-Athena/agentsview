@@ -2,9 +2,13 @@ package service_test
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -106,6 +110,34 @@ type readOnlyHTTPStore struct {
 }
 
 func (readOnlyHTTPStore) ReadOnly() bool { return true }
+
+type recallUnavailableHTTPStore struct {
+	readOnlyHTTPStore
+}
+
+type recallTransientHTTPStore struct {
+	*db.DB
+}
+
+func (recallTransientHTTPStore) QueryRecallEntries(
+	context.Context, db.RecallQuery,
+) (db.RecallPage, error) {
+	return db.RecallPage{}, fmt.Errorf(
+		"%w: embedding endpoint unavailable", db.ErrSemanticTransient,
+	)
+}
+
+func (recallUnavailableHTTPStore) GetRecallEntry(
+	context.Context, string,
+) (*db.RecallEntry, error) {
+	return nil, db.ErrReadOnly
+}
+
+func (recallUnavailableHTTPStore) QueryRecallEntries(
+	context.Context, db.RecallQuery,
+) (db.RecallPage, error) {
+	return db.RecallPage{}, db.ErrReadOnly
+}
 
 // requireWatchEvent reads from ch until an event with the given name
 // arrives, skipping other events, and returns it. It fails the test if
@@ -253,6 +285,298 @@ func TestHTTPBackend_List_StarredFilterRoundtrip(t *testing.T) {
 	assert.Equal(t, "starred-1", list.Sessions[0].ID)
 }
 
+func TestHTTPBackend_ListRecallEntriesRejectsNegativeLimitLocally(t *testing.T) {
+	t.Parallel()
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"entries":[]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	svc := service.NewHTTPBackend(srv.URL, "", false)
+	_, err := svc.ListRecallEntries(context.Background(), service.RecallFilter{
+		Limit: -1,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "limit must be non-negative")
+	assert.Equal(t, 0, calls)
+}
+
+func TestHTTPBackend_ListRecallEntriesIncludesSourceEpisodeIDParam(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/api/v1/recall/entries", r.URL.Path)
+		assert.Equal(t, "recall-session:chunk:0001", r.URL.Query().Get("source_episode_id"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"entries":[]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	svc := service.NewHTTPBackend(srv.URL, "", false)
+	_, err := svc.ListRecallEntries(context.Background(), service.RecallFilter{
+		SourceEpisodeID: "recall-session:chunk:0001",
+	})
+
+	require.NoError(t, err)
+}
+
+func TestHTTPBackend_ListRecallEntriesIncludesTrustedOnlyParam(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/api/v1/recall/entries", r.URL.Path)
+		assert.Equal(t, "true", r.URL.Query().Get("trusted_only"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"entries":[]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	svc := service.NewHTTPBackend(srv.URL, "", false)
+	list, err := svc.ListRecallEntries(context.Background(), service.RecallFilter{
+		TrustedOnly: true,
+	})
+
+	require.NoError(t, err)
+	encoded, err := json.Marshal(list)
+	require.NoError(t, err)
+	var raw map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(encoded, &raw))
+	require.Contains(t, raw, "trusted_only")
+	var trustedOnly bool
+	require.NoError(t, json.Unmarshal(raw["trusted_only"], &trustedOnly))
+	assert.True(t, trustedOnly)
+}
+
+func TestHTTPBackend_QueryRecallEntriesRejectsNegativeLimitLocally(t *testing.T) {
+	t.Parallel()
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"entries":[]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	svc := service.NewHTTPBackend(srv.URL, "", false)
+	_, err := svc.QueryRecallEntries(context.Background(), service.RecallQuery{
+		Query: "cwd",
+		Limit: -1,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "limit must be non-negative")
+	assert.Equal(t, 0, calls)
+}
+
+func TestHTTPBackend_QueryRecallEntriesIncludesSourceEpisodeID(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/api/v1/recall/query", r.URL.Path)
+		var got service.RecallQuery
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&got))
+		assert.Equal(t, "recall-session:chunk:0001", got.SourceEpisodeID)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"entries":[]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	svc := service.NewHTTPBackend(srv.URL, "", false)
+	_, err := svc.QueryRecallEntries(context.Background(), service.RecallQuery{
+		Query:           "cwd",
+		SourceEpisodeID: "recall-session:chunk:0001",
+	})
+
+	require.NoError(t, err)
+}
+
+func TestHTTPBackend_QueryRecallEntriesTransportsSkipRecording(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var got service.RecallQuery
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&got))
+		assert.True(t, got.SkipRecording)
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(service.RecallQueryResult{
+			Mode: db.RecallQueryModeLexical, RecallEntries: []db.RecallResult{},
+		}))
+	}))
+	t.Cleanup(srv.Close)
+
+	svc := service.NewHTTPBackend(srv.URL, "", false)
+	result, err := svc.QueryRecallEntries(context.Background(), service.RecallQuery{
+		Query: "read only recall", SkipRecording: true,
+	})
+
+	require.NoError(t, err)
+	assert.Empty(t, result.QueryID)
+}
+
+func TestHTTPBackend_QueryRecallEntriesRejectsNegativeContextMaxBytesLocally(t *testing.T) {
+	t.Parallel()
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"entries":[]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	svc := service.NewHTTPBackend(srv.URL, "", false)
+	_, err := svc.QueryRecallEntries(context.Background(), service.RecallQuery{
+		Query:           "cwd",
+		IncludeContext:  true,
+		ContextMaxBytes: -1,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "context_max_bytes must be non-negative")
+	assert.Equal(t, 0, calls)
+}
+
+func TestHTTPBackend_QueryRecallEntriesBuildsMissingSummaries(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/api/v1/recall/query", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(service.RecallQueryResult{
+			RecallEntries: []db.RecallResult{{
+				RecallEntry: db.RecallEntry{
+					ID:              "m-http-summary",
+					Type:            "procedure",
+					Scope:           "project",
+					Status:          "accepted",
+					Project:         "agentsview",
+					Agent:           "codex",
+					SourceSessionID: "recall-session",
+					SourceEpisodeID: "recall-session:chunk:0001",
+					SourceRunID:     "smoke-run",
+				},
+				MatchReasons: []string{"keyword", "evidence"},
+			}},
+			Context: "Relevant prior agentsview entries",
+			ContextMeta: &service.RecallContextMeta{
+				EntryCount:  1,
+				IncludedIDs: []string{"m-http-summary"},
+			},
+		}))
+	}))
+	t.Cleanup(srv.Close)
+
+	svc := service.NewHTTPBackend(srv.URL, "", false)
+	got, err := svc.QueryRecallEntries(context.Background(), service.RecallQuery{
+		Query:          "cwd failed reads",
+		IncludeContext: true,
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, got.Summary)
+	assert.Equal(t, 1, got.Summary.Count)
+	assert.Equal(t, 1, got.Summary.ByType["procedure"])
+	assert.Equal(t, 1, got.Summary.ByMatchReason["keyword"])
+	assert.Equal(t, 1, got.Summary.ByMatchReason["evidence"])
+	assert.Equal(t, 1, got.Summary.BySourceRun["smoke-run"])
+	assert.Equal(t, 1, got.Summary.BySourceEpisode["recall-session:chunk:0001"])
+	require.Len(t, got.ContextEntries, 1)
+	assert.Equal(t, "m-http-summary", got.ContextEntries[0].ID)
+	require.NotNil(t, got.ContextSummary)
+	assert.Equal(t, 1, got.ContextSummary.Count)
+	assert.Equal(t, 1, got.ContextSummary.BySourceSession["recall-session"])
+	assert.Equal(t, 1, got.ContextSummary.BySourceEpisode["recall-session:chunk:0001"])
+}
+
+func TestHTTPBackend_QueryRecallEntriesRejectsInconsistentContextEntries(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/api/v1/recall/query", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(service.RecallQueryResult{
+			RecallEntries: []db.RecallResult{
+				{RecallEntry: db.RecallEntry{ID: "m-packed"}},
+				{RecallEntry: db.RecallEntry{ID: "m-other"}},
+			},
+			Context: "Relevant prior agentsview entries",
+			ContextMeta: &service.RecallContextMeta{
+				EntryCount:  1,
+				IncludedIDs: []string{"m-packed"},
+			},
+			ContextEntries: []db.RecallResult{
+				{RecallEntry: db.RecallEntry{ID: "m-other"}},
+			},
+		}))
+	}))
+	t.Cleanup(srv.Close)
+
+	svc := service.NewHTTPBackend(srv.URL, "", false)
+	_, err := svc.QueryRecallEntries(context.Background(), service.RecallQuery{
+		Query:          "cwd failed reads",
+		IncludeContext: true,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(),
+		"context_entries ids must match context_meta.included_ids")
+}
+
+func TestHTTPBackend_QueryRecallEntriesRejectsMissingContextRecallEntryRows(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/api/v1/recall/query", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(service.RecallQueryResult{
+			RecallEntries: []db.RecallResult{},
+			Context:       "Relevant prior agentsview entries",
+			ContextMeta: &service.RecallContextMeta{
+				EntryCount:  1,
+				IncludedIDs: []string{"m-packed"},
+			},
+		}))
+	}))
+	t.Cleanup(srv.Close)
+
+	svc := service.NewHTTPBackend(srv.URL, "", false)
+	_, err := svc.QueryRecallEntries(context.Background(), service.RecallQuery{
+		Query:          "cwd failed reads",
+		IncludeContext: true,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(),
+		"context_entries ids must match context_meta.included_ids")
+}
+
+func TestHTTPBackend_QueryRecallEntriesReportsTrustedOnlyFallback(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/api/v1/recall/query", r.URL.Path)
+		var req service.RecallQuery
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		assert.True(t, req.TrustedOnly)
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(service.RecallQueryResult{
+			RecallEntries: []db.RecallResult{},
+		}))
+	}))
+	t.Cleanup(srv.Close)
+
+	svc := service.NewHTTPBackend(srv.URL, "", false)
+	got, err := svc.QueryRecallEntries(context.Background(), service.RecallQuery{
+		Query:       "cwd failed reads",
+		TrustedOnly: true,
+	})
+
+	require.NoError(t, err)
+	encoded, err := json.Marshal(got)
+	require.NoError(t, err)
+	var raw map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(encoded, &raw))
+	require.Contains(t, raw, "trusted_only")
+	var trustedOnly bool
+	require.NoError(t, json.Unmarshal(raw["trusted_only"], &trustedOnly))
+	assert.True(t, trustedOnly)
+}
+
 func TestHTTPBackend_List_InvalidDate(t *testing.T) {
 	t.Parallel()
 	env := newHTTPBackendEnv(t)
@@ -310,6 +634,71 @@ func TestHTTPBackend_Messages_DescDirection(t *testing.T) {
 		"desc iteration should return highest ordinal first")
 }
 
+func TestHTTPBackend_Messages_AroundRoundtrip(t *testing.T) {
+	t.Parallel()
+	env := newHTTPBackendEnv(t)
+	const sid = "msg-around"
+	dbtest.SeedSessionWithMessages(t, env.DB, sid, "p1",
+		dbtest.UserMessagesf(sid, 12, "m%d"), dbtest.WithMessageCount(12))
+
+	svc := env.Backend("", false)
+	around := 6
+	list, err := svc.Messages(context.Background(), sid, service.MessageFilter{
+		Around: &around,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, list)
+	require.Equal(t, 11, list.Count,
+		"default before=5/after=5 around ordinal 6 spans ordinals 1..11")
+	assert.Equal(t, 1, list.Messages[0].Ordinal)
+	assert.Equal(t, 11, list.Messages[len(list.Messages)-1].Ordinal)
+	require.NotNil(t, list.FirstOrdinal)
+	require.NotNil(t, list.LastOrdinal)
+	assert.Equal(t, 1, *list.FirstOrdinal)
+	assert.Equal(t, 11, *list.LastOrdinal)
+}
+
+func TestHTTPBackend_Messages_RolesRoundtrip(t *testing.T) {
+	t.Parallel()
+	env := newHTTPBackendEnv(t)
+	const sid = "msg-roles"
+	dbtest.SeedSessionWithMessages(t, env.DB, sid, "p1", []db.Message{
+		dbtest.UserMsg(sid, 0, "u0"),
+		dbtest.AsstMsg(sid, 1, "a1"),
+		dbtest.UserMsg(sid, 2, "u2"),
+	}, dbtest.WithMessageCount(3))
+
+	svc := env.Backend("", false)
+	zero := 0
+	list, err := svc.Messages(context.Background(), sid, service.MessageFilter{
+		From:  &zero,
+		Limit: 100,
+		Roles: []string{"user"},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, list)
+	require.Equal(t, 2, list.Count)
+	for _, m := range list.Messages {
+		assert.Equal(t, "user", m.Role)
+	}
+}
+
+func TestHTTPBackend_Messages_AroundValidationErrorSurfaces(t *testing.T) {
+	t.Parallel()
+	env := newHTTPBackendEnv(t)
+	const sid = "msg-validation"
+	dbtest.SeedSessionWithMessages(t, env.DB, sid, "p1",
+		dbtest.UserMessagesf(sid, 3, "m%d"), dbtest.WithMessageCount(3))
+
+	svc := env.Backend("", false)
+	around, from := 1, 0
+	_, err := svc.Messages(context.Background(), sid, service.MessageFilter{
+		Around: &around,
+		From:   &from,
+	})
+	require.Error(t, err)
+}
+
 func TestHTTPBackend_ToolCalls_Empty(t *testing.T) {
 	t.Parallel()
 	env := newHTTPBackendEnv(t)
@@ -355,6 +744,151 @@ func TestHTTPBackend_Sync_RemoteReadOnly(t *testing.T) {
 		Path: "/tmp/whatever",
 	})
 	require.ErrorIs(t, err, db.ErrReadOnly)
+}
+
+func TestHTTPBackend_ImportRecallEntries_ReadOnly(t *testing.T) {
+	t.Parallel()
+	env := newHTTPBackendEnv(t)
+
+	svc := env.Backend("", true)
+	_, err := svc.ImportRecallEntries(
+		context.Background(),
+		strings.NewReader(""),
+		db.RecallImportOptions{DryRun: true},
+	)
+	require.Error(t, err)
+	// Mirrors Sync/ScanSecrets: a read-only backend short-circuits to the
+	// shared sentinel instead of posting to the import endpoint.
+	assert.True(t, errors.Is(err, db.ErrReadOnly),
+		"want db.ErrReadOnly, got %v", err)
+	assert.Contains(t, err.Error(), env.BaseURL)
+}
+
+func TestHTTPBackend_ImportRecallEntries_RemoteReadOnly(t *testing.T) {
+	t.Parallel()
+	// A read-only (pg serve) daemon answers write endpoints with 501. The
+	// backend is not marked read-only locally, so the round-trip must surface
+	// the remote's state as db.ErrReadOnly rather than a bare HTTP error.
+	srv := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNotImplemented)
+		}))
+	defer srv.Close()
+
+	be := service.NewHTTPBackend(srv.URL, "", false)
+	_, err := be.ImportRecallEntries(
+		context.Background(),
+		strings.NewReader(""),
+		db.RecallImportOptions{},
+	)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, db.ErrReadOnly),
+		"want db.ErrReadOnly, got %v", err)
+	assert.Contains(t, err.Error(), srv.URL)
+}
+
+func TestHTTPBackend_RecallReads_RemoteReadOnly(t *testing.T) {
+	t.Parallel()
+	env := newHTTPBackendEnv(t, withHTTPStore(func(d *db.DB) db.Store {
+		return recallUnavailableHTTPStore{
+			readOnlyHTTPStore: readOnlyHTTPStore{DB: d},
+		}
+	}))
+	svc := env.Backend("", false)
+
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "list",
+			run: func() error {
+				_, err := svc.ListRecallEntries(context.Background(), service.RecallFilter{})
+				return err
+			},
+		},
+		{
+			name: "get",
+			run: func() error {
+				_, err := svc.GetRecallEntry(context.Background(), "entry-1")
+				return err
+			},
+		},
+		{
+			name: "query",
+			run: func() error {
+				_, err := svc.QueryRecallEntries(context.Background(), service.RecallQuery{
+					Query: "retry policy",
+				})
+				return err
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.run()
+			require.ErrorIs(t, err, db.ErrReadOnly)
+			assert.Contains(t, err.Error(), env.BaseURL)
+		})
+	}
+}
+
+func TestHTTPBackend_QueryRecallVector501PreservesSemanticCause(t *testing.T) {
+	t.Parallel()
+	body := service.ErrSemanticUnavailable.Error() + ": recall index is stale"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotImplemented)
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]string{
+			"error": body,
+		}))
+	}))
+	t.Cleanup(srv.Close)
+
+	be := service.NewHTTPBackend(srv.URL, "", false)
+	_, err := be.QueryRecallEntries(context.Background(), service.RecallQuery{
+		Query: "retry policy",
+		Mode:  "VECTOR",
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, service.ErrSemanticUnavailable)
+	assert.Equal(t, body, err.Error())
+}
+
+func TestHTTPBackend_QueryRecallVector503PreservesTransientCause(t *testing.T) {
+	env := newHTTPBackendEnv(t, withHTTPStore(func(d *db.DB) db.Store {
+		return recallTransientHTTPStore{DB: d}
+	}))
+
+	_, err := env.Backend("", false).QueryRecallEntries(
+		context.Background(),
+		service.RecallQuery{Query: "retry policy", Mode: db.RecallQueryModeVector},
+	)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, db.ErrSemanticTransient)
+	assert.Contains(t, err.Error(), "embedding endpoint unavailable")
+}
+
+func TestHTTPBackend_QueryRecallRejectsResponseModeMismatch(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(service.RecallQueryResult{
+			Mode:          db.RecallQueryModeLexical,
+			RecallEntries: []db.RecallResult{},
+		}))
+	}))
+	t.Cleanup(srv.Close)
+
+	be := service.NewHTTPBackend(srv.URL, "", false)
+	_, err := be.QueryRecallEntries(context.Background(), service.RecallQuery{
+		Query: "retry policy", Mode: db.RecallQueryModeHybrid,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "requested recall mode hybrid")
+	assert.Contains(t, err.Error(), "returned lexical")
 }
 
 func TestHTTPBackend_Watch_ReceivesSessionUpdated(t *testing.T) {
@@ -417,17 +951,62 @@ func TestHTTPSearchContent(t *testing.T) {
 			if r.URL.Query().Get("pattern") != "needle" {
 				t.Errorf("pattern = %s", r.URL.Query().Get("pattern"))
 			}
+			if r.URL.Query().Get("timezone") != "America/New_York" {
+				t.Errorf("timezone = %s", r.URL.Query().Get("timezone"))
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"matches":[{"session_id":"s1","location":"message"}],"next_cursor":0}`))
 		}))
 	defer srv.Close()
 	be := service.NewHTTPBackend(srv.URL, "", true)
 	res, err := be.SearchContent(context.Background(), service.ContentSearchRequest{
-		Pattern: "needle", Limit: 50,
+		Pattern: "needle", Timezone: "America/New_York", Limit: 50,
 	})
 	require.NoError(t, err)
 	require.Len(t, res.Matches, 1)
 	assert.Equal(t, "s1", res.Matches[0].SessionID)
+}
+
+func TestHTTPSearchContentSemanticSetsIntentHeader(t *testing.T) {
+	t.Parallel()
+	var gotIntent string
+	srv := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			gotIntent = r.Header.Get("X-AgentsView-Search-Intent")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"matches":[],"next_cursor":0}`))
+		}))
+	defer srv.Close()
+	be := service.NewHTTPBackend(srv.URL, "", true)
+
+	_, err := be.SearchContent(context.Background(), service.ContentSearchRequest{
+		Pattern: "needle", Mode: "semantic", Limit: 50,
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, "semantic", gotIntent)
+}
+
+func TestHTTPImportRecallEntriesPassesAllowProductionImport(t *testing.T) {
+	t.Parallel()
+	var gotAllow string
+	srv := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			gotAllow = r.URL.Query().Get("allow_production_import")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"imported":0,"skipped":0}`))
+		}))
+	defer srv.Close()
+	be := service.NewHTTPBackend(srv.URL, "", false)
+
+	_, err := be.ImportRecallEntries(
+		context.Background(),
+		strings.NewReader(""),
+		db.RecallImportOptions{AllowProductionImport: true},
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, "true", gotAllow)
 }
 
 func TestHTTPSearchContent_RealServer(t *testing.T) {
@@ -448,6 +1027,93 @@ func TestHTTPSearchContent_RealServer(t *testing.T) {
 	require.Len(t, res.Matches, 1)
 	assert.Equal(t, "cs-1", res.Matches[0].SessionID)
 	assert.Equal(t, "message", res.Matches[0].Location)
+}
+
+// TestHTTPSearchContent_501PreservesCauseDetail asserts that a 501 response
+// carrying cause-specific remediation text (the shape searcherAdapter's
+// translateSearchError produces for a still-building index) survives the
+// daemon round-trip instead of being collapsed to the bare
+// ErrSemanticUnavailable sentinel message.
+func TestHTTPSearchContent_501PreservesCauseDetail(t *testing.T) {
+	t.Parallel()
+	body := service.ErrSemanticUnavailable.Error() + ": index is building: 40% complete"
+	srv := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotImplemented)
+			_, _ = w.Write([]byte(`{"error":"` + body + `"}`))
+		}))
+	defer srv.Close()
+
+	be := service.NewHTTPBackend(srv.URL, "", true)
+	_, err := be.SearchContent(context.Background(), service.ContentSearchRequest{Pattern: "needle"})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, service.ErrSemanticUnavailable)
+	assert.Contains(t, err.Error(), "index is building: 40% complete")
+}
+
+func TestHTTPSearchContent_501PreservesBackendSpecificReason(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "DuckDB unsupported",
+			body: "semantic search not available: semantic search is not " +
+				"supported by the DuckDB backend",
+		},
+		{
+			name: "PostgreSQL vector disabled",
+			body: "semantic search not available: semantic search: PostgreSQL " +
+				"requires [vector] enabled with a matching [vector.embeddings] " +
+				"config and a generation pushed by 'agentsview pg push'",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(
+				func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusNotImplemented)
+					assert.NoError(t, json.NewEncoder(w).Encode(map[string]string{
+						"error": tt.body,
+					}))
+				}))
+			defer srv.Close()
+
+			be := service.NewHTTPBackend(srv.URL, "", true)
+			_, err := be.SearchContent(context.Background(), service.ContentSearchRequest{
+				Pattern: "needle", Mode: "semantic",
+			})
+			require.Error(t, err)
+			assert.ErrorIs(t, err, service.ErrSemanticUnavailable)
+			assert.Equal(t, tt.body, err.Error())
+			assert.NotContains(t, err.Error(), "agentsview embeddings build")
+		})
+	}
+}
+
+// TestHTTPSearchContent_501IdenticalToSentinelDoesNotDuplicate asserts that
+// when the 501 body's message is exactly the sentinel's own text (no extra
+// cause — e.g. ErrNoActiveGeneration's case), the client returns the bare
+// sentinel rather than a message with the sentinel text repeated twice.
+func TestHTTPSearchContent_501IdenticalToSentinelDoesNotDuplicate(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotImplemented)
+			_, _ = w.Write([]byte(`{"error":"` + service.ErrSemanticUnavailable.Error() + `"}`))
+		}))
+	defer srv.Close()
+
+	be := service.NewHTTPBackend(srv.URL, "", true)
+	_, err := be.SearchContent(context.Background(), service.ContentSearchRequest{Pattern: "needle"})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, service.ErrSemanticUnavailable)
+	assert.Equal(t, service.ErrSemanticUnavailable.Error(), err.Error(),
+		"the sentinel text must not be duplicated when the body carries no extra cause")
 }
 
 func TestNewHTTPBackend_TrimsTrailingSlash(t *testing.T) {

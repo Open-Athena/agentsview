@@ -40,7 +40,7 @@ func (f piProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 
 type piProvider struct {
 	ProviderBase
-	sources DirectoryJSONLSourceSet
+	sources JSONLSourceSet
 }
 
 func (p *piProvider) Discover(ctx context.Context) ([]SourceRef, error) {
@@ -49,6 +49,16 @@ func (p *piProvider) Discover(ctx context.Context) ([]SourceRef, error) {
 		return nil, err
 	}
 	return p.filterDiscoveredSources(sources), nil
+}
+
+func (p *piProvider) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	return p.sources.DiscoverEach(ctx, func(source SourceRef) error {
+		src, ok := source.Opaque.(JSONLSource)
+		if !ok || !IsPiSessionFile(src.Path) {
+			return nil
+		}
+		return yield(source)
+	})
 }
 
 func (p *piProvider) WatchPlan(ctx context.Context) (WatchPlan, error) {
@@ -93,6 +103,9 @@ func (p *piProvider) FindSource(
 	if req.RawSessionID == "" || !IsValidSessionID(req.RawSessionID) {
 		return SourceRef{}, false, nil
 	}
+	if p.Def.Type == AgentOMP {
+		return p.sourceForOMPHeaderSessionID(ctx, req.RawSessionID)
+	}
 	for _, root := range p.Config.Roots {
 		source, ok, err := p.sourceForSessionID(ctx, root, req.RawSessionID)
 		if err != nil || ok {
@@ -125,6 +138,34 @@ func (p *piProvider) sourceForSessionID(
 			return SourceRef{}, false, err
 		}
 		if ok {
+			return source, true, nil
+		}
+	}
+	return SourceRef{}, false, nil
+}
+
+func (p *piProvider) sourceForOMPHeaderSessionID(
+	ctx context.Context,
+	sessionID string,
+) (SourceRef, bool, error) {
+	sources, err := p.sources.Discover(ctx)
+	if err != nil {
+		return SourceRef{}, false, err
+	}
+	for _, source := range sources {
+		if err := ctx.Err(); err != nil {
+			return SourceRef{}, false, err
+		}
+		src, ok := source.Opaque.(JSONLSource)
+		if !ok {
+			continue
+		}
+		headerID, ok := ompSessionHeaderID(src.Path)
+		if !ok {
+			continue
+		}
+		if headerID == sessionID ||
+			(headerID == "" && piSessionIDFromPath("", src.Path) == sessionID) {
 			return source, true, nil
 		}
 	}
@@ -190,21 +231,59 @@ func (p *piProvider) filterDiscoveredSources(sources []SourceRef) []SourceRef {
 	return filtered
 }
 
-func newPiSourceSet(agent AgentType, roots []string) DirectoryJSONLSourceSet {
+func newPiSourceSet(agent AgentType, roots []string) JSONLSourceSet {
+	// OMP nests subagent transcripts one directory deeper than the main
+	// session (<project>/<session>/<agent>.jsonl), so it cannot use the
+	// strict two-segment DirectoryJSONLSourceSet layout the other pi-family
+	// agents rely on. It gets a recursive set that accepts any nested .jsonl.
+	if agent == AgentOMP {
+		return NewJSONLSourceSet(agent, roots,
+			WithRecursive(),
+			WithSymlinkFollowing(),
+			WithIncludePath(isOMPSourcePath),
+			WithProjectHint(func(root, path string) string { return "" }),
+			WithSessionIDFromPath(piSessionIDFromPath),
+			WithContentHashing(),
+		)
+	}
 	return NewDirectoryJSONLSourceSet(agent, roots,
 		WithSymlinkFollowing(),
 		WithIncludePath(isPiSourcePath),
 		WithProjectHint(func(root, path string) string { return "" }),
-		WithSessionIDFromPath(piSessionIDFromPath),
 		// Pi/OMP persisted a full-file content hash (file_hash) in the legacy
 		// per-agent parse. Without this the provider fingerprint hash is empty
 		// and a resync clears the stored file_hash to NULL.
+		WithSessionIDFromPath(piSessionIDFromPath),
 		WithContentHashing(),
-	)
+	).JSONLSourceSet
 }
 
 func isPiSourcePath(root, path string) bool {
 	return strings.HasSuffix(filepath.Base(path), ".jsonl")
+}
+
+// isOMPSourcePath accepts OMP transcripts at the main-session depth
+// (<project>/<session>.jsonl) and at any deeper subagent depth
+// (<project>/<session>/<agent>.jsonl and further nesting). Non-.jsonl
+// companions (.md, .bash.log) and root-level files are rejected.
+func isOMPSourcePath(root, path string) bool {
+	if !strings.HasSuffix(filepath.Base(path), ".jsonl") {
+		return false
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	if len(parts) < 2 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 func piSessionIDFromPath(root, path string) string {
@@ -215,7 +294,7 @@ func piSessionIDFromPath(root, path string) string {
 }
 
 func piProviderCapabilities() Capabilities {
-	return Capabilities{
+	caps := Capabilities{
 		Source: jsonlFileProviderSourceCapabilities(),
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
@@ -229,4 +308,6 @@ func piProviderCapabilities() Capabilities {
 			Model:                CapabilitySupported,
 		},
 	}
+	caps.Source.StreamingDiscovery = CapabilitySupported
+	return caps
 }

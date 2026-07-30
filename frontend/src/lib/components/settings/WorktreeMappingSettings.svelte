@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { Card, Checkbox, SegmentedControl, TextInput } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
   import SettingsSection from "./SettingsSection.svelte";
   import {
@@ -7,7 +8,9 @@
     type DbWorktreeProjectMapping,
     type WorktreeMappingRequest,
   } from "../../api/generated/index";
-  import { callGenerated } from "../../api/runtime.js";
+  import { callGenerated, isAbortError } from "../../api/runtime.js";
+  import { LatestRead } from "../../utils/latest-read.js";
+  import { onDestroy } from "svelte";
 
   interface WorktreeMappingsResponse {
     machine: string;
@@ -17,6 +20,20 @@
   interface Props {
     readOnly?: boolean;
   }
+
+  const explicitLayout = "explicit";
+  const repoDotWorktreesLayout = "repo_dot_worktrees";
+
+  const layoutOptions = $derived([
+    { value: explicitLayout, label: m.worktree_layout_explicit({}) },
+    {
+      value: repoDotWorktreesLayout,
+      label: m.worktree_layout_repo_dot_worktrees({
+        repo: "repo",
+        branch: "branch",
+      }),
+    },
+  ]);
 
   let { readOnly = false }: Props = $props();
 
@@ -29,11 +46,15 @@
   let applyMessage = $state("");
   let editingId: number | null = $state(null);
   let pathPrefix = $state("");
+  let layout = $state(explicitLayout);
   let project = $state("");
   let enabled = $state(true);
+  const mappingsRead = new LatestRead();
+  let disposed = false;
 
   $effect(() => {
     if (readOnly) {
+      mappingsRead.cancel();
       loading = false;
       return;
     }
@@ -41,25 +62,36 @@
   });
 
   async function loadMappings() {
+    if (disposed) return;
+    const signal = mappingsRead.begin();
     loading = true;
     error = "";
     try {
       const res =
         await callGenerated(() =>
           SettingsService.getApiV1SettingsWorktreeMappings(),
+          signal,
         ) as unknown as WorktreeMappingsResponse;
+      if (!mappingsRead.isCurrent(signal)) return;
       machine = res.machine;
       mappings = res.mappings;
     } catch (err) {
+      if (isAbortError(err) || !mappingsRead.isCurrent(signal)) return;
       error = err instanceof Error ? err.message : m.worktree_failed_load();
     } finally {
-      loading = false;
+      if (mappingsRead.finish(signal)) loading = false;
     }
   }
+
+  onDestroy(() => {
+    disposed = true;
+    mappingsRead.cancel();
+  });
 
   function resetForm() {
     editingId = null;
     pathPrefix = "";
+    layout = explicitLayout;
     project = "";
     enabled = true;
   }
@@ -67,6 +99,7 @@
   function editMapping(mapping: DbWorktreeProjectMapping) {
     editingId = mapping.id;
     pathPrefix = mapping.path_prefix;
+    layout = mapping.layout || explicitLayout;
     project = mapping.project;
     enabled = mapping.enabled;
     applyMessage = "";
@@ -76,10 +109,12 @@
   async function saveMapping() {
     const input = {
       path_prefix: pathPrefix.trim(),
+      layout,
       project: project.trim(),
       enabled,
     } satisfies WorktreeMappingRequest;
-    if (!input.path_prefix || !input.project) return;
+    if (!input.path_prefix) return;
+    if (layout !== repoDotWorktreesLayout && !input.project) return;
 
     saving = true;
     error = "";
@@ -101,7 +136,7 @@
       }
       resetForm();
       await loadMappings();
-    } catch (err) {
+      } catch (err) {
       error = err instanceof Error ? err.message : m.worktree_failed_save();
     } finally {
       saving = false;
@@ -144,7 +179,11 @@
     }
   }
 
-  let canSave = $derived(pathPrefix.trim() !== "" && project.trim() !== "");
+  let isRepoDotWorktrees = $derived(layout === repoDotWorktreesLayout);
+  let canSave = $derived(
+    pathPrefix.trim() !== "" &&
+      (layout === repoDotWorktreesLayout || project.trim() !== ""),
+  );
 </script>
 
 <SettingsSection
@@ -164,17 +203,23 @@
     </div>
 
     <div class="mapping-list">
-      {#if mappings.length === 0}
-        <div class="empty">{m.worktree_no_mappings()}</div>
-      {:else}
-        {#each mappings as mapping (mapping.id)}
-          <div class="mapping-row" class:disabled={!mapping.enabled}>
-            <div class="mapping-main">
-              <div class="mapping-project">{mapping.project}</div>
-              <div class="mapping-path">{mapping.path_prefix}</div>
-            </div>
-            <div class="mapping-actions">
-              <span class="status">{mapping.enabled ? m.worktree_on() : m.worktree_off()}</span>
+        {#if mappings.length === 0}
+          <div class="empty">{m.worktree_no_mappings()}</div>
+        {:else}
+          {#each mappings as mapping (mapping.id)}
+            <Card
+              level="inset"
+              padding="none"
+              class={!mapping.enabled ? "mapping-row disabled" : "mapping-row"}
+            >
+              <div class="mapping-main">
+                <div class="mapping-project">
+                  {mapping.project || (mapping.layout === repoDotWorktreesLayout ? m.worktree_layout_repo_dot_worktrees({ repo: "repo", branch: "branch" }) : m.worktree_layout_explicit({}))}
+                </div>
+                <div class="mapping-path">{mapping.path_prefix}</div>
+              </div>
+              <div class="mapping-actions">
+                <span class="status">{mapping.enabled ? m.worktree_on() : m.worktree_off()}</span>
               <button class="small-btn" onclick={() => editMapping(mapping)}>
                 {m.worktree_edit()}
               </button>
@@ -182,28 +227,50 @@
                 {m.worktree_delete()}
               </button>
             </div>
-          </div>
+          </Card>
         {/each}
       {/if}
     </div>
 
     <div class="form-grid">
-      <label class="field">
-        <span>{m.worktree_path_prefix()}</span>
-        <input
-          type="text"
-          bind:value={pathPrefix}
-          placeholder="/Users/me/project.worktrees"
+      <div class="field">
+        <span>{m.worktree_layout()}</span>
+        <SegmentedControl
+          options={layoutOptions}
+          value={layout}
+          block
+          ariaLabel={m.worktree_layout()}
+          onchange={(value) => (layout = value)}
         />
+      </div>
+      <label class="field">
+        <span>{isRepoDotWorktrees ? m.worktree_parent_directory() : m.worktree_path_prefix()}</span>
+        <TextInput
+          type="text"
+          size="md"
+          block
+          bind:value={pathPrefix}
+          placeholder={isRepoDotWorktrees ? "/Users/me" : "/Users/me/project.worktrees"}
+        />
+        {#if isRepoDotWorktrees}
+          <div class="hint">{m.worktree_parent_directory_hint()}</div>
+        {/if}
       </label>
       <label class="field">
         <span>{m.worktree_project()}</span>
-        <input type="text" bind:value={project} placeholder="project-name" />
+        <TextInput
+          type="text"
+          size="md"
+          block
+          bind:value={project}
+          placeholder="project-name"
+          disabled={isRepoDotWorktrees}
+        />
+        <div class="hint">
+          {isRepoDotWorktrees ? m.worktree_project_derived() : m.worktree_project_required()}
+        </div>
       </label>
-      <label class="enabled-toggle">
-        <input type="checkbox" bind:checked={enabled} />
-        {m.worktree_enabled()}
-      </label>
+      <Checkbox bind:checked={enabled} label={m.worktree_enabled()} />
     </div>
 
     {#if error}
@@ -268,19 +335,20 @@
     gap: 6px;
   }
 
-  .mapping-row {
+  .mapping-list :global(.mapping-row) {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
     min-height: 48px;
     padding: 8px 10px;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
-    background: var(--bg-inset);
   }
 
-  .mapping-row.disabled {
+  .mapping-list :global(.mapping-row > .kit-card__body) {
+    display: contents;
+  }
+
+  .mapping-list :global(.mapping-row.disabled) {
     opacity: 0.65;
   }
 
@@ -310,7 +378,7 @@
 
   .form-grid {
     display: grid;
-    grid-template-columns: 1fr 160px;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: var(--space-5);
   }
 
@@ -321,28 +389,14 @@
     min-width: 0;
   }
 
-  .field input {
-    height: 30px;
+  .field :global(.kit-text-input) {
     min-width: 0;
-    padding: 0 10px;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
-    background: var(--bg-inset);
-    color: var(--text-primary);
-    font-size: 12px;
   }
 
-  .field input:focus {
-    outline: none;
-    border-color: var(--accent-blue);
-  }
-
-  .enabled-toggle {
-    display: flex;
-    align-items: center;
-    gap: var(--space-4);
-    color: var(--text-secondary);
-    font-size: 12px;
+  .hint {
+    color: var(--text-muted);
+    font-size: 11px;
+    line-height: 1.3;
   }
 
   .small-btn,
@@ -400,7 +454,7 @@
   }
 
   @media (max-width: 640px) {
-    .mapping-row,
+    .mapping-list :global(.mapping-row),
     .button-row {
       align-items: stretch;
       flex-direction: column;

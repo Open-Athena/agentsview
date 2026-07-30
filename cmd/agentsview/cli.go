@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -103,7 +104,9 @@ func newRootCommand() *cobra.Command {
 	)
 
 	root.AddCommand(newServeCommand())
+	root.AddCommand(newDaemonCommand())
 	root.AddCommand(newSyncCommand())
+	root.AddCommand(newSyncWorkerCommand())
 	root.AddCommand(newPruneCommand())
 	root.AddCommand(newUpdateCommand())
 	root.AddCommand(newTokenUseCommand())
@@ -116,12 +119,15 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(newActivityCommand())
 	root.AddCommand(newPGCommand())
 	root.AddCommand(newDuckDBCommand())
+	root.AddCommand(newEmbeddingsCommand())
 	root.AddCommand(newSessionCommand())
 	root.AddCommand(newMCPCommand())
+	root.AddCommand(newRecallCommand())
 	root.AddCommand(newStatsCommand())
 	root.AddCommand(newParseDiffCommand())
 	root.AddCommand(newClassifierCommand())
 	root.AddCommand(newSecretsCommand())
+	root.AddCommand(newSkillsCommand())
 	root.AddCommand(newDoctorCommand())
 	root.AddCommand(newVersionCommand())
 	root.AddCommand(newOpenAPICommand())
@@ -139,10 +145,15 @@ func newRootCommand() *cobra.Command {
 }
 
 func newServeCommand() *cobra.Command {
+	return newServeCommandWithDaemonDeps(defaultDaemonCommandDeps())
+}
+
+func newServeCommandWithDaemonDeps(deps daemonCommandDeps) *cobra.Command {
 	var background bool
 	var checkDataVersion bool
 	var replace bool
 	var pprofEnabled bool
+	var skipInitialSync bool
 	cmd := &cobra.Command{
 		Use:          "serve",
 		Short:        "Start server",
@@ -167,9 +178,10 @@ func newServeCommand() *cobra.Command {
 				return nil
 			}
 			runServe(mustLoadConfig(cmd), serveOptions{
-				ReplaceDaemon:  replace,
-				NoSyncExplicit: cmd.Flags().Changed("no-sync"),
-				Pprof:          pprofEnabled,
+				ReplaceDaemon:   replace,
+				NoSyncExplicit:  cmd.Flags().Changed("no-sync"),
+				SkipInitialSync: skipInitialSync,
+				Pprof:           pprofEnabled,
 			})
 			return nil
 		},
@@ -194,6 +206,13 @@ func newServeCommand() *cobra.Command {
 	)
 	_ = cmd.Flags().MarkHidden("check-data-version")
 	cmd.Flags().BoolVar(
+		&skipInitialSync,
+		"skip-initial-sync",
+		false,
+		"Start serving before the initial sync",
+	)
+	_ = cmd.Flags().MarkHidden("skip-initial-sync")
+	cmd.Flags().BoolVar(
 		&pprofEnabled,
 		"pprof",
 		false,
@@ -203,6 +222,7 @@ func newServeCommand() *cobra.Command {
 	config.RegisterServePFlags(cmd.Flags())
 	cmd.AddCommand(newServeStatusCommand())
 	cmd.AddCommand(newServeStopCommand())
+	cmd.AddCommand(newServeRestartCommand(deps))
 	return cmd
 }
 
@@ -234,6 +254,22 @@ func newServeStopCommand() *cobra.Command {
 		Args:         cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
 			runServeStop(mustLoadConfig(cmd))
+		},
+	}
+}
+
+func newServeRestartCommand(deps daemonCommandDeps) *cobra.Command {
+	return &cobra.Command{
+		Use:   "restart",
+		Short: "Restart the writable SQLite background daemon",
+		Long: "Restart only the writable SQLite background daemon using settings " +
+			"from config.toml.\n\n" +
+			"Unlike `agentsview serve stop`, this command intentionally leaves " +
+			"read-only PostgreSQL and DuckDB servers running.",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runDaemonRestart(cmd.OutOrStdout(), deps)
 		},
 	}
 }
@@ -300,15 +336,15 @@ func newSyncCommand() *cobra.Command {
 	)
 	cmd.Flags().StringVar(
 		&cfg.Host, "host", "",
-		"SSH hostname for remote sync",
+		"SSH hostname for deprecated remote sync",
 	)
 	cmd.Flags().StringVar(
 		&cfg.User, "user", "",
-		"SSH user for remote sync",
+		"SSH user for deprecated remote sync",
 	)
 	cmd.Flags().IntVar(
 		&cfg.Port, "port", 0,
-		"SSH port for remote sync (default: 22)",
+		"SSH port for deprecated remote sync (default: 22)",
 	)
 	cmd.Flags().StringVar(
 		&cfg.CPUProfile, "cpuprofile", "",
@@ -655,6 +691,7 @@ func newPGCommand() *cobra.Command {
 	cmd.AddCommand(newPGPushCommand())
 	cmd.AddCommand(newPGStatusCommand())
 	cmd.AddCommand(newPGServeCommand())
+	cmd.AddCommand(newPGVectorsCommand())
 	cmd.AddCommand(newPGServiceCommand())
 	return cmd
 }
@@ -703,6 +740,7 @@ func newPGPushCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&cfg.Watch, "watch", false, "Run continuously, pushing on change plus a periodic floor")
 	cmd.Flags().DurationVar(&cfg.Debounce, "debounce", defaultWatchDebounce, "Coalesce window after a change before pushing (--watch only)")
 	cmd.Flags().DurationVar(&cfg.Interval, "interval", defaultWatchInterval, "Periodic floor push interval (--watch only)")
+	cmd.Flags().BoolVar(&cfg.NoVectors, "no-vectors", false, "Skip pushing semantic-search vectors")
 	return cmd
 }
 
@@ -870,16 +908,36 @@ func newDuckDBQuackCommand() *cobra.Command {
 }
 
 func newVersionCommand() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:          "version",
 		Short:        "Show version information",
 		GroupID:      groupMeta,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
-		Run: func(cmd *cobra.Command, args []string) {
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if outputFormat(cmd) == "json" {
+				return json.NewEncoder(cmd.OutOrStdout()).Encode(versionJSON{
+					SchemaVersion: 1,
+					Name:          "agentsview",
+					Version:       version,
+					Commit:        commit,
+					BuildDate:     buildDate,
+				})
+			}
 			printVersion(cmd.OutOrStdout())
+			return nil
 		},
 	}
+	registerFormatFlags(cmd.Flags())
+	return cmd
+}
+
+type versionJSON struct {
+	SchemaVersion int    `json:"schema_version"`
+	Name          string `json:"name"`
+	Version       string `json:"version"`
+	Commit        string `json:"commit"`
+	BuildDate     string `json:"build_date"`
 }
 
 func printVersion(w io.Writer) {
@@ -936,6 +994,13 @@ func writeRootHelp(w io.Writer, root *cobra.Command) {
 	fmt.Fprintln(w, "  to skip directory names/patterns while recursively watching roots.")
 	fmt.Fprintln(w, "  Example:")
 	fmt.Fprintln(w, "  watch_exclude_patterns = [\".git\", \"node_modules\", \".next\", \"dist\"]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Session cwd filter:")
+	fmt.Fprintln(w, "  Add \"sync_include_cwd_prefixes\" to ~/.agentsview/config.toml to")
+	fmt.Fprintln(w, "  ingest only sessions whose working directory is under one of the")
+	fmt.Fprintln(w, "  listed paths. Sessions without a recorded cwd are skipped while")
+	fmt.Fprintln(w, "  the filter is set. Applies to local sync only. Example:")
+	fmt.Fprintln(w, "  sync_include_cwd_prefixes = [\"/home/me/work\"]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Multiple directories:")
 	fmt.Fprintln(w, "  Add arrays to ~/.agentsview/config.toml to scan multiple locations:")

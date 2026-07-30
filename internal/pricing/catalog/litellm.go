@@ -1,11 +1,14 @@
 package catalog
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"time"
+
+	"go.kenn.io/agentsview/internal/money"
 )
 
 const litellmURL = "https://raw.githubusercontent.com/" +
@@ -21,44 +24,66 @@ const litellmURL = "https://raw.githubusercontent.com/" +
 // cache1hRatio x the 5m rate; the bundled snapshot overlay sets explicit
 // 1h values for Anthropic models.
 type ModelPricing struct {
-	ModelPattern           string
-	InputPerMTok           float64
-	OutputPerMTok          float64
-	CacheCreationPerMTok   float64
-	CacheCreation1hPerMTok float64
-	CacheReadPerMTok       float64
+	ModelPattern         string
+	InputPerMTok         money.Money
+	OutputPerMTok        money.Money
+	CacheCreationPerMTok money.Money
+	// CacheCreation1hPerMTok is the 1-hour ephemeral cache-write rate
+	// (Anthropic: 2x input, exactly 8/5 of the 5m rate). LiteLLM exposes
+	// only the 5m rate, so 1h is derived by Fill1hCacheRate; the bundled
+	// snapshot overlay sets explicit 1h values for Anthropic models.
+	CacheCreation1hPerMTok money.Money
+	CacheReadPerMTok       money.Money
 }
 
-// cache1hRatio is the Anthropic-documented ratio of the 1h cache-write
-// rate to the 5m cache-write rate (1h = 2x input, 5m = 1.25x input). Used
-// to synthesize a 1h rate from catalogs (LiteLLM) that only expose 5m.
-const cache1hRatio = 2.0 / 1.25
-
-// Fill1hCacheRate derives the 1h ephemeral cache-write rate from the 5m
-// rate for entries that carry a 5m rate but no explicit 1h rate. Shared by
-// the LiteLLM parser and the snapshot generator's hardcoded overlay so both
-// sources ship a 1h rate.
+// Fill1hCacheRate derives the 1h ephemeral cache-write rate from the 5m rate
+// for entries that carry a 5m rate but no explicit 1h rate. The Anthropic
+// ratio is exactly 8/5 (1h = 2x input, 5m = 1.25x input), computed in money
+// terms via multiply-by-8 then divide-by-5. Shared by the LiteLLM parser and
+// the snapshot generator's overlay so both sources ship a 1h rate.
 func Fill1hCacheRate(p *ModelPricing) {
-	if p.CacheCreation1hPerMTok == 0 && p.CacheCreationPerMTok > 0 {
-		p.CacheCreation1hPerMTok = p.CacheCreationPerMTok * cache1hRatio
+	if p.CacheCreation1hPerMTok == (money.Money{}) &&
+		p.CacheCreationPerMTok.Microdollars > 0 {
+		eightX := money.Money{
+			Microdollars: p.CacheCreationPerMTok.Microdollars * 8,
+		}
+		p.CacheCreation1hPerMTok, _ = money.Divide(eightX, 5)
 	}
 }
 
 type litellmEntry struct {
-	InputCost         *float64 `json:"input_cost_per_token"`
-	OutputCost        *float64 `json:"output_cost_per_token"`
-	CacheCreationCost *float64 `json:"cache_creation_input_token_cost"`
-	CacheReadCost     *float64 `json:"cache_read_input_token_cost"`
-	Provider          string   `json:"litellm_provider"`
+	InputCost         *json.Number `json:"input_cost_per_token"`
+	OutputCost        *json.Number `json:"output_cost_per_token"`
+	CacheCreationCost *json.Number `json:"cache_creation_input_token_cost"`
+	CacheReadCost     *json.Number `json:"cache_read_input_token_cost"`
+	Provider          string       `json:"litellm_provider"`
 }
-
-const perMTok = 1_000_000
 
 // FetchLiteLLMPricing downloads the LiteLLM pricing JSON
 // and parses it into ModelPricing entries.
 func FetchLiteLLMPricing() ([]ModelPricing, error) {
+	return FetchLiteLLMPricingContext(context.Background())
+}
+
+// FetchLiteLLMPricingContext downloads the LiteLLM pricing JSON and binds the
+// request lifetime to ctx.
+func FetchLiteLLMPricingContext(
+	ctx context.Context,
+) ([]ModelPricing, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(litellmURL)
+	return fetchLiteLLMPricing(ctx, client, litellmURL)
+}
+
+func fetchLiteLLMPricing(
+	ctx context.Context,
+	client *http.Client,
+	url string,
+) ([]ModelPricing, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating litellm pricing request: %w", err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetching litellm pricing: %w", err)
 	}
@@ -96,21 +121,44 @@ func ParseLiteLLMPricing(
 			continue
 		}
 		p := ModelPricing{ModelPattern: model}
+		var err error
 		if entry.InputCost != nil {
-			p.InputPerMTok = *entry.InputCost * perMTok
+			p.InputPerMTok, err = parsePerTokenRate(*entry.InputCost)
+			if err != nil {
+				return nil, fmt.Errorf("parsing %s input price: %w", model, err)
+			}
 		}
 		if entry.OutputCost != nil {
-			p.OutputPerMTok = *entry.OutputCost * perMTok
+			p.OutputPerMTok, err = parsePerTokenRate(*entry.OutputCost)
+			if err != nil {
+				return nil, fmt.Errorf("parsing %s output price: %w", model, err)
+			}
 		}
 		if entry.CacheCreationCost != nil {
-			p.CacheCreationPerMTok =
-				*entry.CacheCreationCost * perMTok
+			p.CacheCreationPerMTok, err = parsePerTokenRate(*entry.CacheCreationCost)
+			if err != nil {
+				return nil, fmt.Errorf("parsing %s cache creation price: %w", model, err)
+			}
 		}
 		if entry.CacheReadCost != nil {
-			p.CacheReadPerMTok = *entry.CacheReadCost * perMTok
+			p.CacheReadPerMTok, err = parsePerTokenRate(*entry.CacheReadCost)
+			if err != nil {
+				return nil, fmt.Errorf("parsing %s cache read price: %w", model, err)
+			}
 		}
 		Fill1hCacheRate(&p)
 		prices = append(prices, p)
 	}
 	return prices, nil
+}
+
+func parsePerTokenRate(value json.Number) (money.Money, error) {
+	microdollars, err := money.ParseScaledDecimal(value.String(), 12)
+	if err != nil {
+		return money.Money{}, err
+	}
+	if microdollars < 0 {
+		return money.Money{}, money.ErrNegative
+	}
+	return money.Money{Microdollars: microdollars}, nil
 }

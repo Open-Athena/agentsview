@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"time"
+
+	"go.kenn.io/agentsview/internal/money"
 )
 
 // AgentType identifies the AI agent that produced a session.
@@ -19,12 +21,15 @@ const (
 	AgentMiMoCode       AgentType = "mimocode"
 	AgentOpenCode       AgentType = "opencode"
 	AgentKilo           AgentType = "kilo"
+	AgentKiloLegacy     AgentType = "kilo-legacy"
 	AgentOpenHands      AgentType = "openhands"
 	AgentCursor         AgentType = "cursor"
 	AgentIflow          AgentType = "iflow"
 	AgentAmp            AgentType = "amp"
 	AgentZencoder       AgentType = "zencoder"
 	AgentVSCodeCopilot  AgentType = "vscode-copilot"
+	AgentWindsurf       AgentType = "windsurf"
+	AgentTrae           AgentType = "trae"
 	AgentVSCopilot      AgentType = "visualstudio-copilot"
 	AgentPi             AgentType = "pi"
 	AgentOMP            AgentType = "omp"
@@ -40,22 +45,28 @@ const (
 	AgentKiroIDE        AgentType = "kiro-ide"
 	AgentCortex         AgentType = "cortex"
 	AgentHermes         AgentType = "hermes"
+	AgentGrok           AgentType = "grok"
 	AgentWorkBuddy      AgentType = "workbuddy"
 	AgentForge          AgentType = "forge"
 	AgentDevin          AgentType = "devin"
 	AgentPiebald        AgentType = "piebald"
 	AgentWarp           AgentType = "warp"
 	AgentPositron       AgentType = "positron"
+	AgentPositAssistant AgentType = "posit-assistant"
+	AgentZCode          AgentType = "zcode"
 	AgentAntigravity    AgentType = "antigravity"
 	AgentAntigravityCLI AgentType = "antigravity-cli"
 	AgentVibe           AgentType = "vibe"
 	AgentZed            AgentType = "zed"
 	AgentQwenPaw        AgentType = "qwenpaw"
 	AgentGptme          AgentType = "gptme"
+	AgentQoder          AgentType = "qoder"
 	AgentShelley        AgentType = "shelley"
 	AgentAider          AgentType = "aider"
 	AgentReasonix       AgentType = "reasonix"
 	AgentIcodemate      AgentType = "icodemate"
+	AgentRooCode        AgentType = "roocode"
+	AgentPoolside       AgentType = "poolside"
 )
 
 // AgentDef describes a supported coding agent's filesystem
@@ -72,6 +83,12 @@ type AgentDef struct {
 	ShallowWatch      bool     // true = watch root only, rely on periodic sync for subdirs
 	FileBased         bool     // false for DB-backed agents
 	Usage             UsageCapabilities
+
+	// PeriodicReconcile opts the agent into the scheduled scoped
+	// reconciliation because its declared watch coverage is shallow and
+	// subdirectory changes are invisible to the watcher. Expensive
+	// scheduling inputs default to unsupported.
+	PeriodicReconcile bool
 
 	// WatchRootsFunc resolves the directories to watch for live
 	// updates under a configured root, for agents whose watch
@@ -209,14 +226,41 @@ var Registry = []AgentDef{
 		WatchRootsFunc: ResolveKiloWatchRoots,
 	},
 	{
-		Type:         AgentOpenHands,
-		DisplayName:  "OpenHands CLI",
-		EnvVar:       "OPENHANDS_CONVERSATIONS_DIR",
-		ConfigKey:    "openhands_dirs",
-		DefaultDirs:  []string{".openhands/conversations"},
-		IDPrefix:     "openhands:",
-		FileBased:    true,
-		ShallowWatch: true,
+		// Kilo (legacy) is the legacy RooCode-derived VSCode
+		// extension from Kilocode. Sessions live under
+		// <vscode-globalStorage>/kilocode.kilo-code/tasks/<uuid>/
+		// with task_metadata.json (only `files_in_context`), the
+		// Claude-shaped api_conversation_history.json, and the
+		// Cline-shaped ui_messages.json. Default paths use the
+		// lowercase extension id that VSCode actually writes
+		// on disk, not the mixed-case marketplace id.
+		//
+		// LEGACY-ONLY: covers the pre-OpenCode extension
+		// (RooCode-derived). After Kilo rebuilt the extension on an
+		// OpenCode core (beta 2026-03-10, GA 2026-04-02), new
+		// sessions moved to ~/.local/share/kilo/kilo.db — the same
+		// SQLite the Kilo CLI uses — and are tracked by the `kilo`
+		// agent. This agent is frozen at the legacy tasks/<uuid>/
+		// format for historical sessions.
+		Type:        AgentKiloLegacy,
+		DisplayName: "Kilo (legacy)",
+		EnvVar:      "KILO_LEGACY_DIR",
+		ConfigKey:   "kilo_legacy_dirs",
+		DefaultDirs: kiloLegacyDefaultDirs(),
+		IDPrefix:    "kilo-legacy:",
+		FileBased:   true,
+		Usage:       UsageCapabilities{NoPerMessageTokenData: true},
+	},
+	{
+		Type:              AgentOpenHands,
+		DisplayName:       "OpenHands CLI",
+		EnvVar:            "OPENHANDS_CONVERSATIONS_DIR",
+		ConfigKey:         "openhands_dirs",
+		DefaultDirs:       []string{".openhands/conversations"},
+		IDPrefix:          "openhands:",
+		FileBased:         true,
+		ShallowWatch:      true,
+		PeriodicReconcile: true,
 	},
 	{
 		Type:        AgentCursor,
@@ -283,6 +327,56 @@ var Registry = []AgentDef{
 			NoPerMessageTokenData: true,
 			AICreditsDenominated:  true,
 		},
+	},
+	{
+		Type:        AgentWindsurf,
+		DisplayName: "Windsurf",
+		EnvVar:      "WINDSURF_DIR",
+		ConfigKey:   "windsurf_dirs",
+		DefaultDirs: []string{
+			// Windows
+			"AppData/Roaming/Windsurf/User",
+			"AppData/Roaming/Windsurf - Next/User",
+			// macOS
+			"Library/Application Support/Windsurf/User",
+			"Library/Application Support/Windsurf - Next/User",
+			// Linux
+			".config/Windsurf/User",
+			".config/Windsurf - Next/User",
+		},
+		IDPrefix: "windsurf:",
+		WatchSubdirs: []string{
+			"workspaceStorage",
+		},
+		FileBased: true,
+		Usage: UsageCapabilities{
+			NoPerMessageTokenData: true,
+			AICreditsDenominated:  true,
+		},
+	},
+	{
+		Type:        AgentTrae,
+		DisplayName: "Trae",
+		EnvVar:      "TRAE_DIR",
+		ConfigKey:   "trae_dirs",
+		DefaultDirs: []string{
+			// Windows
+			"AppData/Roaming/Trae/User",
+			"AppData/Roaming/Trae CN/User",
+			"AppData/Roaming/TRAE SOLO CN/User",
+			// macOS
+			"Library/Application Support/Trae/User",
+			"Library/Application Support/Trae CN/User",
+			"Library/Application Support/TRAE SOLO CN/User",
+			// Linux
+			".config/Trae/User",
+			".config/Trae CN/User",
+			".config/TRAE SOLO CN/User",
+		},
+		IDPrefix:     "trae:",
+		WatchSubdirs: []string{"workspaceStorage", "globalStorage"},
+		FileBased:    true,
+		Usage:        UsageCapabilities{NoPerMessageTokenData: true},
 	},
 	{
 		Type:        AgentVSCopilot,
@@ -444,6 +538,15 @@ var Registry = []AgentDef{
 		ShallowWatchRootsFunc: ResolveHermesShallowWatchRoots,
 	},
 	{
+		Type:        AgentGrok,
+		DisplayName: "Grok",
+		EnvVar:      "GROK_DIR",
+		ConfigKey:   "grok_dirs",
+		DefaultDirs: []string{".grok/sessions"},
+		IDPrefix:    "grok:",
+		FileBased:   true,
+	},
+	{
 		Type:        AgentWorkBuddy,
 		DisplayName: "WorkBuddy",
 		EnvVar:      "WORKBUDDY_PROJECTS_DIR",
@@ -511,6 +614,35 @@ var Registry = []AgentDef{
 		FileBased:    true,
 	},
 	{
+		// Posit Assistant (posit-dev/assistant) stores one directory per
+		// conversation under workspaces/<workspaceId>/<conversationId>/,
+		// holding a conversation.json message tree plus an append-only
+		// lm-messages.jsonl transcript. Distinct from the Positron IDE's
+		// built-in Assistant above, which uses VS Code chatSessions files.
+		Type:        AgentPositAssistant,
+		DisplayName: "Posit Assistant",
+		EnvVar:      "POSIT_ASSISTANT_DIR",
+		ConfigKey:   "posit_assistant_dirs",
+		DefaultDirs: []string{".posit/assistant/workspaces"},
+		IDPrefix:    "posit-assistant:",
+		FileBased:   true,
+	},
+	{
+		Type:        AgentZCode,
+		DisplayName: "ZCode",
+		EnvVar:      "ZCODE_DIR",
+		ConfigKey:   "zcode_dirs",
+		DefaultDirs: []string{
+			".zcode/cli/db",
+			".zcode/cli",
+		},
+		IDPrefix:  "zcode:",
+		FileBased: false,
+		Usage: UsageCapabilities{
+			NoPerMessageTokenData: true,
+		},
+	},
+	{
 		Type:         AgentZed,
 		DisplayName:  "Zed",
 		EnvVar:       "ZED_DIR",
@@ -567,6 +699,18 @@ var Registry = []AgentDef{
 		FileBased:   true,
 	},
 	{
+		Type:        AgentQoder,
+		DisplayName: "Qoder",
+		EnvVar:      "QODER_PROJECTS_DIR",
+		ConfigKey:   "qoder_project_dirs",
+		DefaultDirs: []string{
+			".qoder/projects",
+			".qoderwork/projects",
+		},
+		IDPrefix:  "qoder:",
+		FileBased: true,
+	},
+	{
 		// Shelley (exe.dev) stores all conversations in a single
 		// SQLite DB at ~/.config/shelley/shelley.db. Like Zed, each
 		// conversation is addressed by a virtual path (dbPath#id).
@@ -602,13 +746,14 @@ var Registry = []AgentDef{
 		// roots; watch those roots shallowly and rely on the 15-minute
 		// periodic sync to pick up new repos' history files. Aider history
 		// is append-mostly, so this is an acceptable latency tradeoff.
-		Type:         AgentAider,
-		DisplayName:  "Aider",
-		EnvVar:       "AIDER_DIR",
-		ConfigKey:    "aider_dirs",
-		IDPrefix:     "aider:",
-		FileBased:    true,
-		ShallowWatch: true,
+		Type:              AgentAider,
+		DisplayName:       "Aider",
+		EnvVar:            "AIDER_DIR",
+		ConfigKey:         "aider_dirs",
+		IDPrefix:          "aider:",
+		FileBased:         true,
+		ShallowWatch:      true,
+		PeriodicReconcile: true,
 	},
 	{
 		Type:         AgentReasonix,
@@ -630,6 +775,46 @@ var Registry = []AgentDef{
 		WatchSubdirs:   []string{"storage/session_diff"},
 		FileBased:      true,
 		WatchRootsFunc: ResolveIcodemateWatchRoots,
+	},
+	{
+		// RooCode (rooveterinaryinc.roo-cline) is a VSCode extension that
+		// stores sessions in VSCode's globalStorage directory under
+		// tasks/<taskId>/. Each task directory holds history_item.json
+		// (metadata) and ui_messages.json (transcript). VSCode
+		// canonicalizes globalStorage directory names to lowercase, so
+		// the default paths must use the lowercase extension ID to be
+		// discoverable on case-sensitive Linux filesystems. RooCode was
+		// shut down on May 15, 2026; ZooCode is the active community fork.
+		Type:        AgentRooCode,
+		DisplayName: "RooCode",
+		EnvVar:      "ROOCODE_DIR",
+		ConfigKey:   "roocode_dirs",
+		DefaultDirs: []string{
+			// macOS
+			"Library/Application Support/Code/User/globalStorage/rooveterinaryinc.roo-cline",
+			// Linux
+			".config/Code/User/globalStorage/rooveterinaryinc.roo-cline",
+			// Windows
+			"AppData/Roaming/Code/User/globalStorage/rooveterinaryinc.roo-cline",
+		},
+		IDPrefix:  "roocode:",
+		FileBased: true,
+	},
+	{
+		Type:        AgentPoolside,
+		DisplayName: "Poolside",
+		EnvVar:      "POOLSIDE_DIR",
+		ConfigKey:   "poolside_dirs",
+		DefaultDirs: []string{
+			// macOS
+			"Library/Application Support/poolside",
+			// Linux
+			".local/state/poolside",
+			// Windows
+			"AppData/Roaming/poolside",
+		},
+		IDPrefix:  "poolside:",
+		FileBased: true,
 	},
 }
 
@@ -803,6 +988,8 @@ type ParsedSession struct {
 	Project          string
 	Machine          string
 	Agent            AgentType
+	AgentLabel       string
+	Entrypoint       string
 	ParentSessionID  string
 	RelationshipType RelationshipType
 	Cwd              string
@@ -836,6 +1023,14 @@ type ParsedSession struct {
 	// agent format does not yet support classification).
 	TerminationStatus TerminationStatus
 
+	// ClaudeLinearParse reports whether the Claude full parser fell
+	// back to linear processing for this session's file (multi-root or
+	// unresolvable-parent uuid DAG). Linearity is monotonic across
+	// appends, so the incremental parser skips fork detection for
+	// linear-bound sessions. Only set by the Claude parser; nil for
+	// all other agents.
+	ClaudeLinearParse *bool
+
 	TotalOutputTokens    int
 	PeakContextTokens    int
 	HasTotalOutputTokens bool
@@ -846,6 +1041,10 @@ type ParsedSession struct {
 	// (e.g. VSCode Copilot). The sync engine forwards these into
 	// the usage_events table for catalog-based cost pricing.
 	UsageEvents []ParsedUsageEvent
+
+	// CountsAuthoritative marks parsers that own MessageCount and
+	// UserMessageCount even when they intentionally emit no transcript rows.
+	CountsAuthoritative bool
 
 	// aggregateTokenPresenceKnown marks session aggregate token
 	// coverage as parser-owned and authoritative.
@@ -946,7 +1145,7 @@ type ParsedUsageEvent struct {
 	CacheCreationInputTokens int
 	CacheReadInputTokens     int
 	ReasoningTokens          int
-	CostUSD                  *float64
+	Cost                     *money.Money
 	CostStatus               string
 	CostSource               string
 	OccurredAt               string

@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { Button, TextInput, Toggle } from "@kenn-io/kit-ui";
+  import { onDestroy } from "svelte";
   import { m } from "../../i18n/index.js";
   import SettingsSection from "./SettingsSection.svelte";
   import { copyToClipboard } from "../../utils/clipboard.js";
@@ -10,6 +12,7 @@
     setAuthToken,
     isRemoteConnection,
   } from "../../api/runtime.js";
+  import { LatestRead } from "../../utils/latest-read.js";
 
   let serverUrl: string = $state(getServerUrl());
   let tokenInput: string = $state(getAuthToken());
@@ -18,13 +21,20 @@
   let saving: boolean = $state(false);
   let saveMsg: string | null = $state(null);
   let remoteToggling: boolean = $state(false);
+  let pendingRequireAuth: boolean = $state(settings.requireAuth);
 
   let isRemote: boolean = $derived(isRemoteConnection());
   let copied: boolean = $state(false);
+  const versionRead = new LatestRead();
+
+  $effect(() => {
+    if (!remoteToggling) pendingRequireAuth = settings.requireAuth;
+  });
 
   async function handleTestConnection() {
     if (!serverUrl.trim()) return;
     testing = true;
+    const signal = versionRead.begin();
     testResult = null;
     try {
       const base = serverUrl.replace(/\/+$/, "");
@@ -32,7 +42,8 @@
       if (tokenInput.trim()) {
         headers["Authorization"] = `Bearer ${tokenInput.trim()}`;
       }
-      const res = await fetch(`${base}/api/v1/version`, { headers });
+      const res = await fetch(`${base}/api/v1/version`, { headers, signal });
+      if (!versionRead.isCurrent(signal)) return;
       if (res.ok) {
         const data = await res.json();
         testResult = {
@@ -43,14 +54,17 @@
         testResult = { ok: false, message: m.settings_remote_server_returned({ status: res.status }) };
       }
     } catch (e) {
+      if (signal.aborted || !versionRead.isCurrent(signal)) return;
       testResult = {
         ok: false,
         message: e instanceof Error ? e.message : m.settings_remote_connection_failed(),
       };
     } finally {
-      testing = false;
+      if (versionRead.finish(signal)) testing = false;
     }
   }
+
+  onDestroy(() => versionRead.cancel());
 
   function handleConnect() {
     if (!serverUrl.trim()) return;
@@ -70,11 +84,13 @@
     setTimeout(() => window.location.reload(), 500);
   }
 
-  async function handleToggleRemote() {
+  async function handleToggleRemote(requireAuth: boolean) {
+    pendingRequireAuth = requireAuth;
     remoteToggling = true;
     try {
-      await settings.save({ require_auth: !settings.requireAuth });
+      await settings.save({ require_auth: requireAuth });
     } finally {
+      pendingRequireAuth = settings.requireAuth;
       remoteToggling = false;
     }
   }
@@ -97,14 +113,14 @@
     <div class="subsection">
       <div class="toggle-row">
         <span class="toggle-label">{m.settings_remote_require_auth()}</span>
-        <button
-          class="toggle-btn"
-          class:active={settings.requireAuth}
+        <Toggle
+          checked={pendingRequireAuth}
           disabled={remoteToggling}
-          onclick={handleToggleRemote}
+          ariaLabel={m.settings_remote_require_auth()}
+          onchange={handleToggleRemote}
         >
-          {settings.requireAuth ? m.settings_remote_enabled() : m.settings_remote_disabled()}
-        </button>
+          {pendingRequireAuth ? m.settings_remote_enabled() : m.settings_remote_disabled()}
+        </Toggle>
       </div>
 
       <p class="restart-note">
@@ -120,9 +136,9 @@
           <span class="field-label">{m.settings_remote_auth_token()}</span>
           <div class="token-row">
             <code class="token-value">{settings.authToken}</code>
-            <button class="copy-btn" onclick={handleCopyToken}>
+            <Button size="sm" onclick={handleCopyToken}>
               {copied ? m.settings_remote_copied() : m.settings_remote_copy()}
-            </button>
+            </Button>
           </div>
         </div>
 
@@ -160,9 +176,11 @@
     {:else}
       <div class="field">
         <label class="field-label" for="remote-url">{m.settings_remote_server_url()}</label>
-        <input
+        <TextInput
           id="remote-url"
           class="setting-input"
+          size="md"
+          block
           type="url"
           placeholder="http://192.168.1.100:8080"
           bind:value={serverUrl}
@@ -171,9 +189,11 @@
 
       <div class="field">
         <label class="field-label" for="remote-token">{m.settings_remote_auth_token()}</label>
-        <input
+        <TextInput
           id="remote-token"
           class="setting-input"
+          size="md"
+          block
           type="password"
           placeholder={m.settings_remote_paste_token_from_server()}
           bind:value={tokenInput}
@@ -240,32 +260,6 @@
     color: var(--text-primary);
   }
 
-  .toggle-btn {
-    height: 26px;
-    padding: 0 12px;
-    border-radius: var(--radius-sm);
-    font-size: 11px;
-    font-weight: 500;
-    border: 1px solid var(--border-muted);
-    cursor: pointer;
-    background: var(--bg-inset);
-    color: var(--text-secondary);
-    transition:
-      background 0.12s,
-      color 0.12s;
-  }
-
-  .toggle-btn.active {
-    background: var(--accent-green, #22c55e);
-    color: var(--accent-green-foreground);
-    border-color: transparent;
-  }
-
-  .toggle-btn:disabled {
-    opacity: 0.6;
-    cursor: default;
-  }
-
   .token-display,
   .server-info,
   .connected-info {
@@ -300,24 +294,6 @@
     min-width: 0;
   }
 
-  .copy-btn {
-    height: 24px;
-    padding: 0 10px;
-    border-radius: var(--radius-sm);
-    font-size: 11px;
-    font-weight: 500;
-    color: var(--text-secondary);
-    background: var(--bg-inset);
-    border: 1px solid var(--border-muted);
-    cursor: pointer;
-    white-space: nowrap;
-    transition: opacity 0.12s;
-  }
-
-  .copy-btn:hover {
-    opacity: 0.8;
-  }
-
   .info-value {
     font-size: 12px;
     font-family: var(--font-mono, monospace);
@@ -330,21 +306,8 @@
     gap: 4px;
   }
 
-  .setting-input {
-    height: 30px;
-    padding: 0 10px;
-    border-radius: var(--radius-sm);
-    font-size: 12px;
+  :global(.setting-input.kit-text-input) {
     font-family: var(--font-mono, monospace);
-    color: var(--text-primary);
-    background: var(--bg-inset);
-    border: 1px solid var(--border-muted);
-    transition: border-color 0.15s;
-  }
-
-  .setting-input:focus {
-    outline: none;
-    border-color: var(--accent-blue);
   }
 
   .actions {

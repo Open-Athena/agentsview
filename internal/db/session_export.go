@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 )
 
 const sessionExportOrder = "last_activity_at DESC, id ASC"
@@ -50,11 +51,12 @@ type SessionExportResult struct {
 
 type SessionSummaryRow struct {
 	ID                    string                       `json:"id"`
-	Project               string                       `json:"project"`
-	Machine               string                       `json:"machine"`
+	Project               string                       `json:"-"`
+	ProjectReference      export.ProjectReference      `json:"project"`
+	Machine               string                       `json:"-"`
 	Agent                 string                       `json:"agent"`
-	Cwd                   string                       `json:"cwd,omitempty"`
-	GitBranch             string                       `json:"git_branch,omitempty"`
+	Cwd                   string                       `json:"-"`
+	GitBranch             string                       `json:"-"`
 	StartedAt             *string                      `json:"started_at"`
 	EndedAt               *string                      `json:"ended_at"`
 	LastActivityAt        string                       `json:"last_activity_at"`
@@ -68,7 +70,7 @@ type SessionSummaryRow struct {
 	ModelUsage            *SessionModelUsage           `json:"model_usage"`
 	ParentSessionID       *string                      `json:"parent_session_id"`
 	RelationshipType      *string                      `json:"relationship_type"`
-	Worktree              *SessionExportWorktree       `json:"worktree"`
+	Worktree              *SessionExportWorktree       `json:"-"`
 	TotalOutputTokens     int                          `json:"total_output_tokens"`
 	PeakContextTokens     int                          `json:"peak_context_tokens"`
 	HasTotalOutputTokens  bool                         `json:"has_total_output_tokens"`
@@ -83,7 +85,7 @@ type SessionModelUsage struct {
 	CacheCreationInputTokens int                                   `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int                                   `json:"cache_read_input_tokens"`
 	ReasoningTokens          int                                   `json:"reasoning_tokens"`
-	CostUSD                  float64                               `json:"cost_usd"`
+	Cost                     money.Money                           `json:"cost"`
 	HasCost                  bool                                  `json:"has_cost"`
 	ByModel                  map[string]SessionModelUsageBreakdown `json:"by_model"`
 }
@@ -95,7 +97,7 @@ type SessionModelUsageBreakdown struct {
 	CacheCreationInputTokens int               `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int               `json:"cache_read_input_tokens"`
 	ReasoningTokens          int               `json:"reasoning_tokens"`
-	CostUSD                  float64           `json:"cost_usd"`
+	Cost                     money.Money       `json:"cost"`
 	HasCost                  bool              `json:"has_cost"`
 	CostSource               export.CostSource `json:"cost_source"`
 }
@@ -130,6 +132,7 @@ type sessionExportCursorFilters struct {
 	Date                 string   `json:"date,omitempty"`
 	DateFrom             string   `json:"date_from,omitempty"`
 	DateTo               string   `json:"date_to,omitempty"`
+	Timezone             string   `json:"timezone,omitempty"`
 	ActiveSince          string   `json:"active_since,omitempty"`
 	MinMessages          int      `json:"min_messages,omitempty"`
 	MaxMessages          int      `json:"max_messages,omitempty"`
@@ -156,7 +159,8 @@ type sessionExportUsageAccum struct {
 	cacheCreationInputTokens int
 	cacheReadInputTokens     int
 	reasoningTokens          int
-	costUSD                  float64
+	cost                     money.Money
+	authoritativeCost        *money.Money
 	contributing             bool
 	allPriced                bool
 	seen                     map[usageDedupToken]struct{}
@@ -168,7 +172,7 @@ type sessionExportModelUsageAccum struct {
 	cacheCreationInputTokens int
 	cacheReadInputTokens     int
 	reasoningTokens          int
-	costUSD                  float64
+	cost                     money.Money
 	contributing             bool
 	allPriced                bool
 	computed                 bool
@@ -184,6 +188,71 @@ func (db *DB) ExportSessionSummaries(
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	tx, err := db.getReader().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return SessionExportResult{}, fmt.Errorf(
+			"starting session export snapshot: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := db.exportSessionSummariesTx(ctx, tx, opts, true)
+	if err != nil {
+		return SessionExportResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return SessionExportResult{}, fmt.Errorf(
+			"committing session export snapshot: %w", err)
+	}
+	return result, nil
+}
+
+// ExportAllSessionSummaries follows every page inside one read transaction so
+// a combined JSON or NDJSON artifact has one pricing and identity snapshot.
+func (db *DB) ExportAllSessionSummaries(
+	ctx context.Context, opts SessionExportOptions,
+) ([]SessionExportResult, error) {
+	return db.exportAllSessionSummaries(ctx, opts, nil)
+}
+
+func (db *DB) exportAllSessionSummaries(
+	ctx context.Context,
+	opts SessionExportOptions,
+	afterPage func(int) error,
+) ([]SessionExportResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	tx, err := db.getReader().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("starting complete session export snapshot: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	pages := []SessionExportResult{}
+	for {
+		result, err := db.exportSessionSummariesTx(ctx, tx, opts, false)
+		if err != nil {
+			return nil, err
+		}
+		pages = append(pages, result)
+		if afterPage != nil {
+			if err := afterPage(len(pages)); err != nil {
+				return nil, err
+			}
+		}
+		if result.NextCursor == "" {
+			break
+		}
+		opts.Cursor = result.NextCursor
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("committing complete session export snapshot: %w", err)
+	}
+	return pages, nil
+}
+
+func (db *DB) exportSessionSummariesTx(
+	ctx context.Context, tx *sql.Tx, opts SessionExportOptions,
+	cursorIntegrity bool,
+) (SessionExportResult, error) {
 	if opts.Limit <= 0 || opts.Limit > MaxSessionLimit {
 		opts.Limit = MaxSessionLimit
 	}
@@ -192,23 +261,14 @@ func (db *DB) ExportSessionSummaries(
 	}
 	opts.Filter = canonicalSessionExportFilter(opts.Filter)
 
-	databaseID, err := db.GetDatabaseID(ctx)
-	if err != nil {
-		return SessionExportResult{}, err
-	}
 	filters := sessionExportFilters(opts.Filter)
 
 	var cursor sessionExportCursorPayload
+	var err error
 	if opts.Cursor != "" {
 		cursor, err = db.decodeSessionExportCursor(opts.Cursor)
 		if err != nil {
 			return SessionExportResult{}, err
-		}
-		if cursor.DatabaseID != databaseID {
-			return SessionExportResult{}, fmt.Errorf(
-				"%w: cursor database %q does not match %q",
-				ErrSessionExportCursorReset, cursor.DatabaseID, databaseID,
-			)
 		}
 		if cursor.Order != sessionExportOrder {
 			return SessionExportResult{}, fmt.Errorf(
@@ -224,12 +284,19 @@ func (db *DB) ExportSessionSummaries(
 	}
 
 	where, args := buildSessionExportFilter(opts.Filter)
-	tx, err := db.getReader().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	databaseID, err := sessionExportMetadataValue(
+		ctx, tx, archiveMetadataDatabaseIDKey, ErrDatabaseIDMissing,
+		"database id",
+	)
 	if err != nil {
-		return SessionExportResult{}, fmt.Errorf(
-			"starting session export snapshot: %w", err)
+		return SessionExportResult{}, err
 	}
-	defer func() { _ = tx.Rollback() }()
+	if opts.Cursor != "" && cursor.DatabaseID != databaseID {
+		return SessionExportResult{}, fmt.Errorf(
+			"%w: cursor database %q does not match %q",
+			ErrSessionExportCursorReset, cursor.DatabaseID, databaseID,
+		)
+	}
 
 	watermark := cursor.Watermark
 	watermarkSort := cursor.WatermarkSort
@@ -246,7 +313,7 @@ func (db *DB) ExportSessionSummaries(
 			Projects:      map[string]export.ProjectMapEntry{},
 		}, nil
 	}
-	if cursor.SnapshotDigest != "" || cursor.SnapshotCount != 0 {
+	if cursorIntegrity && (cursor.SnapshotDigest != "" || cursor.SnapshotCount != 0) {
 		count, digest, err := db.sessionExportSnapshotFingerprint(
 			ctx, tx, where, args, watermarkSort)
 		if err != nil {
@@ -259,7 +326,7 @@ func (db *DB) ExportSessionSummaries(
 			)
 		}
 	}
-	if cursor.PrefixDigest != "" || cursor.PrefixCount != 0 {
+	if cursorIntegrity && (cursor.PrefixDigest != "" || cursor.PrefixCount != 0) {
 		count, digest, err := db.sessionExportPrefixFingerprint(
 			ctx, tx, where, args, watermarkSort,
 			cursor.LastActivitySort, cursor.LastID)
@@ -285,15 +352,19 @@ func (db *DB) ExportSessionSummaries(
 	if len(resultRows) > opts.Limit {
 		resultRows = resultRows[:opts.Limit]
 		last := resultRows[len(resultRows)-1]
-		snapshotCount, snapshotDigest, err := db.sessionExportSnapshotFingerprint(
-			ctx, tx, where, args, watermarkSort)
-		if err != nil {
-			return SessionExportResult{}, err
-		}
-		prefixCount, prefixDigest, err := db.sessionExportPrefixFingerprint(
-			ctx, tx, where, args, watermarkSort, last.lastActivitySort, last.ID)
-		if err != nil {
-			return SessionExportResult{}, err
+		var snapshotCount, prefixCount int
+		var snapshotDigest, prefixDigest string
+		if cursorIntegrity {
+			snapshotCount, snapshotDigest, err = db.sessionExportSnapshotFingerprint(
+				ctx, tx, where, args, watermarkSort)
+			if err != nil {
+				return SessionExportResult{}, err
+			}
+			prefixCount, prefixDigest, err = db.sessionExportPrefixFingerprint(
+				ctx, tx, where, args, watermarkSort, last.lastActivitySort, last.ID)
+			if err != nil {
+				return SessionExportResult{}, err
+			}
 		}
 		next = db.encodeSessionExportCursor(sessionExportCursorPayload{
 			DatabaseID:       databaseID,
@@ -311,24 +382,69 @@ func (db *DB) ExportSessionSummaries(
 			PrefixDigest:     prefixDigest,
 		})
 	}
-	if err := tx.Commit(); err != nil {
-		return SessionExportResult{}, fmt.Errorf(
-			"committing session export snapshot: %w", err)
-	}
-
-	pricing, err := db.attachSessionExportUsage(ctx, resultRows)
+	pricing, err := db.attachSessionExportUsage(ctx, tx, resultRows)
 	if err != nil {
 		return SessionExportResult{}, err
 	}
-	if err := db.attachSessionExportWorktrees(ctx, resultRows); err != nil {
+	if err := db.attachSessionExportWorktrees(ctx, tx, resultRows); err != nil {
 		return SessionExportResult{}, err
 	}
-	projects, err := db.BuildProjectIdentityMap(
-		ctx, sortedSetKeys(sessionExportProjectLabels(resultRows)))
+	sessionIDs := make([]string, len(resultRows))
+	for i := range resultRows {
+		sessionIDs[i] = resultRows[i].ID
+	}
+	snapshots, err := db.listSessionProjectIdentitySnapshotsFrom(
+		ctx, tx, sessionIDs)
 	if err != nil {
 		return SessionExportResult{}, err
 	}
-
+	archiveID, err := sessionExportMetadataValue(
+		ctx, tx, archiveMetadataArchiveIDKey, ErrArchiveIDMissing,
+		"archive id",
+	)
+	if err != nil {
+		return SessionExportResult{}, err
+	}
+	archiveSalt, err := sessionExportMetadataValue(
+		ctx, tx, archiveMetadataArchiveSaltKey, ErrArchiveSaltMissing,
+		"archive salt",
+	)
+	if err != nil {
+		return SessionExportResult{}, err
+	}
+	archiveSalt, err = validateArchiveSalt(archiveSalt)
+	if err != nil {
+		return SessionExportResult{}, err
+	}
+	archiveScope := export.IdentityScope{
+		ArchiveID: archiveID, ArchiveSalt: archiveSalt,
+	}
+	projects := make(map[string]export.ProjectMapEntry, len(resultRows))
+	for i := range resultRows {
+		obs, ok := snapshots[resultRows[i].ID]
+		if !ok {
+			obs = export.ProjectIdentityObservation{
+				Project: resultRows[i].Project,
+				Machine: resultRows[i].Machine,
+			}
+		}
+		resultRows[i].ProjectReference =
+			export.ResolveProjectReferenceFromObservation(obs, archiveScope)
+		reference := resultRows[i].ProjectReference
+		next := export.ProjectMapEntry{
+			DisplayLabel: reference.DisplayLabel,
+			ProjectKey:   reference.ProjectKey,
+			Resolution:   reference.Resolution,
+			Identity:     export.ProjectCatalogIdentity(reference.Identity),
+		}
+		if existing, ok := projects[reference.ProjectKey]; ok {
+			projects[reference.ProjectKey] = MergeSessionProjectCatalogEntry(
+				existing, next,
+			)
+		} else {
+			projects[reference.ProjectKey] = next
+		}
+	}
 	return SessionExportResult{
 		SchemaVersion: export.SessionSummarySchemaVersion,
 		Rows:          resultRows,
@@ -336,6 +452,49 @@ func (db *DB) ExportSessionSummaries(
 		Pricing:       pricing,
 		Projects:      projects,
 	}, nil
+}
+
+func MergeSessionProjectCatalogEntry(
+	existing, next export.ProjectMapEntry,
+) export.ProjectMapEntry {
+	if existing.Resolution == export.ProjectResolutionAmbiguous ||
+		next.Resolution == export.ProjectResolutionAmbiguous ||
+		(existing.Identity != nil && next.Identity != nil &&
+			existing.Identity.Key != next.Identity.Key) {
+		return export.ProjectMapEntry{
+			DisplayLabel: existing.DisplayLabel,
+			ProjectKey:   existing.ProjectKey,
+			Resolution:   export.ProjectResolutionAmbiguous,
+		}
+	}
+	if existing.Identity == nil && next.Identity != nil {
+		return next
+	}
+	return existing
+}
+
+func sessionExportMetadataValue(
+	ctx context.Context,
+	q sessionExportQuerier,
+	key string,
+	missing error,
+	label string,
+) (string, error) {
+	var value string
+	err := q.QueryRowContext(ctx,
+		`SELECT value FROM archive_metadata WHERE key = ?`, key,
+	).Scan(&value)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", missing
+		}
+		return "", fmt.Errorf("reading %s: %w", label, err)
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", missing
+	}
+	return value, nil
 }
 
 func (db *DB) sessionExportWatermark(
@@ -572,12 +731,12 @@ LIMIT ?`
 }
 
 func (db *DB) attachSessionExportUsage(
-	ctx context.Context, rows []SessionSummaryRow,
+	ctx context.Context, q sessionExportQuerier, rows []SessionSummaryRow,
 ) (*export.PricingBlock, error) {
 	if len(rows) == 0 {
 		return nil, nil
 	}
-	pricingRows, err := db.loadPricingMap(ctx)
+	pricingRows, err := db.loadPricingMapFrom(ctx, q)
 	if err != nil {
 		return nil, fmt.Errorf("loading pricing: %w", err)
 	}
@@ -588,7 +747,7 @@ func (db *DB) attachSessionExportUsage(
 	}
 
 	query, args := sessionExportUsageQuery(sessionExportIDs(rows))
-	sqlRows, err := db.getReader().QueryContext(ctx, query, args...)
+	sqlRows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("querying session export usage: %w", err)
 	}
@@ -614,7 +773,19 @@ func (db *DB) attachSessionExportUsage(
 		}
 		inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok :=
 			sessionExportUsageTokens(r)
-		cost, priced, contributes := sessionRowCost(r, resolver)
+		costRow := r
+		authoritative := r.costSource == CopilotReportedCostSource &&
+			r.cost.Valid
+		if authoritative {
+			v := money.Money{Microdollars: r.cost.Int64}
+			a.authoritativeCost = &v
+			costRow.cost = sql.NullInt64{}
+			resolver.RecordUnattributedReported()
+		}
+		cost, priced, contributes, priceErr := sessionRowCost(costRow, resolver)
+		if priceErr != nil {
+			return nil, priceErr
+		}
 		if !contributes {
 			continue
 		}
@@ -626,7 +797,11 @@ func (db *DB) attachSessionExportUsage(
 		a.cacheReadInputTokens += cacheRdTok
 		a.reasoningTokens += reasoningTok
 		if priced {
-			a.costUSD += cost
+			a.cost, priceErr = money.Add(a.cost, cost)
+			if priceErr != nil {
+				return nil, fmt.Errorf(
+					"summing session export cost: %w", priceErr)
+			}
 		} else {
 			a.allPriced = false
 		}
@@ -641,19 +816,52 @@ func (db *DB) attachSessionExportUsage(
 		ma.cacheCreationInputTokens += cacheCrTok
 		ma.cacheReadInputTokens += cacheRdTok
 		ma.reasoningTokens += reasoningTok
-		if r.costUSD.Valid {
+		if costRow.cost.Valid {
 			ma.reported = true
 		} else {
 			ma.computed = true
 		}
 		if priced {
-			ma.costUSD += cost
+			ma.cost, priceErr = money.Add(ma.cost, cost)
+			if priceErr != nil {
+				return nil, fmt.Errorf(
+					"summing session export model cost: %w", priceErr)
+			}
 		} else {
 			ma.allPriced = false
 		}
 	}
 	if err := sqlRows.Err(); err != nil {
 		return nil, fmt.Errorf("iterating session export usage: %w", err)
+	}
+	for _, a := range accum {
+		if a == nil || a.authoritativeCost == nil {
+			continue
+		}
+		type modelAllocation struct {
+			model string
+			usage *sessionExportModelUsageAccum
+		}
+		models := make([]modelAllocation, 0, len(a.byModel))
+		for model, usage := range a.byModel {
+			if usage != nil {
+				models = append(models, modelAllocation{model: model, usage: usage})
+			}
+		}
+		sort.Slice(models, func(i, j int) bool {
+			return models[i].model < models[j].model
+		})
+		weights := make([]money.Money, len(models))
+		for i, model := range models {
+			weights[i] = model.usage.cost
+		}
+		costs := export.AllocateCostByWeight(*a.authoritativeCost, weights)
+		for i, model := range models {
+			model.usage.cost = costs[i]
+			model.usage.allPriced = true
+		}
+		a.cost = *a.authoritativeCost
+		a.allPriced = true
 	}
 
 	for i := range rows {
@@ -668,8 +876,8 @@ func (db *DB) attachSessionExportUsage(
 			CacheCreationInputTokens: a.cacheCreationInputTokens,
 			CacheReadInputTokens:     a.cacheReadInputTokens,
 			ReasoningTokens:          a.reasoningTokens,
-			CostUSD:                  a.costUSD,
-			HasCost:                  a.contributing && a.allPriced,
+			Cost:                     a.cost,
+			HasCost:                  a.authoritativeCost != nil || (a.contributing && a.allPriced),
 			ByModel:                  sessionExportModelUsageBreakdowns(a.byModel),
 		}
 	}
@@ -710,13 +918,13 @@ func sessionExportUsageTokens(
 }
 
 func (db *DB) attachSessionExportWorktrees(
-	ctx context.Context, rows []SessionSummaryRow,
+	ctx context.Context, q sessionExportQuerier, rows []SessionSummaryRow,
 ) error {
 	if len(rows) == 0 {
 		return nil
 	}
 	labels := sortedSetKeys(sessionExportProjectLabels(rows))
-	observations, err := db.ListProjectIdentityObservations(ctx, labels)
+	observations, err := db.listProjectIdentityObservationsFrom(ctx, q, labels)
 	if err != nil {
 		return err
 	}
@@ -799,6 +1007,7 @@ func sessionExportFilters(f SessionFilter) sessionExportCursorFilters {
 		Date:                 f.Date,
 		DateFrom:             f.DateFrom,
 		DateTo:               f.DateTo,
+		Timezone:             f.Timezone,
 		ActiveSince:          f.ActiveSince,
 		MinMessages:          f.MinMessages,
 		MaxMessages:          f.MaxMessages,
@@ -828,6 +1037,7 @@ func sessionExportFilterFromCursor(f sessionExportCursorFilters) SessionFilter {
 		Date:                 f.Date,
 		DateFrom:             f.DateFrom,
 		DateTo:               f.DateTo,
+		Timezone:             f.Timezone,
 		ActiveSince:          f.ActiveSince,
 		MinMessages:          f.MinMessages,
 		MaxMessages:          f.MaxMessages,
@@ -855,6 +1065,17 @@ func canonicalSessionExportFilter(f SessionFilter) SessionFilter {
 	f.Date = strings.TrimSpace(f.Date)
 	f.DateFrom = strings.TrimSpace(f.DateFrom)
 	f.DateTo = strings.TrimSpace(f.DateTo)
+	if timezone, err := NormalizeSessionTimezone(f.Timezone); err == nil {
+		if timezone == "UTC" {
+			// Preserve the existing cursor wire form while treating an
+			// explicit UTC filter as equivalent to the omitted UTC default.
+			f.Timezone = ""
+		} else {
+			f.Timezone = timezone
+		}
+	} else {
+		f.Timezone = strings.TrimSpace(f.Timezone)
+	}
 	f.ActiveSince = strings.TrimSpace(f.ActiveSince)
 	f.AutomatedScope = normalizeAutomatedScope(f.AutomatedScope, f.ExcludeAutomated)
 	f.ExcludeAutomated = false
@@ -908,12 +1129,6 @@ func sessionExportFiltersEqual(
 
 func buildSessionExportFilter(f SessionFilter) (string, []any) {
 	dialect := SQLiteQueryDialect()
-	if f.IncludeChildren {
-		dialect.activityExpr = sessionExportLastActivitySortExprFor("root_session")
-	} else {
-		dialect.activityExpr = sessionExportLastActivitySortExpr()
-	}
-	dialect.activityParam = func(ph string) string { return "julianday(" + ph + ")" }
 	return BuildSessionFilterSQL(f, dialect)
 }
 
@@ -1020,7 +1235,7 @@ func sessionExportModelUsageBreakdowns(
 			CacheCreationInputTokens: a.cacheCreationInputTokens,
 			CacheReadInputTokens:     a.cacheReadInputTokens,
 			ReasoningTokens:          a.reasoningTokens,
-			CostUSD:                  a.costUSD,
+			Cost:                     a.cost,
 			HasCost:                  a.contributing && a.allPriced,
 			CostSource:               sessionExportCostSource(a.computed, a.reported),
 		}

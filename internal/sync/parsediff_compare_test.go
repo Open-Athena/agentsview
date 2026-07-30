@@ -15,6 +15,7 @@ import (
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
@@ -318,6 +319,37 @@ func TestCompareSessionFields(t *testing.T) {
 				field:  FieldGitBranch,
 				stored: "main",
 				parsed: "feature",
+			}},
+		},
+		{
+			name: "agent_label drift is informational for incremental agents",
+			stored: func(s *db.Session) {
+				s.AgentLabel = "triage"
+			},
+			prepared: func(s *db.Session) {
+				s.AgentLabel = "review"
+			},
+			want: []want{{
+				field:         FieldAgentLabel,
+				stored:        "triage",
+				parsed:        "review",
+				informational: true,
+			}},
+		},
+		{
+			name: "entrypoint drift is a real diff for full-replace agents",
+			stored: func(s *db.Session) {
+				s.Agent = "gemini"
+				s.Entrypoint = "cli"
+			},
+			prepared: func(s *db.Session) {
+				s.Agent = "gemini"
+				s.Entrypoint = "sdk-cli"
+			},
+			want: []want{{
+				field:  FieldEntrypoint,
+				stored: "cli",
+				parsed: "sdk-cli",
 			}},
 		},
 		{
@@ -979,11 +1011,11 @@ func TestCompareUsageEvents(t *testing.T) {
 	})
 
 	t.Run("cost columns are ignored", func(t *testing.T) {
-		cost := 0.42
+		cost := money.MustParseDollars("0.42")
 		stored := []db.UsageEvent{
 			pdEvent("api", "m1", 10, 2, "2026-01-01T00:00:00Z", "", nil),
 		}
-		stored[0].CostUSD = &cost
+		stored[0].Cost = &cost
 		stored[0].CostStatus = "final"
 		stored[0].CostSource = "pricing"
 		parsed := []db.UsageEvent{
@@ -1061,14 +1093,14 @@ func TestFingerprintTwinMatchesDB(t *testing.T) {
 		},
 	}
 
-	written, _, failed := e.writeBatch(
+	written, _, failed, _ := e.writeBatch(
 		[]pendingWrite{pw}, syncWriteBulk, false,
 	)
 	require.Equal(t, 1, written, "session must be written")
 	require.Zero(t, failed)
 
-	prepared, msgs, ok := e.prepareSessionWrite(pw, nil)
-	require.True(t, ok)
+	prepared, msgs, verdict := e.prepareSessionWrite(pw, nil)
+	require.Equal(t, sessionWriteOK, verdict)
 	require.NotEmpty(t, msgs)
 
 	storedFP, err := d.MessageTokenFingerprint(prepared.ID)
@@ -1163,14 +1195,14 @@ func TestCompareStoredSessionRoundTrip(t *testing.T) {
 		},
 	}
 
-	written, _, failed := e.writeBatch(
+	written, _, failed, _ := e.writeBatch(
 		[]pendingWrite{pw}, syncWriteBulk, false,
 	)
 	require.Equal(t, 1, written)
 	require.Zero(t, failed)
 
-	prepared, msgs, ok := e.prepareSessionWrite(pw, nil)
-	require.True(t, ok)
+	prepared, msgs, verdict := e.prepareSessionWrite(pw, nil)
+	require.Equal(t, sessionWriteOK, verdict)
 	events, _ := toDBUsageEvents(prepared.ID, pw.usageEvents)
 
 	stored := pdFetchStored(t, d, prepared.ID)
@@ -1215,7 +1247,7 @@ func TestCompareStoredSessionDetectsDrift(t *testing.T) {
 			},
 		},
 	}
-	written, _, failed := e.writeBatch(
+	written, _, failed, _ := e.writeBatch(
 		[]pendingWrite{pw}, syncWriteBulk, false,
 	)
 	require.Equal(t, 1, written)
@@ -1223,8 +1255,8 @@ func TestCompareStoredSessionDetectsDrift(t *testing.T) {
 
 	// Simulate parser drift: the new parse reports a different model.
 	pw.msgs[0].Model = "claude-haiku"
-	prepared, msgs, ok := e.prepareSessionWrite(pw, nil)
-	require.True(t, ok)
+	prepared, msgs, verdict := e.prepareSessionWrite(pw, nil)
+	require.Equal(t, sessionWriteOK, verdict)
 
 	stored := pdFetchStored(t, d, prepared.ID)
 	diffs, err := e.compareStoredSession(
@@ -1258,7 +1290,7 @@ func pdWriteSingleMessageSession(
 		},
 		msgs: []parser.ParsedMessage{msg},
 	}
-	written, _, failed := e.writeBatch(
+	written, _, failed, _ := e.writeBatch(
 		[]pendingWrite{pw}, syncWriteBulk, false,
 	)
 	require.Equal(t, 1, written)
@@ -1280,8 +1312,8 @@ func TestCompareStoredSessionDetectsContentDrift(t *testing.T) {
 	// New parse: same model and tokens, longer body.
 	pw.msgs[0].Content = "a much longer reply body"
 	pw.msgs[0].ContentLength = len(pw.msgs[0].Content)
-	prepared, msgs, ok := e.prepareSessionWrite(pw, nil)
-	require.True(t, ok)
+	prepared, msgs, verdict := e.prepareSessionWrite(pw, nil)
+	require.Equal(t, sessionWriteOK, verdict)
 
 	stored := pdFetchStored(t, d, prepared.ID)
 	diffs, err := e.compareStoredSession(
@@ -1306,8 +1338,8 @@ func TestCompareStoredSessionDetectsMetadataDrift(t *testing.T) {
 
 	// New parse flips only is_sidechain: same model, tokens, content.
 	pw.msgs[0].IsSidechain = true
-	prepared, msgs, ok := e.prepareSessionWrite(pw, nil)
-	require.True(t, ok)
+	prepared, msgs, verdict := e.prepareSessionWrite(pw, nil)
+	require.Equal(t, sessionWriteOK, verdict)
 
 	stored := pdFetchStored(t, d, prepared.ID)
 	diffs, err := e.compareStoredSession(
@@ -1380,7 +1412,7 @@ func pdWriteToolSession(
 	d := openTestDB(t)
 	e := NewEngine(d, EngineConfig{Machine: "test-machine"})
 	pw := pdToolSession(id)
-	written, _, failed := e.writeBatch(
+	written, _, failed, _ := e.writeBatch(
 		[]pendingWrite{pw}, syncWriteBulk, false,
 	)
 	require.Equal(t, 1, written)
@@ -1393,8 +1425,8 @@ func pdWriteToolSession(
 // way TestFingerprintTwinMatchesDB does for the message fingerprints.
 func TestToolCallAndFlagsFingerprintTwinsMatchDB(t *testing.T) {
 	e, d, pw := pdWriteToolSession(t, "pd-tool-twin")
-	prepared, msgs, ok := e.prepareSessionWrite(pw, nil)
-	require.True(t, ok)
+	prepared, msgs, verdict := e.prepareSessionWrite(pw, nil)
+	require.Equal(t, sessionWriteOK, verdict)
 
 	storedFlagsFP, err := d.MessageFlagsFingerprint(prepared.ID)
 	require.NoError(t, err)
@@ -1427,8 +1459,8 @@ func TestToolCallDiffDetectsFilePath(t *testing.T) {
 // system message must compare identical against itself.
 func TestCompareStoredSessionRoundTripToolCalls(t *testing.T) {
 	e, d, pw := pdWriteToolSession(t, "pd-tool-rt")
-	prepared, msgs, ok := e.prepareSessionWrite(pw, nil)
-	require.True(t, ok)
+	prepared, msgs, verdict := e.prepareSessionWrite(pw, nil)
+	require.Equal(t, sessionWriteOK, verdict)
 
 	stored := pdFetchStored(t, d, prepared.ID)
 	diffs, err := e.compareStoredSession(
@@ -1446,8 +1478,8 @@ func TestCompareStoredSessionRoundTripToolCalls(t *testing.T) {
 func TestCompareStoredSessionDetectsToolCallDrift(t *testing.T) {
 	e, d, pw := pdWriteToolSession(t, "pd-tool-drift")
 	pw.msgs[1].ToolCalls[0].ToolName = "Grep"
-	prepared, msgs, ok := e.prepareSessionWrite(pw, nil)
-	require.True(t, ok)
+	prepared, msgs, verdict := e.prepareSessionWrite(pw, nil)
+	require.Equal(t, sessionWriteOK, verdict)
 
 	stored := pdFetchStored(t, d, prepared.ID)
 	diffs, err := e.compareStoredSession(
@@ -1465,8 +1497,8 @@ func TestCompareStoredSessionDetectsToolCallDrift(t *testing.T) {
 func TestCompareStoredSessionDetectsFlagDrift(t *testing.T) {
 	e, d, pw := pdWriteToolSession(t, "pd-flag-drift")
 	pw.msgs[1].HasThinking = false
-	prepared, msgs, ok := e.prepareSessionWrite(pw, nil)
-	require.True(t, ok)
+	prepared, msgs, verdict := e.prepareSessionWrite(pw, nil)
+	require.Equal(t, sessionWriteOK, verdict)
 
 	stored := pdFetchStored(t, d, prepared.ID)
 	diffs, err := e.compareStoredSession(
@@ -2051,8 +2083,8 @@ func TestParseDiffProviderVirtualSQLiteErrorUsesExactSource(t *testing.T) {
 		DataVersion: db.CurrentDataVersion(),
 	}
 	storedByPath := map[string][]*db.Session{
-		parseDiffSourceKey(firstPath):  {first},
-		parseDiffSourceKey(secondPath): {second},
+		parseDiffSourceKey(parser.AgentOpenCode, firstPath):  {first},
+		parseDiffSourceKey(parser.AgentOpenCode, secondPath): {second},
 	}
 	job := syncJob{
 		path: firstPath,
@@ -2111,8 +2143,8 @@ func TestParseDiffProviderVirtualSQLitePresenceUsesExactSource(t *testing.T) {
 		DataVersion: db.CurrentDataVersion(),
 	}
 	storedByPath := map[string][]*db.Session{
-		parseDiffSourceKey(firstPath):  {first},
-		parseDiffSourceKey(secondPath): {second},
+		parseDiffSourceKey(parser.AgentOpenCode, firstPath):  {first},
+		parseDiffSourceKey(parser.AgentOpenCode, secondPath): {second},
 	}
 	job := syncJob{path: firstPath}
 	engine := &Engine{db: dbtest.OpenTestDB(t)}
@@ -2171,6 +2203,16 @@ func TestParseDiffProviderVirtualSQLiteLimitUsesExactSource(t *testing.T) {
 			"cut path %q must be one exact virtual source", path,
 		)
 	}
+}
+
+func TestParseDiffSourceKeyStateVSCDBIsAgentAware(t *testing.T) {
+	dbPath := "/tmp/state.vscdb"
+	virtualPath := dbPath + "#session-1"
+
+	assert.Equal(t, virtualPath,
+		parseDiffSourceKey(parser.AgentWindsurf, virtualPath))
+	assert.Equal(t, dbPath,
+		parseDiffSourceKey(parser.AgentTrae, virtualPath))
 }
 
 func TestParseDiffDevinVirtualSQLiteLimitUsesExactSource(t *testing.T) {

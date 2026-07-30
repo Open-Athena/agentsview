@@ -11,6 +11,7 @@ import (
 	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/pricing"
 )
 
@@ -158,9 +159,12 @@ func TestActivityReportJSONIncludesExportMetadata(t *testing.T) {
 		resp.Pricing.Models[fallbackModel].CostSource)
 	assert.True(t, resp.Pricing.Fallback.Used)
 	assert.Contains(t, resp.Pricing.Fallback.Models, fallbackModel)
-	require.Contains(t, resp.Projects, "shared-project")
-	assert.Equal(t, export.ProjectResolutionUnknown,
-		resp.Projects["shared-project"].Resolution)
+	require.Len(t, resp.Projects, 1)
+	for key, project := range resp.Projects {
+		assert.NotContains(t, key, "shared-project")
+		assert.Equal(t, "shared-project", project.DisplayLabel)
+		assert.Equal(t, export.ProjectResolutionUnknown, project.Resolution)
+	}
 	assert.Equal(t, 2, resp.Totals.Sessions)
 	assert.Equal(t, 150, resp.Totals.OutputTokens)
 	assert.NotEmpty(t, resp.Buckets)
@@ -200,13 +204,13 @@ func seedActivityReportMetadataFixture(t *testing.T, te *testEnv) {
 					`{"input_tokens":200,"output_tokens":100}`)
 			}
 		})
-	cost := 0.25
+	cost := money.MustParseDollars("0.25")
 	ordinal := 1
 	require.NoError(t, te.db.ReplaceSessionUsageEvents(
 		"activity-meta-reported-cost", []db.UsageEvent{{
 			SessionID: "activity-meta-reported-cost", MessageOrdinal: &ordinal,
 			Source: "session", Model: "gpt-5.1", InputTokens: 100,
-			OutputTokens: 50, CostUSD: &cost,
+			OutputTokens: 50, Cost: &cost,
 			OccurredAt: activityDate + "T10:02:00Z",
 			DedupKey:   "activity-meta-reported-cost:event",
 		}},
@@ -216,7 +220,7 @@ func seedActivityReportMetadataFixture(t *testing.T, te *testEnv) {
 func activityReportFallbackModel(t *testing.T) string {
 	t.Helper()
 	for _, p := range pricing.FallbackPricing() {
-		if p.OutputPerMTok > 0 {
+		if p.OutputPerMTok.Microdollars > 0 {
 			return p.ModelPattern
 		}
 	}

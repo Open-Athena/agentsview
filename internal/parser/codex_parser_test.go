@@ -1,11 +1,13 @@
 package parser
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -113,6 +115,181 @@ func TestParseCodexSession_Basic(t *testing.T) {
 	assert.Equal(t, "/Users/alice/code/my-api", sess.Cwd)
 	assert.Equal(t, 2, len(msgs))
 	assertSessionMeta(t, sess, "codex:abc-123", "my_api", AgentCodex)
+}
+
+func TestParseCodexSession_SubagentLineage(t *testing.T) {
+	const (
+		childID  = "01900000-0000-7000-8000-000000000002"
+		parentID = "01900000-0000-7000-8000-000000000001"
+	)
+
+	tests := []struct {
+		name             string
+		meta             string
+		wantParent       string
+		wantRelationship RelationshipType
+	}{
+		{
+			name: "current nested source",
+			meta: fmt.Sprintf(
+				`{"timestamp":%q,"type":"session_meta","payload":{"id":%q,"cwd":"/tmp","source":{"subagent":{"thread_spawn":{"parent_thread_id":%q,"depth":1}}}}}`,
+				tsEarly, childID, parentID,
+			),
+			wantParent:       "codex:" + parentID,
+			wantRelationship: RelSubagent,
+		},
+		{
+			name: "legacy top-level fields",
+			meta: fmt.Sprintf(
+				`{"timestamp":%q,"type":"session_meta","payload":{"id":%q,"cwd":"/tmp","thread_source":"subagent","parent_thread_id":%q}}`,
+				tsEarly, childID, parentID,
+			),
+			wantParent:       "codex:" + parentID,
+			wantRelationship: RelSubagent,
+		},
+		{
+			name:             "root session",
+			meta:             testjsonl.CodexSessionMetaJSON(childID, "/tmp", "user", tsEarly),
+			wantRelationship: RelNone,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sess, _ := runCodexParserTest(t, "test.jsonl", tt.meta, false)
+
+			require.NotNil(t, sess)
+			assert.Equal(t, tt.wantParent, sess.ParentSessionID)
+			assert.Equal(t, tt.wantRelationship, sess.RelationshipType)
+		})
+	}
+}
+
+func TestParseCodexSession_SubagentActivityLinksSpawn(t *testing.T) {
+	const childID = "01900000-0000-7000-8000-000000000002"
+	activity := testjsonl.CodexSubagentActivityJSON(
+		"started", "call_spawn", childID,
+		"/root/identity_lifecycle", tsLate,
+	)
+	content := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON("parent", "/tmp", "user", tsEarly),
+		testjsonl.CodexMsgJSON("user", "delegate the task", tsEarlyS1),
+		testjsonl.CodexFunctionCallWithCallIDJSON(
+			"spawn_agent", "call_spawn",
+			map[string]any{"task_name": "identity_lifecycle"}, tsEarlyS5,
+		),
+		activity,
+		testjsonl.CodexFunctionCallOutputJSON(
+			"call_spawn", `{"task_name":"/root/identity_lifecycle"}`, tsLateS5,
+		),
+	)
+
+	_, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+
+	require.Len(t, msgs, 2)
+	assertToolCalls(t, msgs[1].ToolCalls, []ParsedToolCall{{
+		ToolUseID:         "call_spawn",
+		ToolName:          "spawn_agent",
+		Category:          "Task",
+		SubagentSessionID: "codex:" + childID,
+	}})
+	assert.True(t, codexIncrementalNeedsFullParse(activity))
+	interacted := testjsonl.CodexSubagentActivityJSON(
+		"interacted", "call_message", childID,
+		"/root/identity_lifecycle", tsLateS5,
+	)
+	assert.False(t, codexIncrementalNeedsFullParse(interacted))
+}
+
+func TestParseCodexSession_InboundAgentMessagesAreUserTurns(t *testing.T) {
+	const (
+		initialTask = "Inspect the parser and report the root cause."
+		followUp    = "Also identify the safest regression test."
+	)
+	initialContext := fmt.Sprintf(
+		`{"timestamp":%q,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<recommended_plugins>\nplugin list\n</recommended_plugins>"},{"type":"input_text","text":"# AGENTS.md\n<INSTRUCTIONS>\nRepository rules\n</INSTRUCTIONS>"},{"type":"input_text","text":"<environment_context>\n<cwd>/tmp/project</cwd>\n</environment_context>"}]}}`,
+		tsEarlyS1,
+	)
+	content := testjsonl.JoinJSONL(
+		testjsonl.CodexSubagentSessionMetaJSON(
+			"child", "parent", "/tmp/project", "user", tsEarly,
+		),
+		initialContext,
+		testjsonl.CodexAgentMessageJSON(
+			"/root", "/root/worker", "Task received from parent.",
+			initialTask, tsEarlyS5,
+		),
+		testjsonl.CodexMsgJSON(
+			"assistant", "I found the parser branch.", tsLate,
+		),
+		testjsonl.CodexAgentMessageJSON(
+			"/root/worker", "/root", "Update sent to parent.",
+			"This outbound update must stay hidden.", tsLateS5,
+		),
+		testjsonl.CodexAgentMessageJSON(
+			"/root", "/root/worker", "Follow-up received from parent.",
+			followUp, "2024-01-01T11:00:10Z",
+		),
+	)
+
+	sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+
+	require.NotNil(t, sess)
+	assert.Equal(t, initialTask, sess.FirstMessage)
+	require.Len(t, msgs, 3)
+	assert.Equal(t, RoleUser, msgs[0].Role)
+	assert.Equal(t, initialTask, msgs[0].Content)
+	assert.Equal(t, RoleAssistant, msgs[1].Role)
+	assert.Equal(t, "I found the parser branch.", msgs[1].Content)
+	assert.Equal(t, RoleUser, msgs[2].Role)
+	assert.Equal(t, followUp, msgs[2].Content)
+}
+
+func TestParseCodexSession_EncryptedAgentMessageUsesTaskName(t *testing.T) {
+	const encrypted = "gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+	content := testjsonl.JoinJSONL(
+		testjsonl.CodexSubagentSessionMetaJSON(
+			"child", "parent", "/tmp/project", "user", tsEarly,
+		),
+		testjsonl.CodexAgentMessageJSON(
+			"/root", "/root/worker", "Task received from parent.",
+			encrypted, tsEarlyS1,
+		),
+		testjsonl.CodexMsgJSON(
+			"assistant", "I completed the encrypted task.", tsEarlyS5,
+		),
+	)
+
+	sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+
+	require.NotNil(t, sess)
+	assert.Empty(t, sess.FirstMessage)
+	assert.Equal(t, "worker", sess.SessionName)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, RoleAssistant, msgs[0].Role)
+	assert.Equal(t, "I completed the encrypted task.", msgs[0].Content)
+}
+
+func TestParseCodexSession_FernetPrefixPlaintextRemainsVisible(t *testing.T) {
+	const prompt = "gAAAAA is only a prefix here, not an encrypted token."
+	content := testjsonl.JoinJSONL(
+		testjsonl.CodexSubagentSessionMetaJSON(
+			"child", "parent", "/tmp/project", "user", tsEarly,
+		),
+		testjsonl.CodexAgentMessageJSON(
+			"/root", "/root/worker", "Task received from parent.",
+			prompt, tsEarlyS1,
+		),
+	)
+
+	sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+
+	require.NotNil(t, sess)
+	assert.Equal(t, prompt, sess.FirstMessage)
+	assert.Empty(t, sess.SessionName)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, RoleUser, msgs[0].Role)
+	assert.Equal(t, prompt, msgs[0].Content)
 }
 
 func TestParseCodexSession_UsesThreadNameFromSessionIndex(t *testing.T) {
@@ -223,6 +400,16 @@ func TestEvictCodexSessionIndexCache(t *testing.T) {
 	_, cached = codexSessionIndexCache.entries[indexPath]
 	codexSessionIndexCache.mu.Unlock()
 	assert.False(t, cached, "session index cache entry should be evicted")
+
+	otherPath := filepath.Join(root, "other-session_index.jsonl")
+	require.NoError(t, os.WriteFile(otherPath, []byte(index), 0o644))
+	CodexSessionIndexTitles(indexPath)
+	CodexSessionIndexTitles(otherPath)
+	EvictAllCodexSessionIndexes()
+	codexSessionIndexCache.mu.Lock()
+	remaining := len(codexSessionIndexCache.entries)
+	codexSessionIndexCache.mu.Unlock()
+	assert.Zero(t, remaining, "all session index cache entries should be evicted")
 }
 
 func TestParseCodexSession_PreservesAssistantBlockquotes(t *testing.T) {
@@ -342,6 +529,58 @@ func TestParseCodexSession_FunctionCalls(t *testing.T) {
 		assert.Equal(t, want, msgs[1].Content)
 		assert.NotEmpty(t, msgs[1].ToolCalls[0].InputJSON)
 		assert.Contains(t, msgs[1].ToolCalls[0].InputJSON, "Begin Patch")
+	})
+
+	t.Run("custom_tool_call apply_patch input and output", func(t *testing.T) {
+		call := `{"timestamp":"2026-07-08T03:20:43.339Z","type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"call_abc","name":"apply_patch","input":"*** Begin Patch\n*** Add File: infra/scripts/with-resolved-images.sh\n+#!/bin/sh\n*** End Patch"}}`
+		patchEnd := `{"timestamp":"2026-07-08T03:20:43.356Z","type":"event_msg","payload":{"type":"patch_apply_end","call_id":"call_abc","stdout":"Success. Updated the following files:\nA infra/scripts/with-resolved-images.sh\n","stderr":"","success":true}}`
+		output := `{"timestamp":"2026-07-08T03:20:43.376Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_abc","output":"Exit code: 0\nWall time: 0 seconds\nOutput:\nSuccess. Updated the following files:\nA infra/scripts/with-resolved-images.sh\n"}}`
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON("fc-custom-tool", "/tmp", "user", tsEarly),
+			testjsonl.CodexMsgJSON("user", "apply the patch", tsEarlyS1),
+			call,
+			patchEnd,
+			output,
+		)
+
+		_, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+
+		require.Len(t, msgs, 2)
+		assert.Equal(t, RoleAssistant, msgs[1].Role)
+		assert.True(t, msgs[1].HasToolUse)
+		assertToolCalls(t, msgs[1].ToolCalls, []ParsedToolCall{{
+			ToolUseID: "call_abc",
+			ToolName:  "apply_patch",
+			Category:  "Edit",
+		}})
+		tc := msgs[1].ToolCalls[0]
+		assert.Contains(t, tc.InputJSON, "Begin Patch")
+		assertToolResultEvents(t, tc.ResultEvents, []ParsedToolResultEvent{{
+			ToolUseID: "call_abc",
+			Source:    "custom_tool_call_output",
+			Status:    "completed",
+			Content:   "Exit code: 0\nWall time: 0 seconds\nOutput:\nSuccess. Updated the following files:\nA infra/scripts/with-resolved-images.sh",
+		}})
+	})
+
+	t.Run("unsupported response_item subtype is ignored", func(t *testing.T) {
+		unsupported := `{"timestamp":"2026-07-08T03:20:43.339Z","type":"response_item","payload":{"type":"custom_tool_callish","call_id":"call_abc","name":"apply_patch","input":"*** Begin Patch\n*** End Patch"}}`
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON("fc-unsupported-response-item", "/tmp", "user", tsEarly),
+			testjsonl.CodexMsgJSON("user", "apply the patch", tsEarlyS1),
+			unsupported,
+		)
+
+		_, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+
+		require.Len(t, msgs, 1)
+		assert.False(t, msgs[0].HasToolUse)
+	})
+
+	t.Run("custom_tool_call_output requests full parse", func(t *testing.T) {
+		line := `{"timestamp":"2026-07-08T03:20:43.376Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_abc","output":"Exit code: 0\nWall time: 0 seconds\nOutput:\nSuccess."}}`
+
+		assert.True(t, codexIncrementalNeedsFullParse(line))
 	})
 
 	t.Run("write_stdin formats with session and chars", func(t *testing.T) {
@@ -1464,6 +1703,123 @@ func TestParseCodexSession_EdgeCases(t *testing.T) {
 		assert.Equal(t, "Actual user message", msgs[0].Content)
 	})
 
+	t.Run("strips recommended plugins from initial context", func(t *testing.T) {
+		plugins := "<recommended_plugins>\n" +
+			"Install Google Drive when useful.\n" +
+			"</recommended_plugins>"
+		initialContext := fmt.Sprintf(
+			`{"timestamp":%q,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":%q},{"type":"input_text","text":%q},{"type":"input_text","text":%q}]}}`,
+			tsEarlyS1,
+			plugins,
+			"# AGENTS.md instructions for /tmp/project\n\n<INSTRUCTIONS>\nrepo rules\n</INSTRUCTIONS>",
+			"<environment_context>\n  <cwd>/tmp/project</cwd>\n</environment_context>",
+		)
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON("abc", "/tmp", "user", tsEarly),
+			initialContext,
+			testjsonl.CodexMsgJSON("user", "Review the changes", tsEarlyS5),
+		)
+
+		sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+
+		require.NotNil(t, sess)
+		require.Len(t, msgs, 1)
+		assert.Equal(t, "Review the changes", msgs[0].Content)
+		assert.Equal(t, "Review the changes", sess.FirstMessage)
+		assert.Equal(t, 1, sess.UserMessageCount)
+	})
+
+	t.Run("preserves prompt bundled with initial context", func(t *testing.T) {
+		plugins := "<recommended_plugins>\n" +
+			"Install Google Drive when useful.\n" +
+			"</recommended_plugins>"
+		initialContext := fmt.Sprintf(
+			`{"timestamp":%q,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":%q},{"type":"input_text","text":%q},{"type":"input_text","text":%q},{"type":"input_text","text":%q}]}}`,
+			tsEarlyS1,
+			plugins,
+			"# AGENTS.md instructions for /tmp/project\n\n<INSTRUCTIONS>\nrepo rules\n</INSTRUCTIONS>",
+			"<environment_context>\n  <cwd>/tmp/project</cwd>\n</environment_context>",
+			"Review the changes",
+		)
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON("abc", "/tmp", "user", tsEarly),
+			initialContext,
+		)
+
+		sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+
+		require.NotNil(t, sess)
+		require.Len(t, msgs, 1)
+		assert.Equal(t, "Review the changes", msgs[0].Content)
+		assert.Equal(t, "Review the changes", sess.FirstMessage)
+		assert.Equal(t, 1, sess.UserMessageCount)
+	})
+
+	t.Run("preserves prompt sharing a block with initial context", func(t *testing.T) {
+		initialContext := fmt.Sprintf(
+			`{"timestamp":%q,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":%q}]}}`,
+			tsEarlyS1,
+			"<recommended_plugins>\nplugin list\n</recommended_plugins>\n"+
+				"# AGENTS.md instructions for /tmp/project\n\n"+
+				"<INSTRUCTIONS>\nrepo rules\n</INSTRUCTIONS>\n\n"+
+				"Review the changes",
+		)
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON("abc", "/tmp", "user", tsEarly),
+			initialContext,
+		)
+
+		sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+
+		require.NotNil(t, sess)
+		require.Len(t, msgs, 1)
+		assert.Equal(t, "Review the changes", msgs[0].Content)
+		assert.Equal(t, "Review the changes", sess.FirstMessage)
+		assert.Equal(t, 1, sess.UserMessageCount)
+	})
+
+	t.Run("preserves user prompt after recommended plugins", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON("abc", "/tmp", "user", tsEarly),
+			testjsonl.CodexMsgJSON(
+				"user",
+				"<recommended_plugins>\nplugin list\n</recommended_plugins>\nFix the parser",
+				tsEarlyS1,
+			),
+			testjsonl.CodexMsgJSON(
+				"user",
+				"<recommended_plugins>later user text</recommended_plugins>",
+				tsEarlyS5,
+			),
+		)
+
+		sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+
+		require.NotNil(t, sess)
+		require.Len(t, msgs, 2)
+		assert.Equal(t, "Fix the parser", msgs[0].Content)
+		assert.Equal(t, "<recommended_plugins>later user text</recommended_plugins>", msgs[1].Content)
+		assert.Equal(t, "Fix the parser", sess.FirstMessage)
+		assert.Equal(t, 2, sess.UserMessageCount)
+	})
+
+	t.Run("finds recommended plugins after leading whitespace", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON("abc", "/tmp", "user", tsEarly),
+			testjsonl.CodexMsgJSON(
+				"user",
+				"\n<recommended_plugins>plugin list</recommended_plugins>\nFix the parser",
+				tsEarlyS1,
+			),
+		)
+
+		sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+
+		require.NotNil(t, sess)
+		require.Len(t, msgs, 1)
+		assert.Equal(t, "Fix the parser", msgs[0].Content)
+	})
+
 	// Codex injects skill template content as role=user JSONL
 	// entries when the model invokes a skill. These look like
 	// follow-up user turns to a naive count, which inflates
@@ -1783,6 +2139,136 @@ func TestParseCodexSession_TerminationStatus(t *testing.T) {
 	})
 }
 
+func TestCodexCursorWarmColdParity(t *testing.T) {
+	prefix := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			"cursor-parity", "/workspace/project-a", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexTurnContextJSON("gpt-5.4", tsEarlyS1),
+		testjsonl.CodexMsgJSON("user", "First request", "2024-01-01T10:00:02Z"),
+		codexEventMsgJSON("task_started", "2024-01-01T10:00:03Z"),
+		testjsonl.CodexMsgJSON("assistant", "Working", "2024-01-01T10:00:04Z"),
+		codexEventMsgJSON("task_complete", "2024-01-01T10:00:05Z"),
+	)
+	path := createTestFile(t, "cursor-parity.jsonl", prefix)
+	warmProvider := newCodexTestProvider(t)
+	sess, prefixMessages, err := warmProvider.parseSession(path, "local", false)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.Len(t, prefixMessages, 2)
+
+	prefixInfo, err := os.Stat(path)
+	require.NoError(t, err)
+	prefixOffset := prefixInfo.Size()
+	inode, device := sourceFileIdentity(prefixInfo)
+	_, cursorHit := warmProvider.cursorCache.Get(
+		path, prefixOffset, inode, device,
+	)
+	require.True(t, cursorHit, "full parse must seed the warm continuation cursor")
+
+	tail := testjsonl.JoinJSONL(
+		testjsonl.CodexTurnContextJSON("gpt-5.5", "2024-01-01T10:00:06Z"),
+		testjsonl.CodexMsgJSON("user", "Second request", "2024-01-01T10:00:07Z"),
+		codexEventMsgJSON("task_started", "2024-01-01T10:00:08Z"),
+		testjsonl.CodexMsgJSON("assistant", "Second answer", "2024-01-01T10:00:09Z"),
+		codexEventMsgJSON("task_complete", "2024-01-01T10:00:10Z"),
+	)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString(tail)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	warm, err := warmProvider.parseSessionFromDetailed(
+		path, prefixOffset, 2, false,
+	)
+	require.NoError(t, err)
+	coldProvider := newCodexTestProvider(t)
+	cold, err := coldProvider.parseSessionFromDetailed(
+		path, prefixOffset, 2, false,
+	)
+	require.NoError(t, err)
+
+	assert.Equal(t, cold, warm)
+	require.Len(t, warm.messages, 2)
+	assert.Equal(t, RoleUser, warm.messages[0].Role)
+	assert.Equal(t, "Second request", warm.messages[0].Content)
+	assert.Equal(t, 2, warm.messages[0].Ordinal)
+	assert.Equal(t, "gpt-5.5", warm.messages[0].Model)
+	assert.Equal(t, RoleAssistant, warm.messages[1].Role)
+	assert.Equal(t, "Second answer", warm.messages[1].Content)
+	assert.Equal(t, 3, warm.messages[1].Ordinal)
+	assert.Equal(t, "gpt-5.5", warm.messages[1].Model)
+	assert.Equal(t, "/workspace/project-a", warm.cursor.cwd)
+	assert.Equal(t, "task_complete", warm.cursor.lastTaskEvent)
+}
+
+func TestCodexPromptReplayDigestParity(t *testing.T) {
+	const prompt = "Implement the bounded continuation cursor"
+	initialEnvelope := "<recommended_plugins>\nplugin list\n</recommended_plugins>\n" +
+		"<environment_context>\n<cwd>/workspace/project-a</cwd>\n</environment_context>\n" +
+		prompt
+	prefix := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			"cursor-replay", "/workspace/project-a", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexTurnContextJSON("gpt-5.4", tsEarlyS1),
+		testjsonl.CodexMsgJSON("user", initialEnvelope, "2024-01-01T10:00:02Z"),
+		testjsonl.CodexMsgJSON("assistant", "Starting", "2024-01-01T10:00:03Z"),
+		codexEventMsgJSON("turn_aborted", "2024-01-01T10:00:04Z"),
+	)
+	path := createTestFile(t, "cursor-replay.jsonl", prefix)
+	warmProvider := newCodexTestProvider(t)
+	sess, prefixMessages, err := warmProvider.parseSession(path, "local", false)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	assert.Equal(t, prompt, sess.FirstMessage)
+	require.Len(t, prefixMessages, 2)
+	assert.Equal(t, prompt, prefixMessages[0].Content)
+
+	prefixInfo, err := os.Stat(path)
+	require.NoError(t, err)
+	prefixOffset := prefixInfo.Size()
+	inode, device := sourceFileIdentity(prefixInfo)
+	seed, cursorHit := warmProvider.cursorCache.Get(
+		path, prefixOffset, inode, device,
+	)
+	require.True(t, cursorHit, "full parse must seed the warm continuation cursor")
+	assert.True(t, seed.firstUserSeen)
+	assert.True(t, seed.mayReplayFirstUserPrompt)
+	assert.Equal(t, "turn_aborted", seed.lastTaskEvent)
+
+	tail := testjsonl.JoinJSONL(
+		testjsonl.CodexMsgJSON("user", prompt, "2024-01-01T10:00:05Z"),
+		testjsonl.CodexTurnContextJSON("gpt-5.5", "2024-01-01T10:00:06Z"),
+		testjsonl.CodexMsgJSON("assistant", "Cursor implemented", "2024-01-01T10:00:07Z"),
+		codexEventMsgJSON("task_complete", "2024-01-01T10:00:08Z"),
+	)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString(tail)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	warm, err := warmProvider.parseSessionFromDetailed(
+		path, prefixOffset, 2, false,
+	)
+	require.NoError(t, err)
+	coldProvider := newCodexTestProvider(t)
+	cold, err := coldProvider.parseSessionFromDetailed(
+		path, prefixOffset, 2, false,
+	)
+	require.NoError(t, err)
+
+	assert.Equal(t, cold, warm)
+	require.Len(t, warm.messages, 1, "the first-prompt replay must be suppressed")
+	assert.Equal(t, RoleAssistant, warm.messages[0].Role)
+	assert.Equal(t, "Cursor implemented", warm.messages[0].Content)
+	assert.Equal(t, 2, warm.messages[0].Ordinal)
+	assert.Equal(t, "gpt-5.5", warm.messages[0].Model)
+	assert.Equal(t, "task_complete", warm.cursor.lastTaskEvent)
+}
+
 func TestParseCodexSessionFrom_Incremental(t *testing.T) {
 	t.Parallel()
 
@@ -1996,6 +2482,39 @@ func TestParseCodexSessionFrom_DedupsReemittedPrompt(t *testing.T) {
 		assert.Contains(t, newMsgs[0].Content, "No issues found.")
 		assert.Equal(t, len(msgs), newMsgs[0].Ordinal,
 			"kept message must keep contiguous ordinals (no gap from the dropped replay)")
+	})
+
+	t.Run("dedups replay after stripped recommended plugins", func(t *testing.T) {
+		initial := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON("inc-plugins", "/tmp", "codex_cli_rs", tsEarly),
+			testjsonl.CodexMsgJSON(
+				"user",
+				"<recommended_plugins>\nplugin list\n</recommended_plugins>\n"+prompt,
+				tsEarlyS1,
+			),
+			testjsonl.CodexMsgJSON("assistant", "looking", tsEarlyS5),
+		)
+		path := createTestFile(t, "incremental-plugins.jsonl", initial)
+		sess, msgs, err := parseCodexTestSession(t, path, "local", false)
+		require.NoError(t, err)
+		require.Equal(t, prompt, sess.FirstMessage)
+		require.Len(t, msgs, 2)
+
+		info, err := os.Stat(path)
+		require.NoError(t, err)
+		offset := info.Size()
+
+		appendLines(t, path, testjsonl.JoinJSONL(
+			testjsonl.CodexMsgJSON("user", "<turn_aborted>\ninterrupted", tsLate),
+			testjsonl.CodexMsgJSON("user", prompt, tsLate),
+			testjsonl.CodexMsgJSON("assistant", "No issues found.", tsLateS5),
+		))
+
+		newMsgs, _, _, err := parseCodexTestSessionFrom(t, path, offset, len(msgs), false)
+		require.NoError(t, err)
+		require.Len(t, newMsgs, 1)
+		assert.Equal(t, RoleAssistant, newMsgs[0].Role)
+		assert.Equal(t, "No issues found.", newMsgs[0].Content)
 	})
 
 	t.Run("keeps a re-emitted prompt when the prefix already had a distinct turn", func(t *testing.T) {
@@ -2472,7 +2991,9 @@ func TestSeedCodexIncrementalState_SkipsInvalidJSON(
 
 	info, err := os.Stat(path)
 	require.NoError(t, err)
-	got := seedCodexIncrementalState(path, info.Size()).model
+	seed, err := seedCodexIncrementalState(path, info.Size())
+	require.NoError(t, err)
+	got := seed.model
 	assert.Equal(t, "gpt-5.4", got,
 		"truncated turn_context should be skipped")
 }
@@ -2501,19 +3022,33 @@ func TestSeedCodexIncrementalState_Model(t *testing.T) {
 	t.Run("full file returns last model", func(t *testing.T) {
 		info, err := os.Stat(path)
 		require.NoError(t, err)
-		got := seedCodexIncrementalState(path, info.Size()).model
+		seed, err := seedCodexIncrementalState(path, info.Size())
+		require.NoError(t, err)
+		got := seed.model
 		assert.Equal(t, "gpt-5.4", got)
 	})
 
 	t.Run("zero offset returns empty", func(t *testing.T) {
-		got := seedCodexIncrementalState(path, 0).model
+		seed, err := seedCodexIncrementalState(path, 0)
+		require.NoError(t, err)
+		got := seed.model
 		assert.Equal(t, "", got)
 	})
 
-	t.Run("nonexistent file returns empty", func(t *testing.T) {
-		got := seedCodexIncrementalState("/no/such/file", 100).model
-		assert.Equal(t, "", got)
+	t.Run("nonexistent file returns error", func(t *testing.T) {
+		_, err := seedCodexIncrementalState("/no/such/file", 100)
+		require.Error(t, err)
 	})
+}
+
+func TestSeedCodexIncrementalStatePropagatesReaderError(t *testing.T) {
+	wantErr := errors.New("prefix read failed")
+
+	_, err := seedCodexIncrementalStateFromReader(
+		iotest.ErrReader(wantErr),
+	)
+
+	require.ErrorIs(t, err, wantErr)
 }
 
 // TestParseCodexSession_TurnAbortedNotCountedAsUser pins the

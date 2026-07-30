@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -65,6 +66,15 @@ type PGConfig struct {
 	AllowInsecure   bool     `toml:"allow_insecure" json:"allow_insecure"`
 	Projects        []string `toml:"projects" json:"projects,omitempty"`
 	ExcludeProjects []string `toml:"exclude_projects" json:"exclude_projects,omitempty"`
+	// PushVectors gates the vector phase of pg push. A pointer so an
+	// absent key defaults to enabled without a load-time default pass.
+	PushVectors *bool `toml:"push_vectors" json:"push_vectors,omitempty"`
+}
+
+// PushVectorsEnabled reports whether pg push should run its vector phase
+// for this target; unset means enabled.
+func (p PGConfig) PushVectorsEnabled() bool {
+	return p.PushVectors == nil || *p.PushVectors
 }
 
 type pgEnvOverrides struct {
@@ -88,17 +98,305 @@ var pgConfigKeys = map[string]struct{}{
 	"allow_insecure":   {},
 	"projects":         {},
 	"exclude_projects": {},
+	"push_vectors":     {},
 }
 
 // DuckDBConfig holds DuckDB mirror and Quack connection settings.
 type DuckDBConfig struct {
-	Path            string   `toml:"path" json:"path"`
-	URL             string   `toml:"url" json:"url"`
-	Token           string   `toml:"token" json:"token,omitempty"`
-	MachineName     string   `toml:"machine_name" json:"machine_name"`
-	AllowInsecure   bool     `toml:"allow_insecure" json:"allow_insecure"`
-	Projects        []string `toml:"projects" json:"projects,omitempty"`
-	ExcludeProjects []string `toml:"exclude_projects" json:"exclude_projects,omitempty"`
+	Path          string `toml:"path" json:"path"`
+	URL           string `toml:"url" json:"url"`
+	Token         string `toml:"token" json:"token,omitempty"`
+	MachineName   string `toml:"machine_name" json:"machine_name"`
+	AllowInsecure bool   `toml:"allow_insecure" json:"allow_insecure"`
+	// AttachTimeout bounds how long a remote Quack ATTACH (and its cheap TCP
+	// preflight) may run before the client gives up, so an unresponsive
+	// endpoint fails fast instead of hanging forever. Zero selects the
+	// package default; a negative value disables the guard.
+	AttachTimeout   time.Duration `toml:"attach_timeout" json:"attach_timeout,omitempty"`
+	Projects        []string      `toml:"projects" json:"projects,omitempty"`
+	ExcludeProjects []string      `toml:"exclude_projects" json:"exclude_projects,omitempty"`
+}
+
+// VectorConfig holds settings for the optional local semantic-search
+// vector index (embeddings + vectors.db).
+type VectorConfig struct {
+	Enabled bool   `toml:"enabled" json:"enabled"`
+	DBPath  string `toml:"db_path" json:"db_path,omitempty"`
+	// IncludeAutomated controls whether automated (e.g. roborev) sessions'
+	// messages are embedded into the vector index, mirroring the
+	// IncludeAutomated convention search already uses to exclude those
+	// sessions from results by default. Default false: automated sessions
+	// are excluded from embedding, since they otherwise dominate a large
+	// archive's index with content that search already hides by default.
+	// `embeddings build --include-automated` can override this for a
+	// one-off build; see that flag's help for the scheduled-build caveat.
+	IncludeAutomated bool                   `toml:"include_automated" json:"include_automated"`
+	Embeddings       VectorEmbeddingsConfig `toml:"embeddings" json:"embeddings"`
+	Embed            VectorEmbedConfig      `toml:"embed" json:"embed"`
+}
+
+// VectorEmbeddingsConfig describes the embedding space — the model identity
+// every server must share — and the named servers that can encode it.
+//
+// Model identity (model, dimension, request_dimensions, max_input_chars,
+// query_prefix, document_prefix, input_suffix) is deliberately global rather
+// than per-server: it joins the generation fingerprint, and query vectors are
+// only comparable to stored document vectors from the same space. Servers
+// differ only in transport and capacity, so a build run on any server produces
+// vectors every other server's queries can search.
+type VectorEmbeddingsConfig struct {
+	Model     string `toml:"model" json:"model"`
+	Dimension int    `toml:"dimension" json:"dimension"`
+	// RequestDimensions, when true, sends Dimension as the OpenAI-compatible
+	// "dimensions" request field — for documents at build time and queries at
+	// search time alike — asking the endpoint for Matryoshka-reduced vectors
+	// of exactly that length (e.g. Qwen3-Embedding through Ollama). Requires
+	// a model and endpoint that support dimension selection; when false (the
+	// default) the field is never sent and Dimension only validates response
+	// length. Part of the generation fingerprint: enabling it re-embeds the
+	// archive on the next build.
+	RequestDimensions bool `toml:"request_dimensions" json:"request_dimensions,omitempty"`
+	// MaxInputChars caps the rune length of each chunk sent for
+	// embedding. Default 8192.
+	MaxInputChars int `toml:"max_input_chars" json:"max_input_chars"`
+	// QueryPrefix is prepended verbatim to search queries before embedding.
+	// It allows instruction-tuned models to distinguish queries from indexed
+	// documents. Changing it cuts a new vector generation. Default empty.
+	QueryPrefix string `toml:"query_prefix" json:"query_prefix,omitempty"`
+	// DocumentPrefix is prepended verbatim to every document chunk before
+	// embedding. Changing it cuts a new vector generation. Default empty.
+	DocumentPrefix string `toml:"document_prefix" json:"document_prefix,omitempty"`
+	// InputSuffix is appended verbatim to every text sent for embedding
+	// (documents and queries alike). Some models expect a terminator the
+	// serving layer does not add — e.g. Qwen3-Embedding under llama.cpp
+	// wants "<|endoftext|>" appended client-side. Changing it cuts a new
+	// vector generation. Default empty.
+	InputSuffix string `toml:"input_suffix" json:"input_suffix,omitempty"`
+	// DefaultServer names the server used for search-time query encoding
+	// and for builds that don't select one (scheduled builds, and
+	// `embeddings build` without --using). Optional when exactly one
+	// server is defined.
+	DefaultServer string `toml:"default_server" json:"default_server,omitempty"`
+	// Servers is the set of named OpenAI-compatible endpoints that serve
+	// Model, keyed by the name `embeddings build --using <name>` selects.
+	Servers map[string]VectorEmbeddingsServerConfig `toml:"servers" json:"servers"`
+}
+
+// VectorEmbeddingsServerConfig is one named embeddings server: transport
+// and capacity settings only; the model identity lives on
+// VectorEmbeddingsConfig.
+type VectorEmbeddingsServerConfig struct {
+	Endpoint string `toml:"endpoint" json:"endpoint"`
+	// APIKeyEnv names the environment variable holding the API key.
+	// Empty means anonymous access.
+	APIKeyEnv string `toml:"api_key_env" json:"api_key_env,omitempty"`
+	// BatchSize is the number of inputs sent per HTTP call. Default 32.
+	BatchSize int `toml:"batch_size" json:"batch_size"`
+	// Concurrency is the number of documents embedded in parallel during a
+	// build against this server. Sequential requests leave a build
+	// round-trip-bound against remote endpoints, so the default is 4;
+	// servers that process one request at a time simply queue the extras.
+	Concurrency int `toml:"concurrency" json:"concurrency"`
+	// Timeout is a parseable duration string applied to each HTTP
+	// call. Default "30s".
+	Timeout string `toml:"timeout" json:"timeout"`
+	// MaxRetries is the maximum total attempts on 429/5xx/network errors
+	// (4xx fails fast); 0 means one attempt. Default 3.
+	MaxRetries int `toml:"max_retries" json:"max_retries"`
+}
+
+// ResolvedDefaultServer returns the server name used when no explicit
+// choice is made: default_server when set, otherwise the only defined
+// server, otherwise "".
+func (c VectorEmbeddingsConfig) ResolvedDefaultServer() string {
+	if c.DefaultServer != "" {
+		return c.DefaultServer
+	}
+	if len(c.Servers) == 1 {
+		for name := range c.Servers {
+			return name
+		}
+	}
+	return ""
+}
+
+// Server resolves name to a defined embeddings server; "" means the
+// default. The resolved name is returned alongside the server so callers
+// can report which server a build actually used.
+func (c VectorEmbeddingsConfig) Server(name string) (string, VectorEmbeddingsServerConfig, error) {
+	if name == "" {
+		name = c.ResolvedDefaultServer()
+	}
+	s, ok := c.Servers[name]
+	if !ok {
+		return "", VectorEmbeddingsServerConfig{}, fmt.Errorf(
+			"[vector.embeddings] no server named %q; define it under [vector.embeddings.servers.%s] (have: %s)",
+			name, name, strings.Join(sortedServerNames(c.Servers), ", "))
+	}
+	return name, s, nil
+}
+
+// normalizedEmbeddingsServers fills each named server's unset transport
+// fields with their defaults (batch_size 32, concurrency 4, timeout "30s",
+// max_retries 3). meta.IsDefined distinguishes "unset" (apply the default)
+// from an explicit zero — an explicit max_retries = 0 disables retries, and
+// an explicit zero batch_size/concurrency stays zero so validation rejects
+// it instead of silently substituting the default.
+func normalizedEmbeddingsServers(
+	servers map[string]VectorEmbeddingsServerConfig, meta toml.MetaData,
+) map[string]VectorEmbeddingsServerConfig {
+	out := make(map[string]VectorEmbeddingsServerConfig, len(servers))
+	for name, s := range servers {
+		if !meta.IsDefined("vector", "embeddings", "servers", name, "batch_size") {
+			s.BatchSize = 32
+		}
+		if !meta.IsDefined("vector", "embeddings", "servers", name, "concurrency") {
+			s.Concurrency = 4
+		}
+		if s.Timeout == "" {
+			s.Timeout = "30s"
+		}
+		if !meta.IsDefined("vector", "embeddings", "servers", name, "max_retries") {
+			s.MaxRetries = 3
+		}
+		out[name] = s
+	}
+	return out
+}
+
+// sortedServerNames returns the configured server names in sorted order,
+// for deterministic error messages and validation.
+func sortedServerNames(servers map[string]VectorEmbeddingsServerConfig) []string {
+	names := make([]string, 0, len(servers))
+	for name := range servers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// VectorEmbedConfig configures when the daemon runs embedding work.
+type VectorEmbedConfig struct {
+	// RunAfterSync enables debounced embedding of sync deltas.
+	// Defaults to true when unset; read it via RunAfterSyncEnabled.
+	RunAfterSync *bool `toml:"run_after_sync" json:"run_after_sync,omitempty"`
+	// Recall explicitly permits automatic Recall embedding. It defaults to
+	// false because Recall entries may contain distilled private content.
+	Recall bool `toml:"recall" json:"recall"`
+	// BackstopInterval is a parseable duration string for a periodic
+	// full rescan. Default "24h"; a negative duration disables it.
+	BackstopInterval string `toml:"backstop_interval" json:"backstop_interval"`
+}
+
+// Validate checks the vector config for internal consistency. It is a
+// no-op when the section is disabled.
+func (c VectorConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if c.Embeddings.Model == "" {
+		return fmt.Errorf("[vector.embeddings] model is required when [vector] is enabled")
+	}
+	if c.Embeddings.Dimension <= 0 {
+		return fmt.Errorf("[vector.embeddings] dimension must be greater than 0 when [vector] is enabled")
+	}
+	if c.Embeddings.MaxInputChars <= 0 {
+		return fmt.Errorf(
+			"[vector.embeddings] max_input_chars must be greater than 0, got %d",
+			c.Embeddings.MaxInputChars)
+	}
+	if err := c.Embeddings.validateServers(); err != nil {
+		return err
+	}
+	backstop, err := time.ParseDuration(c.Embed.BackstopInterval)
+	if err != nil {
+		return fmt.Errorf("[vector.embed] invalid backstop_interval %q: %w", c.Embed.BackstopInterval, err)
+	}
+	if backstop == 0 {
+		return fmt.Errorf(
+			"[vector.embed] backstop_interval must not be zero; " +
+				"use a negative value to disable or omit for the 24h default")
+	}
+	return nil
+}
+
+// ResolvedDBPath returns DBPath if set, else <dataDir>/vectors.db.
+func (c VectorConfig) ResolvedDBPath(dataDir string) string {
+	if c.DBPath != "" {
+		return c.DBPath
+	}
+	return filepath.Join(dataDir, "vectors.db")
+}
+
+// APIKey reads the API key from the environment variable named by
+// APIKeyEnv. Returns "" when APIKeyEnv is unset.
+func (c VectorEmbeddingsServerConfig) APIKey() string {
+	if c.APIKeyEnv == "" {
+		return ""
+	}
+	return os.Getenv(c.APIKeyEnv)
+}
+
+// validateServers checks the named-servers section: at least one server, an
+// unambiguous default, and per-server transport settings that parse.
+func (c VectorEmbeddingsConfig) validateServers() error {
+	if len(c.Servers) == 0 {
+		return fmt.Errorf(
+			"[vector.embeddings] at least one server is required when [vector] is enabled; " +
+				"define one under [vector.embeddings.servers.<name>]")
+	}
+	if c.DefaultServer == "" && len(c.Servers) > 1 {
+		return fmt.Errorf(
+			"[vector.embeddings] default_server is required when more than one server is defined (have: %s)",
+			strings.Join(sortedServerNames(c.Servers), ", "))
+	}
+	if c.DefaultServer != "" {
+		if _, ok := c.Servers[c.DefaultServer]; !ok {
+			return fmt.Errorf(
+				"[vector.embeddings] default_server %q is not a defined server (have: %s)",
+				c.DefaultServer, strings.Join(sortedServerNames(c.Servers), ", "))
+		}
+	}
+	for _, name := range sortedServerNames(c.Servers) {
+		if err := c.Servers[name].validate(name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validate checks one named server's transport settings.
+func (c VectorEmbeddingsServerConfig) validate(name string) error {
+	section := fmt.Sprintf("[vector.embeddings.servers.%s]", name)
+	if c.Endpoint == "" {
+		return fmt.Errorf("%s endpoint is required", section)
+	}
+	if c.BatchSize <= 0 {
+		return fmt.Errorf("%s batch_size must be greater than 0, got %d", section, c.BatchSize)
+	}
+	if c.Concurrency <= 0 {
+		return fmt.Errorf("%s concurrency must be greater than 0, got %d", section, c.Concurrency)
+	}
+	if c.MaxRetries < 0 {
+		return fmt.Errorf("%s max_retries must be >= 0, got %d", section, c.MaxRetries)
+	}
+	timeout, err := time.ParseDuration(c.Timeout)
+	if err != nil {
+		return fmt.Errorf("%s invalid timeout %q: %w", section, c.Timeout, err)
+	}
+	if timeout <= 0 {
+		return fmt.Errorf("%s timeout must be greater than 0, got %q", section, c.Timeout)
+	}
+	return nil
+}
+
+// RunAfterSyncEnabled reports whether embedding should run after sync,
+// defaulting to true when RunAfterSync is unset.
+func (c VectorEmbedConfig) RunAfterSyncEnabled() bool {
+	if c.RunAfterSync == nil {
+		return true
+	}
+	return *c.RunAfterSync
 }
 
 // AutomatedConfig holds user-supplied additions to the
@@ -119,21 +417,23 @@ type AgentConfig struct {
 }
 
 type CustomModelRate struct {
-	Input         float64 `json:"input" toml:"input"`
-	Output        float64 `json:"output" toml:"output"`
-	CacheCreation float64 `json:"cache_creation,omitempty" toml:"cache_creation"`
-	CacheRead     float64 `json:"cache_read,omitempty" toml:"cache_read"`
+	InputMicrodollarsPerMTok         int64 `json:"input_microdollars_per_mtok" toml:"input_microdollars_per_mtok"`
+	OutputMicrodollarsPerMTok        int64 `json:"output_microdollars_per_mtok" toml:"output_microdollars_per_mtok"`
+	CacheCreationMicrodollarsPerMTok int64 `json:"cache_creation_microdollars_per_mtok,omitempty" toml:"cache_creation_microdollars_per_mtok"`
+	CacheReadMicrodollarsPerMTok     int64 `json:"cache_read_microdollars_per_mtok,omitempty" toml:"cache_read_microdollars_per_mtok"`
 }
 
 type RemoteTransport string
 
 const (
+	// RemoteTransportSSH is retained for compatibility but deprecated. New
+	// remote sync configurations should use RemoteTransportHTTP.
 	RemoteTransportSSH  RemoteTransport = "ssh"
 	RemoteTransportHTTP RemoteTransport = "http"
 )
 
 // RemoteHost describes one target for config-driven `agentsview sync`
-// fan-out. Host is required. SSH remotes may set User and Port
+// fan-out. Host is required. Deprecated SSH remotes may set User and Port
 // (Port 0 means the ssh default of 22). HTTP remotes must set URL
 // and Token. A zero/empty Interval disables periodic remote
 // sync for this host.
@@ -168,13 +468,21 @@ type Config struct {
 	NoBrowser            bool                   `json:"no_browser" toml:"no_browser"`
 	DisableUpdateCheck   bool                   `json:"disable_update_check" toml:"disable_update_check"`
 	NoSync               bool                   `json:"-" toml:"-"`
+	SkipInitialSync      bool                   `json:"-" toml:"-"`
 	PG                   PGConfig               `json:"pg,omitempty" toml:"pg"`
 	DefaultPG            string                 `json:"default_pg,omitempty" toml:"default_pg"`
 	PGTargets            map[string]PGConfig    `json:"-" toml:"-"`
 	DuckDB               DuckDBConfig           `json:"duckdb,omitempty" toml:"duckdb"`
+	Vector               VectorConfig           `json:"vector,omitempty" toml:"vector"`
+	Recall               RecallConfig           `json:"recall,omitempty" toml:"recall"`
 	Automated            AutomatedConfig        `json:"automated,omitempty" toml:"automated"`
 	Agent                map[string]AgentConfig `json:"agent,omitempty" toml:"agent"`
 	WriteTimeout         time.Duration          `json:"-" toml:"-"`
+	// LocalMachineName is the operating-system hostname used to identify
+	// sessions ingested from this machine. It is runtime-derived rather than
+	// persisted configuration so local and remote source labels share the same
+	// hostname namespace.
+	LocalMachineName string `json:"-" toml:"-"`
 
 	// AgentDirs maps each AgentType to its configured
 	// directories. Single-dir agents store a one-element
@@ -186,6 +494,14 @@ type Config struct {
 	agentDirSource map[parser.AgentType]dirSource
 
 	ResultContentBlockedCategories []string `json:"result_content_blocked_categories,omitempty" toml:"result_content_blocked_categories"`
+
+	// SyncIncludeCwdPrefixes, when non-empty, restricts local session
+	// ingestion to sessions whose working directory equals one of the
+	// prefixes or lives underneath one. Sessions without a recorded
+	// cwd are skipped while the filter is active. Config-file only;
+	// remote sync is unaffected because the prefixes describe local
+	// paths.
+	SyncIncludeCwdPrefixes []string `json:"-" toml:"sync_include_cwd_prefixes"`
 
 	// EventsCoalesceInterval is the minimum wall-clock time between
 	// SSE data_changed broadcasts to connected clients. Emits that
@@ -373,6 +689,13 @@ func Default() (Config, error) {
 		)
 	}
 	dataDir := filepath.Join(home, ".agentsview")
+	hostname, err := os.Hostname()
+	if err != nil {
+		return Config{}, fmt.Errorf("identify local sync machine: %w", err)
+	}
+	if strings.TrimSpace(hostname) == "" {
+		return Config{}, fmt.Errorf("identify local sync machine: hostname is empty")
+	}
 
 	agentDirs := make(map[parser.AgentType][]string)
 	agentDirSource := make(map[parser.AgentType]dirSource)
@@ -389,6 +712,15 @@ func Default() (Config, error) {
 			}
 			dirs[i] = filepath.Join(home, rel)
 		}
+		// Keep the Hermes profiles container as a stable provider root. The
+		// provider enumerates its children on every discovery pass, so profiles
+		// created after startup become visible without rebuilding Config or the
+		// sync engine. Env/config overrides still replace all default roots.
+		if def.Type == parser.AgentHermes && root == "" {
+			dirs = append(dirs,
+				filepath.Join(home, ".hermes", "profiles"),
+			)
+		}
 		agentDirs[def.Type] = dirs
 		agentDirSource[def.Type] = dirDefault
 	}
@@ -399,6 +731,7 @@ func Default() (Config, error) {
 		DataDir:                        dataDir,
 		DBPath:                         filepath.Join(dataDir, "sessions.db"),
 		WriteTimeout:                   30 * time.Second,
+		LocalMachineName:               hostname,
 		AgentDirs:                      agentDirs,
 		agentDirSource:                 agentDirSource,
 		WatchExcludePatterns:           []string{".git", "node_modules", "__pycache__", ".venv", "venv", "vendor", ".next"},
@@ -406,6 +739,22 @@ func Default() (Config, error) {
 		EventsCoalesceInterval:         10 * time.Second,
 		DaemonIdleTimeout:              20 * time.Minute,
 		Agent:                          map[string]AgentConfig{},
+		Vector: VectorConfig{
+			Embeddings: VectorEmbeddingsConfig{
+				MaxInputChars: 8192,
+			},
+			Embed: VectorEmbedConfig{
+				BackstopInterval: "24h",
+			},
+		},
+		Recall: RecallConfig{
+			Extract: RecallExtractConfig{
+				MaxWindowChars:   50000,
+				QuietPeriod:      "30m",
+				BackstopInterval: "1h",
+				FailureBackoff:   "1h",
+			},
+		},
 	}, nil
 }
 
@@ -667,10 +1016,12 @@ func (c *Config) applyConfigTOML(data string) error {
 		CursorAdminEmail               string                     `toml:"cursor_admin_email"`
 		CursorAdminUserID              string                     `toml:"cursor_admin_user_id"`
 		Host                           string                     `toml:"host"`
+		Port                           int                        `toml:"port"`
 		PublicURL                      string                     `toml:"public_url"`
 		PublicOrigins                  []string                   `toml:"public_origins"`
 		Proxy                          ProxyConfig                `toml:"proxy"`
 		WatchExcludePatterns           []string                   `toml:"watch_exclude_patterns"`
+		SyncIncludeCwdPrefixes         []string                   `toml:"sync_include_cwd_prefixes"`
 		ResultContentBlockedCategories []string                   `toml:"result_content_blocked_categories"`
 		Terminal                       TerminalConfig             `toml:"terminal"`
 		AuthToken                      string                     `toml:"auth_token"`
@@ -680,6 +1031,8 @@ func (c *Config) applyConfigTOML(data string) error {
 		DefaultPG                      string                     `toml:"default_pg"`
 		PG                             PGConfig                   `toml:"pg"`
 		DuckDB                         DuckDBConfig               `toml:"duckdb"`
+		Vector                         VectorConfig               `toml:"vector"`
+		Recall                         RecallConfig               `toml:"recall"`
 		Automated                      AutomatedConfig            `toml:"automated"`
 		Agent                          map[string]AgentConfig     `toml:"agent"`
 		EventsCoalesceInterval         time.Duration              `toml:"events_coalesce_interval"`
@@ -690,6 +1043,15 @@ func (c *Config) applyConfigTOML(data string) error {
 	meta, err := toml.Decode(data, &file)
 	if err != nil {
 		return fmt.Errorf("parsing config: %w", err)
+	}
+	for _, key := range meta.Undecoded() {
+		if len(key) != 3 || key[0] != "custom_model_pricing" {
+			continue
+		}
+		return fmt.Errorf(
+			"%s: unsupported pricing field; use input_microdollars_per_mtok, output_microdollars_per_mtok, cache_creation_microdollars_per_mtok, or cache_read_microdollars_per_mtok",
+			key.String(),
+		)
 	}
 	var raw map[string]any
 	if _, err := toml.Decode(data, &raw); err != nil {
@@ -713,6 +1075,9 @@ func (c *Config) applyConfigTOML(data string) error {
 	if file.Host != "" {
 		c.Host = file.Host
 	}
+	if file.Port != 0 {
+		c.Port = file.Port
+	}
 	if file.PublicURL != "" {
 		c.PublicURL = file.PublicURL
 	}
@@ -727,6 +1092,9 @@ func (c *Config) applyConfigTOML(data string) error {
 	}
 	if file.WatchExcludePatterns != nil {
 		c.WatchExcludePatterns = file.WatchExcludePatterns
+	}
+	if file.SyncIncludeCwdPrefixes != nil {
+		c.SyncIncludeCwdPrefixes = file.SyncIncludeCwdPrefixes
 	}
 	if file.ResultContentBlockedCategories != nil {
 		c.ResultContentBlockedCategories = file.ResultContentBlockedCategories
@@ -769,6 +1137,9 @@ func (c *Config) applyConfigTOML(data string) error {
 		if legacyPG.ExcludeProjects != nil {
 			c.PG.ExcludeProjects = legacyPG.ExcludeProjects
 		}
+		if legacyPG.PushVectors != nil {
+			c.PG.PushVectors = legacyPG.PushVectors
+		}
 	}
 	// Merge duckdb field-by-field so env vars override only
 	// the fields they set, preserving config-file settings.
@@ -787,12 +1158,64 @@ func (c *Config) applyConfigTOML(data string) error {
 	if file.DuckDB.AllowInsecure {
 		c.DuckDB.AllowInsecure = true
 	}
+	if file.DuckDB.AttachTimeout != 0 && c.DuckDB.AttachTimeout == 0 {
+		c.DuckDB.AttachTimeout = file.DuckDB.AttachTimeout
+	}
 	if file.DuckDB.Projects != nil && c.DuckDB.Projects == nil {
 		c.DuckDB.Projects = file.DuckDB.Projects
 	}
 	if file.DuckDB.ExcludeProjects != nil && c.DuckDB.ExcludeProjects == nil {
 		c.DuckDB.ExcludeProjects = file.DuckDB.ExcludeProjects
 	}
+	if file.Vector.Enabled {
+		c.Vector.Enabled = true
+	}
+	if file.Vector.DBPath != "" {
+		c.Vector.DBPath = file.Vector.DBPath
+	}
+	// IsDefined distinguishes "unset" (keep the default false) from an
+	// explicit include_automated = false, matching the other vector
+	// section fields' treatment even though both currently agree.
+	if meta.IsDefined("vector", "include_automated") {
+		c.Vector.IncludeAutomated = file.Vector.IncludeAutomated
+	}
+	if file.Vector.Embeddings.Model != "" {
+		c.Vector.Embeddings.Model = file.Vector.Embeddings.Model
+	}
+	if file.Vector.Embeddings.Dimension != 0 {
+		c.Vector.Embeddings.Dimension = file.Vector.Embeddings.Dimension
+	}
+	if file.Vector.Embeddings.RequestDimensions {
+		c.Vector.Embeddings.RequestDimensions = true
+	}
+	if meta.IsDefined("vector", "embeddings", "max_input_chars") {
+		c.Vector.Embeddings.MaxInputChars = file.Vector.Embeddings.MaxInputChars
+	}
+	if meta.IsDefined("vector", "embeddings", "query_prefix") {
+		c.Vector.Embeddings.QueryPrefix = file.Vector.Embeddings.QueryPrefix
+	}
+	if meta.IsDefined("vector", "embeddings", "document_prefix") {
+		c.Vector.Embeddings.DocumentPrefix = file.Vector.Embeddings.DocumentPrefix
+	}
+	if meta.IsDefined("vector", "embeddings", "input_suffix") {
+		c.Vector.Embeddings.InputSuffix = file.Vector.Embeddings.InputSuffix
+	}
+	if file.Vector.Embeddings.DefaultServer != "" {
+		c.Vector.Embeddings.DefaultServer = file.Vector.Embeddings.DefaultServer
+	}
+	if len(file.Vector.Embeddings.Servers) > 0 {
+		c.Vector.Embeddings.Servers = normalizedEmbeddingsServers(file.Vector.Embeddings.Servers, meta)
+	}
+	if file.Vector.Embed.RunAfterSync != nil {
+		c.Vector.Embed.RunAfterSync = file.Vector.Embed.RunAfterSync
+	}
+	if meta.IsDefined("vector", "embed", "recall") {
+		c.Vector.Embed.Recall = file.Vector.Embed.Recall
+	}
+	if file.Vector.Embed.BackstopInterval != "" {
+		c.Vector.Embed.BackstopInterval = file.Vector.Embed.BackstopInterval
+	}
+	c.mergeRecallExtractTOML(file.Recall, meta)
 	// IsDefined distinguishes "unset" (leave default 10s) from an
 	// explicit "0s" (disable coalescing). Checking != 0 would silently
 	// ignore the latter.
@@ -825,6 +1248,14 @@ func (c *Config) applyConfigTOML(data string) error {
 		}
 	}
 	if len(file.CustomModelPricing) > 0 {
+		for model, rate := range file.CustomModelPricing {
+			if rate.InputMicrodollarsPerMTok < 0 ||
+				rate.OutputMicrodollarsPerMTok < 0 ||
+				rate.CacheCreationMicrodollarsPerMTok < 0 ||
+				rate.CacheReadMicrodollarsPerMTok < 0 {
+				return fmt.Errorf("custom_model_pricing.%s: rates must not be negative", model)
+			}
+		}
 		c.CustomModelPricing = file.CustomModelPricing
 	}
 	if len(file.RemoteHosts) > 0 {
@@ -1019,6 +1450,16 @@ func (c *Config) loadEnv() {
 	if v := os.Getenv("AGENTSVIEW_DUCKDB_MACHINE"); v != "" {
 		c.DuckDB.MachineName = v
 	}
+	if v := os.Getenv("AGENTSVIEW_DUCKDB_ATTACH_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			c.DuckDB.AttachTimeout = d
+		} else {
+			log.Printf(
+				"warning: invalid AGENTSVIEW_DUCKDB_ATTACH_TIMEOUT %q: %v",
+				v, err,
+			)
+		}
+	}
 	if v := os.Getenv("AGENTSVIEW_DISABLE_UPDATE_CHECK"); v != "" {
 		c.DisableUpdateCheck = v == "1" || v == "true"
 	}
@@ -1117,6 +1558,10 @@ func RegisterServeFlags(fs *flag.FlagSet) {
 		"events-coalesce-interval", 10*time.Second,
 		"Minimum interval between SSE data_changed broadcasts (0 disables coalescing)",
 	)
+	fs.Duration(
+		"write-timeout", 30*time.Second,
+		"Max time to write an API response before a 503 request-timed-out; raise for slow aggregates over large datasets (0 disables)",
+	)
 }
 
 // RegisterServePFlags registers serve-command flags on fs.
@@ -1181,6 +1626,10 @@ func RegisterServePFlags(fs *pflag.FlagSet) {
 		"events-coalesce-interval", 10*time.Second,
 		"Minimum interval between SSE data_changed broadcasts (0 disables coalescing)",
 	)
+	fs.Duration(
+		"write-timeout", 30*time.Second,
+		"Max time to write an API response before a 503 request-timed-out; raise for slow aggregates over large datasets (0 disables)",
+	)
 }
 
 // applyFlags copies explicitly-set flags from fs into cfg.
@@ -1240,6 +1689,10 @@ func applyFlagValue(cfg *Config, name, value string) {
 		if d, err := time.ParseDuration(value); err == nil {
 			cfg.EventsCoalesceInterval = d
 		}
+	case "write-timeout":
+		if d, err := time.ParseDuration(value); err == nil {
+			cfg.WriteTimeout = d
+		}
 	case "pg":
 		// Read-routing only. The CLI resolver combines this flag
 		// with cfg.PG from env/config and does not persist a new
@@ -1264,6 +1717,9 @@ func splitFlagList(value string) []string {
 
 func finalize(cfg *Config) error {
 	var err error
+	if strings.TrimSpace(cfg.LocalMachineName) == "" {
+		return fmt.Errorf("identify local sync machine: hostname is empty")
+	}
 	if err := normalizeProxyConfig(&cfg.Proxy); err != nil {
 		return err
 	}
@@ -1285,6 +1741,12 @@ func finalize(cfg *Config) error {
 	}
 	if cfg.DaemonIdleTimeout < 0 {
 		return fmt.Errorf("invalid daemon_idle_timeout: %s", cfg.DaemonIdleTimeout)
+	}
+	if err := cfg.Vector.Validate(); err != nil {
+		return err
+	}
+	if err := cfg.Recall.Extract.Validate(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1638,6 +2100,54 @@ func ResolveDataDir() (string, error) {
 		cfg.DataDir = v
 	}
 	return cfg.DataDir, nil
+}
+
+// IsDefaultAgentsviewDataDir reports whether path is (or symlink-resolves to) a
+// default ~/.agentsview data directory. It is the single guard shared by the
+// CLI and HTTP recall-import paths.
+func IsDefaultAgentsviewDataDir(path string) bool {
+	clean := filepath.Clean(strings.TrimSpace(path))
+	if clean == "" || clean == "." {
+		return false
+	}
+	if filepath.Base(clean) == ".agentsview" {
+		return true
+	}
+	resolved, err := filepath.EvalSymlinks(clean)
+	if err != nil {
+		return false
+	}
+	return filepath.Base(filepath.Clean(resolved)) == ".agentsview"
+}
+
+// IsDefaultAgentsviewDBPath reports whether dbPath lives inside a default
+// ~/.agentsview directory after resolving symlinks. It also resolves a direct
+// symlink whose target does not exist yet, so a lab sessions.db pointing at a
+// not-yet-created ~/.agentsview/sessions.db is still guarded: opening SQLite
+// through that dangling link would otherwise create the production archive.
+func IsDefaultAgentsviewDBPath(dbPath string) bool {
+	dbPath = strings.TrimSpace(dbPath)
+	if dbPath == "" {
+		return false
+	}
+	if resolved, err := filepath.EvalSymlinks(dbPath); err == nil {
+		if defaultAgentsviewDBDir(resolved) {
+			return true
+		}
+	}
+	if target, err := os.Readlink(dbPath); err == nil {
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(dbPath), target)
+		}
+		if defaultAgentsviewDBDir(target) {
+			return true
+		}
+	}
+	return false
+}
+
+func defaultAgentsviewDBDir(dbPath string) bool {
+	return filepath.Base(filepath.Dir(filepath.Clean(dbPath))) == ".agentsview"
 }
 
 // DefaultPGTargetName returns the effective named PG target for this config.
@@ -2056,6 +2566,32 @@ func (c *Config) EnsureAuthToken() error {
 		c.AuthToken = token
 		return nil
 	})
+}
+
+// ValidateArtifactOriginID checks the persisted single-writer origin prefix.
+func ValidateArtifactOriginID(origin string) error {
+	if origin == "" {
+		return errors.New("artifact origin is required")
+	}
+	if origin != strings.TrimSpace(origin) {
+		return fmt.Errorf("invalid artifact origin %q", origin)
+	}
+	if origin == "local" {
+		return fmt.Errorf("invalid artifact origin %q", origin)
+	}
+	if strings.ContainsAny(origin, `/\`) || filepath.Base(origin) != origin {
+		return fmt.Errorf("invalid artifact origin %q", origin)
+	}
+	if strings.HasPrefix(origin, "-") || strings.HasSuffix(origin, "-") {
+		return fmt.Errorf("invalid artifact origin %q", origin)
+	}
+	for _, r := range origin {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' {
+			continue
+		}
+		return fmt.Errorf("invalid artifact origin %q", origin)
+	}
+	return nil
 }
 
 // SaveGithubToken persists the GitHub token to the config file.

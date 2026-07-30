@@ -359,7 +359,7 @@ func BenchmarkResyncBulkIngest(b *testing.B) {
 			engine.syncMu.Lock()
 			defer engine.syncMu.Unlock()
 			return engine.syncAllLocked(
-				ctx, nil, time.Time{}, nil, syncWriteBulk, true,
+				ctx, nil, time.Time{}, nil, syncWriteBulk, true, false,
 			)
 		},
 		func(engine *Engine, stats SyncStats, sessions int) {
@@ -373,6 +373,53 @@ func BenchmarkResyncBulkIngest(b *testing.B) {
 			if writes != int64(sessions) {
 				b.Fatalf(
 					"bulk ingest wrote %d of %d sessions via the batch pipeline",
+					writes, sessions,
+				)
+			}
+		},
+	)
+}
+
+// BenchmarkResyncBulkContributorIngest measures the same cold archive shape
+// when it enters the atomic rebuild through a contributor engine.
+func BenchmarkResyncBulkContributorIngest(b *testing.B) {
+	ctx := context.Background()
+	benchColdArchive(b,
+		func(engine *Engine) SyncStats {
+			dir := engine.agentDirs[parser.AgentClaude][0]
+			engine.agentDirs = nil
+			stats, err := engine.ResyncAllWithOptions(ctx, nil, RebuildOptions{
+				Contributors: []RebuildContributor{{
+					Name: "benchmark-contributor",
+					Config: EngineConfig{
+						AgentDirs: map[parser.AgentType][]string{
+							parser.AgentClaude: {dir},
+						},
+						Machine:   "benchmark-contributor",
+						IDPrefix:  "benchmark~",
+						Ephemeral: true,
+					},
+				}},
+			})
+			if err != nil {
+				b.Fatalf("contributor rebuild: %v", err)
+			}
+			return stats
+		},
+		func(_ *Engine, stats SyncStats, sessions int) {
+			if stats.Synced != sessions {
+				b.Fatalf(
+					"contributor ingest stored %d of %d sessions (failed=%d)",
+					stats.Synced, sessions, stats.Failed,
+				)
+			}
+			if len(stats.RebuildPhases) != 2 {
+				b.Fatalf("contributor ingest recorded %d rebuild phases", len(stats.RebuildPhases))
+			}
+			writes := stats.RebuildPhases[1].BatchedWrites
+			if writes != int64(sessions) {
+				b.Fatalf(
+					"contributor ingest wrote %d of %d sessions via the batch pipeline",
 					writes, sessions,
 				)
 			}

@@ -13,11 +13,13 @@ import {
   filtersToParams,
   splitExcludeProjectParam,
 } from "./sessions.svelte.js";
+import { SessionsService } from "../api/generated/index";
 import { starred } from "./starred.svelte.js";
 import { yokedDates } from "./yokedDates.svelte.js";
 import type { Filters } from "./sessions.svelte.js";
 import type { Session } from "../api/types.js";
 import { callGenerated } from "../api/runtime.js";
+import { rollingRange } from "../utils/dates.js";
 
 const api = vi.hoisted(() => ({
   listSessions: vi.fn(),
@@ -62,6 +64,10 @@ vi.mock("../api/client.js", () => ({
 vi.mock("../api/runtime.js", () => ({
   configureGeneratedClient: vi.fn(),
   callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
+  isAbortError: vi.fn(
+    (error: unknown) =>
+      error instanceof DOMException && error.name === "AbortError",
+  ),
 }));
 
 vi.mock("../api/generated/index", () => ({
@@ -99,6 +105,22 @@ function mockSidebarPage(
   });
 }
 
+function rejectGeneratedRequestOnAbort(
+  request: () => Promise<unknown>,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  const result = request();
+  if (!signal) return result;
+  return new Promise((resolve, reject) => {
+    signal.addEventListener(
+      "abort",
+      () => reject(new DOMException("aborted", "AbortError")),
+      { once: true },
+    );
+    void result.then(resolve, reject);
+  });
+}
+
 type SkinnySessionRow = {
   id: string;
   parent_session_id?: string | null;
@@ -106,6 +128,8 @@ type SkinnySessionRow = {
   project: string;
   machine: string;
   agent: string;
+  agent_label?: string | null;
+  entrypoint?: string | null;
   display_name?: string | null;
   started_at: string | null;
   ended_at: string | null;
@@ -124,6 +148,8 @@ function makeSkinnyRow(
     project: "proj",
     machine: "local",
     agent: "claude",
+    agent_label: null,
+    entrypoint: null,
     display_name: null,
     started_at: null,
     ended_at: null,
@@ -196,13 +222,22 @@ describe("SessionsStore", () => {
   let sessions: ReturnType<typeof createSessionsStore>;
 
   beforeEach(() => {
+    vi.restoreAllMocks();
     vi.clearAllMocks();
+    const resolvedOptions = Intl.DateTimeFormat().resolvedOptions();
+    vi.spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions").mockReturnValue({
+      ...resolvedOptions,
+      timeZone: "America/New_York",
+    });
+    vi.mocked(callGenerated).mockImplementation(
+      (request: () => Promise<unknown>) => request(),
+    );
     storageData.clear();
     mockSidebarPage();
     mockSidebarIndex();
     starred.filterOnly = false;
     starred.ids = new Set();
-    yokedDates.clear();
+    yokedDates.setEnabled(false);
     sessions = createSessionsStore();
   });
 
@@ -284,6 +319,217 @@ describe("SessionsStore", () => {
       const store = createSessionsStore();
       expect(store.filters.project).toBe("");
       expect(store.filters.includeOneShot).toBe(true);
+    });
+
+    it("clears date bounds from legacy unversioned entries", () => {
+      // Entries written before provenance tracking may hold rolling bounds
+      // persisted as if explicit; only their date fields are dropped.
+      localStorage.setItem(
+        "session-filters",
+        JSON.stringify({
+          project: "saved-proj",
+          dateFrom: "2025-07-07",
+          dateTo: "2026-07-06",
+          date: "2025-07-07",
+        }),
+      );
+      const store = createSessionsStore();
+      expect(store.filters.project).toBe("saved-proj");
+      expect(store.filters.dateFrom).toBe("");
+      expect(store.filters.dateTo).toBe("");
+      expect(store.filters.date).toBe("");
+      // Migration is written back so it runs only once.
+      const saved = JSON.parse(
+        localStorage.getItem("session-filters") ?? "{}",
+      );
+      expect(saved.version).toBe(2);
+      expect(saved.dateFrom).toBe("");
+    });
+
+    it("keeps date bounds from versioned entries", () => {
+      localStorage.setItem(
+        "session-filters",
+        JSON.stringify({
+          version: 2,
+          dateFrom: "2026-01-01",
+          dateTo: "2026-01-31",
+        }),
+      );
+      const store = createSessionsStore();
+      expect(store.filters.dateFrom).toBe("2026-01-01");
+      expect(store.filters.dateTo).toBe("2026-01-31");
+    });
+
+    it("stamps the storage version when persisting", async () => {
+      sessions.filters.project = "myproj";
+      await sessions.load();
+      const saved = JSON.parse(
+        localStorage.getItem("session-filters") ?? "{}",
+      );
+      expect(saved.version).toBe(2);
+    });
+
+    it("persists rolling bounds as windowDays intent, not dates", async () => {
+      sessions.filters.project = "myproj";
+      sessions.applyPanelDateFilters(
+        { date_from: "2025-07-07", date_to: "2026-07-06" },
+        365,
+      );
+      await sessions.load();
+
+      const saved = JSON.parse(
+        localStorage.getItem("session-filters") ?? "{}",
+      );
+      expect(saved.dateFrom).toBe("");
+      expect(saved.dateTo).toBe("");
+      expect(saved.date).toBe("");
+      expect(saved.windowDays).toBe(365);
+      expect(saved.project).toBe("myproj");
+      // The current tab still queries with the materialized bounds.
+      expect(sessions.filters.dateFrom).toBe("2025-07-07");
+      expect(sessions.filters.dateTo).toBe("2026-07-06");
+    });
+
+    it("rematerializes a persisted rolling window on load", () => {
+      localStorage.setItem(
+        "session-filters",
+        JSON.stringify({ version: 2, project: "p", windowDays: 30 }),
+      );
+      const store = createSessionsStore();
+      const range = rollingRange(30);
+      expect(store.filters.dateFrom).toBe(range.from);
+      expect(store.filters.dateTo).toBe(range.to);
+      expect(store.dateFiltersWindowDays).toBe(30);
+      expect(store.filters.project).toBe("p");
+    });
+
+    it("ignores an invalid persisted windowDays", () => {
+      localStorage.setItem(
+        "session-filters",
+        JSON.stringify({ version: 2, windowDays: -5 }),
+      );
+      const store = createSessionsStore();
+      expect(store.filters.dateFrom).toBe("");
+      expect(store.dateFiltersWindowDays).toBe(null);
+    });
+
+    it("persists explicitly chosen fixed date bounds", async () => {
+      sessions.applyPanelDateFilters(
+        { date_from: "2026-01-01", date_to: "2026-01-31" },
+        null,
+      );
+      await sessions.load();
+
+      const saved = JSON.parse(
+        localStorage.getItem("session-filters") ?? "{}",
+      );
+      expect(saved.dateFrom).toBe("2026-01-01");
+      expect(saved.dateTo).toBe("2026-01-31");
+      expect(saved.windowDays).toBeUndefined();
+    });
+
+    it("treats deep-linked window_days date bounds as rolling intent", async () => {
+      sessions.initFromParams({
+        window_days: "365",
+        date_from: "2025-07-07",
+        date_to: "2026-07-06",
+      });
+      await sessions.load();
+
+      const saved = JSON.parse(
+        localStorage.getItem("session-filters") ?? "{}",
+      );
+      expect(saved.dateFrom).toBe("");
+      expect(saved.dateTo).toBe("");
+      expect(saved.windowDays).toBe(365);
+      expect(sessions.filters.dateFrom).toBe("2025-07-07");
+    });
+
+    it("treats an invalid deep-linked window_days as explicit bounds", async () => {
+      sessions.initFromParams({
+        window_days: "abc",
+        date_from: "2026-01-01",
+        date_to: "2026-01-31",
+      });
+      expect(sessions.dateFiltersWindowDays).toBe(null);
+      await sessions.load();
+
+      const saved = JSON.parse(
+        localStorage.getItem("session-filters") ?? "{}",
+      );
+      expect(saved.dateFrom).toBe("2026-01-01");
+    });
+
+    it("resumes persisting dates when a rolling range is replaced by an explicit one", async () => {
+      sessions.applyPanelDateFilters(
+        { date_from: "2025-07-07", date_to: "2026-07-06" },
+        365,
+      );
+      await sessions.load();
+      sessions.applyPanelDateFilters(
+        { date_from: "2026-01-01", date_to: "2026-01-31" },
+        null,
+      );
+      await sessions.load();
+
+      const saved = JSON.parse(
+        localStorage.getItem("session-filters") ?? "{}",
+      );
+      expect(saved.dateFrom).toBe("2026-01-01");
+      expect(saved.dateTo).toBe("2026-01-31");
+      expect(saved.windowDays).toBeUndefined();
+    });
+
+    it("persists a provenance flip even when the bounds are identical", async () => {
+      // Fixed range persisted, then a rolling preset materializes to the
+      // exact same bounds. Callers that diff serialized filters see no
+      // change and skip load(), so the store must persist on apply.
+      sessions.applyPanelDateFilters(
+        { date_from: "2025-07-07", date_to: "2026-07-06" },
+        null,
+      );
+      await sessions.load();
+      sessions.applyPanelDateFilters(
+        { date_from: "2025-07-07", date_to: "2026-07-06" },
+        365,
+      );
+
+      const saved = JSON.parse(
+        localStorage.getItem("session-filters") ?? "{}",
+      );
+      expect(saved.dateFrom).toBe("");
+      expect(saved.dateTo).toBe("");
+      expect(saved.windowDays).toBe(365);
+    });
+
+    it("clears the rolling intent on wholesale filter resets", async () => {
+      sessions.applyPanelDateFilters(
+        { date_from: "2025-07-07", date_to: "2026-07-06" },
+        365,
+      );
+      sessions.clearSessionFilters();
+      expect(sessions.dateFiltersWindowDays).toBe(null);
+
+      sessions.applyPanelDateFilters(
+        { date_from: "2025-07-07", date_to: "2026-07-06" },
+        365,
+      );
+      sessions.setProjectFilter("myproj");
+      expect(sessions.dateFiltersWindowDays).toBe(null);
+    });
+
+    it("persists deep-linked explicit date bounds", async () => {
+      sessions.initFromParams({
+        date_from: "2026-01-01",
+        date_to: "2026-01-31",
+      });
+      await sessions.load();
+
+      const saved = JSON.parse(
+        localStorage.getItem("session-filters") ?? "{}",
+      );
+      expect(saved.dateFrom).toBe("2026-01-01");
+      expect(saved.dateTo).toBe("2026-01-31");
     });
   });
 
@@ -509,6 +755,122 @@ describe("SessionsStore", () => {
       expect(sessions.activeSession?.first_message).toBe(
         "hydrated active detail",
       );
+    });
+
+    it("keeps the active appended row when the reloaded index omits it", async () => {
+      mockSidebarIndex([makeSkinnyRow({ id: "listed" })]);
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({
+          id: "offpage",
+          first_message: "hydrated offpage detail",
+        }),
+      );
+
+      await sessions.load();
+      await sessions.navigateToSession("offpage");
+      expect(sessions.activeSession?.first_message).toBe(
+        "hydrated offpage detail",
+      );
+
+      await sessions.load();
+
+      expect(sessions.sessions.map((s) => s.id)).toEqual([
+        "listed",
+        "offpage",
+      ]);
+      expect(sessions.activeSession?.first_message).toBe(
+        "hydrated offpage detail",
+      );
+    });
+
+    it("moves the appended active row into place when pagination reaches it", async () => {
+      vi.mocked(api.getSidebarSessionIndex).mockResolvedValueOnce({
+        sessions: [makeSkinnyRow({ id: "listed" })],
+        total: 2,
+        next_cursor: "page-2",
+      });
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({
+          id: "offpage",
+          first_message: "hydrated offpage detail",
+        }),
+      );
+
+      await sessions.load();
+      await sessions.navigateToSession("offpage");
+      expect(sessions.sessions.map((s) => s.id)).toEqual([
+        "listed",
+        "offpage",
+      ]);
+
+      // A page that doesn't contain the appended row keeps it at the
+      // tail, preserving index order for keyboard navigation.
+      vi.mocked(api.getSidebarSessionIndex).mockResolvedValueOnce({
+        sessions: [makeSkinnyRow({ id: "middle" })],
+        total: 4,
+        next_cursor: "page-3",
+      });
+      await sessions.loadMore();
+      expect(sessions.sessions.map((s) => s.id)).toEqual([
+        "listed",
+        "middle",
+        "offpage",
+      ]);
+
+      vi.mocked(api.getSidebarSessionIndex).mockResolvedValueOnce({
+        sessions: [
+          makeSkinnyRow({ id: "offpage" }),
+          makeSkinnyRow({ id: "last" }),
+        ],
+        total: 4,
+        next_cursor: null,
+      });
+      await sessions.loadMore();
+
+      expect(sessions.sessions.map((s) => s.id)).toEqual([
+        "listed",
+        "middle",
+        "offpage",
+        "last",
+      ]);
+      expect(sessions.activeSession?.first_message).toBe(
+        "hydrated offpage detail",
+      );
+    });
+
+    it("refreshes hydrated agent identity fields from the sidebar index", async () => {
+      mockSidebarIndex([
+        makeSkinnyRow({
+          id: "active",
+          agent_label: "old-label",
+          entrypoint: "old-entrypoint",
+        }),
+      ]);
+      vi.mocked(api.getSession).mockResolvedValue(
+        makeSession({
+          id: "active",
+          agent_label: "old-label",
+          entrypoint: "old-entrypoint",
+          first_message: "hydrated active detail",
+        }),
+      );
+
+      await sessions.load();
+      await sessions.hydrateVisibleSessions(["active"]);
+
+      mockSidebarIndex([
+        makeSkinnyRow({
+          id: "active",
+          agent_label: "triage",
+          entrypoint: "sdk-cli",
+        }),
+      ]);
+      await sessions.load();
+
+      expect(sessions.sessions[0]!.is_index_only).toBe(false);
+      expect(sessions.sessions[0]!.first_message).toBe("hydrated active detail");
+      expect(sessions.sessions[0]!.agent_label).toBe("triage");
+      expect(sessions.sessions[0]!.entrypoint).toBe("sdk-cli");
     });
 
     it("clears stale display names from hydrated rows when the index has none", async () => {
@@ -1203,6 +1565,14 @@ describe("SessionsStore", () => {
   });
 
   describe("load serialization", () => {
+    it("should pass the browser timezone", async () => {
+      await sessions.load();
+
+      expectSidebarIndexCalledWith({
+        timezone: "America/New_York",
+      });
+    });
+
     it("should omit min/max_messages when 0", async () => {
       sessions.filters.minMessages = 0;
       sessions.filters.maxMessages = 0;
@@ -1312,6 +1682,17 @@ describe("SessionsStore", () => {
   });
 
   describe("loadMore serialization", () => {
+    it("should pass the browser timezone in loadMore", async () => {
+      sessions.nextCursor = "cur-timezone";
+
+      mockSidebarPage();
+      await sessions.loadMore();
+
+      expectPaginatedSidebarIndexCalledWith({
+        timezone: "America/New_York",
+      });
+    });
+
     it("should load the sidebar index once with consistent filters", async () => {
       mockSidebarIndex([
         makeSkinnyRow({ id: "s1" }),
@@ -1664,6 +2045,7 @@ describe("SessionsStore", () => {
       sessions.activeSessionId = "session-1";
       sessions.filters.dateFrom = "2025-05-01";
       sessions.filters.dateTo = "2025-05-31";
+      yokedDates.setEnabled(true);
       yokedDates.updateFromPanel({
         from: "2025-05-01",
         to: "2025-05-31",
@@ -1693,6 +2075,7 @@ describe("SessionsStore", () => {
     it("clears the date yoke before clearing the active session when requested by route intent", () => {
       sessions.activeSessionId = "session-1";
       sessions.filters.agent = "codex";
+      yokedDates.setEnabled(true);
       yokedDates.updateFromPanel({
         from: "2025-05-01",
         to: "2025-05-31",
@@ -1721,6 +2104,7 @@ describe("SessionsStore", () => {
 
     it("keeps the date yoke for non-date filter clears without route date intent", () => {
       sessions.filters.agent = "codex";
+      yokedDates.setEnabled(true);
       yokedDates.updateFromPanel({
         from: "2025-05-01",
         to: "2025-05-31",
@@ -2268,6 +2652,50 @@ describe("SessionsStore", () => {
       );
     });
   });
+
+  describe("route cancellation", () => {
+    it("aborts pagination and treats cancellation as normal completion", async () => {
+      const signals: AbortSignal[] = [];
+      vi.mocked(callGenerated).mockImplementation(
+        (request: () => Promise<unknown>, signal?: AbortSignal) => {
+          if (signal) signals.push(signal);
+          return rejectGeneratedRequestOnAbort(request, signal);
+        },
+      );
+      vi.mocked(api.getSidebarSessionIndex).mockReturnValue(
+        new Promise(() => {}),
+      );
+      sessions.nextCursor = "next";
+
+      const load = sessions.loadMore();
+      await Promise.resolve();
+      sessions.cancelRouteReads();
+
+      expect(signals).toHaveLength(1);
+      expect(signals[0]?.aborted).toBe(true);
+      await expect(load).resolves.toBeUndefined();
+    });
+
+    it("keeps a replacement signal-detail request registered", async () => {
+      vi.mocked(callGenerated).mockImplementation(
+        rejectGeneratedRequestOnAbort,
+      );
+      vi.mocked(api.getSession).mockReturnValue(
+        new Promise(() => {}),
+      );
+
+      const obsolete = sessions.fetchSignalDetail("detail");
+      await Promise.resolve();
+      sessions.cancelRouteReads();
+      void sessions.fetchSignalDetail("detail");
+      await obsolete;
+
+      void sessions.fetchSignalDetail("detail");
+      await Promise.resolve();
+
+      expect(api.getSession).toHaveBeenCalledTimes(2);
+    });
+  });
 });
 
 function makeSession(
@@ -2796,6 +3224,51 @@ describe("SessionsStore live refresh", () => {
     spy.mockRestore();
   });
 
+  it("messages events refresh active child sessions", async () => {
+    const { events } = await import("./events.svelte.js");
+    let registered: ((e: { scope: string }) => void) | null = null;
+    const spy = vi
+      .spyOn(events, "subscribe")
+      .mockImplementation((fn) => {
+        registered = fn as (e: { scope: string }) => void;
+        return () => {};
+      });
+
+    vi.mocked(SessionsService.getApiV1SessionsIdChildren)
+      .mockResolvedValueOnce([
+        makeSession({
+          id: "child",
+          parent_session_id: "root",
+          transcript_revision: "child-rev-1",
+        }),
+      ] as Session[])
+      .mockResolvedValueOnce([
+        makeSession({
+          id: "child",
+          parent_session_id: "root",
+          transcript_revision: "child-rev-2",
+        }),
+      ] as Session[]);
+
+    const sessions = createSessionsStore();
+    const detach = sessions.attachSidebar();
+    sessions.activeSessionId = "root";
+    await sessions.loadChildSessions("root");
+    expect(sessions.childSessions.get("child")?.transcript_revision).toBe("child-rev-1");
+    expect(sessions.activeSessionUsageVersion).toBe(0);
+
+    registered!({ scope: "messages" });
+
+    await vi.waitFor(() => {
+      expect(sessions.childSessions.get("child")?.transcript_revision).toBe("child-rev-2");
+    });
+    expect(SessionsService.getApiV1SessionsIdChildren).toHaveBeenCalledTimes(2);
+    expect(sessions.activeSessionUsageVersion).toBe(1);
+
+    detach();
+    spy.mockRestore();
+  });
+
   it("sessions and sync events coalesce to one debounced index reload", async () => {
     vi.useFakeTimers();
     const { events } = await import("./events.svelte.js");
@@ -2842,6 +3315,50 @@ describe("SessionsStore live refresh", () => {
     // listSessions mock would produce.
     await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
     expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+
+    detach();
+    spy.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it("refreshes active child sessions on the 5-minute safety-net interval", async () => {
+    vi.useFakeTimers();
+    const { events } = await import("./events.svelte.js");
+    const spy = vi
+      .spyOn(events, "subscribe")
+      .mockReturnValue(() => {});
+
+    vi.mocked(SessionsService.getApiV1SessionsIdChildren)
+      .mockResolvedValueOnce([
+        makeSession({
+          id: "child",
+          parent_session_id: "root",
+          total_output_tokens: 1,
+        }),
+      ] as Session[])
+      .mockResolvedValueOnce([
+        makeSession({
+          id: "child",
+          parent_session_id: "root",
+          total_output_tokens: 9,
+        }),
+      ] as Session[]);
+
+    const sessions = createSessionsStore();
+    const detach = sessions.attachSidebar();
+    sessions.activeSessionId = "root";
+    await sessions.load();
+    await sessions.loadChildSessions("root");
+    expect(sessions.childSessions.get("child")?.total_output_tokens).toBe(1);
+    expect(sessions.activeSessionUsageVersion).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+
+    await vi.waitFor(() => {
+      expect(sessions.childSessions.get("child")?.total_output_tokens).toBe(9);
+    });
+    expect(SessionsService.getApiV1SessionsIdChildren).toHaveBeenCalledTimes(2);
+    expect(sessions.activeSessionUsageVersion).toBe(1);
 
     detach();
     spy.mockRestore();

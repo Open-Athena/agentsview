@@ -48,6 +48,10 @@ func (p *antigravityProvider) Discover(ctx context.Context) ([]SourceRef, error)
 	return p.sources.Discover(ctx)
 }
 
+func (p *antigravityProvider) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	return p.sources.DiscoverEach(ctx, yield)
+}
+
 func (p *antigravityProvider) WatchPlan(ctx context.Context) (WatchPlan, error) {
 	return p.sources.WatchPlan(ctx)
 }
@@ -160,6 +164,32 @@ func (s antigravitySourceSet) Discover(ctx context.Context) ([]SourceRef, error)
 	return sources, nil
 }
 
+func (s antigravitySourceSet) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	for _, root := range s.roots {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		dir := filepath.Join(root, "conversations")
+		err := streamDirectoryEntries(ctx, dir, func(entry os.DirEntry) error {
+			name := entry.Name()
+			if entry.IsDir() || !strings.HasSuffix(name, ".db") ||
+				!IsValidSessionID(strings.TrimSuffix(name, ".db")) {
+				return nil
+			}
+			if source, ok := s.sourceRef(root, filepath.Join(dir, name), false); ok {
+				if err := yield(source); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // discoverSessionPaths returns one conversations/<uuid>.db path per IDE session
 // under root, sorted by path. It owns the on-disk discovery the package-level
 // DiscoverAntigravitySessions free function used to provide.
@@ -223,7 +253,7 @@ func (s antigravitySourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 			WatchRoot{
 				Path:         filepath.Join(root, "conversations"),
 				Recursive:    false,
-				IncludeGlobs: []string{"*.db", "*.db-*"},
+				IncludeGlobs: []string{"*.db", "*.db-*", "*.trajectory.json"},
 				DebounceKey:  string(AgentAntigravity) + ":conversations:" + root,
 			},
 		)
@@ -354,6 +384,12 @@ func (s antigravitySourceSet) sourceForChangedPath(root, path string) (SourceRef
 	if dbPath, id, ok := antigravityConversationDBForPath(root, path); ok {
 		return s.newSourceRef(root, dbPath, id), true
 	}
+	if id, ok := antigravityIDETrajectoryID(root, path); ok {
+		dbPath := filepath.Join(root, "conversations", id+".db")
+		if IsRegularFile(dbPath) {
+			return s.newSourceRef(root, dbPath, id), true
+		}
+	}
 	if id, ok := antigravityAnnotationID(root, path); ok {
 		dbPath := filepath.Join(root, "conversations", id+".db")
 		if IsRegularFile(dbPath) {
@@ -420,6 +456,24 @@ func antigravityConversationDBForPath(root, path string) (string, string, bool) 
 	return filepath.Join(root, "conversations", id+".db"), id, true
 }
 
+// antigravityIDETrajectoryID reports whether path is a
+// conversations/<id>.trajectory.json agy-reader sidecar under root and,
+// if so, returns the session id so a sidecar write routes back to its
+// .db source for re-sync.
+func antigravityIDETrajectoryID(root, path string) (string, bool) {
+	rel, ok := relUnder(filepath.Clean(root), filepath.Clean(path))
+	if !ok {
+		return "", false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	if len(parts) != 2 || parts[0] != "conversations" ||
+		!strings.HasSuffix(parts[1], ".trajectory.json") {
+		return "", false
+	}
+	id := strings.TrimSuffix(parts[1], ".trajectory.json")
+	return id, IsValidSessionID(id)
+}
+
 func antigravityAnnotationID(root, path string) (string, bool) {
 	rel, ok := relUnder(filepath.Clean(root), filepath.Clean(path))
 	if !ok {
@@ -458,14 +512,18 @@ func antigravityWatchRootMatches(root, watchRoot string) bool {
 
 func antigravityProviderCapabilities() Capabilities {
 	source := jsonlFileProviderSourceCapabilities()
+	source.StreamingDiscovery = CapabilitySupported
 	source.ForceReplaceOnParse = CapabilitySupported
 	return Capabilities{
 		Source: source,
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
+			Thinking:             CapabilitySupported,
 			ToolCalls:            CapabilitySupported,
+			ToolResults:          CapabilitySupported,
 			PerMessageTokenUsage: CapabilitySupported,
 			AggregateUsageEvents: CapabilitySupported,
+			Model:                CapabilitySupported,
 		},
 	}
 }

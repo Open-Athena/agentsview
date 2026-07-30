@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -56,6 +58,66 @@ func writeUnreachableDaemonRuntime(t *testing.T, dir string, readOnly bool) int 
 	ln.Close()
 	writeDaemonRuntimeForTest(t, dir, "127.0.0.1", port, "test", readOnly)
 	return port
+}
+
+func TestDetectTransport_UsesStartupStateFallbackWithoutRuntimeRecord(t *testing.T) {
+	dir := runtimeTestDir(t)
+	host, port := testPingServer(t)
+	createTime, ok := processCreateTimeMillis(os.Getpid())
+	require.True(t, ok)
+	writeStartupFallbackFixture(t, dir, host, port, os.Getpid(), strconv.FormatInt(createTime, 10))
+
+	tr, err := detectTransportContext(context.Background(), dir, "", time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, transportHTTP, tr.Mode)
+	assert.Equal(t, fmt.Sprintf("http://%s:%d", host, port), tr.URL)
+}
+
+func TestDetectTransport_UsesStartupStateFallbackWhileExternalLockRemainsHeld(t *testing.T) {
+	dir := runtimeTestDir(t)
+	holdExternalStartupLockForTest(t, dir)
+	host, port := testPingServer(t)
+	createTime, ok := processCreateTimeMillis(os.Getpid())
+	require.True(t, ok)
+	state := startupState{
+		PID:          os.Getpid(),
+		StartedAt:    time.Now().Add(-time.Minute),
+		Phase:        "starting HTTP server",
+		Host:         host,
+		Port:         port,
+		RuntimeError: "permission denied writing runtime record",
+		CreateTime:   strconv.FormatInt(createTime, 10),
+		APIVersion:   daemonAPIVersion,
+		DataVersion:  db.CurrentDataVersion(),
+		UpdatedAt:    time.Now(),
+	}
+	data, err := json.Marshal(state)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(startupStatePath(dir), data, 0o600))
+
+	tr, err := detectTransportContext(context.Background(), dir, "", time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, transportHTTP, tr.Mode)
+	assert.Equal(t, fmt.Sprintf("http://%s:%d", host, port), tr.URL)
+}
+
+func TestEnsureTransport_SameVersionFallbackDoesNotAutostart(t *testing.T) {
+	dir := runtimeTestDir(t)
+	host, port := testPingServer(t)
+	createTime, ok := processCreateTimeMillis(os.Getpid())
+	require.True(t, ok)
+	writeStartupFallbackFixture(t, dir, host, port, os.Getpid(), strconv.FormatInt(createTime, 10))
+	setTestVersion(t, "test")
+	forbidStartBackgroundServeForTransport(t,
+		"same-version fallback daemon must not trigger autostart")
+
+	cfg := config.Config{DataDir: dir}
+	tr, err := ensureTransport(&cfg, transportIntentRead, time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, transportHTTP, tr.Mode)
+	assert.Equal(t, fmt.Sprintf("http://%s:%d", host, port), tr.URL)
+	require.NotNil(t, tr.Runtime)
+	assert.Equal(t, "test", tr.Runtime.Record.Version)
 }
 
 // incompatibleRuntimeRecord builds a writable runtime record whose API
@@ -339,6 +401,7 @@ func TestEnsureTransport_ReadIntentNoDaemonEnvRefusesDirectRead(t *testing.T) {
 	_, err := ensureTransport(&cfg, transportIntentRead, 100*time.Millisecond)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "direct SQLite reads are not supported")
+	assert.Contains(t, err.Error(), "agentsview daemon start")
 }
 
 func TestEnsureTransport_ReadIntentUnreachableDaemonRefusesDirectRead(t *testing.T) {
@@ -463,6 +526,7 @@ func TestEnsureTransport_ReadIntentNoDaemonEnvRefusesOlderDaemon(
 	require.Error(t, err)
 	assert.Equal(t, transport{}, tr)
 	assert.Contains(t, err.Error(), "daemon restart required")
+	assert.Contains(t, err.Error(), "agentsview daemon restart")
 }
 
 func TestEnsureTransport_ReadIntentPreservesExplicitNoSyncWhenRestartingOlderDaemon(
@@ -526,6 +590,10 @@ func TestEnsureTransport_ArchiveWriteStopsOlderDaemonUnderLaunchLock(
 	dir := daemonRuntimeDir(t)
 	host, port := testPingServer(t)
 	writeDaemonRuntimeForTest(t, dir, host, port, "1.0.0", false)
+
+	// This test exercises the real auto-start machinery; bypass the
+	// test-binary guard in autoStartBackgroundServe.
+	stubStartBackgroundServeForTransport(t, ensureBackgroundServe)
 
 	setTestVersion(t, "1.1.0")
 	stopErr := errors.New("stop after launch lock")
@@ -1106,7 +1174,7 @@ func TestNewService_DirectIncompatibleRefusesWithoutOpeningDB(t *testing.T) {
 	assert.Nil(t, svc)
 	assert.Nil(t, cleanup)
 	assert.Contains(t, err.Error(), "daemon data version 52 is incompatible")
-	assert.Contains(t, err.Error(), "agentsview serve --replace")
+	assert.Contains(t, err.Error(), "agentsview daemon restart")
 	assert.NoFileExists(t, dbPath)
 }
 

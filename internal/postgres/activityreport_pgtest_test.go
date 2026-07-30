@@ -13,6 +13,7 @@ import (
 
 	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/money"
 )
 
 // pgDayQuery resolves a single-day "day" Query for date/tz against a fixed
@@ -130,9 +131,9 @@ func TestPGGetActivityReportUsageCostAndTokens(t *testing.T) {
 
 	_, err := store.DB().ExecContext(ctx, `
 		INSERT INTO model_pricing (
-			model_pattern, input_per_mtok, output_per_mtok,
-			cache_creation_per_mtok, cache_read_per_mtok, updated_at
-		) VALUES ('claude-sonnet-4-20250514', 3, 15, 0, 0, 'seed')`)
+			model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
+			cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok, updated_at
+		) VALUES ('claude-sonnet-4-20250514', 3000000, 15000000, 0, 0, 'seed')`)
 	require.NoError(t, err, "insert pricing")
 	_, err = store.DB().ExecContext(ctx, `
 		INSERT INTO sessions (
@@ -163,7 +164,126 @@ func TestPGGetActivityReportUsageCostAndTokens(t *testing.T) {
 	assert.Equal(t, 1, r.Totals.Sessions)
 	assert.Equal(t, 500, r.Totals.OutputTokens)
 	// Cost = (1000*3 + 500*15) / 1e6 = 0.0105
-	assert.InDelta(t, 0.0105, r.Totals.Cost, 1e-9)
+	assert.Equal(t, money.MustParseDollars("0.0105"), r.Totals.Cost)
+}
+
+func TestPGGetActivityReportCopilotReportedCostReplacesSessionEstimates(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_activity_copilot_authoritative_test")
+	ctx := context.Background()
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO model_pricing (
+			model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
+			cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok, updated_at
+		) VALUES
+			('copilot-model-a', 10000000, 0, 0, 0, 'seed'),
+			('copilot-model-b', 20000000, 0, 0, 0, 'seed')`)
+	require.NoError(t, err)
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at, ended_at,
+			message_count, user_message_count
+		) VALUES (
+			'copilot:activity-authoritative', 'test-machine', 'proj1', 'copilot',
+			'2026-06-16T10:00:00Z'::timestamptz,
+			'2026-06-16T10:10:00Z'::timestamptz, 1, 1
+		)`)
+	require.NoError(t, err)
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO usage_events (
+			session_id, source, model, input_tokens, cost_microdollars,
+			cost_status, cost_source, occurred_at, dedup_key
+		) VALUES
+			('copilot:activity-authoritative', 'shutdown', 'copilot-model-a',
+			 1000000, NULL, '', '', '2026-06-16T10:05:00Z'::timestamptz, 'first'),
+			('copilot:activity-authoritative', 'shutdown', 'copilot-model-b',
+			 1000000, 30000, 'exact', 'copilot-reported',
+			 '2026-06-16T10:10:00Z'::timestamptz, 'final')`)
+	require.NoError(t, err)
+
+	r, err := store.GetActivityReport(
+		ctx, db.AnalyticsFilter{Timezone: "UTC"},
+		pgDayQuery(t, "2026-06-16", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, money.MustParseDollars("0.03"), r.Totals.Cost)
+	require.Len(t, r.BySession, 1)
+	assert.Equal(t, money.MustParseDollars("0.03"), r.BySession[0].Cost)
+	modelCosts := make(map[string]money.Money, len(r.ByModel))
+	for _, model := range r.ByModel {
+		modelCosts[model.Key] = model.Cost
+	}
+	assert.Equal(t, money.MustParseDollars("0.01"), modelCosts["copilot-model-a"])
+	assert.Equal(t, money.MustParseDollars("0.02"), modelCosts["copilot-model-b"])
+	assert.Equal(t, r.Totals.Cost,
+		money.MustAdd(modelCosts["copilot-model-a"], modelCosts["copilot-model-b"]))
+}
+
+// TestPGGetActivityReportIncludesSubagentUsage mirrors the SQLite
+// TestGetActivityReport_IncludesSubagentUsage: subagent and fork sessions
+// are candidates so their usage lands in the totals (matching
+// GetDailyUsage, which never filters by relationship_type). The fork's
+// replayed usage row dedups away, so it adds a session row but no cost.
+func TestPGGetActivityReportIncludesSubagentUsage(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_daily_report_subagent_test")
+	ctx := context.Background()
+
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO model_pricing (
+			model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
+			cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok, updated_at
+		) VALUES
+			('root-model', 3000000, 15000000, 0, 0, 'seed'),
+			('sub-model', 3000000, 15000000, 0, 0, 'seed')`)
+	require.NoError(t, err, "insert pricing")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at, ended_at,
+			message_count, user_message_count,
+			parent_session_id, relationship_type
+		) VALUES
+			('root', 'test-machine', 'proj1', 'claude',
+			 '2026-06-16T10:00:00Z'::timestamptz,
+			 '2026-06-16T10:10:00Z'::timestamptz, 1, 1, NULL, ''),
+			('agent-sub', 'test-machine', 'proj1', 'claude',
+			 '2026-06-16T10:02:00Z'::timestamptz,
+			 '2026-06-16T10:04:00Z'::timestamptz, 1, 1, 'root', 'subagent'),
+			('fork', 'test-machine', 'proj1', 'claude',
+			 '2026-06-16T10:05:00Z'::timestamptz,
+			 '2026-06-16T10:06:00Z'::timestamptz, 1, 1, 'root', 'fork')`)
+	require.NoError(t, err, "insert sessions")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO messages (
+			session_id, ordinal, role, content, timestamp,
+			content_length, model, token_usage,
+			claude_message_id, claude_request_id
+		) VALUES
+			('root', 0, 'assistant', 'x',
+			 '2026-06-16T10:00:00Z'::timestamptz, 1, 'root-model',
+			 '{"input_tokens":1000,"output_tokens":500}', 'm-root', 'r-root'),
+			('agent-sub', 0, 'assistant', 'y',
+			 '2026-06-16T10:03:00Z'::timestamptz, 1, 'sub-model',
+			 '{"input_tokens":2000,"output_tokens":700}', 'm-sub', 'r-sub'),
+			('fork', 0, 'assistant', 'x',
+			 '2026-06-16T10:05:00Z'::timestamptz, 1, 'root-model',
+			 '{"input_tokens":1000,"output_tokens":500}', 'm-root', 'r-root')`)
+	require.NoError(t, err, "insert messages")
+
+	r, err := store.GetActivityReport(
+		ctx, db.AnalyticsFilter{Timezone: "UTC"},
+		pgDayQuery(t, "2026-06-16", "UTC"))
+	require.NoError(t, err)
+	ids := make(map[string]struct{}, len(r.BySession))
+	for _, s := range r.BySession {
+		ids[s.SessionID] = struct{}{}
+	}
+	assert.Contains(t, ids, "root")
+	assert.Contains(t, ids, "agent-sub",
+		"subagent session must be a candidate")
+	assert.Contains(t, ids, "fork", "fork session must be a candidate")
+	assert.Equal(t, 1200, r.Totals.OutputTokens,
+		"totals include subagent usage; the fork's replayed row dedups away")
+	// Cost = root (1000*3+500*15)/1e6 + subagent (2000*3+700*15)/1e6; the
+	// fork's duplicate row contributes nothing.
+	assert.Equal(t, money.MustParseDollars("0.027"), r.Totals.Cost)
 }
 
 func TestPGGetActivityReportPricingModelsOnlyIncludeDedupSurvivors(t *testing.T) {
@@ -172,11 +292,11 @@ func TestPGGetActivityReportPricingModelsOnlyIncludeDedupSurvivors(t *testing.T)
 
 	_, err := store.DB().ExecContext(ctx, `
 		INSERT INTO model_pricing (
-			model_pattern, input_per_mtok, output_per_mtok,
-			cache_creation_per_mtok, cache_read_per_mtok, updated_at
+			model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
+			cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok, updated_at
 		) VALUES
-			('kept-model', 3, 15, 0, 0, 'seed'),
-			('discarded-model', 3, 15, 0, 0, 'seed')`)
+			('kept-model', 3000000, 15000000, 0, 0, 'seed'),
+			('discarded-model', 3000000, 15000000, 0, 0, 'seed')`)
 	require.NoError(t, err, "insert pricing")
 	_, err = store.DB().ExecContext(ctx, `
 		INSERT INTO sessions (
@@ -322,9 +442,9 @@ func TestPGGetActivityReportExcludesIneligibleUsage(t *testing.T) {
 
 	_, err := store.DB().ExecContext(ctx, `
 		INSERT INTO model_pricing (
-			model_pattern, input_per_mtok, output_per_mtok,
-			cache_creation_per_mtok, cache_read_per_mtok, updated_at
-		) VALUES ('claude-sonnet-4-20250514', 3, 15, 0, 0, 'seed')`)
+			model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
+			cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok, updated_at
+		) VALUES ('claude-sonnet-4-20250514', 3000000, 15000000, 0, 0, 'seed')`)
 	require.NoError(t, err, "insert pricing")
 	_, err = store.DB().ExecContext(ctx, `
 		INSERT INTO sessions (
@@ -356,7 +476,7 @@ func TestPGGetActivityReportExcludesIneligibleUsage(t *testing.T) {
 		pgDayQuery(t, "2026-06-16", "UTC"))
 	require.NoError(t, err)
 	assert.Equal(t, 500, r.Totals.OutputTokens, "synthetic message excluded")
-	assert.InDelta(t, 0.0105, r.Totals.Cost, 1e-9)
+	assert.Equal(t, money.MustParseDollars("0.0105"), r.Totals.Cost)
 }
 
 // TestPGGetActivityReportDedupsAcrossChunks confirms the PG usage fetch's
@@ -383,9 +503,9 @@ func TestPGGetActivityReportDedupsAcrossChunks(t *testing.T) {
 
 	_, err := store.DB().ExecContext(ctx, `
 		INSERT INTO model_pricing (
-			model_pattern, input_per_mtok, output_per_mtok,
-			cache_creation_per_mtok, cache_read_per_mtok, updated_at
-		) VALUES ('claude-sonnet-4-20250514', 3, 15, 0, 0, 'seed')`)
+			model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
+			cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok, updated_at
+		) VALUES ('claude-sonnet-4-20250514', 3000000, 15000000, 0, 0, 'seed')`)
 	require.NoError(t, err, "insert pricing")
 
 	// dup-a: earlier timestamp and 500 output tokens -> the correct global
@@ -482,9 +602,9 @@ func TestPGGetActivityReportUsageDedupFallsBackToSourceUUID(t *testing.T) {
 
 	_, err := store.DB().ExecContext(ctx, `
 		INSERT INTO model_pricing (
-			model_pattern, input_per_mtok, output_per_mtok,
-			cache_creation_per_mtok, cache_read_per_mtok, updated_at
-		) VALUES ('claude-sonnet-4-20250514', 3, 15, 0, 0, 'seed')`)
+			model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
+			cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok, updated_at
+		) VALUES ('claude-sonnet-4-20250514', 3000000, 15000000, 0, 0, 'seed')`)
 	require.NoError(t, err, "insert pricing")
 
 	_, err = store.DB().ExecContext(ctx, `

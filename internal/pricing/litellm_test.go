@@ -1,11 +1,12 @@
 package pricing
 
 import (
-	"math"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/money"
 )
 
 func TestParseLiteLLMPricing(t *testing.T) {
@@ -32,17 +33,22 @@ func TestParseLiteLLMPricing(t *testing.T) {
 	}
 	require.NotNil(t, found, "claude-sonnet-4-20250514 not found in results")
 
-	assertClose(t, "InputPerMTok", found.InputPerMTok, 3.0)
-	assertClose(t, "OutputPerMTok", found.OutputPerMTok, 15.0)
-	assertClose(t, "CacheCreationPerMTok",
-		found.CacheCreationPerMTok, 3.75)
-	// LiteLLM only exposes the 5m cache write rate; the 1h rate
-	// is derived as 1.6x the 5m rate (Anthropic's documented ratio:
-	// 5m = 1.25x input, 1h = 2x input, 2/1.25 = 1.6).
-	assertClose(t, "CacheCreation1hPerMTok",
-		found.CacheCreation1hPerMTok, 6.0)
-	assertClose(t, "CacheReadPerMTok",
-		found.CacheReadPerMTok, 0.30)
+	assert.Equal(t, money.Money{Microdollars: 3_000_000}, found.InputPerMTok)
+	assert.Equal(t, money.Money{Microdollars: 15_000_000}, found.OutputPerMTok)
+	assert.Equal(t,
+		money.Money{Microdollars: 3_750_000},
+		found.CacheCreationPerMTok,
+	)
+	// LiteLLM exposes only the 5m rate; the 1h rate is derived as 8/5 of it
+	// (Anthropic: 5m = 1.25x input, 1h = 2x input; 2/1.25 = 8/5).
+	assert.Equal(t,
+		money.Money{Microdollars: 6_000_000},
+		found.CacheCreation1hPerMTok,
+	)
+	assert.Equal(t,
+		money.Money{Microdollars: 300_000},
+		found.CacheReadPerMTok,
+	)
 }
 
 func TestParseLiteLLMPricingMultipleProviders(t *testing.T) {
@@ -117,13 +123,4 @@ func TestFallbackPricing(t *testing.T) {
 	for model, found := range required {
 		assert.True(t, found, "required model %s missing", model)
 	}
-}
-
-func assertClose(
-	t *testing.T,
-	name string,
-	got, want float64,
-) {
-	t.Helper()
-	assert.LessOrEqual(t, math.Abs(got-want), 0.001, "%s: got %f, want %f", name, got, want)
 }

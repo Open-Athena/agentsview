@@ -28,6 +28,14 @@ type PGPushConfig struct {
 	Watch           bool
 	Debounce        time.Duration
 	Interval        time.Duration
+	NoVectors       bool
+	// ScopeVectorsToChangedSessions is set internally by the watch
+	// loop for change-triggered pushes; it has no CLI flag.
+	ScopeVectorsToChangedSessions bool
+	// LastReconciledVectorGeneration is set internally by the watch
+	// loop so a scoped push can promote to generation-wide when the
+	// active generation id has changed; it has no CLI flag.
+	LastReconciledVectorGeneration int64
 }
 
 type PGStatusConfig struct {
@@ -57,13 +65,29 @@ func (s pgTargetSelection) label() string {
 
 func (s pgTargetSelection) syncOptions(
 	projects, excludeProjects []string,
+	vectorSource postgres.VectorPushSource,
 ) postgres.SyncOptions {
 	return postgres.SyncOptions{
 		Projects:               projects,
 		ExcludeProjects:        excludeProjects,
 		SyncStateTarget:        s.SyncStateTarget,
 		MigrateLegacySyncState: s.MigrateLegacySyncState,
+		VectorSource:           vectorSource,
 	}
+}
+
+// pgVectorPushSource returns the vectors.db push source to attach for this
+// target, or nil when the vector push phase is gated off: the target opts out
+// via push_vectors=false, the caller passed --no-vectors, or [vector] is
+// disabled (newVectorPushSource itself returns nil then). A nil source leaves
+// postgres.Sync's vector phase skipped.
+func pgVectorPushSource(
+	appCfg config.Config, target pgTargetSelection, cfg PGPushConfig,
+) postgres.VectorPushSource {
+	if !target.PG.PushVectorsEnabled() || cfg.NoVectors {
+		return nil
+	}
+	return newVectorPushSource(appCfg)
 }
 
 func runPGPush(
@@ -167,17 +191,72 @@ func runPGPushTarget(
 	return nil
 }
 
-func printPGPushProgress(p postgres.PushProgress) {
+// pgPushProgressStage buckets progress reports into the display stages that
+// each own one progress line: daemon-side setup, fingerprinting, the session
+// push, and the vector push.
+func pgPushProgressStage(p postgres.PushProgress) string {
+	switch {
+	case p.Phase == "preparing" && p.SessionsTotal == 0:
+		return "setup"
+	case p.Phase == "preparing":
+		return "fingerprints"
+	case p.Phase == "vectors":
+		return "vectors"
+	default:
+		return "sessions"
+	}
+}
+
+// newPGPushProgressPrinter returns a progress renderer that updates the
+// current stage's line in place and finishes it with a newline when the push
+// moves to the next stage, so each completed stage stays in the scrollback
+// instead of being overwritten by the next one. Every render carries the
+// elapsed time since the printer was created (push start), so long stages
+// show how long the push has been running. Renders end with an
+// erase-to-end-of-line so a shorter render fully replaces a longer one
+// instead of leaving its tail behind.
+func newPGPushProgressPrinter() func(postgres.PushProgress) {
+	lastStage := ""
+	start := time.Now()
+	return func(p postgres.PushProgress) {
+		stage := pgPushProgressStage(p)
+		if lastStage != "" && stage != lastStage {
+			fmt.Println()
+		}
+		lastStage = stage
+		fmt.Printf("\r%s (%s elapsed)\x1b[K",
+			pgPushProgressLine(p), time.Since(start).Round(time.Second))
+	}
+}
+
+// pgPushProgressLine renders one progress report as the visible line text for
+// its stage; newPGPushProgressPrinter owns the in-place terminal handling.
+func pgPushProgressLine(p postgres.PushProgress) string {
+	if p.Phase == "preparing" {
+		if p.SessionsTotal == 0 {
+			return "Preparing push (sync state, metadata, fingerprints)..."
+		}
+		return fmt.Sprintf(
+			"Preparing... %d/%d sessions fingerprinted",
+			p.SessionsDone, p.SessionsTotal,
+		)
+	}
+	if p.Phase == "vectors" {
+		return fmt.Sprintf(
+			"Pushing vectors... %d/%d sessions scanned, %d chunks",
+			p.VectorSessionsDone, p.VectorSessionsTotal,
+			p.VectorChunksPushed,
+		)
+	}
 	if p.SkippedConflicts > 0 {
-		fmt.Printf(
-			"\rPushing... %d/%d sessions, %d messages, %d ownership conflicts skipped",
+		return fmt.Sprintf(
+			"Pushing... %d/%d sessions, %d messages, %d ownership conflicts skipped",
 			p.SessionsDone, p.SessionsTotal,
 			p.MessagesDone, p.SkippedConflicts,
 		)
-		return
 	}
-	fmt.Printf(
-		"\rPushing... %d/%d sessions, %d messages",
+	return fmt.Sprintf(
+		"Pushing... %d/%d sessions, %d messages",
 		p.SessionsDone, p.SessionsTotal,
 		p.MessagesDone,
 	)
@@ -204,6 +283,7 @@ func writePGPushSummary(w io.Writer, result postgres.PushResult) {
 			"Warning: skipped %d session(s) owned by another PostgreSQL push marker\n",
 			result.SkippedConflicts,
 		)
+		writePGVectorPushSummary(w, result.Vectors)
 		return
 	}
 	fmt.Fprintf(
@@ -214,6 +294,40 @@ func writePGPushSummary(w io.Writer, result postgres.PushResult) {
 		errSuffix,
 		dur,
 	)
+	writePGVectorPushSummary(w, result.Vectors)
+}
+
+// writePGVectorPushSummary prints the vector push phase outcome: a skip
+// reason when the phase did not run, otherwise per-session and per-doc
+// counters. An ownership conflict count is surfaced separately, analogous to
+// the session-level SkippedConflicts warning, since those sessions were left
+// untouched on PG because another machine's marker owns them.
+func writePGVectorPushSummary(w io.Writer, v postgres.VectorPushResult) {
+	if v.Skipped {
+		if v.SkippedReason != "" {
+			fmt.Fprintf(w, "Vectors: skipped (%s)\n", v.SkippedReason)
+		}
+		return
+	}
+	fmt.Fprintf(
+		w,
+		"Vectors: %d session(s) pushed, %d unchanged, %d docs, %d chunks\n",
+		v.SessionsPushed, v.SessionsUnchanged, v.DocsPushed, v.ChunksPushed,
+	)
+	if v.Conflicts > 0 {
+		fmt.Fprintf(
+			w,
+			"Warning: skipped %d vector session(s) owned by another PostgreSQL push marker\n",
+			v.Conflicts,
+		)
+	}
+	if v.SessionsDeferred > 0 {
+		fmt.Fprintf(
+			w,
+			"Warning: deferred vectors for %d session(s); the next generation-wide reconciliation sends them\n",
+			v.SessionsDeferred,
+		)
+	}
 }
 
 func runPGStatus(targetName string, cfg PGStatusConfig) error {
@@ -359,24 +473,27 @@ func loadPGServeConfig(cmd *cobra.Command) (config.Config, string, error) {
 	return cfg, basePath, nil
 }
 
-func runPGServe(appCfg config.Config, basePath string) {
-	setupLogFile(appCfg.DataDir)
-	if appCfg.RequireAuth {
-		if err := appCfg.EnsureAuthToken(); err != nil {
-			fatal("pg serve: generating auth token: %v", err)
-		}
-	}
+type pgServeStartup struct {
+	cfg     config.Config
+	ctx     context.Context
+	rtOpts  serveRuntimeOptions
+	srv     *server.Server
+	cleanup func()
+}
 
+var preparePGServe = preparePGServeImpl
+
+func preparePGServeImpl(appCfg config.Config, basePath string) (pgServeStartup, error) {
 	if err := validateServeConfig(appCfg); err != nil {
-		fatal("invalid serve config: %v", err)
+		return pgServeStartup{}, fmt.Errorf("invalid serve config: %w", err)
 	}
 
 	pgCfg, err := appCfg.ResolvePG()
 	if err != nil {
-		fatal("pg serve: %v", err)
+		return pgServeStartup{}, fmt.Errorf("pg serve: %w", err)
 	}
 	if pgCfg.URL == "" {
-		fatal("pg serve: url not configured")
+		return pgServeStartup{}, errors.New("pg serve: url not configured")
 	}
 
 	applyClassifierConfig(appCfg)
@@ -384,9 +501,9 @@ func runPGServe(appCfg config.Config, basePath string) {
 		pgCfg.URL, pgCfg.Schema, pgCfg.AllowInsecure,
 	)
 	if err != nil {
-		fatal("pg serve: %v", err)
+		return pgServeStartup{}, fmt.Errorf("pg serve: %w", err)
 	}
-	defer store.Close()
+	cleanupStore := func() { _ = store.Close() }
 
 	if len(appCfg.CustomModelPricing) > 0 {
 		store.SetCustomPricing(appCfg.CustomModelPricing)
@@ -396,34 +513,47 @@ func runPGServe(appCfg config.Config, basePath string) {
 		context.Background(),
 		os.Interrupt, syscall.SIGTERM,
 	)
-	defer stop()
+	cleanup := func() {
+		stop()
+		cleanupStore()
+	}
 
 	if err := postgres.EnsureSchema(
 		ctx, store.DB(), pgCfg.Schema,
 	); err != nil {
 		if !postgres.IsReadOnlyError(err) {
-			fatal("pg serve: schema migration failed: %v", err)
+			cleanup()
+			return pgServeStartup{}, fmt.Errorf(
+				"pg serve: schema migration failed: %w", err,
+			)
 		}
 	}
 
 	if err := postgres.CheckSchemaCompat(
 		ctx, store.DB(),
 	); err != nil {
-		fatal("pg serve: schema incompatible: %v\n"+
-			"Drop and recreate the PG schema, then run "+
-			"'agentsview pg push --full' to repopulate.", err)
+		cleanup()
+		return pgServeStartup{}, fmt.Errorf(
+			"pg serve: schema incompatible: %w\n"+
+				"Drop and recreate the PG schema, then run "+
+				"'agentsview pg push --full' to repopulate",
+			err,
+		)
 	}
 	if err := postgres.CheckDataVersionCompat(
 		ctx, store.DB(),
 	); err != nil {
-		fatal("pg serve: %v", err)
+		cleanup()
+		return pgServeStartup{}, fmt.Errorf("pg serve: %w", err)
 	}
-	if err := store.DetectInsightGenerationAvailability(
-		ctx,
-	); err != nil {
-		fatal(
-			"pg serve: probing insight generation capability: %v",
-			err,
+	if err := wirePGVectorSearch(ctx, appCfg, store, "pg serve"); err != nil {
+		cleanup()
+		return pgServeStartup{}, fmt.Errorf("pg serve: %w", err)
+	}
+	if err := store.DetectInsightGenerationAvailability(ctx); err != nil {
+		cleanup()
+		return pgServeStartup{}, fmt.Errorf(
+			"pg serve: probing insight generation capability: %w", err,
 		)
 	}
 
@@ -433,7 +563,8 @@ func runPGServe(appCfg config.Config, basePath string) {
 	}
 	appCfg, err = prepareServeRuntimeConfig(appCfg, rtOpts)
 	if err != nil {
-		fatal("pg serve: %v", err)
+		cleanup()
+		return pgServeStartup{}, fmt.Errorf("pg serve: %w", err)
 	}
 
 	opts := []server.Option{
@@ -450,7 +581,29 @@ func runPGServe(appCfg config.Config, basePath string) {
 	if basePath != "" {
 		opts = append(opts, server.WithBasePath(basePath))
 	}
-	srv := server.New(appCfg, store, nil, opts...)
+	return pgServeStartup{
+		cfg: appCfg, ctx: ctx, rtOpts: rtOpts,
+		srv: server.New(appCfg, store, nil, opts...), cleanup: cleanup,
+	}, nil
+}
+
+func runPGServe(appCfg config.Config, basePath string) {
+	setupLogFile(appCfg.DataDir)
+	if appCfg.RequireAuth {
+		if err := appCfg.EnsureAuthToken(); err != nil {
+			fatal("pg serve: generating auth token: %v", err)
+		}
+	}
+
+	startup, err := preparePGServe(appCfg, basePath)
+	if err != nil {
+		fatal("%v", err)
+	}
+	defer startup.cleanup()
+	appCfg = startup.cfg
+	ctx := startup.ctx
+	rtOpts := startup.rtOpts
+	srv := startup.srv
 
 	rt, err := startServerWithOptionalCaddy(
 		ctx,
@@ -468,17 +621,7 @@ func runPGServe(appCfg config.Config, basePath string) {
 	// Write the kit runtime record so CLI commands can discover this
 	// daemon. ReadOnly=true marks it as pg serve (read-only)
 	// so clients can select an appropriate transport.
-	if _, sfErr := WriteDaemonRuntimeWithAuth(
-		rt.Cfg.DataDir, rt.Cfg.Host, rt.Cfg.Port, version, true,
-		rt.Cfg.RequireAuth,
-		rt.Caddy.Pid(),
-	); sfErr != nil {
-		log.Printf(
-			"warning: could not write daemon runtime record: %v"+
-				" (pg serve daemon may not be discoverable by CLI)",
-			sfErr,
-		)
-	} else {
+	if writePGServeRuntimeRecord(rt) {
 		defer RemoveDaemonRuntime(rt.Cfg.DataDir)
 	}
 
@@ -503,6 +646,21 @@ func runPGServe(appCfg config.Config, basePath string) {
 	if err := waitForServerRuntime(ctx, srv, rt); err != nil {
 		fatal("pg serve: %v", err)
 	}
+}
+
+func writePGServeRuntimeRecord(rt *serveRuntime) bool {
+	if _, sfErr := writeDaemonRuntimeWithAuth(
+		rt.Cfg.DataDir, rt.Cfg.Host, rt.Cfg.Port, version, true,
+		rt.Cfg.RequireAuth,
+		rt.Caddy.Pid(),
+	); sfErr != nil {
+		reportRuntimeRecordWrite(
+			os.Stdout, sfErr,
+			"pg serve daemon may not be discoverable by CLI", "",
+		)
+		return false
+	}
+	return true
 }
 
 func resolvePushProjects(

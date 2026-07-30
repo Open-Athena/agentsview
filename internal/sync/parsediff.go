@@ -49,6 +49,7 @@ func NewDiffEngine(database *db.DB, cfg EngineConfig) *Engine {
 func (e *Engine) ParseDiff(ctx context.Context, opts ParseDiffOptions) (*ParseDiffReport, error) {
 	e.syncMu.Lock()
 	defer e.syncMu.Unlock()
+	defer e.retentionBudget().scavengeIfNeeded()
 
 	resolved, err := e.resolveParseDiffAgents(opts.Agents)
 	if err != nil {
@@ -108,7 +109,9 @@ func (e *Engine) ParseDiff(ctx context.Context, opts ParseDiffOptions) (*ParseDi
 		s := &storedSessions[i]
 		storedByID[s.ID] = s
 		if s.FilePath != nil && *s.FilePath != "" {
-			base := parseDiffSourceKey(*s.FilePath)
+			base := parseDiffSourceKey(
+				parser.AgentType(s.Agent), *s.FilePath,
+			)
 			storedByPath[base] = append(storedByPath[base], s)
 		}
 	}
@@ -146,11 +149,13 @@ func (e *Engine) ParseDiff(ctx context.Context, opts ParseDiffOptions) (*ParseDi
 			// Workers emit ctx.Err() for files skipped after
 			// cancellation.
 			cancel()
+			r.releaseRetention()
 			drainResults(results, total-i-1)
 			return nil, ctx.Err()
 		}
 		if r.incremental != nil {
 			cancel()
+			r.releaseRetention()
 			drainResults(results, total-i-1)
 			return nil, fmt.Errorf(
 				"parse-diff: internal error: incremental parse of %s "+
@@ -162,9 +167,11 @@ func (e *Engine) ParseDiff(ctx context.Context, opts ParseDiffOptions) (*ParseDi
 			visited, resolver, &presencePaths,
 		); err != nil {
 			cancel()
+			r.releaseRetention()
 			drainResults(results, total-i-1)
 			return nil, err
 		}
+		r.releaseRetention()
 		if opts.Progress != nil {
 			opts.Progress(i+1, total)
 		}
@@ -366,7 +373,7 @@ func sortAndLimitParseDiffFiles(
 	if limit > 0 && len(files) > limit {
 		limited = true
 		for _, f := range files[limit:] {
-			cutPaths[parseDiffSourceKey(f.Path)] = true
+			cutPaths[parseDiffSourceKey(f.Agent, f.Path)] = true
 		}
 		files = files[:limit]
 	}
@@ -391,8 +398,8 @@ func parseDiffDiscoveryMtime(f parser.DiscoveredFile) (int64, bool) {
 	return f.ProviderSource.DiscoveryMTimeNS, true
 }
 
-func parseDiffSourceKey(path string) string {
-	if isPerSessionDBVirtualSource(path) {
+func parseDiffSourceKey(agent parser.AgentType, path string) string {
+	if isPerSessionDBVirtualSource(agent, path) {
 		return path
 	}
 	return stripVirtualSourceSuffix(path)
@@ -411,7 +418,12 @@ var perSessionDBVirtualSourceBases = []string{
 	parser.WarpDBFilename, parser.ForgeDBFilename, parser.PiebaldDBFilename,
 }
 
-func isPerSessionDBVirtualSource(path string) bool {
+func isPerSessionDBVirtualSource(agent parser.AgentType, path string) bool {
+	if _, _, ok := parser.ParseVirtualSourcePathForBase(
+		path, parser.WindsurfStateDBName,
+	); ok {
+		return agent == parser.AgentWindsurf
+	}
 	for _, base := range perSessionDBVirtualSourceBases {
 		if _, _, ok := parser.ParseVirtualSourcePathForBase(path, base); ok {
 			return true
@@ -440,6 +452,11 @@ func stripVirtualSourceSuffix(path string) string {
 		return dbPath
 	}
 	if dbPath, _, ok := parser.ParseVirtualSourcePathForBase(path, "threads.db"); ok {
+		return dbPath
+	}
+	if dbPath, _, ok := parser.ParseVirtualSourcePathForBase(
+		path, parser.WindsurfStateDBName,
+	); ok {
 		return dbPath
 	}
 	for _, base := range perSessionDBVirtualSourceBases {
@@ -612,7 +629,7 @@ func (e *Engine) parseDiffCollectFile(
 	resolver worktreeProjectResolver,
 	presencePaths *[]string,
 ) error {
-	base := parseDiffSourceKey(job.path)
+	base := parseDiffSourceKey(fileAgents[job.path], job.path)
 
 	if job.err != nil {
 		storedHere := storedByPath[base]
@@ -660,9 +677,9 @@ func (e *Engine) parseDiffCollectFile(
 			usageEvents: pr.UsageEvents,
 			needsRetry:  job.needsRetryForSession(pr.Session.ID),
 		}
-		prepared, msgs, ok := e.prepareSessionWrite(pw, resolver)
+		prepared, msgs, verdict := e.prepareSessionWrite(pw, resolver)
 		id := prepared.ID
-		if !ok {
+		if verdict != sessionWriteOK {
 			// prepareSessionWrite returns a zero session on veto;
 			// reconstruct the final ID the way applyRemoteRewrites
 			// would have.
@@ -674,7 +691,7 @@ func (e *Engine) parseDiffCollectFile(
 		}
 
 		var fields []FieldDiff
-		compare := ok && !pw.needsRetry &&
+		compare := verdict == sessionWriteOK && !pw.needsRetry &&
 			stored != nil && stored.DeletedAt == nil
 		if compare {
 			events, _ := toDBUsageEvents(id, pw.usageEvents)
@@ -770,7 +787,7 @@ func (e *Engine) parseDiffCollectFile(
 
 		class, reason := classifyParseDiffSession(
 			pw.needsRetry,
-			ok,
+			verdict == sessionWriteOK,
 			stored != nil,
 			stored != nil && stored.DeletedAt != nil,
 			stored != nil && stored.DataVersion < db.CurrentDataVersion(),
@@ -891,6 +908,26 @@ func (e *Engine) parseDiffCollectFile(
 		report.Totals.ExcludedByParser++
 	}
 
+	// Virtual members gone from a still-existing shared container are
+	// tombstone-bound on a real sync; mark them visited so the presence
+	// sweep does not misreport them as parser drift.
+	for _, member := range job.sourceMissingMembers {
+		stored := storedByID[member.sessionID]
+		if stored == nil {
+			continue
+		}
+		visited[stored.ID] = true
+		report.Sessions = append(report.Sessions, SessionDiff{
+			SessionID:         stored.ID,
+			Agent:             stored.Agent,
+			FilePath:          member.filePath,
+			Class:             DiffExcluded,
+			Reason:            "member source missing (would tombstone)",
+			StoredDataVersion: stored.DataVersion,
+		})
+		report.Totals.ExcludedByParser++
+	}
+
 	// Legacy source-wide needsRetry output and incomplete provider
 	// result sets are transient and low fidelity; missing sessions
 	// there are expected, not parser drift. Provider per-session
@@ -999,7 +1036,9 @@ func (e *Engine) parseDiffSweepStored(
 		case s.FilePath == nil || *s.FilePath == "":
 			reason = "source missing"
 		default:
-			sourceKey := parseDiffSourceKey(*s.FilePath)
+			sourceKey := parseDiffSourceKey(
+				parser.AgentType(s.Agent), *s.FilePath,
+			)
 			sourcePath := stripVirtualSourceSuffix(*s.FilePath)
 			switch {
 			case cutPaths[sourceKey]:

@@ -1,5 +1,5 @@
 // ABOUTME: Builds and serves the agentsview MCP server (stdio or
-// ABOUTME: StreamableHTTP) over the six read-only retrieval tools.
+// ABOUTME: StreamableHTTP) over the supported read-only retrieval tools.
 package mcp
 
 import (
@@ -22,6 +22,7 @@ import (
 // to it in tests.
 const (
 	ToolSearchSessions     = "search_sessions"
+	ToolQueryRecall        = "query_recall"
 	ToolListSessions       = "list_sessions"
 	ToolGetSessionOverview = "get_session_overview"
 	ToolGetMessages        = "get_messages"
@@ -44,8 +45,8 @@ type ServeOptions struct {
 	Token string
 }
 
-// newServer builds an MCP server with all six read-only tools
-// registered. Shared by the stdio and StreamableHTTP transports.
+// newServer builds an MCP server with the tools supported by its backing
+// service. Shared by the stdio and StreamableHTTP transports.
 func newServer(opts ServeOptions) *mcp.Server {
 	version := opts.Version
 	if version == "" {
@@ -72,6 +73,17 @@ func newServer(opts ServeOptions) *mcp.Server {
 		Annotations: readOnly,
 	}, t.searchSessions)
 
+	if service.SupportsRecallQueries(opts.Service) {
+		mcp.AddTool(s, &mcp.Tool{
+			Name: ToolQueryRecall,
+			Description: "Search distilled knowledge extracted from prior sessions. " +
+				"Use lexical mode for exact terms, vector mode for semantic similarity, " +
+				"or hybrid mode to fuse both rankings. Returns recall entries with their " +
+				"source-session evidence and retrieval scores.",
+			Annotations: readOnly,
+		}, t.queryRecall)
+	}
+
 	mcp.AddTool(s, &mcp.Tool{
 		Name: ToolListSessions,
 		Description: "List recorded agent sessions with filters (project, agent, machine, date range). " +
@@ -89,21 +101,25 @@ func newServer(opts ServeOptions) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: ToolGetMessages,
-		Description: "Read a slice of one session's transcript, paginated by message ordinal. Defaults " +
-			"return only user and assistant messages, each truncated to 2000 characters; truncated " +
-			"messages are flagged so you can re-fetch with a higher max_chars_per_message. Each page " +
-			"reports how many scanned messages the role/system filter dropped as filtered, so across a " +
-			"full pagination sweep, returned plus filtered messages add up to the session's " +
-			"message_count (which counts all stored messages, system included).",
+		Description: "Read a slice of one session's transcript, either by linear pagination (from/direction/" +
+			"limit) or a symmetric window centered on an ordinal (around, with before/after sizing each " +
+			"side, default 5; mutually exclusive with from/direction). Defaults return only user and " +
+			"assistant messages, each truncated to 2000 characters; truncated messages are flagged so you " +
+			"can re-fetch with a higher max_chars_per_message. Each page reports how many scanned messages " +
+			"the role/system filter dropped as filtered, so across a full pagination sweep, returned plus " +
+			"filtered messages add up to the session's message_count (which counts all stored messages, " +
+			"system included).",
 		Annotations: readOnly,
 	}, t.getMessages)
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: ToolSearchContent,
-		Description: "Exact substring or regex search over raw session text, including tool inputs and results. " +
-			"Slower but more precise than search_sessions; use it for error messages, identifiers, or " +
-			"code fragments. Matches from the last 10 minutes (including the current conversation) are " +
-			"excluded unless include_active is set.",
+		Description: "Substring, regex, or semantic/hybrid embedding search over raw session text, including " +
+			"tool inputs and results. Slower but more precise than search_sessions; use it for error " +
+			"messages, identifiers, and code fragments (substring/regex), or a natural-language query when " +
+			"the exact wording is unknown (semantic/hybrid). Set context to include N messages of " +
+			"surrounding conversation with each match. Matches from the last 10 minutes (including the " +
+			"current conversation) are excluded unless include_active is set.",
 		Annotations: readOnly,
 	}, t.searchContent)
 

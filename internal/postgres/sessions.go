@@ -30,12 +30,23 @@ type Store struct {
 	pricingLoadMu sync.Mutex
 	pricingLoad   *pricingLoad
 	customPricing map[string]config.CustomModelRate
+
+	// vectorMu guards the semantic-search seam. vectorSearcher is the PG
+	// vector searcher wired at pg serve startup when a generation matches
+	// the configured embeddings fingerprint; semanticUnavailableReason is a
+	// human explanation surfaced (wrapped in db.ErrSemanticUnavailable) when
+	// no searcher could be wired (extension missing, no matching generation,
+	// stale build).
+	vectorMu                  sync.RWMutex
+	vectorSearcher            db.VectorSearcher
+	semanticUnavailableReason string
 }
 
 // pgSessionCols is the column list for standard PG session
-// queries. PG has no file_path, file_size, file_mtime,
-// file_hash, or local_modified_at columns.
+// queries. PG has no local file metadata columns; transcript_revision
+// carries the backend-neutral content revision pushed from SQLite.
 const pgSessionCols = `id, project, machine, agent,
+	agent_label, entrypoint,
 	first_message, COALESCE(display_name, session_name) AS display_name, created_at, started_at,
 	ended_at, message_count, user_message_count,
 	parent_session_id, relationship_type,
@@ -60,7 +71,7 @@ const pgSessionCols = `id, project, machine, agent,
 	cwd, git_branch, source_session_id, source_version,
 	transcript_fidelity, parser_malformed_lines, is_truncated,
 	secret_leak_count, secrets_rules_version,
-	deleted_at, termination_status`
+	deleted_at, deletion_cause, termination_status, transcript_revision`
 
 // paramBuilder generates numbered PostgreSQL placeholders.
 type paramBuilder struct {
@@ -193,6 +204,7 @@ func scanPGSession(
 	var startedAt, endedAt, deletedAt *time.Time
 	err := rs.Scan(
 		&s.ID, &s.Project, &s.Machine, &s.Agent,
+		&s.AgentLabel, &s.Entrypoint,
 		&s.FirstMessage, &s.DisplayName,
 		&createdAt, &startedAt, &endedAt,
 		&s.MessageCount, &s.UserMessageCount,
@@ -219,7 +231,7 @@ func scanPGSession(
 		&s.SourceSessionID, &s.SourceVersion,
 		&s.TranscriptFidelity, &s.ParserMalformedLines, &s.IsTruncated,
 		&s.SecretLeakCount, &s.SecretsRulesVersion,
-		&deletedAt, &s.TerminationStatus,
+		&deletedAt, &s.DeletionCause, &s.TerminationStatus, &s.TranscriptRevision,
 	)
 	if err != nil {
 		return s, err
@@ -506,6 +518,8 @@ func (s *Store) GetSidebarSessionIndex(
 			project,
 			machine,
 			agent,
+			agent_label,
+			entrypoint,
 			COALESCE(display_name, session_name) AS display_name,
 			started_at,
 			ended_at,
@@ -513,6 +527,7 @@ func (s *Store) GetSidebarSessionIndex(
 			termination_status,
 			message_count,
 			user_message_count,
+			transcript_revision,
 			is_automated,
 			position('<teammate-message' in COALESCE(first_message, '')) > 0
 		FROM sessions
@@ -553,6 +568,14 @@ func (s *Store) getSidebarSessionIndexPage(
 	rootFilter.Starred = false
 	rootWhere, rootArgs := buildPGSessionBaseFilter(rootFilter)
 	canonicalRootWhere := db.BuildCanonicalRootWhere(db.PostgresQueryDialect(), "sessions", f.IncludeOrphans)
+	childAutomationPred := pgAutomatedScopePredicate(
+		normalizePGAutomatedScope(f.AutomatedScope, f.ExcludeAutomated),
+		"s.is_automated",
+	)
+	childAutomationWhere := ""
+	if childAutomationPred != "" {
+		childAutomationWhere = " AND " + childAutomationPred
+	}
 
 	var total int
 	var cur db.SessionCursor
@@ -581,6 +604,7 @@ func (s *Store) getSidebarSessionIndexPage(
 					JOIN tree t ON s.parent_session_id = t.id
 					WHERE s.message_count > 0
 					  AND s.deleted_at IS NULL
+					  ` + childAutomationWhere + `
 				),
 				eligible_roots(id) AS (
 					SELECT DISTINCT t.root_id
@@ -630,6 +654,7 @@ func (s *Store) getSidebarSessionIndexPage(
 			JOIN tree t ON s.parent_session_id = t.id
 			WHERE s.message_count > 0
 			  AND s.deleted_at IS NULL
+			  ` + childAutomationWhere + `
 		)
 		` + pgSidebarStarredRootCTE(f.Starred) + `,
 		root_activity(id, activity) AS (
@@ -718,6 +743,7 @@ func (s *Store) getSidebarSessionIndexPage(
 			JOIN tree t ON s.parent_session_id = t.id
 			WHERE s.message_count > 0
 			  AND s.deleted_at IS NULL
+			  ` + childAutomationWhere + `
 		),
 		ranked_tree(id, ord) AS (
 			SELECT id, MIN(ord) AS ord
@@ -731,6 +757,8 @@ func (s *Store) getSidebarSessionIndexPage(
 			s.project,
 			s.machine,
 			s.agent,
+			s.agent_label,
+			s.entrypoint,
 			COALESCE(s.display_name, s.session_name) AS display_name,
 			s.started_at,
 			s.ended_at,
@@ -738,6 +766,7 @@ func (s *Store) getSidebarSessionIndexPage(
 			s.termination_status,
 			s.message_count,
 			s.user_message_count,
+			s.transcript_revision,
 			s.is_automated,
 			position('<teammate-message' in COALESCE(s.first_message, '')) > 0
 		FROM sessions s
@@ -775,6 +804,8 @@ func scanPGSidebarSessionIndexRows(
 			&row.Project,
 			&row.Machine,
 			&row.Agent,
+			&row.AgentLabel,
+			&row.Entrypoint,
 			&row.DisplayName,
 			&startedAt,
 			&endedAt,
@@ -782,6 +813,7 @@ func scanPGSidebarSessionIndexRows(
 			&row.TerminationStatus,
 			&row.MessageCount,
 			&row.UserMessageCount,
+			&row.TranscriptRevision,
 			&row.IsAutomated,
 			&row.IsTeammate,
 		); err != nil {
@@ -1020,6 +1052,28 @@ func (s *Store) GetProjects(
 		projects = append(projects, pi)
 	}
 	return projects, rows.Err()
+}
+
+func (s *Store) GetActiveProjectLabels(ctx context.Context) ([]string, error) {
+	rows, err := s.pg.QueryContext(ctx,
+		`SELECT DISTINCT project
+		 FROM sessions
+		 WHERE deleted_at IS NULL
+		 ORDER BY project`)
+	if err != nil {
+		return nil, fmt.Errorf("querying active project labels: %w", err)
+	}
+	defer rows.Close()
+
+	var labels []string
+	for rows.Next() {
+		var label string
+		if err := rows.Scan(&label); err != nil {
+			return nil, fmt.Errorf("scanning active project label: %w", err)
+		}
+		labels = append(labels, label)
+	}
+	return labels, rows.Err()
 }
 
 // GetAgents returns distinct agent names with session counts.

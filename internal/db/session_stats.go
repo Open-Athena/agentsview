@@ -13,21 +13,25 @@ import (
 
 	"go.kenn.io/agentsview/internal/db/git"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/timeutil"
 )
 
 // StatsFilter mirrors the service-layer StatsFilter but lives in db
 // because db functions take typed filters without cross-package deps.
 type StatsFilter struct {
-	Since                 string
-	Until                 string
-	Agent                 string
-	IncludeProjects       []string
-	ExcludeProjects       []string
-	Timezone              string
-	IncludeGitOutcomes    bool
-	IncludeGitHubOutcomes bool
-	GHToken               string
+	Since                  string
+	Until                  string
+	Agent                  string
+	ApplyDefaultVisibility bool
+	IncludeOneShot         bool
+	IncludeAutomated       bool
+	IncludeProjects        []string
+	ExcludeProjects        []string
+	Timezone               string
+	IncludeGitOutcomes     bool
+	IncludeGitHubOutcomes  bool
+	GHToken                string
 }
 
 // StatsInputError marks invalid user-supplied stats filters so HTTP
@@ -68,7 +72,7 @@ func (db *DB) GetSessionStats(
 	}
 
 	stats := &SessionStats{
-		SchemaVersion: 1,
+		SchemaVersion: 2,
 		Window: StatsWindow{
 			Since: from.UTC().Format(time.RFC3339),
 			Until: to.UTC().Format(time.RFC3339),
@@ -435,7 +439,7 @@ func (db *DB) loadSessionsInWindow(
 	// the two paths can't drift.
 	preds := []string{
 		"message_count > 0",
-		RelationshipExclusionSQL(includeSubagents, ""),
+		RelationshipExclusionSQL(includeSubagents, false, ""),
 		"deleted_at IS NULL",
 		"COALESCE(NULLIF(started_at, ''), created_at) >= ?",
 		"COALESCE(NULLIF(started_at, ''), created_at) < ?",
@@ -443,6 +447,19 @@ func (db *DB) loadSessionsInWindow(
 	args := []any{
 		from.UTC().Format(time.RFC3339Nano),
 		to.UTC().Format(time.RFC3339Nano),
+	}
+	if f.ApplyDefaultVisibility {
+		visibilityBuilder := NewQueryBuilder(SQLiteQueryDialect(), len(args))
+		preds, _ = appendSessionVisibilityPredicates(
+			preds,
+			SessionFilter{
+				ExcludeOneShot:   !f.IncludeOneShot,
+				ExcludeAutomated: !f.IncludeAutomated,
+			},
+			visibilityBuilder,
+			func(col string) string { return "s." + col },
+		)
+		args = append(args, visibilityBuilder.Args()...)
 	}
 
 	if f.Agent != "" {
@@ -938,8 +955,8 @@ type sessionCacheTotals struct {
 	inputTok     int64
 	cacheCreateT int64
 	cacheReadT   int64
-	dollarsSpent float64
-	dollarsNoCac float64 // cost if the workload had never cached
+	dollarsSpent money.Money
+	dollarsNoCac money.Money // cost if the workload had never cached
 }
 
 // computeCacheEconomics populates stats.CacheEconomics for Claude
@@ -996,8 +1013,8 @@ func (db *DB) computeCacheEconomics(
 	var (
 		cacheReadSum   int64
 		denominatorSum int64
-		dollarsSpent   float64
-		dollarsNoCache float64
+		dollarsSpent   money.Money
+		dollarsNoCache money.Money
 	)
 	// Iterate in session-id order so floating-point sums stay
 	// deterministic across runs; Go's map iteration order is
@@ -1014,8 +1031,14 @@ func (db *DB) computeCacheEconomics(
 		}
 		denom := totals.inputTok + totals.cacheReadT +
 			totals.cacheCreateT
-		dollarsSpent += totals.dollarsSpent
-		dollarsNoCache += totals.dollarsNoCac
+		dollarsSpent, err = money.Add(dollarsSpent, totals.dollarsSpent)
+		if err != nil {
+			return fmt.Errorf("summing cache spending: %w", err)
+		}
+		dollarsNoCache, err = money.Add(dollarsNoCache, totals.dollarsNoCac)
+		if err != nil {
+			return fmt.Errorf("summing uncached spending: %w", err)
+		}
 		if denom <= 0 {
 			continue
 		}
@@ -1036,7 +1059,10 @@ func (db *DB) computeCacheEconomics(
 	// frontend/src/lib/utils/usageSavings.ts) surface that "costlier
 	// than uncached" state directly, so do not clamp it away here —
 	// hiding it would mask real cache-efficiency regressions.
-	ce.DollarsSavedVsUncached = dollarsNoCache - dollarsSpent
+	ce.DollarsSavedVsUncached, err = money.Sub(dollarsNoCache, dollarsSpent)
+	if err != nil {
+		return fmt.Errorf("computing cache savings: %w", err)
+	}
 
 	stats.CacheEconomics = ce
 	return nil
@@ -1090,9 +1116,11 @@ func (db *DB) accumulateCacheTotals(
 		); err != nil {
 			return fmt.Errorf("scanning cache tokens: %w", err)
 		}
-		addMessageToCacheTotals(
+		if err := addMessageToCacheTotals(
 			perSession, sessionID, model, tokenJSON, pricing,
-		)
+		); err != nil {
+			return err
+		}
 	}
 	return sqlRows.Err()
 }
@@ -1104,7 +1132,7 @@ func addMessageToCacheTotals(
 	perSession map[string]*sessionCacheTotals,
 	sessionID, model, tokenJSON string,
 	pricing *export.PricingResolver,
-) {
+) error {
 	inputTok, outputTok, cacheCrTok, cacheRdTok :=
 		clampedUsageTokenCounters(tokenJSON)
 
@@ -1118,18 +1146,31 @@ func addMessageToCacheTotals(
 	totals.cacheReadT += int64(cacheRdTok)
 
 	rates := pricing.Lookup(model).Rates
-	totals.dollarsSpent += rates.CostForTokens(
+	spent, err := rates.CostForTokens(
 		inputTok, outputTok, 0, cacheCrTok, cacheRdTok)
+	if err != nil {
+		return fmt.Errorf("pricing cache usage for model %q: %w", model, err)
+	}
+	totals.dollarsSpent, err = money.Add(totals.dollarsSpent, spent)
+	if err != nil {
+		return fmt.Errorf("summing cache usage for model %q: %w", model, err)
+	}
 	// Uncached counterfactual: cache_creation tokens would still
 	// have been sent as ordinary input (so they are billed at the
 	// input rate, not dropped), and cache_read tokens are re-billed
 	// at the input rate too. This matches the rest of the codebase
 	// (see internal/db/usage.go and the savings calculation in
 	// frontend/src/lib/utils/usageSavings.ts).
-	totals.dollarsNoCac += (float64(inputTok)*rates.InputPerMTok +
-		float64(outputTok)*rates.OutputPerMTok +
-		float64(cacheCrTok)*rates.InputPerMTok +
-		float64(cacheRdTok)*rates.InputPerMTok) / 1_000_000
+	uncached, err := rates.CostForTokens(
+		inputTok+cacheCrTok+cacheRdTok, outputTok, 0, 0, 0)
+	if err != nil {
+		return fmt.Errorf("pricing uncached usage for model %q: %w", model, err)
+	}
+	totals.dollarsNoCac, err = money.Add(totals.dollarsNoCac, uncached)
+	if err != nil {
+		return fmt.Errorf("summing uncached usage for model %q: %w", model, err)
+	}
+	return nil
 }
 
 // computeTemporal fills stats.Temporal.HourlyUTC and ReporterTimezone.
@@ -1484,10 +1525,15 @@ func (db *DB) computeOutcomeStats(
 	since := from.UTC().Format(time.RFC3339)
 	until := to.UTC().Format(time.RFC3339)
 	var cache *git.Cache
-	if db.ReadOnly() {
-		cache = git.NewReadOnlyCache(db.rawReader())
+	// Snapshot the writer pool once: CloseWriter can nil it concurrently for a
+	// worker maintenance pass, so a check-then-load would hand git.NewCache a nil
+	// *sql.DB and panic on first use. When the snapshot is nil (writer closed) or
+	// the store is read-only, fall back to the read-only cache: analytics keep
+	// computing from the reader without persisting git stats.
+	if writer := db.rawWriter(); !db.ReadOnly() && writer != nil {
+		cache = git.NewCache(writer)
 	} else {
-		cache = git.NewCache(db.rawWriter())
+		cache = git.NewReadOnlyCache(db.rawReader())
 	}
 	out := &StatsOutcomeStats{}
 	contributed := false

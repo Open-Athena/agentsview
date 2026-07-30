@@ -12,6 +12,8 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
   { name: "devin", color: "var(--accent-red)", label: "Devin" },
   { name: "gemini", color: "var(--accent-rose)" },
   { name: "opencode", color: "var(--accent-purple)" },
+  { name: "kilo", color: "var(--accent-purple)", label: "Kilo" },
+  { name: "kilo-legacy", color: "var(--accent-purple)", label: "Kilo (legacy)" },
   { name: "openhands", color: "var(--accent-teal)", label: "OpenHands" },
   { name: "cursor", color: "var(--accent-black)" },
   { name: "amp", color: "var(--accent-coral)", label: "Amp" },
@@ -53,6 +55,7 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
   { name: "kiro-ide", color: "var(--accent-lime)", label: "Kiro IDE" },
   { name: "cortex", color: "var(--accent-cyan)", label: "Cortex Code" },
   { name: "workbuddy", color: "var(--accent-violet)", label: "WorkBuddy" },
+  { name: "qoder", color: "var(--accent-cyan)", label: "Qoder" },
   { name: "piebald", color: "var(--accent-orange)", label: "Piebald" },
   {
     name: "antigravity",
@@ -65,6 +68,13 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
     label: "Antigravity CLI",
   },
   { name: "vibe", color: "var(--accent-orange)", label: "Mistral Vibe" },
+  {
+    name: "posit-assistant",
+    color: "var(--accent-indigo)",
+    label: "Posit Assistant",
+  },
+  { name: "roocode", color: "var(--accent-rose)", label: "RooCode" },
+  { name: "poolside", color: "var(--accent-cyan)", label: "Poolside" },
 ];
 
 const agentColorMap = new Map(
@@ -103,8 +113,20 @@ export function agentForeground(agent: string): string {
   return accentForeground(agentColor(agent));
 }
 
-export function agentLabel(agent: string): string {
+export function agentLabel(agent: string, override?: string | null): string {
+  if (override?.trim()) return override;
   const meta = KNOWN_AGENTS.find((a) => a.name === agent);
   if (meta?.label) return meta.label;
   return agent.charAt(0).toUpperCase() + agent.slice(1);
+}
+
+// Ordinary Claude CLI transcripts record entrypoint "cli" on nearly every
+// session, so badging it would tag the whole sidebar with noise. Only
+// non-default entrypoints (sdk-cli, sdk-py, ...) are worth surfacing.
+const DEFAULT_ENTRYPOINT = "cli";
+
+export function entrypointBadge(entrypoint?: string | null): string | null {
+  const value = entrypoint?.trim();
+  if (!value || value === DEFAULT_ENTRYPOINT) return null;
+  return value;
 }

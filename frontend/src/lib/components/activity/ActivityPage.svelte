@@ -16,7 +16,7 @@
     type PanelDateState,
   } from "../../stores/yokedDates.svelte.js";
   import ProjectTypeahead from "../layout/ProjectTypeahead.svelte";
-  import { Typeahead, type TypeaheadOption } from "@kenn-io/kit-ui";
+  import { Card, Typeahead, type TypeaheadOption } from "@kenn-io/kit-ui";
   import RefreshControl from "../shared/RefreshControl.svelte";
   import {
     addDays,
@@ -71,7 +71,23 @@
   });
 
   const earliestSession = $derived(sync.stats?.earliest_session ?? null);
-  const today = $derived(localDateStr(new Date()));
+  let today = $state(localDateStr(new Date()));
+  let todayRolloverTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function scheduleTodayRollover(): void {
+    const now = new Date();
+    today = localDateStr(now);
+    const nextMidnight = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate() + 1,
+    );
+    todayRolloverTimer = setTimeout(() => {
+      today = localDateStr(new Date());
+      scheduleTodayRollover();
+    }, nextMidnight.getTime() - now.getTime());
+  }
+
   const agentOptions = $derived.by((): TypeaheadOption[] => [
     {
       name: "",
@@ -259,6 +275,7 @@
   }
 
   onMount(() => {
+    scheduleTodayRollover();
     // Register as a consumer so a completed sync refreshes the filter
     // dropdowns while this page is on screen; detach on unmount.
     const detach = activity.attach();
@@ -278,6 +295,10 @@
     // manual button.
     const unsubEvents = events.subscribe(() => activity.markNewData());
     return () => {
+      activity.cancelInFlightReads();
+      if (todayRolloverTimer !== undefined) {
+        clearTimeout(todayRolloverTimer);
+      }
       detach();
       unsubEvents();
     };
@@ -363,24 +384,24 @@
          error states only show before the first report exists. -->
     {#if activity.report}
       <SummaryCards report={activity.report} />
-      <div class="chart-panel">
+      <Card level="default" padding="none" class="chart-panel">
         <ConcurrencyTimeline
           report={activity.report}
           selectedBucket={slotFilter?.idx ?? null}
           onSelectBucket={(sel) => (slotFilter = sel)}
         />
-      </div>
-      <div class="chart-panel">
+      </Card>
+      <Card level="default" padding="none" class="chart-panel">
         <SessionsTable
           report={activity.report}
           filterIds={slotFilter?.sessionIds ?? null}
           filterLabel={slotFilter?.label ?? ""}
           onClearFilter={() => (slotFilter = null)}
         />
-      </div>
-      <div class="chart-panel">
+      </Card>
+      <Card level="default" padding="none" class="chart-panel">
         <Breakdowns report={activity.report} />
-      </div>
+      </Card>
     {:else if activity.loading}
       <div class="status">{m.activity_loading_report()}</div>
     {:else if activity.error}
@@ -401,13 +422,13 @@
          single-day fallback (a deep link to a week/month/custom range would
          otherwise fetch an insight for the wrong span while the report loads). -->
     {#if activity.report}
-      <div class="chart-panel">
+      <Card level="default" padding="none" class="chart-panel">
         <ActivityInsight
           dateFrom={insightFrom}
           dateTo={insightTo}
           timezone={activity.timezone}
         />
-      </div>
+      </Card>
     {/if}
   </div>
 </div>
@@ -450,10 +471,7 @@
     gap: 16px;
   }
 
-  .chart-panel {
-    background: var(--bg-surface);
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-md);
+  .activity-content :global(.chart-panel) {
     padding: 12px;
     min-width: 0;
   }

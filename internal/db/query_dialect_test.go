@@ -28,6 +28,7 @@ func TestBuildSessionFilterSQLRendersEquivalentDialectFilters(t *testing.T) {
 		Date:                 "2026-06-08",
 		DateFrom:             "2026-06-01",
 		DateTo:               "2026-06-30",
+		Timezone:             "America/New_York",
 		ActiveSince:          "2026-06-08T12:00:00Z",
 		MinMessages:          3,
 		MaxMessages:          100,
@@ -59,10 +60,11 @@ func TestBuildSessionFilterSQLRendersEquivalentDialectFilters(t *testing.T) {
 				"project != ?",
 				"machine IN (?,?)",
 				"agent IN (?,?)",
-				"date(COALESCE(NULLIF(started_at, ''), created_at)) = ?",
-				"date(COALESCE(NULLIF(started_at, ''), created_at)) >= ?",
-				"date(COALESCE(NULLIF(started_at, ''), created_at)) <= ?",
-				"COALESCE(NULLIF(ended_at, ''), NULLIF(started_at, ''), created_at) >= ?",
+				"julianday(COALESCE(NULLIF(ended_at, ''), (SELECT m.timestamp FROM messages m WHERE m.session_id = sessions.id AND m.timestamp != '' ORDER BY julianday(m.timestamp) DESC, m.timestamp DESC LIMIT 1), NULLIF(started_at, ''), created_at)) >= julianday(?)",
+				"julianday(COALESCE(NULLIF(started_at, ''), created_at)) < julianday(?)",
+				"julianday(COALESCE(NULLIF(ended_at, ''), (SELECT m.timestamp FROM messages m WHERE m.session_id = sessions.id AND m.timestamp != '' ORDER BY julianday(m.timestamp) DESC, m.timestamp DESC LIMIT 1), NULLIF(started_at, ''), created_at)) >= julianday(?)",
+				"julianday(COALESCE(NULLIF(started_at, ''), created_at)) < julianday(?)",
+				"julianday(COALESCE(NULLIF(ended_at, ''), (SELECT m.timestamp FROM messages m WHERE m.session_id = sessions.id AND m.timestamp != '' ORDER BY julianday(m.timestamp) DESC, m.timestamp DESC LIMIT 1), NULLIF(started_at, ''), created_at)) >= julianday(?)",
 				"message_count >= ?",
 				"message_count <= ?",
 				"user_message_count >= ?",
@@ -85,19 +87,20 @@ func TestBuildSessionFilterSQLRendersEquivalentDialectFilters(t *testing.T) {
 				"project != $2",
 				"machine IN ($3,$4)",
 				"agent IN ($5,$6)",
-				"DATE(COALESCE(started_at, created_at) AT TIME ZONE 'UTC') = $7::date",
-				"DATE(COALESCE(started_at, created_at) AT TIME ZONE 'UTC') >= $8::date",
-				"DATE(COALESCE(started_at, created_at) AT TIME ZONE 'UTC') <= $9::date",
-				"COALESCE(ended_at, started_at, created_at) >= $10::timestamptz",
-				"message_count >= $11",
-				"message_count <= $12",
-				"user_message_count >= $13",
+				"COALESCE(ended_at, (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = sessions.id AND m.timestamp IS NOT NULL), started_at, created_at) >= $7::timestamptz",
+				"COALESCE(started_at, created_at) < $8::timestamptz",
+				"COALESCE(ended_at, (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = sessions.id AND m.timestamp IS NOT NULL), started_at, created_at) >= $9::timestamptz",
+				"COALESCE(started_at, created_at) < $10::timestamptz",
+				"COALESCE(ended_at, (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = sessions.id AND m.timestamp IS NOT NULL), started_at, created_at) >= $11::timestamptz",
+				"message_count >= $12",
+				"message_count <= $13",
+				"user_message_count >= $14",
 				"(termination_status = 'clean' OR termination_status = 'awaiting_user')",
 				"(user_message_count > 1 OR is_automated = TRUE)",
-				"outcome IN ($14,$15)",
-				"health_grade IN ($16,$17)",
-				"tool_failure_signal_count >= $18",
-				"secret_leak_count > 0 AND secrets_rules_version IN ($19,$20)",
+				"outcome IN ($15,$16)",
+				"health_grade IN ($17,$18)",
+				"tool_failure_signal_count >= $19",
+				"secret_leak_count > 0 AND secrets_rules_version IN ($20,$21)",
 			},
 		},
 		{
@@ -111,10 +114,11 @@ func TestBuildSessionFilterSQLRendersEquivalentDialectFilters(t *testing.T) {
 				"project != ?",
 				"machine IN (?,?)",
 				"agent IN (?,?)",
-				"CAST(COALESCE(started_at, created_at) AS DATE) = CAST(? AS DATE)",
-				"CAST(COALESCE(started_at, created_at) AS DATE) >= CAST(? AS DATE)",
-				"CAST(COALESCE(started_at, created_at) AS DATE) <= CAST(? AS DATE)",
-				"COALESCE(ended_at, started_at, created_at) >= CAST(? AS TIMESTAMP)",
+				"CAST(COALESCE(ended_at, (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = sessions.id AND m.timestamp IS NOT NULL), started_at, created_at) AS TIMESTAMP) >= CAST(? AS TIMESTAMP)",
+				"CAST(COALESCE(started_at, created_at) AS TIMESTAMP) < CAST(? AS TIMESTAMP)",
+				"CAST(COALESCE(ended_at, (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = sessions.id AND m.timestamp IS NOT NULL), started_at, created_at) AS TIMESTAMP) >= CAST(? AS TIMESTAMP)",
+				"CAST(COALESCE(started_at, created_at) AS TIMESTAMP) < CAST(? AS TIMESTAMP)",
+				"CAST(COALESCE(ended_at, (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = sessions.id AND m.timestamp IS NOT NULL), started_at, created_at) AS TIMESTAMP) >= CAST(? AS TIMESTAMP)",
 				"message_count >= ?",
 				"message_count <= ?",
 				"user_message_count >= ?",
@@ -129,7 +133,8 @@ func TestBuildSessionFilterSQLRendersEquivalentDialectFilters(t *testing.T) {
 	}
 	wantArgs := []any{
 		"proj-a", "unknown", "laptop", "server", "claude", "codex",
-		"2026-06-08", "2026-06-01", "2026-06-30",
+		"2026-06-08T04:00:00Z", "2026-06-09T04:00:00Z",
+		"2026-06-01T04:00:00Z", "2026-07-01T04:00:00Z",
 		"2026-06-08T12:00:00Z", 3, 100, 2,
 		"success", "failed", "A", "C", 2, "v1", "v2",
 	}
@@ -149,6 +154,32 @@ func TestBuildSessionFilterSQLRendersEquivalentDialectFilters(t *testing.T) {
 			} {
 				assert.NotContains(t, normalized, "'"+value+"'")
 			}
+		})
+	}
+}
+
+func TestBuildSessionFilterSQLResolvesDSTDateBounds(t *testing.T) {
+	filter := SessionFilter{
+		DateFrom: "2024-03-10",
+		DateTo:   "2024-03-10",
+		Timezone: "America/New_York",
+	}
+
+	tests := []struct {
+		name    string
+		dialect QueryDialect
+	}{
+		{name: "sqlite", dialect: SQLiteQueryDialect()},
+		{name: "postgres", dialect: PostgresQueryDialect()},
+		{name: "duckdb", dialect: DuckDBQueryDialect()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, args := BuildSessionFilterSQL(filter, tt.dialect)
+			assert.Equal(t, []any{
+				"2024-03-10T05:00:00Z",
+				"2024-03-11T04:00:00Z",
+			}, args)
 		})
 	}
 }

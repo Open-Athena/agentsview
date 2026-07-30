@@ -5,7 +5,7 @@ import {
   expect,
   it,
   vi,
-} from "vitest";
+} from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 // @ts-ignore
 import TopSkills from "./TopSkills.svelte";
@@ -69,7 +69,7 @@ describe("TopSkills", () => {
     return mount(TopSkills, { target: document.body });
   }
 
-  it("renders skill usage, breakdowns, and trend", async () => {
+  it("renders skill usage and breakdowns", async () => {
     const component = mountWithData();
     await tick();
 
@@ -90,9 +90,7 @@ describe("TopSkills", () => {
     expect(document.body.textContent).toContain("2");
     expect(document.body.textContent).toContain("29%");
     expect(document.body.textContent).toContain("Projects: agentsview: 4, notes: 3");
-    expect(document.body.textContent).toContain("Weekly Trend");
-
-    unmount(component);
+    await unmount(component);
   });
 
   it("does not expose incomplete click-to-search behavior", async () => {
@@ -107,7 +105,7 @@ describe("TopSkills", () => {
 
     expect(ui.activeModal).toBeNull();
 
-    unmount(component);
+    await unmount(component);
   });
 
   it("renders empty state", async () => {
@@ -122,7 +120,7 @@ describe("TopSkills", () => {
 
     expect(document.body.textContent).toContain("No skill usage data");
 
-    unmount(component);
+    await unmount(component);
   });
 
   it("renders error state and retries", async () => {
@@ -144,6 +142,6 @@ describe("TopSkills", () => {
 
     expect(retrySpy).toHaveBeenCalledOnce();
 
-    unmount(component);
+    await unmount(component);
   });
 });

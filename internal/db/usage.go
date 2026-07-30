@@ -12,24 +12,29 @@ import (
 	"time"
 
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/parser"
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
 )
 
+// CopilotReportedCostSource identifies the authoritative cumulative cost
+// reported by Copilot CLI shutdown records.
+const CopilotReportedCostSource = "copilot-reported"
+
 // aiCreditUSD is the USD value of one AI credit for agents whose cost
 // is denominated in AI credits (the AICreditsDenominated capability).
-const aiCreditUSD = 0.01
+const microdollarsPerAICredit = 10_000
 
 // AICreditsFromCost converts a USD cost into AI credits when the
 // agent's cost is denominated in AI credits, and returns 0 otherwise.
 // It is the single home of the credit conversion shared by the SQLite,
 // PostgreSQL, and DuckDB usage paths; a per-agent credit rate would
 // slot in here rather than at each accumulation site.
-func AICreditsFromCost(agent string, costUSD float64) float64 {
-	if costUSD == 0 || !parser.AgentNameUsesAICredits(agent) {
+func AICreditsFromCost(agent string, cost money.Money) float64 {
+	if cost.Microdollars == 0 || !parser.AgentNameUsesAICredits(agent) {
 		return 0
 	}
-	return costUSD / aiCreditUSD
+	return float64(cost.Microdollars) / microdollarsPerAICredit
 }
 
 // NoTokenData reports whether a daily-usage total carries neither token
@@ -41,7 +46,7 @@ func NoTokenData(t UsageTotals) bool {
 		t.OutputTokens == 0 &&
 		t.CacheCreationTokens == 0 &&
 		t.CacheReadTokens == 0 &&
-		t.TotalCost == 0 &&
+		t.TotalCost.Microdollars == 0 &&
 		t.CopilotAICredits == 0
 }
 
@@ -53,6 +58,11 @@ type UsageFilter struct {
 	Agent   string // "" for all; supports comma-separated
 	Project string // "" for all; supports comma-separated
 	Machine string // "" for all; supports comma-separated
+	// ProjectLabels and ExcludeProjectLabels preserve exact internal labels
+	// that may themselves contain commas. A non-nil slice takes precedence
+	// over the legacy comma-separated string field.
+	ProjectLabels        []string
+	ExcludeProjectLabels []string
 	// GitBranch is a branchListSep-joined list of opaque (project, branch) tokens (EncodeBranchFilterToken).
 	GitBranch         string
 	Model             string // "" for all; supports comma-separated
@@ -68,6 +78,30 @@ type UsageFilter struct {
 	Termination       string // "", "clean", "unclean", "active", or "stale"
 	Breakdowns        bool   // populate Project/AgentBreakdowns per day
 	SkipSessionCounts bool   // skip distinct session counts when callers do not need them
+}
+
+// ProjectFilterLabels returns exact include labels when present, otherwise it
+// decodes the legacy comma-separated project filter.
+func (f UsageFilter) ProjectFilterLabels() []string {
+	if f.ProjectLabels != nil {
+		return f.ProjectLabels
+	}
+	if f.Project == "" {
+		return nil
+	}
+	return strings.Split(f.Project, ",")
+}
+
+// ExcludedProjectFilterLabels returns exact exclude labels when present,
+// otherwise it decodes the legacy comma-separated project filter.
+func (f UsageFilter) ExcludedProjectFilterLabels() []string {
+	if f.ExcludeProjectLabels != nil {
+		return f.ExcludeProjectLabels
+	}
+	if f.ExcludeProject == "" {
+		return nil
+	}
+	return strings.Split(f.ExcludeProject, ",")
 }
 
 func (f UsageFilter) appendUsageBranchFilterClauses(
@@ -119,13 +153,12 @@ func (f UsageFilter) appendUsageSourceFilterClauses(
 func (f UsageFilter) appendUsageSessionFilterClauses(
 	where string, args []any,
 ) (string, []any) {
-	appendCSV := func(
-		q string, a []any, col, csv string, include bool,
+	appendValues := func(
+		q string, a []any, col string, vals []string, include bool,
 	) (string, []any) {
-		if csv == "" {
+		if len(vals) == 0 {
 			return q, a
 		}
-		vals := strings.Split(csv, ",")
 		op := "IN"
 		if !include {
 			op = "NOT IN"
@@ -148,16 +181,28 @@ func (f UsageFilter) appendUsageSessionFilterClauses(
 		}
 		return q, a
 	}
+	appendCSV := func(
+		q string, a []any, col, csv string, include bool,
+	) (string, []any) {
+		if csv == "" {
+			return q, a
+		}
+		return appendValues(q, a, col, strings.Split(csv, ","), include)
+	}
 
 	where, args = appendCSV(where, args, "s.agent", f.Agent, true)
-	where, args = appendCSV(where, args, "s.project", f.Project, true)
+	where, args = appendValues(
+		where, args, "s.project", f.ProjectFilterLabels(), true,
+	)
 	where, args = appendCSV(where, args, "s.machine", f.Machine, true)
 	if f.GitBranch != "" {
 		var clause string
 		clause, args = BranchPairClauseArgs("s.project", "s.git_branch", f.GitBranch, args)
 		where += "\n\tAND " + clause
 	}
-	where, args = appendCSV(where, args, "s.project", f.ExcludeProject, false)
+	where, args = appendValues(
+		where, args, "s.project", f.ExcludedProjectFilterLabels(), false,
+	)
 	where, args = appendCSV(where, args, "s.agent", f.ExcludeAgent, false)
 
 	if f.MinUserMessages > 0 {
@@ -364,7 +409,7 @@ SELECT
 		WHEN json_valid(m.token_usage) THEN COALESCE(CAST(json_extract(m.token_usage, '$.reasoning_tokens') AS INTEGER), 0)
 		ELSE 0
 	END AS reasoning_tokens,
-	NULL AS cost_usd,
+	NULL AS cost_microdollars,
 	'' AS cost_status,
 	'' AS cost_source,
 	m.claude_message_id,
@@ -398,7 +443,7 @@ SELECT
 	ue.cache_creation_input_tokens,
 	ue.cache_read_input_tokens,
 	ue.reasoning_tokens,
-	ue.cost_usd,
+	ue.cost_microdollars,
 	ue.cost_status,
 	ue.cost_source,
 	'' AS claude_message_id,
@@ -447,13 +492,15 @@ SELECT
 		WHEN json_valid(m.token_usage) THEN COALESCE(CAST(json_extract(m.token_usage, '$.reasoning_tokens') AS INTEGER), 0)
 		ELSE 0
 	END AS reasoning_tokens,
-	NULL AS cost_usd,
+	NULL AS cost_microdollars,
+	'' AS cost_source,
 	m.claude_message_id,
 	m.claude_request_id,
 	m.source_uuid,
 	'' AS usage_dedup_key,
 	` + rollupProjectExpr + ` AS project,
-	s.agent
+	s.agent,
+	s.machine
 FROM messages m
 JOIN sessions s ON m.session_id = s.id
 WHERE %s
@@ -472,7 +519,8 @@ SELECT
 	ue.cache_creation_input_tokens,
 	ue.cache_read_input_tokens,
 	ue.reasoning_tokens,
-	ue.cost_usd,
+	ue.cost_microdollars,
+	ue.cost_source,
 	'' AS claude_message_id,
 	'' AS claude_request_id,
 	'' AS source_uuid,
@@ -481,7 +529,8 @@ SELECT
 		ELSE ue.session_id || ':' || ue.source || ':id:' || ue.id
 	END AS usage_dedup_key,
 	` + rollupProjectExpr + ` AS project,
-	s.agent
+	s.agent,
+	s.machine
 FROM usage_events ue
 JOIN sessions s ON s.id = ue.session_id
 WHERE %s`
@@ -502,13 +551,15 @@ SELECT
 		WHEN json_valid(m.token_usage) THEN COALESCE(CAST(json_extract(m.token_usage, '$.reasoning_tokens') AS INTEGER), 0)
 		ELSE 0
 	END AS reasoning_tokens,
-	NULL AS cost_usd,
+	NULL AS cost_microdollars,
+	'' AS cost_source,
 	m.claude_message_id,
 	m.claude_request_id,
 	m.source_uuid,
 	'' AS usage_dedup_key,
 	` + rollupProjectExpr + ` AS project,
-	s.agent
+	s.agent,
+	s.machine
 FROM %s m
 JOIN sessions s ON m.session_id = s.id
 WHERE %s`
@@ -526,7 +577,8 @@ SELECT
 	ue.cache_creation_input_tokens,
 	ue.cache_read_input_tokens,
 	ue.reasoning_tokens,
-	ue.cost_usd,
+	ue.cost_microdollars,
+	ue.cost_source,
 	'' AS claude_message_id,
 	'' AS claude_request_id,
 	'' AS source_uuid,
@@ -535,7 +587,8 @@ SELECT
 		ELSE ue.session_id || ':' || ue.source || ':id:' || ue.id
 	END AS usage_dedup_key,
 	` + rollupProjectExpr + ` AS project,
-	s.agent
+	s.agent,
+	s.machine
 FROM %s ue
 JOIN sessions s ON s.id = ue.session_id
 WHERE %s`
@@ -583,7 +636,8 @@ usage_event_timestamp_rows AS MATERIALIZED (
 			ue.cache_creation_input_tokens,
 			ue.cache_read_input_tokens,
 			ue.reasoning_tokens,
-			ue.cost_usd,
+			ue.cost_microdollars,
+			ue.cost_source,
 		ue.dedup_key
 	FROM usage_events ue
 	WHERE ` + eventTimestampWhere + `
@@ -631,7 +685,7 @@ type usageScanRow struct {
 	cacheCreationInputTokens int
 	cacheReadInputTokens     int
 	reasoningTokens          int
-	costUSD                  sql.NullFloat64
+	cost                     sql.NullInt64
 	costStatus               string
 	costSource               string
 	claudeMessageID          string
@@ -661,13 +715,15 @@ type dailyUsageScanRow struct {
 	cacheCreationInputTokens int
 	cacheReadInputTokens     int
 	reasoningTokens          int
-	costUSD                  sql.NullFloat64
+	cost                     sql.NullInt64
+	costSource               string
 	claudeMessageID          string
 	claudeRequestID          string
 	sourceUUID               string
 	usageDedupKey            string
 	project                  string
 	agent                    string
+	machine                  string
 }
 
 type topSessionMetadata struct {
@@ -691,7 +747,7 @@ SELECT
 	u.cache_creation_input_tokens,
 	u.cache_read_input_tokens,
 	u.reasoning_tokens,
-	u.cost_usd,
+	u.cost_microdollars,
 	u.cost_status,
 	u.cost_source,
 	u.claude_message_id,
@@ -719,6 +775,16 @@ func usageRowSelect() string {
 }
 
 func dailyUsageRowSelectFromRows(rowsSQL string) string {
+	return dailyUsageRowSelectFromRowsWithMachine(rowsSQL, false)
+}
+
+func dailyUsageRowSelectFromRowsWithMachine(
+	rowsSQL string, includeMachine bool,
+) string {
+	machineColumn := ""
+	if includeMachine {
+		machineColumn = ",\n\tu.machine"
+	}
 	return `
 SELECT
 	u.session_id,
@@ -731,14 +797,15 @@ SELECT
 		u.output_tokens,
 		u.cache_creation_input_tokens,
 		u.cache_read_input_tokens,
-		u.reasoning_tokens,
-		u.cost_usd,
+	u.reasoning_tokens,
+	u.cost_microdollars,
+	u.cost_source,
 	u.claude_message_id,
 	u.claude_request_id,
 	u.source_uuid,
 	u.usage_dedup_key,
 	u.project,
-	u.agent
+	u.agent` + machineColumn + `
 FROM (` + rowsSQL + `) u
 WHERE 1=1`
 }
@@ -910,13 +977,15 @@ SELECT
 	cu.cache_write_tokens AS cache_creation_input_tokens,
 	cu.cache_read_tokens AS cache_read_input_tokens,
 	0 AS reasoning_tokens,
-	cu.charged_cents / 100.0 AS cost_usd,
+	cu.charged_microdollars AS cost_microdollars,
+	'cursor-reported' AS cost_source,
 	'' AS claude_message_id,
 	'' AS claude_request_id,
 	'' AS source_uuid,
 	cu.dedup_key AS usage_dedup_key,
 	'' AS project,
-	'cursor' AS agent
+	'cursor' AS agent,
+	'' AS machine
 FROM cursor_usage_events cu
 WHERE %s`
 
@@ -927,7 +996,8 @@ func cursorUsageRowsSQLForBounds(
 	// Cursor usage rows carry no project or git branch and bypass the session
 	// filter, so any filter they cannot satisfy (project, machine, branch)
 	// must exclude them entirely rather than let them leak into totals.
-	if f.Project != "" || f.ExcludeProject != "" ||
+	if len(f.ProjectFilterLabels()) > 0 ||
+		len(f.ExcludedProjectFilterLabels()) > 0 ||
 		f.Machine != "" || f.GitBranch != "" || f.MinUserMessages > 0 ||
 		f.ExcludeOneShot || termPred != "" ||
 		f.ActiveSince != "" {
@@ -998,7 +1068,7 @@ func scanUsageRow(rows *sql.Rows) (usageScanRow, error) {
 		&r.cacheCreationInputTokens,
 		&r.cacheReadInputTokens,
 		&r.reasoningTokens,
-		&r.costUSD,
+		&r.cost,
 		&r.costStatus,
 		&r.costSource,
 		&r.claudeMessageID,
@@ -1019,8 +1089,14 @@ func scanUsageRow(rows *sql.Rows) (usageScanRow, error) {
 }
 
 func scanDailyUsageRow(rows *sql.Rows) (dailyUsageScanRow, error) {
+	return scanDailyUsageRowWithMachine(rows, false)
+}
+
+func scanDailyUsageRowWithMachine(
+	rows *sql.Rows, includeMachine bool,
+) (dailyUsageScanRow, error) {
 	var r dailyUsageScanRow
-	err := rows.Scan(
+	dest := []any{
 		&r.sessionID,
 		&r.messageOrdinal,
 		&r.usageSource,
@@ -1032,14 +1108,19 @@ func scanDailyUsageRow(rows *sql.Rows) (dailyUsageScanRow, error) {
 		&r.cacheCreationInputTokens,
 		&r.cacheReadInputTokens,
 		&r.reasoningTokens,
-		&r.costUSD,
+		&r.cost,
+		&r.costSource,
 		&r.claudeMessageID,
 		&r.claudeRequestID,
 		&r.sourceUUID,
 		&r.usageDedupKey,
 		&r.project,
 		&r.agent,
-	)
+	}
+	if includeMachine {
+		dest = append(dest, &r.machine)
+	}
+	err := rows.Scan(dest...)
 	return r, err
 }
 
@@ -1410,7 +1491,11 @@ func clampedUsageTokenCountersWithReasoning(
 
 func dailyUsageAmounts(
 	r dailyUsageScanRow, pricing *export.PricingResolver,
-) (inputTok, outputTok, cacheCrTok, cacheRdTok int, cost, savings float64) {
+) (
+	inputTok, outputTok, cacheCrTok, cacheRdTok int,
+	cost, savings money.Money,
+	err error,
+) {
 	reasoningTok := r.reasoningTokens
 	// cacheCr5m/cacheCr1h split the cache-creation total so the two
 	// ephemeral TTLs are priced at their separate rates. Sources with no
@@ -1437,32 +1522,55 @@ func dailyUsageAmounts(
 
 	lookup := pricing.Lookup(r.model)
 	rates := lookup.Rates
-	if r.costUSD.Valid {
-		cost = r.costUSD.Float64
+	if r.cost.Valid && r.costSource != CopilotReportedCostSource {
+		cost = money.Money{Microdollars: r.cost.Int64}
 		pricing.RecordReported(r.model, lookup)
 	} else {
-		// Inline cost (not CostForTokens) so the 5m and 1h cache-write
-		// buckets are billed at their separate rates. Mirrors
-		// CostForTokens' reasoning-as-output fallback.
+		// Money-native cost with the 5m/1h cache-write split: the two
+		// ephemeral buckets bill at their separate rates. billableOutput
+		// mirrors CostForTokens' reasoning-as-output fallback.
 		billableOutput := outputTok
 		if billableOutput == 0 {
 			billableOutput = reasoningTok
 		}
-		cost = (float64(inputTok)*rates.InputPerMTok +
-			float64(billableOutput)*rates.OutputPerMTok +
-			float64(cacheCr5m)*rates.CacheWritePerMTok +
-			float64(cacheCr1h)*rates.CacheWrite1hPerMTok +
-			float64(cacheRdTok)*rates.CacheReadPerMTok) / 1_000_000
+		cost, err = money.CostPerMillion([]money.RatedTokens{
+			{Tokens: int64(inputTok), Rate: rates.InputPerMTok},
+			{Tokens: int64(billableOutput), Rate: rates.OutputPerMTok},
+			{Tokens: int64(cacheCr5m), Rate: rates.CacheWritePerMTok},
+			{Tokens: int64(cacheCr1h), Rate: rates.CacheWrite1hPerMTok},
+			{Tokens: int64(cacheRdTok), Rate: rates.CacheReadPerMTok},
+		})
+		if err != nil {
+			return 0, 0, 0, 0, money.Money{}, money.Money{},
+				fmt.Errorf("pricing usage row for model %q: %w", r.model, err)
+		}
 		pricing.RecordComputed(r.model, lookup)
 	}
 
-	readDelta := float64(cacheRdTok) *
-		(rates.InputPerMTok - rates.CacheReadPerMTok) / 1_000_000
-	cr5mDelta := float64(cacheCr5m) *
-		(rates.InputPerMTok - rates.CacheWritePerMTok) / 1_000_000
-	cr1hDelta := float64(cacheCr1h) *
-		(rates.InputPerMTok - rates.CacheWrite1hPerMTok) / 1_000_000
-	savings = readDelta + cr5mDelta + cr1hDelta
+	readRate, err := money.Sub(rates.InputPerMTok, rates.CacheReadPerMTok)
+	if err != nil {
+		return 0, 0, 0, 0, money.Money{}, money.Money{},
+			fmt.Errorf("deriving cache read rate for model %q: %w", r.model, err)
+	}
+	cr5mRate, err := money.Sub(rates.InputPerMTok, rates.CacheWritePerMTok)
+	if err != nil {
+		return 0, 0, 0, 0, money.Money{}, money.Money{},
+			fmt.Errorf("deriving 5m cache creation rate for model %q: %w", r.model, err)
+	}
+	cr1hRate, err := money.Sub(rates.InputPerMTok, rates.CacheWrite1hPerMTok)
+	if err != nil {
+		return 0, 0, 0, 0, money.Money{}, money.Money{},
+			fmt.Errorf("deriving 1h cache creation rate for model %q: %w", r.model, err)
+	}
+	savings, err = money.SignedCostPerMillion([]money.RatedTokens{
+		{Tokens: int64(cacheRdTok), Rate: readRate},
+		{Tokens: int64(cacheCr5m), Rate: cr5mRate},
+		{Tokens: int64(cacheCr1h), Rate: cr1hRate},
+	})
+	if err != nil {
+		return 0, 0, 0, 0, money.Money{}, money.Money{},
+			fmt.Errorf("pricing cache savings for model %q: %w", r.model, err)
+	}
 	return
 }
 
@@ -1552,11 +1660,12 @@ type DailyUsageEntry struct {
 	OutputTokens        int                `json:"outputTokens"`
 	CacheCreationTokens int                `json:"cacheCreationTokens"`
 	CacheReadTokens     int                `json:"cacheReadTokens"`
-	TotalCost           float64            `json:"totalCost"`
+	TotalCost           money.Money        `json:"totalCost"`
 	ModelsUsed          []string           `json:"modelsUsed"`
 	ModelBreakdowns     []ModelBreakdown   `json:"modelBreakdowns"`
 	ProjectBreakdowns   []ProjectBreakdown `json:"projectBreakdowns"`
 	AgentBreakdowns     []AgentBreakdown   `json:"agentBreakdowns"`
+	MachineBreakdowns   []MachineBreakdown `json:"machineBreakdowns"`
 }
 
 func (e DailyUsageEntry) MarshalJSON() ([]byte, error) {
@@ -1574,47 +1683,61 @@ func (e DailyUsageEntry) MarshalJSON() ([]byte, error) {
 	if out.AgentBreakdowns == nil {
 		out.AgentBreakdowns = []AgentBreakdown{}
 	}
+	if out.MachineBreakdowns == nil {
+		out.MachineBreakdowns = []MachineBreakdown{}
+	}
 	return json.Marshal(out)
 }
 
 // ModelBreakdown holds per-model token and cost breakdown.
 type ModelBreakdown struct {
-	ModelName           string  `json:"modelName"`
-	InputTokens         int     `json:"inputTokens"`
-	OutputTokens        int     `json:"outputTokens"`
-	CacheCreationTokens int     `json:"cacheCreationTokens"`
-	CacheReadTokens     int     `json:"cacheReadTokens"`
-	Cost                float64 `json:"cost"`
+	ModelName           string      `json:"modelName"`
+	InputTokens         int         `json:"inputTokens"`
+	OutputTokens        int         `json:"outputTokens"`
+	CacheCreationTokens int         `json:"cacheCreationTokens"`
+	CacheReadTokens     int         `json:"cacheReadTokens"`
+	Cost                money.Money `json:"cost"`
 }
 
 // ProjectBreakdown is the per-project slice of a day's usage.
 type ProjectBreakdown struct {
-	Project             string  `json:"project"`
-	InputTokens         int     `json:"inputTokens"`
-	OutputTokens        int     `json:"outputTokens"`
-	CacheCreationTokens int     `json:"cacheCreationTokens"`
-	CacheReadTokens     int     `json:"cacheReadTokens"`
-	Cost                float64 `json:"cost"`
+	ProjectKey          string      `json:"project_key"`
+	Project             string      `json:"project"`
+	InputTokens         int         `json:"inputTokens"`
+	OutputTokens        int         `json:"outputTokens"`
+	CacheCreationTokens int         `json:"cacheCreationTokens"`
+	CacheReadTokens     int         `json:"cacheReadTokens"`
+	Cost                money.Money `json:"cost"`
 }
 
 // AgentBreakdown is the per-agent slice of a day's usage.
 type AgentBreakdown struct {
-	Agent               string  `json:"agent"`
-	InputTokens         int     `json:"inputTokens"`
-	OutputTokens        int     `json:"outputTokens"`
-	CacheCreationTokens int     `json:"cacheCreationTokens"`
-	CacheReadTokens     int     `json:"cacheReadTokens"`
-	Cost                float64 `json:"cost"`
+	Agent               string      `json:"agent"`
+	InputTokens         int         `json:"inputTokens"`
+	OutputTokens        int         `json:"outputTokens"`
+	CacheCreationTokens int         `json:"cacheCreationTokens"`
+	CacheReadTokens     int         `json:"cacheReadTokens"`
+	Cost                money.Money `json:"cost"`
+}
+
+// MachineBreakdown is the per-source-machine slice of a day's usage.
+type MachineBreakdown struct {
+	MachineName         string      `json:"machineName"`
+	InputTokens         int         `json:"inputTokens"`
+	OutputTokens        int         `json:"outputTokens"`
+	CacheCreationTokens int         `json:"cacheCreationTokens"`
+	CacheReadTokens     int         `json:"cacheReadTokens"`
+	Cost                money.Money `json:"cost"`
 }
 
 // UsageTotals holds aggregate token and cost totals.
 type UsageTotals struct {
-	InputTokens         int     `json:"inputTokens"`
-	OutputTokens        int     `json:"outputTokens"`
-	CacheCreationTokens int     `json:"cacheCreationTokens"`
-	CacheReadTokens     int     `json:"cacheReadTokens"`
-	TotalCost           float64 `json:"totalCost"`
-	CopilotAICredits    float64 `json:"copilotAICredits,omitempty"`
+	InputTokens         int         `json:"inputTokens"`
+	OutputTokens        int         `json:"outputTokens"`
+	CacheCreationTokens int         `json:"cacheCreationTokens"`
+	CacheReadTokens     int         `json:"cacheReadTokens"`
+	TotalCost           money.Money `json:"totalCost"`
+	CopilotAICredits    float64     `json:"copilotAICredits,omitempty"`
 	// CacheSavings is the net dollar delta vs an uncached run:
 	// cache reads save (input_rate - cache_read_rate) per token,
 	// cache creations cost (input_rate - cache_creation_rate)
@@ -1622,7 +1745,7 @@ type UsageTotals struct {
 	// above the input rate). Computed from per-model rates so
 	// mixed-model workloads get the right number, not a fixed
 	// Sonnet proxy.
-	CacheSavings float64 `json:"cacheSavings"`
+	CacheSavings money.Money `json:"cacheSavings"`
 }
 
 // DailyUsageResult wraps the daily entries and totals.
@@ -1635,6 +1758,31 @@ type DailyUsageResult struct {
 	SessionCounts UsageSessionCounts                `json:"sessionCounts,omitempty"`
 }
 
+func SanitizeDailyUsageProjectLabelsWithCatalog(
+	result *DailyUsageResult,
+	projects map[string]export.ProjectMapEntry,
+) {
+	for i := range result.Daily {
+		for j := range result.Daily[i].ProjectBreakdowns {
+			raw := result.Daily[i].ProjectBreakdowns[j].Project
+			result.Daily[i].ProjectBreakdowns[j].ProjectKey =
+				export.ProjectKeyForEntry(projects[raw])
+			result.Daily[i].ProjectBreakdowns[j].Project =
+				export.SafeProjectDisplayLabel(raw)
+		}
+	}
+	if result.SessionCounts.ByProject != nil {
+		byProject := make(map[string]int, len(result.SessionCounts.ByProject))
+		for raw, count := range result.SessionCounts.ByProject {
+			key := export.ProjectKeyForEntry(projects[raw])
+			if key != "" {
+				byProject[key] += count
+			}
+		}
+		result.SessionCounts.ByProject = byProject
+	}
+}
+
 // loadPricingMap reads the model_pricing table into a map for
 // in-memory joins. This is much faster than a SQL LEFT JOIN
 // on every row of the daily usage scan, since the pricing
@@ -1642,12 +1790,18 @@ type DailyUsageResult struct {
 func (db *DB) loadPricingMap(
 	ctx context.Context,
 ) ([]export.EffectivePricingRow, error) {
-	rows, err := db.getReader().QueryContext(ctx,
+	return db.loadPricingMapFrom(ctx, db.getReader())
+}
+
+func (db *DB) loadPricingMapFrom(
+	ctx context.Context, q sessionExportQuerier,
+) ([]export.EffectivePricingRow, error) {
+	rows, err := q.QueryContext(ctx,
 		`SELECT model_pattern,
-			input_per_mtok, output_per_mtok,
-			cache_creation_per_mtok,
-			cache_creation_1h_per_mtok,
-			cache_read_per_mtok,
+			input_microdollars_per_mtok, output_microdollars_per_mtok,
+			cache_creation_microdollars_per_mtok,
+			cache_creation_1h_microdollars_per_mtok,
+			cache_read_microdollars_per_mtok,
 			updated_at
 		 FROM model_pricing
 		 WHERE model_pattern NOT LIKE '\_%' ESCAPE '\'`)
@@ -1680,13 +1834,23 @@ func (db *DB) loadPricingMap(
 
 	for model, cp := range db.customPricing {
 		rates := export.ModelRates{
-			InputPerMTok:      cp.Input,
-			OutputPerMTok:     cp.Output,
-			CacheWritePerMTok: cp.CacheCreation,
-			// Custom rates carry no separate 1h value; bill 1h at the
-			// same (5m) cache-write rate the user configured.
-			CacheWrite1hPerMTok: cp.CacheCreation,
-			CacheReadPerMTok:    cp.CacheRead,
+			InputPerMTok: money.Money{
+				Microdollars: cp.InputMicrodollarsPerMTok,
+			},
+			OutputPerMTok: money.Money{
+				Microdollars: cp.OutputMicrodollarsPerMTok,
+			},
+			CacheWritePerMTok: money.Money{
+				Microdollars: cp.CacheCreationMicrodollarsPerMTok,
+			},
+			// Custom rates carry no separate 1h value; bill 1h at the same
+			// (5m) cache-write rate the user configured.
+			CacheWrite1hPerMTok: money.Money{
+				Microdollars: cp.CacheCreationMicrodollarsPerMTok,
+			},
+			CacheReadPerMTok: money.Money{
+				Microdollars: cp.CacheReadMicrodollarsPerMTok,
+			},
 		}
 		rates.Source = customPricingSource()
 		if source, ok := db.customPricingSources[model]; ok {
@@ -1707,7 +1871,7 @@ func fallbackRateMap() map[string]export.ModelRates {
 	out := make(map[string]export.ModelRates, len(fallback))
 	for _, p := range fallback {
 		cacheWrite1h := p.CacheCreation1hPerMTok
-		if cacheWrite1h == 0 && p.CacheCreationPerMTok > 0 {
+		if cacheWrite1h == (money.Money{}) && p.CacheCreationPerMTok.Microdollars > 0 {
 			cacheWrite1h = p.CacheCreationPerMTok
 		}
 		rates := export.ModelRates{
@@ -1736,7 +1900,7 @@ func modelPricingRates(p ModelPricing) export.ModelRates {
 	// before the column existed, or rows pushed by an older PG sync client),
 	// fall back to the 5m rate so 1h cache writes are still billed rather
 	// than dropped to zero.
-	if cacheWrite1h == 0 && p.CacheCreationPerMTok > 0 {
+	if cacheWrite1h == (money.Money{}) && p.CacheCreationPerMTok.Microdollars > 0 {
 		cacheWrite1h = p.CacheCreationPerMTok
 	}
 	return export.ModelRates{
@@ -1807,7 +1971,7 @@ func (db *DB) GetDailyUsage(
 	// Pad by +/-14h to cover all timezone offsets; the actual
 	// date filtering happens post-query via localDate.
 	query, args := dailyUsageRowsSQLForBounds(f, usageBoundsForFilter(f), db.hasCursorUsageTable())
-	query = dailyUsageRowSelectFromRows(query)
+	query = dailyUsageRowSelectFromRowsWithMachine(query, f.Breakdowns)
 	query += ` ORDER BY u.ts ASC, u.session_id ASC,
 		COALESCE(u.message_ordinal, -1) ASC`
 
@@ -1823,6 +1987,7 @@ func (db *DB) GetDailyUsage(
 		date    string
 		project string
 		agent   string
+		machine string
 		model   string
 	}
 	type bucket struct {
@@ -1830,10 +1995,16 @@ func (db *DB) GetDailyUsage(
 		outputTok int
 		cacheCr   int
 		cacheRd   int
-		cost      float64
+		cost      money.Money
+	}
+	type sessionCost struct {
+		estimated     map[accumKey]money.Money
+		authoritative *money.Money
 	}
 
 	accum := make(map[accumKey]*bucket)
+	sessionCosts := make(map[string]sessionCost)
+	useAuthoritativeCost := f.Model == "" && f.ExcludeModel == ""
 
 	seen := make(map[usageDedupToken]struct{})
 	var seenSessions map[string]UsageSessionInfo
@@ -1847,10 +2018,10 @@ func (db *DB) GetDailyUsage(
 	// at the message level instead of deriving from totals
 	// later because the rate mix varies per workload and a
 	// single fallback rate would misreport mixed-model periods.
-	var totalSavings float64
+	var totalSavings money.Money
 
 	for rows.Next() {
-		r, scanErr := scanDailyUsageRow(rows)
+		r, scanErr := scanDailyUsageRowWithMachine(rows, f.Breakdowns)
 		if scanErr != nil {
 			return DailyUsageResult{},
 				fmt.Errorf("scanning daily usage row: %w", scanErr)
@@ -1889,13 +2060,20 @@ func (db *DB) GetDailyUsage(
 			projectLabels[r.project] = struct{}{}
 		}
 
-		inputTok, outputTok, cacheCrTok, cacheRdTok, cost, savings :=
+		inputTok, outputTok, cacheCrTok, cacheRdTok, cost, savings, priceErr :=
 			dailyUsageAmounts(r, rateResolver)
-		totalSavings += savings
+		if priceErr != nil {
+			return DailyUsageResult{}, priceErr
+		}
+		totalSavings, priceErr = money.Add(totalSavings, savings)
+		if priceErr != nil {
+			return DailyUsageResult{}, fmt.Errorf(
+				"summing daily usage cache savings: %w", priceErr)
+		}
 
 		key := accumKey{
 			date: date, project: r.project,
-			agent: r.agent, model: r.model,
+			agent: r.agent, machine: r.machine, model: r.model,
 		}
 		b, ok := accum[key]
 		if !ok {
@@ -1906,11 +2084,88 @@ func (db *DB) GetDailyUsage(
 		b.outputTok += outputTok
 		b.cacheCr += cacheCrTok
 		b.cacheRd += cacheRdTok
-		b.cost += cost
+
+		sc := sessionCosts[r.sessionID]
+		if sc.estimated == nil {
+			sc.estimated = make(map[accumKey]money.Money)
+		}
+		sc.estimated[key], priceErr = money.Add(sc.estimated[key], cost)
+		if priceErr != nil {
+			return DailyUsageResult{}, fmt.Errorf(
+				"summing daily usage session cost: %w", priceErr)
+		}
+		if useAuthoritativeCost &&
+			r.costSource == CopilotReportedCostSource && r.cost.Valid {
+			v := money.Money{Microdollars: r.cost.Int64}
+			sc.authoritative = &v
+			rateResolver.RecordUnattributedReported()
+		}
+		sessionCosts[r.sessionID] = sc
 	}
 	if err := rows.Err(); err != nil {
 		return DailyUsageResult{},
 			fmt.Errorf("iterating daily usage rows: %w", err)
+	}
+
+	sessionIDs := make([]string, 0, len(sessionCosts))
+	for sessionID := range sessionCosts {
+		sessionIDs = append(sessionIDs, sessionID)
+	}
+	sort.Strings(sessionIDs)
+	for _, sessionID := range sessionIDs {
+		sc := sessionCosts[sessionID]
+		if sc.authoritative != nil {
+			keys := make([]accumKey, 0, len(sc.estimated))
+			for key := range sc.estimated {
+				keys = append(keys, key)
+			}
+			sort.Slice(keys, func(i, j int) bool {
+				a, b := keys[i], keys[j]
+				if a.date != b.date {
+					return a.date < b.date
+				}
+				if a.project != b.project {
+					return a.project < b.project
+				}
+				if a.agent != b.agent {
+					return a.agent < b.agent
+				}
+				if a.machine != b.machine {
+					return a.machine < b.machine
+				}
+				return a.model < b.model
+			})
+			weights := make([]money.Money, len(keys))
+			for i, key := range keys {
+				weights[i] = sc.estimated[key]
+			}
+			costs := export.AllocateCostByWeight(*sc.authoritative, weights)
+			for i, key := range keys {
+				b := accum[key]
+				if b == nil {
+					b = &bucket{}
+					accum[key] = b
+				}
+				b.cost, err = money.Add(b.cost, costs[i])
+				if err != nil {
+					return DailyUsageResult{}, fmt.Errorf(
+						"summing allocated daily usage cost: %w", err)
+				}
+			}
+		} else {
+			for key, cost := range sc.estimated {
+				b := accum[key]
+				if b == nil {
+					b = &bucket{}
+					accum[key] = b
+				}
+				b.cost, err = money.Add(b.cost, cost)
+				if err != nil {
+					return DailyUsageResult{}, fmt.Errorf(
+						"summing estimated daily usage cost: %w", err)
+				}
+			}
+		}
 	}
 
 	// Two paths: without breakdowns (CLI, fast) and with breakdowns
@@ -1929,7 +2184,7 @@ func (db *DB) GetDailyUsage(
 			outputTok int
 			cacheCr   int
 			cacheRd   int
-			cost      float64
+			cost      money.Money
 		}
 		dm := make(map[dateModelKey]*modelAccum)
 		for key, b := range accum {
@@ -1943,7 +2198,11 @@ func (db *DB) GetDailyUsage(
 			ma.outputTok += b.outputTok
 			ma.cacheCr += b.cacheCr
 			ma.cacheRd += b.cacheRd
-			ma.cost += b.cost
+			ma.cost, err = money.Add(ma.cost, b.cost)
+			if err != nil {
+				return DailyUsageResult{}, fmt.Errorf(
+					"summing daily model cost: %w", err)
+			}
 		}
 
 		type dayData struct {
@@ -1990,8 +2249,8 @@ func (db *DB) GetDailyUsage(
 				}
 				ci := left.cost
 				cj := right.cost
-				if ci != cj {
-					return ci > cj
+				if ci.Microdollars != cj.Microdollars {
+					return ci.Microdollars > cj.Microdollars
 				}
 				return modelNames[i] < modelNames[j]
 			})
@@ -2008,7 +2267,11 @@ func (db *DB) GetDailyUsage(
 				entry.OutputTokens += ma.outputTok
 				entry.CacheCreationTokens += ma.cacheCr
 				entry.CacheReadTokens += ma.cacheRd
-				entry.TotalCost += ma.cost
+				entry.TotalCost, err = money.Add(entry.TotalCost, ma.cost)
+				if err != nil {
+					return DailyUsageResult{}, fmt.Errorf(
+						"summing daily entry cost: %w", err)
+				}
 				mbd = append(mbd, ModelBreakdown{
 					ModelName:           m,
 					InputTokens:         ma.inputTok,
@@ -2025,7 +2288,11 @@ func (db *DB) GetDailyUsage(
 			totals.OutputTokens += entry.OutputTokens
 			totals.CacheCreationTokens += entry.CacheCreationTokens
 			totals.CacheReadTokens += entry.CacheReadTokens
-			totals.TotalCost += entry.TotalCost
+			totals.TotalCost, err = money.Add(totals.TotalCost, entry.TotalCost)
+			if err != nil {
+				return DailyUsageResult{}, fmt.Errorf(
+					"summing daily usage total: %w", err)
+			}
 		}
 
 		if daily == nil {
@@ -2049,6 +2316,10 @@ func (db *DB) GetDailyUsage(
 		if err != nil {
 			return DailyUsageResult{}, err
 		}
+		projectRows := DailyUsageResult{Daily: daily, SessionCounts: sessionCounts}
+		SanitizeDailyUsageProjectLabelsWithCatalog(&projectRows, projects)
+		daily = projectRows.Daily
+		sessionCounts = projectRows.SessionCounts
 		pricingBlock, err := rateResolver.BuildBlock()
 		if err != nil {
 			return DailyUsageResult{}, fmt.Errorf(
@@ -2057,7 +2328,7 @@ func (db *DB) GetDailyUsage(
 		return DailyUsageResult{
 			SchemaVersion: export.UsageDailySchemaVersion,
 			Pricing:       &pricingBlock,
-			Projects:      projects,
+			Projects:      export.ProjectMapForWire(projects),
 			Daily:         daily,
 			Totals:        totals,
 			SessionCounts: sessionCounts,
@@ -2069,6 +2340,7 @@ func (db *DB) GetDailyUsage(
 		models   map[string]bucket
 		projects map[string]bucket
 		agents   map[string]bucket
+		machines map[string]bucket
 	}
 	days := make(map[string]*dayMaps, 64)
 	for key, b := range accum {
@@ -2078,6 +2350,7 @@ func (db *DB) GetDailyUsage(
 				models:   make(map[string]bucket, 4),
 				projects: make(map[string]bucket, 8),
 				agents:   make(map[string]bucket, 4),
+				machines: make(map[string]bucket, 4),
 			}
 			days[key.date] = dm
 		}
@@ -2086,7 +2359,11 @@ func (db *DB) GetDailyUsage(
 		cur.outputTok += b.outputTok
 		cur.cacheCr += b.cacheCr
 		cur.cacheRd += b.cacheRd
-		cur.cost += b.cost
+		cur.cost, err = money.Add(cur.cost, b.cost)
+		if err != nil {
+			return DailyUsageResult{}, fmt.Errorf(
+				"summing daily model breakdown cost: %w", err)
+		}
 		dm.models[key.model] = cur
 
 		cur = dm.projects[key.project]
@@ -2094,7 +2371,11 @@ func (db *DB) GetDailyUsage(
 		cur.outputTok += b.outputTok
 		cur.cacheCr += b.cacheCr
 		cur.cacheRd += b.cacheRd
-		cur.cost += b.cost
+		cur.cost, err = money.Add(cur.cost, b.cost)
+		if err != nil {
+			return DailyUsageResult{}, fmt.Errorf(
+				"summing daily project breakdown cost: %w", err)
+		}
 		dm.projects[key.project] = cur
 
 		cur = dm.agents[key.agent]
@@ -2102,8 +2383,24 @@ func (db *DB) GetDailyUsage(
 		cur.outputTok += b.outputTok
 		cur.cacheCr += b.cacheCr
 		cur.cacheRd += b.cacheRd
-		cur.cost += b.cost
+		cur.cost, err = money.Add(cur.cost, b.cost)
+		if err != nil {
+			return DailyUsageResult{}, fmt.Errorf(
+				"summing daily agent breakdown cost: %w", err)
+		}
 		dm.agents[key.agent] = cur
+
+		cur = dm.machines[key.machine]
+		cur.inputTok += b.inputTok
+		cur.outputTok += b.outputTok
+		cur.cacheCr += b.cacheCr
+		cur.cacheRd += b.cacheRd
+		cur.cost, err = money.Add(cur.cost, b.cost)
+		if err != nil {
+			return DailyUsageResult{}, fmt.Errorf(
+				"summing daily machine breakdown cost: %w", err)
+		}
+		dm.machines[key.machine] = cur
 	}
 
 	dateKeys := make([]string, 0, len(days))
@@ -2132,8 +2429,8 @@ func (db *DB) GetDailyUsage(
 			right := dm.models[modelNames[j]]
 			ci := left.cost
 			cj := right.cost
-			if ci != cj {
-				return ci > cj
+			if ci.Microdollars != cj.Microdollars {
+				return ci.Microdollars > cj.Microdollars
 			}
 			return modelNames[i] < modelNames[j]
 		})
@@ -2150,7 +2447,11 @@ func (db *DB) GetDailyUsage(
 			entry.OutputTokens += b.outputTok
 			entry.CacheCreationTokens += b.cacheCr
 			entry.CacheReadTokens += b.cacheRd
-			entry.TotalCost += b.cost
+			entry.TotalCost, err = money.Add(entry.TotalCost, b.cost)
+			if err != nil {
+				return DailyUsageResult{}, fmt.Errorf(
+					"summing daily breakdown entry cost: %w", err)
+			}
 			mbd = append(mbd, ModelBreakdown{
 				ModelName:           m,
 				InputTokens:         b.inputTok,
@@ -2176,8 +2477,8 @@ func (db *DB) GetDailyUsage(
 			})
 		}
 		sort.Slice(pbd, func(i, j int) bool {
-			if pbd[i].Cost != pbd[j].Cost {
-				return pbd[i].Cost > pbd[j].Cost
+			if pbd[i].Cost.Microdollars != pbd[j].Cost.Microdollars {
+				return pbd[i].Cost.Microdollars > pbd[j].Cost.Microdollars
 			}
 			return pbd[i].Project < pbd[j].Project
 		})
@@ -2197,12 +2498,33 @@ func (db *DB) GetDailyUsage(
 			})
 		}
 		sort.Slice(abd, func(i, j int) bool {
-			if abd[i].Cost != abd[j].Cost {
-				return abd[i].Cost > abd[j].Cost
+			if abd[i].Cost.Microdollars != abd[j].Cost.Microdollars {
+				return abd[i].Cost.Microdollars > abd[j].Cost.Microdollars
 			}
 			return abd[i].Agent < abd[j].Agent
 		})
 		entry.AgentBreakdowns = abd
+
+		machineBreakdowns := make(
+			[]MachineBreakdown, 0, len(dm.machines),
+		)
+		for machine, b := range dm.machines {
+			machineBreakdowns = append(machineBreakdowns, MachineBreakdown{
+				MachineName:         machine,
+				InputTokens:         b.inputTok,
+				OutputTokens:        b.outputTok,
+				CacheCreationTokens: b.cacheCr,
+				CacheReadTokens:     b.cacheRd,
+				Cost:                b.cost,
+			})
+		}
+		sort.Slice(machineBreakdowns, func(i, j int) bool {
+			if machineBreakdowns[i].Cost.Microdollars != machineBreakdowns[j].Cost.Microdollars {
+				return machineBreakdowns[i].Cost.Microdollars > machineBreakdowns[j].Cost.Microdollars
+			}
+			return machineBreakdowns[i].MachineName < machineBreakdowns[j].MachineName
+		})
+		entry.MachineBreakdowns = machineBreakdowns
 
 		daily = append(daily, entry)
 
@@ -2210,7 +2532,11 @@ func (db *DB) GetDailyUsage(
 		totals.OutputTokens += entry.OutputTokens
 		totals.CacheCreationTokens += entry.CacheCreationTokens
 		totals.CacheReadTokens += entry.CacheReadTokens
-		totals.TotalCost += entry.TotalCost
+		totals.TotalCost, err = money.Add(totals.TotalCost, entry.TotalCost)
+		if err != nil {
+			return DailyUsageResult{}, fmt.Errorf(
+				"summing daily breakdown total: %w", err)
+		}
 	}
 
 	if daily == nil {
@@ -2237,6 +2563,10 @@ func (db *DB) GetDailyUsage(
 	if err != nil {
 		return DailyUsageResult{}, err
 	}
+	projectRows := DailyUsageResult{Daily: daily, SessionCounts: sessionCounts}
+	SanitizeDailyUsageProjectLabelsWithCatalog(&projectRows, projects)
+	daily = projectRows.Daily
+	sessionCounts = projectRows.SessionCounts
 	pricingBlock, err := rateResolver.BuildBlock()
 	if err != nil {
 		return DailyUsageResult{}, fmt.Errorf(
@@ -2245,7 +2575,7 @@ func (db *DB) GetDailyUsage(
 	return DailyUsageResult{
 		SchemaVersion: export.UsageDailySchemaVersion,
 		Pricing:       &pricingBlock,
-		Projects:      projects,
+		Projects:      export.ProjectMapForWire(projects),
 		Daily:         daily,
 		Totals:        totals,
 		SessionCounts: sessionCounts,
@@ -2254,13 +2584,13 @@ func (db *DB) GetDailyUsage(
 
 // TopSessionEntry is one row in the "top sessions by cost" result.
 type TopSessionEntry struct {
-	SessionID   string  `json:"sessionId"`
-	DisplayName string  `json:"displayName"`
-	Agent       string  `json:"agent"`
-	Project     string  `json:"project"`
-	StartedAt   string  `json:"startedAt"`
-	TotalTokens int     `json:"totalTokens"`
-	Cost        float64 `json:"cost"`
+	SessionID   string      `json:"sessionId"`
+	DisplayName string      `json:"displayName"`
+	Agent       string      `json:"agent"`
+	Project     string      `json:"project"`
+	StartedAt   string      `json:"startedAt"`
+	TotalTokens int         `json:"totalTokens"`
+	Cost        money.Money `json:"cost"`
 }
 
 // GetTopSessionsByCost returns sessions ranked by total cost
@@ -2300,8 +2630,9 @@ func (db *DB) GetTopSessionsByCost(
 	loc := f.location()
 
 	type sessAccum struct {
-		totalTokens int
-		cost        float64
+		totalTokens       int
+		cost              money.Money
+		authoritativeCost *money.Money
 	}
 
 	accum := make(map[string]*sessAccum)
@@ -2342,8 +2673,11 @@ func (db *DB) GetTopSessionsByCost(
 			seen[key] = struct{}{}
 		}
 
-		inputTok, outputTok, cacheCrTok, cacheRdTok, cost, _ :=
+		inputTok, outputTok, cacheCrTok, cacheRdTok, cost, _, priceErr :=
 			dailyUsageAmounts(r, rateResolver)
+		if priceErr != nil {
+			return nil, priceErr
+		}
 
 		sa, ok := accum[r.sessionID]
 		if !ok {
@@ -2353,7 +2687,15 @@ func (db *DB) GetTopSessionsByCost(
 		}
 		sa.totalTokens += inputTok + outputTok +
 			cacheCrTok + cacheRdTok
-		sa.cost += cost
+		sa.cost, priceErr = money.Add(sa.cost, cost)
+		if priceErr != nil {
+			return nil, fmt.Errorf("summing top-session cost: %w", priceErr)
+		}
+		if f.Model == "" && f.ExcludeModel == "" &&
+			r.costSource == CopilotReportedCostSource && r.cost.Valid {
+			v := money.Money{Microdollars: r.cost.Int64}
+			sa.authoritativeCost = &v
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil,
@@ -2370,13 +2712,18 @@ func (db *DB) GetTopSessionsByCost(
 			SessionID:   id,
 			DisplayName: id,
 			TotalTokens: sa.totalTokens,
-			Cost:        sa.cost,
+			Cost: func() money.Money {
+				if sa.authoritativeCost != nil {
+					return *sa.authoritativeCost
+				}
+				return sa.cost
+			}(),
 		})
 	}
 
 	sort.Slice(result, func(i, j int) bool {
-		if result[i].Cost != result[j].Cost {
-			return result[i].Cost > result[j].Cost
+		if result[i].Cost.Microdollars != result[j].Cost.Microdollars {
+			return result[i].Cost.Microdollars > result[j].Cost.Microdollars
 		}
 		return result[i].SessionID < result[j].SessionID
 	})
@@ -2408,20 +2755,38 @@ func (db *DB) GetTopSessionsByCost(
 // SessionUsage is the per-session token + cost summary returned by
 // the `session usage` command. Cost is an estimate from the
 // model_pricing catalog unless an agent reported cost directly
-// (usage_events.cost_usd). CostUSD is non-zero only when HasCost is
+// (usage_events.cost_microdollars). Cost is non-zero only when HasCost is
 // true; a partial total (some models unpriced) is never emitted.
 type SessionUsage struct {
-	SessionID         string   `json:"session_id"`
-	Agent             string   `json:"agent"`
-	Project           string   `json:"project"`
-	TotalOutputTokens int      `json:"total_output_tokens"`
-	PeakContextTokens int      `json:"peak_context_tokens"`
-	HasTokenData      bool     `json:"has_token_data"`
-	CostUSD           float64  `json:"cost_usd"`
-	HasCost           bool     `json:"has_cost"`
-	AICredits         float64  `json:"ai_credits,omitempty"`
-	Models            []string `json:"models"`
-	UnpricedModels    []string `json:"unpriced_models,omitempty"`
+	SessionID         string                       `json:"session_id"`
+	Agent             string                       `json:"agent"`
+	Project           string                       `json:"project"`
+	TotalOutputTokens int                          `json:"total_output_tokens"`
+	PeakContextTokens int                          `json:"peak_context_tokens"`
+	HasTokenData      bool                         `json:"has_token_data"`
+	Cost              money.Money                  `json:"cost"`
+	HasCost           bool                         `json:"has_cost"`
+	CostSource        export.CostSource            `json:"cost_source,omitempty"`
+	AICredits         float64                      `json:"ai_credits,omitempty"`
+	Models            []string                     `json:"models"`
+	UnpricedModels    []string                     `json:"unpriced_models,omitempty"`
+	BreakdownCount    int                          `json:"breakdown_count"`
+	Breakdown         []SessionUsageBreakdownEntry `json:"breakdown"`
+}
+
+type SessionUsageBreakdownEntry struct {
+	Ordinal                  int         `json:"ordinal"`
+	MessageOrdinal           *int        `json:"message_ordinal,omitempty"`
+	Source                   string      `json:"source"`
+	Label                    string      `json:"label"`
+	Timestamp                string      `json:"timestamp"`
+	Model                    string      `json:"model"`
+	InputTokens              int         `json:"input_tokens"`
+	OutputTokens             int         `json:"output_tokens"`
+	CacheCreationInputTokens int         `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int         `json:"cache_read_input_tokens"`
+	Cost                     money.Money `json:"cost"`
+	HasCost                  bool        `json:"has_cost"`
 }
 
 // sessionRowCost computes one usage row's cost and reports whether
@@ -2431,7 +2796,7 @@ type SessionUsage struct {
 // "$0".
 func sessionRowCost(
 	r usageScanRow, pricing *export.PricingResolver,
-) (cost float64, priced, contributes bool) {
+) (cost money.Money, priced, contributes bool, err error) {
 	var inTok, outTok, crTok, rdTok int
 	// cr5m/cr1h split the cache-creation total by ephemeral TTL so the two
 	// are priced at their separate rates, matching dailyUsageAmounts.
@@ -2453,31 +2818,86 @@ func sessionRowCost(
 		cr5m = crTok
 	}
 
-	if r.costUSD.Valid {
+	if r.cost.Valid {
 		pricing.RecordReported(r.model, pricing.Lookup(r.model))
-		return r.costUSD.Float64, true, true
+		return money.Money{Microdollars: r.cost.Int64}, true, true, nil
 	}
 	if inTok == 0 && outTok == 0 && reasoningTok == 0 &&
 		crTok == 0 && rdTok == 0 {
-		return 0, true, false
+		return money.Money{}, true, false, nil
 	}
 	lookup := pricing.Lookup(r.model)
 	if !lookup.OK {
 		pricing.RecordComputed(r.model, lookup)
-		return 0, false, true
+		return money.Money{}, false, true, nil
 	}
 	rates := lookup.Rates
 	billableOutput := outTok
 	if billableOutput == 0 {
 		billableOutput = reasoningTok
 	}
-	cost = (float64(inTok)*rates.InputPerMTok +
-		float64(billableOutput)*rates.OutputPerMTok +
-		float64(cr5m)*rates.CacheWritePerMTok +
-		float64(cr1h)*rates.CacheWrite1hPerMTok +
-		float64(rdTok)*rates.CacheReadPerMTok) / 1_000_000
+	cost, err = money.CostPerMillion([]money.RatedTokens{
+		{Tokens: int64(inTok), Rate: rates.InputPerMTok},
+		{Tokens: int64(billableOutput), Rate: rates.OutputPerMTok},
+		{Tokens: int64(cr5m), Rate: rates.CacheWritePerMTok},
+		{Tokens: int64(cr1h), Rate: rates.CacheWrite1hPerMTok},
+		{Tokens: int64(rdTok), Rate: rates.CacheReadPerMTok},
+	})
+	if err != nil {
+		return money.Money{}, false, false,
+			fmt.Errorf("pricing session usage for model %q: %w", r.model, err)
+	}
 	pricing.RecordComputed(r.model, lookup)
-	return cost, true, true
+	return cost, true, true, nil
+}
+
+func sessionUsageBreakdownEntry(
+	r usageScanRow,
+	ordinal int,
+	cost money.Money,
+	priced bool,
+) SessionUsageBreakdownEntry {
+	var inTok, outTok, crTok, rdTok int
+	if r.usageSource == "message" {
+		inTok, outTok, crTok, rdTok =
+			clampedUsageTokenCounters(r.tokenJSON)
+	} else {
+		inTok, outTok, crTok, rdTok = usageEventRowTokens(
+			r.usageSource,
+			r.inputTokens, r.outputTokens,
+			r.cacheCreationInputTokens, r.cacheReadInputTokens)
+	}
+	entry := SessionUsageBreakdownEntry{
+		Ordinal:                  ordinal,
+		Source:                   r.usageSource,
+		Label:                    sessionUsageBreakdownLabel(r),
+		Timestamp:                r.ts,
+		Model:                    r.model,
+		InputTokens:              inTok,
+		OutputTokens:             outTok,
+		CacheCreationInputTokens: crTok,
+		CacheReadInputTokens:     rdTok,
+		Cost:                     cost,
+		HasCost:                  priced,
+	}
+	if r.messageOrdinal.Valid {
+		messageOrdinal := int(r.messageOrdinal.Int64)
+		entry.MessageOrdinal = &messageOrdinal
+	}
+	return entry
+}
+
+func sessionUsageBreakdownLabel(r usageScanRow) string {
+	if r.messageOrdinal.Valid {
+		if r.usageSource == "message" {
+			return fmt.Sprintf("Prompt %d", r.messageOrdinal.Int64+1)
+		}
+		return fmt.Sprintf("Step %d", r.messageOrdinal.Int64+1)
+	}
+	if r.usageSource != "" {
+		return r.usageSource
+	}
+	return "usage"
 }
 
 // GetSessionUsage returns one session's token totals and cost
@@ -2487,9 +2907,11 @@ func sessionRowCost(
 // rows. Dedup is intra-session only; this reports the session's own
 // usage, which can diverge from the dashboard's cross-session
 // credited total for fork/subagent sessions. Returns (nil, nil) when
-// the session does not exist.
+// the session does not exist. BreakdownCount is always populated;
+// per-row Breakdown entries are built only when includeBreakdown is
+// true so callers that need just the totals avoid the row payload.
 func (db *DB) GetSessionUsage(
-	ctx context.Context, sessionID string,
+	ctx context.Context, sessionID string, includeBreakdown bool,
 ) (*SessionUsage, error) {
 	sess, err := db.GetSession(ctx, sessionID)
 	if err != nil {
@@ -2507,18 +2929,24 @@ func (db *DB) GetSessionUsage(
 
 	query := usageRowSelect() + ` AND u.session_id = ?
 		ORDER BY u.ts ASC, u.session_id ASC,
-		COALESCE(u.message_ordinal, -1) ASC`
+		COALESCE(u.message_ordinal, -1) ASC,
+		u.usage_source ASC,
+		COALESCE(u.usage_dedup_key, '') ASC`
 	rows, err := db.getReader().QueryContext(ctx, query, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("querying session usage: %w", err)
 	}
 	defer rows.Close()
 
-	var cost float64
+	var cost money.Money
+	var authoritativeCost *money.Money
+	var hasComputedCost, hasReportedCost bool
 	contributing := false
 	allPriced := true
 	modelsSet := make(map[string]struct{})
 	unpricedSet := make(map[string]struct{})
+	breakdown := make([]SessionUsageBreakdownEntry, 0)
+	breakdownCount := 0
 
 	seen := make(map[usageDedupToken]struct{})
 
@@ -2537,21 +2965,57 @@ func (db *DB) GetSessionUsage(
 			seen[key] = struct{}{}
 		}
 
-		c, priced, contributes := sessionRowCost(r, rateResolver)
+		costRow := r
+		authoritative := r.costSource == CopilotReportedCostSource && r.cost.Valid
+		if authoritative {
+			v := money.Money{Microdollars: r.cost.Int64}
+			authoritativeCost = &v
+			costRow.cost = sql.NullInt64{}
+		}
+		c, priced, contributes, priceErr := sessionRowCost(costRow, rateResolver)
+		if priceErr != nil {
+			return nil, priceErr
+		}
 		if !contributes {
 			continue
 		}
 		contributing = true
 		modelsSet[r.model] = struct{}{}
+		if !authoritative {
+			if r.cost.Valid {
+				hasReportedCost = true
+			} else {
+				hasComputedCost = true
+			}
+		}
 		if priced {
-			cost += c
+			cost, priceErr = money.Add(cost, c)
+			if priceErr != nil {
+				return nil, fmt.Errorf("summing session usage cost: %w", priceErr)
+			}
 		} else {
 			allPriced = false
 			unpricedSet[r.model] = struct{}{}
 		}
+		breakdownCount++
+		if includeBreakdown {
+			breakdown = append(breakdown, sessionUsageBreakdownEntry(
+				r, breakdownCount, c, priced))
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterating session usage rows: %w", err)
+	}
+	if authoritativeCost != nil && len(breakdown) > 0 {
+		weights := make([]money.Money, len(breakdown))
+		for i := range breakdown {
+			weights[i] = breakdown[i].Cost
+		}
+		costs := export.AllocateCostByWeight(*authoritativeCost, weights)
+		for i := range breakdown {
+			breakdown[i].Cost = costs[i]
+			breakdown[i].HasCost = true
+		}
 	}
 
 	out := &SessionUsage{
@@ -2562,11 +3026,19 @@ func (db *DB) GetSessionUsage(
 		PeakContextTokens: sess.PeakContextTokens,
 		HasTokenData:      sess.HasTotalOutputTokens || sess.HasPeakContextTokens,
 		Models:            sortedSetKeys(modelsSet),
-		HasCost:           contributing && allPriced,
+		HasCost:           authoritativeCost != nil || (contributing && allPriced),
+		BreakdownCount:    breakdownCount,
+		Breakdown:         breakdown,
 	}
 	if out.HasCost {
-		out.CostUSD = cost
-		out.AICredits = AICreditsFromCost(sess.Agent, cost)
+		if authoritativeCost != nil {
+			out.Cost = *authoritativeCost
+			out.CostSource = export.CostSourceReported
+		} else {
+			out.Cost = cost
+			out.CostSource = export.CombinedCostSource(hasComputedCost, hasReportedCost)
+		}
+		out.AICredits = AICreditsFromCost(sess.Agent, out.Cost)
 	}
 	if len(unpricedSet) > 0 {
 		out.UnpricedModels = sortedSetKeys(unpricedSet)

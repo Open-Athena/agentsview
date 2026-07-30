@@ -6,10 +6,12 @@
 package activity
 
 import (
+	"fmt"
 	"sort"
 	"time"
 
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 )
 
 // Params controls one range aggregation. RangeStart/RangeEnd are the resolved
@@ -57,12 +59,76 @@ type UsageRow struct {
 	Model           string
 	Timestamp       string // ts, RFC3339 or ""
 	OutputTokens    int
-	Cost            float64
+	Cost            money.Money
+	CostSource      export.CostSource
+	SessionCost     *money.Money
+	Priced          bool
+	Contributes     bool
 	Agent           string
 	ClaudeMessageID string
 	ClaudeRequestID string
 	SourceUUID      string
 	UsageDedupKey   string
+}
+
+type UsageCostAllocation struct {
+	Cost        money.Money
+	CostSource  export.CostSource
+	Priced      bool
+	Contributes bool
+}
+
+// AllocateUsageCosts selects aggregate row costs. A session may carry one
+// session total; when it does, that settlement replaces the session's row
+// estimates and is distributed by their catalog-cost weights.
+func AllocateUsageCosts(usage []UsageRow) []UsageCostAllocation {
+	type sessionCost struct {
+		carrier int
+		cost    money.Money
+		indices []int
+	}
+	allocated := make([]UsageCostAllocation, len(usage))
+	sessionCosts := make(map[string]*sessionCost)
+	for i, row := range usage {
+		allocated[i] = UsageCostAllocation{
+			Cost: row.Cost, CostSource: row.CostSource,
+			Priced: row.Priced, Contributes: row.Contributes,
+		}
+		if row.SessionCost != nil {
+			sessionCosts[row.SessionID] = &sessionCost{
+				carrier: i,
+				cost:    *row.SessionCost,
+			}
+		}
+	}
+	for i, row := range usage {
+		selected := sessionCosts[row.SessionID]
+		if selected == nil || !allocated[i].Contributes {
+			continue
+		}
+		selected.indices = append(selected.indices, i)
+	}
+	for _, selected := range sessionCosts {
+		if len(selected.indices) == 0 {
+			allocated[selected.carrier] = UsageCostAllocation{
+				Cost: selected.cost, CostSource: export.CostSourceReported,
+				Priced: true, Contributes: true,
+			}
+			continue
+		}
+		weights := make([]money.Money, len(selected.indices))
+		for i, index := range selected.indices {
+			weights[i] = usage[index].Cost
+		}
+		costs := export.AllocateCostByWeight(selected.cost, weights)
+		for i, index := range selected.indices {
+			allocated[index] = UsageCostAllocation{
+				Cost: costs[i], CostSource: export.CostSourceReported,
+				Priced: true, Contributes: true,
+			}
+		}
+	}
+	return allocated
 }
 
 // Report is the API payload.
@@ -90,13 +156,39 @@ type Report struct {
 	Intervals          []ReportInterval                  `json:"intervals"`
 }
 
+func SanitizeProjectLabels(
+	report *Report, projects map[string]export.ProjectMapEntry,
+) {
+	for i := range report.ByProject {
+		report.ByProject[i].ProjectKey = export.ProjectKeyForEntry(
+			projects[report.ByProject[i].Key],
+		)
+		report.ByProject[i].Key = export.SafeProjectDisplayLabel(
+			report.ByProject[i].Key,
+		)
+	}
+	for i := range report.BySession {
+		title := export.SafeProjectDisplayLabel(report.BySession[i].Title)
+		if title == "" {
+			title = report.BySession[i].SessionID
+		}
+		report.BySession[i].Title = title
+		report.BySession[i].ProjectKey = export.ProjectKeyForEntry(
+			projects[report.BySession[i].Project],
+		)
+		report.BySession[i].Project = export.SafeProjectDisplayLabel(
+			report.BySession[i].Project,
+		)
+	}
+}
+
 type Bucket struct {
-	Start        string  `json:"start"`
-	End          string  `json:"end"`
-	MaxAgents    int     `json:"max_agents"`
-	AgentMinutes float64 `json:"agent_minutes"`
-	OutputTokens int     `json:"output_tokens"`
-	Cost         float64 `json:"cost"`
+	Start        string      `json:"start"`
+	End          string      `json:"end"`
+	MaxAgents    int         `json:"max_agents"`
+	AgentMinutes float64     `json:"agent_minutes"`
+	OutputTokens int         `json:"output_tokens"`
+	Cost         money.Money `json:"cost"`
 	// Automated/interactive split of the concurrency peak: the live automated
 	// and interactive counts AT the instant MaxAgents first occurs. They sum to
 	// MaxAgents, so a stacked bar reflects the true peak rather than stacking two
@@ -121,20 +213,20 @@ type Peak struct {
 }
 
 type Totals struct {
-	ActiveMinutes    float64 `json:"active_minutes"`
-	IdleMinutes      float64 `json:"idle_minutes"`
-	AgentMinutes     float64 `json:"agent_minutes"`
-	Sessions         int     `json:"sessions"`
-	UntimedSessions  int     `json:"untimed_sessions"`
-	DistinctProjects int     `json:"distinct_projects"`
-	DistinctModels   int     `json:"distinct_models"`
-	OutputTokens     int     `json:"output_tokens"`
-	Cost             float64 `json:"cost"`
+	ActiveMinutes    float64     `json:"active_minutes"`
+	IdleMinutes      float64     `json:"idle_minutes"`
+	AgentMinutes     float64     `json:"agent_minutes"`
+	Sessions         int         `json:"sessions"`
+	UntimedSessions  int         `json:"untimed_sessions"`
+	DistinctProjects int         `json:"distinct_projects"`
+	DistinctModels   int         `json:"distinct_models"`
+	OutputTokens     int         `json:"output_tokens"`
+	Cost             money.Money `json:"cost"`
 	// Additive automated/interactive segments (segment + segment == combined).
-	AutomatedAgentMinutes   float64 `json:"automated_agent_minutes"`
-	InteractiveAgentMinutes float64 `json:"interactive_agent_minutes"`
-	AutomatedCost           float64 `json:"automated_cost"`
-	InteractiveCost         float64 `json:"interactive_cost"`
+	AutomatedAgentMinutes   float64     `json:"automated_agent_minutes"`
+	InteractiveAgentMinutes float64     `json:"interactive_agent_minutes"`
+	AutomatedCost           money.Money `json:"automated_cost"`
+	InteractiveCost         money.Money `json:"interactive_cost"`
 	// Session counts split by class (AutomatedSessions + InteractiveSessions
 	// == Sessions), so the summary card can show "total (auto / int)".
 	AutomatedSessions   int `json:"automated_sessions"`
@@ -146,29 +238,31 @@ type Totals struct {
 // additive automated/interactive segments of each, exposed for a stacked-bar
 // rendering the current UI does not yet draw (it shows the combined metric).
 type KeyMinutes struct {
-	Key                     string  `json:"key"`
-	AgentMinutes            float64 `json:"agent_minutes"`
-	Cost                    float64 `json:"cost"`
-	AutomatedAgentMinutes   float64 `json:"automated_agent_minutes"`
-	InteractiveAgentMinutes float64 `json:"interactive_agent_minutes"`
-	AutomatedCost           float64 `json:"automated_cost"`
-	InteractiveCost         float64 `json:"interactive_cost"`
+	ProjectKey              string      `json:"project_key,omitempty"`
+	Key                     string      `json:"key"`
+	AgentMinutes            float64     `json:"agent_minutes"`
+	Cost                    money.Money `json:"cost"`
+	AutomatedAgentMinutes   float64     `json:"automated_agent_minutes"`
+	InteractiveAgentMinutes float64     `json:"interactive_agent_minutes"`
+	AutomatedCost           money.Money `json:"automated_cost"`
+	InteractiveCost         money.Money `json:"interactive_cost"`
 }
 
 type SessionRow struct {
-	SessionID     string   `json:"session_id"`
-	Title         string   `json:"title"`
-	Project       string   `json:"project"`
-	Agent         string   `json:"agent"`
-	PrimaryModel  string   `json:"primary_model"`
-	Models        []string `json:"models"`
-	AgentMinutes  *float64 `json:"agent_minutes"` // nil when untimed
-	Cost          float64  `json:"cost"`
-	OutputTokens  int      `json:"output_tokens"`
-	FirstActive   *string  `json:"first_active"`
-	LastActive    *string  `json:"last_active"`
-	TimingQuality string   `json:"timing_quality"` // "timed" | "untimed"
-	IsAutomated   bool     `json:"is_automated"`
+	SessionID     string      `json:"session_id"`
+	ProjectKey    string      `json:"project_key"`
+	Title         string      `json:"title"`
+	Project       string      `json:"project"`
+	Agent         string      `json:"agent"`
+	PrimaryModel  string      `json:"primary_model"`
+	Models        []string    `json:"models"`
+	AgentMinutes  *float64    `json:"agent_minutes"` // nil when untimed
+	Cost          money.Money `json:"cost"`
+	OutputTokens  int         `json:"output_tokens"`
+	FirstActive   *string     `json:"first_active"`
+	LastActive    *string     `json:"last_active"`
+	TimingQuality string      `json:"timing_quality"` // "timed" | "untimed"
+	IsAutomated   bool        `json:"is_automated"`
 }
 
 // interval is an internal half-open active span anchored to one session.
@@ -206,7 +300,9 @@ func rangeWindows(p Params) []BucketWindow {
 }
 
 // Aggregate builds the range's report from the three input streams.
-func Aggregate(p Params, sessions []SessionMeta, activity []ActivityEvent, usage []UsageRow) Report {
+func Aggregate(
+	p Params, sessions []SessionMeta, activity []ActivityEvent, usage []UsageRow,
+) (Report, error) {
 	gapCap := time.Duration(p.GapCapSeconds) * time.Second
 	startUTC, endUTC, effEnd := p.RangeStart, p.RangeEnd, p.EffectiveEnd
 	var asOf *string
@@ -248,10 +344,18 @@ func Aggregate(p Params, sessions []SessionMeta, activity []ActivityEvent, usage
 		r.Totals.IdleMinutes = 0
 	}
 
-	applyUsage(&r, p, windows, startUTC, endUTC, usage, automatedBy)
-	buildSessionsTable(&r, startUTC, endUTC, effEnd, sessions, intervals, usage)
+	if err := applyUsage(
+		&r, p, windows, startUTC, endUTC, usage, automatedBy,
+	); err != nil {
+		return Report{}, err
+	}
+	if err := buildSessionsTable(
+		&r, startUTC, endUTC, effEnd, sessions, intervals, usage,
+	); err != nil {
+		return Report{}, err
+	}
 	r.Intervals = reportIntervals(intervals)
-	return r
+	return r, nil
 }
 
 // paramsLoc returns the params timezone, defaulting nil to UTC.
@@ -520,9 +624,9 @@ func minTime(a, b time.Time) time.Time {
 // buildSessionsTable consumes it to build per-session rows and model breakdowns
 // from the same deduped survivor set dedupUsage returns.
 type usageAgg struct {
-	cost         float64
+	cost         money.Money
 	outputTokens int
-	models       map[string]float64 // model -> cost (for primary/mixed)
+	models       map[string]money.Money // model -> cost (for primary/mixed)
 }
 
 type usageDedupToken struct {
@@ -602,21 +706,43 @@ func dedupUsage(start, end, effEnd time.Time, usage []UsageRow) []UsageRow {
 // and cost into r.Totals and the window whose [Start, End) contains each row's
 // timestamp.
 func applyUsage(r *Report, p Params, windows []BucketWindow, start, end time.Time,
-	usage []UsageRow, automatedBy map[string]bool) {
-	for _, u := range dedupUsage(start, end, p.EffectiveEnd, usage) {
+	usage []UsageRow, automatedBy map[string]bool) error {
+	usage = dedupUsage(start, end, p.EffectiveEnd, usage)
+	allocated := AllocateUsageCosts(usage)
+	for i, u := range usage {
 		r.Totals.OutputTokens += u.OutputTokens
-		r.Totals.Cost += u.Cost
+		var err error
+		r.Totals.Cost, err = money.Add(r.Totals.Cost, allocated[i].Cost)
+		if err != nil {
+			return fmt.Errorf("summing activity report cost: %w", err)
+		}
 		if automatedBy[u.SessionID] {
-			r.Totals.AutomatedCost += u.Cost
+			r.Totals.AutomatedCost, err = money.Add(
+				r.Totals.AutomatedCost, allocated[i].Cost,
+			)
+			if err != nil {
+				return fmt.Errorf("summing automated activity report cost: %w", err)
+			}
 		} else {
-			r.Totals.InteractiveCost += u.Cost
+			r.Totals.InteractiveCost, err = money.Add(
+				r.Totals.InteractiveCost, allocated[i].Cost,
+			)
+			if err != nil {
+				return fmt.Errorf("summing interactive activity report cost: %w", err)
+			}
 		}
 		t, _ := parseTS(u.Timestamp)
 		if b := windowIndex(windows, t); b >= 0 && b < len(r.Buckets) {
 			r.Buckets[b].OutputTokens += u.OutputTokens
-			r.Buckets[b].Cost += u.Cost
+			r.Buckets[b].Cost, err = money.Add(
+				r.Buckets[b].Cost, allocated[i].Cost,
+			)
+			if err != nil {
+				return fmt.Errorf("summing activity bucket cost: %w", err)
+			}
 		}
 	}
+	return nil
 }
 
 // windowIndex returns the index of the ascending-sorted window whose half-open
@@ -646,7 +772,7 @@ func windowIndex(windows []BucketWindow, t time.Time) int {
 // per-session minutes up by project/agent (timed sessions only) and by interval
 // model, all sorted by minutes descending with empty/zero keys dropped.
 func buildSessionsTable(r *Report, start, end, effEnd time.Time,
-	sessions []SessionMeta, ivs []interval, usage []UsageRow) {
+	sessions []SessionMeta, ivs []interval, usage []UsageRow) error {
 	// Sort sessions by ID so the cost and minute rollups below accumulate in
 	// one deterministic order. addKey sums float64 values across sessions and
 	// float addition is not associative, so the unspecified per-backend row
@@ -683,16 +809,27 @@ func buildSessionsTable(r *Report, start, end, effEnd time.Time,
 	}
 	// Per-session cost/tokens/models from deduped usage.
 	cost := map[string]*usageAgg{}
-	for _, u := range dedupUsage(start, end, effEnd, usage) {
+	usage = dedupUsage(start, end, effEnd, usage)
+	allocated := AllocateUsageCosts(usage)
+	for i, u := range usage {
 		c := cost[u.SessionID]
 		if c == nil {
-			c = &usageAgg{models: map[string]float64{}}
+			c = &usageAgg{models: map[string]money.Money{}}
 			cost[u.SessionID] = c
 		}
-		c.cost += u.Cost
+		var err error
+		c.cost, err = money.Add(c.cost, allocated[i].Cost)
+		if err != nil {
+			return fmt.Errorf("summing activity session cost: %w", err)
+		}
 		c.outputTokens += u.OutputTokens
 		if u.Model != "" {
-			c.models[u.Model] += u.Cost
+			c.models[u.Model], err = money.Add(
+				c.models[u.Model], allocated[i].Cost,
+			)
+			if err != nil {
+				return fmt.Errorf("summing activity session model cost: %w", err)
+			}
 		}
 	}
 	projSet := map[string]struct{}{}
@@ -721,10 +858,16 @@ func buildSessionsTable(r *Report, start, end, effEnd time.Time,
 			l := a.last.Format(time.RFC3339)
 			row.FirstActive, row.LastActive = &f, &l
 			row.PrimaryModel, row.Models = primaryAndModels(a.modelMins)
-			addKey(byProject, s.Project, mins, 0, au)
-			addKey(byAgent, s.Agent, mins, 0, au)
+			if err := addKey(byProject, s.Project, mins, money.Money{}, au); err != nil {
+				return fmt.Errorf("summing activity project minutes: %w", err)
+			}
+			if err := addKey(byAgent, s.Agent, mins, money.Money{}, au); err != nil {
+				return fmt.Errorf("summing activity agent minutes: %w", err)
+			}
 			for m, mm := range a.modelMins {
-				addKey(byModel, m, mm, 0, au)
+				if err := addKey(byModel, m, mm, money.Money{}, au); err != nil {
+					return fmt.Errorf("summing activity model minutes: %w", err)
+				}
 			}
 		} else {
 			r.Totals.UntimedSessions++
@@ -733,14 +876,20 @@ func buildSessionsTable(r *Report, start, end, effEnd time.Time,
 			row.Cost = c.cost
 			row.OutputTokens = c.outputTokens
 			if row.PrimaryModel == "" {
-				row.PrimaryModel, row.Models = primaryAndModels(c.models)
+				row.PrimaryModel, row.Models = primaryAndMoneyModels(c.models)
 			}
 			// Cost rolls up for every session with usage, timed or not, so the
 			// cost breakdown sums to Totals.Cost. Minutes stay timed-only above.
-			addKey(byProject, s.Project, 0, c.cost, au)
-			addKey(byAgent, s.Agent, 0, c.cost, au)
+			if err := addKey(byProject, s.Project, 0, c.cost, au); err != nil {
+				return fmt.Errorf("summing activity project cost: %w", err)
+			}
+			if err := addKey(byAgent, s.Agent, 0, c.cost, au); err != nil {
+				return fmt.Errorf("summing activity agent cost: %w", err)
+			}
 			for m, mc := range c.models {
-				addKey(byModel, m, 0, mc, au)
+				if err := addKey(byModel, m, 0, mc, au); err != nil {
+					return fmt.Errorf("summing activity model cost: %w", err)
+				}
 			}
 		}
 		for _, m := range row.Models {
@@ -757,6 +906,7 @@ func buildSessionsTable(r *Report, start, end, effEnd time.Time,
 	r.ByProject = breakdownRows(byProject, false)
 	r.ByAgent = breakdownRows(byAgent, false)
 	r.ByModel = breakdownRows(byModel, true)
+	return nil
 }
 
 // keyAgg accumulates a breakdown key's combined agent-minutes and cost plus the
@@ -764,30 +914,38 @@ func buildSessionsTable(r *Report, start, end, effEnd time.Time,
 // from deduped usage (all sessions, timed or not).
 type keyAgg struct {
 	minutes      float64
-	cost         float64
+	cost         money.Money
 	autoMinutes  float64
 	interMinutes float64
-	autoCost     float64
-	interCost    float64
+	autoCost     money.Money
+	interCost    money.Money
 }
 
 // addKey accumulates minutes and cost into the key's aggregate, routing the
 // values into the automated or interactive segment by the session's class.
-func addKey(m map[string]*keyAgg, key string, minutes, cost float64, automated bool) {
+func addKey(
+	m map[string]*keyAgg, key string, minutes float64, cost money.Money,
+	automated bool,
+) error {
 	a := m[key]
 	if a == nil {
 		a = &keyAgg{}
 		m[key] = a
 	}
 	a.minutes += minutes
-	a.cost += cost
+	var err error
+	a.cost, err = money.Add(a.cost, cost)
+	if err != nil {
+		return err
+	}
 	if automated {
 		a.autoMinutes += minutes
-		a.autoCost += cost
+		a.autoCost, err = money.Add(a.autoCost, cost)
 	} else {
 		a.interMinutes += minutes
-		a.interCost += cost
+		a.interCost, err = money.Add(a.interCost, cost)
 	}
+	return err
 }
 
 // breakdownRows turns a key->aggregate map into a slice sorted by combined
@@ -797,7 +955,7 @@ func addKey(m map[string]*keyAgg, key string, minutes, cost float64, automated b
 func breakdownRows(m map[string]*keyAgg, dropModelKeys bool) []KeyMinutes {
 	out := make([]KeyMinutes, 0, len(m))
 	for k, v := range m {
-		if k == "" || (v.minutes == 0 && v.cost == 0) {
+		if k == "" || (v.minutes == 0 && v.cost.Microdollars == 0) {
 			continue
 		}
 		if dropModelKeys && k == "unknown" {
@@ -845,6 +1003,26 @@ func primaryAndModels(w map[string]float64) (string, []string) {
 		keys = append(keys, k)
 		if v > best {
 			best, primary = v, k
+		}
+	}
+	sort.Strings(keys)
+	if primary == "" && len(keys) > 0 {
+		primary = keys[0]
+	}
+	return primary, keys
+}
+
+func primaryAndMoneyModels(w map[string]money.Money) (string, []string) {
+	var keys []string
+	primary := ""
+	var best int64
+	for k, v := range w {
+		if k == "" || k == "unknown" {
+			continue
+		}
+		keys = append(keys, k)
+		if v.Microdollars > best {
+			best, primary = v.Microdollars, k
 		}
 	}
 	sort.Strings(keys)

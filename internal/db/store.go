@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"io"
 
 	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/export"
@@ -37,7 +38,9 @@ type Store interface {
 
 	// Messages.
 	GetMessages(ctx context.Context, sessionID string, from, limit int, asc bool) ([]Message, error)
+	GetMessagesWindow(ctx context.Context, sessionID string, w MessageWindow) ([]Message, error)
 	GetAllMessages(ctx context.Context, sessionID string) ([]Message, error)
+	GetResumeModelCounts(ctx context.Context, sessionID string) ([]ModelCount, error)
 	GetSessionActivity(ctx context.Context, sessionID string) (*SessionActivityResponse, error)
 
 	// Timing.
@@ -45,6 +48,7 @@ type Store interface {
 
 	// Search.
 	HasFTS() bool
+	HasSemantic() bool
 	Search(ctx context.Context, f SearchFilter) (SearchPage, error)
 	SearchSession(ctx context.Context, sessionID, query string) ([]int, error)
 	SearchContent(ctx context.Context, f ContentSearchFilter) (ContentSearchPage, error)
@@ -57,6 +61,7 @@ type Store interface {
 	// Metadata.
 	GetStats(ctx context.Context, excludeOneShot, excludeAutomated bool) (Stats, error)
 	GetProjects(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]ProjectInfo, error)
+	GetActiveProjectLabels(ctx context.Context) ([]string, error)
 	GetAgents(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]AgentInfo, error)
 	GetMachines(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]string, error)
 	GetBranches(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]BranchInfo, error)
@@ -71,7 +76,7 @@ type Store interface {
 	GetAnalyticsHourOfWeek(ctx context.Context, f AnalyticsFilter) (HourOfWeekResponse, error)
 	GetAnalyticsSessionShape(ctx context.Context, f AnalyticsFilter) (SessionShapeResponse, error)
 	GetAnalyticsTools(ctx context.Context, f AnalyticsFilter) (ToolsAnalyticsResponse, error)
-	GetAnalyticsSkills(ctx context.Context, f AnalyticsFilter) (SkillsAnalyticsResponse, error)
+	GetAnalyticsSkills(ctx context.Context, f AnalyticsFilter, granularity string) (SkillsAnalyticsResponse, error)
 	GetAnalyticsVelocity(ctx context.Context, f AnalyticsFilter) (VelocityResponse, error)
 	GetAnalyticsTopSessions(ctx context.Context, f AnalyticsFilter, metric string) (TopSessionsResponse, error)
 	GetAnalyticsSignals(ctx context.Context, f AnalyticsFilter) (SignalsAnalyticsResponse, error)
@@ -85,7 +90,7 @@ type Store interface {
 	GetTopSessionsByCost(ctx context.Context, f UsageFilter, limit int) ([]TopSessionEntry, error)
 	GetUsageSessionCounts(ctx context.Context, f UsageFilter) (UsageSessionCounts, error)
 	GetUsageMatchingSessionCount(ctx context.Context, f UsageFilter) (int, error)
-	GetSessionUsage(ctx context.Context, sessionID string) (*SessionUsage, error)
+	GetSessionUsage(ctx context.Context, sessionID string, includeBreakdown bool) (*SessionUsage, error)
 	GetLongestUserPrompts(ctx context.Context, limit int, project string) ([]LongestUserPrompt, error)
 
 	// Stars.
@@ -105,6 +110,22 @@ type Store interface {
 	GetCachedInsight(ctx context.Context, cacheKey string) (*Insight, error)
 	InsertInsight(s Insight) (int64, error)
 	DeleteInsight(id int64) error
+
+	// RecallEntries.
+	ListRecallEntries(ctx context.Context, q RecallQuery) ([]RecallEntry, error)
+	GetRecallEntry(ctx context.Context, id string) (*RecallEntry, error)
+	QueryRecallEntries(ctx context.Context, q RecallQuery) (RecallPage, error)
+	RecordRecallQueryEvent(
+		ctx context.Context, event RecallQueryEvent,
+	) (string, error)
+	InsertRecallEntry(m RecallEntry) (string, error)
+	ImportAcceptedRecallEntriesJSONL(ctx context.Context, r io.Reader) (RecallImportResult, error)
+	ImportAcceptedRecallEntriesJSONLWithOptions(
+		ctx context.Context, r io.Reader, opts RecallImportOptions,
+	) (RecallImportResult, error)
+	IngestEvalTrajectory(
+		ctx context.Context, in EvalTrajectoryIngest,
+	) (EvalTrajectoryIngestResult, error)
 
 	// Session management.
 	RenameSession(id string, displayName *string) error

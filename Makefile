@@ -11,8 +11,24 @@ LDFLAGS := -X main.version=$(VERSION) \
 LDFLAGS_RELEASE := $(LDFLAGS) -s -w
 DESKTOP_DIST_DIR := dist/desktop
 GOLANGCI_LINT_VERSION ?= v2.11.4
+# Isolate each checkout from stale sibling-worktree fixes and issue positions.
+GOLANGCI_LINT_CACHE ?= $(CURDIR)/.golangci-cache
+export GOLANGCI_LINT_CACHE
 CUSTOM_GCL := ./custom-gcl
 PRICING_SNAPSHOT_FILE := internal/pricing/snapshot/litellm_snapshot.json.gz
+
+# sqlite-vec's cgo bindings #include "sqlite3.h". Without an override the
+# compiler falls back to the system header (the macOS SDK one marks
+# sqlite3_auto_extension deprecated, warning on every build) which can also
+# drift from the amalgamation mattn/go-sqlite3 statically links. Compile
+# against the bundled amalgamation's own header instead, mirroring the
+# Linux release workflow in .github/workflows/release.yml.
+# Setting CGO_CFLAGS replaces Go's built-in default of "-O2 -g", so restate
+# it explicitly or the SQLite amalgamation compiles unoptimized (2-3x slower
+# queries, caught by the bench gate). Caller-provided flags stay last so
+# they can still override.
+SQLITE_INCLUDE_DIR := .sqlite-include
+export CGO_CFLAGS := -O2 -g -I$(CURDIR)/$(SQLITE_INCLUDE_DIR) $(CGO_CFLAGS)
 
 GOPATH_FIRST := $(shell go env GOPATH | cut -d: -f1)
 AIR_BIN := $(shell if command -v air >/dev/null 2>&1; then command -v air; \
@@ -20,7 +36,7 @@ AIR_BIN := $(shell if command -v air >/dev/null 2>&1; then command -v air; \
 	elif [ -x "$(GOPATH_FIRST)/bin/air" ]; then printf "%s" "$(GOPATH_FIRST)/bin/air"; \
 	fi)
 
-.PHONY: build build-release install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app docs-install docs-build docs-serve docs-check docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy test test-short bench-backends bench-gate bench-gate-config test-postgres test-postgres-ci test-s3 postgres-up postgres-down test-ssh test-ssh-ci ssh-up ssh-down e2e e2e-duckdb vet lint lint-ci lint-golangci lint-golangci-ci nilaway nilaway-golangci-build lint-tools tidy clean release release-darwin-arm64 release-darwin-amd64 release-linux-amd64 install-hooks ensure-embed-dir pricing-snapshot dev-snapshot help
+.PHONY: build build-release install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app docs-install docs-build docs-serve docs-check docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy test test-short test-evalingest bench-backends bench-gate bench-gate-config test-postgres test-postgres-ci test-s3 postgres-up postgres-down test-ssh test-ssh-ci ssh-up ssh-down e2e e2e-duckdb vet lint lint-ci lint-golangci lint-golangci-ci nilaway nilaway-golangci-build lint-tools tidy clean release release-darwin-arm64 release-darwin-amd64 release-linux-amd64 install-hooks ensure-embed-dir pricing-snapshot sqlite-vec-header dev-snapshot help
 
 # Ensure go:embed has at least one file (no-op if frontend is built)
 ensure-embed-dir:
@@ -30,9 +46,19 @@ ensure-embed-dir:
 			'keep embed dir for generated frontend assets' \
 			> internal/web/dist/.keep
 
+# Copy the go-sqlite3 amalgamation header where CGO_CFLAGS points.
+# Chained from pricing-snapshot so every Go-compiling target stages it
+# without lengthening each prerequisite list.
+sqlite-vec-header:
+	@go mod download github.com/mattn/go-sqlite3
+	@mkdir -p $(SQLITE_INCLUDE_DIR)
+	@install -m 0644 \
+		"$$(go list -m -f '{{.Dir}}' github.com/mattn/go-sqlite3)/sqlite3-binding.h" \
+		$(SQLITE_INCLUDE_DIR)/sqlite3.h
+
 # Restore the generated LiteLLM fallback snapshot from its artifact branch.
 # Pinned ref, SHA256, and branch are compiled into the snapshot tool.
-pricing-snapshot:
+pricing-snapshot: sqlite-vec-header
 	go run ./internal/pricing/cmd/litellm-snapshot -restore
 
 # Build the binary (debug, with embedded pricing snapshot and frontend)
@@ -256,6 +282,11 @@ test: pricing-snapshot ensure-embed-dir
 test-short: pricing-snapshot ensure-embed-dir
 	go test -tags "fts5" ./... -short -count=1
 
+# Run the quarantined eval-ingest endpoint tests under their build tag.
+test-evalingest: pricing-snapshot ensure-embed-dir
+	CGO_ENABLED=1 go test -tags "fts5,evalingest" \
+		./internal/db ./internal/server -v -count=1
+
 # Compare db.Store read-query performance across SQLite, DuckDB, and PostgreSQL.
 # Requires Docker because the PostgreSQL backend is started with testcontainers.
 BENCH_BACKENDS_FLAGS ?= -bench . -run '^$$' -benchmem
@@ -425,7 +456,7 @@ tidy: pricing-snapshot
 clean:
 	rm -f agentsview agentsv
 	rm -f $(PRICING_SNAPSHOT_FILE)
-	rm -rf internal/web/dist dist/ tmp/
+	rm -rf internal/web/dist dist/ tmp/ $(SQLITE_INCLUDE_DIR)
 	mkdir -p internal/web/dist
 	printf '%s\n' \
 		'keep embed dir for generated frontend assets' \

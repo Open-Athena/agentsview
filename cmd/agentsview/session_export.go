@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -57,6 +58,15 @@ func newSessionExportCommand() *cobra.Command {
 				return err
 			}
 			if id == "" {
+				return fmt.Errorf(
+					"session not in local archive: %s", args[0],
+				)
+			}
+			session, err := d.GetSession(cmd.Context(), id)
+			if err != nil {
+				return err
+			}
+			if session == nil {
 				return fmt.Errorf(
 					"session not in local archive: %s", args[0],
 				)
@@ -125,6 +135,51 @@ func newSessionExportCommand() *cobra.Command {
 				}
 				return err
 			}
+			switch session.Agent {
+			case string(parser.AgentWindsurf):
+				if dbPath, sessionID, ok := parser.SplitWindsurfVirtualPath(storedPath); ok {
+					err := parser.WriteWindsurfSessionJSON(
+						cmd.OutOrStdout(), dbPath, sessionID,
+					)
+					if errors.Is(err, os.ErrNotExist) {
+						return fmt.Errorf(
+							"source file not found: %s", dbPath,
+						)
+					}
+					return err
+				}
+			case string(parser.AgentTrae):
+				if dbPath, sessionID, ok := parser.SplitTraeVirtualPath(storedPath); ok {
+					err := parser.WriteTraeSessionJSON(
+						cmd.OutOrStdout(), dbPath, sessionID,
+					)
+					if errors.Is(err, os.ErrNotExist) {
+						return fmt.Errorf(
+							"source file not found: %s", dbPath,
+						)
+					}
+					return err
+				}
+			}
+			if session.Agent == string(parser.AgentHermes) &&
+				filepath.Base(parser.ResolveSourceFilePath(storedPath)) == "state.db" {
+				rawSessionID := session.SourceSessionID
+				if rawSessionID == "" {
+					rawSessionID, _ = rawHermesSessionID(id)
+				}
+				err := parser.WriteHermesSessionJSONL(
+					cmd.OutOrStdout(),
+					storedPath,
+					cfg.AgentDirs[parser.AgentHermes],
+					rawSessionID,
+				)
+				if errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf(
+						"source file not found for session %s", id,
+					)
+				}
+				return err
+			}
 			path := parser.ResolveSourceFilePath(storedPath)
 			f, err := os.Open(path)
 			if err != nil {
@@ -145,6 +200,16 @@ func newSessionExportCommand() *cobra.Command {
 func rawAiderSessionID(sessionID string) (string, bool) {
 	def, ok := parser.AgentByPrefix(sessionID)
 	if !ok || def.Type != parser.AgentAider {
+		return "", false
+	}
+	_, rawID := parser.StripHostPrefix(sessionID)
+	rawID = strings.TrimPrefix(rawID, def.IDPrefix)
+	return rawID, rawID != ""
+}
+
+func rawHermesSessionID(sessionID string) (string, bool) {
+	def, ok := parser.AgentByPrefix(sessionID)
+	if !ok || def.Type != parser.AgentHermes {
 		return "", false
 	}
 	_, rawID := parser.StripHostPrefix(sessionID)

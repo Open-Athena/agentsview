@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -23,6 +24,7 @@ import (
 	"github.com/gofrs/flock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/kit/daemon"
 )
@@ -59,9 +61,43 @@ func startSleepProcess(t *testing.T) int {
 // a graceful stop and drives the force-kill escalation path.
 func startTERMIgnoringProcess(t *testing.T) int {
 	t.Helper()
-	return startProcessKilledOnCleanup(
-		t, exec.Command("sh", "-c", "trap '' TERM; sleep 60"),
-	)
+	cmd := exec.Command("sh", "-c", "trap '' TERM; echo ready; exec sleep 60")
+	stdout, err := cmd.StdoutPipe()
+	require.NoError(t, err)
+	require.NoError(t, cmd.Start())
+	ready, err := bufio.NewReader(stdout).ReadString('\n')
+	require.NoError(t, err)
+	require.Equal(t, "ready", strings.TrimSpace(ready))
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	return cmd.Process.Pid
+}
+
+// startReapedTERMIgnoringProcess starts a child that has installed its SIGTERM
+// disposition before returning. The child is reaped concurrently so a test can
+// distinguish a running process from one that stopDaemonProcess force-killed.
+func startReapedTERMIgnoringProcess(t *testing.T) (int, <-chan struct{}) {
+	t.Helper()
+	cmd := exec.Command("sh", "-c", "trap '' TERM; echo ready; exec sleep 60")
+	stdout, err := cmd.StdoutPipe()
+	require.NoError(t, err)
+	require.NoError(t, cmd.Start())
+	ready, err := bufio.NewReader(stdout).ReadString('\n')
+	require.NoError(t, err)
+	require.Equal(t, "ready", strings.TrimSpace(ready))
+
+	reaped := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(reaped)
+	}()
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		<-reaped
+	})
+	return cmd.Process.Pid, reaped
 }
 
 func startProcessKilledOnCleanup(t *testing.T, cmd *exec.Cmd) int {
@@ -283,7 +319,13 @@ func holdExternalDaemonStartLock(t *testing.T, dataDir string) func() {
 
 	var once sync.Once
 	unlock := func() {
-		once.Do(func() { _ = stdin.Close() })
+		once.Do(func() {
+			_ = stdin.Close()
+			deadline := time.Now().Add(5 * time.Second)
+			for isExternalDaemonStarting(dataDir) && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
 	}
 	t.Cleanup(unlock)
 	return unlock
@@ -480,6 +522,303 @@ func testPingServer(t *testing.T) (host string, port int) {
 	return endpoint.Host, endpoint.Port
 }
 
+func writeStartupFallbackFixture(
+	t *testing.T, dir, host string, port, pid int, createTime string,
+) {
+	t.Helper()
+	MarkDaemonStarting(dir)
+	t.Cleanup(func() { UnmarkDaemonStarting(dir) })
+	state := startupState{
+		PID:          pid,
+		StartedAt:    time.Now().Add(-time.Minute),
+		Phase:        "starting HTTP server",
+		Host:         host,
+		Port:         port,
+		RuntimeError: "permission denied writing runtime record",
+		CreateTime:   createTime,
+		APIVersion:   daemonAPIVersion,
+		DataVersion:  db.CurrentDataVersion(),
+		UpdatedAt:    time.Now(),
+	}
+	data, err := json.Marshal(state)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(startupStatePath(dir), data, 0o600))
+}
+
+func failRuntimeRecordListing(t *testing.T) {
+	t.Helper()
+	oldList := listDaemonRuntimeRecords
+	listDaemonRuntimeRecords = func(daemon.RuntimeStore) ([]daemon.RuntimeRecord, error) {
+		return nil, errors.New("store unavailable")
+	}
+	t.Cleanup(func() { listDaemonRuntimeRecords = oldList })
+}
+
+func TestFindDaemonRuntime_UsesStartupFallbackWhenRuntimeStoreInspectionFails(t *testing.T) {
+	dir := runtimeTestDir(t)
+	host, port := testPingServer(t)
+	createTime, ok := processCreateTimeMillis(os.Getpid())
+	require.True(t, ok)
+	writeStartupFallbackFixture(
+		t, dir, host, port, os.Getpid(), strconv.FormatInt(createTime, 10),
+	)
+	failRuntimeRecordListing(t)
+
+	rt := FindDaemonRuntime(dir)
+	require.NotNil(t, rt)
+	assert.True(t, rt.RuntimeFallback)
+	assert.Equal(t, port, rt.Port)
+}
+
+func TestFindIncompatibleDaemonRuntime_UsesStartupFallbackWhenRuntimeStoreInspectionFails(t *testing.T) {
+	dir := runtimeTestDir(t)
+	host, port := testPingServer(t)
+	createTime, ok := processCreateTimeMillis(os.Getpid())
+	require.True(t, ok)
+	writeStartupFallbackFixture(
+		t, dir, host, port, os.Getpid(), strconv.FormatInt(createTime, 10),
+	)
+	state := readStartupState(dir)
+	require.NotNil(t, state)
+	state.APIVersion = daemonAPIVersion + 1
+	data, err := json.Marshal(state)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(startupStatePath(dir), data, 0o600))
+	failRuntimeRecordListing(t)
+
+	rt, compatErr := FindIncompatibleDaemonRuntime(dir)
+	require.NotNil(t, rt)
+	require.Error(t, compatErr)
+	assert.True(t, rt.RuntimeFallback)
+	assert.ErrorContains(t, compatErr, "API version")
+}
+
+func TestWritableDaemonFallbackResolver(t *testing.T) {
+	dir := runtimeTestDir(t)
+	host, port := testPingServer(t)
+	createTime, ok := processCreateTimeMillis(os.Getpid())
+	require.True(t, ok)
+	writeStartupFallbackFixture(t, dir, host, port, os.Getpid(), strconv.FormatInt(createTime, 10))
+
+	rt := FindWritableDaemonRuntime(dir)
+	require.NotNil(t, rt)
+	assert.True(t, rt.RuntimeFallback)
+	assert.Equal(t, port, rt.Port)
+
+	state := readStartupState(dir)
+	require.NotNil(t, state)
+	state.CreateTime = "1"
+	data, err := json.Marshal(state)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(startupStatePath(dir), data, 0o600))
+	assert.Nil(t, FindWritableDaemonRuntime(dir), "stale fallback must fail closed")
+}
+
+func TestFindWritableDaemonRuntime_StartupFallbackSurvivesStartLockProbeError(t *testing.T) {
+	dir := runtimeTestDir(t)
+	host, port := testPingServer(t)
+	createTime, ok := processCreateTimeMillis(os.Getpid())
+	require.True(t, ok)
+	state := startupState{
+		PID:          os.Getpid(),
+		StartedAt:    time.Now().Add(-time.Minute),
+		Phase:        "starting HTTP server",
+		Host:         host,
+		Port:         port,
+		RuntimeError: "permission denied writing runtime record",
+		CreateTime:   strconv.FormatInt(createTime, 10),
+		APIVersion:   daemonAPIVersion,
+		DataVersion:  db.CurrentDataVersion(),
+		UpdatedAt:    time.Now(),
+	}
+	data, err := json.Marshal(state)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(startupStatePath(dir), data, 0o600))
+
+	oldTryLock := startLockTryLock
+	startLockTryLock = func(*flock.Flock) (bool, error) {
+		return false, errors.New("simulated lock probe failure")
+	}
+	t.Cleanup(func() { startLockTryLock = oldTryLock })
+
+	rt := FindWritableDaemonRuntime(dir)
+	require.NotNil(t, rt)
+	assert.True(t, rt.RuntimeFallback)
+	assert.True(t, IsLocalDaemonActive(dir))
+}
+
+func TestLocalWritableDaemonRecordsWithFallbackPreservesReadOnlyRecords(t *testing.T) {
+	dir := runtimeTestDir(t)
+	readOnlyHost, readOnlyPort := testPingServer(t)
+	createTime, ok := processCreateTimeMillis(os.Getpid())
+	require.True(t, ok)
+	writeRuntimeRecordFixture(t, dir, daemon.RuntimeRecord{
+		PID:       os.Getpid(),
+		Service:   daemonService,
+		Version:   "test",
+		Network:   daemon.NetworkTCP,
+		Address:   net.JoinHostPort(readOnlyHost, strconv.Itoa(readOnlyPort)),
+		StartedAt: time.Now(),
+		Metadata: map[string]string{
+			runtimeHost:        readOnlyHost,
+			runtimePort:        strconv.Itoa(readOnlyPort),
+			runtimeReadOnly:    "true",
+			runtimeAPIVersion:  strconv.Itoa(daemonAPIVersion),
+			runtimeDataVersion: strconv.Itoa(db.CurrentDataVersion()),
+			runtimeCreateTime:  strconv.FormatInt(createTime, 10),
+		},
+	})
+	host, port := testPingServer(t)
+	writeStartupFallbackFixture(t, dir, host, port, os.Getpid(), strconv.FormatInt(createTime, 10))
+
+	records, fallback := localWritableDaemonRecordsWithFallback(dir, "")
+	require.True(t, fallback)
+	require.Len(t, records, 2)
+
+	readOnlySeen := false
+	writableSeen := false
+	for _, rec := range records {
+		rt := daemonRuntimeFromRecord(rec)
+		if rt.ReadOnly {
+			readOnlySeen = true
+			assert.Equal(t, readOnlyPort, rt.Port)
+			continue
+		}
+		writableSeen = true
+		assert.Equal(t, port, rt.Port)
+	}
+	assert.True(t, readOnlySeen)
+	assert.True(t, writableSeen)
+}
+
+func TestFindDaemonRuntime_IgnoresIncompatibleStartupStateFallback(t *testing.T) {
+	dir := runtimeTestDir(t)
+	host, port := testPingServer(t)
+	createTime, ok := processCreateTimeMillis(os.Getpid())
+	require.True(t, ok)
+	writeStartupFallbackFixture(
+		t, dir, host, port, os.Getpid(), strconv.FormatInt(createTime, 10),
+	)
+	state := readStartupState(dir)
+	require.NotNil(t, state)
+	state.APIVersion = daemonAPIVersion + 1
+	data, err := json.Marshal(state)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(startupStatePath(dir), data, 0o600))
+
+	assert.Nil(t, FindDaemonRuntime(dir))
+	rt, compatErr := FindIncompatibleDaemonRuntime(dir)
+	require.NotNil(t, rt)
+	require.Error(t, compatErr)
+	assert.Contains(t, compatErr.Error(), "API version")
+	assert.True(t, rt.RuntimeFallback)
+}
+
+func TestWriteDaemonRuntimeFailurePreservesUpdateLaunchArgs(t *testing.T) {
+	dir := runtimeTestDir(t)
+	MarkDaemonStarting(dir)
+	t.Cleanup(func() { UnmarkDaemonStarting(dir) })
+	newStartupStateWriter(dir, time.Now).SetPhase("starting HTTP server")
+	host, port := testPingServer(t)
+	runtimePath, err := runtimeStore(dir).Path(os.Getpid())
+	require.NoError(t, err)
+	require.NoError(t, os.Mkdir(runtimePath, 0o700))
+
+	_, err = WriteDaemonRuntimeWithAuthAndNoSync(
+		dir, host, port, "test", false, true, true,
+	)
+	require.Error(t, err)
+
+	rt := FindWritableDaemonRuntime(dir)
+	require.NotNil(t, rt)
+	assert.Equal(t, "test", rt.Record.Version)
+	state := readStartupState(dir)
+	require.NotNil(t, state)
+	assert.True(t, state.RequireAuthKnown)
+	assert.True(t, state.RequireAuth)
+	assert.True(t, state.NoSyncKnown)
+	assert.True(t, state.NoSync)
+
+	oldStop := stopDaemonRuntimeForUpgrade
+	stopDaemonRuntimeForUpgrade = func(_ config.Config, _ *DaemonRuntime) error { return nil }
+	t.Cleanup(func() { stopDaemonRuntimeForUpgrade = oldStop })
+	result, err := stopWritableDaemonsForUpdate(config.Config{DataDir: dir})
+	require.NoError(t, err)
+	assert.True(t, result.Stopped)
+	args := restartDaemonAfterUpdateArgs(config.Config{}, result)
+	assert.Contains(t, args, "--require-auth")
+	assert.Contains(t, args, "--no-sync")
+}
+
+func TestWriteDaemonRuntimeFailurePreservesManagedCaddyIdentity(t *testing.T) {
+	dir := runtimeTestDir(t)
+	MarkDaemonStarting(dir)
+	t.Cleanup(func() { UnmarkDaemonStarting(dir) })
+	newStartupStateWriter(dir, time.Now).SetPhase("starting HTTP server")
+	host, port := testPingServer(t)
+	runtimePath, err := runtimeStore(dir).Path(os.Getpid())
+	require.NoError(t, err)
+	require.NoError(t, os.Mkdir(runtimePath, 0o700))
+	caddyCreateTime, ok := processCreateTimeMillis(os.Getpid())
+	require.True(t, ok)
+
+	_, err = WriteDaemonRuntimeWithAuthAndNoSync(
+		dir, host, port, "test", false, false, false, os.Getpid(),
+	)
+	require.Error(t, err)
+
+	state := readStartupState(dir)
+	require.NotNil(t, state)
+	assert.Equal(t, os.Getpid(), state.CaddyPID)
+	assert.Equal(t, strconv.FormatInt(caddyCreateTime, 10), state.CaddyCreateTime)
+
+	rt := FindWritableDaemonRuntime(dir)
+	require.NotNil(t, rt)
+	assert.Equal(t, strconv.Itoa(os.Getpid()), rt.Record.Metadata[runtimeCaddyPID])
+	assert.Equal(t, strconv.FormatInt(caddyCreateTime, 10), rt.Record.Metadata[runtimeCaddyCreateTime])
+}
+
+func TestStopWritableDaemonsForUpdateIgnoresStaleWritableRecordBeforeFallback(t *testing.T) {
+	dir := runtimeTestDir(t)
+	staleHost, stalePort := testPingServer(t)
+	createTime, ok := processCreateTimeMillis(os.Getpid())
+	require.True(t, ok)
+	writeRuntimeRecordFixture(t, dir, daemon.RuntimeRecord{
+		PID:       os.Getpid(),
+		Service:   daemonService,
+		Version:   "stale",
+		Network:   daemon.NetworkTCP,
+		Address:   net.JoinHostPort(staleHost, strconv.Itoa(stalePort)),
+		StartedAt: time.Now(),
+		Metadata: map[string]string{
+			runtimeHost:        staleHost,
+			runtimePort:        strconv.Itoa(stalePort),
+			runtimeAPIVersion:  strconv.Itoa(daemonAPIVersion),
+			runtimeDataVersion: strconv.Itoa(db.CurrentDataVersion()),
+			runtimeCreateTime:  "1",
+		},
+	})
+	host, port := testPingServer(t)
+	writeStartupFallbackFixture(
+		t, dir, host, port, os.Getpid(), strconv.FormatInt(createTime, 10),
+	)
+
+	oldStop := stopDaemonRuntimeForUpgrade
+	var stopped *DaemonRuntime
+	stopDaemonRuntimeForUpgrade = func(_ config.Config, rt *DaemonRuntime) error {
+		stopped = rt
+		return nil
+	}
+	t.Cleanup(func() { stopDaemonRuntimeForUpgrade = oldStop })
+
+	result, err := stopWritableDaemonsForUpdate(config.Config{DataDir: dir})
+	require.NoError(t, err)
+	require.NotNil(t, stopped)
+	assert.True(t, result.Stopped)
+	assert.Equal(t, port, stopped.Port)
+	assert.Equal(t, strconv.FormatInt(createTime, 10), stopped.Record.Metadata[runtimeCreateTime])
+}
+
 func newAuthenticatedPingDaemon(t *testing.T, token string) testDaemonEndpoint {
 	t.Helper()
 	ping := daemon.NewPingHandler(daemon.PingHandlerOptions{
@@ -604,6 +943,26 @@ func writeProbeableLegacyRuntime(
 	return endpoint, writeLegacyRuntimeStateForTest(t, dataDir, state)
 }
 
+func writeAuthenticatedProbeableLegacyRuntime(
+	t *testing.T,
+	dataDir string,
+	token string,
+	state legacyStateFile,
+) (testDaemonEndpoint, string) {
+	t.Helper()
+	endpoint := newAuthenticatedPingDaemon(t, token)
+	if state.PID == 0 {
+		state.PID = os.Getpid()
+	}
+	if state.Host == "" {
+		state.Host = endpoint.Host
+	}
+	if state.Port == 0 {
+		state.Port = endpoint.Port
+	}
+	return endpoint, writeLegacyRuntimeStateForTest(t, dataDir, state)
+}
+
 func rewriteLegacyState(
 	t *testing.T,
 	path string,
@@ -712,6 +1071,7 @@ func TestFindDaemonRuntime_IgnoresIncompatibleRuntime(t *testing.T) {
 	require.NotNil(t, rt)
 	require.Error(t, compatErr)
 	assert.Contains(t, compatErr.Error(), "API version")
+	assert.Contains(t, compatErr.Error(), "restart the daemon")
 	assert.True(t, IsLocalDaemonActive(dir),
 		"incompatible writable daemon still owns the local archive")
 }
@@ -904,6 +1264,262 @@ func TestLiveWritableRuntimeWithMismatchedCreateTimeIsRemoved(t *testing.T) {
 	assert.False(t, IsLocalDaemonActive(dir))
 	assertRuntimeRecordRemoved(t, dir, os.Getpid(),
 		"mismatched create-time runtime record should be removed")
+}
+
+func TestCompareProcessCreateTime(t *testing.T) {
+	tests := []struct {
+		name     string
+		recorded string
+		live     int64
+		liveOK   bool
+		want     processCreateTimeState
+	}{
+		{name: "exact match", recorded: "1234", live: 1234, liveOK: true, want: processCreateTimeMatch},
+		{name: "proven mismatch", recorded: "1234", live: 1235, liveOK: true, want: processCreateTimeMismatch},
+		{name: "missing recorded value", recorded: "", live: 1234, liveOK: true, want: processCreateTimeUnknown},
+		{name: "malformed recorded value", recorded: "not-a-time", live: 1234, liveOK: true, want: processCreateTimeUnknown},
+		{name: "zero recorded value", recorded: "0", live: 1234, liveOK: true, want: processCreateTimeUnknown},
+		{name: "negative recorded value", recorded: "-1", live: 1234, liveOK: true, want: processCreateTimeUnknown},
+		{name: "live lookup unavailable", recorded: "1234", live: 0, liveOK: false, want: processCreateTimeUnknown},
+		{name: "nonpositive live value", recorded: "1234", live: 0, liveOK: true, want: processCreateTimeUnknown},
+		{name: "negative live value", recorded: "1234", live: -1, liveOK: true, want: processCreateTimeUnknown},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, compareProcessCreateTime(
+				tt.recorded, tt.live, tt.liveOK,
+			))
+		})
+	}
+}
+
+func TestWritableDaemonRecordsFiltersAndCleansRuntimeRecords(t *testing.T) {
+	liveCreateTime, ok := processCreateTimeMillis(os.Getpid())
+	if !ok {
+		t.Skip("process create time is unavailable on this platform")
+	}
+
+	tests := []struct {
+		name        string
+		options     []runtimeRecordOption
+		wantRecords int
+		wantFile    bool
+	}{
+		{
+			name:        "matching writable record",
+			options:     []runtimeRecordOption{withRuntimeMetadata(runtimeCreateTime, strconv.FormatInt(liveCreateTime, 10))},
+			wantRecords: 1,
+			wantFile:    true,
+		},
+		{
+			name:        "missing create time is preserved as unknown",
+			wantRecords: 1,
+			wantFile:    true,
+		},
+		{
+			name:        "malformed create time is preserved as unknown",
+			options:     []runtimeRecordOption{withRuntimeMetadata(runtimeCreateTime, "not-a-time")},
+			wantRecords: 1,
+			wantFile:    true,
+		},
+		{
+			name:        "zero create time is preserved as unknown",
+			options:     []runtimeRecordOption{withRuntimeMetadata(runtimeCreateTime, "0")},
+			wantRecords: 1,
+			wantFile:    true,
+		},
+		{
+			name:        "negative create time is preserved as unknown",
+			options:     []runtimeRecordOption{withRuntimeMetadata(runtimeCreateTime, "-1")},
+			wantRecords: 1,
+			wantFile:    true,
+		},
+		{
+			name:        "proven mismatch is removed",
+			options:     []runtimeRecordOption{withRuntimeMetadata(runtimeCreateTime, strconv.FormatInt(liveCreateTime+1, 10))},
+			wantRecords: 0,
+			wantFile:    false,
+		},
+		{
+			name:        "read only record is ignored but preserved",
+			options:     []runtimeRecordOption{withRuntimeReadOnly(true)},
+			wantRecords: 0,
+			wantFile:    true,
+		},
+		{
+			name:        "another service is ignored but preserved",
+			options:     []runtimeRecordOption{func(rec *daemon.RuntimeRecord) { rec.Service = "other" }},
+			wantRecords: 0,
+			wantFile:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := runtimeTestDir(t)
+			path, err := writeRuntimeRecordForTest(dir, daemonRuntimeRecord(
+				"127.0.0.1", 9, tt.options...,
+			))
+			require.NoError(t, err)
+
+			records, err := writableDaemonRecords(dir, "")
+			require.NoError(t, err)
+			require.Len(t, records, tt.wantRecords)
+			if tt.wantRecords > 0 {
+				assert.Equal(t, os.Getpid(), records[0].PID)
+				assert.Equal(t, path, records[0].SourcePath)
+			}
+			if tt.wantFile {
+				assert.FileExists(t, path)
+			} else {
+				assertPathRemoved(t, path)
+			}
+		})
+	}
+}
+
+func TestWritableDaemonRecordsCleansDeadRecord(t *testing.T) {
+	dir := runtimeTestDir(t)
+	pid := deadPID(t)
+	path, err := writeRuntimeRecordForTest(dir, daemonRuntimeRecord(
+		"127.0.0.1", 9, withRuntimePID(pid),
+	))
+	require.NoError(t, err)
+
+	records, err := writableDaemonRecords(dir, "")
+	require.NoError(t, err)
+	assert.Empty(t, records)
+	assertPathRemoved(t, path, "dead runtime record should be cleaned up")
+}
+
+func TestWritableDaemonRecordsReturnsEveryLiveWritableRecord(t *testing.T) {
+	requirePOSIXSignals(t, "requires a long-lived child process")
+	dir := runtimeTestDir(t)
+	pids := []int{os.Getpid(), startSleepProcess(t)}
+	wantPaths := make(map[int]string, len(pids))
+	for i, pid := range pids {
+		path, err := writeRuntimeRecordForTest(dir, daemonRuntimeRecord(
+			"127.0.0.1", 10+i, withRuntimePID(pid),
+		))
+		require.NoError(t, err)
+		wantPaths[pid] = path
+	}
+
+	records, err := writableDaemonRecords(dir, "")
+	require.NoError(t, err)
+	require.Len(t, records, len(pids))
+	for _, rec := range records {
+		assert.Equal(t, wantPaths[rec.PID], rec.SourcePath)
+		delete(wantPaths, rec.PID)
+	}
+	assert.Empty(t, wantPaths, "all live writable records should be returned")
+}
+
+func TestWritableDaemonRecordsMigratesLegacyRuntime(t *testing.T) {
+	dir := runtimeTestDir(t)
+	endpoint, legacyPath := writeProbeableLegacyRuntime(t, dir, legacyStateFile{})
+
+	records, err := writableDaemonRecords(dir, "")
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	assert.Equal(t, endpoint.Port, daemonRuntimeFromRecord(records[0]).Port)
+	assert.Equal(t, runtimePathForTest(dir, os.Getpid()), records[0].SourcePath)
+	assertPathRemoved(t, legacyPath, "migrated legacy record should be removed")
+}
+
+func TestWritableDaemonRecordsReportsMismatchedRecordRemovalFailure(
+	t *testing.T,
+) {
+	requirePOSIXSignals(t, "directory removal permissions require POSIX semantics")
+	dir := runtimeTestDir(t)
+	liveCreateTime, ok := processCreateTimeMillis(os.Getpid())
+	require.True(t, ok)
+	path, err := writeRuntimeRecordForTest(dir, daemonRuntimeRecord(
+		"127.0.0.1", 9,
+		withRuntimeMetadata(
+			runtimeCreateTime, strconv.FormatInt(liveCreateTime+1, 10),
+		),
+	))
+	require.NoError(t, err)
+	stored, err := runtimeStore(dir).List()
+	require.NoError(t, err)
+	require.Len(t, stored, 1)
+	require.NoError(t, os.Chmod(dir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	records, err := writableDaemonRecordsFromStore(
+		staticRuntimeRecordStore{records: stored},
+	)
+	assert.Nil(t, records)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "remove mismatched daemon runtime record")
+	assert.ErrorContains(t, err, path)
+	assert.FileExists(t, path, "failed cleanup must leave the record recoverable")
+}
+
+type staticRuntimeRecordStore struct {
+	records []daemon.RuntimeRecord
+}
+
+func (staticRuntimeRecordStore) CleanupDead() (int, error) {
+	return 0, nil
+}
+
+func (s staticRuntimeRecordStore) List() ([]daemon.RuntimeRecord, error) {
+	return s.records, nil
+}
+
+type cleanupFailingRuntimeRecordStore struct {
+	err error
+}
+
+func (s cleanupFailingRuntimeRecordStore) CleanupDead() (int, error) {
+	return 0, s.err
+}
+
+func (cleanupFailingRuntimeRecordStore) List() ([]daemon.RuntimeRecord, error) {
+	return nil, nil
+}
+
+type listFailingRuntimeRecordStore struct {
+	err error
+}
+
+func (listFailingRuntimeRecordStore) CleanupDead() (int, error) {
+	return 0, nil
+}
+
+func (s listFailingRuntimeRecordStore) List() ([]daemon.RuntimeRecord, error) {
+	return nil, s.err
+}
+
+func TestWritableDaemonRecordsSurfacesRuntimeStoreErrors(t *testing.T) {
+	tests := []struct {
+		name  string
+		store daemonRuntimeRecordStore
+		want  string
+	}{
+		{
+			name:  "cleanup failure",
+			store: cleanupFailingRuntimeRecordStore{err: errors.New("cleanup failed")},
+			want:  "cleanup failed",
+		},
+		{
+			name:  "list failure",
+			store: listFailingRuntimeRecordStore{err: errors.New("list failed")},
+			want:  "list failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			records, err := writableDaemonRecordsFromStore(tt.store)
+			assert.Nil(t, records)
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tt.want)
+		})
+	}
 }
 
 func TestStartLock_OwnProcess(t *testing.T) {

@@ -183,6 +183,7 @@ func parseVibeResultFile(path string, fileInfo FileInfo) (ParseResult, error) {
 	defer file.Close()
 
 	lr := newLineReader(file, maxLineSize)
+	defer releaseLineReader(lr)
 	messageOrdinal := 0
 	var firstUserContent string
 
@@ -454,7 +455,7 @@ func vibeUsageEvents(
 		CacheReadInputTokens:     0,
 		ReasoningTokens:          0,
 		// Vibe doesn't currently expose cost information
-		CostUSD:    nil,
+		Cost:       nil,
 		CostStatus: "",
 		CostSource: "",
 		OccurredAt: vibeTimeString(endedAt, startedAt),

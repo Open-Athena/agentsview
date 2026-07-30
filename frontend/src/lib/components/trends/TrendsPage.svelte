@@ -13,7 +13,7 @@
   import { rollingRange } from "../../utils/dates.js";
   import type { TrendsGranularity } from "../../api/types.js";
   import { ChartColumnIcon, ChevronDownIcon } from "../../icons.js";
-  import { Spinner } from "@kenn-io/kit-ui";
+  import { Spinner, Toggle } from "@kenn-io/kit-ui";
   import RangePicker from "../shared/RangePicker.svelte";
   import {
     resolveRange,
@@ -42,6 +42,9 @@
 
   let activeTerm: string | null = $state(null);
   let trendsWindowDays: number | null = $state(DEFAULT_TREND_WINDOW_DAYS);
+  // Keep bare defaults out of history so a later mount cannot mistake them
+  // for a user selection, deep link, or shared seed.
+  let trendsDateIntentEstablished = false;
   const trendsPanelDate = $derived(currentTrendsPanelDate());
 
   const GRANULARITIES: TrendsGranularity[] = ["day", "week", "month"];
@@ -110,10 +113,12 @@
     if (current.has("desktop")) {
       q.set("desktop", current.get("desktop") ?? "");
     }
-    q.set("from", trends.from);
-    q.set("to", trends.to);
-    if (trendsWindowDays !== null) {
-      q.set(TREND_WINDOW_PARAM, String(trendsWindowDays));
+    if (trendsDateIntentEstablished) {
+      q.set("from", trends.from);
+      q.set("to", trends.to);
+      if (trendsWindowDays !== null) {
+        q.set(TREND_WINDOW_PARAM, String(trendsWindowDays));
+      }
     }
     q.set("granularity", trends.granularity);
     if (trends.normalized) {
@@ -130,14 +135,17 @@
 
   function materializeRollingWindow(): void {
     if (trendsWindowDays === null) return;
+    const yokeEstablished = yokedDates.range !== null;
     const range = rollingRange(trendsWindowDays);
     if (trends.from === range.from && trends.to === range.to) return;
     trends.from = range.from;
     trends.to = range.to;
-    updateYokeFromTrends(panelDateState(range.from, range.to, {
-      mode: "rolling",
-      windowDays: trendsWindowDays,
-    }));
+    if (yokeEstablished) {
+      updateYokeFromTrends(panelDateState(range.from, range.to, {
+        mode: "rolling",
+        windowDays: trendsWindowDays,
+      }));
+    }
   }
 
   async function refresh() {
@@ -159,6 +167,7 @@
     const range = resolveRange(sel, earliestSession);
     trends.from = range.from;
     trends.to = range.to;
+    trendsDateIntentEstablished = true;
     const yokeState = yokeStateForSelection(sel, range);
     trendsWindowDays = yokeState?.mode === "rolling"
       ? yokeState.windowDays ?? null
@@ -178,11 +187,6 @@
       });
     }
     return panelDateState(range.from, range.to, { mode: "fixed" });
-  }
-
-  function setNormalized(event: Event) {
-    trends.normalized = (event.currentTarget as HTMLInputElement).checked;
-    writeUrl();
   }
 
   async function resetTerms() {
@@ -217,6 +221,7 @@
     const seed = yokedDates.seedForPanel();
     const state = seed ? rangeToPanelDate(seed) : null;
     if (!state) return;
+    trendsDateIntentEstablished = true;
     trends.from = state.from;
     trends.to = state.to;
     trendsWindowDays = state.mode === "rolling"
@@ -226,6 +231,7 @@
 
   onMount(() => {
     const hasDateParams = applyQueryParams();
+    trendsDateIntentEstablished = hasDateParams;
     if (hasDateParams) {
       updateYokeFromTrends();
     } else {
@@ -237,6 +243,7 @@
     document.addEventListener("click", onGroupByDocClick);
     document.addEventListener("keydown", onGroupByKey);
     return () => {
+      trends.cancelInFlightReads();
       document.removeEventListener("click", onGroupByDocClick);
       document.removeEventListener("keydown", onGroupByKey);
     };
@@ -317,14 +324,14 @@
             </div>
           {/if}
         </div>
-        <label class="normalize-toggle">
-          <input
-            type="checkbox"
-            bind:checked={trends.normalized}
-            onchange={setNormalized}
-          />
-          <span>{m.trends_normalize()}</span>
-        </label>
+        <Toggle
+          checked={trends.normalized}
+          onchange={(checked) => {
+            trends.normalized = checked;
+            writeUrl();
+          }}
+          label={m.trends_normalize()}
+        />
       </div>
       <TrendsLineChart
         buckets={trends.response?.buckets ?? []}
@@ -411,7 +418,6 @@
   }
 
   button,
-  input,
   textarea {
     font: inherit;
   }
@@ -466,18 +472,11 @@
     font-weight: 600;
   }
 
-  input,
   textarea {
     border: 1px solid var(--border-default);
     border-radius: 6px;
     background: var(--bg-surface);
     color: var(--text-primary);
-  }
-
-  input {
-    height: 32px;
-    padding: 0 8px;
-    font-size: 12px;
   }
 
   .chart-options {
@@ -560,22 +559,6 @@
   .group-item.active {
     color: var(--accent-blue);
     font-weight: 500;
-  }
-
-  .normalize-toggle {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    color: var(--text-muted);
-    font-size: 12px;
-    font-weight: 500;
-    cursor: pointer;
-  }
-
-  .normalize-toggle input {
-    width: 14px;
-    height: 14px;
-    padding: 0;
   }
 
   .content-grid {

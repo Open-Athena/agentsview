@@ -5,7 +5,9 @@ description: Local-first desktop and web app for AI agent sessions
 
 # AgentsView
 
-A local-first desktop and web app for browsing, searching, and analyzing your past AI coding sessions. See where your agents' time and money actually go — across every project, model, and tool.
+A local-first desktop and web app for browsing, searching, and analyzing your
+past AI coding sessions. See where your agents' time and money actually go —
+across every project, model, and tool.
 
 <p class="hero-actions">
   <a class="md-button md-button--primary" href="/quickstart/">Get Started</a>
@@ -37,34 +39,38 @@ A local-first desktop and web app for browsing, searching, and analyzing your pa
 <p class="agent-section__lead">Reads sessions from dozens of AI coding agents &mdash; auto-discovered, nothing to configure.</p>
 
 <div class="agent-grid">
-  <a class="agent-chip" data-agent="claude-code" href="https://www.anthropic.com/claude-code" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-claude"/></svg></span><span class="agent-chip__name">Claude Code</span></a>
-  <a class="agent-chip" data-agent="openclaude" href="/configuration/#session-discovery"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-claude"/></svg></span><span class="agent-chip__name">OpenClaude</span></a>
-  <a class="agent-chip" data-agent="codex" href="https://openai.com/codex/" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-openai"/></svg></span><span class="agent-chip__name">Codex</span></a>
-  <a class="agent-chip" data-agent="gemini" href="https://github.com/google-gemini/gemini-cli" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-gemini"/></svg></span><span class="agent-chip__name">Gemini</span></a>
-  <a class="agent-chip" data-agent="copilot" href="https://github.com/features/copilot" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-copilot"/></svg></span><span class="agent-chip__name">Copilot</span></a>
-  <a class="agent-chip" data-agent="cursor" href="https://cursor.com" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-cursor"/></svg></span><span class="agent-chip__name">Cursor</span></a>
-  <a class="agent-chip" data-agent="vscode-copilot" href="https://github.com/features/copilot" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-vscode"/></svg></span><span class="agent-chip__name">VS Code Copilot</span></a>
-  <a class="agent-chip" data-agent="visualstudio-copilot" href="https://visualstudio.microsoft.com" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-visualstudio"/></svg></span><span class="agent-chip__name">Visual Studio Copilot</span></a>
-  <a class="agent-chip" data-agent="qwen" href="https://github.com/QwenLM/qwen-code" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-qwen"/></svg></span><span class="agent-chip__name">Qwen Code</span></a>
-  <a class="agent-chip" data-agent="deepseek-tui" href="https://www.deepseek.com" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-deepseek"/></svg></span><span class="agent-chip__name">DeepSeek TUI</span></a>
-  <a class="agent-chip" data-agent="vibe" href="https://mistral.ai" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-mistral"/></svg></span><span class="agent-chip__name">Mistral Vibe</span></a>
-  <a class="agent-chip" data-agent="zed" href="https://zed.dev" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-zed"/></svg></span><span class="agent-chip__name">Zed</span></a>
-  <a class="agent-chip" data-agent="warp" href="https://www.warp.dev" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-warp"/></svg></span><span class="agent-chip__name">Warp</span></a>
-  <a class="agent-chip" data-agent="amp" href="https://ampcode.com" target="_blank" rel="noopener" title="Deprecated: historical local Amp thread JSON only"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-sourcegraph"/></svg></span><span class="agent-chip__name">Amp (historical)</span></a>
-  <a class="agent-chip" data-agent="opencode" href="https://opencode.ai" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-opencode"/></svg></span><span class="agent-chip__name">OpenCode</span></a>
-  <a class="agent-chip" data-agent="positron" href="https://positron.posit.co" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-posit"/></svg></span><span class="agent-chip__name">Positron</span></a>
-  <a class="agent-chip" data-agent="cowork" href="https://www.anthropic.com" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-claude"/></svg></span><span class="agent-chip__name">Claude Cowork</span></a>
+  <a class="agent-chip" data-agent="claude-code" href="https://www.anthropic.com/claude-code" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-claude"/></svg></span><span class="agent-chip__name">Claude Code</span></a>
+  <a class="agent-chip" data-agent="openclaude" href="/configuration/#session-discovery"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-claude"/></svg></span><span class="agent-chip__name">OpenClaude</span></a>
+  <a class="agent-chip" data-agent="codex" href="https://openai.com/codex/" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-openai"/></svg></span><span class="agent-chip__name">Codex</span></a>
+  <a class="agent-chip" data-agent="gemini" href="https://github.com/google-gemini/gemini-cli" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-gemini"/></svg></span><span class="agent-chip__name">Gemini</span></a>
+  <a class="agent-chip" data-agent="copilot" href="https://github.com/features/copilot" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-copilot"/></svg></span><span class="agent-chip__name">Copilot</span></a>
+  <a class="agent-chip" data-agent="cursor" href="https://cursor.com" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-cursor"/></svg></span><span class="agent-chip__name">Cursor</span></a>
+  <a class="agent-chip" data-agent="vscode-copilot" href="https://github.com/features/copilot" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-vscode"/></svg></span><span class="agent-chip__name">VS Code Copilot</span></a>
+  <a class="agent-chip" data-agent="visualstudio-copilot" href="https://visualstudio.microsoft.com" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-visualstudio"/></svg></span><span class="agent-chip__name">Visual Studio Copilot</span></a>
+  <a class="agent-chip" data-agent="qwen" href="https://github.com/QwenLM/qwen-code" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-qwen"/></svg></span><span class="agent-chip__name">Qwen Code</span></a>
+  <a class="agent-chip" data-agent="deepseek-tui" href="https://www.deepseek.com" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-deepseek"/></svg></span><span class="agent-chip__name">DeepSeek TUI</span></a>
+  <a class="agent-chip" data-agent="vibe" href="https://mistral.ai" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-mistral"/></svg></span><span class="agent-chip__name">Mistral Vibe</span></a>
+  <a class="agent-chip" data-agent="zed" href="https://zed.dev" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-zed"/></svg></span><span class="agent-chip__name">Zed</span></a>
+  <a class="agent-chip" data-agent="warp" href="https://www.warp.dev" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-warp"/></svg></span><span class="agent-chip__name">Warp</span></a>
+  <a class="agent-chip" data-agent="amp" href="https://ampcode.com" target="_blank" rel="noopener" title="Deprecated: historical local Amp thread JSON only"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-sourcegraph"/></svg></span><span class="agent-chip__name">Amp (historical)</span></a>
+  <a class="agent-chip" data-agent="opencode" href="https://opencode.ai" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-opencode"/></svg></span><span class="agent-chip__name">OpenCode</span></a>
+  <a class="agent-chip" data-agent="positron" href="https://positron.posit.co" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-posit"/></svg></span><span class="agent-chip__name">Positron</span></a>
+  <a class="agent-chip" data-agent="posit-assistant" href="https://github.com/posit-dev/assistant" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-posit"/></svg></span><span class="agent-chip__name">Posit Assistant</span></a>
+  <a class="agent-chip" data-agent="cowork" href="https://www.anthropic.com" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use xlink:href="#i-claude"/></svg></span><span class="agent-chip__name">Claude Cowork</span></a>
   <a class="agent-chip" data-agent="aider" href="https://aider.chat" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">Ai</span><span class="agent-chip__name">Aider</span></a>
   <a class="agent-chip" data-agent="antigravity" href="https://antigravity.google" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">Ag</span><span class="agent-chip__name">Antigravity</span></a>
   <a class="agent-chip" data-agent="gptme" href="https://gptme.org" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">gm</span><span class="agent-chip__name">gptme</span></a>
   <a class="agent-chip" data-agent="kilo" href="https://kilocode.ai" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">Kl</span><span class="agent-chip__name">Kilo</span></a>
+  <a class="agent-chip" data-agent="kilo-legacy" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">KL</span><span class="agent-chip__name">Kilo (legacy)</span></a>
   <a class="agent-chip" data-agent="kimi" href="https://www.kimi.com" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">Km</span><span class="agent-chip__name">Kimi</span></a>
   <a class="agent-chip" data-agent="kiro" href="https://kiro.dev" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">Kr</span><span class="agent-chip__name">Kiro</span></a>
   <a class="agent-chip" data-agent="openhands" href="https://github.com/All-Hands-AI/OpenHands" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">OH</span><span class="agent-chip__name">OpenHands</span></a>
+  <a class="agent-chip" data-agent="zcode" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Zc</span><span class="agent-chip__name">ZCode</span></a>
   <a class="agent-chip" data-agent="zencoder" href="https://zencoder.ai" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">Ze</span><span class="agent-chip__name">Zencoder</span></a>
   <a class="agent-chip" data-agent="commandcode" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Cc</span><span class="agent-chip__name">Command Code</span></a>
   <a class="agent-chip" data-agent="cortex-code" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Cx</span><span class="agent-chip__name">Cortex Code</span></a>
   <a class="agent-chip" data-agent="forge" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Fo</span><span class="agent-chip__name">Forge</span></a>
+  <a class="agent-chip" data-agent="grok" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Gr</span><span class="agent-chip__name">Grok</span></a>
   <a class="agent-chip" data-agent="hermes" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">He</span><span class="agent-chip__name">Hermes</span></a>
   <a class="agent-chip" data-agent="iflow" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">iF</span><span class="agent-chip__name">iFlow</span></a>
   <a class="agent-chip" data-agent="mimocode" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Mi</span><span class="agent-chip__name">MiMoCode</span></a>
@@ -72,10 +78,13 @@ A local-first desktop and web app for browsing, searching, and analyzing your pa
   <a class="agent-chip" data-agent="openclaw" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Oc</span><span class="agent-chip__name">OpenClaw</span></a>
   <a class="agent-chip" data-agent="pi" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">&#960;</span><span class="agent-chip__name">Pi</span></a>
   <a class="agent-chip" data-agent="piebald" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Pb</span><span class="agent-chip__name">Piebald</span></a>
+  <a class="agent-chip" data-agent="poolside" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Po</span><span class="agent-chip__name">Poolside</span></a>
   <a class="agent-chip" data-agent="qclaw" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Qc</span><span class="agent-chip__name">QClaw</span></a>
   <a class="agent-chip" data-agent="qwenpaw" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Qp</span><span class="agent-chip__name">QwenPaw</span></a>
   <a class="agent-chip" data-agent="reasonix" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Rx</span><span class="agent-chip__name">Reasonix</span></a>
+  <a class="agent-chip" data-agent="roocode" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Ro</span><span class="agent-chip__name">RooCode</span></a>
   <a class="agent-chip" data-agent="shelley" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Sh</span><span class="agent-chip__name">Shelley</span></a>
+  <a class="agent-chip" data-agent="trae" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Tr</span><span class="agent-chip__name">Trae</span></a>
   <a class="agent-chip" data-agent="workbuddy" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Wb</span><span class="agent-chip__name">WorkBuddy</span></a>
 </div>
 
@@ -83,11 +92,10 @@ A local-first desktop and web app for browsing, searching, and analyzing your pa
 
 **Download the desktop app (recommended):**
 
-Download the latest `.dmg` (macOS), `.exe` (Windows), or
-`.AppImage` (Linux) from
-[GitHub Releases](https://github.com/kenn-io/agentsview/releases) or via homebrew: `brew install --cask agentsview`.
-The desktop app is fully bundled and includes built-in
-auto-update.
+Download the latest `.dmg` (macOS), `.exe` (Windows), or `.AppImage` (Linux)
+from [GitHub Releases](https://github.com/kenn-io/agentsview/releases) or via
+homebrew: `brew install --cask agentsview`. The desktop app is fully bundled and
+includes built-in auto-update.
 
 **Install via pip** — or run instantly with `uvx`:
 
@@ -109,30 +117,33 @@ powershell -ExecutionPolicy ByPass -c "irm https://agentsview.io/install.ps1 | i
 ```
 
 ```bash
-agentsview serve              # Start server
-agentsview serve --port 9090  # Custom port
-agentsview serve --no-browser # Disable browser auto-open
-agentsview serve --background # Run in the background
+agentsview serve          # Start the server in the foreground
+agentsview daemon start   # Start the writable SQLite daemon
+agentsview daemon status  # Show daemon status
+agentsview daemon restart # Restart from current configuration
+agentsview daemon stop    # Stop the writable daemon
 ```
 
+The existing `serve --background`, `serve status`, and `serve stop` forms also
+remain available for compatibility and one-off flag-driven launches. See the
+[CLI reference](/commands/#agentsview-daemon) for lifecycle details.
+
 !!! note
-    The desktop app and CLI share the same data directory
-    (`~/.agentsview/`), so you can use one or both — they are
-    fully complementary.
+
+    The desktop app and CLI share the same data directory (`~/.agentsview/`), so
+    you can use one or both — they are fully complementary.
 
 ## Fast Token Usage & Cost Reports
 
-If you've been reaching for
-[`ccusage`](https://github.com/ryoppippi/ccusage) to see how
-much you spent on Claude Code yesterday, try
-[`agentsview usage`](/token-usage/) instead. It reads from the
-same pre-indexed SQLite database that powers the rest of
-AgentsView, so reports come back in well under a second even on
-large histories. It reports on token-bearing sessions from Claude
-Code, Codex, Copilot CLI, OpenCode-format tools, Pi, Gemini,
-Qwen Code, OpenClaw/QClaw, Hermes, WorkBuddy, Forge, Piebald,
-Antigravity, Zed, VS Code Copilot, Visual Studio Copilot,
-gptme, Mistral Vibe, and more as parser coverage expands.
+If you've been reaching for [`ccusage`](https://github.com/ryoppippi/ccusage) to
+see how much you spent on Claude Code yesterday, try
+[`agentsview usage`](/token-usage/) instead. It reads from the same pre-indexed
+SQLite database that powers the rest of AgentsView, so reports come back in well
+under a second even on large histories. It reports on token-bearing sessions
+from Claude Code, Codex, Copilot CLI, OpenCode-format tools, Pi, Gemini, Qwen
+Code, OpenClaw/QClaw, Hermes, WorkBuddy, Forge, Piebald, Antigravity, Zed, VS
+Code Copilot, Visual Studio Copilot, gptme, Mistral Vibe, and more as parser
+coverage expands.
 
 ```bash
 agentsview usage daily          # last 30 days, terminal table
@@ -140,30 +151,26 @@ agentsview usage daily --all    # full history, JSON-friendly
 agentsview usage statusline     # $9.61 today
 ```
 
-On a 22,000-session local database, `agentsview usage daily`
-runs **80–220× faster** than `npx ccusage@latest daily` (see
-[benchmarks](/token-usage/#how-it-compares-to-ccusage)). On
-smaller databases the absolute gap is smaller, but reports
-still come back sub-second. See
+On a 22,000-session local database, `agentsview usage daily` runs **80–220×
+faster** than `npx ccusage@latest daily` (see
+[benchmarks](/token-usage/#how-it-compares-to-ccusage)). On smaller databases
+the absolute gap is smaller, but reports still come back sub-second. See
 [Token Usage & Costs](/token-usage/) for the full write-up.
 
 ## See When Your Agents Are Working
 
-The [**Activity**](/activity/) dashboard turns timestamped session
-data into a clear picture of *when* your agents ran, how much work
-overlapped, and what it cost. See peak concurrency and the exact
-moment it happened, active versus idle time, agent-minutes across
-concurrent sessions, and total cost — scoped to any day, week,
-month, or custom range and filterable by project, agent, and
-machine.
+The [**Activity**](/activity/) dashboard turns timestamped session data into a
+clear picture of *when* your agents ran, how much work overlapped, and what it
+cost. See peak concurrency and the exact moment it happened, active versus idle
+time, agent-minutes across concurrent sessions, and total cost — scoped to any
+day, week, month, or custom range and filterable by project, agent, and machine.
 
 ![AgentsView Activity dashboard](/assets/generated/screenshots/activity-page.png)
 
-Click any bucket in the concurrency timeline to see exactly which
-sessions were running in that slot, overlay token or cost trends
-over the bars, and break activity down by project, model, or agent.
-The same report is available from the CLI, with `--json` for
-scripting:
+Click any bucket in the concurrency timeline to see exactly which sessions were
+running in that slot, overlay token or cost trends over the bars, and break
+activity down by project, model, or agent. The same report is available from the
+CLI, with `--json` for scripting:
 
 ```bash
 agentsview activity report --preset day
@@ -175,11 +182,10 @@ See [Activity](/activity/) for the full reference.
 ## What It Does
 
 AgentsView reads the session files that your
-[AI coding agents](/configuration/#session-discovery) leave on
-your machine and gives you a local-first desktop and web app to
-work with them. By default everything stays on your machine.
-Optionally, [PostgreSQL sync](/pg-sync/) can push session data
-to a shared database for team or multi-machine setups.
+[AI coding agents](/configuration/#session-discovery) leave on your machine and
+gives you a local-first desktop and web app to work with them. By default
+everything stays on your machine. Optionally, [PostgreSQL sync](/pg-sync/) can
+push session data to a shared database for team or multi-machine setups.
 
 <div class="grid cards" markdown>
 
@@ -202,6 +208,9 @@ to a shared database for team or multi-machine setups.
     Full-text search across all message content. Find that
     one conversation where you discussed a specific function,
     error message, or design decision — even months later.
+    Opt-in [semantic search](/semantic-search/) matches by
+    meaning when you don't remember the exact words, and every
+    match cites the conversation unit it came from.
 
 -   **Recent Edits**
 
@@ -245,9 +254,10 @@ to a shared database for team or multi-machine setups.
     Works with [dozens of AI coding session sources](/configuration/#session-discovery)
     including Claude Code, OpenClaude, Codex, Copilot, Cursor,
     Gemini, OpenHands, Aider, Claude Cowork, DeepSeek TUI, gptme,
-    Kilo, MiMoCode, Mistral Vibe, OhMyPi, QwenPaw, Reasonix,
-    Shelley, and Visual Studio Copilot. Auto-discovers session
-    directories so there's nothing to configure.
+    Grok, Kilo, Kilo (legacy), MiMoCode, Mistral Vibe, OhMyPi,
+    Poolside, QwenPaw, Reasonix, RooCode, Shelley, Trae, Visual
+    Studio Copilot, and ZCode. Auto-discovers session directories
+    so there's nothing to configure.
 
 -   **Import Chat History**
 
@@ -268,8 +278,7 @@ to a shared database for team or multi-machine setups.
 
 <img src="/assets/static/architecture.svg" alt="AgentsView architecture: agent sessions sync into SQLite with FTS5 search, served via REST API, SSE events, and embedded Svelte SPA" style="width: 100%; max-width: 960px; margin: 1.5rem auto; display: block;" />
 
-AgentsView watches your agent session directories for changes,
-parses JSONL files from each agent format, and stores structured
-data in SQLite with full-text search indexes. The embedded web
-frontend provides browsing, search, and analytics over the
-REST API.
+AgentsView watches your agent session directories for changes, parses JSONL
+files from each agent format, and stores structured data in SQLite with
+full-text search indexes. The embedded web frontend provides browsing, search,
+and analytics over the REST API.

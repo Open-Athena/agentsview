@@ -221,7 +221,7 @@ func (c *schemaProbeConn) QueryContext(
 				"user_message_count", "is_automated",
 			},
 		}, nil
-	case strings.Contains(normalized, "from project_identity_observations") &&
+	case strings.Contains(normalized, "from source_project_identity_observations") &&
 		strings.Contains(normalized, "select project"):
 		return &schemaProbeRows{
 			columns: []string{
@@ -279,6 +279,12 @@ func (s *schemaProbeState) alterTableExecCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.alterTableExecs)
+}
+
+func (s *schemaProbeState) alterTableSQL() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return strings.Join(s.alterTableExecs, "\n")
 }
 
 func (s *schemaProbeState) execCount() int {
@@ -358,6 +364,43 @@ func TestEnsureSchemaBatchesColumnIntrospection(t *testing.T) {
 
 	assert.Equal(t, 1, state.informationQueryCount(),
 		"information_schema.columns queries")
+}
+
+func TestEnsureSchemaMigratesSessionDeletionCause(t *testing.T) {
+	pg, state := newSchemaProbeDB(t, map[string][]string{
+		"sessions": {
+			"owner_marker", "created_at", "deleted_at",
+			"source_display_name", "source_deleted_at",
+			"total_output_tokens", "peak_context_tokens",
+			"has_total_output_tokens", "has_peak_context_tokens",
+			"is_automated", "tool_failure_signal_count", "tool_retry_count",
+			"edit_churn_count", "consecutive_failure_max", "outcome",
+			"outcome_confidence", "ended_with_role", "final_failure_streak",
+			"signals_pending_since", "compaction_count",
+			"mid_task_compaction_count", "context_pressure_max", "health_score",
+			"health_grade", "has_tool_calls", "has_context_data", "data_version",
+			"cwd", "quality_signal_version", "short_prompt_count",
+			"unstructured_start", "missing_success_criteria_count",
+			"missing_verification_count", "duplicate_prompt_count",
+			"no_code_context_count", "runaway_tool_loop_count", "git_branch",
+			"source_session_id", "source_version", "parser_malformed_lines",
+			"is_truncated", "termination_status", "secret_leak_count",
+			"secrets_rules_version", "session_name",
+		},
+		"messages": {
+			"model", "token_usage", "context_tokens", "output_tokens",
+			"has_context_tokens", "has_output_tokens", "claude_message_id",
+			"claude_request_id", "source_type", "source_subtype", "source_uuid",
+			"source_parent_uuid", "is_sidechain", "is_compact_boundary",
+			"thinking_text",
+		},
+		"tool_calls": {"call_index", "file_path"},
+	})
+
+	require.NoError(t, EnsureSchema(t.Context(), pg, "agentsview"))
+
+	assert.Contains(t, state.alterTableSQL(),
+		"ADD COLUMN IF NOT EXISTS deletion_cause TEXT")
 }
 
 func TestEnsureSchemaBackfillsCurationBaselinesWhenAdded(t *testing.T) {
@@ -486,9 +529,11 @@ func TestEnsureSchemaChecksDataVersionBeforeDDL(t *testing.T) {
 func TestSyncEnsureSchemaSkipsDDLWhenSchemaCompatible(t *testing.T) {
 	pg, state := newSchemaProbeDB(t, nil)
 	state.existingTables = map[string]bool{
-		"model_pricing":                 true,
-		"project_identity_observations": true,
-		"cursor_usage_events":           true,
+		"model_pricing":                             true,
+		"source_archives":                           true,
+		"source_project_identity_observations":      true,
+		"source_session_project_identity_snapshots": true,
+		"cursor_usage_events":                       true,
 	}
 	state.existingIndexes = map[string]bool{
 		"idx_cursor_usage_events_dedup": true,
@@ -513,9 +558,11 @@ func TestSyncEnsureSchemaSkipsDDLWhenSchemaCompatible(t *testing.T) {
 func TestEnsureSchemaScrubsProjectIdentityGitRemoteCredentials(t *testing.T) {
 	pg, state := newSchemaProbeDB(t, nil)
 	state.existingTables = map[string]bool{
-		"model_pricing":                 true,
-		"project_identity_observations": true,
-		"cursor_usage_events":           true,
+		"model_pricing":                             true,
+		"source_archives":                           true,
+		"source_project_identity_observations":      true,
+		"source_session_project_identity_snapshots": true,
+		"cursor_usage_events":                       true,
 	}
 	state.existingIndexes = map[string]bool{
 		"idx_cursor_usage_events_dedup": true,
@@ -529,7 +576,7 @@ func TestEnsureSchemaScrubsProjectIdentityGitRemoteCredentials(t *testing.T) {
 	require.NoError(t, syncer.EnsureSchema(context.Background()))
 
 	queried := strings.ToLower(state.queriedSQL())
-	assert.Contains(t, queried, "project_identity_observations",
+	assert.Contains(t, queried, "source_project_identity_observations",
 		"schema repair must touch project identity observations")
 	assert.True(t,
 		state.execArgValueSeen(projectIdentityRemoteScrubMetadataKey),
@@ -563,6 +610,79 @@ func TestCheckSchemaCompatRequiresCurationBaselineColumns(t *testing.T) {
 	assert.Contains(t, err.Error(), "sessions table missing curation columns")
 }
 
+func TestCheckSchemaCompatRequiresDeletionCause(t *testing.T) {
+	pg, state := newSchemaProbeDB(t, nil)
+	state.queryErrors = []schemaProbeQueryError{{
+		contains: "deletion_cause",
+		err: errors.New(
+			`ERROR: column "deletion_cause" does not exist (SQLSTATE 42703)`),
+	}}
+
+	err := CheckSchemaCompat(t.Context(), pg)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "sessions table missing required columns")
+}
+
+func TestCheckSchemaCompatRequiresUsageEventMicrodollars(t *testing.T) {
+	pg, state := newSchemaProbeDB(t, nil)
+	state.queryErrors = []schemaProbeQueryError{{
+		contains: "cost_microdollars",
+		err: errors.New(
+			`ERROR: column "cost_microdollars" does not exist (SQLSTATE 42703)`),
+	}}
+
+	err := CheckSchemaCompat(t.Context(), pg)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(),
+		"usage_events table missing required columns")
+}
+
+func TestCheckSchemaCompatRequiresModelPricingMicrodollarsWhenPresent(
+	t *testing.T,
+) {
+	pg, state := newSchemaProbeDB(t, nil)
+	state.queryErrors = []schemaProbeQueryError{{
+		contains: "input_microdollars_per_mtok",
+		err: errors.New(
+			`ERROR: column "input_microdollars_per_mtok" does not exist (SQLSTATE 42703)`),
+	}}
+
+	err := CheckSchemaCompat(t.Context(), pg)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(),
+		"model_pricing table missing required columns")
+}
+
+func TestCheckSchemaCompatAllowsMissingOptionalModelPricing(t *testing.T) {
+	pg, state := newSchemaProbeDB(t, nil)
+	state.queryErrors = []schemaProbeQueryError{{
+		contains: "from model_pricing",
+		err: errors.New(
+			`ERROR: relation "model_pricing" does not exist (SQLSTATE 42P01)`),
+	}}
+
+	require.NoError(t, CheckSchemaCompat(t.Context(), pg))
+}
+
+func TestCheckSchemaCompatPropagatesModelPricingPermissionFailure(t *testing.T) {
+	pg, state := newSchemaProbeDB(t, nil)
+	state.queryErrors = []schemaProbeQueryError{{
+		contains: "from model_pricing",
+		err: errors.New(
+			`ERROR: permission denied for table model_pricing (SQLSTATE 42501)`),
+	}}
+
+	err := CheckSchemaCompat(t.Context(), pg)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(),
+		"model_pricing table missing required columns")
+	assert.Contains(t, err.Error(), "permission denied")
+}
+
 func TestCheckSchemaCompatRequiresExcludedSessions(t *testing.T) {
 	pg, state := newSchemaProbeDB(t, nil)
 	state.queryErrors = []schemaProbeQueryError{{
@@ -594,16 +714,46 @@ func TestCheckSchemaCompatRequiresSessionAliases(t *testing.T) {
 func TestCheckSchemaCompatRequiresProjectIdentityObservations(t *testing.T) {
 	pg, state := newSchemaProbeDB(t, nil)
 	state.queryErrors = []schemaProbeQueryError{{
-		contains: "from project_identity_observations",
+		contains: "from source_project_identity_observations",
 		err: errors.New(
-			`ERROR: relation "project_identity_observations" does not exist (SQLSTATE 42P01)`),
+			`ERROR: relation "source_project_identity_observations" does not exist (SQLSTATE 42P01)`),
 	}}
 
 	err := CheckSchemaCompat(context.Background(), pg)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(),
-		"project_identity_observations table missing required columns")
+		"source_project_identity_observations table missing required columns")
+}
+
+func TestCheckSchemaCompatRequiresSessionProjectIdentitySnapshots(t *testing.T) {
+	pg, state := newSchemaProbeDB(t, nil)
+	state.queryErrors = []schemaProbeQueryError{{
+		contains: "from source_session_project_identity_snapshots",
+		err: errors.New(
+			`ERROR: relation "source_session_project_identity_snapshots" does not exist (SQLSTATE 42P01)`),
+	}}
+
+	err := CheckSchemaCompat(context.Background(), pg)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(),
+		"source session project identity snapshots missing required columns")
+}
+
+func TestCheckSchemaCompatRequiresSourceArchives(t *testing.T) {
+	pg, state := newSchemaProbeDB(t, nil)
+	state.queryErrors = []schemaProbeQueryError{{
+		contains: "from source_archives",
+		err: errors.New(
+			`ERROR: relation "source_archives" does not exist (SQLSTATE 42P01)`),
+	}}
+
+	err := CheckSchemaCompat(context.Background(), pg)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(),
+		"source_archives table missing required columns")
 }
 
 func TestSyncEnsureSchemaRunsDDLWhenPushMetadataMissing(t *testing.T) {
@@ -812,10 +962,11 @@ func TestEnsureSchemaGroupsMissingColumnMigrationsByTable(t *testing.T) {
 
 	require.NoError(t, EnsureSchema(context.Background(), db, "agentsview"))
 
-	// Two tables have missing columns (sessions: termination_status;
+	// Three tables have missing columns (sessions: termination_status;
 	// messages: source_parent_uuid, is_sidechain, is_compact_boundary,
-	// thinking_text). Per-table batching means one ALTER each. tool_calls
+	// thinking_text; source_project_identity_observations: repository/worktree/
+	// checkout/remote context). Per-table batching means one ALTER each. tool_calls
 	// lists all its migration columns (call_index, file_path) as present, so
 	// it contributes no ALTER.
-	assert.Equal(t, 2, state.alterTableExecCount(), "ALTER TABLE execs")
+	assert.Equal(t, 3, state.alterTableExecCount(), "ALTER TABLE execs")
 }

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { Card } from "@kenn-io/kit-ui";
   import { onMount, onDestroy, untrack } from "svelte";
   import RangePicker from "../shared/RangePicker.svelte";
   import {
@@ -15,6 +16,7 @@
   import VelocityMetrics from "./VelocityMetrics.svelte";
   import ToolUsage from "./ToolUsage.svelte";
   import TopSkills from "./TopSkills.svelte";
+  import SkillTrend from "./SkillTrend.svelte";
   import AgentComparison from "./AgentComparison.svelte";
   import SessionHealthSection from "./SessionHealthSection.svelte";
   import TopSessions from "./TopSessions.svelte";
@@ -22,6 +24,7 @@
   import SessionFilterControl from "../filters/SessionFilterControl.svelte";
   import FilterDropdown from "../usage/FilterDropdown.svelte";
   import { analytics } from "../../stores/analytics.svelte.js";
+  import { analyticsPageDates } from "../../stores/analyticsPageDates.js";
   import {
     sessions,
     filtersToParams,
@@ -33,8 +36,8 @@
   import {
     yokedDates,
     panelDateState,
-    panelStateToRange,
-    rangeToSessionParams,
+    panelDateToSessionFilterParams,
+    rangeToPanelDate,
     sessionParamsToPanelDate,
     type PanelDateState,
   } from "../../stores/yokedDates.svelte.js";
@@ -59,6 +62,7 @@
 
   function applyRange(sel: RangeSelection) {
     if (sel.mode === "relative" && sel.days > 0) {
+      sessionDateIntentEstablished = true;
       analytics.setRollingWindow(sel.days);
       const state = panelDateState(analytics.from, analytics.to, {
         mode: "rolling",
@@ -70,6 +74,7 @@
       }
     } else {
       const range = resolveRange(sel, earliestSession);
+      sessionDateIntentEstablished = true;
       analytics.setDateRange(range.from, range.to);
       const state = panelDateState(range.from, range.to, {
         mode: "fixed",
@@ -137,12 +142,6 @@
     return JSON.stringify({ mode: "none" });
   }
 
-  function clearSessionDateFilters(): void {
-    sessions.filters.date = "";
-    sessions.filters.dateFrom = "";
-    sessions.filters.dateTo = "";
-  }
-
   function sessionDateFiltersAreClear(): boolean {
     return !sessions.filters.date &&
       !sessions.filters.dateFrom &&
@@ -164,19 +163,11 @@
     state: PanelDateState,
   ): boolean {
     const before = JSON.stringify(filtersToParams(sessions.filters));
-    clearSessionDateFilters();
-    const range = panelStateToRange(
-      state.mode === "rolling"
-        ? { ...state, mode: "fixed", windowDays: undefined }
-        : state,
-      Date.now(),
+    const params = panelDateToSessionFilterParams(state);
+    sessions.applyPanelDateFilters(
+      params,
+      state.mode === "rolling" ? state.windowDays ?? null : null,
     );
-    if (range) {
-      const params = rangeToSessionParams(range);
-      sessions.filters.date = params["date"] ?? "";
-      sessions.filters.dateFrom = params["date_from"] ?? "";
-      sessions.filters.dateTo = params["date_to"] ?? "";
-    }
     const after = JSON.stringify(filtersToParams(sessions.filters));
     return before !== after;
   }
@@ -240,6 +231,7 @@
   function handleDateRangeChange(from: string, to: string) {
     const state = panelDateState(from, to, { mode: "fixed" });
     if (!state) return;
+    sessionDateIntentEstablished = true;
     analytics.setDateRange(from, to);
     yokedDates.updateFromPanel(state);
     writeSessionDateParams(state);
@@ -300,6 +292,7 @@
   let analyticsDateUrlInitRan = $state(false);
   let analyticsDateUrlInitComplete = $state(false);
   let lastAnalyticsDateUrlSignature: string | null = $state(null);
+  let sessionDateIntentEstablished = false;
 
   onMount(() => {
     // The URL-date effect owns the initial load so deep links and stored yoke
@@ -442,19 +435,25 @@
         let changed = false;
         if (firstRun) {
           const seed = yokedDates.seedForPanel();
+          const retained = seed
+            ? null
+            : analyticsPageDates.restoreWithIntent("sessions");
           state = seed
-            ? panelDateState(seed.from, seed.to, {
-                mode: seed.mode,
-                windowDays: seed.windowDays,
-              })
-            : null;
+            ? rangeToPanelDate(seed)
+            : retained?.state ?? null;
+          sessionDateIntentEstablished = seed !== null ||
+            retained?.explicitDateIntent === true;
           if (state) {
             changed = applyAnalyticsPanelDate(state);
-            writeSessionDateParams(state);
+            if (sessionDateIntentEstablished) {
+              writeSessionDateParams(state);
+            }
           }
         } else if (dateChanged && sessionDateFiltersAreClear()) {
+          sessionDateIntentEstablished = false;
           yokedDates.clear();
         } else if (dateChanged) {
+          sessionDateIntentEstablished = true;
           state = rollingPanelDate(analytics.windowDays);
           if (state) {
             changed = applyAnalyticsPanelDate(state);
@@ -476,6 +475,7 @@
       let changed = false;
       let sessionChanged = false;
       if (dateChanged) {
+        sessionDateIntentEstablished = true;
         changed = applyAnalyticsPanelDate(state);
         sessionChanged = syncSessionFiltersForDateState(state);
         yokedDates.updateFromPanel(state);
@@ -493,6 +493,15 @@
   });
 
   onDestroy(() => {
+    analytics.cancelInFlightReads();
+    const state = currentAnalyticsPanelDate();
+    if (state) {
+      analyticsPageDates.retain(
+        "sessions",
+        state,
+        sessionDateIntentEstablished,
+      );
+    }
     unsubEvents?.();
   });
 </script>
@@ -522,7 +531,7 @@
       label={m.analytics_refresh()}
     />
     <FilterDropdown
-      label="Model"
+      label={m.analytics_model()}
       items={modelItems}
       excludedCsv={analytics.model}
       mode="include"
@@ -548,11 +557,11 @@
     <SummaryCards />
 
     <div class="chart-grid">
-      <div class="chart-panel wide">
+      <Card level="default" padding="none" class="chart-panel wide">
         <Heatmap />
-      </div>
+      </Card>
 
-      <div class="chart-panel">
+      <Card level="default" padding="none" class="chart-panel">
         <div class="chart-header">
           <h3 class="chart-title">
             {m.analytics_activity_by_day_hour()}
@@ -564,35 +573,39 @@
         <ActivityTimeline onDateRangeChange={handleDateRangeChange} />
         <div class="chart-divider"></div>
         <HourOfWeekHeatmap />
-      </div>
+      </Card>
 
-      <div class="chart-panel">
+      <Card level="default" padding="none" class="chart-panel">
         <TopSessions />
-      </div>
+      </Card>
 
-      <div class="chart-panel wide">
+      <Card level="default" padding="none" class="chart-panel wide">
         <ProjectBreakdown />
-      </div>
+      </Card>
 
-      <div class="chart-panel">
+      <Card level="default" padding="none" class="chart-panel">
         <SessionShape />
-      </div>
+      </Card>
 
-      <div class="chart-panel">
+      <Card level="default" padding="none" class="chart-panel">
         <ToolUsage />
-      </div>
+      </Card>
 
-      <div class="chart-panel wide">
+      <Card level="default" padding="none" class="chart-panel wide">
         <TopSkills />
-      </div>
+      </Card>
 
-      <div class="chart-panel wide">
+      <Card level="default" padding="none" class="chart-panel wide">
+        <SkillTrend />
+      </Card>
+
+      <Card level="default" padding="none" class="chart-panel wide">
         <VelocityMetrics />
-      </div>
+      </Card>
 
-      <div class="chart-panel wide">
+      <Card level="default" padding="none" class="chart-panel wide">
         <AgentComparison />
-      </div>
+      </Card>
     </div>
 
     <SessionHealthSection />
@@ -686,19 +699,21 @@
     gap: 12px;
   }
 
-  .chart-panel {
-    background: var(--bg-surface);
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-md);
+  .chart-grid :global(.chart-panel) {
     padding: 12px;
     min-height: 200px;
     min-width: 0;
     overflow-x: hidden;
     display: flex;
     flex-direction: column;
+    gap: 0;
   }
 
-  .chart-panel.wide {
+  .chart-grid :global(.chart-panel > .kit-card__body) {
+    display: contents;
+  }
+
+  .chart-grid :global(.chart-panel.wide) {
     grid-column: 1 / -1;
   }
 

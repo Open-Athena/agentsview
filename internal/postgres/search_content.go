@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"go.kenn.io/agentsview/internal/db"
@@ -29,6 +30,30 @@ func (s *Store) SearchContent(
 	if f.Pattern == "" {
 		return db.ContentSearchPage{}, nil
 	}
+
+	// Semantic and hybrid validate Sources themselves (messages only) ahead
+	// of the substring/regex/fts source-set default just below, which fills
+	// in tool_input/tool_result that neither mode supports -- mirroring
+	// internal/db's SearchContent so an empty Sources field is not defaulted
+	// out from under ValidateSemanticFilter's empty-or-messages-only check.
+	if f.Mode == "semantic" || f.Mode == "hybrid" {
+		// Validate input the same way SQLite's semantic/hybrid paths do
+		// before reporting the capability gate: an invalid request (bad
+		// cursor, non-messages source) must return the same 400
+		// SearchInputError on every backend rather than a 501 here and a
+		// 400 on SQLite (backend parity, see AGENTS.md).
+		if err := db.ValidateSemanticFilter(f); err != nil {
+			return db.ContentSearchPage{}, err
+		}
+		if s.getVectorSearcher() == nil {
+			return db.ContentSearchPage{}, s.semanticUnavailableError()
+		}
+		if f.Mode == "semantic" {
+			return s.searchContentSemanticPG(ctx, f)
+		}
+		return s.searchContentHybridPG(ctx, f)
+	}
+
 	if len(f.Sources) == 0 {
 		f.Sources = []string{"messages", "tool_input", "tool_result"}
 	}
@@ -63,6 +88,7 @@ func pgSessionFilter(f db.ContentSearchFilter) db.SessionFilter {
 		Project: f.Project, ExcludeProject: f.ExcludeProject,
 		Machine: f.Machine, GitBranch: f.GitBranch, Agent: f.Agent,
 		Date: f.Date, DateFrom: f.DateFrom, DateTo: f.DateTo,
+		Timezone:         f.Timezone,
 		ActiveSince:      f.ActiveSince,
 		ExcludeOneShot:   !f.IncludeOneShot,
 		ExcludeAutomated: !f.IncludeAutomated,
@@ -130,7 +156,7 @@ func pgMessagesBranch(
 	return fmt.Sprintf(`
 		SELECT m.session_id, s.project, s.agent, 'message' AS location,
 			m.role AS role, '' AS tool_name, m.ordinal,
-			COALESCE(m.timestamp::text, '') AS ts,
+			m.timestamp AS ts,
 			m.content AS snippet, 0 AS src, 0::bigint AS row_id,
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
 		FROM messages m
@@ -182,7 +208,7 @@ func pgToolInputBranch(
 	return fmt.Sprintf(`
 		SELECT tc.session_id, s.project, s.agent, 'tool_input' AS location,
 			'assistant' AS role, tc.tool_name, tc.message_ordinal AS ordinal,
-			COALESCE(m.timestamp::text, '') AS ts,
+			m.timestamp AS ts,
 			tc.input_json AS snippet, 1 AS src, tc.id AS row_id,
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
 		FROM tool_calls tc
@@ -207,7 +233,7 @@ func pgToolResultContentBranch(
 	return fmt.Sprintf(`
 		SELECT tc.session_id, s.project, s.agent, 'tool_result' AS location,
 			'assistant' AS role, tc.tool_name, tc.message_ordinal AS ordinal,
-			COALESCE(m.timestamp::text, '') AS ts,
+			m.timestamp AS ts,
 			tc.result_content AS snippet, 2 AS src, tc.id AS row_id,
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
 		FROM tool_calls tc
@@ -236,7 +262,7 @@ func pgToolResultEventsBranch(
 		SELECT tre.session_id, s.project, s.agent, 'tool_result' AS location,
 			'assistant' AS role, '' AS tool_name,
 			tre.tool_call_message_ordinal AS ordinal,
-			COALESCE(tre.timestamp::text, '') AS ts,
+			tre.timestamp AS ts,
 			tre.content AS snippet, 3 AS src, tre.id AS row_id,
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
 		FROM tool_result_events tre
@@ -248,7 +274,9 @@ func pgToolResultEventsBranch(
 
 // scanPGContentMatches runs query and assembles a ContentSearchPage. The
 // query's final column is the full source field; makeSnippet derives the
-// windowed, redacted snippet so redaction sees whole secrets.
+// windowed, redacted snippet so redaction sees whole secrets. The returned
+// page then gets its derived unit ranges and lineage assigned by the shared
+// deriveLexicalUnitsPG pass (post-truncation, O(page)).
 func (s *Store) scanPGContentMatches(
 	ctx context.Context, query string, args []any, limit, cursor int,
 	makeSnippet func(body string) string,
@@ -263,12 +291,16 @@ func (s *Store) scanPGContentMatches(
 	for rows.Next() {
 		var m db.ContentMatch
 		var body string
+		var ts *time.Time
 		if err := rows.Scan(
 			&m.SessionID, &m.Project, &m.Agent,
 			&m.Location, &m.Role, &m.ToolName, &m.Ordinal,
-			&m.Timestamp, &body,
+			&ts, &body,
 		); err != nil {
 			return db.ContentSearchPage{}, fmt.Errorf("scan pg match: %w", err)
+		}
+		if ts != nil {
+			m.Timestamp = FormatISO8601(*ts)
 		}
 		m.Snippet = makeSnippet(body)
 		out = append(out, m)
@@ -276,10 +308,20 @@ func (s *Store) scanPGContentMatches(
 	if err := rows.Err(); err != nil {
 		return db.ContentSearchPage{}, err
 	}
+	// Close the cursor before deriving units (exhausting Next already
+	// auto-closed it; this keeps the release explicit): deriveLexicalUnitsPG
+	// issues new queries, which must never wait on a connection this cursor
+	// would otherwise still pin.
+	if err := rows.Close(); err != nil {
+		return db.ContentSearchPage{}, fmt.Errorf("closing pg content matches: %w", err)
+	}
 	page := db.ContentSearchPage{Matches: out}
 	if len(out) > limit {
 		page.Matches = out[:limit]
 		page.NextCursor = cursor + limit
+	}
+	if err := s.deriveLexicalUnitsPG(ctx, page.Matches); err != nil {
+		return db.ContentSearchPage{}, err
 	}
 	return page, nil
 }
@@ -306,13 +348,17 @@ func (s *Store) searchContentRegexPG(
 	for rows.Next() {
 		var m db.ContentMatch
 		var body string
+		var ts *time.Time
 		if err := rows.Scan(
 			&m.SessionID, &m.Project, &m.Agent,
 			&m.Location, &m.Role, &m.ToolName, &m.Ordinal,
-			&m.Timestamp, &body,
+			&ts, &body,
 		); err != nil {
 			return db.ContentSearchPage{},
 				fmt.Errorf("scan pg regex candidate: %w", err)
+		}
+		if ts != nil {
+			m.Timestamp = FormatISO8601(*ts)
 		}
 		loc := re.FindStringIndex(body)
 		if loc == nil {
@@ -331,10 +377,20 @@ func (s *Store) searchContentRegexPG(
 	if err := rows.Err(); err != nil {
 		return db.ContentSearchPage{}, err
 	}
+	// Close the candidate cursor before deriving units: the loop breaks out
+	// with rows still open once Limit+1 matches are collected, and
+	// deriveLexicalUnitsPG issues new queries that could otherwise block on a
+	// constrained connection pool while this cursor pins a connection.
+	if err := rows.Close(); err != nil {
+		return db.ContentSearchPage{}, fmt.Errorf("closing pg regex candidates: %w", err)
+	}
 	page := db.ContentSearchPage{Matches: out}
 	if len(out) > f.Limit {
 		page.Matches = out[:f.Limit]
 		page.NextCursor = f.Cursor + f.Limit
+	}
+	if err := s.deriveLexicalUnitsPG(ctx, page.Matches); err != nil {
+		return db.ContentSearchPage{}, err
 	}
 	return page, nil
 }
@@ -404,7 +460,7 @@ func pgMessagesCandidateBranch(
 	return fmt.Sprintf(`
 		SELECT m.session_id, s.project, s.agent, 'message' AS location,
 			m.role AS role, '' AS tool_name, m.ordinal,
-			COALESCE(m.timestamp::text, '') AS ts,
+			m.timestamp AS ts,
 			m.content AS body, 0 AS src, 0::bigint AS row_id,
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
 		FROM messages m
@@ -423,7 +479,7 @@ func pgToolInputCandidateBranch(
 	return fmt.Sprintf(`
 		SELECT tc.session_id, s.project, s.agent, 'tool_input' AS location,
 			'assistant' AS role, tc.tool_name, tc.message_ordinal AS ordinal,
-			COALESCE(m.timestamp::text, '') AS ts,
+			m.timestamp AS ts,
 			tc.input_json AS body, 1 AS src, tc.id AS row_id,
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
 		FROM tool_calls tc
@@ -444,7 +500,7 @@ func pgToolResultContentCandidateBranch(
 	return fmt.Sprintf(`
 		SELECT tc.session_id, s.project, s.agent, 'tool_result' AS location,
 			'assistant' AS role, tc.tool_name, tc.message_ordinal AS ordinal,
-			COALESCE(m.timestamp::text, '') AS ts,
+			m.timestamp AS ts,
 			tc.result_content AS body, 2 AS src, tc.id AS row_id,
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
 		FROM tool_calls tc
@@ -472,7 +528,7 @@ func pgToolResultEventsCandidateBranch(
 		SELECT tre.session_id, s.project, s.agent, 'tool_result' AS location,
 			'assistant' AS role, '' AS tool_name,
 			tre.tool_call_message_ordinal AS ordinal,
-			COALESCE(tre.timestamp::text, '') AS ts,
+			tre.timestamp AS ts,
 			tre.content AS body, 3 AS src, tre.id AS row_id,
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
 		FROM tool_result_events tre

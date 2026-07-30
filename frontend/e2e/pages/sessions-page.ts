@@ -1,5 +1,7 @@
 import { expect, type Locator, type Page } from "@playwright/test";
 
+const SESSION_READY_TIMEOUT_MS = process.env.CI === "true" ? 15_000 : 5_000;
+
 /**
  * Page object for the sessions view.
  * Encapsulates selectors and common navigation actions
@@ -37,7 +39,7 @@ export class SessionsPage {
   async goto() {
     await this.page.goto("/");
     await expect(this.sessionItems.first()).toBeVisible({
-      timeout: 5_000,
+      timeout: SESSION_READY_TIMEOUT_MS,
     });
   }
 
@@ -80,9 +82,12 @@ export class SessionsPage {
     await input.click();
     await input.fill(project);
     const escaped = project.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    // kit-ui renders the option label as match-highlight segments inside
+    // a label span, so the option's text carries template whitespace
+    // around the name — anchor with \s* instead of exact spacing.
     await this.projectTypeahead
       .locator(".kit-typeahead__option", {
-        hasText: new RegExp(`^${escaped} \\(`),
+        hasText: new RegExp(`^\\s*${escaped}\\s*\\(`),
       })
       .click();
   }

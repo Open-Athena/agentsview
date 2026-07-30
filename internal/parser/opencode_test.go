@@ -52,6 +52,7 @@ CREATE TABLE session (
 	project_id TEXT NOT NULL,
 	parent_id TEXT,
 	title TEXT,
+	directory TEXT NOT NULL DEFAULT '',
 	time_created INTEGER NOT NULL,
 	time_updated INTEGER NOT NULL,
 	FOREIGN KEY (project_id) REFERENCES project(id)
@@ -104,9 +105,39 @@ func (s *OpenCodeSeeder) AddSession(id, projectID, parentID, title string, timeC
 		tStr = title
 	}
 
-	_, err := s.db.Exec(`INSERT INTO session (id, project_id, parent_id, title, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?)`,
-		id, projectID, pID, tStr, timeCreated, timeUpdated)
+	// Omit directory so the same helper works on legacy schemas that
+	// lack the column; modern fixtures default directory to ''.
+	_, err := s.db.Exec(
+		`INSERT INTO session
+			(id, project_id, parent_id, title, time_created, time_updated)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		id, projectID, pID, tStr, timeCreated, timeUpdated,
+	)
 	require.NoError(s.t, err, "add session")
+}
+
+func (s *OpenCodeSeeder) AddSessionDirectory(
+	id, projectID, parentID, title, directory string,
+	timeCreated, timeUpdated int64,
+) {
+	s.t.Helper()
+
+	var pID, tStr any
+	if parentID != "" {
+		pID = parentID
+	}
+	if title != "" {
+		tStr = title
+	}
+
+	_, err := s.db.Exec(
+		`INSERT INTO session
+			(id, project_id, parent_id, title, directory,
+			 time_created, time_updated)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		id, projectID, pID, tStr, directory, timeCreated, timeUpdated,
+	)
+	require.NoError(s.t, err, "add session with directory")
 }
 
 func (s *OpenCodeSeeder) AddMessage(id, sessionID string, timeCreated, timeUpdated int64, data string) {
@@ -837,6 +868,255 @@ func TestParseOpenCodeDB_ToolParts(t *testing.T) {
 	}})
 }
 
+// TestParseOpenCodeDB_SkillTool verifies that a "skill" tool part
+// populates ParsedToolCall.SkillName straight from the tool's own
+// input, without going through the read-file/shell-command
+// inference heuristics. Before this fix extractOpenCodeToolCall
+// never set SkillName at all (#1040).
+func TestParseOpenCodeDB_SkillTool(t *testing.T) {
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+
+	seeder.AddProject("prj_1", "/tmp/proj")
+	seeder.AddSession("ses_skill", "prj_1", "", "", 1700000000000, 1700000030000)
+
+	seeder.AddMessage("msg_u", "ses_skill", 1700000000000, 1700000000000, `{"role":"user"}`)
+	seeder.AddPart("prt_u", "msg_u", "ses_skill", 1700000000000, 1700000000000, `{"type":"text","text":"use the doc-writer skill"}`)
+
+	seeder.AddMessage("msg_a", "ses_skill", 1700000010000, 1700000010000, `{"role":"assistant"}`)
+	seeder.AddPart("prt_t", "msg_a", "ses_skill", 1700000010000, 1700000010000,
+		`{"type":"tool","tool":"skill","callID":"call_skill","state":{"input":{"name":"doc-writer"}}}`)
+
+	sessions, err := parseOpenCodeAll(dbPath, "m")
+	require.NoError(t, err, "ParseOpenCodeDB")
+	require.Len(t, sessions, 1, "sessions len")
+
+	msgs := sessions[0].Messages
+	require.Len(t, msgs, 2, "messages len")
+
+	ast := msgs[1]
+	require.Len(t, ast.ToolCalls, 1, "tool calls len")
+	assertEq(t, "SkillName", ast.ToolCalls[0].SkillName, "doc-writer")
+}
+
+// TestParseOpenCodeDB_InvalidToolCall verifies that an invalid
+// tool call (tool:"invalid") populates ResultEvents with
+// Status:"errored" so the signal engine detects it as a failure.
+func TestParseOpenCodeDB_InvalidToolCall(t *testing.T) {
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+
+	seeder.AddProject("prj_1", "/tmp/proj")
+	seeder.AddSession("ses_inv", "prj_1", "", "", 1700000000000, 1700000030000)
+
+	seeder.AddMessage("msg_u", "ses_inv", 1700000000000, 1700000000000, `{"role":"user"}`)
+	seeder.AddPart("prt_u", "msg_u", "ses_inv", 1700000000000, 1700000000000, `{"type":"text","text":"do something"}`)
+
+	seeder.AddMessage("msg_a", "ses_inv", 1700000010000, 1700000010000, `{"role":"assistant"}`)
+	seeder.AddPart("prt_t", "msg_a", "ses_inv", 1700000010000, 1700000010000,
+		`{"type":"tool","tool":"invalid","callID":"call_inv","state":{"input":{"tool":"nonexistent_tool","error":"Model tried to call unavailable tool 'nonexistent_tool'"}}}`)
+
+	sessions, err := parseOpenCodeAll(dbPath, "m")
+	require.NoError(t, err, "ParseOpenCodeDB")
+	require.Len(t, sessions, 1, "sessions len")
+
+	msgs := sessions[0].Messages
+	require.Len(t, msgs, 2, "messages len")
+
+	ast := msgs[1]
+	require.Len(t, ast.ToolCalls, 1, "tool calls len")
+	require.Len(t, ast.ToolCalls[0].ResultEvents, 1, "result events len")
+	assertEq(t, "ResultEvents[0].Status", ast.ToolCalls[0].ResultEvents[0].Status, "errored")
+}
+
+// TestParseOpenCodeDB_BashExitFailure verifies that a bash tool whose
+// state metadata records a non-zero exit is reported as a failure even
+// when the output text lacks an "exit status N" marker, and that a
+// successful or exit-less part stays clean.
+func TestParseOpenCodeDB_BashExitFailure(t *testing.T) {
+	tests := []struct {
+		name        string
+		tool        string
+		state       string
+		wantErrored bool
+	}{
+		{
+			name:        "non-zero exit without exit-status text",
+			tool:        "bash",
+			state:       `{"input":{"command":"build"},"output":"error: command failed","metadata":{"exit":1}}`,
+			wantErrored: true,
+		},
+		{
+			name:        "non-zero exit with empty output",
+			tool:        "bash",
+			state:       `{"input":{"command":"build"},"output":"","metadata":{"exit":127}}`,
+			wantErrored: true,
+		},
+		{
+			name:        "zero exit is not a failure",
+			tool:        "bash",
+			state:       `{"input":{"command":"build"},"output":"ok","metadata":{"exit":0}}`,
+			wantErrored: false,
+		},
+		{
+			name:        "metadata without an exit key is not a failure",
+			tool:        "bash",
+			state:       `{"input":{"command":"build"},"output":"ok","metadata":{"truncated":false}}`,
+			wantErrored: false,
+		},
+		{
+			name:        "no metadata is not a failure",
+			tool:        "bash",
+			state:       `{"input":{"command":"build"},"output":"ok"}`,
+			wantErrored: false,
+		},
+		{
+			name:        "non-bash metadata exit is not a failure",
+			tool:        "mcp_lookup",
+			state:       `{"input":{"query":"exit routes"},"output":"route 1","metadata":{"exit":1}}`,
+			wantErrored: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dbPath, seeder, db := newTestDB(t)
+			defer db.Close()
+
+			seeder.AddProject("prj_1", "/tmp/proj")
+			seeder.AddSession("ses_bexit", "prj_1", "", "", 1700000000000, 1700000030000)
+
+			seeder.AddMessage("msg_u", "ses_bexit", 1700000000000, 1700000000000, `{"role":"user"}`)
+			seeder.AddPart("prt_u", "msg_u", "ses_bexit", 1700000000000, 1700000000000, `{"type":"text","text":"build"}`)
+
+			seeder.AddMessage("msg_a", "ses_bexit", 1700000010000, 1700000010000, `{"role":"assistant"}`)
+			seeder.AddPart("prt_t", "msg_a", "ses_bexit", 1700000010000, 1700000010000,
+				`{"type":"tool","tool":"`+tt.tool+`","callID":"call_exit","state":`+tt.state+`}`)
+
+			sessions, err := parseOpenCodeAll(dbPath, "m")
+			require.NoError(t, err, "ParseOpenCodeDB")
+			require.Len(t, sessions, 1, "sessions len")
+
+			msgs := sessions[0].Messages
+			require.Len(t, msgs, 2, "messages len")
+
+			ast := msgs[1]
+			require.Len(t, ast.ToolCalls, 1, "tool calls len")
+			if !tt.wantErrored {
+				assert.Empty(t, ast.ToolCalls[0].ResultEvents, "result events")
+				return
+			}
+			require.Len(t, ast.ToolCalls[0].ResultEvents, 1, "result events len")
+			assertEq(t, "ResultEvents[0].Status", ast.ToolCalls[0].ResultEvents[0].Status, "errored")
+		})
+	}
+}
+
+// TestParseOpenCodeDB_SkillNameFromReadTool verifies that a
+// "read" tool part whose input points at a real on-disk SKILL.md
+// infers the skill name from the file's frontmatter, matching the
+// Cursor/Codex read-file heuristic shared via inferOpenCodeSkillName.
+func TestParseOpenCodeDB_SkillNameFromReadTool(t *testing.T) {
+	path := writeTestSkill(t, "foo", "foo")
+
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+
+	seeder.AddProject("prj_1", "/tmp/proj")
+	seeder.AddSession("ses_read", "prj_1", "", "", 1700000000000, 1700000030000)
+
+	seeder.AddMessage("msg_u", "ses_read", 1700000000000, 1700000000000, `{"role":"user"}`)
+	seeder.AddPart("prt_u", "msg_u", "ses_read", 1700000000000, 1700000000000, `{"type":"text","text":"read the skill file"}`)
+
+	seeder.AddMessage("msg_a", "ses_read", 1700000010000, 1700000010000, `{"role":"assistant"}`)
+	seeder.AddPart("prt_t", "msg_a", "ses_read", 1700000010000, 1700000010000,
+		`{"type":"tool","tool":"read","callID":"call_read","state":{"input":{"file_path":`+
+			quoteJSON(t, path)+`}}}`)
+
+	sessions, err := parseOpenCodeAll(dbPath, "m")
+	require.NoError(t, err, "ParseOpenCodeDB")
+	require.Len(t, sessions, 1, "sessions len")
+
+	msgs := sessions[0].Messages
+	require.Len(t, msgs, 2, "messages len")
+
+	ast := msgs[1]
+	require.Len(t, ast.ToolCalls, 1, "tool calls len")
+	assertEq(t, "SkillName", ast.ToolCalls[0].SkillName, "foo")
+}
+
+// TestParseOpenCodeDB_SkillNameFromReadToolRelativePath verifies
+// that a read tool with a relative SKILL.md path resolves against
+// the session worktree and reads frontmatter instead of falling
+// back to the parent directory name.
+func TestParseOpenCodeDB_SkillNameFromReadToolRelativePath(t *testing.T) {
+	// Frontmatter name intentionally differs from the folder name
+	// ("renamed") to prove we read frontmatter, not the directory.
+	path := writeTestSkill(t, "renamed", "actual-skill")
+	directory := filepath.Dir(filepath.Dir(filepath.Dir(path)))
+
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+
+	seeder.AddProject("prj_1", filepath.Join(t.TempDir(), "project-root"))
+	seeder.AddSessionDirectory(
+		"ses_rel", "prj_1", "", "", directory,
+		1700000000000, 1700000030000,
+	)
+
+	seeder.AddMessage("msg_u", "ses_rel", 1700000000000, 1700000000000, `{"role":"user"}`)
+	seeder.AddPart("prt_u", "msg_u", "ses_rel", 1700000000000, 1700000000000, `{"type":"text","text":"read the skill"}`)
+
+	seeder.AddMessage("msg_a", "ses_rel", 1700000010000, 1700000010000, `{"role":"assistant"}`)
+	seeder.AddPart("prt_t", "msg_a", "ses_rel", 1700000010000, 1700000010000,
+		`{"type":"tool","tool":"read","callID":"call_read","state":{"input":{"file_path":"skills/renamed/SKILL.md"}}}`)
+
+	sessions, err := parseOpenCodeAll(dbPath, "m")
+	require.NoError(t, err, "ParseOpenCodeDB")
+	require.Len(t, sessions, 1, "sessions len")
+
+	msgs := sessions[0].Messages
+	require.Len(t, msgs, 2, "messages len")
+
+	ast := msgs[1]
+	require.Len(t, ast.ToolCalls, 1, "tool calls len")
+	assertEq(t, "SkillName", ast.ToolCalls[0].SkillName, "actual-skill")
+}
+
+// TestParseOpenCodeDB_SkillNameFromShellCommandRelativePath
+// verifies that a "bash" tool part running a relative-path
+// SKILL.md read is resolved against the session's project
+// worktree (threaded through buildOpenCodeMessage), matching the
+// Codex shell-command heuristic.
+func TestParseOpenCodeDB_SkillNameFromShellCommandRelativePath(t *testing.T) {
+	path := writeTestSkill(t, "foo", "foo")
+	worktree := filepath.Dir(filepath.Dir(filepath.Dir(path)))
+
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+
+	seeder.AddProject("prj_1", worktree)
+	seeder.AddSession("ses_bash", "prj_1", "", "", 1700000000000, 1700000030000)
+
+	seeder.AddMessage("msg_u", "ses_bash", 1700000000000, 1700000000000, `{"role":"user"}`)
+	seeder.AddPart("prt_u", "msg_u", "ses_bash", 1700000000000, 1700000000000, `{"type":"text","text":"cat the skill file"}`)
+
+	seeder.AddMessage("msg_a", "ses_bash", 1700000010000, 1700000010000, `{"role":"assistant"}`)
+	seeder.AddPart("prt_t", "msg_a", "ses_bash", 1700000010000, 1700000010000,
+		`{"type":"tool","tool":"bash","callID":"call_bash","state":{"input":{"command":"cat skills/foo/SKILL.md"}}}`)
+
+	sessions, err := parseOpenCodeAll(dbPath, "m")
+	require.NoError(t, err, "ParseOpenCodeDB")
+	require.Len(t, sessions, 1, "sessions len")
+
+	msgs := sessions[0].Messages
+	require.Len(t, msgs, 2, "messages len")
+
+	ast := msgs[1]
+	require.Len(t, ast.ToolCalls, 1, "tool calls len")
+	assertEq(t, "SkillName", ast.ToolCalls[0].SkillName, "foo")
+}
+
 func TestParseOpenCodeDB_EmptySession(t *testing.T) {
 	dbPath, seeder, db := newTestDB(t)
 	defer db.Close()
@@ -877,6 +1157,238 @@ func TestParseOpenCodeDB_ProjectFromWorktree(t *testing.T) {
 	assertEq(t, "sessions len", len(sessions), 1)
 
 	assertEq(t, "Project", sessions[0].Session.Project, "my_project")
+}
+
+func TestResolveOpenCodeWorktree(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		session string
+		project string
+		want    string
+	}{
+		{
+			name:    "prefers concrete session directory over global project",
+			session: "/home/user/code/myapp",
+			project: "/",
+			want:    "/home/user/code/myapp",
+		},
+		{
+			name:    "falls back when session directory empty",
+			session: "",
+			project: "/home/user/code/myapp",
+			want:    "/home/user/code/myapp",
+		},
+		{
+			name:    "falls back when session directory is root",
+			session: "/",
+			project: "/home/user/code/myapp",
+			want:    "/home/user/code/myapp",
+		},
+		{
+			name:    "trims session directory whitespace",
+			session: "  /home/user/code/myapp  ",
+			project: "/",
+			want:    "/home/user/code/myapp",
+		},
+		{
+			name:    "keeps project root when session unusable",
+			session: "/",
+			project: "/",
+			want:    "/",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := resolveOpenCodeWorktree(tt.session, tt.project)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestParseOpenCodeDB_PrefersSessionDirectoryOverGlobalProject(t *testing.T) {
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+
+	// OpenCode's synthetic global project uses worktree="/".
+	seeder.AddProject("global", "/")
+	seeder.AddSessionDirectory(
+		"ses_global", "global", "", "Global Session",
+		"/home/user/code/lonely-app",
+		1700000000000, 1700000010000,
+	)
+	seeder.AddMessage("msg_1", "ses_global", 1700000000000, 1700000000000, `{"role":"user"}`)
+	seeder.AddPart(
+		"prt_1", "msg_1", "ses_global",
+		1700000000000, 1700000000000,
+		`{"type":"text","text":"hello from global project"}`,
+	)
+
+	sessions, err := parseOpenCodeAll(dbPath, "testmachine")
+	require.NoError(t, err, "ParseOpenCodeDB")
+	require.Len(t, sessions, 1)
+
+	s := sessions[0].Session
+	assert.Equal(t, "/home/user/code/lonely-app", s.Cwd)
+	assert.Equal(t, "lonely_app", s.Project)
+	assert.NotEqual(t, "unknown", s.Project)
+}
+
+func TestParseOpenCodeDB_ProjectFromUnavailableProjectWorktree(t *testing.T) {
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+
+	worktree := filepath.Join(t.TempDir(), "unavailable-repo")
+	directory := filepath.Join(worktree, "subdir")
+	_, err := os.Stat(worktree)
+	require.Error(t, err)
+	require.True(t, os.IsNotExist(err), "project checkout must be unavailable")
+
+	seeder.AddProject("prj_unavailable", worktree)
+	seeder.AddSessionDirectory(
+		"ses_subdir", "prj_unavailable", "", "Unavailable Checkout",
+		directory, 1700000000000, 1700000010000,
+	)
+	seeder.AddMessage(
+		"msg_1", "ses_subdir", 1700000000000, 1700000000000,
+		`{"role":"user"}`,
+	)
+	seeder.AddPart(
+		"prt_1", "msg_1", "ses_subdir",
+		1700000000000, 1700000000000,
+		`{"type":"text","text":"hello"}`,
+	)
+
+	sessions, err := parseOpenCodeAll(dbPath, "testmachine")
+	require.NoError(t, err)
+	require.Len(t, sessions, 1)
+
+	assert.Equal(t, directory, sessions[0].Session.Cwd)
+	assert.Equal(t, "unavailable_repo", sessions[0].Session.Project)
+}
+
+func TestParseOpenCodeDB_EmptySessionDirectoryUsesProjectWorktree(t *testing.T) {
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+
+	seeder.AddProject("prj_1", "/home/user/code/myapp")
+	seeder.AddSessionDirectory(
+		"ses_empty_dir", "prj_1", "", "No Directory",
+		"",
+		1700000000000, 1700000010000,
+	)
+	seeder.AddMessage("msg_1", "ses_empty_dir", 1700000000000, 1700000000000, `{"role":"user"}`)
+	seeder.AddPart(
+		"prt_1", "msg_1", "ses_empty_dir",
+		1700000000000, 1700000000000,
+		`{"type":"text","text":"hello"}`,
+	)
+
+	sessions, err := parseOpenCodeAll(dbPath, "testmachine")
+	require.NoError(t, err, "ParseOpenCodeDB")
+	require.Len(t, sessions, 1)
+
+	s := sessions[0].Session
+	assert.Equal(t, "/home/user/code/myapp", s.Cwd)
+	assert.Equal(t, "myapp", s.Project)
+}
+
+// openCodeSchemaLegacy omits session.directory, matching older OpenCode-family
+// SQLite layouts still used by Kilo/MiMoCode/ICodeMate archives.
+const openCodeSchemaLegacy = `
+CREATE TABLE project (
+	id TEXT PRIMARY KEY,
+	worktree TEXT NOT NULL,
+	time_created INTEGER NOT NULL DEFAULT 0,
+	time_updated INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE session (
+	id TEXT PRIMARY KEY,
+	project_id TEXT NOT NULL,
+	parent_id TEXT,
+	title TEXT,
+	time_created INTEGER NOT NULL,
+	time_updated INTEGER NOT NULL,
+	FOREIGN KEY (project_id) REFERENCES project(id)
+);
+
+CREATE TABLE message (
+	id TEXT PRIMARY KEY,
+	session_id TEXT NOT NULL,
+	time_created INTEGER NOT NULL,
+	time_updated INTEGER NOT NULL,
+	data TEXT NOT NULL,
+	FOREIGN KEY (session_id) REFERENCES session(id)
+);
+
+CREATE TABLE part (
+	id TEXT PRIMARY KEY,
+	message_id TEXT NOT NULL,
+	session_id TEXT NOT NULL,
+	time_created INTEGER NOT NULL,
+	time_updated INTEGER NOT NULL,
+	data TEXT NOT NULL,
+	FOREIGN KEY (message_id) REFERENCES message(id)
+);
+`
+
+func newLegacyOpenCodeTestDB(t *testing.T) (string, *OpenCodeSeeder, *sql.DB) {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "opencode-legacy.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err, "open legacy test db")
+	_, err = db.Exec(openCodeSchemaLegacy)
+	require.NoError(t, err, "create legacy schema")
+	return dbPath, &OpenCodeSeeder{db: db, t: t}, db
+}
+
+func TestParseOpenCodeDB_LegacySchemaWithoutDirectoryUsesProjectWorktree(t *testing.T) {
+	dbPath, seeder, db := newLegacyOpenCodeTestDB(t)
+	defer db.Close()
+
+	seeder.AddProject("prj_legacy", "/home/user/code/legacy-app")
+	// AddSession inserts without directory; legacy schema has no such column.
+	seeder.AddSession(
+		"ses_legacy", "prj_legacy", "", "Legacy Session",
+		1700000000000, 1700000010000,
+	)
+	seeder.AddMessage("msg_1", "ses_legacy", 1700000000000, 1700000000000, `{"role":"user"}`)
+	seeder.AddPart(
+		"prt_1", "msg_1", "ses_legacy",
+		1700000000000, 1700000000000,
+		`{"type":"text","text":"hello from legacy schema"}`,
+	)
+
+	// Confirm the column is actually absent so the test would fail closed
+	// if the modern SELECT path were used.
+	hasDir, err := openCodeSessionTableHasDirectory(db)
+	require.NoError(t, err)
+	require.False(t, hasDir, "legacy fixture must omit session.directory")
+
+	sessions, err := parseOpenCodeAll(dbPath, "testmachine")
+	require.NoError(t, err, "ParseOpenCodeDB on legacy schema")
+	require.Len(t, sessions, 1)
+
+	s := sessions[0].Session
+	assert.Equal(t, "/home/user/code/legacy-app", s.Cwd)
+	assert.Equal(t, "legacy_app", s.Project)
+}
+
+func TestParseOpenCodeDB_ModernSchemaDirectoryColumnDetected(t *testing.T) {
+	dbPath, seeder, db := newTestDB(t)
+	defer db.Close()
+	seedStandardSession(t, seeder)
+
+	hasDir, err := openCodeSessionHasDirectoryCached(db, dbPath)
+	require.NoError(t, err)
+	assert.True(t, hasDir, "modern fixture must include session.directory")
+
+	sessions, err := parseOpenCodeAll(dbPath, "testmachine")
+	require.NoError(t, err)
+	require.Len(t, sessions, 1)
+	assert.Equal(t, "/home/user/code/myapp", sessions[0].Session.Cwd)
 }
 
 func TestParseOpenCodeSession_SingleSession(t *testing.T) {

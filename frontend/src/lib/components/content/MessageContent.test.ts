@@ -9,6 +9,9 @@ import MessageContent from "./MessageContent.svelte";
 const copyToClipboardMock = vi.hoisted(() =>
   vi.fn().mockResolvedValue(true),
 );
+const initMermaidRenderingMock = vi.hoisted(() =>
+  vi.fn(() => ({ renderNow: vi.fn(), disconnect: vi.fn() })),
+);
 
 const forkSessionMock = vi.hoisted(() => vi.fn());
 const sessionsState = vi.hoisted(() => ({
@@ -80,6 +83,20 @@ vi.mock("../../utils/clipboard.js", () => ({
   copyToClipboard: copyToClipboardMock,
 }));
 
+// Stub MermaidBlock's kit-ui boundary: routing (fence -> pre.mermaid block
+// vs CodeBlock) is MessageContent's contract; the real rendering pipeline
+// is covered in MermaidBlock.svelte.test.ts.
+vi.mock("@kenn-io/kit-ui/utils/markdown-mermaid", () => ({
+  mermaidCodeFence: (code: string, lang: string) => {
+    if (lang !== "mermaid") return undefined;
+    const pre = document.createElement("pre");
+    pre.className = "mermaid";
+    pre.textContent = code;
+    return pre.outerHTML;
+  },
+  initMarkdownMermaidRendering: initMermaidRenderingMock,
+}));
+
 type MessageWithTokenFlags = Message & {
   has_context_tokens?: boolean;
   has_output_tokens?: boolean;
@@ -108,6 +125,39 @@ function makeMessage(
   };
 }
 
+function makeSession(
+  overrides: Partial<Session> = {},
+): Session {
+  return {
+    id: "session-1",
+    agent: "claude",
+    project: "proj-a",
+    machine: "test",
+    first_message: "hello",
+    started_at: "2026-02-20T12:30:00Z",
+    ended_at: "2026-02-20T12:31:00Z",
+    message_count: 3,
+    user_message_count: 2,
+    total_output_tokens: 0,
+    peak_context_tokens: 0,
+    is_automated: false,
+    created_at: "2026-02-20T12:30:00Z",
+    ...overrides,
+  } as Session;
+}
+
+async function renderRole(
+  message: MessageWithTokenFlags,
+  props: Record<string, unknown> = {},
+) {
+  const component = mount(MessageContent, {
+    target: document.body,
+    props: { message, ...props },
+  });
+  await tick();
+  return component;
+}
+
 afterEach(() => {
   setLocale("en");
   document.body.innerHTML = "";
@@ -123,6 +173,183 @@ beforeEach(() => {
 });
 
 describe("MessageContent", () => {
+  it("labels inline teammate transcript messages as Teammate", async () => {
+    const content = `Another Claude session sent a message:
+<teammate-message teammate_id="batch-d-browser" color="pink" summary="Batch D complete; item 9 needs delegation">
+Batch D (browser/picker/tabs/media-monitor) is done...
+</teammate-message>`;
+    sessionsState.sessions = [makeSession()];
+    sessionsState.activeSession = sessionsState.sessions[0]!;
+
+    const component = await renderRole(
+      makeMessage({
+        id: 10,
+        role: "user",
+        content,
+        content_length: content.length,
+      }),
+    );
+
+    expect(document.querySelector(".role-label")?.textContent?.trim()).toBe(
+      "Teammate",
+    );
+    expect(document.querySelector(".role-icon")?.textContent?.trim()).toBe(
+      "T",
+    );
+    unmount(component);
+  });
+
+  it("keeps ordinary user prompts labeled as User", async () => {
+    sessionsState.sessions = [makeSession()];
+    const component = await renderRole(
+      makeMessage({ id: 11, role: "user", content: "Please summarize this." }),
+    );
+
+    expect(document.querySelector(".role-label")?.textContent?.trim()).toBe(
+      "User",
+    );
+    expect(document.querySelector(".role-icon")?.textContent?.trim()).toBe(
+      "U",
+    );
+    unmount(component);
+  });
+
+  it("keeps teammate ancestry rows labeled as Teammate", async () => {
+    sessionsState.sessions = [
+      makeSession({
+        id: "teammate-session",
+        first_message: "<teammate-message>hello</teammate-message>",
+      }),
+    ];
+    const component = await renderRole(
+      makeMessage({ id: 12, role: "user", session_id: "teammate-session" }),
+    );
+
+    expect(document.querySelector(".role-label")?.textContent?.trim()).toBe(
+      "Teammate",
+    );
+    expect(document.querySelector(".role-icon")?.textContent?.trim()).toBe(
+      "T",
+    );
+    unmount(component);
+  });
+
+  it("keeps subagent ancestry rows labeled as Agent when inline teammate markup is present", async () => {
+    const content = '<teammate-message teammate_id="batch-d-browser">reply</teammate-message>';
+    sessionsState.sessions = [
+      makeSession({
+        id: "subagent-session",
+        relationship_type: "subagent",
+      }),
+    ];
+    const component = await renderRole(
+      makeMessage({
+        id: 13,
+        role: "user",
+        session_id: "subagent-session",
+        content,
+        content_length: content.length,
+      }),
+    );
+
+    expect(document.querySelector(".role-label")?.textContent?.trim()).toBe(
+      "Agent",
+    );
+    expect(document.querySelector(".role-icon")?.textContent?.trim()).toBe(
+      "S",
+    );
+    unmount(component);
+  });
+
+  it("does not relabel teammate wrappers inside fenced code blocks", async () => {
+    const content = "```xml\n<teammate-message teammate_id=\"batch-d-browser\">\nreply\n</teammate-message>\n```";
+    sessionsState.sessions = [makeSession()];
+    const component = await renderRole(
+      makeMessage({
+        id: 14,
+        role: "user",
+        content,
+        content_length: content.length,
+      }),
+    );
+
+    expect(document.querySelector(".role-label")?.textContent?.trim()).toBe(
+      "User",
+    );
+    expect(document.querySelector(".role-icon")?.textContent?.trim()).toBe(
+      "U",
+    );
+    unmount(component);
+  });
+
+  it("keeps inline teammate, ancestry, subagent, and code-fence rows separated", async () => {
+    const cases = [
+      {
+        content: '<teammate-message teammate_id="t">reply</teammate-message>',
+        session: makeSession(),
+        props: {},
+        label: "Teammate",
+        icon: "T",
+      },
+      {
+        content: "ordinary",
+        session: makeSession({
+          id: "teammate-session",
+          first_message: "<teammate-message>hello</teammate-message>",
+        }),
+        props: {},
+        label: "Teammate",
+        icon: "T",
+      },
+      {
+        content: '<teammate-message teammate_id="t">reply</teammate-message>',
+        session: makeSession({
+          id: "subagent-session",
+          relationship_type: "subagent",
+        }),
+        props: {},
+        label: "Agent",
+        icon: "S",
+      },
+      {
+        content: "ordinary",
+        session: makeSession(),
+        props: { isSubagentContext: true },
+        label: "Agent",
+        icon: "S",
+      },
+      {
+        content: "```xml\n<teammate-message teammate_id=\"t\">reply</teammate-message>\n```",
+        session: makeSession(),
+        props: {},
+        label: "User",
+        icon: "U",
+      },
+    ];
+
+    for (const [index, testCase] of cases.entries()) {
+      document.body.innerHTML = "";
+      sessionsState.sessions = [testCase.session];
+      const component = await renderRole(
+        makeMessage({
+          id: 100 + index,
+          role: "user",
+          session_id: testCase.session.id,
+          content: testCase.content,
+          content_length: testCase.content.length,
+        }),
+        testCase.props,
+      );
+      expect(document.querySelector(".role-label")?.textContent?.trim()).toBe(
+        testCase.label,
+      );
+      expect(document.querySelector(".role-icon")?.textContent?.trim()).toBe(
+        testCase.icon,
+      );
+      unmount(component);
+    }
+  });
+
   it("renders message controls in Simplified Chinese without translating content", async () => {
     setLocale("zh-CN");
     const component = mount(MessageContent, {
@@ -553,6 +780,70 @@ describe("MessageContent", () => {
     await tick();
 
     expect(document.querySelector("button.fork-btn")).toBeNull();
+
+    unmount(component);
+  });
+
+  it("routes mermaid fences through MermaidBlock", async () => {
+    const content = [
+      "Mermaid diagram:",
+      "",
+      "```mermaid",
+      "graph TD",
+      "A-->B",
+      "```",
+    ].join("\n");
+
+    const component = mount(MessageContent, {
+      target: document.body,
+      props: {
+        message: makeMessage({
+          content,
+          content_length: content.length,
+        }),
+      },
+    });
+
+    await tick();
+    await tick();
+
+    expect(document.body.textContent).toContain("Mermaid diagram:");
+    const pre = document.querySelector(".mermaid-block pre.mermaid");
+    expect(pre?.textContent).toBe("graph TD\nA-->B\n");
+    expect(initMermaidRenderingMock).toHaveBeenCalledTimes(1);
+
+    unmount(component);
+  });
+
+  it("renders mermaid source as a code block when search is active", async () => {
+    const content = [
+      "Mermaid diagram:",
+      "",
+      "```mermaid",
+      "graph TD",
+      "A-->SearchTarget",
+      "```",
+    ].join("\n");
+
+    const component = mount(MessageContent, {
+      target: document.body,
+      props: {
+        message: makeMessage({
+          content,
+          content_length: content.length,
+        }),
+        highlightQuery: "SearchTarget",
+        isCurrentHighlight: true,
+      },
+    });
+
+    await tick();
+
+    expect(initMermaidRenderingMock).not.toHaveBeenCalled();
+    expect(document.querySelector(".code-content")?.textContent).toContain(
+      "A-->SearchTarget",
+    );
+    expect(document.querySelector(".code-lang")?.textContent).toBe("mermaid");
 
     unmount(component);
   });

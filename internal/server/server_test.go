@@ -114,31 +114,29 @@ func setupWithServerOptsAndDBTemplate(
 ) *testEnv {
 	t.Helper()
 	dir := tempDirWithRetryCleanup(t)
-	dbPath := filepath.Join(dir, "test.db")
+	cfg := config.Config{
+		Host:         "127.0.0.1",
+		Port:         0,
+		DataDir:      dir,
+		DBPath:       filepath.Join(dir, "test.db"),
+		WriteTimeout: 30 * time.Second,
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 	if dbFiles != nil {
-		writeDBTemplateFiles(t, dbPath, dbFiles)
+		writeDBTemplateFiles(t, cfg.DBPath, dbFiles)
 	}
 
-	database := dbtest.OpenTestDBAt(t, dbPath)
+	database := dbtest.OpenTestDBAt(t, cfg.DBPath)
 
-	claudeDir := filepath.Join(dir, "claude")
-	codexDir := filepath.Join(dir, "codex")
+	claudeDir := filepath.Join(cfg.DataDir, "claude")
+	codexDir := filepath.Join(cfg.DataDir, "codex")
 	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
 		t.Fatalf("creating claude dir: %v", err)
 	}
 	if err := os.MkdirAll(codexDir, 0o755); err != nil {
 		t.Fatalf("creating codex dir: %v", err)
-	}
-
-	cfg := config.Config{
-		Host:         "127.0.0.1",
-		Port:         0,
-		DataDir:      dir,
-		DBPath:       dbPath,
-		WriteTimeout: 30 * time.Second,
-	}
-	for _, opt := range opts {
-		opt(&cfg)
 	}
 	// Disable coalescing in tests so emits fan out deterministically.
 	broadcaster := server.NewBroadcaster(0)
@@ -733,7 +731,13 @@ func TestOpenAPIEndpointDocumentsEnumsAndRequestBodies(t *testing.T) {
 			path:   "/api/v1/search/content",
 			method: "get",
 			name:   "mode",
-			want:   []string{"substring", "regex", "fts"},
+			want:   []string{"substring", "regex", "fts", "semantic", "hybrid"},
+		},
+		{
+			path:   "/api/v1/search/content",
+			method: "get",
+			name:   "scope",
+			want:   []string{"top", "all", "subordinate"},
 		},
 		{
 			path:   "/api/v1/sessions/{id}/md",
@@ -819,6 +823,135 @@ func TestOpenAPIEndpointDocumentsEnumsAndRequestBodies(t *testing.T) {
 	require.True(t, ok, "post /api/v1/config/terminal missing mode property")
 	mode = resolveSchema(mode)
 	assert.Equal(t, []string{"auto", "custom", "clipboard"}, mode.Enum)
+}
+
+func TestSearchContentSemanticGETRequiresIntentHeader(t *testing.T) {
+	te := setup(t)
+	te.db.SetVectorSearcher(fakeTransientVectorSearcher{})
+
+	w := te.wrappedRequest(http.MethodGet, "/api/v1/search/content?pattern=fox&mode=semantic",
+		withOrigin("http://evil-site.com"))
+	assertStatus(t, w, http.StatusForbidden)
+	assert.Contains(t, w.Body.String(), "X-AgentsView-Search-Intent")
+}
+
+func TestSearchContentSemanticGETWithIntentHeaderReachesSearcher(t *testing.T) {
+	te := setup(t)
+	te.db.SetVectorSearcher(fakeTransientVectorSearcher{})
+
+	w := te.get(t, "/api/v1/search/content?pattern=fox&mode=semantic")
+	assertStatus(t, w, http.StatusForbidden)
+
+	w = te.wrappedRequest(http.MethodGet, "/api/v1/search/content?pattern=fox&mode=semantic",
+		withHeader("X-AgentsView-Search-Intent", "semantic"))
+	assertStatus(t, w, http.StatusServiceUnavailable)
+}
+
+// TestSearchContentSemanticModeUnavailable pins the end-to-end capability
+// gate: a test server has no VectorSearcher wired in (db.HasSemantic is
+// false), so a semantic or hybrid content search must respond 501 rather
+// than 500 or a silently-empty page.
+func TestSearchContentSemanticModeUnavailable(t *testing.T) {
+	te := setup(t)
+
+	for _, mode := range []string{"semantic", "hybrid"} {
+		w := te.wrappedRequest(http.MethodGet, "/api/v1/search/content?pattern=fox&mode="+mode,
+			withHeader("X-AgentsView-Search-Intent", "semantic"))
+		assertStatus(t, w, http.StatusNotImplemented)
+	}
+}
+
+// fakeTransientVectorSearcher implements db.VectorSearcher, always failing
+// with an error wrapping db.ErrSemanticTransient — standing in for what
+// cmd/agentsview's searcherAdapter returns when the embeddings endpoint
+// itself is unreachable at query time (translateSearchError wraps a
+// vector.QueryEncodeError this way).
+type fakeTransientVectorSearcher struct{}
+
+func (fakeTransientVectorSearcher) SemanticSearch(
+	_ context.Context, _ string, _ int,
+) ([]db.VectorHit, error) {
+	return nil, fmt.Errorf("%w: dial tcp: connection refused", db.ErrSemanticTransient)
+}
+
+func (fakeTransientVectorSearcher) ResolveMessageUnits(
+	_ context.Context, refs []db.MessageRef,
+) ([]db.UnitRef, error) {
+	return make([]db.UnitRef, len(refs)), nil
+}
+
+// TestSearchContentSemanticQueryEncodeFailureReturns503 covers the
+// query-time embeddings-endpoint-down case: it must map to 503 (the
+// feature is configured and the request can be retried), not 501 (which
+// would read as "semantic search is disabled") or a bare 500.
+func TestSearchContentSemanticQueryEncodeFailureReturns503(t *testing.T) {
+	te := setup(t)
+	te.db.SetVectorSearcher(fakeTransientVectorSearcher{})
+
+	w := te.wrappedRequest(http.MethodGet, "/api/v1/search/content?pattern=fox&mode=semantic",
+		withHeader("X-AgentsView-Search-Intent", "semantic"))
+	assertStatus(t, w, http.StatusServiceUnavailable)
+}
+
+// TestOpenAPIEndpointDocumentsBatchDeleteSessionIDsAsNonNullableArray guards
+// the schema huma emits for the batch-delete request body: session_ids must
+// serialize as a plain, non-nullable string array (schema type "array"), not
+// the OpenAPI 3.1 nullable union ["array", "null"] huma's DefaultArrayNullable
+// otherwise applies to every slice field. Losing that keeps the generated
+// TypeScript client's session_ids typed as Array<string> rather than
+// loosening to any[] | null.
+func TestOpenAPIEndpointDocumentsBatchDeleteSessionIDsAsNonNullableArray(t *testing.T) {
+	te := setup(t)
+
+	w := te.get(t, "/api/openapi.json")
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	var spec struct {
+		Components struct {
+			Schemas map[string]struct {
+				Required   []string `json:"required"`
+				Properties map[string]struct {
+					Type json.RawMessage `json:"type"`
+				} `json:"properties"`
+			} `json:"schemas"`
+		} `json:"components"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &spec))
+
+	schema, ok := spec.Components.Schemas["BatchDeleteInputBody"]
+	require.True(t, ok, "spec missing BatchDeleteInputBody schema")
+	assert.Contains(t, schema.Required, "session_ids")
+
+	prop, ok := schema.Properties["session_ids"]
+	require.True(t, ok, "session_ids property missing from BatchDeleteInputBody schema")
+	assert.JSONEq(t, `"array"`, string(prop.Type),
+		`session_ids must be a non-nullable array, not the nullable ["array","null"] union`)
+}
+
+func TestOpenAPIEndpointDocumentsOptionalProjectIdentity(t *testing.T) {
+	te := setup(t)
+
+	w := te.get(t, "/api/openapi.json")
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	var spec struct {
+		Components struct {
+			Schemas map[string]struct {
+				Required   []string `json:"required"`
+				Properties map[string]struct {
+					Ref string `json:"$ref"`
+				} `json:"properties"`
+			} `json:"schemas"`
+		} `json:"components"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &spec))
+
+	schema, ok := spec.Components.Schemas["ExportProjectMapEntry"]
+	require.True(t, ok, "spec missing ExportProjectMapEntry schema")
+	assert.NotContains(t, schema.Required, "identity")
+	identity, ok := schema.Properties["identity"]
+	require.True(t, ok, "identity property missing from ExportProjectMapEntry")
+	assert.Equal(t, "#/components/schemas/ExportProjectIdentity", identity.Ref)
 }
 
 func TestOpenAPIEndpointDocumentsQualitySignalResponses(t *testing.T) {
@@ -1608,6 +1741,7 @@ func TestSidebarIndexValidatesParams(t *testing.T) {
 		"/api/v1/sessions/sidebar-index?min_user_messages=bad",
 		"/api/v1/sessions/sidebar-index?date=2024-99-99",
 		"/api/v1/sessions/sidebar-index?date_from=2024-06-02&date_to=2024-06-01",
+		"/api/v1/sessions/sidebar-index?timezone=Fake%2FZone",
 		"/api/v1/sessions/sidebar-index?active_since=not-a-timestamp",
 	}
 
@@ -1617,6 +1751,73 @@ func TestSidebarIndexValidatesParams(t *testing.T) {
 			assertStatus(t, w, http.StatusBadRequest)
 		})
 	}
+}
+
+func TestSessionDateFilterUsesRequestedTimezoneAndDefaultsToUTC(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "utc-only", "my-app", 2, func(s *db.Session) {
+		s.UserMessageCount = 2
+		s.StartedAt = new("2024-06-16T01:00:00Z")
+		s.EndedAt = new("2024-06-16T02:00:00Z")
+	})
+	te.seedSession(t, "new-york-day", "my-app", 2, func(s *db.Session) {
+		s.UserMessageCount = 2
+		s.StartedAt = new("2024-06-16T05:00:00Z")
+		s.EndedAt = new("2024-06-16T06:00:00Z")
+	})
+
+	w := te.get(t, "/api/v1/sessions?date=2024-06-16")
+	assertStatus(t, w, http.StatusOK)
+	list := decode[sessionListResponse](t, w)
+	listIDs := make([]string, len(list.Sessions))
+	for i, session := range list.Sessions {
+		listIDs[i] = session.ID
+	}
+	assert.ElementsMatch(t, []string{"utc-only", "new-york-day"},
+		listIDs)
+
+	w = te.get(t,
+		"/api/v1/sessions?date=2024-06-16&timezone=America%2FNew_York")
+	assertStatus(t, w, http.StatusOK)
+	list = decode[sessionListResponse](t, w)
+	require.Len(t, list.Sessions, 1)
+	assert.Equal(t, "new-york-day", list.Sessions[0].ID)
+
+	w = te.get(t,
+		"/api/v1/sessions/sidebar-index?date=2024-06-16&timezone=America%2FNew_York")
+	assertStatus(t, w, http.StatusOK)
+	index := decode[db.SidebarSessionIndex](t, w)
+	assert.Equal(t, []string{"new-york-day"},
+		sidebarIndexRowIDs(index.Sessions))
+
+	w = te.get(t, "/api/v1/sessions?timezone=Fake%2FZone")
+	assertStatus(t, w, http.StatusBadRequest)
+	assertBodyContains(t, w, "invalid timezone: Fake/Zone")
+}
+
+func TestContentSearchDateFilterUsesRequestedTimezone(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "search-new-york-previous-day", "my-app", 2, func(s *db.Session) {
+		s.StartedAt = new("2024-06-16T01:00:00Z")
+		s.EndedAt = new("2024-06-16T02:00:00Z")
+	})
+	te.seedMessages(t, "search-new-york-previous-day", 1, func(_ int, m *db.Message) {
+		m.Content = "TIMEZONE_NEEDLE"
+	})
+	te.seedSession(t, "search-new-york-requested-day", "my-app", 2, func(s *db.Session) {
+		s.StartedAt = new("2024-06-16T05:00:00Z")
+		s.EndedAt = new("2024-06-16T06:00:00Z")
+	})
+	te.seedMessages(t, "search-new-york-requested-day", 1, func(_ int, m *db.Message) {
+		m.Content = "TIMEZONE_NEEDLE"
+	})
+
+	w := te.get(t, "/api/v1/search/content?pattern=TIMEZONE_NEEDLE"+
+		"&date=2024-06-16&timezone=America%2FNew_York")
+	assertStatus(t, w, http.StatusOK)
+	result := decode[service.ContentSearchResult](t, w)
+	require.Len(t, result.Matches, 1)
+	assert.Equal(t, "search-new-york-requested-day", result.Matches[0].SessionID)
 }
 
 func TestGetSession_Found(t *testing.T) {
@@ -1806,6 +2007,24 @@ func TestGetMessages_DescWithFrom(t *testing.T) {
 		t.Fatalf("expected first ordinal=10, got %d",
 			resp.Messages[0].Ordinal)
 	}
+}
+
+// TestGetMessages_RolesTrimsSpacesAndDropsTrailingEmpty covers a regression
+// where "roles=user, assistant," (a space after the comma, plus a trailing
+// comma) silently narrowed the filter: an untrimmed " assistant" role never
+// matches any stored row's plain "assistant" value, so assistant messages
+// were dropped even though the caller asked for both roles.
+func TestGetMessages_RolesTrimsSpacesAndDropsTrailingEmpty(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "s1", "my-app", 4)
+	te.seedMessages(t, "s1", 4)
+
+	w := te.get(t, "/api/v1/sessions/s1/messages?roles=user,%20assistant,")
+	assertStatus(t, w, http.StatusOK)
+
+	resp := decode[messageListResponse](t, w)
+	require.Len(t, resp.Messages, 4,
+		"a space after the comma or a trailing empty element must not narrow the role filter")
 }
 
 func TestGetMessages_Pagination(t *testing.T) {
@@ -2170,6 +2389,56 @@ func TestGetStats_ExcludeOneShotDefault(t *testing.T) {
 	}
 }
 
+func TestSessionStats_DefaultVisibilityMatchesListDefaults(t *testing.T) {
+	te := setup(t)
+	startedAt := time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)
+	endedAt := time.Now().UTC().Add(-90 * time.Minute).Format(time.RFC3339)
+	te.seedSession(t, "deep", "my-app", 10, func(s *db.Session) {
+		s.UserMessageCount = 5
+		s.StartedAt = &startedAt
+		s.EndedAt = &endedAt
+	})
+	te.seedSession(t, "one-shot", "my-app", 5, func(s *db.Session) {
+		s.UserMessageCount = 1
+		s.StartedAt = &startedAt
+		s.EndedAt = &endedAt
+	})
+	te.seedSession(t, "automated", "my-app", 6, func(s *db.Session) {
+		fm := "You are a code reviewer. Review the code."
+		s.FirstMessage = &fm
+		s.UserMessageCount = 1
+		s.StartedAt = &startedAt
+		s.EndedAt = &endedAt
+	})
+	te.seedMessages(t, "deep", 10)
+	te.seedMessages(t, "one-shot", 5)
+	te.seedMessages(t, "automated", 6)
+
+	w := te.get(t, "/api/v1/session-stats")
+	assertStatus(t, w, http.StatusOK)
+	resp := decode[db.SessionStats](t, w)
+	assert.Equal(t, 1, resp.Totals.SessionsAll, "default sessions_all")
+	assert.Equal(t, 10, resp.Totals.MessagesTotal, "default messages_total")
+
+	w = te.get(t, "/api/v1/session-stats?include_one_shot=true")
+	assertStatus(t, w, http.StatusOK)
+	resp = decode[db.SessionStats](t, w)
+	assert.Equal(t, 2, resp.Totals.SessionsAll, "include_one_shot sessions_all")
+	assert.Equal(t, 15, resp.Totals.MessagesTotal, "include_one_shot messages_total")
+
+	w = te.get(t, "/api/v1/session-stats?include_automated=true")
+	assertStatus(t, w, http.StatusOK)
+	resp = decode[db.SessionStats](t, w)
+	assert.Equal(t, 2, resp.Totals.SessionsAll, "include_automated sessions_all")
+	assert.Equal(t, 16, resp.Totals.MessagesTotal, "include_automated messages_total")
+
+	w = te.get(t, "/api/v1/session-stats?include_one_shot=true&include_automated=true")
+	assertStatus(t, w, http.StatusOK)
+	resp = decode[db.SessionStats](t, w)
+	assert.Equal(t, 3, resp.Totals.SessionsAll, "include_all sessions_all")
+	assert.Equal(t, 21, resp.Totals.MessagesTotal, "include_all messages_total")
+}
+
 func TestListMachines_ExcludeOneShotDefault(t *testing.T) {
 	te := setup(t)
 	te.seedSession(t, "s1", "my-app", 5, func(s *db.Session) {
@@ -2350,14 +2619,17 @@ func TestDuckDBPushLocalNoSyncDaemonWritesConfiguredPath(t *testing.T) {
 	}
 
 	te := setupNoSyncMode(t)
-	target := filepath.Join(t.TempDir(), "agentsview.duckdb")
+	// The daemon writes only its own resolved mirror path (the server-side
+	// path guard rejects any other request path), which defaults to
+	// sessions.duckdb in the data dir; the request carries non-path config
+	// like the machine name.
+	target := filepath.Join(te.dataDir, "sessions.duckdb")
 	body, err := json.Marshal(struct {
 		Full   bool                `json:"full"`
 		DuckDB config.DuckDBConfig `json:"duckdb"`
 	}{
 		Full: true,
 		DuckDB: config.DuckDBConfig{
-			Path:        target,
 			MachineName: "workstation",
 		},
 	})
@@ -2366,6 +2638,44 @@ func TestDuckDBPushLocalNoSyncDaemonWritesConfiguredPath(t *testing.T) {
 	w := te.post(t, "/api/v1/push/duckdb", string(body))
 
 	assertStatus(t, w, http.StatusOK)
+	assert.FileExists(t, target)
+}
+
+// TestDuckDBPushStreamsSSEDoneEvent pins the push route's SSE mode: a client
+// that accepts text/event-stream (the CLI's daemon-delegated push) gets an
+// event stream ending in a done event carrying the push result, instead of a
+// single JSON body after a silent wait.
+func TestDuckDBPushStreamsSSEDoneEvent(t *testing.T) {
+	if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
+		t.Skip("duckdb-go-bindings does not ship a windows/arm64 library")
+	}
+
+	te := setupNoSyncMode(t)
+	// As above, the daemon-side path guard pins writes to the server's own
+	// resolved mirror path (DataDir/sessions.duckdb by default).
+	target := filepath.Join(te.dataDir, "sessions.duckdb")
+	body, err := json.Marshal(struct {
+		Full   bool                `json:"full"`
+		DuckDB config.DuckDBConfig `json:"duckdb"`
+	}{
+		Full: true,
+		DuckDB: config.DuckDBConfig{
+			MachineName: "workstation",
+		},
+	})
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/push/duckdb",
+		strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://127.0.0.1:0")
+	req.Header.Set("Accept", "text/event-stream")
+	w := httptest.NewRecorder()
+	te.handler.ServeHTTP(w, req)
+
+	assertStatus(t, w, http.StatusOK)
+	assert.Contains(t, w.Header().Get("Content-Type"), "text/event-stream")
+	assert.Contains(t, w.Body.String(), "event: done")
 	assert.FileExists(t, target)
 }
 
@@ -4267,7 +4577,7 @@ func TestGetVersion(t *testing.T) {
 		)
 	}
 	assert.True(t, resp.InsightGenerationAvailable)
-	assert.Equal(t, 2, resp.APIVersion)
+	assert.Equal(t, server.APIVersion, resp.APIVersion)
 	assert.Equal(t, db.CurrentDataVersion(), resp.DataVersion)
 }
 
@@ -4281,7 +4591,7 @@ func TestGetVersion_Default(t *testing.T) {
 	if resp.Version != "" {
 		t.Errorf("version = %q, want empty", resp.Version)
 	}
-	assert.Equal(t, 2, resp.APIVersion)
+	assert.Equal(t, server.APIVersion, resp.APIVersion)
 	assert.Equal(t, db.CurrentDataVersion(), resp.DataVersion)
 }
 

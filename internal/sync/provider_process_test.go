@@ -104,7 +104,7 @@ func TestProcessFileProviderForgeVirtualSource(t *testing.T) {
 		Machine: "devbox",
 	})
 
-	files := engine.classifyProviderChangedPath(dbPath)
+	files := requireClassifyProviderChangedPath(t, engine, dbPath)
 	require.Len(t, files, 1)
 	assert.Equal(t, dbPath+"#conv-001", files[0].Path)
 	assert.Equal(t, parser.AgentForge, files[0].Agent)
@@ -141,7 +141,7 @@ func TestProcessFileProviderSkipsStoredFreshSource(t *testing.T) {
 	})
 	require.NoError(t, first.err)
 	require.Len(t, first.results, 1)
-	written, _, failed := engine.writeBatch(
+	written, _, failed, _ := engine.writeBatch(
 		[]pendingWrite{{
 			sess:         first.results[0].Session,
 			msgs:         first.results[0].Messages,
@@ -224,7 +224,7 @@ func TestProcessFileProviderPiebaldSkipsStoredFreshSource(t *testing.T) {
 	})
 	require.NoError(t, first.err)
 	require.Len(t, first.results, 1)
-	written, _, failed := engine.writeBatch(
+	written, _, failed, _ := engine.writeBatch(
 		[]pendingWrite{{
 			sess:         first.results[0].Session,
 			msgs:         first.results[0].Messages,
@@ -277,12 +277,48 @@ func TestProcessFileProviderWarpVirtualSource(t *testing.T) {
 	assert.NotEmpty(t, res.results[0].Messages)
 }
 
+func TestProcessFileProviderZCodeVirtualSource(t *testing.T) {
+	root := t.TempDir()
+	dbPath := writeProcessProviderZCodeDB(t, filepath.Join(root, ".zcode", "cli"))
+	engine := NewEngine(openTestDB(t), EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentZCode: {filepath.Join(root, ".zcode", "cli")},
+		},
+		Machine: "devbox",
+	})
+
+	files := requireClassifyProviderChangedPath(t, engine, dbPath)
+	require.Len(t, files, 1)
+	assert.Equal(t, dbPath+"#session-001", files[0].Path)
+	assert.Equal(t, parser.AgentZCode, files[0].Agent)
+	assert.False(t, files[0].ForceParse)
+
+	res := engine.processFile(context.Background(), files[0])
+
+	require.NoError(t, res.err)
+	require.Len(t, res.results, 1)
+	assert.True(t, res.forceReplace)
+	assert.NotZero(t, res.mtime)
+	assert.Equal(t, "zcode:session-001", res.results[0].Session.ID)
+	assert.Equal(t, parser.AgentZCode, res.results[0].Session.Agent)
+	assert.Equal(t, "devbox", res.results[0].Session.Machine)
+	require.Len(t, res.results[0].Messages, 3)
+	assert.Equal(t, parser.RoleAssistant, res.results[0].Messages[1].Role)
+	assert.True(t, res.results[0].Messages[1].HasToolUse)
+	require.Len(t, res.results[0].Messages[1].ToolCalls, 1)
+	assert.Equal(t, "call-read", res.results[0].Messages[1].ToolCalls[0].ToolUseID)
+	require.Len(t, res.results[0].UsageEvents, 1)
+	assert.Equal(t, 1, res.results[0].UsageEvents[0].InputTokens)
+	assert.Equal(t, 2, res.results[0].UsageEvents[0].OutputTokens)
+}
+
 func TestProcessFileUsesProviderDBBackedFamily(t *testing.T) {
 
 	for _, agent := range []parser.AgentType{
 		parser.AgentForge,
 		parser.AgentPiebald,
 		parser.AgentWarp,
+		parser.AgentZCode,
 	} {
 		assert.True(t, processFileUsesProvider(agent), agent)
 	}
@@ -555,6 +591,189 @@ func TestSyncSingleSessionProviderAuthoritativeBypassesProviderSkipCache(t *test
 	assert.False(t, cached)
 }
 
+func TestProcessFileClaudeCachedSourceWithoutStoredSessionSkipsParse(t *testing.T) {
+	root := t.TempDir()
+	sourcePath, fingerprint := writeProcessProviderSource(t, root, "noninteractive.jsonl")
+	fingerprint.Hash = "unchanged-content"
+	source := processFixtureSource(sourcePath)
+	source.Provider = parser.AgentClaude
+	provider := newProcessFixtureProvider(
+		source,
+		fingerprint,
+		parser.ParseOutcome{ResultSetComplete: true},
+	)
+	provider.Def.Type = parser.AgentClaude
+	provider.Def.IDPrefix = "claude:"
+	engine := NewEngine(openTestDB(t), EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {root},
+		},
+		Machine:           "devbox",
+		ProviderFactories: []parser.ProviderFactory{processFixtureFactory{provider: provider}},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			parser.AgentClaude: parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	engine.cacheSkip(providerProcessCacheKey(
+		parser.DiscoveredFile{Path: sourcePath, Agent: parser.AgentClaude},
+		source, fingerprint,
+	), fingerprint.MTimeNS)
+
+	res := engine.processFile(context.Background(), parser.DiscoveredFile{
+		Path:  sourcePath,
+		Agent: parser.AgentClaude,
+	})
+
+	require.NoError(t, res.err)
+	assert.True(t, res.skip)
+	assert.Equal(t, []string{"find-source", "fingerprint"}, provider.calls)
+	assert.Empty(t, provider.parseRequests)
+}
+
+func TestProcessFileRowlessCachedSourceChangedHashReparses(t *testing.T) {
+	for _, agent := range []parser.AgentType{parser.AgentClaude, parser.AgentCodex} {
+		t.Run(string(agent), func(t *testing.T) {
+			root := t.TempDir()
+			sourcePath, fingerprint := writeProcessProviderSource(
+				t, root, "became-interactive.jsonl",
+			)
+			fingerprint.Hash = "new-valid-content"
+			source := processFixtureSource(sourcePath)
+			source.Provider = agent
+			provider := newProcessFixtureProvider(
+				source,
+				fingerprint,
+				parser.ParseOutcome{
+					Results: []parser.ParseResultOutcome{{
+						Result: processFixtureResult(
+							string(agent)+":valid", agent, "fixture-project",
+							sourcePath, fingerprint,
+						),
+						DataVersion: parser.DataVersionCurrent,
+					}},
+					ResultSetComplete: true,
+				},
+			)
+			provider.Def.Type = agent
+			provider.Def.IDPrefix = string(agent) + ":"
+			engine := NewEngine(openTestDB(t), EngineConfig{
+				AgentDirs: map[parser.AgentType][]string{agent: {root}},
+				Machine:   "devbox",
+				ProviderFactories: []parser.ProviderFactory{
+					processFixtureFactory{provider: provider},
+				},
+				ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+					agent: parser.ProviderMigrationProviderAuthoritative,
+				},
+			})
+			oldFingerprint := fingerprint
+			oldFingerprint.Hash = "old-ignored-content"
+			oldKey := providerProcessCacheKey(
+				parser.DiscoveredFile{Path: sourcePath, Agent: agent},
+				source, oldFingerprint,
+			)
+			engine.cacheSkip(oldKey, fingerprint.MTimeNS)
+
+			res := engine.processFile(context.Background(), parser.DiscoveredFile{
+				Path: sourcePath, Agent: agent,
+			})
+
+			require.NoError(t, res.err)
+			assert.False(t, res.skip)
+			assert.Equal(t, []string{"find-source", "fingerprint", "parse"}, provider.calls)
+			require.Len(t, provider.parseRequests, 1)
+		})
+	}
+}
+
+func TestCacheSkipRetainsOnlyLatestSourceHashKey(t *testing.T) {
+	engine := &Engine{
+		skipCache:        make(map[string]int64),
+		skipFingerprints: make(map[string]string),
+	}
+	const (
+		plain = "/archive/session.jsonl"
+		base  = plain + "?source_hash="
+	)
+	engine.cacheSkip(plain, 1)
+	engine.cacheSkip(base+"old", 1)
+	engine.cacheSkip(base+"new", 1)
+
+	assert.Equal(t, map[string]int64{base + "new": 1}, engine.SnapshotSkipCache())
+}
+
+func TestNewEngineNormalizesLegacySourceHashSkipDuplicates(t *testing.T) {
+	database := openTestDB(t)
+	const (
+		plain     = "/archive/session.jsonl"
+		hashBase  = plain + "?source_hash="
+		unrelated = "/archive/unrelated.jsonl"
+	)
+	require.NoError(t, database.ReplaceSkippedFiles(map[string]int64{
+		plain:            1,
+		hashBase + "old": 2,
+		hashBase + "new": 3,
+		unrelated:        4,
+	}))
+
+	engine := NewEngine(database, EngineConfig{})
+	t.Cleanup(engine.Close)
+
+	assert.Equal(t, map[string]int64{unrelated: 4}, engine.SnapshotSkipCache(),
+		"ambiguous legacy hashes must reparse once instead of choosing a stale key")
+}
+
+func TestProcessFileClaudeCachedStoredSessionChangedHashReparses(t *testing.T) {
+	root := t.TempDir()
+	sourcePath, fingerprint := writeProcessProviderSource(t, root, "stored.jsonl")
+	fingerprint.Hash = "new-content"
+	source := processFixtureSource(sourcePath)
+	source.Provider = parser.AgentClaude
+	provider := newProcessFixtureProvider(
+		source,
+		fingerprint,
+		parser.ParseOutcome{ResultSetComplete: true},
+	)
+	provider.Def.Type = parser.AgentClaude
+	provider.Def.IDPrefix = "claude:"
+	engine := NewEngine(openTestDB(t), EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {root},
+		},
+		Machine:           "devbox",
+		ProviderFactories: []parser.ProviderFactory{processFixtureFactory{provider: provider}},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			parser.AgentClaude: parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	stored := processFixtureResult(
+		"claude:stored",
+		parser.AgentClaude,
+		"fixture-project",
+		sourcePath,
+		fingerprint,
+	)
+	stored.Session.File.Hash = "old-content"
+	written, _, failed, _ := engine.writeBatch(
+		[]pendingWrite{{sess: stored.Session, msgs: stored.Messages}},
+		syncWriteDefault,
+		false,
+	)
+	require.Equal(t, 1, written)
+	require.Zero(t, failed)
+	engine.cacheSkip(source.FingerprintKey, fingerprint.MTimeNS)
+
+	res := engine.processFile(context.Background(), parser.DiscoveredFile{
+		Path:  sourcePath,
+		Agent: parser.AgentClaude,
+	})
+
+	require.NoError(t, res.err)
+	assert.False(t, res.skip)
+	assert.Equal(t, []string{"find-source", "fingerprint", "parse"}, provider.calls)
+	require.Len(t, provider.parseRequests, 1)
+}
+
 func TestProcessFileProviderDevinSkipsStoredFreshSource(t *testing.T) {
 	root := t.TempDir()
 	dbPath, transcriptPath := writeProcessProviderDevinFixture(
@@ -585,7 +804,7 @@ func TestProcessFileProviderDevinSkipsStoredFreshSource(t *testing.T) {
 	require.NotZero(t, storedMtime)
 	assert.GreaterOrEqual(t, storedMtime, transcriptProcessProviderMtime(t, transcriptPath))
 
-	written, _, failed := engine.writeBatch(
+	written, _, failed, _ := engine.writeBatch(
 		[]pendingWrite{{
 			sess:         first.results[0].Session,
 			msgs:         first.results[0].Messages,
@@ -640,7 +859,7 @@ func TestProcessFileProviderDevinReparsesTranscriptOnlyChange(t *testing.T) {
 	})
 	require.NoError(t, first.err)
 	require.Len(t, first.results, 1)
-	written, _, failed := engine.writeBatch(
+	written, _, failed, _ := engine.writeBatch(
 		[]pendingWrite{{
 			sess:         first.results[0].Session,
 			msgs:         first.results[0].Messages,
@@ -715,7 +934,7 @@ func TestProcessFileProviderDevinSameSizeSameMtimeTranscriptRewriteReparses(t *t
 			require.NotZero(t, initialMtime)
 			require.NotEmpty(t, initialHash)
 
-			written, _, failed := engine.writeBatch(
+			written, _, failed, _ := engine.writeBatch(
 				[]pendingWrite{{
 					sess:         first.results[0].Session,
 					msgs:         first.results[0].Messages,
@@ -915,7 +1134,7 @@ func writeProcessProviderDevinResult(
 ) {
 	t.Helper()
 	require.Len(t, result.results, 1)
-	written, _, failed := engine.writeBatch(
+	written, _, failed, _ := engine.writeBatch(
 		[]pendingWrite{{
 			sess:         result.results[0].Session,
 			msgs:         result.results[0].Messages,
@@ -1366,6 +1585,116 @@ func seedProcessProviderWarpConversation(t *testing.T, database *sql.DB) {
 		`"Completed"`,
 		"auto-genius",
 	)
+}
+
+func writeProcessProviderZCodeDB(t *testing.T, cliRoot string) string {
+	t.Helper()
+	dbDir := filepath.Join(cliRoot, "db")
+	require.NoError(t, os.MkdirAll(dbDir, 0o755))
+	dbPath := filepath.Join(dbDir, "db.sqlite")
+	database, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	mustExecProcessProviderSQL(t, database, `
+		CREATE TABLE session (
+			id TEXT PRIMARY KEY NOT NULL,
+			project_id TEXT,
+			workspace_id TEXT,
+			directory TEXT,
+			title TEXT,
+			time_created TEXT,
+			time_updated TEXT
+		);
+		CREATE TABLE model_usage (
+			session_id TEXT NOT NULL,
+			turn_id TEXT,
+			provider_id TEXT,
+			model_id TEXT,
+			status TEXT,
+			input_tokens INTEGER,
+			output_tokens INTEGER,
+			reasoning_tokens INTEGER,
+			cache_creation_input_tokens INTEGER,
+			cache_read_input_tokens INTEGER,
+			computed_total_tokens INTEGER,
+			started_at TEXT,
+			completed_at TEXT,
+			duration_ms INTEGER,
+			tool_call_count INTEGER
+		);
+		CREATE TABLE message (
+			id TEXT PRIMARY KEY NOT NULL,
+			session_id TEXT NOT NULL,
+			time_created TEXT,
+			data TEXT
+		);
+		CREATE TABLE part (
+			id TEXT PRIMARY KEY NOT NULL,
+			message_id TEXT NOT NULL,
+			session_id TEXT NOT NULL,
+			data TEXT
+		);
+	`)
+	mustExecProcessProviderSQL(t, database,
+		`INSERT INTO session (
+			id, project_id, workspace_id, directory, title,
+			time_created, time_updated
+		) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		"session-001", "project-7", "workspace-19", "/Users/alice/code/acme-app",
+		"Acme session", "2026-07-06T13:00:01Z", "2026-07-06T13:05:00Z",
+	)
+	mustExecProcessProviderSQL(t, database,
+		`INSERT INTO model_usage (
+			session_id, turn_id, provider_id, model_id, status,
+			input_tokens, output_tokens, reasoning_tokens,
+			cache_creation_input_tokens, cache_read_input_tokens,
+			computed_total_tokens, started_at, completed_at,
+			duration_ms, tool_call_count
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"session-001", "1", "builtin:bigmodel-coding-plan", "claude-sonnet-4-6", "done",
+		int64(1), int64(2), int64(0), int64(0), int64(0), int64(3),
+		"2026-07-06T13:00:02Z", "2026-07-06T13:00:03Z", int64(1000), int64(1),
+	)
+	mustExecProcessProviderSQL(t, database,
+		`INSERT INTO message (
+			id, session_id, time_created, data
+		) VALUES (?, ?, ?, ?)`,
+		"msg-1", "session-001", "2026-07-06T13:00:01Z", `{"role":"user"}`,
+	)
+	mustExecProcessProviderSQL(t, database,
+		`INSERT INTO part (
+			id, message_id, session_id, data
+		) VALUES (?, ?, ?, ?)`,
+		"part-1", "msg-1", "session-001", `{"type":"text","text":"Inspect the auth flow."}`,
+	)
+	mustExecProcessProviderSQL(t, database,
+		`INSERT INTO message (
+			id, session_id, time_created, data
+		) VALUES (?, ?, ?, ?)`,
+		"msg-2", "session-001", "2026-07-06T13:00:02Z",
+		`{"role":"assistant","modelID":"claude-sonnet-4-6"}`,
+	)
+	mustExecProcessProviderSQL(t, database,
+		`INSERT INTO part (
+			id, message_id, session_id, data
+		) VALUES (?, ?, ?, ?)`,
+		"part-2", "msg-2", "session-001",
+		`{"type":"tool_use","id":"call-read","name":"Read","input":{"file_path":"auth.go"}}`,
+	)
+	mustExecProcessProviderSQL(t, database,
+		`INSERT INTO message (
+			id, session_id, time_created, data
+		) VALUES (?, ?, ?, ?)`,
+		"msg-3", "session-001", "2026-07-06T13:00:03Z", `{"role":"user"}`,
+	)
+	mustExecProcessProviderSQL(t, database,
+		`INSERT INTO part (
+			id, message_id, session_id, data
+		) VALUES (?, ?, ?, ?)`,
+		"part-3", "msg-3", "session-001",
+		`{"type":"tool_result","tool_use_id":"call-read","content":"package auth"}`,
+	)
+	return dbPath
 }
 
 func mustExecProcessProviderSQL(

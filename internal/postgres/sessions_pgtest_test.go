@@ -4,6 +4,7 @@ package postgres
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -11,6 +12,109 @@ import (
 
 	"go.kenn.io/agentsview/internal/db"
 )
+
+func TestGetActiveProjectLabelsIncludesRelationshipSessions(t *testing.T) {
+	pgURL := testPGURL(t)
+	ensureStoreSchema(t, pgURL)
+
+	store, err := NewStore(pgURL, testSchema, true)
+	require.NoError(t, err, "NewStore")
+	defer store.Close()
+
+	_, err = store.DB().Exec(`
+		INSERT INTO sessions
+			(id, machine, project, agent, relationship_type)
+		VALUES
+			('active-project-subagent', 'm', 'child-only', 'claude', 'subagent'),
+			('active-project-fork', 'm', 'fork-only', 'claude', 'fork'),
+			('active-project-deleted', 'm', 'deleted-only', 'claude', 'root');
+		UPDATE sessions
+		SET deleted_at = NOW()
+		WHERE id = 'active-project-deleted'
+	`)
+	require.NoError(t, err)
+
+	labels, err := store.GetActiveProjectLabels(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		"child-only", "fork-only", "test-project",
+	}, labels)
+}
+
+func TestListSessionsDateFilterIncludesOverlappingSessions(t *testing.T) {
+	pgURL := testPGURL(t)
+	ensureStoreSchema(t, pgURL)
+
+	store, err := NewStore(pgURL, testSchema, true)
+	require.NoError(t, err, "NewStore")
+	defer store.Close()
+
+	_, err = store.DB().Exec(`
+		INSERT INTO sessions
+			(id, machine, project, agent, started_at, ended_at,
+			 message_count, user_message_count)
+		VALUES
+			('date-overlap-before', 'm', 'date-overlap', 'claude',
+			 '2024-06-16T02:00:00Z'::timestamptz,
+			 '2024-06-16T03:59:59Z'::timestamptz, 2, 1),
+			('date-overlap-spanning', 'm', 'date-overlap', 'claude',
+			 '2024-06-16T03:00:00Z'::timestamptz,
+			 '2024-06-16T10:00:00Z'::timestamptz, 2, 1),
+			('date-overlap-open', 'm', 'date-overlap', 'claude',
+			 '2024-06-16T02:00:00Z'::timestamptz,
+			 NULL, 2, 1),
+			('date-overlap-after', 'm', 'date-overlap', 'claude',
+			 '2024-06-17T04:00:00Z'::timestamptz,
+			 '2024-06-17T05:00:00Z'::timestamptz, 2, 1),
+			('date-overlap-child', 'm', 'date-overlap', 'claude',
+			 '2024-06-17T08:00:00Z'::timestamptz,
+			 '2024-06-17T09:00:00Z'::timestamptz, 1, 1);
+		UPDATE sessions
+		SET parent_session_id = 'date-overlap-spanning',
+			relationship_type = 'subagent'
+		WHERE id = 'date-overlap-child';
+		INSERT INTO messages
+			(session_id, ordinal, role, content, timestamp, content_length)
+		VALUES
+			('date-overlap-open', 1, 'user', 'x',
+			 '2024-06-17T03:59:59Z'::timestamptz, 1)
+	`)
+	require.NoError(t, err, "seeding date-overlap sessions")
+
+	page, err := store.ListSessions(context.Background(), db.SessionFilter{
+		Project:  "date-overlap",
+		Date:     "2024-06-16",
+		Timezone: "America/New_York",
+		Limit:    50,
+	})
+	require.NoError(t, err, "ListSessions")
+	ids := make([]string, len(page.Sessions))
+	for i, session := range page.Sessions {
+		ids[i] = session.ID
+	}
+	slices.Sort(ids)
+	assert.Equal(t, []string{
+		"date-overlap-open",
+		"date-overlap-spanning",
+	}, ids)
+
+	index, err := store.GetSidebarSessionIndex(context.Background(), db.SessionFilter{
+		Project:  "date-overlap",
+		Date:     "2024-06-16",
+		Timezone: "America/New_York",
+	})
+	require.NoError(t, err, "GetSidebarSessionIndex")
+	ids = ids[:0]
+	for _, session := range index.Sessions {
+		ids = append(ids, session.ID)
+	}
+	slices.Sort(ids)
+	assert.Equal(t, []string{
+		"date-overlap-child",
+		"date-overlap-open",
+		"date-overlap-spanning",
+	}, ids)
+}
 
 // TestListSessions_HasSecret verifies that the HasSecret filter
 // returns only sessions where secret_leak_count > 0.

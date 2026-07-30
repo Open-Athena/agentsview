@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { Card } from "@kenn-io/kit-ui";
   import { onDestroy, onMount, tick, untrack } from "svelte";
   import {
     usage,
@@ -46,6 +47,13 @@
     sessions.projects.map((p) => ({
       name: p.name,
       count: p.session_count,
+    })),
+  );
+
+  const agentItems = $derived(
+    sessions.agents.map((a) => ({
+      name: a.name,
+      count: a.session_count,
     })),
   );
 
@@ -170,7 +178,7 @@
   // apply params that are actually present in the URL.
   const USAGE_FILTER_KEYS = new Set([
     "from", "to", "window_days",
-    "model", "exclude_model",
+    "model", "exclude_model", "exclude_agent",
   ]);
   const SESSION_FILTER_KEYS = new Set([
     "project", "machine", "agent",
@@ -214,14 +222,6 @@
       let changed = false;
       let sessionChanged = false;
 
-      // Sync pin state from URL: dated URL pins, undated URL unpins.
-      // Runs before the !hasFilterKeys early return so a fully bare URL
-      // (no exclude_* either) still flips the pin off.
-      if (usage.isPinned !== hasDateParam) {
-        usage.isPinned = hasDateParam;
-        changed = true;
-      }
-
       if (!hasDateParam && parsedWindowDays === null) {
         const seed = yokedDates.seedForPanel();
         const state = seed
@@ -232,6 +232,13 @@
           : null;
         if (state) {
           changed = applyUsagePanelDate(state) || changed;
+        } else {
+          changed = applyUsagePanelDate({
+            from: usage.from,
+            to: usage.to,
+            mode: "rolling",
+            windowDays: usage.windowDays,
+          }) || changed;
         }
       }
 
@@ -298,6 +305,11 @@
         usage.excludedProjects = newExProject;
         changed = true;
       }
+      const newExAgent = params["exclude_agent"] ?? "";
+      if (newExAgent !== usage.excludedAgents) {
+        usage.excludedAgents = newExAgent;
+        changed = true;
+      }
       if (usage.excludedModels) {
         usage.excludedModels = "";
         changed = true;
@@ -324,6 +336,7 @@
       isPinned: usage.isPinned,
       windowDays: usage.windowDays,
       excludedProjects: usage.excludedProjects,
+      excludedProjectKeys: usage.excludedProjectKeys,
       excludedAgents: usage.excludedAgents,
       excludedModels: usage.excludedModels,
       selectedModels: usage.selectedModels,
@@ -355,6 +368,9 @@
 
   onMount(() => {
     mounted = true;
+    // The Agent dropdown reads sessions.agents, which is otherwise loaded
+    // lazily by the sidebar filter control; a direct /usage visit needs it too.
+    sessions.loadAgents();
     // SSE events only flag new data; RefreshControl owns the periodic refresh
     // and the manual button. The initial and filter-change fetches run from the
     // effects above once URL/filter state is hydrated.
@@ -365,6 +381,7 @@
   });
 
   onDestroy(() => {
+    usage.cancelInFlightReads();
     unsubEvents?.();
   });
 </script>
@@ -403,6 +420,16 @@
       />
 
       <FilterDropdown
+        label={m.analytics_col_agent()}
+        items={agentItems}
+        excludedCsv={usage.excludedAgents}
+        onToggle={(name) => usage.toggleAgent(name)}
+        onSelectAll={() => usage.selectAllAgents()}
+        onDeselectAll={() =>
+          usage.deselectAllAgents(agentItems.map((a) => a.name))}
+      />
+
+      <FilterDropdown
         label={m.usage_model()}
         items={modelItems}
         excludedCsv={usage.selectedModels}
@@ -427,6 +454,7 @@
   <SessionActiveFilters
     modelFilters={selectedModels}
     onClearProjects={() => usage.selectAllProjects()}
+    onClearAgents={() => usage.selectAllAgents()}
     onRemoveModel={(model) => usage.toggleModel(model)}
     onClearModels={() => usage.selectAllModels()}
   />
@@ -441,34 +469,39 @@
     {/if}
 
     {#if unsupportedUsageMessage}
-      <div class="usage-note" role="status">
-        {unsupportedUsageMessage}
-      </div>
+      <Card level="default" padding="none" class="usage-note">
+        <div role="status">
+          {unsupportedUsageMessage}
+        </div>
+      </Card>
     {/if}
 
     <UsageSummaryCards />
 
-    <div class="chart-panel wide">
+    <Card level="default" padding="none" class="chart-panel wide">
       <CostTimeSeriesChart />
-    </div>
+    </Card>
 
-    <div class="chart-panel wide">
+    <Card level="default" padding="none" class="chart-panel wide">
       <AttributionPanel />
-    </div>
+    </Card>
 
     <div class="bottom-grid">
-      <div class="chart-panel bounded">
+      <Card level="default" padding="none" class="chart-panel bounded">
         <TopSessionsTable />
-      </div>
-      <div class="chart-panel bounded">
+      </Card>
+      <Card level="default" padding="none" class="chart-panel bounded">
         <CacheEfficiencyPanel />
-      </div>
+      </Card>
     </div>
 
-    <div class="chart-panel wide">
+    <Card level="default" padding="none" class="chart-panel wide">
       <UsagePairwiseComparisonPanel />
+    </Card>
+
+    <Card level="default" padding="none" class="chart-panel wide">
       <LongestPromptsPanel />
-    </div>
+    </Card>
   </div>
 </div>
 
@@ -515,12 +548,9 @@
     transition: opacity 0.12s;
   }
 
-  .usage-note {
+  .usage-content :global(.usage-note) {
     padding: 12px 14px;
-    background: var(--bg-surface);
-    border: 1px solid var(--border-muted);
     border-left: 4px solid var(--accent-blue);
-    border-radius: var(--radius-md);
     color: var(--text-secondary);
   }
 
@@ -553,15 +583,12 @@
     animation: query-progress 1s ease-in-out infinite;
   }
 
-  .chart-panel {
-    background: var(--bg-surface);
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-md);
+  .usage-content :global(.chart-panel) {
     padding: 12px;
     min-width: 0;
   }
 
-  .chart-panel.wide {
+  .usage-content :global(.chart-panel.wide) {
     width: 100%;
   }
 
@@ -572,7 +599,7 @@
     align-items: start;
   }
 
-  .chart-panel.bounded {
+  .usage-content :global(.chart-panel.bounded) {
     max-height: min(420px, 48vh);
     overflow: auto;
   }

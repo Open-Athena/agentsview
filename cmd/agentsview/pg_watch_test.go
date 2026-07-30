@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -191,15 +192,22 @@ type fakeTarget struct {
 	ensureErr  error
 	pushErr    error
 	pushResult postgres.PushResult
+	onPush     func()
 	pushes     int
 	closed     int
+	pushOpts   []postgres.PushOptions // options of each push, in order
 }
 
 func (f *fakeTarget) EnsureSchema(context.Context) error { return f.ensureErr }
-func (f *fakeTarget) Push(
-	context.Context, bool, func(postgres.PushProgress),
+func (f *fakeTarget) PushWithOptions(
+	_ context.Context, opts postgres.PushOptions,
+	_ func(postgres.PushProgress),
 ) (postgres.PushResult, error) {
 	f.pushes++
+	f.pushOpts = append(f.pushOpts, opts)
+	if f.onPush != nil {
+		f.onPush()
+	}
 	return f.pushResult, f.pushErr
 }
 func (f *fakeTarget) Close() error { f.closed++; return nil }
@@ -214,7 +222,8 @@ type pusherRecorder struct {
 func newTestPgPusher(targets ...*fakeTarget) (*pgPusher, *pusherRecorder) {
 	rec := &pusherRecorder{}
 	p := &pgPusher{
-		localSync: func(context.Context) error { return nil },
+		localSync:     func(context.Context) error { return nil },
+		ensurePricing: func(context.Context) error { return nil },
 		connect: func() (pgTarget, error) {
 			tgt := targets[rec.connects]
 			rec.connects++
@@ -222,6 +231,204 @@ func newTestPgPusher(targets ...*fakeTarget) (*pgPusher, *pusherRecorder) {
 		},
 	}
 	return p, rec
+}
+
+// TestPGPusherScopesChangeVectorPushes pins the watch scoping policy: only
+// change-triggered pushes after a clean generation-wide vector
+// reconciliation scope their vector phase; startup and the interval floor
+// stay generation-wide, and a deferring vector phase forces the next push
+// back to generation-wide before scoping resumes.
+func TestPGPusherScopesChangeVectorPushes(t *testing.T) {
+	target := &fakeTarget{pushResult: postgres.PushResult{
+		Vectors: postgres.VectorPushResult{GenerationID: 1},
+	}}
+	pusher, _ := newTestPgPusher(target)
+	pusher.vectorReconcileNeeded = true
+	ctx := context.Background()
+
+	require.NoError(t, pusher.push(ctx, reasonStartup, false))
+	require.NoError(t, pusher.push(ctx, reasonChange, false))
+	require.NoError(t, pusher.push(ctx, reasonInterval, false))
+	target.pushResult = postgres.PushResult{
+		Vectors: postgres.VectorPushResult{SessionsDeferred: 1},
+	}
+	require.NoError(t, pusher.push(ctx, reasonChange, false))
+	target.pushResult = postgres.PushResult{
+		Vectors: postgres.VectorPushResult{GenerationID: 1},
+	}
+	require.NoError(t, pusher.push(ctx, reasonChange, false))
+	require.NoError(t, pusher.push(ctx, reasonChange, false))
+
+	scoped := make([]bool, 0, len(target.pushOpts))
+	for _, o := range target.pushOpts {
+		scoped = append(scoped, o.ScopeVectorsToChangedSessions)
+	}
+	assert.Equal(t,
+		[]bool{false, true, false, true, false, true}, scoped,
+		"startup full-read, scoped change, full interval, scoped change that defers, reconciling change, scoped change")
+}
+
+// TestPGPusherZeroGenerationKeepsReconcile pins that a generation-wide
+// phase reporting no generation id — a daemon predating the field — never
+// clears the reconcile bit. Clearing on it would let the next change push
+// scope with a zero memo, which the vector phase cannot promote if the
+// generation was recreated meanwhile. Scoping resumes with the first
+// response that carries an id.
+func TestPGPusherZeroGenerationKeepsReconcile(t *testing.T) {
+	target := &fakeTarget{}
+	pusher, _ := newTestPgPusher(target)
+	pusher.vectorReconcileNeeded = true
+	ctx := context.Background()
+
+	require.NoError(t, pusher.push(ctx, reasonStartup, false))
+	require.NoError(t, pusher.push(ctx, reasonChange, false))
+	target.pushResult = postgres.PushResult{
+		Vectors: postgres.VectorPushResult{GenerationID: 3},
+	}
+	require.NoError(t, pusher.push(ctx, reasonInterval, false))
+	require.NoError(t, pusher.push(ctx, reasonChange, false))
+
+	require.Len(t, target.pushOpts, 4)
+	assert.False(t, target.pushOpts[1].ScopeVectorsToChangedSessions,
+		"a zero-id reconciliation must not enable scoping")
+	assert.Zero(t, target.pushOpts[1].LastReconciledVectorGeneration,
+		"no generation id was ever reported, so none is carried")
+	assert.True(t, target.pushOpts[3].ScopeVectorsToChangedSessions,
+		"scoping resumes once a response reports the reconciled id")
+	assert.Equal(t, int64(3), target.pushOpts[3].LastReconciledVectorGeneration,
+		"the scoped push carries the first reported generation id")
+}
+
+// TestPGPusherPushErrorForcesReconcile pins that any push error sends the
+// next push back to a generation-wide vector reconciliation.
+func TestPGPusherPushErrorForcesReconcile(t *testing.T) {
+	failing := &fakeTarget{pushErr: fmt.Errorf("boom")}
+	recovered := &fakeTarget{}
+	pusher, _ := newTestPgPusher(failing, recovered)
+	pusher.vectorReconcileNeeded = false
+	ctx := context.Background()
+
+	require.Error(t, pusher.push(ctx, reasonChange, false))
+	require.NoError(t, pusher.push(ctx, reasonChange, false))
+
+	require.Len(t, failing.pushOpts, 1)
+	assert.True(t, failing.pushOpts[0].ScopeVectorsToChangedSessions)
+	require.Len(t, recovered.pushOpts, 1)
+	assert.False(t, recovered.pushOpts[0].ScopeVectorsToChangedSessions)
+}
+
+// TestPGPusherThreadsGenerationID pins the generation-id memo that keeps a
+// scoped push from exposing an incomplete generation: the watch process
+// threads the last generation-wide id into every push and advances it
+// whenever a push reconciles a different generation, so a later scoped push
+// always carries the current id for the vector phase to compare against.
+func TestPGPusherThreadsGenerationID(t *testing.T) {
+	target := &fakeTarget{}
+	pusher, _ := newTestPgPusher(target)
+	pusher.vectorReconcileNeeded = true
+	ctx := context.Background()
+
+	// Startup reconciles generation id 1 generation-wide.
+	target.pushResult = postgres.PushResult{
+		Vectors: postgres.VectorPushResult{GenerationID: 1},
+	}
+	require.NoError(t, pusher.push(ctx, reasonStartup, false))
+
+	// A scoped change push carries id 1 and leaves the memo unchanged.
+	require.NoError(t, pusher.push(ctx, reasonChange, false))
+
+	// The active generation is recreated as id 2. The phase promotes itself
+	// and reconciles it generation-wide, reported by the differing id, so the
+	// memo advances to 2 while the reconcile bit stays clear.
+	target.pushResult = postgres.PushResult{
+		Vectors: postgres.VectorPushResult{GenerationID: 2},
+	}
+	require.NoError(t, pusher.push(ctx, reasonChange, false))
+
+	// The next scoped change push now carries id 2.
+	require.NoError(t, pusher.push(ctx, reasonChange, false))
+
+	require.Len(t, target.pushOpts, 4)
+	assert.Zero(t, target.pushOpts[0].LastReconciledVectorGeneration,
+		"startup carries no prior generation id")
+	assert.False(t, target.pushOpts[0].ScopeVectorsToChangedSessions)
+	assert.Equal(t, int64(1), target.pushOpts[1].LastReconciledVectorGeneration,
+		"the scoped change push carries the startup generation id")
+	assert.True(t, target.pushOpts[1].ScopeVectorsToChangedSessions)
+	assert.Equal(t, int64(1), target.pushOpts[2].LastReconciledVectorGeneration,
+		"the switch push still carries id 1 so the phase can detect the change")
+	assert.True(t, target.pushOpts[2].ScopeVectorsToChangedSessions)
+	assert.Equal(t, int64(2), target.pushOpts[3].LastReconciledVectorGeneration,
+		"once id 2 is reconciled the next scoped push carries it")
+	assert.True(t, target.pushOpts[3].ScopeVectorsToChangedSessions)
+}
+
+func TestPGPusherEnsuresPricingAfterLocalSyncBeforeConnect(t *testing.T) {
+	var events []string
+	target := &fakeTarget{
+		onPush: func() { events = append(events, "push") },
+	}
+	pusher := &pgPusher{
+		localSync: func(context.Context) error {
+			events = append(events, "local sync")
+			return nil
+		},
+		ensurePricing: func(context.Context) error {
+			events = append(events, "pricing ensure")
+			return nil
+		},
+		connect: func() (pgTarget, error) {
+			events = append(events, "connect")
+			return target, nil
+		},
+	}
+
+	require.NoError(t, pusher.push(
+		context.Background(), reasonChange, false,
+	))
+	assert.Equal(t, []string{
+		"local sync", "pricing ensure", "connect", "push",
+	}, events)
+}
+
+func TestPGPusherPricingFailureWarnsAndContinues(t *testing.T) {
+	wantErr := errors.New("catalog unavailable")
+	target := &fakeTarget{}
+	logs := captureLogOutput(t)
+	pusher := &pgPusher{
+		localSync:     func(context.Context) error { return nil },
+		ensurePricing: func(context.Context) error { return wantErr },
+		connect:       func() (pgTarget, error) { return target, nil },
+	}
+
+	require.NoError(t, pusher.push(
+		context.Background(), reasonChange, false,
+	))
+	assert.Equal(t, 1, target.pushes)
+	assert.Contains(t, logs.String(), "pricing refresh failed")
+	assert.Contains(t, logs.String(), wantErr.Error())
+}
+
+func TestPGPusherCanceledPricingStopsBeforeConnect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	connectCalled := false
+	pusher := &pgPusher{
+		localSync: func(context.Context) error { return nil },
+		ensurePricing: func(got context.Context) error {
+			require.Equal(t, ctx, got)
+			cancel()
+			return got.Err()
+		},
+		connect: func() (pgTarget, error) {
+			connectCalled = true
+			return &fakeTarget{}, nil
+		},
+	}
+
+	err := pusher.push(ctx, reasonChange, false)
+
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.False(t, connectCalled)
 }
 
 // requireReconnectAfterTargetError verifies that a push failure on first closes
@@ -286,7 +493,8 @@ func TestPgPusher_LogsPartialPushErrors(t *testing.T) {
 	logs := captureLogOutput(t)
 
 	p, _ := newTestPgPusher(target)
-	require.NoError(t, p.push(context.Background(), reasonChange, false))
+	require.Error(t, p.push(context.Background(), reasonChange, false),
+		"partial pushes must remain pending for retry")
 
 	got := logs.String()
 	assert.Contains(t, got, "pushed 3 sessions, 9 messages, 2 errors")

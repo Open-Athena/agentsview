@@ -7,12 +7,333 @@ import (
 	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 )
+
+func TestPGUsageEventFingerprintsPreserveExactMicrodollars(t *testing.T) {
+	pgURL := testPGURL(t)
+	const schema = "agentsview_usage_fingerprint_money_test"
+	cleanNamedPGSchema(t, pgURL, schema)
+	t.Cleanup(func() { cleanNamedPGSchema(t, pgURL, schema) })
+
+	ctx := context.Background()
+	pg, err := Open(pgURL, schema, true)
+	require.NoError(t, err)
+	defer pg.Close()
+	require.NoError(t, EnsureSchema(ctx, pg, schema))
+
+	local, err := db.Open(filepath.Join(t.TempDir(), "local.db"))
+	require.NoError(t, err)
+	defer local.Close()
+	require.NoError(t, local.UpsertSession(db.Session{
+		ID: "exact-money", Project: "project", Machine: "machine", Agent: "codex",
+	}))
+	cost := money.Money{Microdollars: 9_007_199_254_740_993}
+	require.NoError(t, local.ReplaceSessionUsageEvents("exact-money", []db.UsageEvent{{
+		SessionID: "exact-money", Source: "provider", Model: "model",
+		InputTokens: 11, OutputTokens: 7, Cost: &cost,
+		CostStatus: "priced", CostSource: "provider",
+		OccurredAt: "2026-07-22T12:00:00Z", DedupKey: "exact-cost",
+	}}))
+	want, err := local.UsageEventFingerprint("exact-money")
+	require.NoError(t, err)
+
+	_, err = pg.ExecContext(ctx, `
+		INSERT INTO sessions (id, machine, project, agent)
+		VALUES ('exact-money', 'machine', 'project', 'codex');
+		INSERT INTO usage_events (
+			session_id, source, model, input_tokens, output_tokens,
+			cost_microdollars, cost_status, cost_source, occurred_at, dedup_key
+		) VALUES (
+			'exact-money', 'provider', 'model', 11, 7,
+			9007199254740993, 'priced', 'provider',
+			'2026-07-22T12:00:00Z', 'exact-cost'
+		)`)
+	require.NoError(t, err)
+
+	tx, err := pg.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer tx.Rollback()
+	got, err := pgUsageEventFingerprint(ctx, tx, "exact-money")
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
+
+	batched := map[string]string{}
+	require.NoError(t, loadPushUsageEventFingerprints(
+		ctx, tx, []string{"exact-money"}, batched,
+	))
+	assert.Equal(t, want, batched["exact-money"])
+}
+
+func TestPushMirrorsSessionProjectIdentitySnapshotsByArchiveGeneration(
+	t *testing.T,
+) {
+	pgURL := testPGURL(t)
+	const schema = "agentsview_push_project_snapshot_test"
+	pg, err := Open(pgURL, schema, true)
+	require.NoError(t, err)
+	defer pg.Close()
+	ctx := context.Background()
+	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+	require.NoError(t, err)
+	require.NoError(t, EnsureSchema(ctx, pg, schema))
+
+	local, err := db.Open(filepath.Join(t.TempDir(), "local.db"))
+	require.NoError(t, err)
+	defer local.Close()
+	require.NoError(t, local.UpsertSession(db.Session{
+		ID: "snapshot-session", Project: "app", Machine: "laptop", Agent: "codex",
+	}))
+	require.NoError(t, local.UpsertProjectIdentityObservation(ctx,
+		export.ProjectIdentityObservation{
+			SessionID: "snapshot-session", Project: "app", Machine: "laptop",
+			RootPath: "/workspace/app", GitRemote: "https://github.com/acme/app.git",
+			GitRemoteName: "origin", RepositoryPath: "/workspace/app/.git",
+			WorktreeRootPath:     "/workspace/app",
+			WorktreeRelationship: export.WorktreeMain,
+			CheckoutState:        export.CheckoutDetached,
+			RemoteResolution:     export.ProjectResolutionResolved,
+			ObservedAt:           time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC),
+		},
+	))
+	archiveID, err := local.GetArchiveID(ctx)
+	require.NoError(t, err)
+	generation, err := local.GetDatabaseID(ctx)
+	require.NoError(t, err)
+
+	syncer := &Sync{
+		pg: pg, local: local, machine: "laptop", schema: schema, schemaDone: true,
+	}
+	require.NoError(t, syncer.syncProjectIdentityObservations(ctx, false))
+
+	var gotArchive, gotGeneration, gotSession, gotRemote string
+	var gotRelationship export.WorktreeRelationship
+	var gotCheckout export.CheckoutState
+	err = pg.QueryRowContext(ctx, `
+		SELECT source_archive_id, source_database_generation,
+			source_session_id, git_remote, worktree_relationship, checkout_state
+		FROM source_session_project_identity_snapshots
+		WHERE source_session_id = $1`, "snapshot-session",
+	).Scan(
+		&gotArchive, &gotGeneration, &gotSession, &gotRemote,
+		&gotRelationship, &gotCheckout,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, archiveID, gotArchive)
+	assert.Equal(t, generation, gotGeneration)
+	assert.Equal(t, "snapshot-session", gotSession)
+	assert.Equal(t, "https://github.com/acme/app.git", gotRemote)
+	assert.Equal(t, export.WorktreeMain, gotRelationship)
+	assert.Equal(t, export.CheckoutDetached, gotCheckout)
+
+	_, err = pg.ExecContext(ctx, `
+		UPDATE source_session_project_identity_snapshots
+		SET git_remote = 'sentinel'
+		WHERE source_session_id = $1`, "snapshot-session")
+	require.NoError(t, err)
+	require.NoError(t, syncer.syncProjectIdentityObservations(ctx, false))
+	require.NoError(t, pg.QueryRowContext(ctx, `
+		SELECT git_remote FROM source_session_project_identity_snapshots
+		WHERE source_session_id = $1`, "snapshot-session").Scan(&gotRemote))
+	assert.Equal(t, "sentinel", gotRemote,
+		"unchanged local revision should skip PG publication")
+	require.NoError(t, syncer.syncProjectIdentityObservations(ctx, true))
+	require.NoError(t, pg.QueryRowContext(ctx, `
+		SELECT git_remote FROM source_session_project_identity_snapshots
+		WHERE source_session_id = $1`, "snapshot-session").Scan(&gotRemote))
+	assert.Equal(t, "https://github.com/acme/app.git", gotRemote,
+		"forced publication should rebuild PG identity rows")
+
+	require.NoError(t, local.DeleteSession("snapshot-session"))
+	require.NoError(t, syncer.syncProjectIdentityObservations(ctx, false))
+	var snapshotCount int
+	require.NoError(t, pg.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM source_session_project_identity_snapshots
+		WHERE source_archive_id = $1`, archiveID,
+	).Scan(&snapshotCount))
+	assert.Zero(t, snapshotCount)
+}
+
+func TestFilteredThenUnfilteredIdentityPublicationIncludesExcludedProject(
+	t *testing.T,
+) {
+	pgURL := testPGURL(t)
+	const schema = "agentsview_filtered_identity_revision_test"
+	cleanNamedPGSchema(t, pgURL, schema)
+	t.Cleanup(func() { cleanNamedPGSchema(t, pgURL, schema) })
+	ctx := context.Background()
+	local, err := db.Open(filepath.Join(t.TempDir(), "local.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, local.Close()) })
+	for _, project := range []string{"alpha", "beta"} {
+		sessionID := "identity-" + project
+		require.NoError(t, local.UpsertSession(db.Session{
+			ID: sessionID, Project: project, Machine: "laptop", Agent: "codex",
+		}))
+		require.NoError(t, local.UpsertProjectIdentityObservation(ctx,
+			export.ProjectIdentityObservation{
+				SessionID: sessionID, Project: project, Machine: "laptop",
+				RootPath:         "/workspace/" + project,
+				GitRemote:        "https://example.com/" + project + ".git",
+				RemoteResolution: export.ProjectResolutionResolved,
+				ObservedAt:       time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC),
+			},
+		))
+	}
+	filtered, err := New(
+		pgURL, schema, local, "laptop", true,
+		SyncOptions{Projects: []string{"alpha"}},
+	)
+	require.NoError(t, err)
+	require.NoError(t, filtered.EnsureSchema(ctx))
+	require.NoError(t, filtered.syncProjectIdentityObservations(ctx, false))
+	_, err = filtered.pg.ExecContext(ctx, `
+		UPDATE source_project_identity_observations
+		SET git_remote_name = 'sentinel'
+		WHERE project = 'alpha'`)
+	require.NoError(t, err)
+	require.NoError(t, local.UpsertProjectIdentityObservation(ctx,
+		export.ProjectIdentityObservation{
+			SessionID: "identity-beta", Project: "beta", Machine: "laptop",
+			RootPath:         "/workspace/beta",
+			GitRemote:        "https://example.com/beta.git",
+			GitRemoteName:    "upstream",
+			RemoteResolution: export.ProjectResolutionResolved,
+			ObservedAt:       time.Date(2026, 7, 11, 13, 0, 0, 0, time.UTC),
+		},
+	))
+	require.NoError(t, filtered.syncProjectIdentityObservations(ctx, false))
+	var alphaRemoteName string
+	require.NoError(t, filtered.pg.QueryRowContext(ctx, `
+		SELECT git_remote_name FROM source_project_identity_observations
+		WHERE project = 'alpha'`).Scan(&alphaRemoteName))
+	assert.Equal(t, "sentinel", alphaRemoteName,
+		"out-of-scope changes must not republish the filtered identity scope")
+	require.NoError(t, filtered.Close())
+
+	unfiltered, err := New(
+		pgURL, schema, local, "laptop", true, SyncOptions{},
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, unfiltered.Close()) })
+	require.NoError(t, unfiltered.EnsureSchema(ctx))
+	require.NoError(t, unfiltered.syncProjectIdentityObservations(ctx, false))
+	var betaSnapshots int
+	require.NoError(t, unfiltered.pg.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM source_session_project_identity_snapshots
+		WHERE project = $1`, "beta").Scan(&betaSnapshots))
+	assert.Equal(t, 1, betaSnapshots)
+}
+
+func TestIdentityPublicationUpdatesOnlyChangedRowsAndAppliesTombstones(
+	t *testing.T,
+) {
+	pgURL := testPGURL(t)
+	const schema = "agentsview_identity_delta_test"
+	cleanNamedPGSchema(t, pgURL, schema)
+	t.Cleanup(func() { cleanNamedPGSchema(t, pgURL, schema) })
+	ctx := context.Background()
+	local, err := db.Open(filepath.Join(t.TempDir(), "local.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, local.Close()) })
+	observedAt := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	for _, project := range []string{"alpha", "beta"} {
+		sessionID := "identity-" + project
+		require.NoError(t, local.UpsertSession(db.Session{
+			ID: sessionID, Project: project, Machine: "laptop", Agent: "codex",
+		}))
+		require.NoError(t, local.UpsertProjectIdentityObservation(ctx,
+			export.ProjectIdentityObservation{
+				SessionID: sessionID, Project: project, Machine: "laptop",
+				RootPath:         "/workspace/" + project,
+				GitRemote:        "https://example.com/" + project + ".git",
+				GitRemoteName:    "origin",
+				RemoteResolution: export.ProjectResolutionResolved,
+				ObservedAt:       observedAt,
+			},
+		))
+	}
+	require.NoError(t, local.UpsertSession(db.Session{
+		ID: "identity-gamma", Project: "gamma", Machine: "laptop", Agent: "codex",
+	}))
+	require.NoError(t, local.UpsertProjectIdentityObservation(ctx,
+		export.ProjectIdentityObservation{
+			SessionID: "identity-gamma", Project: "gamma", Machine: "laptop",
+			RootPath:         "/workspace/gamma",
+			RemoteResolution: export.ProjectResolutionUnknown,
+			ObservedAt:       observedAt,
+		},
+	))
+
+	syncer, err := New(pgURL, schema, local, "laptop", true, SyncOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, syncer.Close()) })
+	require.NoError(t, syncer.EnsureSchema(ctx))
+	require.NoError(t, syncer.syncProjectIdentityObservations(ctx, false))
+	_, err = syncer.pg.ExecContext(ctx, `
+		UPDATE source_project_identity_observations
+		SET git_remote_name = 'sentinel'
+		WHERE project = 'beta'`)
+	require.NoError(t, err)
+
+	require.NoError(t, local.UpsertProjectIdentityObservation(ctx,
+		export.ProjectIdentityObservation{
+			SessionID: "identity-alpha", Project: "alpha", Machine: "laptop",
+			RootPath:         "/workspace/alpha",
+			GitRemote:        "https://example.com/alpha.git",
+			GitRemoteName:    "upstream",
+			RemoteResolution: export.ProjectResolutionResolved,
+			ObservedAt:       observedAt.Add(time.Hour),
+		},
+	))
+	require.NoError(t, local.UpsertProjectIdentityObservation(ctx,
+		export.ProjectIdentityObservation{
+			SessionID: "identity-gamma", Project: "gamma", Machine: "laptop",
+			RootPath:         "/workspace/gamma",
+			GitRemote:        "https://example.com/gamma.git",
+			GitRemoteName:    "origin",
+			RemoteResolution: export.ProjectResolutionResolved,
+			ObservedAt:       observedAt.Add(time.Hour),
+		},
+	))
+	require.NoError(t, syncer.syncProjectIdentityObservations(ctx, false))
+
+	var alphaRemoteName, betaRemoteName string
+	require.NoError(t, syncer.pg.QueryRowContext(ctx, `
+		SELECT git_remote_name FROM source_project_identity_observations
+		WHERE project = 'alpha'`).Scan(&alphaRemoteName))
+	require.NoError(t, syncer.pg.QueryRowContext(ctx, `
+		SELECT git_remote_name FROM source_project_identity_observations
+		WHERE project = 'beta'`).Scan(&betaRemoteName))
+	assert.Equal(t, "upstream", alphaRemoteName)
+	assert.Equal(t, "sentinel", betaRemoteName,
+		"incremental publication must not rewrite unchanged rows")
+	var gammaFallbacks, gammaRemotes int
+	require.NoError(t, syncer.pg.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM source_project_identity_observations
+		WHERE project = 'gamma' AND git_remote = ''`).Scan(&gammaFallbacks))
+	require.NoError(t, syncer.pg.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM source_project_identity_observations
+		WHERE project = 'gamma' AND git_remote = $1`,
+		"https://example.com/gamma.git").Scan(&gammaRemotes))
+	assert.Zero(t, gammaFallbacks)
+	assert.Equal(t, 1, gammaRemotes)
+
+	require.NoError(t, local.DeleteSession("identity-alpha"))
+	require.NoError(t, syncer.syncProjectIdentityObservations(ctx, false))
+	var snapshotCount int
+	require.NoError(t, syncer.pg.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM source_session_project_identity_snapshots
+		WHERE source_session_id = $1`, "identity-alpha").Scan(&snapshotCount))
+	assert.Zero(t, snapshotCount)
+}
 
 // TestPushSystemFingerprintCollisionRegression verifies that the fast-path
 // in pushMessages correctly detects a change when the is_system flags are
@@ -536,6 +857,134 @@ func TestPushPreservesPGServeLocalCurationFields(t *testing.T) {
 	require.True(t, gotFirstMessage.Valid, "first_message should remain visible")
 	assert.Equal(t, updatedFirstMessage, gotFirstMessage.String,
 		"source-owned fields should still update")
+}
+
+func TestPushPreservesRecoverableWatcherTombstonesAcrossPG(t *testing.T) {
+	pgURL := testPGURL(t)
+	const schema = "agentsview_push_source_missing_test"
+	pg, err := Open(pgURL, schema, true)
+	require.NoError(t, err)
+	defer pg.Close()
+	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+	})
+	require.NoError(t, EnsureSchema(t.Context(), pg, schema))
+
+	local, err := db.Open(filepath.Join(t.TempDir(), "local.db"))
+	require.NoError(t, err)
+	defer local.Close()
+	syncer := &Sync{
+		pg: pg, local: local, machine: "test-machine",
+		schema: schema, schemaDone: true,
+	}
+	paths := map[string]string{}
+	for _, id := range []string{
+		"source-revive", "source-protected", "user-delete", "user-empty",
+	} {
+		path := filepath.Join(t.TempDir(), id+".jsonl")
+		paths[id] = path
+		mtime := time.Now().UnixNano()
+		require.NoError(t, local.UpsertSession(db.Session{
+			ID: id, Project: "project", Machine: "test-machine", Agent: "claude",
+			CreatedAt: "2026-07-14T00:00:00Z", FilePath: &path, FileMtime: &mtime,
+		}))
+	}
+	_, err = syncer.Push(t.Context(), false, nil)
+	require.NoError(t, err, "initial push")
+
+	store, err := NewStore(pgURL, schema, true)
+	require.NoError(t, err)
+	defer store.Close()
+	for _, id := range []string{"user-delete", "user-empty"} {
+		require.NoError(t, store.SoftDeleteSession(id), "PG user trash %s", id)
+	}
+	sources := make([]db.SessionSourcePath, 0, len(paths))
+	for _, path := range paths {
+		sources = append(sources, db.SessionSourcePath{
+			Agent: "claude", FilePath: path,
+		})
+	}
+	require.NoError(t, local.BaselineActiveSessionSourcePaths(
+		t.Context(), "test-machine", sources,
+	))
+	for id, path := range paths {
+		changed, tombstoneErr := local.SoftDeleteSessionSourceOwnership(
+			t.Context(), "test-machine", "claude", id, path,
+		)
+		require.NoError(t, tombstoneErr)
+		require.True(t, changed)
+	}
+	_, err = syncer.Push(t.Context(), false, nil)
+	require.NoError(t, err, "push source-missing state")
+
+	for _, id := range []string{"source-revive", "source-protected"} {
+		active, getErr := store.GetSession(t.Context(), id)
+		require.NoError(t, getErr)
+		assert.Nil(t, active, "%s must remain hidden while its source is missing", id)
+		var deleted bool
+		var cause sql.NullString
+		require.NoError(t, pg.QueryRow(`
+			SELECT deleted_at IS NOT NULL, deletion_cause
+			FROM sessions WHERE id = $1`, id,
+		).Scan(&deleted, &cause))
+		assert.True(t, deleted)
+		require.True(t, cause.Valid)
+		assert.Equal(t, "source_missing", cause.String)
+	}
+	trashed, err := store.ListTrashedSessions(t.Context())
+	require.NoError(t, err)
+	trashIDs := sessionIDs(trashed)
+	assert.NotContains(t, trashIDs, "source-revive")
+	assert.NotContains(t, trashIDs, "source-protected")
+	assert.Contains(t, trashIDs, "user-delete")
+	assert.Contains(t, trashIDs, "user-empty")
+
+	restored, err := store.RestoreSession("source-protected")
+	require.NoError(t, err)
+	assert.Zero(t, restored, "PG restore must refuse watcher tombstones")
+	deleted, err := store.DeleteSessionIfTrashed("source-protected")
+	require.NoError(t, err)
+	assert.Zero(t, deleted, "PG permanent delete must refuse watcher tombstones")
+	deleted, err = store.DeleteSessionIfTrashed("user-delete")
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, deleted, "ordinary PG user trash remains deletable")
+
+	for _, id := range []string{"source-revive", "user-empty"} {
+		path := paths[id]
+		mtime := time.Now().UnixNano()
+		require.NoError(t, local.UpsertSession(db.Session{
+			ID: id, Project: "project", Machine: "test-machine", Agent: "claude",
+			CreatedAt: "2026-07-14T00:00:00Z", FilePath: &path, FileMtime: &mtime,
+		}), "revive local source %s", id)
+	}
+	_, err = syncer.Push(t.Context(), false, nil)
+	require.NoError(t, err, "push local source revival")
+
+	active, err := store.GetSession(t.Context(), "source-revive")
+	require.NoError(t, err)
+	require.NotNil(t, active, "recoverable source must become visible after revival")
+	var deletedAt sql.NullTime
+	var cause sql.NullString
+	require.NoError(t, pg.QueryRow(`
+		SELECT deleted_at, deletion_cause
+		FROM sessions WHERE id = 'source-revive'`,
+	).Scan(&deletedAt, &cause))
+	assert.False(t, deletedAt.Valid)
+	assert.False(t, cause.Valid)
+
+	trashed, err = store.ListTrashedSessions(t.Context())
+	require.NoError(t, err)
+	assert.Contains(t, sessionIDs(trashed), "user-empty",
+		"newer PG user trash must survive an older local revival")
+	emptied, err := store.EmptyTrash()
+	require.NoError(t, err)
+	assert.Equal(t, 1, emptied)
+	protected, err := store.GetSessionFull(t.Context(), "source-protected")
+	require.NoError(t, err)
+	assert.NotNil(t, protected,
+		"EmptyTrash must not purge a still-missing recoverable source")
 }
 
 func TestPushPreservesPGServePermanentDeletes(t *testing.T) {
@@ -1075,7 +1524,7 @@ func TestPushSyncsUsageEventsForZeroMessageSession(t *testing.T) {
 		Model:        "gpt-5.5",
 		InputTokens:  1000000,
 		OutputTokens: 500000,
-		CostUSD:      nil,
+		Cost:         nil,
 		OccurredAt:   started,
 		DedupKey:     "session:" + sessID,
 	}}), "ReplaceSessionUsageEvents")
@@ -1104,7 +1553,7 @@ func TestPushSyncsUsageEventsForZeroMessageSession(t *testing.T) {
 		Timezone: "UTC",
 	})
 	require.NoError(t, err, "GetDailyUsage")
-	assert.InDelta(t, 20.0, result.Totals.TotalCost, 1e-9,
+	assert.Equal(t, money.MustParseDollars("20"), result.Totals.TotalCost,
 		"gpt-5.5 usage should be priced from the catalog")
 }
 
@@ -1126,10 +1575,10 @@ func TestPushSyncsCursorUsageEventsIntoPGDailyUsage(t *testing.T) {
 	defer localDB.Close()
 	require.NoError(t, localDB.UpsertModelPricing([]db.ModelPricing{{
 		ModelPattern:         "claude-4.6-opus-high-thinking",
-		InputPerMTok:         5.0,
-		OutputPerMTok:        25.0,
-		CacheCreationPerMTok: 6.25,
-		CacheReadPerMTok:     0.5,
+		InputPerMTok:         money.MustParseDollars("5.0"),
+		OutputPerMTok:        money.MustParseDollars("25.0"),
+		CacheCreationPerMTok: money.MustParseDollars("6.25"),
+		CacheReadPerMTok:     money.MustParseDollars("0.5"),
 	}}), "UpsertModelPricing")
 	require.NoError(t, localDB.InsertCursorUsageEvents([]db.CursorUsageEvent{{
 		OccurredAt:       "2026-05-14T10:05:00Z",
@@ -1139,8 +1588,8 @@ func TestPushSyncsCursorUsageEventsIntoPGDailyUsage(t *testing.T) {
 		OutputTokens:     567,
 		CacheWriteTokens: 12,
 		CacheReadTokens:  34,
-		ChargedCents:     15.66,
-		CursorTokenFee:   3.32,
+		Charged:          money.MustParseDollars("0.1566"),
+		CursorTokenFee:   money.MustParseDollars("0.0332"),
 		UserID:           "152683922",
 		UserEmail:        "member@example.com",
 		IsHeadless:       false,
@@ -1175,7 +1624,7 @@ func TestPushSyncsCursorUsageEventsIntoPGDailyUsage(t *testing.T) {
 	assert.Equal(t, 567, result.Daily[0].OutputTokens)
 	assert.Equal(t, 12, result.Daily[0].CacheCreationTokens)
 	assert.Equal(t, 34, result.Daily[0].CacheReadTokens)
-	assert.InDelta(t, 0.1566, result.Daily[0].TotalCost, 1e-9)
+	assert.Equal(t, money.MustParseDollars("0.1566"), result.Daily[0].TotalCost)
 	assert.Empty(t, result.Projects, "cursor-only usage should not emit project identities")
 	assert.NotContains(t, result.Projects, "")
 	assert.Equal(t, 0, result.SessionCounts.Total)
@@ -1183,6 +1632,84 @@ func TestPushSyncsCursorUsageEventsIntoPGDailyUsage(t *testing.T) {
 	assert.Empty(t, result.SessionCounts.ByProject)
 	require.Len(t, result.Daily[0].AgentBreakdowns, 1)
 	assert.Equal(t, "cursor", result.Daily[0].AgentBreakdowns[0].Agent)
+}
+
+func TestPushCursorUsageEventsDedupsAfterLegacyMoneyMigration(t *testing.T) {
+	pgURL := testPGURL(t)
+
+	const schema = "agentsview_cursor_usage_money_migration_push_test"
+	pg, err := Open(pgURL, schema, true)
+	require.NoError(t, err, "Open")
+	defer pg.Close()
+
+	ctx := t.Context()
+	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+	require.NoError(t, err, "drop schema")
+	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
+
+	_, err = pg.ExecContext(ctx, `
+		ALTER TABLE cursor_usage_events
+			ALTER COLUMN charged_microdollars TYPE DOUBLE PRECISION
+			USING charged_microdollars / 10000.0;
+		ALTER TABLE cursor_usage_events
+			RENAME COLUMN charged_microdollars TO charged_cents;
+		ALTER TABLE cursor_usage_events
+			ALTER COLUMN cursor_token_fee_microdollars TYPE DOUBLE PRECISION
+			USING cursor_token_fee_microdollars / 10000.0;
+		ALTER TABLE cursor_usage_events
+			RENAME COLUMN cursor_token_fee_microdollars TO cursor_token_fee;
+	`)
+	require.NoError(t, err, "restore legacy Cursor money columns")
+	legacyTimestamp, err := time.Parse(
+		time.RFC3339Nano, "2026-05-14T10:05:00.123456789Z",
+	)
+	require.NoError(t, err)
+	_, err = pg.ExecContext(ctx, `
+		INSERT INTO cursor_usage_events (
+			occurred_at, model, kind,
+			input_tokens, output_tokens,
+			cache_write_tokens, cache_read_tokens,
+			charged_cents, cursor_token_fee,
+			user_id, user_email, is_headless, dedup_key
+		) VALUES (
+			$1,
+			'claude-4.6-opus-high-thinking',
+			'USAGE_EVENT_KIND_USAGE_BASED',
+			1234, 567, 12, 34,
+			15.66001, 3.32001,
+			'152683922', 'member@example.com', false,
+			'legacy-fractional-cent-key'
+		)`, legacyTimestamp)
+	require.NoError(t, err, "seed legacy Cursor usage")
+	require.NoError(t, EnsureSchema(ctx, pg, schema),
+		"migrate legacy Cursor money")
+
+	localDB, err := db.Open(filepath.Join(t.TempDir(), "sessions.db"))
+	require.NoError(t, err, "open local db")
+	defer localDB.Close()
+	require.NoError(t, localDB.InsertCursorUsageEvents([]db.CursorUsageEvent{{
+		OccurredAt:       "2026-05-14T10:05:00.123456789Z",
+		Model:            "claude-4.6-opus-high-thinking",
+		Kind:             "USAGE_EVENT_KIND_USAGE_BASED",
+		InputTokens:      1234,
+		OutputTokens:     567,
+		CacheWriteTokens: 12,
+		CacheReadTokens:  34,
+		Charged:          money.MustParseDollars("0.1566"),
+		CursorTokenFee:   money.MustParseDollars("0.0332"),
+		UserID:           "152683922",
+		UserEmail:        "member@example.com",
+	}}), "insert refetched local Cursor usage")
+
+	sync := &Sync{
+		local: localDB, pg: pg, machine: "test-machine",
+		schema: schema, schemaDone: true,
+	}
+	_, err = sync.Push(ctx, false, nil)
+	require.NoError(t, err, "Push")
+
+	assert.Equal(t, 1, pgTableCount(t, ctx, pg, "cursor_usage_events"),
+		"refetched quantized event must not duplicate its migrated PG row")
 }
 
 func TestPushCursorUsageEventsPreservesRowsFromOtherMachines(t *testing.T) {
@@ -1203,14 +1730,14 @@ func TestPushCursorUsageEventsPreservesRowsFromOtherMachines(t *testing.T) {
 			occurred_at, model, kind,
 			input_tokens, output_tokens,
 			cache_write_tokens, cache_read_tokens,
-			charged_cents, cursor_token_fee,
+			charged_microdollars, cursor_token_fee_microdollars,
 			user_id, user_email, is_headless, dedup_key
 		) VALUES (
 			'2026-05-14T09:05:00Z'::timestamptz,
 			'claude-4.6-opus-high-thinking',
 			'USAGE_EVENT_KIND_USAGE_BASED',
 			10, 20, 0, 30,
-			1.25, 0.25,
+			12500, 2500,
 			'other-user', 'other@example.com', false, 'other-machine-row'
 		)`)
 	require.NoError(t, err, "seed existing pg row")
@@ -1226,8 +1753,8 @@ func TestPushCursorUsageEventsPreservesRowsFromOtherMachines(t *testing.T) {
 		OutputTokens:     567,
 		CacheWriteTokens: 12,
 		CacheReadTokens:  34,
-		ChargedCents:     15.66,
-		CursorTokenFee:   3.32,
+		Charged:          money.MustParseDollars("0.1566"),
+		CursorTokenFee:   money.MustParseDollars("0.0332"),
 		UserID:           "152683922",
 		UserEmail:        "member@example.com",
 		IsHeadless:       false,
@@ -1708,7 +2235,7 @@ func TestPushMarkerNotWrittenWhenResetRecoveryFails(t *testing.T) {
 	// reset branch re-runs EnsureSchema, but CREATE TABLE IF NOT EXISTS does
 	// not re-add a column to an existing table, so the failure persists.
 	_, err = pg.Exec(
-		`ALTER TABLE model_pricing DROP COLUMN cache_read_per_mtok`,
+		`ALTER TABLE model_pricing DROP COLUMN cache_read_microdollars_per_mtok`,
 	)
 	require.NoError(t, err, "drop model_pricing column")
 
@@ -1721,7 +2248,7 @@ func TestPushMarkerNotWrittenWhenResetRecoveryFails(t *testing.T) {
 	// absent) and re-push the session.
 	_, err = pg.Exec(
 		`ALTER TABLE model_pricing
-		 ADD COLUMN cache_read_per_mtok DOUBLE PRECISION NOT NULL DEFAULT 0`,
+		 ADD COLUMN cache_read_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0`,
 	)
 	require.NoError(t, err, "restore model_pricing column")
 

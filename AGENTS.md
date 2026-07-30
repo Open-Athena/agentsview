@@ -7,14 +7,29 @@ Instructions for autonomous coding agents working in this repository.
 - Applies to all agent-driven work in this repo.
 - If multiple instruction files exist, follow the most specific one for the
   files you are editing.
+- Requests to review, analyze, or explain are read-only unless the user also
+  asks for changes.
+- `AGENTS.md` is the source of truth for standing rules; keep `CLAUDE.md` as a
+  symlink to it and record new durable rules here.
+
+## Roborev
+
+- Never invoke the `roborev review` CLI command in any form unless the user
+  explicitly asks for it. Use all other `roborev` CLI commands normally when
+  they are appropriate for interacting with roborev. Never invoke a roborev
+  skill (including `roborev-fix` or `roborev-design-review-branch`) unless the
+  user explicitly asks for that skill.
 
 ## Required Git Rules
 
 1. Commit every turn that changes tracked files.
 1. Do not make empty commits. If a turn is read-only or only changes ignored
    files, state that no commit was made.
-1. Do not amend commits.
+1. Do not amend, squash, or rebase commits unless explicitly requested.
 1. Do not change branches without explicit user permission.
+1. Deliver changes through pull requests from feature branches.
+1. Do not merge pull requests. Open them and report status; merging is always
+   the user's decision, even when checks are green and the change is urgent.
 
 ## Commit Expectations
 
@@ -24,12 +39,45 @@ Instructions for autonomous coding agents working in this repository.
 - Do not include generated-with lines, attribution blocks, validation footers,
   or command transcripts in commit messages.
 
+## Content Hygiene
+
+- Keep private project names, hostnames, personal identities, infrastructure
+  details, and absolute user paths out of code, tests, fixtures, docs, commit
+  messages, and pull request text. Run the private-data scrub before
+  publishing.
+- Keep pull request titles and descriptions synchronized with the current diff.
+- Do not post pull request or issue comments unless explicitly requested.
+
 ## Validation
 
 - Run relevant tests before committing when practical.
 - If tests cannot be run, state that clearly in the handoff.
 - After Go code changes, run `go fmt ./...` and `go vet ./...` before
   committing.
+
+## Background Memory
+
+- Keep passive daemon memory within a few hundred megabytes on macOS, Linux, and
+  Windows. Treat sustained growth beyond that range as a regression.
+- Background watcher, polling, and sync work must be bounded by the changed
+  batch, not by total archive size. Do not scan or materialize every stored
+  session for each filesystem event.
+- Declare expensive scheduling inputs as provider capabilities and compute them
+  only for providers that observably consume them. Default new capabilities to
+  unsupported.
+- Add cardinality-scaling regressions for background paths: compare small and
+  large archives and assert that unchanged per-event work remains bounded.
+  Preserve deletion, tombstone, and persistent-archive behavior in the same
+  tests.
+- Diagnose long-running memory with allocation and CPU profiles plus live heap,
+  forced-GC heap, and operating-system physical/dirty memory. Raw RSS alone is
+  not proof of live memory because it includes clean reclaimable mappings.
+- Profile branch binaries only against isolated production-scale database and
+  source clones. Never point profiling workloads at live archives or live
+  agent transcripts.
+- Include a retention observation long enough to reproduce the reported growth
+  window. On macOS record `vmmap` physical footprint and dirty memory; use
+  portable Go allocation and heap metrics for Linux and Windows.
 
 ## Backend Parity
 
@@ -42,6 +90,35 @@ Instructions for autonomous coding agents working in this repository.
   backend, for example "this is only for PostgreSQL". If one backend needs a
   different implementation, explain why and keep the observable behavior the
   same.
+
+## DuckDB Mirror
+
+- DuckDB is a disposable read mirror of the SQLite archive, never a system of
+  record. Backend Parity above applies to SQLite and PostgreSQL only; DuckDB
+  is derived data and must stay rebuildable from SQLite at any time.
+- The mirror has no in-place schema migrations. A mirror schema or source
+  data-version change bumps `internal/duckdb.SchemaVersion` and forces a full
+  rebuild into a fresh file that is validated and atomically swapped in. Do
+  not add ALTER-style migrations, version-bridging reads, or compatibility
+  shims for old mirror files.
+- All DuckDB push state (cutoff, revisions, scope, machine, versions) lives in
+  the mirror's own `sync_metadata`. Never store DuckDB sync cursors in SQLite;
+  deleting the mirror file must lose nothing.
+- Incremental updates are whole-session replace only, gated by per-session
+  fingerprints. Do not add per-table, per-column, or diff-based incremental
+  sync to the mirror.
+- Quack is read-side only. `duckdb push` writes the local mirror file; there is
+  no remote DuckDB push and none should be added.
+- Never overwrite an existing file that is not positively identified as an
+  agentsview DuckDB mirror; unrecognized destinations fail closed.
+
+## Provider Format Provenance
+
+When adding a provider, changing its format or usage/cost accounting, or
+investigating a provider release, new artifact generation, parser bug, or usage
+discrepancy, consult `docs/internal/session-format-sources.md` and reverify or
+update its evidence entry in the same change. Grok remains temporarily excluded
+only until its separately owned format-alignment work lands.
 
 ## Localization
 
@@ -66,6 +143,11 @@ Instructions for autonomous coding agents working in this repository.
 - Do not revert user-authored or unrelated local changes unless explicitly
   requested.
 - Avoid destructive git commands unless explicitly requested.
+- Never install over a live binary, run migrations against a production
+  database, or write to live data directories without explicit permission.
+  Point branch builds and profiling runs at isolated scratch data.
+- For login or OAuth flows, give the user the exact command to run rather than
+  driving the interactive authentication flow.
 - The SQLite database is a persistent archive. Never delete, drop, truncate, or
   recreate it to handle data version changes. Schema changes use
   non-destructive migrations such as `ALTER TABLE` and `UPDATE`; parser
@@ -117,9 +199,13 @@ CLI (agentsview) -> Config -> DB (SQLite/FTS5)
 - `internal/db/` - SQLite sessions, messages, search, analytics, and schema.
 - `internal/postgres/` - PostgreSQL push sync, read-only store, schema, and
   connection helpers.
+- `internal/duckdb/` - Disposable DuckDB read mirror: probe, rebuild-and-swap,
+  session-replace push, and the Quack read backend (see DuckDB Mirror above).
 - `internal/parser/` - Per-agent session file parsers and content extraction.
 - `internal/server/` - HTTP handlers, SSE, middleware, search, and export.
 - `internal/sync/` - Sync engine, file watcher, discovery, and hashing.
+- `internal/vector/` - Semantic search: embeddings encoder, `vectors.db`
+  mirror/index, build orchestration, and semantic/hybrid search.
 - `internal/timeutil/` - Time parsing utilities.
 - `internal/web/` - Embedded frontend copied from `frontend/dist/` at build
   time.
@@ -128,30 +214,36 @@ CLI (agentsview) -> Config -> DB (SQLite/FTS5)
 
 ## Key Files
 
-| Path                             | Purpose                                       |
-| -------------------------------- | --------------------------------------------- |
-| `cmd/agentsview/main.go`         | CLI entry point, server startup, file watcher |
-| `cmd/agentsview/pg.go`           | `pg` command group: push, status, serve       |
-| `internal/server/server.go`      | HTTP router and handler setup                 |
-| `internal/server/sessions.go`    | Session list/detail API handlers              |
-| `internal/server/search.go`      | Full-text search API                          |
-| `internal/server/events.go`      | SSE event streaming                           |
-| `internal/db/db.go`              | Database open, migrations, schema             |
-| `internal/db/sessions.go`        | Session CRUD queries                          |
-| `internal/db/search.go`          | FTS5 search queries                           |
-| `internal/sync/engine.go`        | Sync orchestration                            |
-| `internal/parser/types.go`       | Agent registry with one `AgentDef` per agent  |
-| `internal/parser/*.go`           | Per-agent session parsers                     |
-| `internal/postgres/connect.go`   | Connection setup, SSL checks, DSN helpers     |
-| `internal/postgres/schema.go`    | PG DDL and schema management                  |
-| `internal/postgres/push.go`      | Push logic and fingerprinting                 |
-| `internal/postgres/sync.go`      | Push sync lifecycle                           |
-| `internal/postgres/store.go`     | PostgreSQL read-only store                    |
-| `internal/postgres/sessions.go`  | PG session queries on the read side           |
-| `internal/postgres/messages.go`  | PG message queries and ILIKE search           |
-| `internal/postgres/analytics.go` | PG analytics queries                          |
-| `internal/postgres/time.go`      | Timestamp conversion helpers                  |
-| `internal/config/config.go`      | Config loading and flag registration          |
+| Path                             | Purpose                                                   |
+| -------------------------------- | --------------------------------------------------------- |
+| `cmd/agentsview/main.go`         | CLI entry point, server startup, file watcher             |
+| `cmd/agentsview/pg.go`           | `pg` command group: push, status, serve                   |
+| `cmd/agentsview/embeddings.go`   | `embeddings` command group: build, list, activate, retire |
+| `internal/server/server.go`      | HTTP router and handler setup                             |
+| `internal/server/sessions.go`    | Session list/detail API handlers                          |
+| `internal/server/search.go`      | Full-text search API                                      |
+| `internal/server/events.go`      | SSE event streaming                                       |
+| `internal/db/db.go`              | Database open, migrations, schema                         |
+| `internal/db/sessions.go`        | Session CRUD queries                                      |
+| `internal/db/search.go`          | FTS5 search queries                                       |
+| `internal/vector/index.go`       | `vectors.db` schema, generations, staleness gate          |
+| `internal/vector/search.go`      | Semantic + hybrid search, RRF merge                       |
+| `internal/sync/engine.go`        | Sync orchestration                                        |
+| `internal/parser/types.go`       | Agent registry with one `AgentDef` per agent              |
+| `internal/parser/*.go`           | Per-agent session parsers                                 |
+| `internal/postgres/connect.go`   | Connection setup, SSL checks, DSN helpers                 |
+| `internal/postgres/schema.go`    | PG DDL and schema management                              |
+| `internal/postgres/push.go`      | Push logic and fingerprinting                             |
+| `internal/postgres/sync.go`      | Push sync lifecycle                                       |
+| `internal/postgres/store.go`     | PostgreSQL read-only store                                |
+| `internal/postgres/sessions.go`  | PG session queries on the read side                       |
+| `internal/postgres/messages.go`  | PG message queries and ILIKE search                       |
+| `internal/postgres/analytics.go` | PG analytics queries                                      |
+| `internal/postgres/time.go`      | Timestamp conversion helpers                              |
+| `internal/duckdb/probe.go`       | Read-only mirror probe and rebuild triggers               |
+| `internal/duckdb/rebuild.go`     | Full rebuild into a temp file, validate, atomic swap      |
+| `internal/duckdb/sync.go`        | Push entry point and session-replace incremental          |
+| `internal/config/config.go`      | Config loading and flag registration                      |
 
 ## Development
 
@@ -252,6 +344,9 @@ GitHub Actions service container in `.github/workflows/ci.yml`.
 
 ## Pull Requests
 
+- Do not poll or watch GitHub Actions checks unless the developer explicitly
+  requests it.
+- Do not use `gh api` to watch CI jobs unless the user explicitly requests it.
 - PR descriptions should be summaries only, with no test plans or checklists. Do
   not add a "Tests", "Testing", "Verification", or "Test plan" section. CI
   runs the tests, so the description must not restate the suite, list test

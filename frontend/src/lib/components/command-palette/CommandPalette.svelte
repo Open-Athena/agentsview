@@ -1,12 +1,16 @@
 <script lang="ts">
   import { m } from "../../i18n/index.js";
-  import { KbdBadge } from "@kenn-io/kit-ui";
+  import {
+    Button,
+    KbdBadge,
+    SegmentedControl,
+    type SegmentedControlOption,
+  } from "@kenn-io/kit-ui";
   import { SearchIcon } from "../../icons.js";
   import { tick, onDestroy, untrack } from "svelte";
   import { ui } from "../../stores/ui.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { searchStore } from "../../stores/search.svelte.js";
-  import { messages } from "../../stores/messages.svelte.js";
   import { router } from "../../stores/router.svelte.js";
   import {
     formatRelativeTime,
@@ -17,11 +21,21 @@
   import { copyToClipboard } from "../../utils/clipboard.js";
   import { stripIdPrefix } from "../../utils/resume.js";
   import { normalizeMessagePreview } from "../../utils/messages.js";
-  import type { Session, SearchResult } from "../../api/types.js";
+  import SemanticSetupHelp from "./SemanticSetupHelp.svelte";
+  import type { Session } from "../../api/types.js";
+  import type {
+    PaletteSearchResult,
+    SearchMode,
+  } from "../../stores/search.svelte.js";
 
   let inputRef: HTMLInputElement | undefined = $state(undefined);
   let selectedIndex: number = $state(0);
   let inputValue: string = $state(searchStore.query ?? "");
+  let searchModeOptions = $derived<SegmentedControlOption[]>([
+    { value: "fulltext", label: m.command_palette_mode_fulltext() },
+    { value: "semantic", label: m.command_palette_mode_semantic() },
+    { value: "hybrid", label: m.command_palette_mode_hybrid() },
+  ]);
 
   // Clear state and reset sort whenever the palette is unmounted, regardless
   // of close path (Escape key, overlay click, command-palette toggle, or any other
@@ -73,6 +87,17 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
+    const interactiveTarget =
+      e.target !== inputRef &&
+      e.target instanceof Element &&
+      e.target.closest(
+        "button, a[href], input, select, textarea, [contenteditable='true'], " +
+          "[role='button'], [role='checkbox'], [role='combobox'], " +
+          // kit-ui-check-ignore: selector list for interactive event targets, not toggle markup
+          "[role='menuitem'], [role='radio'], [role='switch'], [role='tab']",
+      );
+    if (e.key !== "Escape" && interactiveTarget) return;
+
     if (e.key === "ArrowDown") {
       e.preventDefault();
       selectedIndex = Math.min(selectedIndex + 1, totalItems - 1);
@@ -84,7 +109,40 @@
       selectCurrent();
     } else if (e.key === "Escape") {
       e.preventDefault();
+      e.stopPropagation();
       close();
+    }
+  }
+
+  function retryActiveMode(target: EventTarget | null): boolean {
+    const radio = target instanceof Element
+      ? target.closest<HTMLElement>('[role="radio"]')
+      : null;
+    if (
+      radio?.getAttribute("aria-checked") !== "true" ||
+      searchStore.mode === "fulltext" ||
+      searchStore.error === null ||
+      !inputValue.trim()
+    ) {
+      return false;
+    }
+    searchStore.retry();
+    selectedIndex = 0;
+    return true;
+  }
+
+  function handleControlClick(e: MouseEvent) {
+    retryActiveMode(e.target);
+  }
+
+  function handleControlKeydown(e: KeyboardEvent) {
+    if (e.key === "Escape") return;
+    e.stopPropagation();
+    if (
+      (e.key === "Enter" || e.key === " ") &&
+      retryActiveMode(e.target)
+    ) {
+      e.preventDefault();
     }
   }
 
@@ -102,14 +160,18 @@
     }
   }
 
+  // Route-first: commit the URL and let App's deep-link effect own
+  // selection and hydration, exactly as a direct deep link does.
+  // Selecting through the sessions store before the route commits
+  // starts hydration under the old route, where it can be cancelled
+  // or lost (#1190).
   function selectSession(s: Session) {
-    sessions.selectSession(s.id);
     router.navigateToSession(s.id);
     close();
   }
 
-  function selectSearchResult(r: SearchResult) {
-    void sessions.navigateToSession(r.session_id);
+  function selectSearchResult(r: PaletteSearchResult) {
+    router.navigateToSession(r.session_id);
     if (r.ordinal !== -1) {
       ui.scrollToOrdinal(r.ordinal, r.session_id);
     } else {
@@ -117,7 +179,6 @@
       // previously highlighted ordinal is not left active.
       ui.clearScrollState();
     }
-    router.navigateToSession(r.session_id);
     close();
   }
 
@@ -172,8 +233,22 @@
       <KbdBadge keys={["⎋"]} ariaLabel="Escape" />
     </div>
 
-    <div class="palette-results">
-      {#if showSearchResults}
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div
+      class="palette-controls"
+      onclick={handleControlClick}
+      onkeydown={handleControlKeydown}
+    >
+      <SegmentedControl
+        options={searchModeOptions}
+        value={searchStore.mode}
+        onchange={(value) => {
+          searchStore.setMode(value as SearchMode);
+          selectedIndex = 0;
+        }}
+        ariaLabel={m.command_palette_search_mode_label()}
+      />
+      {#if showSearchResults && searchStore.mode === "fulltext"}
         <div class="palette-sort">
           <button
             class="sort-btn"
@@ -188,8 +263,37 @@
             onclick={() => { searchStore.setSort("recency"); selectedIndex = 0; }}
           >{m.command_palette_recency()}</button>
         </div>
+      {/if}
+    </div>
+
+    <div class="palette-results">
+      {#if showSearchResults}
         {#if searchStore.isSearching}
           <div class="palette-empty">{m.command_palette_searching()}</div>
+        {:else if searchStore.error?.kind === "semantic-unavailable"}
+          <SemanticSetupHelp
+            onResolved={() => searchStore.retry()}
+            searchDetail={searchStore.error.detail}
+          />
+        {:else if searchStore.error}
+          <div class="palette-error" role="alert">
+            {#if searchStore.error.kind === "timeout"}
+              <strong>{m.command_palette_search_timeout_title()}</strong>
+              <span>{m.command_palette_search_timeout_detail()}</span>
+              <div class="palette-error-action">
+                <Button
+                  size="sm"
+                  tone="info"
+                  surface="soft"
+                  label={m.shared_retry()}
+                  onclick={() => searchStore.retry()}
+                />
+              </div>
+            {:else}
+              <strong>{m.command_palette_search_error()}</strong>
+              <span>{searchStore.error.detail ?? m.command_palette_search_failed()}</span>
+            {/if}
+          </div>
         {:else if searchStore.results.length === 0}
           <div class="palette-empty">{m.command_palette_no_results()}</div>
         {:else}
@@ -210,12 +314,16 @@
                 {/if}
                 {#if result.snippet && result.snippet.replace(/<\/?mark>/g, '') !== result.name}
                   <span class="item-snippet">
-                    {@html sanitizeSnippet(result.snippet)}
+                    {#if result.snippetFormat === "plain-text"}
+                      {result.snippet}
+                    {:else}
+                      {@html sanitizeSnippet(result.snippet)}
+                    {/if}
                   </span>
                 {/if}
               </span>
               <span class="item-meta">
-                {truncate(result.project, 20)}{result.session_ended_at ? ' · ' + formatRelativeTime(result.session_ended_at) : ''}
+                {truncate(result.project, 20)}{result.timestamp ? ' · ' + formatRelativeTime(result.timestamp) : ''}
               </span>
               <!-- svelte-ignore a11y_click_events_have_key_events -->
               <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -312,6 +420,15 @@
     padding: 4px 0;
   }
 
+  .palette-controls {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px 14px;
+    border-bottom: 1px solid var(--border-default);
+  }
+
   .palette-section-label {
     padding: 6px 14px 4px;
     font-size: 10px;
@@ -383,10 +500,30 @@
     font-size: 13px;
   }
 
+  .palette-error {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 16px;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 13px;
+  }
+
+  .palette-error strong {
+    color: var(--text-primary);
+  }
+
+  .palette-error-action {
+    display: flex;
+    justify-content: center;
+    margin-top: 8px;
+  }
+
   .palette-sort {
     display: flex;
     gap: 4px;
-    padding: 6px 14px 2px;
+    margin-left: auto;
   }
 
   .sort-btn {

@@ -6,6 +6,7 @@ import { m } from "../../i18n/index.js";
 import { router } from "../../stores/router.svelte.js";
 import type { Report } from "../../api/types.js";
 import type { ActivitySessionRow } from "../../api/generated/index";
+import { testMoney } from "../../test/money.js";
 
 function makeRow(
   overrides: Partial<ActivitySessionRow> = {},
@@ -14,11 +15,12 @@ function makeRow(
     session_id: "sess",
     title: "Session",
     project: "proj",
+	project_key: "pl1:sha256:proj",
     agent: "claude",
     primary_model: "opus",
     models: ["opus"],
     agent_minutes: 10,
-    cost: 1,
+    cost: testMoney(1),
     output_tokens: 0,
     first_active: "2026-06-16T08:00:00Z",
     last_active: "2026-06-16T09:00:00Z",
@@ -40,7 +42,7 @@ function makeReport(rows: ActivitySessionRow[]): Report {
       distinct_projects: 0,
       distinct_models: 0,
       output_tokens: 0,
-      cost: 0,
+      cost: testMoney(0),
     },
     partial: false,
     as_of: null,
@@ -70,19 +72,19 @@ function fixtureRows(): ActivitySessionRow[] {
       session_id: "low-min",
       title: "Low minutes high cost",
       agent_minutes: 5,
-      cost: 9,
+      cost: testMoney(9),
     }),
     makeRow({
       session_id: "high-min",
       title: "High minutes low cost",
       agent_minutes: 40,
-      cost: 1,
+      cost: testMoney(1),
     }),
     makeRow({
       session_id: "untimed",
       title: "Untimed",
       agent_minutes: null,
-      cost: 4,
+      cost: testMoney(4),
       first_active: null,
       last_active: null,
     }),

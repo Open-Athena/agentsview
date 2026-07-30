@@ -99,9 +99,20 @@ func (s *Server) humaScanSecrets(
 			stream.SendJSON("progress", p)
 		})
 		if err != nil {
+			// The scan commits per-session results as it walks, so a
+			// failure or cancellation partway through has already
+			// changed eligibility for everything it scanned.
+			if summary != nil && summary.Scanned > 0 {
+				s.notifySessionMutation()
+			}
 			stream.SendJSON("error", map[string]string{"error": err.Error()})
 			return
 		}
+		// A completed scan changes extraction eligibility in both
+		// directions — new findings retract generated entries, fresh
+		// clean stamps make sessions extractable — and no sync activity
+		// follows a delegated scan to surface either.
+		s.notifySessionMutation()
 		stream.SendJSON("summary", summary)
 	}}, nil
 }

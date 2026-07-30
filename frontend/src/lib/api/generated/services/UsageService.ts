@@ -15,7 +15,7 @@ export class UsageService {
    * @throws ApiError
    */
   public static getApiV1UsageComparison({
-    currentCost,
+    currentMicrodollars,
     from,
     to,
     timezone,
@@ -24,6 +24,7 @@ export class UsageService {
     machine,
     gitBranch,
     excludeProject,
+    excludeProjectKey,
     excludeAgent,
     excludeModel,
     model,
@@ -37,9 +38,9 @@ export class UsageService {
     sessionCounts = true,
   }: {
     /**
-     * Current period total cost
+     * Current period total cost in microdollars
      */
-    currentCost: number,
+    currentMicrodollars: number,
     /**
      * Range start date
      */
@@ -72,6 +73,10 @@ export class UsageService {
      * Exclude a project
      */
     excludeProject?: string,
+    /**
+     * Exclude an opaque project key
+     */
+    excludeProjectKey?: string,
     /**
      * Exclude an agent
      */
@@ -129,6 +134,7 @@ export class UsageService {
         'machine': machine,
         'git_branch': gitBranch,
         'exclude_project': excludeProject,
+        'exclude_project_key': excludeProjectKey,
         'exclude_agent': excludeAgent,
         'exclude_model': excludeModel,
         'model': model,
@@ -140,7 +146,7 @@ export class UsageService {
         'no_default_range': noDefaultRange,
         'breakdowns': breakdowns,
         'session_counts': sessionCounts,
-        'current_cost': currentCost,
+        'current_microdollars': currentMicrodollars,
       },
       errors: {
         400: `Bad Request`,
@@ -175,6 +181,7 @@ export class UsageService {
     machine,
     gitBranch,
     excludeProject,
+    excludeProjectKey,
     excludeAgent,
     excludeModel,
     model,
@@ -192,7 +199,7 @@ export class UsageService {
      */
     leftDimension: string,
     /**
-     * Left-side comparison value
+     * Left-side comparison value; opaque project key for the project dimension
      */
     leftValue: string,
     /**
@@ -200,7 +207,7 @@ export class UsageService {
      */
     rightDimension: string,
     /**
-     * Right-side comparison value
+     * Right-side comparison value; opaque project key for the project dimension
      */
     rightValue: string,
     /**
@@ -235,6 +242,10 @@ export class UsageService {
      * Exclude a project
      */
     excludeProject?: string,
+    /**
+     * Exclude an opaque project key
+     */
+    excludeProjectKey?: string,
     /**
      * Exclude an agent
      */
@@ -292,6 +303,7 @@ export class UsageService {
         'machine': machine,
         'git_branch': gitBranch,
         'exclude_project': excludeProject,
+        'exclude_project_key': excludeProjectKey,
         'exclude_agent': excludeAgent,
         'exclude_model': excludeModel,
         'model': model,
@@ -337,6 +349,7 @@ export class UsageService {
     machine,
     gitBranch,
     excludeProject,
+    excludeProjectKey,
     excludeAgent,
     excludeModel,
     model,
@@ -381,6 +394,10 @@ export class UsageService {
      * Exclude a project
      */
     excludeProject?: string,
+    /**
+     * Exclude an opaque project key
+     */
+    excludeProjectKey?: string,
     /**
      * Exclude an agent
      */
@@ -438,6 +455,7 @@ export class UsageService {
         'machine': machine,
         'git_branch': gitBranch,
         'exclude_project': excludeProject,
+        'exclude_project_key': excludeProjectKey,
         'exclude_agent': excludeAgent,
         'exclude_model': excludeModel,
         'model': model,
@@ -479,6 +497,7 @@ export class UsageService {
     machine,
     gitBranch,
     excludeProject,
+    excludeProjectKey,
     excludeAgent,
     excludeModel,
     model,
@@ -524,6 +543,10 @@ export class UsageService {
      * Exclude a project
      */
     excludeProject?: string,
+    /**
+     * Exclude an opaque project key
+     */
+    excludeProjectKey?: string,
     /**
      * Exclude an agent
      */
@@ -585,6 +608,7 @@ export class UsageService {
         'machine': machine,
         'git_branch': gitBranch,
         'exclude_project': excludeProject,
+        'exclude_project_key': excludeProjectKey,
         'exclude_agent': excludeAgent,
         'exclude_model': excludeModel,
         'model': model,

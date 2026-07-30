@@ -6,7 +6,7 @@ import {
   beforeEach,
 } from "vite-plus/test";
 import { insights } from "./insights.svelte.js";
-import type { Insight } from "../api/types.js";
+import type { Insight, Session } from "../api/types.js";
 
 const api = vi.hoisted(() => {
   class MockApiError extends Error {
@@ -28,13 +28,20 @@ const api = vi.hoisted(() => {
 
 const ApiError = api.ApiError;
 
+const runtimeMocks = vi.hoisted(() => ({
+  callGenerated: vi.fn(
+    (request: () => Promise<unknown>, _signal?: AbortSignal) => request(),
+  ),
+}));
+
 vi.mock("../api/client.js", () => ({
   generateInsight: api.generateInsight,
 }));
 
 vi.mock("../api/runtime.js", () => ({
   configureGeneratedClient: vi.fn(),
-  callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
+  callGenerated: runtimeMocks.callGenerated,
+  isAbortError: vi.fn(() => false),
 }));
 
 vi.mock("../api/generated/index", () => ({
@@ -63,6 +70,25 @@ function makeInsight(
   };
 }
 
+function makeSession(overrides: Partial<Session> = {}): Session {
+  return {
+    id: "run:session-1",
+    project: "proj-a",
+    machine: "local",
+    agent: "claude",
+    first_message: "hello",
+    started_at: "2026-07-05T14:30:00Z",
+    ended_at: "2026-07-05T14:45:00Z",
+    message_count: 2,
+    user_message_count: 1,
+    total_output_tokens: 0,
+    peak_context_tokens: 0,
+    is_automated: false,
+    created_at: "2026-07-05T14:30:00Z",
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   insights.items = [];
@@ -79,9 +105,48 @@ beforeEach(() => {
   insights.setAutomatedScope("human");
   insights.setSessionFilters(undefined);
   insights.promptText = "";
+  runtimeMocks.callGenerated.mockReset();
+  runtimeMocks.callGenerated.mockImplementation(
+    (request: () => Promise<unknown>, _signal?: AbortSignal) => request(),
+  );
 });
 
 describe("load", () => {
+  it("aborts an obsolete list read without aborting generation", async () => {
+    const signals: AbortSignal[] = [];
+    runtimeMocks.callGenerated.mockImplementation((request, signal) => {
+      signals.push(signal as AbortSignal);
+      return request();
+    });
+    vi.mocked(api.listInsights)
+      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockResolvedValueOnce({ insights: [] });
+
+    void insights.load();
+    await Promise.resolve();
+    await insights.load();
+
+    expect(signals[0]?.aborted).toBe(true);
+    expect(api.generateInsight).not.toHaveBeenCalled();
+  });
+
+  it("aborts the list read on page teardown", async () => {
+    const signals: AbortSignal[] = [];
+    runtimeMocks.callGenerated.mockImplementation((request, signal) => {
+      signals.push(signal as AbortSignal);
+      return request();
+    });
+    vi.mocked(api.listInsights).mockImplementationOnce(
+      () => new Promise(() => {}),
+    );
+
+    void insights.load();
+    await Promise.resolve();
+    insights.cancelInFlightReads();
+
+    expect(signals[0]?.aborted).toBe(true);
+  });
+
   it("fetches insights and updates state", async () => {
     const s1 = makeInsight({ id: 1 });
     const s2 = makeInsight({ id: 2, project: "my-app" });
@@ -338,6 +403,28 @@ describe("generate (multi-task)", () => {
       expect.any(Function),
       expect.any(Function),
     );
+  });
+
+  it("generates agent analysis for a single session", () => {
+    vi.mocked(api.generateInsight).mockReturnValueOnce({
+      abort: vi.fn(),
+      done: Promise.resolve(makeInsight({ id: 32 })),
+    });
+
+    insights.generateForSession(makeSession());
+
+    expect(api.generateInsight).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "agent_analysis",
+        date_from: "2026-07-05",
+        date_to: "2026-07-05",
+        project: "proj-a",
+        session_id: "run:session-1",
+      }),
+      expect.any(Function),
+      expect.any(Function),
+    );
+    expect(insights.selectedTaskId).toBe(insights.tasks[0]?.clientId);
   });
 
   it("sends dashboard session filters for canned recommendations", async () => {

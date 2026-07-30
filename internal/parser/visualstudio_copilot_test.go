@@ -493,6 +493,14 @@ func TestResolveSourceFilePath(t *testing.T) {
 			VisualStudioCopilotVirtualPath(sessionPath, conversationID),
 		),
 		"VS 2026 session virtual path should resolve to its physical session file")
+	assert.Equal(t, "/profile/User/workspaceStorage/hash/state.vscdb",
+		ResolveSourceFilePath(
+			"/profile/User/workspaceStorage/hash/state.vscdb#windsurf-session",
+		),
+		"Windsurf virtual path should resolve to its physical workspace DB")
+	assert.Equal(t, "/logs/session#draft.jsonl",
+		ResolveSourceFilePath("/logs/session#draft.jsonl"),
+		"non-Windsurf paths containing # should be returned unchanged")
 	assert.Equal(t, "/logs/session.jsonl",
 		ResolveSourceFilePath("/logs/session.jsonl"),
 		"a plain source path should be returned unchanged")
@@ -1910,4 +1918,35 @@ func mustJSON(t *testing.T, value any) []byte {
 	data, err := json.Marshal(value)
 	require.NoError(t, err)
 	return data
+}
+
+// Every trace file in a discovery pass shares one directory, so the
+// composite sibling fingerprint must be computed once per pass — not
+// re-enumerated per trace file, which is quadratic in rotated-trace
+// count. The memo proves reuse by ignoring filesystem changes after
+// the first computation.
+func TestVSCopilotRootCompositeComputesOnce(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	first := filepath.Join(dir, "a_VSGitHubCopilot_traces.jsonl")
+	second := filepath.Join(dir, "b_VSGitHubCopilot_traces.jsonl")
+	require.NoError(t, os.WriteFile(first, []byte("one"), 0o644))
+	require.NoError(t, os.WriteFile(second, []byte("two"), 0o644))
+
+	var composite vsCopilotRootComposite
+	size, mtime, err := composite.fingerprint(first)
+	require.NoError(t, err)
+	assert.Equal(t, int64(len("one")+len("two")), size)
+
+	// A sibling appearing mid-pass must not change the memoized value.
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "c_VSGitHubCopilot_traces.jsonl"),
+		[]byte("three"), 0o644,
+	))
+	sizeAgain, mtimeAgain, err := composite.fingerprint(second)
+	require.NoError(t, err)
+	assert.Equal(t, size, sizeAgain,
+		"second lookup must reuse the per-pass composite, not re-enumerate")
+	assert.Equal(t, mtime, mtimeAgain)
 }

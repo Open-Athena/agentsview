@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
@@ -18,6 +19,7 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/pricing"
 )
 
@@ -48,7 +50,7 @@ func TestExportSessionsJSONEmitsOneDocument(t *testing.T) {
 	assert.Empty(t, stderr)
 
 	doc := decodeExportSessionsDocument(t, stdout)
-	assert.Equal(t, 1, doc.SchemaVersion)
+	assert.Equal(t, export.SessionSummarySchemaVersion, doc.SchemaVersion)
 	assert.NotEmpty(t, doc.DatabaseID)
 	assert.NotNil(t, doc.Pricing)
 	assert.NotNil(t, doc.Projects)
@@ -68,7 +70,7 @@ func TestExportSessionsJSONAliasEmitsOneDocument(t *testing.T) {
 	assert.Empty(t, stderr)
 
 	doc := decodeExportSessionsDocument(t, stdout)
-	assert.Equal(t, 1, doc.SchemaVersion)
+	assert.Equal(t, export.SessionSummarySchemaVersion, doc.SchemaVersion)
 	assert.Len(t, doc.Sessions, 2)
 	assert.Empty(t, strings.TrimSpace(decoderRemainder(t, stdout)),
 		"--json must emit exactly one JSON document")
@@ -114,7 +116,7 @@ func TestExportSessionsNDJSONEmitsMetaThenRows(t *testing.T) {
 	require.Len(t, lines, 3)
 	meta := decodeExportSessionsDocument(t, lines[0])
 	assert.Equal(t, "meta", meta.Type)
-	assert.Equal(t, 1, meta.SchemaVersion)
+	assert.Equal(t, export.SessionSummarySchemaVersion, meta.SchemaVersion)
 	assert.NotEmpty(t, meta.DatabaseID)
 	assert.NotNil(t, meta.Pricing)
 	assert.NotNil(t, meta.Projects)
@@ -165,9 +167,92 @@ func TestExportSessionsAllJSONMergesPricingAcrossPages(t *testing.T) {
 	assert.Empty(t, doc.Cursor.Next)
 }
 
-func TestMergeExportSessionsPricingTreatsNoModelPagesAsNeutral(t *testing.T) {
+func TestExportSessionsAllJSONPreservesCostOnlyReportedPricingAcrossPages(
+	t *testing.T,
+) {
+	dataDir := testDataDir(t)
+	database := dbtest.OpenTestDBAt(t, filepath.Join(dataDir, "sessions.db"))
+	require.NoError(t, database.SetDatabaseIDForTest(
+		context.Background(), "cost-only-reported-export-db"))
+	require.NoError(t, database.UpsertModelPricing([]db.ModelPricing{{
+		ModelPattern: "computed-model", InputPerMTok: money.MustParseDollars("1"),
+	}}))
+	insertExportSessionsTestSession(t, database, db.Session{
+		ID: "computed", Project: "alpha", Machine: "local", Agent: "codex",
+		StartedAt:    dbtest.Ptr("2026-06-16T11:00:00Z"),
+		EndedAt:      dbtest.Ptr("2026-06-16T11:10:00Z"),
+		MessageCount: 2, UserMessageCount: 2,
+	})
+	require.NoError(t, database.InsertMessages([]db.Message{{
+		SessionID: "computed", Ordinal: 0, Role: "assistant",
+		Timestamp: "2026-06-16T11:05:00Z", Model: "computed-model",
+		TokenUsage: json.RawMessage(`{"input_tokens":1000000}`),
+	}}))
+	insertExportSessionsTestSession(t, database, db.Session{
+		ID: "cost-only-reported", Project: "alpha", Machine: "local",
+		Agent: "copilot", StartedAt: dbtest.Ptr("2026-06-16T10:00:00Z"),
+		EndedAt:      dbtest.Ptr("2026-06-16T10:10:00Z"),
+		MessageCount: 2, UserMessageCount: 2,
+	})
+	reportedCost := money.MustParseDollars("0.03")
+	require.NoError(t, database.ReplaceSessionUsageEvents(
+		"cost-only-reported", []db.UsageEvent{{
+			Source: "shutdown", Model: "copilot-cost-only",
+			Cost: &reportedCost, CostStatus: "exact",
+			CostSource: db.CopilotReportedCostSource,
+			OccurredAt: "2026-06-16T10:10:00Z", DedupKey: "final",
+		}},
+	))
+	require.NoError(t, database.Close())
+
+	stdout, stderr, err := executeExportSessionsCommand(
+		newRootCommand(), "export", "sessions", "--all", "--format", "json",
+		"--limit", "1",
+	)
+	require.NoError(t, err, "export all sessions")
+	assert.Empty(t, stderr)
+
+	doc := decodeExportSessionsDocument(t, stdout)
+	require.Len(t, doc.Sessions, 2)
+	assert.Equal(t, string(export.CostSourceMixed), doc.Pricing["cost_source"])
+	require.NotNil(t, doc.Sessions[1].ModelUsage)
+	assert.Equal(t, "cost-only-reported", doc.Sessions[1].ID)
+	assert.Equal(t, reportedCost, doc.Sessions[1].ModelUsage.Cost)
+}
+
+func TestBuildExportSessionsOutputMarksCrossPageProjectConflictAmbiguous(t *testing.T) {
+	const projectKey = "pl1:sha256:project"
+	page := func(identityKey string) db.SessionExportResult {
+		return db.SessionExportResult{Projects: map[string]export.ProjectMapEntry{
+			projectKey: {
+				ProjectKey: projectKey,
+				Resolution: export.ProjectResolutionResolved,
+				Identity: &export.ProjectIdentity{
+					Key: identityKey, Kind: export.ProjectKindGitRemote,
+				},
+			},
+		}}
+	}
+
+	got := buildExportSessionsOutput("database", []db.SessionExportResult{
+		page("p1:sha256:first"), page("p1:sha256:second"),
+	})
+
+	require.Contains(t, got.Projects, projectKey)
+	assert.Equal(t, export.ProjectResolutionAmbiguous,
+		got.Projects[projectKey].Resolution)
+	assert.Nil(t, got.Projects[projectKey].Identity)
+}
+
+func TestMergeExportSessionsPricingTreatsOnlyComputedNoModelPagesAsNeutral(
+	t *testing.T,
+) {
 	noModels := &export.PricingBlock{
 		CostSource: export.CostSourceComputed,
+		Models:     map[string]export.EffectiveModelRate{},
+	}
+	mixedNoModels := &export.PricingBlock{
+		CostSource: export.CostSourceMixed,
 		Models:     map[string]export.EffectiveModelRate{},
 	}
 	reported := &export.PricingBlock{
@@ -187,6 +272,12 @@ func TestMergeExportSessionsPricingTreatsNoModelPagesAsNeutral(t *testing.T) {
 
 	got = mergeExportSessionsPricing(noModels, noModels)
 	assert.Equal(t, export.CostSourceComputed, got.CostSource)
+
+	got = mergeExportSessionsPricing(noModels, mixedNoModels)
+	assert.Equal(t, export.CostSourceMixed, got.CostSource)
+
+	got = mergeExportSessionsPricing(mixedNoModels, noModels)
+	assert.Equal(t, export.CostSourceMixed, got.CostSource)
 }
 
 func TestExportSessionsAllNDJSONCursorNextEmpty(t *testing.T) {
@@ -385,6 +476,102 @@ func TestExportSessionsRequiresExistingDatabaseID(t *testing.T) {
 	require.ErrorIs(t, idErr, db.ErrDatabaseIDMissing)
 }
 
+func TestExportSessionsUpgradeRequiresBackgroundEvidenceBackfill(t *testing.T) {
+	dataDir := testDataDir(t)
+	dbPath := filepath.Join(dataDir, "sessions.db")
+	database := dbtest.OpenTestDBAt(t, dbPath)
+	insertExportSessionsTestSession(t, database, db.Session{
+		ID: "legacy", Project: "agentsview", Machine: "local",
+		Agent: "codex", Cwd: "/work/agentsview", MessageCount: 2,
+		UserMessageCount: 1,
+	})
+	require.NoError(t, database.Close())
+	raw, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = raw.Exec(`DROP TABLE session_project_identity_snapshots`)
+	require.NoError(t, err)
+	require.NoError(t, raw.Close())
+
+	stdout, stderr, err := executeExportSessionsCommand(
+		newRootCommand(), "export", "status",
+	)
+	require.NoError(t, err)
+	assert.Empty(t, stderr)
+	assert.Equal(t, "project identity evidence: pending (0/1)\n", stdout)
+
+	stdout, stderr, err = executeExportSessionsCommand(
+		newRootCommand(), "export", "sessions", "--format", "json",
+	)
+	require.Error(t, err)
+	assert.Empty(t, stderr)
+	assert.Empty(t, stdout)
+	assert.Contains(t, err.Error(), "project identity evidence backfill is pending")
+	assert.Contains(t, err.Error(), "agentsview export status")
+
+	raw, err = sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	defer raw.Close()
+	var exists int
+	require.NoError(t, raw.QueryRow(`
+		SELECT COUNT(*) FROM sqlite_master
+		WHERE type = 'table' AND name = 'session_project_identity_snapshots'
+	`).Scan(&exists))
+	assert.Equal(t, 1, exists)
+	var state string
+	require.NoError(t, raw.QueryRow(`
+		SELECT state FROM background_migrations
+		WHERE name = 'session_project_identity_snapshots_v1'
+	`).Scan(&state))
+	assert.Equal(t, "pending", state)
+}
+
+func TestExportStatusReportsBackfillFailure(t *testing.T) {
+	dataDir := testDataDir(t)
+	dbPath := filepath.Join(dataDir, "sessions.db")
+	database := dbtest.OpenTestDBAt(t, dbPath)
+	raw, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = raw.Exec(`
+		INSERT INTO background_migrations (
+			name, state, total_items, completed_items, last_error
+		) VALUES (
+			'session_project_identity_snapshots_v1', 'failed', 3, 1,
+			'git metadata unavailable'
+		)
+	`)
+	require.NoError(t, err)
+	require.NoError(t, raw.Close())
+	require.NoError(t, database.Close())
+
+	stdout, stderr, err := executeExportSessionsCommand(
+		newRootCommand(), "export", "status",
+	)
+	require.NoError(t, err)
+	assert.Empty(t, stderr)
+	assert.Equal(t,
+		"project identity evidence: failed (1/3)\n"+
+			"last error: git metadata unavailable\n",
+		stdout)
+}
+
+func TestExportSessionsDoesNotUpgradeUnrelatedReadOnlyOpenFailure(t *testing.T) {
+	dataDir := testDataDir(t)
+	dbPath := filepath.Join(dataDir, "sessions.db")
+	require.NoError(t, os.WriteFile(dbPath, nil, 0o600))
+
+	stdout, stderr, err := executeExportSessionsCommand(
+		newRootCommand(), "export", "sessions", "--format", "json",
+	)
+	require.Error(t, err)
+	assert.Empty(t, stdout)
+	assert.Empty(t, stderr)
+
+	info, statErr := os.Stat(dbPath)
+	require.NoError(t, statErr)
+	assert.Zero(t, info.Size(),
+		"a non-schema read failure must not initialize or rebuild the archive")
+}
+
 func removeArchiveDatabaseIDForTest(t *testing.T, dbPath string) {
 	t.Helper()
 	raw, err := sql.Open("sqlite3", dbPath)
@@ -475,8 +662,12 @@ func TestExportSessionsJSONGolden(t *testing.T) {
 	)
 	require.NoError(t, err, "export sessions json golden")
 	require.Empty(t, stderr)
+	assert.NotContains(t, stdout, "/fixtures/")
+	assert.NotContains(t, stdout, `"cwd"`)
+	assert.NotContains(t, stdout, `"machine":"golden-host"`)
+	assert.NotContains(t, stdout, `"root_path":"/`)
 
-	assertGoldenBytes(t, "session_export_v1.json", []byte(stdout))
+	assertGoldenBytes(t, "session_export_v3.json", []byte(stdout))
 }
 
 func TestExportSessionsNDJSONGolden(t *testing.T) {
@@ -491,7 +682,7 @@ func TestExportSessionsNDJSONGolden(t *testing.T) {
 	require.NoError(t, err, "export sessions ndjson golden")
 	require.Empty(t, stderr)
 
-	assertGoldenBytes(t, "session_export_v1.ndjson", []byte(stdout))
+	assertGoldenBytes(t, "session_export_v3.ndjson", []byte(stdout))
 }
 
 func firstExportSessionsCursor(t *testing.T) string {
@@ -555,7 +746,7 @@ func TestExportSessionsFallbackPricingOnUnseededArchive(t *testing.T) {
 	require.NotNil(t, usage, "model usage")
 	assert.True(t, usage.HasCost,
 		"fallback-priced model %s should have cost", model)
-	assert.Greater(t, usage.CostUSD, 0.0, "fallback-priced cost")
+	assert.Positive(t, usage.Cost.Microdollars, "fallback-priced cost")
 
 	fallback, ok := doc.Pricing["fallback"].(map[string]any)
 	require.True(t, ok, "pricing fallback block")
@@ -573,7 +764,7 @@ func exactFallbackPricedModel(t *testing.T) string {
 		if strings.ContainsAny(p.ModelPattern, "*/_") {
 			continue
 		}
-		if p.InputPerMTok > 0 && p.OutputPerMTok > 0 {
+		if p.InputPerMTok.Microdollars > 0 && p.OutputPerMTok.Microdollars > 0 {
 			return p.ModelPattern
 		}
 	}
@@ -633,6 +824,12 @@ func insertExportSessionsTestSession(
 	t.Helper()
 	require.NoError(t, database.UpsertSession(session),
 		"upsert session %s", session.ID)
+	require.NoError(t, database.UpsertProjectIdentityObservation(
+		context.Background(), export.ProjectIdentityObservation{
+			SessionID: session.ID, Project: session.Project,
+			Machine: session.Machine, RootPath: session.Cwd,
+			GitBranch: session.GitBranch, ObservedAt: time.Now().UTC(),
+		}), "upsert session project identity %s", session.ID)
 }
 
 func decodeExportSessionsDocument(

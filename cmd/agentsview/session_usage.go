@@ -16,6 +16,8 @@ import (
 	"github.com/spf13/cobra"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/service"
 )
@@ -144,8 +146,11 @@ func httpSessionUsageData(
 		}
 		return nil, tokenUseExitErr, err
 	}
+	// Request the full breakdown so the remote path matches the
+	// shape returned by the direct store paths.
 	endpoint := strings.TrimSuffix(baseURL, "/") +
-		"/api/v1/sessions/" + url.PathEscape(resolvedID) + "/usage"
+		"/api/v1/sessions/" + url.PathEscape(resolvedID) +
+		"/usage?breakdown=true"
 	req, err := http.NewRequestWithContext(
 		ctx, http.MethodGet, endpoint, nil,
 	)
@@ -217,7 +222,7 @@ func storeSessionUsageData(
 		return nil, tokenUseExitNotFound, nil
 	}
 
-	u, err := store.GetSessionUsage(ctx, resolvedID)
+	u, err := store.GetSessionUsage(ctx, resolvedID, true)
 	if err != nil {
 		return nil, tokenUseExitErr,
 			fmt.Errorf("querying %s session usage: %w", storeName, err)
@@ -282,8 +287,16 @@ func renderSessionUsageHuman(w io.Writer, out *sessionUsageOutput) error {
 	fmt.Fprintf(w, "%s %d\n", label("Peak ctx"), out.PeakContextTokens)
 	if out.HasCost {
 		models := strings.Join(out.Models, ", ")
-		fmt.Fprintf(w, "%s ~$%.2f (%s)\n", label("Cost"),
-			out.CostUSD, sanitizeTerminal(models))
+		prefix := "~"
+		if out.CostSource == export.CostSourceReported {
+			prefix = ""
+		}
+		suffix := ""
+		if models != "" {
+			suffix = " (" + sanitizeTerminal(models) + ")"
+		}
+		fmt.Fprintf(w, "%s %s%s%s\n", label("Cost"), prefix,
+			money.FormatUSD(out.Cost, money.DisplayCents), suffix)
 	} else if len(out.UnpricedModels) > 0 {
 		fmt.Fprintf(w, "%s n/a (unpriced: %s)\n", label("Cost"),
 			sanitizeTerminal(strings.Join(out.UnpricedModels, ", ")))

@@ -131,6 +131,29 @@
   "status_bar_synced_ago": "已同步 {time}",
   "status_bar_build": "Build: {commit}",
   "command_palette_placeholder": "搜索会话和消息...",
+  "command_palette_search_mode_label": "搜索模式",
+  "command_palette_mode_fulltext": "全文",
+  "command_palette_mode_semantic": "语义",
+  "command_palette_mode_hybrid": "混合",
+  "command_palette_search_error": "搜索不可用",
+  "command_palette_search_failed": "搜索失败。请重试。",
+  "command_palette_semantic_setup_title": "语义搜索尚未设置",
+  "command_palette_semantic_setup_config_step": "1. 在 config.toml 中添加 [vector] 部分，并根据你的嵌入服务器调整模型和端点（任何兼容 OpenAI 的端点均可，例如 Ollama）：",
+  "command_palette_semantic_setup_build_step": "2. 重启守护进程，然后构建索引：",
+  "command_palette_semantic_copy_config": "复制配置片段",
+  "command_palette_semantic_copy_command": "复制命令",
+  "command_palette_semantic_copied": "已复制！",
+  "command_palette_semantic_disabled_title": "语义搜索已禁用",
+  "command_palette_semantic_ready_title": "语义索引尚未构建",
+  "command_palette_semantic_ready_intro": "语义搜索已配置，但尚未为此归档构建嵌入索引。",
+  "command_palette_semantic_build_button": "构建嵌入",
+  "command_palette_semantic_build_hint": "构建在服务器后台运行；完成后将自动重新执行此搜索。",
+  "command_palette_semantic_building_title": "正在构建嵌入索引...",
+  "command_palette_semantic_building_scanning": "正在扫描归档...",
+  "command_palette_semantic_building_progress": "已嵌入 {percentLabel}",
+  "command_palette_semantic_failed_title": "嵌入构建失败",
+  "command_palette_search_timeout_title": "搜索耗时过长",
+  "command_palette_search_timeout_detail": "请重试。嵌入模型预热时，首次语义或混合搜索可能会更慢。",
   "command_palette_relevance": "相关性",
   "command_palette_recency": "最近",
   "command_palette_searching": "正在搜索...",
@@ -153,6 +176,38 @@
   "session_breadcrumb_copy_session_id_value": "复制会话 ID：{id}",
   "session_breadcrumb_copied": "已复制！",
   "session_breadcrumb_estimated_session_cost": "预估会话成本",
+  "session_breadcrumb_total_cost": "总计",
+  "session_breadcrumb_total_cost_title": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "包含 {countLabel} 个子代理的总成本",
+        "countPlural=other": "包含 {countLabel} 个子代理的总成本"
+      }
+    }
+  ],
+  "session_breadcrumb_usage_breakdown_title": "会话用量明细",
+  "session_breadcrumb_usage_breakdown_loading": "正在加载用量数据...",
+  "session_breadcrumb_usage_breakdown_steps": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countLabel} 个步骤"
+      }
+    }
+  ],
   "session_breadcrumb_copy_link_to_session": "复制会话链接",
   "session_breadcrumb_show_session_analysis": "显示会话分析",
   "session_breadcrumb_hide_session_analysis": "隐藏会话分析",
@@ -168,6 +223,8 @@
   "session_breadcrumb_path_copied": "路径已复制！",
   "session_breadcrumb_opened_in": "已在 {target} 中打开",
   "session_breadcrumb_failed_to_open": "打开失败",
+  "session_breadcrumb_open_in_codex_desktop": "在 Codex Desktop 中打开",
+  "session_breadcrumb_open_in_claude_code": "在 Claude Code 中打开",
   "session_breadcrumb_summary_mode": "摘要模式",
   "session_breadcrumb_summary_mode_tooltip": "此 transcript 缺少工具结果、思考内容和代码差异。需要 agy-reader sidecar 才能获得完整保真度 — 请安装它，若已安装，请等待其同步完成。点击了解如何操作。",
   "session_breadcrumb_malformed_lines": [
@@ -213,6 +270,10 @@
   "session_find_close": "关闭查找栏",
   "message_list_empty": "选择一个会话查看消息",
   "message_list_loading": "正在加载消息...",
+  "read_progress_boundary": "阅读进度边界",
+  "read_progress_new_messages": "新消息",
+  "read_progress_earlier_messages": "较早消息",
+  "read_progress_unread_messages": "未读消息",
   "code_block_copy_code_block": "复制代码块",
   "code_block_copied_code_block": "代码块已复制",
   "code_block_copy_code": "复制代码",
@@ -544,6 +605,21 @@
   ],
   "analytics_tool_usage_trend_tooltip": "{date} | 总计 {total} | {parts}",
   "analytics_tool_usage_empty": "无 tool 使用数据",
+  "analytics_tool_usage_loading": "正在加载 tool 使用数据...",
+  "analytics_tool_usage_top_tools": "热门 Tool",
+  "analytics_tool_usage_sessions": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countLabel} 个会话"
+      }
+    }
+  ],
   "analytics_by_category": "按类别",
   "analytics_by_agent": "按 Agent",
   "analytics_by_project": "按项目",
@@ -597,6 +673,7 @@
   "analytics_granularity_day": "日",
   "analytics_granularity_week": "周",
   "analytics_granularity_month": "月",
+  "analytics_granularity_label": "时间粒度",
   "analytics_activity_empty": "无活动数据",
   "analytics_activity_title": "活动",
   "analytics_heatmap_showing_recent_year": "显示最近一年",
@@ -703,6 +780,13 @@
   "analytics_top_skills_agents": "Agents",
   "analytics_top_skills_projects": "项目：{projects}",
   "analytics_top_skills_empty": "无 skill 使用数据",
+  "analytics_skill_trend_title": "Skill 使用趋势",
+  "analytics_skill_trend_other": "其他",
+  "analytics_skill_trend_legend": "切换 skill 显示",
+  "analytics_skill_trend_chart_label": "Skill 使用趋势。使用左右箭头键查看日期。",
+  "analytics_skill_trend_date": "日期",
+  "analytics_skill_trend_loading": "正在加载 skill 使用数据...",
+  "analytics_skill_trend_empty": "无 skill 使用数据",
   "usage_model": "模型",
   "usage_models": "模型",
   "usage_refresh": "刷新用量数据",
@@ -755,6 +839,9 @@
   "usage_top_sessions_by_cost": "按成本排序的热门会话",
   "settings_title": "设置",
   "settings_loading": "正在加载设置...",
+  "settings_date_ranges_title": "日期范围",
+  "settings_date_ranges_description": "在会话、用量、活动、趋势和洞察页面之间共享日期选择。",
+  "settings_date_ranges_link": "跨页面关联日期范围",
   "settings_resync_title_unavailable": "只读模式下无法完整重新同步",
   "settings_resync_unavailable_hint": "连接到只读后端时不可用",
   "settings_resync_hint": "从头重新扫描所有会话文件",
@@ -764,6 +851,8 @@
   "settings_language_english": "English",
   "settings_language_simplified_chinese": "简体中文",
   "settings_language_traditional_chinese": "繁体中文",
+  "settings_language_korean": "韩语",
+  "settings_language_french": "法语",
   "settings_language_no_results": "未找到语言",
   "nav_recent_edits": "最近编辑",
   "recent_edits_title": "最近编辑",
@@ -891,6 +980,7 @@
   "analytics_agent_comparison": "代理对比",
   "analytics_no_comparison_data": "无对比数据（需要 2 个以上代理）",
   "analytics_agent": "代理",
+  "analytics_model": "模型",
   "analytics_cycle_p50": "周期 p50",
   "analytics_msgs_per_min": "消息/分",
   "analytics_tools_per_min": "工具/分",
@@ -1020,10 +1110,25 @@
       }
     }
   ],
+  "session_recall_title": "记忆",
+  "session_recall_loading": "正在加载提炼记忆…",
+  "session_recall_empty": "此会话没有提炼记忆。",
+  "session_recall_error": "无法加载提炼记忆。",
+  "session_recall_generation": "代次",
+  "session_recall_review_state": "审核状态",
+  "session_recall_provenance_revoked": "来源已撤销",
+  "session_recall_evidence_range": "消息 {start}–{end}",
+  "session_recall_jump_evidence": "跳转到转录消息 {start}–{end}",
   "session_vitals_title": "分析",
   "session_vitals_subtitle": "会话指标",
   "session_vitals_close": "关闭会话分析",
   "session_vitals_session": "会话",
+  "session_vitals_repository": "存储库",
+  "session_vitals_worktree": "工作树",
+  "session_vitals_copy_repository": "复制存储库",
+  "session_vitals_repository_copied": "已复制存储库",
+  "session_vitals_copy_worktree": "复制工作树",
+  "session_vitals_worktree_copied": "已复制工作树",
   "session_vitals_running": "运行中",
   "session_vitals_running_duration": "运行中 {duration}+",
   "session_vitals_tool_calls": "工具调用",
@@ -1397,6 +1502,8 @@
   "shortcuts_close_palette": "关闭面板 / 弹窗 / 查找",
   "shortcuts_next_message": "下一条消息",
   "shortcuts_prev_message": "上一条消息",
+  "shortcuts_next_user_prompt": "下一个用户提示",
+  "shortcuts_prev_user_prompt": "上一个用户提示",
   "shortcuts_next_session": "下一个会话",
   "shortcuts_prev_session": "上一个会话",
   "shortcuts_toggle_sort": "切换排序方式",
@@ -1460,6 +1567,65 @@
   "settings_github_not_configured": "未配置",
   "settings_github_saving": "正在保存...",
   "settings_github_save_token": "保存令牌",
+  "settings_embeddings_title": "语义嵌入",
+  "settings_embeddings_description": "会话内容语义搜索索引的构建状态。",
+  "settings_embeddings_loading": "正在加载嵌入状态...",
+  "settings_embeddings_unavailable": "此服务器不支持语义搜索嵌入。",
+  "settings_embeddings_load_failed": "加载嵌入状态失败",
+  "settings_embeddings_model_label": "模型",
+  "settings_embeddings_dimension_label": "维度",
+  "settings_embeddings_status_label": "状态",
+  "settings_embeddings_status_idle": "空闲",
+  "settings_embeddings_status_scanning": "扫描中",
+  "settings_embeddings_status_embedding": "嵌入中",
+  "settings_embeddings_status_running": "运行中",
+  "settings_embeddings_scanning_hint": "正在扫描会话变更 - 总工作量尚未确定。",
+  "settings_embeddings_progress_chunks": [
+    {
+      "declarations": [
+        "input count",
+        "input doneLabel",
+        "input totalLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{doneLabel} / {totalLabel} 个块"
+      }
+    }
+  ],
+  "settings_embeddings_rate": [
+    {
+      "declarations": [
+        "input count",
+        "input rateLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{rateLabel} 块/秒"
+      }
+    }
+  ],
+  "settings_embeddings_elapsed": "已用 {duration}",
+  "settings_embeddings_eta": "预计剩余 {duration}",
+  "settings_embeddings_eta_estimating": "正在估算剩余时间...",
+  "settings_embeddings_duration_hours_minutes": "{hours} 小时 {minutes} 分",
+  "settings_embeddings_duration_minutes_seconds": "{minutes} 分 {seconds} 秒",
+  "settings_embeddings_duration_seconds": "{seconds} 秒",
+  "settings_embeddings_last_build_label": "上次构建",
+  "settings_embeddings_last_build_completed": "已完成",
+  "settings_embeddings_last_build_failed": "失败",
+  "settings_embeddings_last_build_activated": "已激活新代",
+  "settings_embeddings_last_build_documents": "已嵌入文档数",
+  "settings_embeddings_last_build_chunks": "已嵌入块数",
+  "settings_embeddings_generations_title": "嵌入代",
+  "settings_embeddings_generations_empty": "尚无嵌入代。",
+  "settings_embeddings_state_active": "活跃",
+  "settings_embeddings_state_building": "构建中",
+  "settings_embeddings_state_retired": "已停用",
+  "settings_embeddings_coverage": "已嵌入 {embeddedLabel} · 缺少 {missingLabel}",
+  "settings_embeddings_progress_aria": "嵌入进度",
   "settings_remote_connected_version": "已连接 (v{version})",
   "settings_remote_server_returned": "服务器返回 {status}",
   "settings_remote_connection_failed": "连接失败",
@@ -1504,6 +1670,13 @@
   "worktree_failed_apply": "应用映射失败",
   "worktree_title": "工作树映射",
   "worktree_description": "将工作树路径前缀映射到本机上的规范项目。",
+  "worktree_layout": "布局",
+  "worktree_layout_explicit": "显式",
+  "worktree_layout_repo_dot_worktrees": "{repo}.worktrees/{branch}",
+  "worktree_parent_directory": "父目录",
+  "worktree_parent_directory_hint": "输入包含 repo.worktrees 文件夹的目录。",
+  "worktree_project_required": "显式映射需要项目名。",
+  "worktree_project_derived": "从 repo.worktrees 文件夹派生。",
   "worktree_local_only": "工作树映射仅在本地模式下可用。",
   "worktree_loading": "正在加载映射...",
   "worktree_machine": "机器",

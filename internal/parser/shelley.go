@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"context"
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
@@ -127,9 +128,9 @@ type ShelleyConversationMeta struct {
 	RawID       string
 	VirtualPath string
 	// FileMtime is the conversation's updated_at as a nanosecond
-	// timestamp. It stays a real (whole-second) timestamp so the
-	// modified-between range queries that drive PG/DuckDB push never
-	// see a Shelley row as "future"; see shelleyChangeMtime.
+	// timestamp. It stays a real (whole-second) timestamp so no
+	// change-detection query ever sees a Shelley row as "future";
+	// see shelleyChangeMtime.
 	FileMtime int64
 	// Fingerprint is a digest over every parser-observed conversation and
 	// message field. It is stored in file_hash and compared in the sync
@@ -145,10 +146,11 @@ type ShelleyConversationMeta struct {
 //
 //   - File.Mtime / ShelleyConversationMeta.FileMtime is the conversation's
 //     updated_at as a real nanosecond timestamp. The sync skip compares it
-//     for equality, but it must also stay a true timestamp because
-//     ListSessionsModifiedBetween filters file_mtime <= now for PG/DuckDB
-//     push; a synthetic future value would drop a just-synced Shelley row
-//     from a same-second push until a later run.
+//     for equality, but it must also stay a true timestamp: a synthetic
+//     future value would inflate the trigger-maintained sync_marker and
+//     make the row a perpetual PG/DuckDB push candidate (the mirror window
+//     is unbounded above), and the parse-diff engine's bounded
+//     ListSessionsModifiedBetween would treat it as future.
 //   - Fingerprint, a digest stored in file_hash, distinguishes any
 //     same-second parser-visible change the timestamp cannot: metadata
 //     edits, appends, in-place rewrites, and even length-preserving edits
@@ -218,8 +220,44 @@ func shelleyFingerprint(h hash.Hash64) string {
 func ListShelleyConversationMetas(
 	conn *sql.DB, dbPath string,
 ) ([]ShelleyConversationMeta, error) {
-	rows, err := conn.Query(
-		`SELECT c.conversation_id, COALESCE(c.slug, ''),
+	var metas []ShelleyConversationMeta
+	err := ForEachShelleyConversationMeta(context.Background(), conn, dbPath, func(meta ShelleyConversationMeta) error {
+		metas = append(metas, meta)
+		return nil
+	})
+	return metas, err
+}
+
+func ForEachShelleyConversationMeta(
+	ctx context.Context, conn *sql.DB, dbPath string,
+	yield func(ShelleyConversationMeta) error,
+) error {
+	return forEachShelleyConversationMetaQuery(ctx, conn, dbPath, "", nil, yield)
+}
+
+// ShelleyConversationMetaByID reads only one conversation's metadata. It is
+// used by per-member fingerprinting so an exact rehydrate never scans or
+// materializes the rest of the archive.
+func ShelleyConversationMetaByID(
+	ctx context.Context, conn *sql.DB, dbPath, conversationID string,
+) (ShelleyConversationMeta, bool, error) {
+	var meta ShelleyConversationMeta
+	found := false
+	err := forEachShelleyConversationMetaQuery(
+		ctx, conn, dbPath, " WHERE c.conversation_id = ?", []any{conversationID},
+		func(candidate ShelleyConversationMeta) error {
+			meta, found = candidate, true
+			return nil
+		},
+	)
+	return meta, found, err
+}
+
+func forEachShelleyConversationMetaQuery(
+	ctx context.Context, conn *sql.DB, dbPath, where string, args []any,
+	yield func(ShelleyConversationMeta) error,
+) error {
+	query := `SELECT c.conversation_id, COALESCE(c.slug, ''),
 		        COALESCE(c.user_initiated, 1),
 		        COALESCE(c.created_at, ''), COALESCE(c.updated_at, ''),
 		        COALESCE(c.cwd, ''), COALESCE(c.parent_conversation_id, ''),
@@ -229,25 +267,26 @@ func ListShelleyConversationMetas(
 		        COALESCE(m.usage_data, ''), COALESCE(m.created_at, '')
 		   FROM conversations c
 		   JOIN messages m ON m.conversation_id = c.conversation_id
-		  ORDER BY c.conversation_id, m.sequence_id`,
-	)
+		` + where + `
+		  ORDER BY c.conversation_id, m.sequence_id`
+	rows, err := conn.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("listing shelley conversations: %w", err)
+		return fmt.Errorf("listing shelley conversations: %w", err)
 	}
 	defer rows.Close()
 
 	var (
-		metas []ShelleyConversationMeta
 		curID string
 		conv  shelleyConversationRow
 	)
 	h := fnv.New64a()
-	flush := func() {
+	flush := func() error {
 		// curID is "" before the first row; IsValidSessionID rejects it.
 		if !IsValidSessionID(curID) {
-			return
+			return nil
 		}
-		metas = append(metas, ShelleyConversationMeta{
+		observeStreamingDiscoveryBuffer(ctx, 1)
+		return yield(ShelleyConversationMeta{
 			RawID:       curID,
 			VirtualPath: ShelleyVirtualPath(dbPath, curID),
 			FileMtime:   parseTimestamp(conv.updatedAt).UnixNano(),
@@ -266,18 +305,22 @@ func ListShelleyConversationMetas(
 			&msg.sequenceID, &msg.msgType, &msg.llmData,
 			&msg.userData, &msg.usageData, &msg.createdAt,
 		); err != nil {
-			return nil, fmt.Errorf("scanning shelley conversation meta: %w", err)
+			return fmt.Errorf("scanning shelley conversation meta: %w", err)
 		}
 		rowConv.userInitiated = userInitiated != 0
 		if rowConv.conversationID != curID {
-			flush()
+			if err := flush(); err != nil {
+				return err
+			}
 			curID, conv, h = rowConv.conversationID, rowConv, fnv.New64a()
 			shelleyDigestConversation(h, conv)
 		}
 		shelleyDigestMessage(h, msg)
 	}
-	flush()
-	return metas, rows.Err()
+	if err := flush(); err != nil {
+		return err
+	}
+	return rows.Err()
 }
 
 // ShelleySourceMtime resolves the per-conversation change signal for a
@@ -347,7 +390,8 @@ func OpenShelleyDB(dbPath string) (*sql.DB, error) {
 }
 
 func openShelleyDB(dbPath string) (*sql.DB, error) {
-	dsn := dbPath + "?mode=ro&_journal_mode=WAL&_busy_timeout=3000"
+	dsn := "file:" + sqliteURIPath(dbPath) +
+		"?mode=ro&_busy_timeout=3000"
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening shelley db %s: %w", dbPath, err)

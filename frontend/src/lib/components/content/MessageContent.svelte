@@ -28,6 +28,7 @@
   import ToolBlock from "./ToolBlock.svelte";
   import ParallelGroup from "./ParallelGroup.svelte";
   import CodeBlock from "./CodeBlock.svelte";
+  import MermaidBlock from "./MermaidBlock.svelte";
   import SkillBlock from "./SkillBlock.svelte";
   import { CopyButton } from "@kenn-io/kit-ui";
   import { ui } from "../../stores/ui.svelte.js";
@@ -143,6 +144,19 @@
     return false;
   }
 
+  const INLINE_TEAMMATE_MESSAGE_RE =
+    /<teammate-message\b[^>]*\bteammate_id\s*=\s*(?:"[^"]+"|'[^']+'|[^\s>]+)[^>]*>[\s\S]*?<\/teammate-message\s*>/;
+
+  let hasInlineTeammateMessage = $derived(
+    isUser &&
+    !isSubagentContext &&
+    segments.some(
+      (segment) =>
+        segment.type === "text" &&
+        INLINE_TEAMMATE_MESSAGE_RE.test(segment.content),
+    ),
+  );
+
   /** Classify the session kind, walking the parent chain. */
   let sessionKind = $derived.by((): "teammate" | "subagent" | "user" => {
     const s = owningSession;
@@ -157,16 +171,17 @@
   let roleLabel = $derived.by(() => {
     if (!isUser) return m.message_content_role_assistant();
     if (isSubagentContext) return m.message_content_role_agent();
-    if (sessionKind === "teammate") return m.message_content_role_teammate();
     if (sessionKind === "subagent") return m.message_content_role_agent();
+    if (sessionKind === "teammate" || hasInlineTeammateMessage)
+      return m.message_content_role_teammate();
     return m.message_content_role_user();
   });
 
   let roleIcon = $derived.by(() => {
     if (!isUser) return "A";
     if (isSubagentContext) return "S";
-    if (sessionKind === "teammate") return "T";
     if (sessionKind === "subagent") return "S";
+    if (sessionKind === "teammate" || hasInlineTeammateMessage) return "T";
     return "U";
   });
 
@@ -457,12 +472,26 @@
              (v1 simplification: text first, then all tools). -->
       {:else if segment.type === "code"}
         {#if hasSearchQuery || ui.isBlockVisible("code")}
-          <CodeBlock
-            content={segment.content}
-            language={segment.label}
-            highlightQuery={highlightQuery}
-            isCurrentHighlight={isCurrentHighlight}
-          />
+          {@const codeLabel = segment.label?.trim().toLowerCase()}
+          {#if codeLabel === "mermaid"}
+            {#if hasSearchQuery}
+              <CodeBlock
+                content={segment.content}
+                language={segment.label}
+                highlightQuery={highlightQuery}
+                isCurrentHighlight={isCurrentHighlight}
+              />
+            {:else}
+              <MermaidBlock content={segment.content} />
+            {/if}
+          {:else}
+            <CodeBlock
+              content={segment.content}
+              language={segment.label}
+              highlightQuery={highlightQuery}
+              isCurrentHighlight={isCurrentHighlight}
+            />
+          {/if}
         {/if}
       {:else if segment.type === "skill"}
         {#if showText}

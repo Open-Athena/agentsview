@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -155,7 +156,8 @@ type remoteUsageSpec struct {
 
 // remoteUsageRequests records what the fake usage server observed.
 type remoteUsageRequests struct {
-	UsagePath string
+	UsagePath  string
+	UsageQuery string
 }
 
 // newRemoteUsageServer stands in for a remote agentsview server answering
@@ -195,6 +197,7 @@ func newRemoteUsageServer(
 			writeJSONResponse(w, detailJSON)
 		case usagePath:
 			reqs.UsagePath = r.URL.Path
+			reqs.UsageQuery = r.URL.RawQuery
 			if spec.usageDelay > 0 {
 				time.Sleep(spec.usageDelay)
 			}
@@ -221,7 +224,7 @@ func remoteUsageJSON(spec remoteUsageSpec) string {
 		"total_output_tokens": %d,
 		"peak_context_tokens": 2048,
 		"has_token_data": true,
-		"cost_usd": 0.5,
+		"cost": {"microdollars": 500000},
 		"has_cost": true,
 		"models": ["gpt-5.1"],
 		"unpriced_models": []%s
@@ -947,6 +950,171 @@ func TestSessionExport_StreamsFromDisk(t *testing.T) {
 	assert.Equal(t, body, out)
 }
 
+func createTraeExportStateDB(t *testing.T, root string) string {
+	t.Helper()
+	dbPath := filepath.Join(root, "workspaceStorage", "hash", "state.vscdb")
+	require.NoError(t, os.MkdirAll(filepath.Dir(dbPath), 0o755))
+
+	conn, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+
+	_, err = conn.Exec(`
+		CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);
+		INSERT INTO ItemTable(key, value) VALUES (
+			'memento/icube-ai-agent-storage',
+			'{"list":[{"sessionId":"session-1","messages":[{"role":"user","content":"target trae message"}]}]}'
+		);
+	`)
+	require.NoError(t, err)
+	return dbPath
+}
+
+func TestSessionExportTraeStateDB(t *testing.T) {
+	dataDir := newAgentDataDir(t)
+	root := t.TempDir()
+	dbPath := createTraeExportStateDB(t, root)
+	virtualPath := dbPath + "#session-1"
+
+	seedSessionWithOpts(t, dataDir, "trae:session-1", "proj",
+		func(s *db.Session) {
+			s.Agent = string(parser.AgentTrae)
+			s.SourceSessionID = "session-1"
+			s.FilePath = &virtualPath
+		})
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "export", "trae:session-1")
+	require.NoError(t, err)
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal([]byte(out), &doc))
+	assert.Equal(t, "session-1", doc["sessionId"])
+	messages, ok := doc["messages"].([]any)
+	require.True(t, ok)
+	require.Len(t, messages, 1)
+	first, ok := messages[0].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "user", first["role"])
+	assert.Equal(t, "target trae message", first["content"])
+}
+
+func createHermesExportStateDB(t *testing.T, root string) string {
+	t.Helper()
+	sessionsDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+
+	dbPath := filepath.Join(root, "state.db")
+	conn, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+
+	_, err = conn.Exec(`
+		CREATE TABLE sessions (
+			id TEXT PRIMARY KEY,
+			source TEXT NOT NULL,
+			model TEXT,
+			parent_session_id TEXT,
+			started_at REAL NOT NULL,
+			ended_at REAL,
+			message_count INTEGER DEFAULT 0,
+			input_tokens INTEGER DEFAULT 0,
+			output_tokens INTEGER DEFAULT 0,
+			cache_read_tokens INTEGER DEFAULT 0,
+			cache_write_tokens INTEGER DEFAULT 0,
+			reasoning_tokens INTEGER DEFAULT 0,
+			estimated_cost_usd REAL,
+			actual_cost_usd REAL,
+			cost_status TEXT,
+			cost_source TEXT,
+			title TEXT,
+			api_call_count INTEGER DEFAULT 0
+		);
+		CREATE TABLE messages (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id TEXT NOT NULL,
+			role TEXT NOT NULL,
+			content TEXT,
+			tool_call_id TEXT,
+			tool_calls TEXT,
+			timestamp REAL NOT NULL,
+			finish_reason TEXT,
+			reasoning TEXT,
+			reasoning_content TEXT,
+			reasoning_details TEXT,
+			codex_reasoning_items TEXT,
+			codex_message_items TEXT
+		);
+		INSERT INTO sessions (
+			id, source, model, started_at, ended_at, message_count, title
+		) VALUES
+			('child', 'profile', 'gpt-5.4', 1778767200.0, 1778767800.0, 1, 'Child Session'),
+			('sibling', 'profile', 'gpt-5.4', 1778767200.0, 1778767800.0, 1, 'Sibling Session');
+		INSERT INTO messages (
+			session_id, role, content, timestamp
+		) VALUES
+			('child', 'user', 'target hermes message', 1778767210.0),
+			('sibling', 'user', 'sibling hermes message', 1778767211.0);
+	`)
+	require.NoError(t, err)
+	return dbPath
+}
+
+func TestSessionExportHermesStateDB(t *testing.T) {
+	dataDir := newAgentDataDir(t)
+
+	wrongRoot := t.TempDir()
+	_ = createHermesExportStateDB(t, wrongRoot)
+	root := t.TempDir()
+	dbPath := createHermesExportStateDB(t, root)
+	t.Setenv("HERMES_SESSIONS_DIR", filepath.Join(wrongRoot, "sessions"))
+
+	seedSessionWithOpts(t, dataDir, "hermes:child", "proj",
+		func(s *db.Session) {
+			s.Agent = string(parser.AgentHermes)
+			s.SourceSessionID = "child"
+			s.SourceVersion = "hermes-state-db"
+			s.FilePath = &dbPath
+		})
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "export", "hermes:child")
+	require.NoError(t, err)
+	assert.NotContains(t, out, "SQLite format 3")
+	assert.Contains(t, out, `"role":"session_meta"`)
+	assert.Contains(t, out, "target hermes message")
+	assert.NotContains(t, out, "sibling hermes message")
+	assert.NotContains(t, out, "wrong root message")
+
+	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
+		assert.JSONEq(t, line, line)
+	}
+}
+
+func TestSessionExportHermesStateDBWithoutSourceVersion(t *testing.T) {
+	dataDir := newAgentDataDir(t)
+
+	root := t.TempDir()
+	dbPath := createHermesExportStateDB(t, root)
+
+	seedSessionWithOpts(t, dataDir, "hermes:child", "proj",
+		func(s *db.Session) {
+			s.Agent = string(parser.AgentHermes)
+			s.FilePath = &dbPath
+		})
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "export", "hermes:child")
+	require.NoError(t, err)
+	assert.NotContains(t, out, "SQLite format 3")
+	assert.Contains(t, out, `"role":"session_meta"`)
+	assert.Contains(t, out, "target hermes message")
+	assert.NotContains(t, out, "sibling hermes message")
+
+	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
+		assert.JSONEq(t, line, line)
+	}
+}
+
 func TestSessionExport_AiderVirtualPathStreamsOnlySelectedRun(t *testing.T) {
 	dataDir := newAgentDataDir(t)
 
@@ -1080,6 +1248,8 @@ func TestSessionUsage_ServerFlagUsesHTTP(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, out)
 	assert.Equal(t, "/api/v1/sessions/remote-session/usage", reqs.UsagePath)
+	assert.Equal(t, "breakdown=true", reqs.UsageQuery,
+		"remote CLI must request full breakdown rows")
 	assert.Equal(t, tokenUseExitOK, code)
 	assert.Equal(t, "remote-session", out.SessionID)
 	assert.Equal(t, "remote-project", out.Project)
@@ -1109,7 +1279,7 @@ func TestSessionUsage_UsesDiscoveredDaemon(t *testing.T) {
 				"total_output_tokens": 42,
 				"peak_context_tokens": 2048,
 				"has_token_data": true,
-				"cost_usd": 0.5,
+				"cost": {"microdollars": 500000},
 				"has_cost": true,
 				"models": ["gpt-5.1"],
 				"unpriced_models": []
@@ -1179,7 +1349,7 @@ func TestTokenUse_UsesDiscoveredDaemon(t *testing.T) {
 				"total_output_tokens": 42,
 				"peak_context_tokens": 2048,
 				"has_token_data": true,
-				"cost_usd": 0.5,
+				"cost": {"microdollars": 500000},
 				"has_cost": true,
 				"models": ["gpt-5.1"],
 				"unpriced_models": []

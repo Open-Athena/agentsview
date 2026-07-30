@@ -6,18 +6,24 @@ import type {
   CannedInsightKind,
   AutomatedScope,
   InsightGenerationFilters,
+  Session,
 } from "../api/types.js";
 import {
   ApiError as GeneratedApiError,
   InsightsService,
 } from "../api/generated/index";
-import { configureGeneratedClient } from "../api/runtime.js";
+import {
+  callGenerated,
+  configureGeneratedClient,
+  isAbortError,
+} from "../api/runtime.js";
 import {
   generateInsight,
   type GenerateInsightHandle,
   type InsightLogEvent,
 } from "../api/client.js";
 import { localDateStr } from "../utils/dates.js";
+import { LatestRead } from "../utils/latest-read.js";
 
 export interface InsightTask {
   clientId: string;
@@ -29,6 +35,7 @@ export interface InsightTask {
   kind?: CannedInsightKind;
   promptText: string;
   automatedScope: AutomatedScope;
+  sessionId?: string;
   sessionFilters?: InsightGenerationFilters;
   status: "generating" | "done" | "error";
   phase: string;
@@ -48,6 +55,7 @@ interface GenerationSnapshot {
   kind?: CannedInsightKind;
   promptText: string;
   automatedScope: AutomatedScope;
+  sessionId?: string;
   sessionFilters?: InsightGenerationFilters;
 }
 
@@ -69,6 +77,7 @@ class InsightsStore {
 
   #handles = new Map<string, GenerateInsightHandle>();
   #version = 0;
+  #listRead = new LatestRead();
 
   get selectedItem(): Insight | undefined {
     return this.items.find(
@@ -91,12 +100,15 @@ class InsightsStore {
 
   async load() {
     const v = ++this.#version;
+    const signal = this.#listRead.begin();
     this.loading = true;
     try {
       configureGeneratedClient();
-      const res =
-        await InsightsService.getApiV1Insights({}) as unknown as InsightsResponse;
-      if (this.#version === v) {
+      const res = await callGenerated(
+        () => InsightsService.getApiV1Insights({}),
+        signal,
+      ) as unknown as InsightsResponse;
+      if (this.#version === v && this.#listRead.isCurrent(signal)) {
         this.items = res.insights;
         if (
           this.selectedId !== null &&
@@ -107,15 +119,22 @@ class InsightsStore {
           this.selectedId = null;
         }
       }
-    } catch {
+    } catch (e) {
+      if (isAbortError(e) || !this.#listRead.isCurrent(signal)) return;
       if (this.#version === v) {
         this.items = [];
       }
     } finally {
-      if (this.#version === v) {
+      if (this.#listRead.finish(signal)) {
         this.loading = false;
       }
     }
+  }
+
+  cancelInFlightReads(): void {
+    this.#version++;
+    this.#listRead.cancel();
+    this.loading = false;
   }
 
   setDateFrom(date: string) {
@@ -174,10 +193,34 @@ class InsightsStore {
         : undefined,
       promptText: this.promptText,
       automatedScope: this.automatedScope,
+      sessionId: undefined,
       sessionFilters: this.sessionFilters
         ? { ...this.sessionFilters }
         : undefined,
     });
+  }
+
+  generateForSession(session: Session) {
+    const date = sessionInsightDate(session);
+    this.type = "agent_analysis";
+    this.dateFrom = date;
+    this.dateTo = date;
+    this.project = session.project || "";
+    this.automatedScope = "human";
+    this.#startGeneration(
+      {
+        type: "agent_analysis",
+        dateFrom: date,
+        dateTo: date,
+        project: session.project || "",
+        agent: this.agent,
+        promptText: this.promptText,
+        automatedScope: "human",
+        sessionId: session.id,
+      },
+      undefined,
+      true,
+    );
   }
 
   retryTask(clientId: string) {
@@ -193,6 +236,7 @@ class InsightsStore {
         kind: task.kind,
         promptText: task.promptText,
         automatedScope: task.automatedScope,
+        sessionId: task.sessionId,
         sessionFilters: task.sessionFilters
           ? { ...task.sessionFilters }
           : undefined,
@@ -217,6 +261,7 @@ class InsightsStore {
       kind: snap.kind,
       promptText: snap.promptText,
       automatedScope: snap.automatedScope,
+      sessionId: snap.sessionId,
       sessionFilters: snap.sessionFilters
         ? { ...snap.sessionFilters }
         : undefined,
@@ -245,6 +290,7 @@ class InsightsStore {
         date_to: snap.dateTo,
         project: snap.project || undefined,
         prompt: snap.promptText || undefined,
+        session_id: snap.sessionId,
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         agent: snap.agent,
         kind: snap.kind,
@@ -359,3 +405,11 @@ class InsightsStore {
 }
 
 export const insights = new InsightsStore();
+
+function sessionInsightDate(session: Session): string {
+  const ts =
+    session.started_at ||
+    session.ended_at ||
+    session.created_at;
+  return ts.slice(0, 10);
+}

@@ -3,7 +3,6 @@ package db
 import (
 	"context"
 	"errors"
-	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/money"
 )
 
 type storeContractBackend struct {
@@ -268,6 +268,13 @@ func contractMessagesOrderingAndToolResults(
 	require.NoError(t, err)
 	require.Equal(t, []int{0, 1, 2, 3, 4}, messageOrdinals(all))
 
+	modelCounts, err := store.GetResumeModelCounts(ctx, fixture.alphaID)
+	require.NoError(t, err)
+	require.Equal(t, []ModelCount{{
+		Model: "claude-sonnet-contract",
+		Count: 2,
+	}}, modelCounts)
+
 	activity, err := store.GetSessionActivity(ctx, fixture.alphaID)
 	require.NoError(t, err)
 	require.NotNil(t, activity)
@@ -512,7 +519,7 @@ func contractAnalyticsTrendsAndUsage(
 	skills, err := store.GetAnalyticsSkills(ctx, AnalyticsFilter{
 		From: "2026-01-10",
 		To:   "2026-01-10",
-	})
+	}, "week")
 	require.NoError(t, err)
 	require.Equal(t, 1, skills.TotalSkillCalls)
 	require.Equal(t, 1, skills.DistinctSkills)
@@ -543,7 +550,7 @@ func contractAnalyticsTrendsAndUsage(
 	require.GreaterOrEqual(t, len(daily.Daily), 2)
 	require.Equal(t, 315, daily.Totals.InputTokens)
 	require.Equal(t, 130, daily.Totals.OutputTokens)
-	require.InDelta(t, 0.002435, daily.Totals.TotalCost, 0.00001)
+	require.Equal(t, money.MustParseDollars("0.002435"), daily.Totals.TotalCost)
 
 	top, err := store.GetTopSessionsByCost(ctx, UsageFilter{
 		From: "2026-01-10",
@@ -561,13 +568,13 @@ func contractAnalyticsTrendsAndUsage(
 	require.Equal(t, 3, counts.Total)
 	require.Equal(t, 2, counts.ByProject["alpha"])
 
-	usage, err := store.GetSessionUsage(ctx, fixture.alphaID)
+	usage, err := store.GetSessionUsage(ctx, fixture.alphaID, true)
 	require.NoError(t, err)
 	require.NotNil(t, usage)
 	require.True(t, usage.HasTokenData)
 	require.True(t, usage.HasCost)
 	require.Equal(t, []string{"claude-sonnet-contract"}, usage.Models)
-	require.InDelta(t, 0.002355, usage.CostUSD, 0.00001)
+	require.Equal(t, money.MustParseDollars("0.002355"), usage.Cost)
 }
 
 func contractLocalOnlyMethods(
@@ -593,6 +600,10 @@ func contractLocalOnlyMethods(
 		_, err = store.InsertInsight(Insight{})
 		requireReadOnly(t, err)
 		requireReadOnly(t, store.DeleteInsight(1))
+		_, err = store.RecordRecallQueryEvent(ctx, RecallQueryEvent{
+			Surface: RecallQuerySurfaceQuery,
+		})
+		requireReadOnly(t, err)
 		return
 	}
 
@@ -642,6 +653,12 @@ func contractLocalOnlyMethods(
 	require.NoError(t, err)
 	require.Len(t, list, 1)
 	require.NoError(t, store.DeleteInsight(insightID))
+	queryID, err := store.RecordRecallQueryEvent(ctx, RecallQueryEvent{
+		Query:   "store contract recall query",
+		Surface: RecallQuerySurfaceQuery,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, queryID)
 }
 
 func TestStoreContractGetUsageMatchingSessionCountCountsCopilotSessionsWithoutUsageRows(
@@ -736,17 +753,17 @@ func seedStoreContractSQLite(
 	require.NoError(t, pricingStore.UpsertModelPricing([]ModelPricing{
 		{
 			ModelPattern:         "claude-sonnet-contract",
-			InputPerMTok:         3,
-			OutputPerMTok:        15,
-			CacheCreationPerMTok: 3.75,
-			CacheReadPerMTok:     0.3,
+			InputPerMTok:         money.MustParseDollars("3"),
+			OutputPerMTok:        money.MustParseDollars("15"),
+			CacheCreationPerMTok: money.MustParseDollars("3.75"),
+			CacheReadPerMTok:     money.MustParseDollars("0.3"),
 		},
 		{
 			ModelPattern:         "codex-mini-contract",
-			InputPerMTok:         1,
-			OutputPerMTok:        5,
-			CacheCreationPerMTok: 1,
-			CacheReadPerMTok:     0.1,
+			InputPerMTok:         money.MustParseDollars("1"),
+			OutputPerMTok:        money.MustParseDollars("5"),
+			CacheCreationPerMTok: money.MustParseDollars("1"),
+			CacheReadPerMTok:     money.MustParseDollars("0.1"),
 		},
 	}))
 
@@ -903,7 +920,7 @@ func seedStoreContractSQLite(
 					Model:        "codex-mini-contract",
 					InputTokens:  0,
 					OutputTokens: 30,
-					CostUSD:      floatPtr(0.00005),
+					Cost:         Ptr(money.MustParseDollars("0.00005")),
 					CostStatus:   "reported",
 					CostSource:   "fixture",
 					OccurredAt:   "2026-01-12T10:04:00Z",
@@ -1157,13 +1174,6 @@ func requireReadOnly(t *testing.T, err error) {
 	t.Helper()
 	require.Error(t, err)
 	require.True(t, errors.Is(err, ErrReadOnly), "expected ErrReadOnly, got %v", err)
-}
-
-func floatPtr(v float64) *float64 {
-	if math.IsNaN(v) {
-		return nil
-	}
-	return &v
 }
 
 func TestStoreContractBackendsAreRegisteredExplicitly(t *testing.T) {

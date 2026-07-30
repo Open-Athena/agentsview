@@ -57,6 +57,11 @@ type analyticsActivityInput struct {
 	Granularity analyticsGranularity `query:"granularity" enum:"day,week,month" default:"day" doc:"Time bucket granularity"`
 }
 
+type analyticsSkillsInput struct {
+	AnalyticsFilterInput
+	Granularity analyticsGranularity `query:"granularity" enum:"day,week,month" default:"week" doc:"Trend bucket granularity"`
+}
+
 type analyticsHeatmapInput struct {
 	AnalyticsFilterInput
 	Metric heatmapMetric `query:"metric" enum:"messages,sessions,output_tokens" default:"messages" doc:"Heatmap metric"`
@@ -233,13 +238,13 @@ func (s *Server) humaAnalyticsTools(
 
 func (s *Server) humaAnalyticsSkills(
 	ctx context.Context,
-	in *AnalyticsFilterInput,
+	in *analyticsSkillsInput,
 ) (*jsonOutput[db.SkillsAnalyticsResponse], error) {
-	f, err := analyticsFilterFromInput(*in)
+	f, err := analyticsFilterFromInput(in.AnalyticsFilterInput)
 	if err != nil {
 		return nil, err
 	}
-	result, err := s.db.GetAnalyticsSkills(ctx, f)
+	result, err := s.db.GetAnalyticsSkills(ctx, f, string(in.Granularity))
 	if err != nil {
 		return nil, internalError("analytics error", err)
 	}

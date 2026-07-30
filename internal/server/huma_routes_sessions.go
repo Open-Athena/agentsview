@@ -16,6 +16,8 @@ import (
 
 	"github.com/danielgtaylor/huma/v2"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/service"
 	"go.kenn.io/agentsview/internal/sessionwatch"
@@ -64,9 +66,10 @@ type sessionFilterInput struct {
 	Machine          string            `query:"machine" doc:"Filter by machine"`
 	GitBranch        string            `query:"git_branch" doc:"Filter by git branch; opaque (project, branch) tokens from the /branches endpoint"`
 	Agent            string            `query:"agent" doc:"Filter by agent"`
-	Date             string            `query:"date" format:"date" doc:"Filter to a single YYYY-MM-DD date"`
-	DateFrom         string            `query:"date_from" format:"date" doc:"Filter start date"`
-	DateTo           string            `query:"date_to" format:"date" doc:"Filter end date"`
+	Date             string            `query:"date" format:"date" doc:"Filter sessions active on this YYYY-MM-DD date"`
+	DateFrom         string            `query:"date_from" format:"date" doc:"Filter sessions active on or after this date"`
+	DateTo           string            `query:"date_to" format:"date" doc:"Filter sessions active on or before this date"`
+	Timezone         string            `query:"timezone" doc:"IANA timezone for calendar-date filters; defaults to UTC"`
 	ActiveSince      string            `query:"active_since" format:"date-time" doc:"Filter sessions active since this RFC3339 timestamp"`
 	MinMessages      int               `query:"min_messages" minimum:"0" doc:"Minimum total message count"`
 	MaxMessages      int               `query:"max_messages" minimum:"0" doc:"Maximum total message count"`
@@ -91,6 +94,10 @@ type messageListInput struct {
 	Limit     int              `query:"limit" minimum:"0" doc:"Maximum number of messages"`
 	Direction messageDirection `query:"direction" enum:"asc,desc" doc:"Message ordering direction"`
 	From      optionalIntParam `query:"from" minimum:"0" doc:"Starting message ordinal"`
+	Around    optionalIntParam `query:"around" minimum:"0" doc:"Center a symmetric window on this ordinal (mutually exclusive with from/direction)"`
+	Before    optionalIntParam `query:"before" minimum:"0" doc:"Messages before the around anchor (default 5)"`
+	After     optionalIntParam `query:"after" minimum:"0" doc:"Messages after the around anchor (default 5)"`
+	Roles     string           `query:"roles" doc:"Comma-separated roles to include, e.g. user,assistant"`
 }
 
 type searchSessionInput struct {
@@ -111,6 +118,10 @@ func (in *sessionFilterInput) listFilter() (service.ListFilter, error) {
 	if err := validateDateFilterValues(in.Date, in.DateFrom, in.DateTo, in.ActiveSince); err != nil {
 		return service.ListFilter{}, err
 	}
+	timezone, err := db.NormalizeSessionTimezone(in.Timezone)
+	if err != nil {
+		return service.ListFilter{}, apiError(http.StatusBadRequest, err.Error())
+	}
 	if _, err := db.ParseSortSpec(in.OrderBy); err != nil {
 		return service.ListFilter{}, apiError(http.StatusBadRequest, "invalid order_by: "+err.Error())
 	}
@@ -124,6 +135,7 @@ func (in *sessionFilterInput) listFilter() (service.ListFilter, error) {
 		Date:             in.Date,
 		DateFrom:         in.DateFrom,
 		DateTo:           in.DateTo,
+		Timezone:         timezone,
 		ActiveSince:      in.ActiveSince,
 		MinMessages:      in.MinMessages,
 		MaxMessages:      in.MaxMessages,
@@ -151,6 +163,10 @@ func (in *sessionFilterInput) dbFilter(includeChildren bool) (db.SessionFilter, 
 	if err := validateDateFilterValues(in.Date, in.DateFrom, in.DateTo, in.ActiveSince); err != nil {
 		return db.SessionFilter{}, err
 	}
+	timezone, err := db.NormalizeSessionTimezone(in.Timezone)
+	if err != nil {
+		return db.SessionFilter{}, apiError(http.StatusBadRequest, err.Error())
+	}
 	// The order_by param is shared with the list route via this struct; reject
 	// malformed specs here too (the dropped enum used to guard every route),
 	// even though the sidebar index applies its own ordering and ignores it.
@@ -170,6 +186,7 @@ func (in *sessionFilterInput) dbFilter(includeChildren bool) (db.SessionFilter, 
 		Date:             in.Date,
 		DateFrom:         in.DateFrom,
 		DateTo:           in.DateTo,
+		Timezone:         timezone,
 		ActiveSince:      in.ActiveSince,
 		MinMessages:      in.MinMessages,
 		MaxMessages:      in.MaxMessages,
@@ -279,11 +296,42 @@ func (s *Server) humaGetMessages(
 	if in.From.IsSet {
 		filter.From = &in.From.Value
 	}
+	if in.Around.IsSet {
+		filter.Around = &in.Around.Value
+	}
+	if in.Before.IsSet {
+		filter.Before = &in.Before.Value
+	}
+	if in.After.IsSet {
+		filter.After = &in.After.Value
+	}
+	if in.Roles != "" {
+		filter.Roles = splitTrimmedNonEmpty(in.Roles)
+	}
 	list, err := s.sessions.Messages(ctx, in.ID, filter)
 	if err != nil {
+		if errors.Is(err, service.ErrAroundMutuallyExclusive) ||
+			errors.Is(err, service.ErrBeforeAfterRequireAround) {
+			return nil, apiError(http.StatusBadRequest, err.Error())
+		}
 		return nil, serverError(err)
 	}
 	return &jsonOutput[*service.MessageList]{Body: list}, nil
+}
+
+// splitTrimmedNonEmpty splits s on commas, trims surrounding whitespace from
+// each part, and drops empty parts. This matches the CLI's `session search
+// --in` convention (cmd/agentsview/session_search.go) so a trailing or
+// doubled comma (e.g. "user,") narrows the filter by one intended value
+// instead of silently adding a spurious "" element that matches nothing.
+func splitTrimmedNonEmpty(s string) []string {
+	var out []string
+	for part := range strings.SplitSeq(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func (s *Server) humaToolCalls(
@@ -323,18 +371,46 @@ func (s *Server) humaSessionTiming(
 }
 
 type sessionUsageResponse struct {
-	SessionID         string   `json:"session_id"`
-	Agent             string   `json:"agent"`
-	Project           string   `json:"project"`
-	TotalOutputTokens int      `json:"total_output_tokens"`
-	PeakContextTokens int      `json:"peak_context_tokens"`
-	HasTokenData      bool     `json:"has_token_data"`
-	CostUSD           float64  `json:"cost_usd"`
-	HasCost           bool     `json:"has_cost"`
-	AICredits         float64  `json:"ai_credits,omitempty"`
-	Models            []string `json:"models"`
-	UnpricedModels    []string `json:"unpriced_models"`
-	ServerRunning     bool     `json:"server_running"`
+	SessionID           string                          `json:"session_id"`
+	Agent               string                          `json:"agent"`
+	Project             string                          `json:"project"`
+	TotalOutputTokens   int                             `json:"total_output_tokens"`
+	PeakContextTokens   int                             `json:"peak_context_tokens"`
+	HasTokenData        bool                            `json:"has_token_data"`
+	Cost                money.Money                     `json:"cost"`
+	HasCost             bool                            `json:"has_cost"`
+	CostSource          export.CostSource               `json:"cost_source,omitempty"`
+	AICredits           float64                         `json:"ai_credits,omitempty"`
+	Models              []string                        `json:"models"`
+	UnpricedModels      []string                        `json:"unpriced_models"`
+	BreakdownCount      int                             `json:"breakdown_count"`
+	Breakdown           []sessionUsageBreakdownResponse `json:"breakdown"`
+	ServerRunning       bool                            `json:"server_running"`
+	RollupCost          *money.Money                    `json:"rollup_cost,omitempty"`
+	RollupCostSource    export.CostSource               `json:"rollup_cost_source,omitempty"`
+	HasRollupCost       *bool                           `json:"has_rollup_cost,omitempty"`
+	RollupSubagentCount *int                            `json:"rollup_subagent_count,omitempty"`
+}
+
+type sessionUsageInput struct {
+	ID        string `path:"id" required:"true" doc:"Session ID"`
+	Breakdown bool   `query:"breakdown" doc:"Include per-step breakdown rows"`
+	Rollup    bool   `query:"rollup" doc:"Include explicit subagent descendant costs"`
+}
+
+type sessionUsageBreakdownResponse struct {
+	Ordinal                  int         `json:"ordinal"`
+	MessageOrdinal           *int        `json:"message_ordinal,omitempty"`
+	Source                   string      `json:"source"`
+	Label                    string      `json:"label"`
+	Timestamp                string      `json:"timestamp"`
+	Model                    string      `json:"model"`
+	InputTokens              int         `json:"input_tokens"`
+	OutputTokens             int         `json:"output_tokens"`
+	CacheCreationInputTokens int         `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int         `json:"cache_read_input_tokens"`
+	Cost                     money.Money `json:"cost"`
+	HasCost                  bool        `json:"has_cost"`
 }
 
 type sessionUsageErrorBody struct {
@@ -360,6 +436,23 @@ func newSessionUsageHumaResponse(usage *db.SessionUsage) sessionUsageResponse {
 	if unpricedModels == nil {
 		unpricedModels = []string{}
 	}
+	breakdown := make([]sessionUsageBreakdownResponse, 0, len(usage.Breakdown))
+	for _, entry := range usage.Breakdown {
+		breakdown = append(breakdown, sessionUsageBreakdownResponse{
+			Ordinal:                  entry.Ordinal,
+			MessageOrdinal:           entry.MessageOrdinal,
+			Source:                   entry.Source,
+			Label:                    entry.Label,
+			Timestamp:                entry.Timestamp,
+			Model:                    entry.Model,
+			InputTokens:              entry.InputTokens,
+			OutputTokens:             entry.OutputTokens,
+			CacheCreationInputTokens: entry.CacheCreationInputTokens,
+			CacheReadInputTokens:     entry.CacheReadInputTokens,
+			Cost:                     entry.Cost,
+			HasCost:                  entry.HasCost,
+		})
+	}
 	return sessionUsageResponse{
 		SessionID:         usage.SessionID,
 		Agent:             usage.Agent,
@@ -367,20 +460,43 @@ func newSessionUsageHumaResponse(usage *db.SessionUsage) sessionUsageResponse {
 		TotalOutputTokens: usage.TotalOutputTokens,
 		PeakContextTokens: usage.PeakContextTokens,
 		HasTokenData:      usage.HasTokenData,
-		CostUSD:           usage.CostUSD,
+		Cost:              usage.Cost,
 		HasCost:           usage.HasCost,
+		CostSource:        usage.CostSource,
 		AICredits:         usage.AICredits,
 		Models:            usage.Models,
 		UnpricedModels:    unpricedModels,
+		BreakdownCount:    usage.BreakdownCount,
+		Breakdown:         breakdown,
 		ServerRunning:     true,
 	}
 }
 
 func (s *Server) humaSessionUsage(
 	ctx context.Context,
-	in *idPathInput,
+	in *sessionUsageInput,
 ) (*jsonOutput[sessionUsageResponse], error) {
-	usage, err := s.db.GetSessionUsage(ctx, in.ID)
+	if in.Rollup {
+		rollup, err := service.GetSessionUsageRollup(ctx, s.db, in.ID, in.Breakdown)
+		if err != nil {
+			if handled := handleHumaContextError(err); handled != nil {
+				return nil, handled
+			}
+			return nil, &sessionUsageError{Status: http.StatusInternalServerError, Body: sessionUsageErrorBody{Code: "usage_query_failed", Message: "failed to query session usage"}}
+		}
+		if rollup == nil {
+			return nil, &sessionUsageError{Status: http.StatusNotFound, Body: sessionUsageErrorBody{Code: "session_not_found", Message: "session not found"}}
+		}
+		body := newSessionUsageHumaResponse(rollup.Usage)
+		if rollup.HasCost {
+			body.RollupCost = &rollup.Cost
+			body.RollupCostSource = rollup.CostSource
+		}
+		body.HasRollupCost = &rollup.HasCost
+		body.RollupSubagentCount = &rollup.SubagentCount
+		return &jsonOutput[sessionUsageResponse]{Body: body}, nil
+	}
+	usage, err := s.db.GetSessionUsage(ctx, in.ID, in.Breakdown)
 	if err != nil {
 		if handled := handleHumaContextError(err); handled != nil {
 			return nil, handled
@@ -627,12 +743,21 @@ func (s *Server) humaDeleteSession(
 		}
 		return nil, internalError("soft delete session", err)
 	}
+	s.notifySessionMutation()
 	return &noContentOutput{Status: http.StatusNoContent}, nil
 }
 
 type batchDeleteInput struct {
 	Body struct {
-		SessionIDs []string `json:"session_ids" required:"true" doc:"Session IDs to soft-delete"`
+		SessionIDs []string `json:"session_ids" required:"true" nullable:"false" doc:"Session IDs to soft-delete"`
+	}
+}
+
+// notifySessionMutation reports a completed session-lifecycle change to the
+// registered notifier, if any.
+func (s *Server) notifySessionMutation() {
+	if s.sessionMutationNotify != nil {
+		s.sessionMutationNotify()
 	}
 }
 
@@ -649,6 +774,7 @@ func (s *Server) humaBatchDeleteSessions(
 		}
 		return nil, internalError("batch delete sessions", err)
 	}
+	s.notifySessionMutation()
 	return &noContentOutput{Status: http.StatusNoContent}, nil
 }
 
@@ -666,6 +792,7 @@ func (s *Server) humaRestoreSession(
 	if n == 0 {
 		return nil, apiError(http.StatusNotFound, "session not found or not in trash")
 	}
+	s.notifySessionMutation()
 	return &noContentOutput{Status: http.StatusNoContent}, nil
 }
 
@@ -683,6 +810,7 @@ func (s *Server) humaPermanentDeleteSession(
 	if n == 0 {
 		return nil, apiError(http.StatusConflict, "session not found or not in trash")
 	}
+	s.notifySessionMutation()
 	return &noContentOutput{Status: http.StatusNoContent}, nil
 }
 
@@ -708,6 +836,7 @@ func (s *Server) humaEmptyTrash(
 		}
 		return nil, internalError("empty trash", err)
 	}
+	s.notifySessionMutation()
 	return &jsonOutput[emptyTrashResponse]{Body: emptyTrashResponse{Deleted: count}}, nil
 }
 
@@ -1133,12 +1262,19 @@ func (s *Server) humaResumeSession(
 	}
 	prefix := string(session.Agent) + ":"
 	rawID := strings.TrimPrefix(in.ID, prefix)
-	var cmd string
-	if strings.Contains(tmpl, "%s") {
-		cmd = fmt.Sprintf(tmpl, shellQuote(rawID))
-	} else {
-		cmd = tmpl
+	if s.db.ReadOnly() && !req.CommandOnly {
+		return nil, apiError(http.StatusNotImplemented,
+			"session launch not available in remote mode")
 	}
+	model := ""
+	if resumeAgentNeedsModel(string(session.Agent)) {
+		counts, err := s.db.GetResumeModelCounts(ctx, session.ID)
+		if err != nil {
+			return nil, internalError("resume: model lookup failed", err)
+		}
+		model = primaryResumeModel(counts)
+	}
+	cmd := resumeCommand(string(session.Agent), tmpl, rawID, model)
 	if string(session.Agent) == "claude" {
 		if req.SkipPermissions {
 			cmd += " --dangerously-skip-permissions"
@@ -1164,10 +1300,6 @@ func (s *Server) humaResumeSession(
 				Cwd:      launchDir,
 			},
 		}, nil
-	}
-	if s.db.ReadOnly() {
-		return nil, apiError(http.StatusNotImplemented,
-			"session launch not available in remote mode")
 	}
 	if req.OpenerID != "" {
 		return s.humaResumeWithOpener(session, rawID, cmd, responseCmd, launchDir, req.OpenerID)

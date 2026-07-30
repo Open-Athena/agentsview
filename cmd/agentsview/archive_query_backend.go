@@ -11,6 +11,7 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/pricing"
+	"go.kenn.io/agentsview/internal/pricingrefresh"
 	"go.kenn.io/agentsview/internal/sync"
 )
 
@@ -249,7 +250,8 @@ func (b localArchiveQueryBackend) SessionUsage(
 	if known && !b.skipFreshData {
 		engine := sync.NewEngine(b.database, sync.EngineConfig{
 			AgentDirs:               b.cfg.AgentDirs,
-			Machine:                 "local",
+			IncludeCwdPrefixes:      b.cfg.SyncIncludeCwdPrefixes,
+			Machine:                 b.cfg.LocalMachineName,
 			BlockedResultCategories: b.cfg.ResultContentBlockedCategories,
 		})
 		if syncErr := engine.SyncSingleSessionContext(
@@ -263,7 +265,7 @@ func (b localArchiveQueryBackend) SessionUsage(
 		engine.Close()
 	}
 
-	u, err := b.database.GetSessionUsage(ctx, resolvedID)
+	u, err := b.database.GetSessionUsage(ctx, resolvedID, true)
 	if err != nil {
 		return nil, tokenUseExitErr,
 			fmt.Errorf("querying session usage: %w", err)
@@ -273,16 +275,16 @@ func (b localArchiveQueryBackend) SessionUsage(
 		return nil, tokenUseExitNotFound, nil
 	}
 	if len(u.UnpricedModels) > 0 && !b.offline {
-		refreshed, refErr := refreshPricingIfStale(
+		refreshed, refErr := pricingrefresh.RefreshIfStale(
 			b.database, pricing.FetchLiteLLMPricing,
-			pricingRefreshCooldown, time.Now(),
+			pricingrefresh.RefreshCooldown, time.Now(),
 		)
 		if refErr != nil {
 			fmt.Fprintf(os.Stderr,
 				"warning: pricing refresh failed: %v\n", refErr)
 		} else if refreshed {
 			if u2, e := b.database.GetSessionUsage(
-				ctx, resolvedID,
+				ctx, resolvedID, true,
 			); e == nil && u2 != nil {
 				u = u2
 			}

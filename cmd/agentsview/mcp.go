@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -17,6 +18,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
 	mcpserver "go.kenn.io/agentsview/internal/mcp"
 	"go.kenn.io/agentsview/internal/service"
 )
@@ -32,7 +34,7 @@ func newMCPCommand() *cobra.Command {
 StreamableHTTP, exposing read-only tools for searching and reading
 recorded agent sessions: search_sessions, list_sessions,
 get_session_overview, get_messages, search_content, and
-get_usage_summary.
+get_usage_summary, plus query_recall for distilled session knowledge.
 
 The server reads through the daemon path. By default each tool call talks to
 the local agentsview daemon, starting it when needed so a long-lived MCP server
@@ -148,7 +150,13 @@ func resolveMCPService(
 		if err != nil {
 			return nil, nil, err
 		}
-		return service.NewHTTPBackend(remote, token, false),
+		capabilities, err := service.ProbeHTTPServerCapabilities(
+			cmd.Context(), remote, token,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		return service.NewHTTPBackendForServer(remote, token, capabilities),
 			func() {}, nil
 	}
 	cfg, err := config.LoadPFlags(cmd.Flags())
@@ -172,6 +180,14 @@ type mcpDaemonService struct {
 
 func newMCPDaemonService(cfg config.Config) service.SessionService {
 	return &mcpDaemonService{cfg: cfg}
+}
+
+func (s *mcpDaemonService) SupportsRecallQueries() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	runtime := FindDaemonRuntime(s.cfg.DataDir, s.cfg.AuthToken)
+	return runtime == nil || !runtime.ReadOnly
 }
 
 func (s *mcpDaemonService) daemonService(
@@ -314,6 +330,46 @@ func (s *mcpDaemonService) UsagePairwiseComparison(
 		return nil, err
 	}
 	return svc.UsagePairwiseComparison(ctx, req)
+}
+
+func (s *mcpDaemonService) ListRecallEntries(
+	ctx context.Context, f service.RecallFilter,
+) (*service.RecallList, error) {
+	svc, err := s.daemonService(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return svc.ListRecallEntries(ctx, f)
+}
+
+func (s *mcpDaemonService) GetRecallEntry(
+	ctx context.Context, id string,
+) (*db.RecallEntry, error) {
+	svc, err := s.daemonService(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return svc.GetRecallEntry(ctx, id)
+}
+
+func (s *mcpDaemonService) QueryRecallEntries(
+	ctx context.Context, req service.RecallQuery,
+) (*service.RecallQueryResult, error) {
+	svc, err := s.daemonService(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return svc.QueryRecallEntries(ctx, req)
+}
+
+func (s *mcpDaemonService) ImportRecallEntries(
+	ctx context.Context, r io.Reader, opts db.RecallImportOptions,
+) (*db.RecallImportResult, error) {
+	svc, err := s.daemonService(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return svc.ImportRecallEntries(ctx, r, opts)
 }
 
 func (s *mcpDaemonService) ListSecrets(

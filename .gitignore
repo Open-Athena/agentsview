@@ -20,6 +20,7 @@ internal/web/dist/*
 
 # Test/build artifacts
 /dist/
+/.sqlite-include/
 *.out
 coverage.out
 *.test
@@ -43,6 +44,8 @@ __pycache__/
 
 # Build caches
 .gocache
+# Per-checkout golangci-lint cache isolates sibling worktrees.
+/.golangci-cache/
 .cache
 .gomodcache/
 .gopath/

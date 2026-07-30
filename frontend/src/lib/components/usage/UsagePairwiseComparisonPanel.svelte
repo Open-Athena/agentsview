@@ -1,16 +1,10 @@
 <script lang="ts">
-  import { Typeahead, type TypeaheadOption } from "@kenn-io/kit-ui";
+  import { Card, Typeahead, type TypeaheadOption } from "@kenn-io/kit-ui";
   import { usage } from "../../stores/usage.svelte.js";
   import { m } from "../../i18n/index.js";
   import type { UsagePairwiseDimension } from "../../api/types/usage.js";
-
-  function fmtCost(value: number): string {
-    return `$${value.toFixed(2)}`;
-  }
-
-  function fmtSignedCost(value: number): string {
-    return `${value >= 0 ? "+" : "-"}$${Math.abs(value).toFixed(2)}`;
-  }
+  import type { Money } from "../../money.js";
+  import { formatMoney, formatSignedMoney } from "../../money.js";
 
   function fmtCount(value: number): string {
     return String(value);
@@ -44,9 +38,9 @@
     return `${prefix}${(value * 100).toFixed(1)}%`;
   }
 
-  function fmtMaybeCost(value: number | null | undefined): string {
+  function fmtMaybeCost(value: Money | null | undefined): string {
     if (value == null) return m.shared_none();
-    return fmtCost(value);
+    return formatMoney(value);
   }
 
   function fmtMaybeTokens(value: number | null | undefined): string {
@@ -54,9 +48,9 @@
     return fmtTokens(value);
   }
 
-  function fmtMaybeSignedCost(value: number | null | undefined): string {
+  function fmtMaybeSignedCost(value: Money | null | undefined): string {
     if (value == null) return m.shared_none();
-    return fmtSignedCost(value);
+    return formatSignedMoney(value);
   }
 
   function fmtMaybeSignedTokens(value: number | null | undefined): string {
@@ -75,7 +69,9 @@
   ): TypeaheadOption[] {
     return optionsFor(dimension).map((option) => ({
       name: option,
-      label: option,
+      label: dimension === "project"
+        ? usage.pairwiseProjectLabel(option)
+        : option,
     }));
   }
 
@@ -115,9 +111,9 @@
     return [
       {
         label: m.usage_total_cost(),
-        left: fmtCost(comparison.left.totalCost),
-        right: fmtCost(comparison.right.totalCost),
-        delta: fmtSignedCost(comparison.deltas.totalCostDelta),
+        left: formatMoney(comparison.left.totalCost),
+        right: formatMoney(comparison.right.totalCost),
+        delta: formatSignedMoney(comparison.deltas.totalCostDelta),
         ratio: fmtRatio(comparison.deltas.totalCostDeltaRatio),
       },
       {
@@ -175,7 +171,7 @@
   </div>
 
   <div class="selectors">
-    <div class="side">
+    <Card level="default" padding="none" class="side">
       <span class="side-label">{m.usage_pairwise_left()}</span>
       <div class="side-controls">
         <label>
@@ -215,9 +211,9 @@
           </div>
         </label>
       </div>
-    </div>
+    </Card>
 
-    <div class="side">
+    <Card level="default" padding="none" class="side">
       <span class="side-label">{m.usage_pairwise_right()}</span>
       <div class="side-controls">
         <label>
@@ -257,22 +253,22 @@
           </div>
         </label>
       </div>
-    </div>
+    </Card>
   </div>
 
   {#if usage.errors.pairwise}
-    <div class="error-bar">
+    <Card level="default" padding="none" class="error-bar">
       <span>{usage.errors.pairwise}</span>
       <button class="retry-btn" onclick={() => usage.fetchAll()}>
         {m.shared_retry()}
       </button>
-    </div>
+    </Card>
   {:else if !hasSelection}
-    <div class="pairwise-note">
+    <Card level="default" padding="none" class="pairwise-note">
       {m.usage_pairwise_not_enough_data()}
-    </div>
+    </Card>
   {:else if usage.loading.pairwise && rows.length === 0}
-    <div class="pairwise-note">{m.shared_refresh()}</div>
+    <Card level="default" padding="none" class="pairwise-note">{m.shared_refresh()}</Card>
   {:else if rows.length > 0}
     <div class="table-wrap">
       <table>
@@ -339,11 +335,8 @@
     gap: 12px;
   }
 
-  .side {
+  .selectors :global(.side) {
     padding: 12px;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-md);
-    background: color-mix(in srgb, var(--bg-surface) 92%, transparent);
   }
 
   .side-label {
@@ -420,22 +413,24 @@
     font-size: 11px;
   }
 
-  .pairwise-note,
-  .error-bar {
+  .pairwise-panel :global(.pairwise-note) {
     padding: 12px;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-md);
-    background: var(--bg-surface);
     color: var(--text-muted);
     font-size: 12px;
   }
 
-  .error-bar {
+  .pairwise-panel :global(.error-bar) {
     display: flex;
     align-items: center;
     gap: 8px;
+    padding: 12px;
     border-color: var(--accent-red);
     color: var(--accent-red);
+    font-size: 12px;
+  }
+
+  .pairwise-panel :global(.error-bar > .kit-card__body) {
+    display: contents;
   }
 
   .retry-btn {

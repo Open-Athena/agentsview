@@ -57,6 +57,8 @@ func parseDiffAgentDirs(env *testEnv) map[parser.AgentType][]string {
 	add(parser.AgentKiro, env.kiroDir)
 	add(parser.AgentKilo, env.kiloDir)
 	add(parser.AgentShelley, env.shelleyDir)
+	add(parser.AgentTrae, env.traeDir)
+	add(parser.AgentWindsurf, env.windsurfDir)
 	add(parser.AgentAntigravityCLI, env.antigravityCLIDir)
 	return dirs
 }
@@ -2248,6 +2250,14 @@ func TestParseDiffEngineRefusesWrites(t *testing.T) {
 		"DELETE FROM secret_findings WHERE session_id = ?", sessionID)
 	require.Error(t, diffEngine.RecomputeSignals(ctx, sessionID),
 		"RecomputeSignals on a report-only engine must error")
+	mutateDB(t, env,
+		"UPDATE sessions SET secret_leak_count = 0, "+
+			"secrets_rules_version = '', quality_signal_version = 0"+
+			" WHERE id = ?", sessionID)
+	mutateDB(t, env,
+		"DELETE FROM secret_findings WHERE session_id = ?", sessionID)
+	require.Error(t, diffEngine.BackfillSignalComputer()(ctx, sessionID),
+		"BackfillSignalComputer on a report-only engine must error")
 	mutateDB(t, env,
 		"UPDATE sessions SET secret_leak_count = 0, "+
 			"secrets_rules_version = '', quality_signal_version = 0"+

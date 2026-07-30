@@ -8,12 +8,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -110,14 +112,14 @@ func TestSessionSummaryExportRowsAreContentFreeAndMetadataScoped(t *testing.T) {
 		IsAutomated:      true,
 		Cwd:              "/repo/alpha/worktrees/feature/sub",
 	})
-	reported := 0.0123
+	reported := money.MustParseDollars("0.0123")
 	require.NoError(t, d.ReplaceSessionUsageEvents("alpha-child", []UsageEvent{{
 		Source:          "provider",
 		Model:           "model-reported",
 		InputTokens:     200,
 		OutputTokens:    40,
 		ReasoningTokens: 7,
-		CostUSD:         &reported,
+		Cost:            &reported,
 		OccurredAt:      "2026-05-01T10:04:00Z",
 	}}), "replace usage events")
 
@@ -193,7 +195,7 @@ func TestSessionSummaryExportRowsAreContentFreeAndMetadataScoped(t *testing.T) {
 	require.NotNil(t, child.RelationshipType, "child relationship_type")
 	assert.Equal(t, "subagent", *child.RelationshipType)
 	assert.Equal(t, 7, child.ModelUsage.ReasoningTokens)
-	assert.Equal(t, reported, child.ModelUsage.CostUSD)
+	assert.Equal(t, reported, child.ModelUsage.Cost)
 	assert.True(t, child.ModelUsage.HasCost)
 	require.NotNil(t, child.Worktree, "child worktree")
 	assert.Equal(t, Ptr("feature"), child.Worktree.Name)
@@ -211,9 +213,13 @@ func TestSessionSummaryExportRowsAreContentFreeAndMetadataScoped(t *testing.T) {
 		result.Pricing.Models["model-computed"].CostSource)
 	assert.Equal(t, export.CostSourceMixed,
 		result.Pricing.Models["model-reported"].CostSource)
-	require.Contains(t, result.Projects, "alpha")
-	require.Contains(t, result.Projects, "beta")
-	require.NotContains(t, result.Projects, "unreturned")
+	projectLabels := make([]string, 0, len(result.Projects))
+	for key, project := range result.Projects {
+		assert.NotContains(t, key, "alpha")
+		assert.NotContains(t, key, "beta")
+		projectLabels = append(projectLabels, project.DisplayLabel)
+	}
+	assert.ElementsMatch(t, []string{"alpha", "beta"}, projectLabels)
 	assertContentFreeJSON(t, result)
 
 	for _, row := range result.Rows {
@@ -221,6 +227,165 @@ func TestSessionSummaryExportRowsAreContentFreeAndMetadataScoped(t *testing.T) {
 		assertJSONHasKey(t, row, "relationship_type")
 		assertContentFreeJSON(t, row)
 	}
+}
+
+func TestSessionSummaryExportKeepsFirstConclusiveProjectIdentity(t *testing.T) {
+	d := testSessionExportDB(t)
+	ctx := context.Background()
+	insertExportSession(t, d, Session{
+		ID:               "stable-project-session",
+		Project:          "/Users/alice/private/project",
+		Machine:          "laptop",
+		Agent:            "codex",
+		Cwd:              "/Users/alice/private/project/pkg",
+		StartedAt:        Ptr("2026-05-01T10:00:00Z"),
+		EndedAt:          Ptr("2026-05-01T10:01:00Z"),
+		MessageCount:     1,
+		UserMessageCount: 1,
+	})
+	first := export.ProjectIdentityObservation{
+		SessionID:            "stable-project-session",
+		Project:              "/Users/alice/private/project",
+		Machine:              "laptop",
+		RootPath:             "/Users/alice/private/project",
+		GitRemote:            "https://github.com/acme/project.git",
+		GitRemoteName:        "origin",
+		RepositoryPath:       "/Users/alice/private/project",
+		WorktreeRootPath:     "/Users/alice/private/project",
+		WorktreeRelationship: export.WorktreeMain,
+		CheckoutState:        export.CheckoutBranch,
+		GitBranch:            "main",
+		ObservedAt:           time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC),
+	}
+	require.NoError(t, d.UpsertProjectIdentityObservation(ctx, first))
+
+	missingDirectoryRefresh := first
+	missingDirectoryRefresh.RootPath = "/Users/alice/private/project/pkg"
+	missingDirectoryRefresh.GitRemote = ""
+	missingDirectoryRefresh.GitRemoteName = ""
+	missingDirectoryRefresh.RemoteResolution = export.ProjectResolutionUnknown
+	missingDirectoryRefresh.ObservedAt = first.ObservedAt.Add(time.Hour)
+	require.NoError(t, d.UpsertProjectIdentityObservation(ctx, missingDirectoryRefresh))
+
+	changedRemoteRefresh := first
+	changedRemoteRefresh.GitRemote = "https://gitlab.com/acme/other.git"
+	changedRemoteRefresh.ObservedAt = first.ObservedAt.Add(2 * time.Hour)
+	require.NoError(t, d.UpsertProjectIdentityObservation(ctx, changedRemoteRefresh))
+
+	result, err := d.ExportSessionSummaries(ctx, SessionExportOptions{Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, result.Rows, 1)
+	require.NotNil(t, result.Rows[0].ProjectReference.Identity)
+	assert.Equal(t, "github.com/acme/project",
+		result.Rows[0].ProjectReference.Identity.NormalizedRemote)
+	assert.NotEmpty(t, result.Rows[0].ProjectReference.Identity.RootKey,
+		"session row retains its immutable machine-local root")
+	assert.Equal(t, export.WorktreeMain,
+		result.Rows[0].ProjectReference.Worktree.Relationship)
+	assert.Equal(t, export.CheckoutBranch,
+		result.Rows[0].ProjectReference.Checkout.State)
+	assert.Equal(t, "main", result.Rows[0].ProjectReference.Checkout.Branch)
+	assert.Empty(t, result.Rows[0].ProjectReference.DisplayLabel)
+	project := result.Projects[result.Rows[0].ProjectReference.ProjectKey]
+	require.NotNil(t, project.Identity)
+	assert.Empty(t, project.Identity.RootKey,
+		"remote-backed catalog entries must not select a row-dependent root")
+
+	payload, err := json.Marshal(result)
+	require.NoError(t, err)
+	assert.NotContains(t, string(payload), "/Users/alice")
+}
+
+func TestSessionSummaryExportCatalogMarksConflictingSessionIdentitiesAmbiguous(
+	t *testing.T,
+) {
+	d := testSessionExportDB(t)
+	ctx := context.Background()
+	for i, remote := range []string{
+		"https://github.com/acme/first.git",
+		"https://github.com/acme/second.git",
+	} {
+		id := fmt.Sprintf("shared-project-%d", i)
+		insertExportSession(t, d, Session{
+			ID: id, Project: "shared-project", Machine: "laptop", Agent: "codex",
+			StartedAt: Ptr(fmt.Sprintf("2026-05-01T10:0%d:00Z", i)),
+			EndedAt:   Ptr(fmt.Sprintf("2026-05-01T10:0%d:30Z", i)),
+		})
+		require.NoError(t, d.UpsertProjectIdentityObservation(ctx,
+			export.ProjectIdentityObservation{
+				SessionID: id, Project: "shared-project", Machine: "laptop",
+				RootPath: "/workspace/shared-project", GitRemote: remote,
+				GitRemoteName: "origin", RepositoryPath: "/workspace/shared-project",
+				WorktreeRootPath:     "/workspace/shared-project",
+				WorktreeRelationship: export.WorktreeMain,
+				ObservedAt:           time.Date(2026, 5, 1, 10, i, 0, 0, time.UTC),
+			},
+		))
+	}
+
+	result, err := d.ExportSessionSummaries(ctx, SessionExportOptions{Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, result.Rows, 2)
+	require.Len(t, result.Projects, 1)
+	for _, row := range result.Rows {
+		require.NotNil(t, row.ProjectReference.Identity)
+		assert.Equal(t, row.ProjectReference.ProjectKey,
+			result.Rows[0].ProjectReference.ProjectKey)
+	}
+	for _, project := range result.Projects {
+		assert.Equal(t, export.ProjectResolutionAmbiguous, project.Resolution)
+		assert.Nil(t, project.Identity)
+	}
+}
+
+func TestSessionSummaryExportKeepsConclusiveMachineRootSnapshot(t *testing.T) {
+	d := testSessionExportDB(t)
+	ctx := context.Background()
+	insertExportSession(t, d, Session{
+		ID: "machine-root-session", Project: "local-app", Machine: "laptop",
+		Agent: "codex", Cwd: "/workspace/local-app",
+		StartedAt: Ptr("2026-05-01T10:00:00Z"),
+		EndedAt:   Ptr("2026-05-01T10:01:00Z"),
+	})
+	first := export.ProjectIdentityObservation{
+		SessionID: "machine-root-session", Project: "local-app",
+		Machine: "laptop", RootPath: "/workspace/local-app",
+		RepositoryPath:   "/workspace/local-app",
+		RemoteResolution: export.ProjectResolutionResolved,
+		ObservedAt:       time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC),
+	}
+	require.NoError(t, d.UpsertProjectIdentityObservation(ctx, first))
+	changed := first
+	changed.GitRemote = "https://github.com/acme/local-app.git"
+	changed.ObservedAt = first.ObservedAt.Add(time.Hour)
+	require.NoError(t, d.UpsertProjectIdentityObservation(ctx, changed))
+
+	result, err := d.ExportSessionSummaries(ctx, SessionExportOptions{Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, result.Rows, 1)
+	require.NotNil(t, result.Rows[0].ProjectReference.Identity)
+	assert.Equal(t, export.ProjectKindMachineRoot,
+		result.Rows[0].ProjectReference.Identity.Kind)
+	assert.Empty(t, result.Rows[0].ProjectReference.Identity.NormalizedRemote)
+}
+
+func TestSessionSummaryExportWithoutSnapshotDoesNotDeriveFromCWD(t *testing.T) {
+	d := testSessionExportDB(t)
+	insertExportSession(t, d, Session{
+		ID: "no-snapshot", Project: "app", Machine: "laptop",
+		Agent: "codex", Cwd: "/workspace/app/private/subdir",
+		StartedAt: Ptr("2026-05-01T10:00:00Z"),
+		EndedAt:   Ptr("2026-05-01T10:01:00Z"),
+	})
+
+	result, err := d.ExportSessionSummaries(
+		context.Background(), SessionExportOptions{Limit: 10},
+	)
+	require.NoError(t, err)
+	require.Len(t, result.Rows, 1)
+	assert.Equal(t, export.ProjectResolutionUnknown,
+		result.Rows[0].ProjectReference.Resolution)
+	assert.Nil(t, result.Rows[0].ProjectReference.Identity)
 }
 
 func TestSessionSummaryExportIncludesReasoningOnlyUsageRows(t *testing.T) {
@@ -258,7 +423,7 @@ func TestSessionSummaryExportIncludesReasoningOnlyUsageRows(t *testing.T) {
 	assert.Zero(t, usage.OutputTokens)
 	assert.Equal(t, 25, usage.ReasoningTokens)
 	assert.True(t, usage.HasCost)
-	assert.InDelta(t, 0.0005, usage.CostUSD, 0.0000001)
+	assert.Equal(t, money.MustParseDollars("0.0005"), usage.Cost)
 	require.Contains(t, usage.ByModel, "model-computed")
 	assert.Equal(t, 25, usage.ByModel["model-computed"].ReasoningTokens)
 	assert.Equal(t, export.CostSourceComputed,
@@ -308,7 +473,7 @@ func TestSessionSummaryExportIncludesMessageReasoningTokens(t *testing.T) {
 	assert.Zero(t, usage.OutputTokens)
 	assert.Equal(t, 25, usage.ReasoningTokens)
 	assert.True(t, usage.HasCost)
-	assert.InDelta(t, 0.0006, usage.CostUSD, 0.0000001)
+	assert.Equal(t, money.MustParseDollars("0.0006"), usage.Cost)
 	require.Contains(t, usage.ByModel, "model-computed")
 	assert.Equal(t, 25, usage.ByModel["model-computed"].ReasoningTokens)
 }
@@ -861,6 +1026,161 @@ func TestSessionExportCursorPrefixUsesSameSnapshotAsPageQuery(t *testing.T) {
 	assert.Equal(t, snapshotDigest, afterDigest)
 }
 
+func TestSessionExportUsageUsesPageReadSnapshot(t *testing.T) {
+	d := testSessionExportDB(t)
+	ctx := context.Background()
+	seedSessionExportPricing(t, d)
+	insertExportSession(t, d, Session{
+		ID: "usage-snapshot", Project: "alpha", Machine: "local",
+	})
+	insertMessages(t, d, Message{
+		SessionID: "usage-snapshot", Ordinal: 0, Role: "assistant",
+		Timestamp: "2026-05-01T10:00:00Z", Model: "model-computed",
+		TokenUsage:       json.RawMessage(`{"input_tokens":100,"output_tokens":10}`),
+		HasContextTokens: true,
+		HasOutputTokens:  true,
+	})
+
+	tx, err := d.getReader().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	require.NoError(t, err, "begin page snapshot")
+	defer func() { require.NoError(t, tx.Rollback(), "rollback page snapshot") }()
+	var messageCount int
+	require.NoError(t, tx.QueryRowContext(ctx,
+		`SELECT count(*) FROM messages WHERE session_id = ?`,
+		"usage-snapshot").Scan(&messageCount), "establish page snapshot")
+	require.Equal(t, 1, messageCount)
+
+	_, err = d.getWriter().ExecContext(ctx, `
+		UPDATE messages
+		SET token_usage = '{"input_tokens":900,"output_tokens":90}'
+		WHERE session_id = ?`, "usage-snapshot")
+	require.NoError(t, err, "mutate live usage after page snapshot")
+
+	rows := []SessionSummaryRow{{ID: "usage-snapshot"}}
+	_, err = d.attachSessionExportUsage(ctx, tx, rows)
+	require.NoError(t, err, "attach usage from page snapshot")
+	require.NotNil(t, rows[0].ModelUsage)
+	assert.Equal(t, 100, rows[0].ModelUsage.InputTokens)
+	assert.Equal(t, 10, rows[0].ModelUsage.OutputTokens)
+}
+
+func TestSessionExportCopilotReportedCostReplacesSessionEstimates(t *testing.T) {
+	d := testSessionExportDB(t)
+	ctx := context.Background()
+	require.NoError(t, d.UpsertModelPricing([]ModelPricing{
+		{ModelPattern: "copilot-model-a", InputPerMTok: money.MustParseDollars("10")},
+		{ModelPattern: "copilot-model-b", InputPerMTok: money.MustParseDollars("20")},
+	}))
+	insertExportSession(t, d, Session{
+		ID: "copilot:export-authoritative", Project: "alpha", Machine: "local",
+		Agent: "copilot", StartedAt: Ptr("2026-06-16T10:00:00Z"),
+		EndedAt: Ptr("2026-06-16T10:10:00Z"), UserMessageCount: 1,
+	})
+	reportedCost := money.MustParseDollars("0.03")
+	require.NoError(t, d.ReplaceSessionUsageEvents(
+		"copilot:export-authoritative",
+		[]UsageEvent{
+			{
+				Source: "shutdown", Model: "copilot-model-a",
+				InputTokens: 1_000_000,
+				OccurredAt:  "2026-06-16T10:05:00Z", DedupKey: "first",
+			},
+			{
+				Source: "shutdown", Model: "copilot-model-b",
+				InputTokens: 1_000_000,
+				Cost:        &reportedCost, CostStatus: "exact",
+				CostSource: CopilotReportedCostSource,
+				OccurredAt: "2026-06-16T10:10:00Z", DedupKey: "final",
+			},
+		},
+	))
+
+	result, err := d.ExportSessionSummaries(ctx, SessionExportOptions{
+		Filter: SessionFilter{IncludeChildren: true}, Limit: 10, Format: "json",
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Rows, 1)
+	require.NotNil(t, result.Rows[0].ModelUsage)
+	assert.True(t, result.Rows[0].ModelUsage.HasCost)
+	assert.Equal(t, reportedCost, result.Rows[0].ModelUsage.Cost)
+	assert.Equal(t, money.MustParseDollars("0.01"),
+		result.Rows[0].ModelUsage.ByModel["copilot-model-a"].Cost)
+	assert.Equal(t, money.MustParseDollars("0.02"),
+		result.Rows[0].ModelUsage.ByModel["copilot-model-b"].Cost)
+	assert.Equal(t, result.Rows[0].ModelUsage.Cost,
+		money.MustAdd(
+			result.Rows[0].ModelUsage.ByModel["copilot-model-a"].Cost,
+			result.Rows[0].ModelUsage.ByModel["copilot-model-b"].Cost,
+		))
+	assert.Equal(t, export.CostSourceComputed,
+		result.Rows[0].ModelUsage.ByModel["copilot-model-a"].CostSource)
+	assert.Equal(t, export.CostSourceComputed,
+		result.Rows[0].ModelUsage.ByModel["copilot-model-b"].CostSource)
+	require.NotNil(t, result.Pricing)
+	assert.Equal(t, export.CostSourceMixed, result.Pricing.CostSource)
+}
+
+func TestAllSessionExportKeepsOnePricingSnapshotAcrossPages(t *testing.T) {
+	d := testSessionExportDB(t)
+	ctx := context.Background()
+	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
+		ModelPattern: "snapshot-model", InputPerMTok: money.MustParseDollars("1"),
+	}}))
+	for i, endedAt := range []string{
+		"2026-05-01T10:00:00Z", "2026-05-01T09:00:00Z",
+	} {
+		id := fmt.Sprintf("pricing-page-%d", i)
+		insertExportSession(t, d, Session{
+			ID: id, Project: "alpha", Machine: "local",
+			EndedAt: &endedAt, UserMessageCount: 1,
+		})
+		insertMessages(t, d, Message{
+			SessionID: id, Ordinal: 0, Role: "assistant",
+			Timestamp: endedAt, Model: "snapshot-model",
+			TokenUsage:       json.RawMessage(`{"input_tokens":1000000}`),
+			HasContextTokens: true,
+		})
+	}
+
+	pages, err := d.exportAllSessionSummaries(ctx, SessionExportOptions{
+		Limit: 1, Filter: SessionFilter{IncludeChildren: true},
+	}, func(page int) error {
+		if page != 1 {
+			return nil
+		}
+		return d.UpsertModelPricing([]ModelPricing{{
+			ModelPattern: "snapshot-model", InputPerMTok: money.MustParseDollars("99"),
+		}})
+	})
+	require.NoError(t, err)
+	require.Len(t, pages, 2)
+	require.NotEmpty(t, pages[0].NextCursor)
+	internalCursor, err := d.decodeSessionExportCursor(pages[0].NextCursor)
+	require.NoError(t, err)
+	assert.Zero(t, internalCursor.SnapshotCount)
+	assert.Empty(t, internalCursor.SnapshotDigest)
+	assert.Zero(t, internalCursor.PrefixCount)
+	assert.Empty(t, internalCursor.PrefixDigest)
+	require.NotNil(t, pages[0].Pricing)
+	require.NotNil(t, pages[1].Pricing)
+	assert.Equal(t, pages[0].Pricing.Digest, pages[1].Pricing.Digest)
+	for _, page := range pages {
+		require.Len(t, page.Rows, 1)
+		require.NotNil(t, page.Rows[0].ModelUsage)
+		assert.Equal(t, money.MustParseDollars("1.0"), page.Rows[0].ModelUsage.Cost)
+	}
+}
+
+func TestAllSessionExportHonorsCancellation(t *testing.T) {
+	d := testSessionExportDB(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := d.ExportAllSessionSummaries(ctx, SessionExportOptions{Limit: 1})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
 func TestSessionExportCursorResetsWhenRowMovesBeforeCursor(t *testing.T) {
 	d := testSessionExportDB(t)
 	ctx := context.Background()
@@ -1092,6 +1412,117 @@ func TestSessionExportCursorAllowsEquivalentFilters(t *testing.T) {
 	assert.Equal(t, []string{"filter-b"}, sessionExportRowIDs(second.Rows))
 }
 
+func TestSessionExportCursorPreservesTimezoneFilter(t *testing.T) {
+	d := testSessionExportDB(t)
+	ctx := context.Background()
+	for _, row := range []struct {
+		id, started, ended string
+	}{
+		{"new-york-late", "2024-06-17T02:30:00Z", "2024-06-17T03:00:00Z"},
+		{"new-york-earlier", "2024-06-17T01:30:00Z", "2024-06-17T02:00:00Z"},
+		{"utc-only", "2024-06-16T01:30:00Z", "2024-06-16T02:00:00Z"},
+	} {
+		insertExportSession(t, d, Session{
+			ID:               row.id,
+			Project:          "timezone-cursor",
+			Machine:          "local",
+			Agent:            "claude",
+			StartedAt:        Ptr(row.started),
+			EndedAt:          Ptr(row.ended),
+			MessageCount:     1,
+			UserMessageCount: 1,
+		})
+	}
+
+	first, err := d.ExportSessionSummaries(ctx, SessionExportOptions{
+		Filter: SessionFilter{
+			Project:  "timezone-cursor",
+			Date:     "2024-06-16",
+			Timezone: " America/New_York ",
+		},
+		Limit: 1,
+	})
+	require.NoError(t, err, "first page")
+	require.Equal(t, []string{"new-york-late"}, sessionExportRowIDs(first.Rows))
+	require.NotEmpty(t, first.NextCursor)
+
+	t.Run("cursor owned filter", func(t *testing.T) {
+		second, err := d.ExportSessionSummaries(ctx, SessionExportOptions{
+			Cursor:          first.NextCursor,
+			UseCursorFilter: true,
+			Limit:           1,
+		})
+		require.NoError(t, err, "resume with embedded filter")
+		assert.Equal(t,
+			[]string{"new-york-earlier"}, sessionExportRowIDs(second.Rows))
+		assert.Empty(t, second.NextCursor)
+	})
+
+	t.Run("equivalent timezone", func(t *testing.T) {
+		second, err := d.ExportSessionSummaries(ctx, SessionExportOptions{
+			Filter: SessionFilter{
+				Project:  "timezone-cursor",
+				Date:     "2024-06-16",
+				Timezone: "America/New_York",
+			},
+			Cursor: first.NextCursor,
+			Limit:  1,
+		})
+		require.NoError(t, err, "resume with equivalent timezone")
+		assert.Equal(t,
+			[]string{"new-york-earlier"}, sessionExportRowIDs(second.Rows))
+	})
+
+	t.Run("changed timezone", func(t *testing.T) {
+		_, err := d.ExportSessionSummaries(ctx, SessionExportOptions{
+			Filter: SessionFilter{
+				Project:  "timezone-cursor",
+				Date:     "2024-06-16",
+				Timezone: "UTC",
+			},
+			Cursor: first.NextCursor,
+			Limit:  1,
+		})
+		require.Error(t, err, "changed timezone")
+		assert.ErrorIs(t, err, ErrSessionExportCursorConflict)
+	})
+}
+
+func TestSessionExportCursorTreatsDefaultAndExplicitUTCAsEquivalent(t *testing.T) {
+	d := testSessionExportDB(t)
+	ctx := context.Background()
+	for _, row := range []struct {
+		id, started, ended string
+	}{
+		{"utc-later", "2024-06-16T03:00:00Z", "2024-06-16T04:00:00Z"},
+		{"utc-earlier", "2024-06-16T01:00:00Z", "2024-06-16T02:00:00Z"},
+	} {
+		insertExportSession(t, d, Session{
+			ID: row.id, Project: "utc-cursor", Machine: "local", Agent: "claude",
+			StartedAt: new(row.started), EndedAt: new(row.ended),
+			MessageCount: 1, UserMessageCount: 1,
+		})
+	}
+
+	first, err := d.ExportSessionSummaries(ctx, SessionExportOptions{
+		Filter: SessionFilter{Project: "utc-cursor", Date: "2024-06-16"},
+		Limit:  1,
+	})
+	require.NoError(t, err, "first page")
+	require.Equal(t, []string{"utc-later"}, sessionExportRowIDs(first.Rows))
+	require.NotEmpty(t, first.NextCursor)
+
+	second, err := d.ExportSessionSummaries(ctx, SessionExportOptions{
+		Filter: SessionFilter{
+			Project: "utc-cursor", Date: "2024-06-16", Timezone: "UTC",
+		},
+		Cursor: first.NextCursor,
+		Limit:  1,
+	})
+	require.NoError(t, err, "explicit UTC should match the default timezone")
+	assert.Equal(t, []string{"utc-earlier"}, sessionExportRowIDs(second.Rows))
+}
+
 func TestSessionExportCursorTamperingReturnsInvalidCursor(t *testing.T) {
 	ctx := context.Background()
 	d := testSessionExportDB(t)
@@ -1201,24 +1632,24 @@ func seedSessionExportPricing(t *testing.T, d *DB) {
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{
 		{
 			ModelPattern:         "model-computed",
-			InputPerMTok:         10,
-			OutputPerMTok:        20,
-			CacheCreationPerMTok: 30,
-			CacheReadPerMTok:     1,
+			InputPerMTok:         money.MustParseDollars("10"),
+			OutputPerMTok:        money.MustParseDollars("20"),
+			CacheCreationPerMTok: money.MustParseDollars("30"),
+			CacheReadPerMTok:     money.MustParseDollars("1"),
 		},
 		{
 			ModelPattern:         "model-reported",
-			InputPerMTok:         1,
-			OutputPerMTok:        2,
-			CacheCreationPerMTok: 3,
-			CacheReadPerMTok:     0.5,
+			InputPerMTok:         money.MustParseDollars("1"),
+			OutputPerMTok:        money.MustParseDollars("2"),
+			CacheCreationPerMTok: money.MustParseDollars("3"),
+			CacheReadPerMTok:     money.MustParseDollars("0.5"),
 		},
 		{
 			ModelPattern:         "unreturned-model",
-			InputPerMTok:         100,
-			OutputPerMTok:        200,
-			CacheCreationPerMTok: 300,
-			CacheReadPerMTok:     50,
+			InputPerMTok:         money.MustParseDollars("100"),
+			OutputPerMTok:        money.MustParseDollars("200"),
+			CacheCreationPerMTok: money.MustParseDollars("300"),
+			CacheReadPerMTok:     money.MustParseDollars("50"),
 		},
 	}), "upsert pricing")
 }

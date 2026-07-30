@@ -63,7 +63,14 @@ func Classify(
 	// message follows the last assistant turn, the agent is no
 	// longer parked — the user has already replied, so the UI
 	// should not show a "waiting for you" indicator.
-	lastIsAssistant := messages[len(messages)-1].Role == RoleAssistant
+	lastIsAssistant := false
+	for _, m := range slices.Backward(messages) {
+		if m.IsSystem {
+			continue
+		}
+		lastIsAssistant = m.Role == RoleAssistant
+		break
+	}
 	if lastIsAssistant && isAwaitingUserStopReason(stopReason) {
 		return TerminationAwaitingUser
 	}
@@ -90,8 +97,14 @@ func isAwaitingUserStopReason(stopReason string) bool {
 // in forked sessions or malformed transcripts) must not retroactively
 // mark the final unresolved call as resolved.
 func hasOrphanedToolCall(messages []ParsedMessage) bool {
+	if len(messages) == 0 {
+		return false
+	}
 	lastAssistantIdx := -1
 	for i, v := range slices.Backward(messages) {
+		if v.IsSystem {
+			continue
+		}
 		if v.Role == RoleAssistant {
 			lastAssistantIdx = i
 			break
@@ -110,6 +123,23 @@ func hasOrphanedToolCall(messages []ParsedMessage) bool {
 		for _, tr := range m.ToolResults {
 			if tr.ToolUseID != "" {
 				resolved[tr.ToolUseID] = true
+			}
+		}
+	}
+	// Also treat tool calls with embedded results (e.g. RooCode
+	// stores results directly in ResultEvents) as resolved — but only
+	// through events that indicate the call finished or produced
+	// output. Codex subagent "running" notifications stream in while
+	// the wait call is still executing and must keep it pending.
+	for i := range last.ToolCalls {
+		tc := &last.ToolCalls[i]
+		if tc.ToolUseID == "" {
+			continue
+		}
+		for _, ev := range tc.ResultEvents {
+			if ev.Status != "running" {
+				resolved[tc.ToolUseID] = true
+				break
 			}
 		}
 	}

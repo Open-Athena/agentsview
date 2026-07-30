@@ -4,6 +4,7 @@ import { resolveViewToken } from "./lib/utils/viewToken.js";
 import { SNAPSHOT } from "./lib/utils/snapshot.js";
 import { viewMeta } from "./lib/stores/viewMeta.svelte.js";
 import "@kenn-io/kit-ui/theme.css";
+import "@kenn-io/kit-ui/mermaid.css";
 import "./app.css";
 import { initI18n } from "./lib/i18n/index.js";
 import { installPerfFetchInstrumentation } from "./lib/stores/perf.svelte.js";

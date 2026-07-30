@@ -134,6 +134,29 @@
   "status_bar_synced_ago": "synced {time}",
   "status_bar_build": "Build: {commit}",
   "command_palette_placeholder": "Search sessions and messages...",
+  "command_palette_search_mode_label": "Search mode",
+  "command_palette_mode_fulltext": "Full text",
+  "command_palette_mode_semantic": "Semantic",
+  "command_palette_mode_hybrid": "Hybrid",
+  "command_palette_search_error": "Search unavailable",
+  "command_palette_search_failed": "Search failed. Please try again.",
+  "command_palette_semantic_setup_title": "Semantic search isn't set up",
+  "command_palette_semantic_setup_config_step": "1. Add a [vector] section to config.toml, adjusting the model and endpoint for your embeddings server (any OpenAI-compatible endpoint works, e.g. Ollama):",
+  "command_palette_semantic_setup_build_step": "2. Restart the daemon, then build the index:",
+  "command_palette_semantic_copy_config": "Copy config snippet",
+  "command_palette_semantic_copy_command": "Copy command",
+  "command_palette_semantic_copied": "Copied!",
+  "command_palette_semantic_disabled_title": "Semantic search is disabled",
+  "command_palette_semantic_ready_title": "Semantic index not built yet",
+  "command_palette_semantic_ready_intro": "Semantic search is configured, but the embeddings index hasn't been built for this archive.",
+  "command_palette_semantic_build_button": "Build embeddings",
+  "command_palette_semantic_build_hint": "The build runs on the server in the background; this search re-runs when it finishes.",
+  "command_palette_semantic_building_title": "Building embeddings index...",
+  "command_palette_semantic_building_scanning": "Scanning the archive...",
+  "command_palette_semantic_building_progress": "{percentLabel} embedded",
+  "command_palette_semantic_failed_title": "Embeddings build failed",
+  "command_palette_search_timeout_title": "Search took too long",
+  "command_palette_search_timeout_detail": "Try again. The first Semantic or Hybrid search can be slower while the embedding model warms up.",
   "command_palette_relevance": "Relevance",
   "command_palette_recency": "Recency",
   "command_palette_searching": "Searching...",
@@ -156,6 +179,39 @@
   "session_breadcrumb_copy_session_id_value": "Copy session ID: {id}",
   "session_breadcrumb_copied": "Copied!",
   "session_breadcrumb_estimated_session_cost": "Estimated session cost",
+  "session_breadcrumb_total_cost": "Total",
+  "session_breadcrumb_total_cost_title": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "Total cost including {countLabel} subagent",
+        "countPlural=other": "Total cost including {countLabel} subagents"
+      }
+    }
+  ],
+  "session_breadcrumb_usage_breakdown_title": "Session usage breakdown",
+  "session_breadcrumb_usage_breakdown_loading": "Loading usage...",
+  "session_breadcrumb_usage_breakdown_steps": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} step",
+        "countPlural=other": "{countLabel} steps"
+      }
+    }
+  ],
   "session_breadcrumb_copy_link_to_session": "Copy link to session",
   "session_breadcrumb_show_session_analysis": "Show session analysis",
   "session_breadcrumb_hide_session_analysis": "Hide session analysis",
@@ -171,6 +227,8 @@
   "session_breadcrumb_path_copied": "Path copied!",
   "session_breadcrumb_opened_in": "Opened in {target}",
   "session_breadcrumb_failed_to_open": "Failed to open",
+  "session_breadcrumb_open_in_codex_desktop": "Open in Codex Desktop",
+  "session_breadcrumb_open_in_claude_code": "Open in Claude Code",
   "session_breadcrumb_summary_mode": "Summary mode",
   "session_breadcrumb_summary_mode_tooltip": "Tool results, thinking, and diffs are missing from this transcript. Full fidelity needs the agy-reader sidecar — install it, or if installed, let it catch up. Click to learn how.",
   "session_breadcrumb_malformed_lines": [
@@ -218,6 +276,10 @@
   "session_find_close": "Close find bar",
   "message_list_empty": "Select a session to view messages",
   "message_list_loading": "Loading messages...",
+  "read_progress_boundary": "Read progress boundary",
+  "read_progress_new_messages": "New messages",
+  "read_progress_earlier_messages": "Earlier messages",
+  "read_progress_unread_messages": "Unread messages",
   "code_block_copy_code_block": "Copy code block",
   "code_block_copied_code_block": "Copied code block",
   "code_block_copy_code": "Copy code",
@@ -558,6 +620,22 @@
   ],
   "analytics_tool_usage_trend_tooltip": "{date} | {total} total | {parts}",
   "analytics_tool_usage_empty": "No tool usage data",
+  "analytics_tool_usage_loading": "Loading tool usage...",
+  "analytics_tool_usage_top_tools": "Top tools",
+  "analytics_tool_usage_sessions": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} session",
+        "countPlural=other": "{countLabel} sessions"
+      }
+    }
+  ],
   "analytics_by_category": "By Category",
   "analytics_by_agent": "By Agent",
   "analytics_by_project": "By Project",
@@ -613,6 +691,7 @@
   "analytics_granularity_day": "Day",
   "analytics_granularity_week": "Week",
   "analytics_granularity_month": "Month",
+  "analytics_granularity_label": "Granularity",
   "analytics_activity_empty": "No activity data",
   "analytics_activity_title": "Activity",
   "analytics_heatmap_showing_recent_year": "Showing most recent year",
@@ -725,6 +804,13 @@
   "analytics_top_skills_agents": "Agents",
   "analytics_top_skills_projects": "Projects: {projects}",
   "analytics_top_skills_empty": "No skill usage data",
+  "analytics_skill_trend_title": "Skill Usage Over Time",
+  "analytics_skill_trend_other": "Other",
+  "analytics_skill_trend_legend": "Toggle skills",
+  "analytics_skill_trend_chart_label": "Skill usage over time. Use the left and right arrow keys to inspect dates.",
+  "analytics_skill_trend_date": "Date",
+  "analytics_skill_trend_loading": "Loading skill usage...",
+  "analytics_skill_trend_empty": "No skill usage data",
   "usage_model": "Model",
   "usage_models": "Models",
   "usage_refresh": "Refresh usage data",
@@ -780,6 +866,9 @@
   "usage_top_sessions_by_cost": "Top Sessions by Cost",
   "settings_title": "Settings",
   "settings_loading": "Loading settings...",
+  "settings_date_ranges_title": "Date ranges",
+  "settings_date_ranges_description": "Share date selections across Sessions, Usage, Activity, Trends, and Insights.",
+  "settings_date_ranges_link": "Link date ranges across pages",
   "settings_resync_title_unavailable": "Full resync unavailable in read-only mode",
   "settings_resync_unavailable_hint": "Unavailable while connected to a read-only backend",
   "settings_resync_hint": "Re-scan all session files from scratch",
@@ -789,6 +878,8 @@
   "settings_language_english": "English",
   "settings_language_simplified_chinese": "Simplified Chinese",
   "settings_language_traditional_chinese": "Traditional Chinese",
+  "settings_language_korean": "Korean",
+  "settings_language_french": "French",
   "settings_language_no_results": "No languages found",
   "nav_recent_edits": "Recent Edits",
   "recent_edits_title": "Recent Edits",
@@ -917,6 +1008,7 @@
   "analytics_agent_comparison": "Agent Comparison",
   "analytics_no_comparison_data": "No comparison data (need 2+ agents)",
   "analytics_agent": "Agent",
+  "analytics_model": "Model",
   "analytics_cycle_p50": "Cycle p50",
   "analytics_msgs_per_min": "Msgs/min",
   "analytics_tools_per_min": "Tools/min",
@@ -1050,10 +1142,25 @@
       }
     }
   ],
+  "session_recall_title": "Recall",
+  "session_recall_loading": "Loading distilled recall…",
+  "session_recall_empty": "No distilled recall for this session.",
+  "session_recall_error": "Could not load distilled recall.",
+  "session_recall_generation": "Generation",
+  "session_recall_review_state": "Review state",
+  "session_recall_provenance_revoked": "Provenance revoked",
+  "session_recall_evidence_range": "Messages {start}–{end}",
+  "session_recall_jump_evidence": "Jump to transcript messages {start}–{end}",
   "session_vitals_title": "Analysis",
   "session_vitals_subtitle": "Session vital signs",
   "session_vitals_close": "Close session analysis",
   "session_vitals_session": "Session",
+  "session_vitals_repository": "Repository",
+  "session_vitals_worktree": "Worktree",
+  "session_vitals_copy_repository": "Copy repository",
+  "session_vitals_repository_copied": "Repository copied",
+  "session_vitals_copy_worktree": "Copy worktree",
+  "session_vitals_worktree_copied": "Worktree copied",
   "session_vitals_running": "running",
   "session_vitals_running_duration": "running {duration}+",
   "session_vitals_tool_calls": "tool calls",
@@ -1432,6 +1539,8 @@
   "shortcuts_close_palette": "Close palette / modal / find",
   "shortcuts_next_message": "Next message",
   "shortcuts_prev_message": "Previous message",
+  "shortcuts_next_user_prompt": "Next user prompt",
+  "shortcuts_prev_user_prompt": "Previous user prompt",
   "shortcuts_next_session": "Next session",
   "shortcuts_prev_session": "Previous session",
   "shortcuts_toggle_sort": "Toggle sort order",
@@ -1495,6 +1604,67 @@
   "settings_github_not_configured": "Not configured",
   "settings_github_saving": "Saving...",
   "settings_github_save_token": "Save token",
+  "settings_embeddings_title": "Embeddings",
+  "settings_embeddings_description": "Semantic search index build status for session content.",
+  "settings_embeddings_loading": "Loading embeddings status...",
+  "settings_embeddings_unavailable": "Semantic search embeddings are not available on this server.",
+  "settings_embeddings_load_failed": "Failed to load embeddings status",
+  "settings_embeddings_model_label": "Model",
+  "settings_embeddings_dimension_label": "Dimensions",
+  "settings_embeddings_status_label": "Status",
+  "settings_embeddings_status_idle": "Idle",
+  "settings_embeddings_status_scanning": "Scanning",
+  "settings_embeddings_status_embedding": "Embedding",
+  "settings_embeddings_status_running": "Running",
+  "settings_embeddings_scanning_hint": "Scanning sessions for changes - the total amount of work is not known yet.",
+  "settings_embeddings_progress_chunks": [
+    {
+      "declarations": [
+        "input count",
+        "input doneLabel",
+        "input totalLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{doneLabel} / {totalLabel} chunk",
+        "countPlural=other": "{doneLabel} / {totalLabel} chunks"
+      }
+    }
+  ],
+  "settings_embeddings_rate": [
+    {
+      "declarations": [
+        "input count",
+        "input rateLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{rateLabel} chunk/s",
+        "countPlural=other": "{rateLabel} chunks/s"
+      }
+    }
+  ],
+  "settings_embeddings_elapsed": "Elapsed {duration}",
+  "settings_embeddings_eta": "ETA {duration}",
+  "settings_embeddings_eta_estimating": "Estimating time remaining...",
+  "settings_embeddings_duration_hours_minutes": "{hours}h {minutes}m",
+  "settings_embeddings_duration_minutes_seconds": "{minutes}m {seconds}s",
+  "settings_embeddings_duration_seconds": "{seconds}s",
+  "settings_embeddings_last_build_label": "Last build",
+  "settings_embeddings_last_build_completed": "Completed",
+  "settings_embeddings_last_build_failed": "Failed",
+  "settings_embeddings_last_build_activated": "new generation activated",
+  "settings_embeddings_last_build_documents": "Documents embedded",
+  "settings_embeddings_last_build_chunks": "Chunks embedded",
+  "settings_embeddings_generations_title": "Generations",
+  "settings_embeddings_generations_empty": "No embedding generations exist yet.",
+  "settings_embeddings_state_active": "Active",
+  "settings_embeddings_state_building": "Building",
+  "settings_embeddings_state_retired": "Retired",
+  "settings_embeddings_coverage": "{embeddedLabel} embedded · {missingLabel} missing",
+  "settings_embeddings_progress_aria": "Embedding progress",
   "settings_remote_connected_version": "Connected (v{version})",
   "settings_remote_server_returned": "Server returned {status}",
   "settings_remote_connection_failed": "Connection failed",
@@ -1539,6 +1709,13 @@
   "worktree_failed_apply": "Failed to apply mappings",
   "worktree_title": "Worktree mappings",
   "worktree_description": "Map worktree path prefixes to canonical projects on this machine.",
+  "worktree_layout": "Layout",
+  "worktree_layout_explicit": "Explicit",
+  "worktree_layout_repo_dot_worktrees": "{repo}.worktrees/{branch}",
+  "worktree_parent_directory": "Parent directory",
+  "worktree_parent_directory_hint": "Enter the directory that contains the repo.worktrees folders.",
+  "worktree_project_required": "Required for explicit mappings.",
+  "worktree_project_derived": "Derived from the repo.worktrees folder.",
   "worktree_local_only": "Worktree mappings are available in local mode only.",
   "worktree_loading": "Loading mappings...",
   "worktree_machine": "Machine",

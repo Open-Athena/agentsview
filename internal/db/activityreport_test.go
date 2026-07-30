@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/activity"
+	"go.kenn.io/agentsview/internal/money"
 )
 
 func reportSessionIDs(sessions []activity.SessionRow) map[string]struct{} {
@@ -97,8 +98,8 @@ func TestGetActivityReport_UsageCostAndTokens(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet-4-20250514",
-		InputPerMTok:  3.0,
-		OutputPerMTok: 15.0,
+		InputPerMTok:  money.MustParseDollars("3.0"),
+		OutputPerMTok: money.MustParseDollars("15.0"),
 	}}), "UpsertModelPricing")
 
 	insertSession(t, d, "s1", "proj1", func(s *Session) {
@@ -122,7 +123,54 @@ func TestGetActivityReport_UsageCostAndTokens(t *testing.T) {
 	assert.Equal(t, 1, r.Totals.Sessions)
 	assert.Equal(t, 500, r.Totals.OutputTokens)
 	// Cost = (1000*3 + 500*15) / 1e6 = 0.0105
-	assert.InDelta(t, 0.0105, r.Totals.Cost, 1e-9)
+	assert.Equal(t, money.MustParseDollars("0.0105"), r.Totals.Cost)
+}
+
+func TestGetActivityReport_CopilotReportedCostReplacesSessionEstimates(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	require.NoError(t, d.UpsertModelPricing([]ModelPricing{
+		{ModelPattern: "copilot-model-a", InputPerMTok: money.MustParseDollars("10")},
+		{ModelPattern: "copilot-model-b", InputPerMTok: money.MustParseDollars("20")},
+	}))
+	insertSession(t, d, "copilot:activity-authoritative", "proj1", func(s *Session) {
+		s.Agent = "copilot"
+		s.StartedAt = Ptr("2026-06-16T10:00:00Z")
+		s.EndedAt = Ptr("2026-06-16T10:10:00Z")
+	})
+	reportedCost := money.MustParseDollars("0.03")
+	require.NoError(t, d.ReplaceSessionUsageEvents(
+		"copilot:activity-authoritative",
+		[]UsageEvent{
+			{
+				Source: "shutdown", Model: "copilot-model-a",
+				InputTokens: 1_000_000,
+				OccurredAt:  "2026-06-16T10:05:00Z", DedupKey: "first",
+			},
+			{
+				Source: "shutdown", Model: "copilot-model-b",
+				InputTokens: 1_000_000,
+				Cost:        &reportedCost, CostStatus: "exact",
+				CostSource: CopilotReportedCostSource,
+				OccurredAt: "2026-06-16T10:10:00Z", DedupKey: "final",
+			},
+		},
+	))
+
+	r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},
+		dayQuery(t, "2026-06-16", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, reportedCost, r.Totals.Cost)
+	require.Len(t, r.BySession, 1)
+	assert.Equal(t, reportedCost, r.BySession[0].Cost)
+	modelCosts := make(map[string]money.Money, len(r.ByModel))
+	for _, model := range r.ByModel {
+		modelCosts[model.Key] = model.Cost
+	}
+	assert.Equal(t, money.MustParseDollars("0.01"), modelCosts["copilot-model-a"])
+	assert.Equal(t, money.MustParseDollars("0.02"), modelCosts["copilot-model-b"])
+	assert.Equal(t, r.Totals.Cost,
+		money.MustAdd(modelCosts["copilot-model-a"], modelCosts["copilot-model-b"]))
 }
 
 func TestGetActivityReport_PricingModelsOnlyIncludeDedupSurvivors(t *testing.T) {
@@ -131,13 +179,13 @@ func TestGetActivityReport_PricingModelsOnlyIncludeDedupSurvivors(t *testing.T) 
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{
 		{
 			ModelPattern:  "kept-model",
-			InputPerMTok:  3.0,
-			OutputPerMTok: 15.0,
+			InputPerMTok:  money.MustParseDollars("3.0"),
+			OutputPerMTok: money.MustParseDollars("15.0"),
 		},
 		{
 			ModelPattern:  "discarded-model",
-			InputPerMTok:  3.0,
-			OutputPerMTok: 15.0,
+			InputPerMTok:  money.MustParseDollars("3.0"),
+			OutputPerMTok: money.MustParseDollars("15.0"),
 		},
 	}), "UpsertModelPricing")
 
@@ -173,6 +221,76 @@ func TestGetActivityReport_PricingModelsOnlyIncludeDedupSurvivors(t *testing.T) 
 	require.NotNil(t, r.Pricing)
 	assert.Contains(t, r.Pricing.Models, "kept-model")
 	assert.NotContains(t, r.Pricing.Models, "discarded-model")
+}
+
+// TestGetActivityReport_IncludesSubagentUsage confirms subagent and fork
+// sessions are candidates so their usage lands in the totals, keeping the
+// activity cost consistent with GetDailyUsage (which never filters by
+// relationship_type). A fork whose only usage row replays the root's
+// Claude ids contributes a session row but no extra cost: the aggregator's
+// first-seen dedup collapses the duplicate, the same guarantee
+// GetDailyUsage relies on.
+func TestGetActivityReport_IncludesSubagentUsage(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	require.NoError(t, d.UpsertModelPricing([]ModelPricing{
+		{ModelPattern: "root-model", InputPerMTok: money.MustParseDollars("3.0"), OutputPerMTok: money.MustParseDollars("15.0")},
+		{ModelPattern: "sub-model", InputPerMTok: money.MustParseDollars("3.0"), OutputPerMTok: money.MustParseDollars("15.0")},
+	}), "UpsertModelPricing")
+
+	insertSession(t, d, "root", "proj1", func(s *Session) {
+		s.Agent = "claude"
+		s.StartedAt = Ptr("2026-06-16T10:00:00Z")
+		s.EndedAt = Ptr("2026-06-16T10:10:00Z")
+	})
+	insertMessages(t, d, Message{
+		SessionID: "root", Ordinal: 0, Role: "assistant", Content: "x",
+		Timestamp: "2026-06-16T10:00:00Z", Model: "root-model",
+		ClaudeMessageID: "m-root", ClaudeRequestID: "r-root",
+		TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
+	})
+	insertSession(t, d, "agent-sub", "proj1", func(s *Session) {
+		s.Agent = "claude"
+		s.ParentSessionID = Ptr("root")
+		s.RelationshipType = "subagent"
+		s.StartedAt = Ptr("2026-06-16T10:02:00Z")
+		s.EndedAt = Ptr("2026-06-16T10:04:00Z")
+	})
+	insertMessages(t, d, Message{
+		SessionID: "agent-sub", Ordinal: 0, Role: "assistant", Content: "y",
+		Timestamp: "2026-06-16T10:03:00Z", Model: "sub-model",
+		ClaudeMessageID: "m-sub", ClaudeRequestID: "r-sub",
+		TokenUsage: json.RawMessage(`{"input_tokens":2000,"output_tokens":700}`),
+	})
+	// Fork replaying the root's message: same Claude ids, so the dedup
+	// must drop its usage row while the session itself still appears.
+	insertSession(t, d, "fork", "proj1", func(s *Session) {
+		s.Agent = "claude"
+		s.ParentSessionID = Ptr("root")
+		s.RelationshipType = "fork"
+		s.StartedAt = Ptr("2026-06-16T10:05:00Z")
+		s.EndedAt = Ptr("2026-06-16T10:06:00Z")
+	})
+	insertMessages(t, d, Message{
+		SessionID: "fork", Ordinal: 0, Role: "assistant", Content: "x",
+		Timestamp: "2026-06-16T10:05:00Z", Model: "root-model",
+		ClaudeMessageID: "m-root", ClaudeRequestID: "r-root",
+		TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
+	})
+
+	r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},
+		dayQuery(t, "2026-06-16", "UTC"))
+	require.NoError(t, err)
+	ids := reportSessionIDs(r.BySession)
+	assert.Contains(t, ids, "root")
+	assert.Contains(t, ids, "agent-sub",
+		"subagent session must be a candidate")
+	assert.Contains(t, ids, "fork", "fork session must be a candidate")
+	assert.Equal(t, 1200, r.Totals.OutputTokens,
+		"totals include subagent usage; the fork's replayed row dedups away")
+	// Cost = root (1000*3+500*15)/1e6 + subagent (2000*3+700*15)/1e6; the
+	// fork's duplicate row contributes nothing.
+	assert.Equal(t, money.MustParseDollars("0.027"), r.Totals.Cost)
 }
 
 // TestGetActivityReport_ExcludesOtherDays confirms the candidate-session
@@ -317,8 +435,8 @@ func TestGetActivityReport_ExcludesIneligibleUsage(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet-4-20250514",
-		InputPerMTok:  3.0,
-		OutputPerMTok: 15.0,
+		InputPerMTok:  money.MustParseDollars("3.0"),
+		OutputPerMTok: money.MustParseDollars("15.0"),
 	}}), "UpsertModelPricing")
 
 	insertSession(t, d, "s1", "proj1", func(s *Session) {
@@ -353,7 +471,7 @@ func TestGetActivityReport_ExcludesIneligibleUsage(t *testing.T) {
 		dayQuery(t, "2026-06-16", "UTC"))
 	require.NoError(t, err)
 	assert.Equal(t, 500, r.Totals.OutputTokens, "synthetic message excluded")
-	assert.InDelta(t, 0.0105, r.Totals.Cost, 1e-9)
+	assert.Equal(t, money.MustParseDollars("0.0105"), r.Totals.Cost)
 }
 
 // TestGetActivityReport_HourlyRange exercises a multi-day custom range so
@@ -411,8 +529,8 @@ func TestGetActivityReport_UsageDedupSubSecondOrder(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet-4-20250514",
-		InputPerMTok:  3.0,
-		OutputPerMTok: 15.0,
+		InputPerMTok:  money.MustParseDollars("3.0"),
+		OutputPerMTok: money.MustParseDollars("15.0"),
 	}}), "UpsertModelPricing")
 
 	insertSession(t, d, "earlier", "proj1", func(s *Session) {
@@ -452,8 +570,8 @@ func TestGetActivityReport_UsageDedupFallsBackToSourceUUID(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet-4-20250514",
-		InputPerMTok:  3.0,
-		OutputPerMTok: 15.0,
+		InputPerMTok:  money.MustParseDollars("3.0"),
+		OutputPerMTok: money.MustParseDollars("15.0"),
 	}}), "UpsertModelPricing")
 
 	insertSession(t, d, "earlier", "proj1", func(s *Session) {
@@ -525,6 +643,26 @@ func TestGetActivityReport_TitleSkipsEmptyDisplayName(t *testing.T) {
 	require.Len(t, r.BySession, 1)
 	assert.Equal(t, "real-session-name", r.BySession[0].Title,
 		"empty display_name must not mask the real session_name")
+}
+
+func TestGetActivityReport_TitleNeverFallsBackToFirstMessage(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	insertSession(t, d, "private-title", "safe-project", func(s *Session) {
+		s.Agent = "claude"
+		s.FirstMessage = Ptr("distinctive private prompt sentinel")
+		s.StartedAt = Ptr("2026-06-16T10:00:00Z")
+		s.EndedAt = Ptr("2026-06-16T10:02:00Z")
+	})
+	seedMessage(t, d, "private-title", 1, "user", "2026-06-16T10:00:00Z", "")
+	seedMessage(t, d, "private-title", 2, "assistant", "2026-06-16T10:02:00Z", "opus")
+
+	r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},
+		dayQuery(t, "2026-06-16", "UTC"))
+	require.NoError(t, err)
+	require.Len(t, r.BySession, 1)
+	assert.Equal(t, "safe-project", r.BySession[0].Title)
+	assert.NotContains(t, r.BySession[0].Title, "private prompt sentinel")
 }
 
 // TestGetActivityReport_OpenSessionWithInRangeMessageIncluded confirms a

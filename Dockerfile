@@ -24,6 +24,17 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
+# sqlite-vec's cgo bindings (pulled in via go.kenn.io/kit/vector/sqlitevec)
+# #include "sqlite3.h", which this image does not ship. Compile them against
+# the header of the exact SQLite amalgamation that mattn/go-sqlite3 bundles
+# and statically links, so header and linked library always match.
+# "-O2 -g" restates Go's built-in default, which setting CGO_CFLAGS would
+# otherwise replace, leaving the SQLite amalgamation unoptimized (2-3x
+# slower queries).
+RUN mkdir -p /sqlite-include \
+    && cp "$(go list -m -f '{{.Dir}}' github.com/mattn/go-sqlite3)/sqlite3-binding.h" /sqlite-include/sqlite3.h
+ENV CGO_CFLAGS="-O2 -g -I/sqlite-include"
+
 COPY . ./
 COPY --from=frontend-build /src/frontend/dist ./internal/web/dist
 

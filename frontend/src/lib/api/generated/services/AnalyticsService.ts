@@ -708,7 +708,7 @@ export class AnalyticsService {
      */
     agent?: string,
     /**
-     * Filter by model
+     * Comma-separated model filter
      */
     model?: string,
     /**
@@ -932,6 +932,7 @@ export class AnalyticsService {
     includeOneShot,
     includeAutomated,
     termination,
+    granularity = 'week',
   }: {
     /**
      * Range start date
@@ -997,6 +998,10 @@ export class AnalyticsService {
      * Filter by termination reason
      */
     termination?: string,
+    /**
+     * Trend bucket granularity
+     */
+    granularity?: 'day' | 'week' | 'month',
   }): CancelablePromise<DbSkillsAnalyticsResponse> {
     return __request(OpenAPI, {
       method: 'GET',
@@ -1018,6 +1023,7 @@ export class AnalyticsService {
         'include_one_shot': includeOneShot,
         'include_automated': includeAutomated,
         'termination': termination,
+        'granularity': granularity,
       },
       errors: {
         400: `Bad Request`,

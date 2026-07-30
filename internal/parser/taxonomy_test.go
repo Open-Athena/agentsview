@@ -53,6 +53,20 @@ func TestNormalizeToolCategory(t *testing.T) {
 		{"glob", "Glob"},
 		{"task", "Task"},
 
+		// Kilo (legacy) / RooCode (Cline-family) camelCase tool names.
+		{"appliedDiff", "Edit"},
+		{"editedExistingFile", "Edit"},
+		{"deleteFile", "Edit"},
+		{"searchFiles", "Grep"},
+		{"codebaseSearch", "Grep"},
+		{"writeToFile", "Write"},
+		{"newFileCreated", "Write"},
+		{"executeCommand", "Bash"},
+		{"newTask", "Task"},
+		{"updateTodoList", "Tool"},
+		{"finishTask", "Tool"},
+		{"switchMode", "Tool"},
+
 		// Amp tools
 		{"create_file", "Write"},
 		{"look_at", "Read"},
@@ -101,6 +115,21 @@ func TestNormalizeToolCategory(t *testing.T) {
 		{"todo_write", "Tool"},
 		{"todo_read", "Tool"},
 		{"parallel", "Task"},
+
+		// RooCode tools
+		{"readFile", "Read"},
+		{"writeToFile", "Write"},
+		{"insertContent", "Write"},
+		{"searchAndReplace", "Edit"},
+		{"appliedDiff", "Edit"},
+		{"listFiles", "Read"},
+		{"listFilesTopLevel", "Read"},
+		{"listFilesRecursive", "Read"},
+		{"listCodeDefinitionNames", "Read"},
+		{"searchFiles", "Grep"},
+		{"newTask", "Task"},
+		{"skill", "Tool"},
+		{"search", "Tool"},
 
 		// Unknown
 		{"view_image", "Other"},

@@ -9,11 +9,12 @@
     EllipsisVerticalIcon,
     FileTextIcon,
     FolderIcon,
+    LightbulbIcon,
     LinkIcon,
     SearchIcon,
     SquareTerminalIcon,
   } from "../../icons.js";
-  import { onMount } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import type { Session } from "../../api/types.js";
   import {
     OpenersService,
@@ -21,24 +22,34 @@
     type ResumeRequest,
     type ResumeResponse,
   } from "../../api/generated/index";
-  import { configureGeneratedClient } from "../../api/runtime.js";
+  import {
+    callGenerated,
+    configureGeneratedClient,
+    isAbortError,
+  } from "../../api/runtime.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
   import {
     agentColor,
     agentForeground,
     agentLabel,
+    entrypointBadge,
   } from "../../utils/agents.js";
   import { formatCost, formatTokenUsage } from "../../utils/format.js";
+  import type { Money } from "../../money.js";
   import { normalizeMessagePreview } from "../../utils/messages.js";
   import { getGradeStyle, getGradeLabel } from "../../utils/grade.js";
   import SignalPanel from "../content/SignalPanel.svelte";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { router } from "../../stores/router.svelte.js";
+  import { insights } from "../../stores/insights.svelte.js";
   import {
     supportsResume,
     buildResumeCommand,
     formatResumeResponseCommand,
   } from "../../utils/resume.js";
+  import { codexDesktopLink } from "../../utils/codex.js";
+  import { claudeCodeLink } from "../../utils/claude.js";
+  import { LatestRead } from "../../utils/latest-read.js";
 
   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
   import { messages as messagesStore } from "../../stores/messages.svelte.js";
@@ -64,6 +75,10 @@
   let openFeedback = $state("");
   let feedbackTimer: ReturnType<typeof setTimeout> | undefined;
   let sessionDir = $state<string | null>(null);
+  const openersRead = new LatestRead();
+  const directoryRead = new LatestRead();
+  const costRead = new LatestRead();
+  const breakdownRead = new LatestRead();
 
   interface Opener {
     id: string;
@@ -80,40 +95,82 @@
     path: string;
   }
 
+  interface SessionUsageBreakdownEntry {
+    ordinal: number;
+    message_ordinal?: number;
+    source: string;
+    label: string;
+    timestamp: string;
+    model: string;
+    input_tokens: number;
+    output_tokens: number;
+    cache_creation_input_tokens: number;
+    cache_read_input_tokens: number;
+    cost: Money;
+    has_cost: boolean;
+  }
+
   onMount(() => {
+    const signal = openersRead.begin();
     configureGeneratedClient();
-    OpenersService.getApiV1Openers()
+    callGenerated(() => OpenersService.getApiV1Openers(), signal)
       .then((res) => {
+        if (!openersRead.isCurrent(signal)) return;
         openers = (res as unknown as OpenersResponse).openers;
       })
-      .catch(() => {});
+      .catch((e) => {
+        if (!isAbortError(e)) openers = [];
+      })
+      .finally(() => openersRead.finish(signal));
+    return () => openersRead.cancel();
   });
 
   let resolvedSessionDirId: string | null = null;
+  let pendingSessionDirId: string | null = null;
   $effect(() => {
     if (!session) {
+      directoryRead.cancel();
       sessionDir = null;
       resolvedSessionDirId = null;
+      pendingSessionDirId = null;
       return;
     }
     const id = session.id;
-    if (id === resolvedSessionDirId) return;
+    if (id === resolvedSessionDirId || id === pendingSessionDirId) return;
+    const signal = directoryRead.begin();
+    pendingSessionDirId = id;
     sessionDir = null;
     configureGeneratedClient();
-    SessionsService.getApiV1SessionsIdDirectory({ id })
+    callGenerated(
+      () => SessionsService.getApiV1SessionsIdDirectory({ id }),
+      signal,
+    )
       .then(({ path }) => {
-        if (session?.id === id) {
+        if (session?.id === id && directoryRead.isCurrent(signal)) {
           sessionDir = (path as SessionDirectoryResponse["path"]) || null;
           resolvedSessionDirId = id;
         }
       })
-      .catch(() => {
+      .catch((e) => {
+        if (isAbortError(e)) return;
         // Don't cache the ID on failure so the next
         // session refresh retries the lookup.
+      })
+      .finally(() => {
+        if (
+          directoryRead.finish(signal) &&
+          pendingSessionDirId === id
+        ) {
+          pendingSessionDirId = null;
+        }
       });
   });
 
-  let sessionCost = $state<number | null>(null);
+  let sessionCost = $state<Money | null>(null);
+  let sessionCostIsRollup = $state(false);
+  let sessionRollupSubagentCount = $state(0);
+  let sessionUsageBreakdownCount = $state(0);
+  let sessionUsageBreakdown = $state<SessionUsageBreakdownEntry[]>([]);
   // Key of the last successful usage fetch. Cost depends on more
   // than output tokens (input/cache tokens and explicit usage-event
   // costs), so the key includes every cost-affecting field present
@@ -123,52 +180,162 @@
   // marker in the session API.
   let costFetchKey: string | null = null;
   let costSessionId: string | null = null;
-  let costRequestSeq = 0;
+  let breakdownFetchKey: string | null = null;
+
+  function childUsageFetchKey(parentId: string): string {
+    return Array.from(sessions.childSessions.values())
+      .filter((child) => child.parent_session_id === parentId)
+      .map((child) =>
+        [
+          child.id,
+          child.relationship_type ?? "",
+          child.transcript_revision ?? "",
+          child.message_count ?? 0,
+          child.total_output_tokens ?? 0,
+          child.peak_context_tokens ?? 0,
+          child.ended_at ?? "",
+        ].join("\t")
+      )
+      .sort()
+      .join("\n");
+  }
+
+  function usageFetchKey(s: Session): string {
+    return [
+      s.id,
+      s.transcript_revision ?? "",
+      s.total_output_tokens ?? 0,
+      s.peak_context_tokens ?? 0,
+      s.has_total_output_tokens ?? "",
+      s.has_peak_context_tokens ?? "",
+      s.message_count ?? 0,
+      s.ended_at ?? "",
+      sessions.activeSessionUsageVersion,
+      childUsageFetchKey(s.id),
+    ].join("\n");
+  }
+
+  function resetUsageBreakdown() {
+    breakdownRead.cancel();
+    sessionUsageBreakdownCount = 0;
+    sessionUsageBreakdown = [];
+    usageBreakdownOpen = false;
+    usageBreakdownLoading = false;
+    breakdownFetchKey = null;
+  }
+
   $effect(() => {
     if (!session) {
+      costRead.cancel();
       sessionCost = null;
+      sessionCostIsRollup = false;
+      sessionRollupSubagentCount = 0;
+      resetUsageBreakdown();
       costFetchKey = null;
       costSessionId = null;
-      costRequestSeq++;
       return;
     }
     const id = session.id;
-    const key = [
-      id,
-      session.total_output_tokens ?? 0,
-      session.peak_context_tokens ?? 0,
-      session.has_total_output_tokens ?? "",
-      session.has_peak_context_tokens ?? "",
-      session.message_count ?? 0,
-      session.ended_at ?? "",
-    ].join("\n");
+    const key = usageFetchKey(session);
     if (id !== costSessionId) {
       // Entering a different session invalidates both the displayed
       // cost and the fetch cache; the cached key must never satisfy
       // the early return below while another session's request is
       // still in flight.
       sessionCost = null;
+      sessionCostIsRollup = false;
+      sessionRollupSubagentCount = 0;
+      resetUsageBreakdown();
       costFetchKey = null;
     }
     if (key === costFetchKey) return;
+    const signal = costRead.begin();
     costSessionId = id;
-    const seq = ++costRequestSeq;
     configureGeneratedClient();
-    SessionsService.getApiV1SessionsIdUsage({ id })
+    callGenerated(
+      () => SessionsService.getApiV1SessionsIdUsage({ id, rollup: true }),
+      signal,
+    )
       .then((res) => {
-        if (seq !== costRequestSeq) return;
+        if (!costRead.isCurrent(signal)) return;
         costFetchKey = key;
-        sessionCost = res.has_cost ? res.cost_usd : null;
+        sessionRollupSubagentCount = res.rollup_subagent_count ?? 0;
+        sessionCostIsRollup =
+          sessionRollupSubagentCount > 0 && res.has_rollup_cost === true;
+        sessionCost = sessionCostIsRollup
+          ? (res.rollup_cost ?? null)
+          : res.has_cost
+            ? res.cost
+            : null;
+        sessionUsageBreakdownCount = res.breakdown_count ?? 0;
       })
-      .catch(() => {
+      .catch((e) => {
+        if (isAbortError(e) || !costRead.isCurrent(signal)) return;
+        sessionUsageBreakdownCount = 0;
         // Leave the fetch key unset so the next
         // session refresh retries the lookup.
-      });
+      })
+      .finally(() => costRead.finish(signal));
+  });
+
+  // Breakdown rows are fetched only when the menu opens; large
+  // sessions can have thousands of entries and the count-only
+  // /usage fetch above happens automatically on every session.
+  $effect(() => {
+    if (!usageBreakdownOpen || !session) {
+      breakdownRead.cancel();
+      usageBreakdownLoading = false;
+      return;
+    }
+    const id = session.id;
+    const key = usageFetchKey(session);
+    if (key === breakdownFetchKey) return;
+    const signal = breakdownRead.begin();
+    usageBreakdownLoading = true;
+    configureGeneratedClient();
+    callGenerated(
+      () => SessionsService.getApiV1SessionsIdUsage({ id, breakdown: true }),
+      signal,
+    )
+      .then((res) => {
+        if (!breakdownRead.isCurrent(signal)) return;
+        breakdownFetchKey = key;
+        usageBreakdownLoading = false;
+        sessionUsageBreakdown = Array.isArray(res.breakdown)
+          ? (res.breakdown as SessionUsageBreakdownEntry[])
+          : [];
+      })
+      .catch((e) => {
+        if (isAbortError(e) || !breakdownRead.isCurrent(signal)) return;
+        usageBreakdownLoading = false;
+        sessionUsageBreakdown = [];
+        // Leave the fetch key unset so reopening retries.
+      })
+      .finally(() => breakdownRead.finish(signal));
+  });
+
+  onDestroy(() => {
+    openersRead.cancel();
+    directoryRead.cancel();
+    costRead.cancel();
+    breakdownRead.cancel();
   });
 
   let sessionCostLabel = $derived(
     sessionCost !== null ? formatCost(sessionCost) : null,
   );
+  let sessionCostTitle = $derived(
+        sessionCostIsRollup
+      ? m.session_breadcrumb_total_cost_title({
+          count: sessionRollupSubagentCount,
+          countLabel: sessionRollupSubagentCount.toLocaleString(),
+        })
+      : m.session_breadcrumb_estimated_session_cost(),
+  );
+  // Menu rows render only while open, so the collapsed dropdown
+  // stays DOM-free.
+  let usageBreakdownOpen = $state(false);
+  let usageBreakdownLoading = $state(false);
 
   let sessionContextTokens = $derived(session?.peak_context_tokens ?? 0);
   let sessionOutputTokens = $derived(session?.total_output_tokens ?? 0);
@@ -199,6 +366,10 @@
       : "",
   );
 
+  let resumeModel = $derived(
+    session ? messagesStore.resumeModelFor(session.id) : "",
+  );
+
   const gradeStyle = $derived(
     getGradeStyle(session?.health_grade),
   );
@@ -212,6 +383,30 @@
   function sessionDisplayId(id: string): string {
     const idx = id.indexOf(":");
     return idx >= 0 ? id.slice(idx + 1) : id;
+  }
+
+  function formatTokenCount(value: number): string {
+    return Math.max(0, value).toLocaleString();
+  }
+
+  function formatBreakdownContext(entry: SessionUsageBreakdownEntry): string {
+    const context =
+      entry.input_tokens +
+      entry.cache_creation_input_tokens +
+      entry.cache_read_input_tokens;
+    return formatTokenCount(context);
+  }
+
+  function formatBreakdownTitle(entry: SessionUsageBreakdownEntry): string {
+    const parts = [
+      entry.model || entry.source,
+      `${formatBreakdownContext(entry)} ctx`,
+      `${formatTokenCount(entry.output_tokens)} out`,
+    ];
+    if (entry.has_cost) {
+      parts.push(formatCost(entry.cost));
+    }
+    return parts.filter(Boolean).join(" · ");
   }
 
   async function copySessionId(
@@ -242,6 +437,12 @@
     copiedLinkTimer = setTimeout(() => {
       if (copiedLinkId === id) copiedLinkId = "";
     }, 1500);
+  }
+
+  function handleAgentAnalysis() {
+    if (!session) return;
+    insights.generateForSession(session);
+    router.navigate("insights");
   }
 
   function toggleMenu() {
@@ -334,7 +535,9 @@
     } catch {
       // Fall back to local command build.
     }
-    const cmd = buildResumeCommand(session.agent, session.id);
+    const cmd = buildResumeCommand(session.agent, session.id, {
+      model: resumeModel,
+    });
     if (cmd) {
       const ok = await copyToClipboard(cmd);
       showFeedback(ok
@@ -366,7 +569,9 @@
     } catch {
       // Fall back to local build.
     }
-    const cmd = buildResumeCommand(session.agent, session.id);
+    const cmd = buildResumeCommand(session.agent, session.id, {
+      model: resumeModel,
+    });
     if (cmd) {
       const ok = await copyToClipboard(cmd);
       showFeedback(ok
@@ -435,7 +640,9 @@
     } catch {
       // Fall back to local command build.
     }
-    const cmd = buildResumeCommand(session.agent, session.id);
+    const cmd = buildResumeCommand(session.agent, session.id, {
+      model: resumeModel,
+    });
     if (cmd) {
       const ok = await copyToClipboard(cmd);
       showFeedback(ok
@@ -455,6 +662,16 @@
     session
       ? supportsResume(session.agent) && isLocal
       : false,
+  );
+
+  const codexLink = $derived(
+    session ? codexDesktopLink(session.agent, session.id) : null,
+  );
+
+  const claudeLink = $derived(
+    session?.agent === "claude" && isLocal
+      ? claudeCodeLink(sessionDir)
+      : null,
   );
 
   const terminalOpeners = $derived(
@@ -477,6 +694,7 @@
 
   const showDropdown = $derived(
     canResume ||
+    codexLink !== null ||
     (isLocal && (
       editorOpeners.length > 0 ||
       fileOpeners.length > 0 ||
@@ -565,7 +783,10 @@
         class="agent-badge"
         style:background={agentColor(session.agent)}
         style:color={agentForeground(session.agent)}
-      >{agentLabel(session.agent)}</span>
+      >{agentLabel(session.agent, session.agent_label)}</span>
+      {#if entrypointBadge(session.entrypoint)}
+        <span class="agent-badge entrypoint-badge">{entrypointBadge(session.entrypoint)}</span>
+      {/if}
       {#if session.agent === "antigravity-cli" && session.transcript_fidelity === "summary"}
         <a
           class="summary-badge"
@@ -654,6 +875,34 @@
                   </span>
                   <span class="open-menu-name">{m.session_breadcrumb_default_terminal()}</span>
                 </button>
+                {#if codexLink}
+                  <div class="open-menu-divider"></div>
+                  <a
+                    class="open-menu-item"
+                    data-testid="codex-desktop-link"
+                    href={codexLink}
+                    title={m.session_breadcrumb_open_in_codex_desktop()}
+                  >
+                    <span class="open-menu-num">
+                      <CirclePlayIcon size="10" strokeWidth="2" aria-hidden="true" />
+                    </span>
+                    <span class="open-menu-name">{m.session_breadcrumb_open_in_codex_desktop()}</span>
+                  </a>
+                {/if}
+                {#if claudeLink}
+                  <div class="open-menu-divider"></div>
+                  <a
+                    class="open-menu-item"
+                    data-testid="claude-code-link"
+                    href={claudeLink}
+                    title={m.session_breadcrumb_open_in_claude_code()}
+                  >
+                    <span class="open-menu-num">
+                      <CirclePlayIcon size="10" strokeWidth="2" aria-hidden="true" />
+                    </span>
+                    <span class="open-menu-name">{m.session_breadcrumb_open_in_claude_code()}</span>
+                  </a>
+                {/if}
                 <div class="open-menu-divider"></div>
                 <button class="open-menu-item" onclick={handleCopyResumeCommand}>
                   <span class="open-menu-num">
@@ -736,9 +985,60 @@
           {sessionTokenSummary}
         </span>
       {/if}
+      {#if sessionUsageBreakdownCount > 0}
+        <details class="usage-breakdown" bind:open={usageBreakdownOpen}>
+          <summary
+            class="usage-breakdown-trigger"
+            title={m.session_breadcrumb_usage_breakdown_title()}
+          >
+            {m.session_breadcrumb_usage_breakdown_steps({
+              count: sessionUsageBreakdownCount,
+              countLabel: sessionUsageBreakdownCount.toLocaleString(),
+            })}
+          </summary>
+          {#if usageBreakdownOpen}
+            <div class="usage-breakdown-menu">
+              {#if usageBreakdownLoading}
+                <div class="usage-breakdown-status">
+                  {m.session_breadcrumb_usage_breakdown_loading()}
+                </div>
+              {:else if sessionUsageBreakdown.length === 0}
+                <div class="usage-breakdown-status">
+                  {m.session_breadcrumb_failed()}
+                </div>
+              {:else}
+              {#each sessionUsageBreakdown as row (row.ordinal)}
+                <div class="usage-breakdown-row" title={formatBreakdownTitle(row)}>
+                  <span class="usage-breakdown-label">
+                    {row.label}
+                  </span>
+                  <span class="usage-breakdown-model">
+                    {row.model || row.source}
+                  </span>
+                  <span class="usage-breakdown-tokens">
+                    {formatBreakdownContext(row)} ctx
+                    <span aria-hidden="true">/</span>
+                    {formatTokenCount(row.output_tokens)} out
+                  </span>
+                  {#if row.has_cost}
+                    <span class="usage-breakdown-cost">
+                      {formatCost(row.cost)}
+                    </span>
+                  {/if}
+                </div>
+              {/each}
+              {/if}
+            </div>
+          {/if}
+        </details>
+      {/if}
       {#if sessionCostLabel}
-        <span class="cost-badge" title={m.session_breadcrumb_estimated_session_cost()}>
-          {sessionCostLabel}
+        <span class="cost-badge" title={sessionCostTitle}>
+          {#if sessionCostIsRollup}
+            {m.session_breadcrumb_total_cost()}: {sessionCostLabel}
+          {:else}
+            {sessionCostLabel}
+          {/if}
         </span>
       {/if}
       {#if mainModel}
@@ -770,6 +1070,14 @@
             : m.session_breadcrumb_show_session_analysis()}
         >
           <ChartColumnIcon size="13" strokeWidth="2" aria-hidden="true" />
+        </button>
+        <button
+          class="insight-btn"
+          title={m.insights_page_agent_analysis()}
+          aria-label={m.insights_page_agent_analysis()}
+          onclick={handleAgentAnalysis}
+        >
+          <LightbulbIcon size="13" strokeWidth="2" aria-hidden="true" />
         </button>
         <button
           class="find-btn"
@@ -894,6 +1202,10 @@
     color: white;
     flex-shrink: 0;
     background: var(--text-muted);
+  }
+
+  .entrypoint-badge {
+    opacity: 0.8;
   }
 
   .summary-badge {
@@ -1024,6 +1336,7 @@
     padding: 6px 10px;
     font-size: 13px;
     color: var(--text-primary);
+    text-decoration: none;
     border-radius: 5px;
     cursor: pointer;
     transition: background 0.1s;
@@ -1108,6 +1421,98 @@
     background: var(--bg-tertiary);
     white-space: nowrap;
     flex-shrink: 0;
+  }
+
+  .usage-breakdown {
+    position: relative;
+    flex-shrink: 0;
+  }
+
+  .usage-breakdown-trigger {
+    list-style: none;
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: var(--bg-tertiary);
+    white-space: nowrap;
+    cursor: pointer;
+  }
+
+  .usage-breakdown-trigger::-webkit-details-marker {
+    display: none;
+  }
+
+  .usage-breakdown[open] .usage-breakdown-trigger,
+  .usage-breakdown-trigger:hover {
+    color: var(--text-secondary);
+    background: var(--bg-surface-hover);
+  }
+
+  .usage-breakdown-menu {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    margin-top: 4px;
+    width: min(460px, calc(100vw - 24px));
+    max-height: 260px;
+    overflow: auto;
+    padding: 6px;
+    border: 1px solid var(--border-default);
+    border-radius: 6px;
+    background: var(--bg-primary);
+    box-shadow: var(--shadow-lg);
+    z-index: var(--z-popover);
+  }
+
+  .usage-breakdown-status {
+    padding: 5px 6px;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .usage-breakdown-row {
+    display: grid;
+    grid-template-columns: minmax(62px, 0.85fr) minmax(90px, 1fr) max-content max-content;
+    gap: 8px;
+    align-items: center;
+    padding: 5px 6px;
+    border-radius: 4px;
+    font-size: 11px;
+    line-height: 1.25;
+    color: var(--text-secondary);
+  }
+
+  .usage-breakdown-row:hover {
+    background: var(--bg-surface-hover);
+  }
+
+  .usage-breakdown-label,
+  .usage-breakdown-model {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .usage-breakdown-label {
+    color: var(--text-primary);
+    font-weight: 500;
+  }
+
+  .usage-breakdown-model {
+    color: var(--text-muted);
+  }
+
+  .usage-breakdown-tokens,
+  .usage-breakdown-cost {
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .usage-breakdown-cost {
+    color: var(--text-muted);
   }
 
   .model-badge {
@@ -1200,6 +1605,26 @@
     color: var(--accent-blue);
   }
 
+  .insight-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border: none;
+    border-radius: var(--radius-sm, 4px);
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+    flex-shrink: 0;
+  }
+
+  .insight-btn:hover {
+    background: var(--bg-surface-hover);
+    color: var(--accent-blue);
+  }
+
   .find-btn--active {
     color: var(--accent-blue);
     background: color-mix(in srgb, var(--accent-blue) 12%, transparent);
@@ -1288,6 +1713,26 @@
       max-width: 110px;
       overflow: hidden;
       text-overflow: ellipsis;
+    }
+
+    .usage-breakdown-trigger {
+      font-size: 9px;
+      padding: 1px 4px;
+    }
+
+    .usage-breakdown-menu {
+      right: -54px;
+      width: min(360px, calc(100vw - 16px));
+    }
+
+    .usage-breakdown-row {
+      grid-template-columns: minmax(56px, 0.8fr) minmax(68px, 1fr) max-content;
+      gap: 6px;
+      font-size: 10px;
+    }
+
+    .usage-breakdown-cost {
+      display: none;
     }
 
     .session-id {

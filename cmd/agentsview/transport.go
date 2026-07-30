@@ -7,10 +7,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"strconv"
 	"strings"
+	"testing"
 	"time"
 
 	"go.kenn.io/agentsview/internal/config"
@@ -38,8 +40,27 @@ var errLocalDaemonUnreachable = errors.New(
 	"local daemon owns the SQLite archive but is not responding",
 )
 
-var startBackgroundServeForTransport = ensureBackgroundServe
+var startBackgroundServeForTransport = autoStartBackgroundServe
 var waitForDaemonStartupForTransport = WaitForDaemonStartupContext
+
+// autoStartBackgroundServe guards transport auto-start against test
+// binaries: os.Executable inside `go test` is the test executable, so a
+// CLI test reaching this path would detach a real `agentsview.test serve`
+// daemon that outlives the test run and can squat on the real daemon's
+// port. Tests must stub startBackgroundServeForTransport or set
+// AGENTSVIEW_NO_DAEMON=1; tests of the auto-start machinery itself call
+// ensureBackgroundServe directly.
+func autoStartBackgroundServe(
+	ctx context.Context, cfg *config.Config, waitTimeout time.Duration,
+) (*DaemonRuntime, error) {
+	if testing.Testing() {
+		return nil, errors.New(
+			"refusing to auto-start a background daemon from a test binary; " +
+				"stub startBackgroundServeForTransport or set AGENTSVIEW_NO_DAEMON=1",
+		)
+	}
+	return ensureBackgroundServe(ctx, cfg, waitTimeout)
+}
 
 // transport captures how to reach the session-data layer from a
 // CLI subcommand. Either the HTTP daemon (URL set) or the local DB.
@@ -252,7 +273,7 @@ func ensureTransportContext(
 			return transport{}, errors.New(
 				"daemon autostart is disabled; direct SQLite reads are " +
 					"not supported for this command. Start a daemon with " +
-					"`agentsview serve --background` or unset " +
+					"`agentsview daemon start` or unset " +
 					"AGENTSVIEW_NO_DAEMON",
 			)
 		}
@@ -440,7 +461,15 @@ func newService(
 				"opening db: %w", err,
 			)
 		}
-		cleanup := func() { d.Close() }
+		closeVectorSearcher := installDirectVectorSearcher(cfg, d)
+		cleanup := func() {
+			if closeVectorSearcher != nil {
+				if cerr := closeVectorSearcher(); cerr != nil {
+					log.Printf("close vectors.db: %v", cerr)
+				}
+			}
+			d.Close()
+		}
 		// engine is nil — CLI reads don't need it, and Sync
 		// is handled via the HTTP daemon when one is running.
 		return service.NewDirectBackend(d, nil), cleanup, nil
@@ -461,7 +490,10 @@ func directIncompatibleDaemonError(tr transport) error {
 // newPGReadService builds a read-only SessionService over the
 // configured PostgreSQL sync store. It shares the same store
 // construction path as pg serve, but leaves schema repair/migration
-// to pg push/serve because CLI read commands never mutate PG.
+// to pg push/serve because CLI read commands never mutate PG. Like
+// pg serve, it runs the PG vector gate so `session search --pg
+// --semantic|--hybrid` and `mcp --pg` get the same semantic search
+// the SQLite direct path wires via installDirectVectorSearcher.
 func newPGReadService(
 	cfg config.Config, pgCfg config.PGConfig,
 ) (service.SessionService, func(), error) {
@@ -477,5 +509,6 @@ func newPGReadService(
 			priced.SetCustomPricing(cfg.CustomModelPricing)
 		}
 	}
+	wirePGReadVectorSearchFn(cfg, store)
 	return service.NewReadOnlyBackend(store), cleanup, nil
 }

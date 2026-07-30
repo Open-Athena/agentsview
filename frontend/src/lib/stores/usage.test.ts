@@ -11,8 +11,13 @@ import type {
   UsagePairwiseComparisonResponse,
   UsageSummaryResponse,
 } from "../api/types/usage.js";
+import { testMoney } from "../test/money.js";
 
-const usageServiceMocks = vi.hoisted(() => ({
+const usageServiceMocks = vi.hoisted(() => {
+  const money = (dollars: number) => ({
+    microdollars: Math.round(dollars * 1_000_000),
+  });
+  return {
   getApiV1UsageSummary: vi.fn().mockResolvedValue({
     from: "2024-01-01",
     to: "2024-01-31",
@@ -21,25 +26,27 @@ const usageServiceMocks = vi.hoisted(() => ({
       outputTokens: 0,
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
-      totalCost: 0,
+      totalCost: money(0),
     },
     daily: [],
     projectTotals: [
       {
+        project_key: "pl1:sha256:alpha",
         project: "alpha",
         inputTokens: 0,
         outputTokens: 0,
         cacheCreationTokens: 0,
         cacheReadTokens: 0,
-        cost: 0,
+        cost: money(0),
       },
       {
+        project_key: "pl1:sha256:beta",
         project: "beta",
         inputTokens: 0,
         outputTokens: 0,
         cacheCreationTokens: 0,
         cacheReadTokens: 0,
-        cost: 0,
+        cost: money(0),
       },
     ],
     modelTotals: [
@@ -49,7 +56,7 @@ const usageServiceMocks = vi.hoisted(() => ({
         outputTokens: 0,
         cacheCreationTokens: 0,
         cacheReadTokens: 0,
-        cost: 0,
+        cost: money(0),
       },
       {
         model: "gpt-4o",
@@ -57,7 +64,7 @@ const usageServiceMocks = vi.hoisted(() => ({
         outputTokens: 0,
         cacheCreationTokens: 0,
         cacheReadTokens: 0,
-        cost: 0,
+        cost: money(0),
       },
     ],
     agentTotals: [],
@@ -72,40 +79,40 @@ const usageServiceMocks = vi.hoisted(() => ({
       uncachedInputTokens: 0,
       outputTokens: 0,
       hitRate: 0,
-      savingsVsUncached: 0,
+      savingsVsUncached: money(0),
     },
   }),
   getApiV1UsageComparison: vi.fn().mockResolvedValue({
     priorFrom: "2023-12-01",
     priorTo: "2023-12-31",
-    priorTotalCost: 1,
+    priorTotalCost: money(1),
     deltaPct: 0.5,
   }),
   getApiV1UsagePairwiseComparison: vi.fn().mockResolvedValue({
     left: {
-      totalCost: 1,
+      totalCost: money(1),
       inputTokens: 10,
       outputTokens: 5,
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
       totalTokens: 15,
       sessionCount: 1,
-      costPerSession: 1,
+      costPerSession: money(1),
       tokensPerSession: 15,
     },
     right: {
-      totalCost: 2,
+      totalCost: money(2),
       inputTokens: 20,
       outputTokens: 10,
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
       totalTokens: 30,
       sessionCount: 2,
-      costPerSession: 1,
+      costPerSession: money(1),
       tokensPerSession: 15,
     },
     deltas: {
-      totalCostDelta: 1,
+      totalCostDelta: money(1),
       totalCostDeltaRatio: 1,
       inputTokensDelta: 10,
       inputTokensDeltaRatio: 1,
@@ -119,20 +126,34 @@ const usageServiceMocks = vi.hoisted(() => ({
       totalTokensDeltaRatio: 1,
       sessionCountDelta: 1,
       sessionCountDeltaRatio: 1,
-      costPerSessionDelta: 0,
+      costPerSessionDelta: money(0),
       costPerSessionRatio: 0,
       tokensPerSessionDelta: 0,
       tokensPerSessionRatio: 0,
     },
   }),
   getApiV1UsageTopSessions: vi.fn().mockResolvedValue([]),
-}));
+  };
+});
 
-const apiRuntimeMocks = vi.hoisted(() => ({
-  configureGeneratedClient: vi.fn(),
-  callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
-  isAbortError: vi.fn(() => false),
-}));
+const apiRuntimeMocks = vi.hoisted(() => {
+  class ApiError extends Error {
+    constructor(
+      public readonly status: number,
+      message: string,
+      public readonly code?: string,
+    ) {
+      super(message);
+      this.name = "ApiError";
+    }
+  }
+  return {
+    ApiError,
+    configureGeneratedClient: vi.fn(),
+    callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
+    isAbortError: vi.fn(() => false),
+  };
+});
 
 vi.mock("../api/runtime.js", () => apiRuntimeMocks);
 
@@ -185,25 +206,27 @@ function usageSummary(totalCost = 0): UsageSummaryResponse {
       outputTokens: 0,
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
-      totalCost,
+      totalCost: testMoney(totalCost),
     },
     daily: [],
     projectTotals: [
       {
+        project_key: "pl1:sha256:alpha",
         project: "alpha",
         inputTokens: 0,
         outputTokens: 0,
         cacheCreationTokens: 0,
         cacheReadTokens: 0,
-        cost: 0,
+        cost: testMoney(0),
       },
       {
+        project_key: "pl1:sha256:beta",
         project: "beta",
         inputTokens: 0,
         outputTokens: 0,
         cacheCreationTokens: 0,
         cacheReadTokens: 0,
-        cost: 0,
+        cost: testMoney(0),
       },
     ],
     modelTotals: [
@@ -213,7 +236,7 @@ function usageSummary(totalCost = 0): UsageSummaryResponse {
         outputTokens: 0,
         cacheCreationTokens: 0,
         cacheReadTokens: 0,
-        cost: 0,
+        cost: testMoney(0),
       },
       {
         model: "gpt-4o",
@@ -221,7 +244,7 @@ function usageSummary(totalCost = 0): UsageSummaryResponse {
         outputTokens: 0,
         cacheCreationTokens: 0,
         cacheReadTokens: 0,
-        cost: 0,
+        cost: testMoney(0),
       },
     ],
     agentTotals: [],
@@ -236,7 +259,7 @@ function usageSummary(totalCost = 0): UsageSummaryResponse {
       uncachedInputTokens: 0,
       outputTokens: 0,
       hitRate: 0,
-      savingsVsUncached: 0,
+      savingsVsUncached: testMoney(0),
     },
   };
 }
@@ -245,7 +268,7 @@ function usageComparison(): UsageComparison {
   return {
     priorFrom: "2023-12-01",
     priorTo: "2023-12-31",
-    priorTotalCost: 1,
+    priorTotalCost: testMoney(1),
     deltaPct: 0.5,
   };
 }
@@ -269,16 +292,17 @@ function usageSummaryWithOptions(options: {
       outputTokens: 0,
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
-      totalCost,
+      totalCost: testMoney(totalCost),
     },
     daily: [],
     projectTotals: projects.map((project) => ({
+      project_key: `pl1:sha256:${project}`,
       project,
       inputTokens: 0,
       outputTokens: 0,
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
-      cost: 0,
+      cost: testMoney(0),
     })),
     modelTotals: models.map((model) => ({
       model,
@@ -286,7 +310,7 @@ function usageSummaryWithOptions(options: {
       outputTokens: 0,
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
-      cost: 0,
+      cost: testMoney(0),
     })),
     agentTotals: [],
     sessionCounts: {
@@ -300,7 +324,7 @@ function usageSummaryWithOptions(options: {
       uncachedInputTokens: 0,
       outputTokens: 0,
       hitRate: 0,
-      savingsVsUncached: 0,
+      savingsVsUncached: testMoney(0),
     },
   };
 }
@@ -308,29 +332,29 @@ function usageSummaryWithOptions(options: {
 function usagePairwiseComparison(): UsagePairwiseComparisonResponse {
   return {
     left: {
-      totalCost: 1,
+      totalCost: testMoney(1),
       inputTokens: 10,
       outputTokens: 5,
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
       totalTokens: 15,
       sessionCount: 1,
-      costPerSession: 1,
+      costPerSession: testMoney(1),
       tokensPerSession: 15,
     },
     right: {
-      totalCost: 2,
+      totalCost: testMoney(2),
       inputTokens: 20,
       outputTokens: 10,
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
       totalTokens: 30,
       sessionCount: 2,
-      costPerSession: 1,
+      costPerSession: testMoney(1),
       tokensPerSession: 15,
     },
     deltas: {
-      totalCostDelta: 1,
+      totalCostDelta: testMoney(1),
       totalCostDeltaRatio: 1,
       inputTokensDelta: 10,
       inputTokensDeltaRatio: 1,
@@ -344,7 +368,7 @@ function usagePairwiseComparison(): UsagePairwiseComparisonResponse {
       totalTokensDeltaRatio: 1,
       sessionCountDelta: 1,
       sessionCountDeltaRatio: 1,
-      costPerSessionDelta: 0,
+      costPerSessionDelta: testMoney(0),
       costPerSessionRatio: 0,
       tokensPerSessionDelta: 0,
       tokensPerSessionRatio: 0,
@@ -369,6 +393,7 @@ describe("UsageStore filter persistence", () => {
   it("saves exclude filters to localStorage on fetchAll", async () => {
     const { usage } = await loadStore();
     usage.excludedProjects = "proj-a";
+    usage.excludedProjectKeys = "pl1:sha256:proj-a";
     usage.excludedAgents = "claude";
     await usage.fetchAll();
 
@@ -376,6 +401,7 @@ describe("UsageStore filter persistence", () => {
       localStorage.getItem("usage-filters") ?? "{}",
     );
     expect(saved.excludedProjects).toBe("proj-a");
+    expect(saved.excludedProjectKeys).toBeUndefined();
     expect(saved.excludedAgents).toBe("claude");
   });
 
@@ -384,12 +410,14 @@ describe("UsageStore filter persistence", () => {
       "usage-filters",
       JSON.stringify({
         excludedProjects: "saved-proj",
+        excludedProjectKeys: "pl1:sha256:saved-proj",
         excludedModels: "opus",
         selectedModels: "sonnet",
       }),
     );
     const { usage } = await loadStore();
     expect(usage.excludedProjects).toBe("saved-proj");
+    expect(usage.excludedProjectKeys).toBe("");
     expect(usage.excludedModels).toBe("");
     expect(usage.selectedModels).toBe("sonnet");
     expect(usage.excludedAgents).toBe("");
@@ -518,6 +546,67 @@ describe("UsageStore session filter params", () => {
     );
   });
 
+  it("passes exclusion filters to usage endpoints", async () => {
+    const { usage } = await loadStore();
+
+    usage.excludedProjects = "proj-a,proj-b";
+    usage.excludedProjectKeys = "pl1:sha256:project";
+    usage.excludedAgents = "codex";
+
+    await usage.fetchAll();
+
+    expect(usageServiceMocks.getApiV1UsageSummary).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        excludeProject: "proj-a,proj-b",
+        excludeProjectKey: "pl1:sha256:project",
+        excludeAgent: "codex",
+      }),
+    );
+    expect(usageServiceMocks.getApiV1UsageTopSessions).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        excludeProject: "proj-a,proj-b",
+        excludeProjectKey: "pl1:sha256:project",
+        excludeAgent: "codex",
+      }),
+    );
+  });
+
+  it("refreshes response-scoped project selections after archive identity changes", async () => {
+    usageServiceMocks.getApiV1UsageSummary.mockRejectedValueOnce(
+      new apiRuntimeMocks.ApiError(
+        400,
+        "unknown project key",
+        "unknown_project_key",
+      ),
+    );
+    const { usage } = await loadStore();
+    usage.excludedProjectKeys = "pl1:sha256:stale";
+    usage.pairwiseSelection = {
+      left: { dimension: "project", value: "pl1:sha256:stale" },
+      right: { dimension: "model", value: "gpt-4o" },
+    };
+
+    await usage.fetchAll();
+
+    expect(usage.excludedProjectKeys).toBe("");
+    expect(usageServiceMocks.getApiV1UsageSummary).toHaveBeenCalledTimes(2);
+    expect(usageServiceMocks.getApiV1UsageSummary).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        excludeProjectKey: "pl1:sha256:stale",
+      }),
+    );
+    expect(usageServiceMocks.getApiV1UsageSummary).toHaveBeenNthCalledWith(
+      2,
+      expect.not.objectContaining({ excludeProjectKey: expect.anything() }),
+    );
+    expect(usageServiceMocks.getApiV1UsageTopSessions).toHaveBeenCalledTimes(2);
+    expect(usage.pairwiseSelection.left.value).not.toBe(
+      "pl1:sha256:stale",
+    );
+    expect(usage.summary).not.toBeNull();
+  });
+
   it("stores pairwise comparison data from the generated API", async () => {
     const { usage } = await loadStore();
 
@@ -576,8 +665,8 @@ describe("UsageStore session filter params", () => {
     await Promise.resolve();
 
     expect(usage.pairwiseSelection).toEqual({
-      left: { dimension: "project", value: "beta" },
-      right: { dimension: "project", value: "gamma" },
+      left: { dimension: "project", value: "pl1:sha256:beta" },
+      right: { dimension: "project", value: "pl1:sha256:gamma" },
     });
     expect(usage.pairwiseComparison).toBeNull();
   });
@@ -785,7 +874,7 @@ describe("UsageStore session filter params", () => {
         return Promise.resolve({
           priorFrom: "2023-12-01",
           priorTo: "2023-12-31",
-          priorTotalCost: 1,
+          priorTotalCost: testMoney(1),
           deltaPct: 0.5,
         });
       },
@@ -818,14 +907,14 @@ describe("UsageStore session filter params", () => {
     expect(usage.summary?.comparison).toEqual({
       priorFrom: "2023-12-01",
       priorTo: "2023-12-31",
-      priorTotalCost: 1,
+      priorTotalCost: testMoney(1),
       deltaPct: 0.5,
     });
     expect(usage.pairwiseComparison).toEqual(usagePairwiseComparison());
     expect(
       usageServiceMocks.getApiV1UsageComparison,
     ).toHaveBeenCalledWith(
-      expect.objectContaining({ currentCost: 0 }),
+      expect.objectContaining({ currentMicrodollars: 0 }),
     );
     expect(
       usageServiceMocks.getApiV1UsagePairwiseComparison,
@@ -869,7 +958,7 @@ describe("UsageStore session filter params", () => {
 
     expect(usage.querying.summary).toBe(false);
     await vi.waitFor(() => expect(usage.isQuerying).toBe(false));
-    expect(usage.summary?.totals.totalCost).toBe(2);
+    expect(usage.summary?.totals.totalCost).toEqual(testMoney(2));
   });
 
   it("aborts stale top sessions when a new full refresh starts", async () => {
@@ -895,6 +984,26 @@ describe("UsageStore session filter params", () => {
 
     void usage.fetchAll();
     await Promise.resolve();
+
+    expect(signals[0]?.aborted).toBe(true);
+  });
+
+  it("aborts visible panel requests on teardown", async () => {
+    const signals: (AbortSignal | undefined)[] = [];
+    apiRuntimeMocks.callGenerated.mockImplementation(
+      (request: () => Promise<unknown>, signal?: AbortSignal) => {
+        signals.push(signal);
+        return request();
+      },
+    );
+    usageServiceMocks.getApiV1UsageSummary.mockImplementationOnce(
+      () => new Promise(() => {}),
+    );
+    const { usage } = await loadStore();
+
+    void usage.fetchSummary();
+    await Promise.resolve();
+    usage.cancelInFlightReads();
 
     expect(signals[0]?.aborted).toBe(true);
   });
@@ -1053,7 +1162,7 @@ describe("UsageStore session filter params", () => {
     expect(usage.summary?.comparison).toEqual({
       priorFrom: "2023-12-01",
       priorTo: "2023-12-31",
-      priorTotalCost: 1,
+      priorTotalCost: testMoney(1),
       deltaPct: 0.5,
     });
     expect(usage.pairwiseComparison).toEqual(usagePairwiseComparison());
@@ -1092,7 +1201,7 @@ describe("UsageStore session filter params", () => {
 
     usage.setPairwiseSide("right", {
       dimension: "project",
-      value: "alpha",
+      value: "pl1:sha256:alpha",
     });
     await Promise.resolve();
 
@@ -1100,7 +1209,7 @@ describe("UsageStore session filter params", () => {
       ...usagePairwiseComparison(),
       left: {
         ...usagePairwiseComparison().left,
-        totalCost: 99,
+        totalCost: testMoney(99),
       },
     });
     await Promise.resolve();
@@ -1110,11 +1219,11 @@ describe("UsageStore session filter params", () => {
       ...usagePairwiseComparison(),
       left: {
         ...usagePairwiseComparison().left,
-        totalCost: 3,
+        totalCost: testMoney(3),
       },
       deltas: {
         ...usagePairwiseComparison().deltas,
-        totalCostDelta: 2,
+        totalCostDelta: testMoney(2),
         totalCostDeltaRatio: 2,
       },
     };
@@ -1137,7 +1246,7 @@ describe("UsageStore session filter params", () => {
       expect.objectContaining({
         leftDimension: "project",
         rightDimension: "project",
-        rightValue: "alpha",
+        rightValue: "pl1:sha256:alpha",
       }),
     );
   });
@@ -1160,7 +1269,7 @@ describe("UsageStore session filter params", () => {
           outputTokens: 0,
           cacheCreationTokens: 0,
           cacheReadTokens: 0,
-          totalCost: 0,
+          totalCost: testMoney(0),
         },
         daily: [],
         projectTotals: [],
@@ -1177,7 +1286,7 @@ describe("UsageStore session filter params", () => {
           uncachedInputTokens: 0,
           outputTokens: 0,
           hitRate: 0,
-          savingsVsUncached: 0,
+          savingsVsUncached: testMoney(0),
         },
       });
 
@@ -1278,12 +1387,14 @@ describe("buildUsageUrlParams", () => {
       isPinned: false,
       windowDays: 30,
       excludedProjects: "p1",
+      excludedProjectKeys: "pk1",
       excludedAgents: "a1",
       excludedModels: "m1",
       selectedModels: "m2",
     });
     expect(params).toEqual({
       exclude_project: "p1",
+      exclude_agent: "a1",
       model: "m2",
     });
   });
@@ -1296,6 +1407,7 @@ describe("buildUsageUrlParams", () => {
       isPinned: true,
       windowDays: 30,
       excludedProjects: "",
+      excludedProjectKeys: "",
       excludedAgents: "",
       excludedModels: "",
       selectedModels: "",
@@ -1314,6 +1426,7 @@ describe("buildUsageUrlParams", () => {
       isPinned: false,
       windowDays: 30,
       excludedProjects: "",
+      excludedProjectKeys: "",
       excludedAgents: "",
       excludedModels: "",
       selectedModels: "",
@@ -1329,6 +1442,7 @@ describe("buildUsageUrlParams", () => {
       isPinned: true,
       windowDays: 30,
       excludedProjects: "",
+      excludedProjectKeys: "",
       excludedAgents: "",
       excludedModels: "",
       selectedModels: "",
@@ -1344,6 +1458,7 @@ describe("buildUsageUrlParams", () => {
       isPinned: false,
       windowDays: 7,
       excludedProjects: "",
+      excludedProjectKeys: "",
       excludedAgents: "",
       excludedModels: "",
       selectedModels: "",
@@ -1359,6 +1474,7 @@ describe("buildUsageUrlParams", () => {
       isPinned: true,
       windowDays: 7,
       excludedProjects: "",
+      excludedProjectKeys: "",
       excludedAgents: "",
       excludedModels: "",
       selectedModels: "",

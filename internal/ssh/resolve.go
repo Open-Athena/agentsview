@@ -14,6 +14,10 @@ import (
 // is not a valid agent type, so parseResolvedDirs routes it separately.
 const resolveFilePrefix = "@file"
 
+// resolveAgentFilePrefix marks lines that name an agent-scoped file to
+// transfer without recursively archiving that agent's root directory.
+const resolveAgentFilePrefix = "@agentfile"
+
 const resolveRecordSep = "\x00"
 
 func aiderSkipDirCasePattern() string {
@@ -73,6 +77,188 @@ func buildAiderResolveSnippet(envVar string) string {
 // the remote are skipped.
 func buildResolveScript() string {
 	var b strings.Builder
+	b.WriteString(
+		"av_emit_agent_file() { " +
+			"agent=\"$1\"; " +
+			"file=\"$2\"; " +
+			"[ -f \"$file\" ] && printf '%s\\000' \"" + resolveAgentFilePrefix + ":$agent:$file\"; " +
+			"}\n" +
+			"av_emit_windsurf_target() { " +
+			"target=\"$1\"; " +
+			"case \"$target\" in */) target=\"${target%/}\";; esac; " +
+			"workspace=\"$target\"; " +
+			"case \"$workspace\" in */workspaceStorage) ;; " +
+			"*) workspace=\"$workspace/workspaceStorage\";; esac; " +
+			"[ -d \"$workspace\" ] || return; " +
+			"av_windsurf_root_emitted=0; " +
+			"for av_windsurf_ws in \"$workspace\"/*; do " +
+			"[ -d \"$av_windsurf_ws\" ] || continue; " +
+			"av_windsurf_db=\"$av_windsurf_ws/" + parser.WindsurfStateDBName + "\"; " +
+			"[ -f \"$av_windsurf_db\" ] || continue; " +
+			"if [ \"$av_windsurf_root_emitted\" -eq 0 ]; then " +
+			"printf '%s\\000' \"" + string(parser.AgentWindsurf) + ":$target\"; " +
+			"av_windsurf_root_emitted=1; " +
+			"fi; " +
+			"for av_windsurf_file in \"$av_windsurf_db\" \"$av_windsurf_db-wal\" \"$av_windsurf_ws/workspace.json\"; do " +
+			"av_emit_agent_file \"" + string(parser.AgentWindsurf) + "\" \"$av_windsurf_file\"; " +
+			"done; " +
+			"done; " +
+			"}\n" +
+			// RooCode's root is VSCode's whole globalStorage extension
+			// directory, which also holds settings/mcp_settings.json
+			// (MCP env vars, API keys), caches, and checkpoints. Emit
+			// only discovered per-task session files, never the raw
+			// directory, mirroring remotesync.resolveRooCodeTarget.
+			"av_emit_roocode_target() { " +
+			"target=\"$1\"; " +
+			"case \"$target\" in */) target=\"${target%/}\";; esac; " +
+			"av_roo_tasks=\"$target/tasks\"; " +
+			"[ -d \"$av_roo_tasks\" ] || return; " +
+			"av_roocode_root_emitted=0; " +
+			"for av_roo_task in \"$av_roo_tasks\"/*; do " +
+			"[ -d \"$av_roo_task\" ] || continue; " +
+			"case \"${av_roo_task##*/}\" in _*) continue;; esac; " +
+			"av_roo_history=\"$av_roo_task/history_item.json\"; " +
+			"[ -f \"$av_roo_history\" ] || continue; " +
+			"if [ \"$av_roocode_root_emitted\" -eq 0 ]; then " +
+			"printf '%s\\000' \"" + string(parser.AgentRooCode) + ":$target\"; " +
+			"av_roocode_root_emitted=1; " +
+			"fi; " +
+			"av_emit_agent_file \"" + string(parser.AgentRooCode) + "\" \"$av_roo_history\"; " +
+			"av_emit_agent_file \"" + string(parser.AgentRooCode) + "\" \"$av_roo_task/ui_messages.json\"; " +
+			"done; " +
+			"}\n" +
+			// Kilo Legacy's root is VSCode's whole globalStorage
+			// extension directory, which can contain MCP settings,
+			// API credentials, caches, and other unrelated data. Emit
+			// only discovered per-task session files, never the raw
+			// directory, mirroring remotesync.resolveKiloLegacyTarget.
+			"av_emit_kilo_legacy_target() { " +
+			"target=\"$1\"; " +
+			"case \"$target\" in */) target=\"${target%/}\";; esac; " +
+			"av_kl_tasks=\"$target/tasks\"; " +
+			"[ -d \"$av_kl_tasks\" ] || return; " +
+			"av_kilo_legacy_root_emitted=0; " +
+			"for av_kl_task in \"$av_kl_tasks\"/*; do " +
+			"[ -d \"$av_kl_task\" ] || continue; " +
+			"[ -L \"$av_kl_task\" ] && continue; " +
+			"case \"${av_kl_task##*/}\" in _*|.*) continue;; esac; " +
+			"av_kl_metadata=\"$av_kl_task/task_metadata.json\"; " +
+			"[ -f \"$av_kl_metadata\" ] || continue; " +
+			"if [ \"$av_kilo_legacy_root_emitted\" -eq 0 ]; then " +
+			"printf '%s\\000' \"" + string(parser.AgentKiloLegacy) + ":$target\"; " +
+			"av_kilo_legacy_root_emitted=1; " +
+			"fi; " +
+			"av_emit_agent_file \"" + string(parser.AgentKiloLegacy) + "\" \"$av_kl_metadata\"; " +
+			"av_emit_agent_file \"" + string(parser.AgentKiloLegacy) + "\" \"$av_kl_task/ui_messages.json\"; " +
+			"av_emit_agent_file \"" + string(parser.AgentKiloLegacy) + "\" \"$av_kl_task/api_conversation_history.json\"; " +
+			"done; " +
+			"}\n" +
+			// Poolside's root is the application-data directory, which
+			// may contain config, caches, or credentials. Only the
+			// trajectories/ subdirectory is parsed, so only it must be
+			// archived during remote sync, mirroring
+			// remotesync.resolvePoolsideTarget.
+			"av_emit_poolside_target() { " +
+			"target=\"$1\"; " +
+			"case \"$target\" in */) target=\"${target%/}\";; esac; " +
+			"case \"${target##*/}\" in " +
+			"trajectories) [ -d \"$target\" ] && " +
+			"printf '%s\\000' \"" + string(parser.AgentPoolside) + ":$target\";; " +
+			"*) av_poolside_traj=\"$target/trajectories\"; " +
+			"[ -d \"$av_poolside_traj\" ] && " +
+			"printf '%s\\000' \"" + string(parser.AgentPoolside) + ":$av_poolside_traj\";; " +
+			"esac; " +
+			"}\n" +
+			"av_emit_target() { " +
+			"agent=\"$1\"; " +
+			"target=\"$2\"; " +
+			"if [ \"$agent\" = \"" + string(parser.AgentWindsurf) + "\" ]; then " +
+			"av_emit_windsurf_target \"$target\"; " +
+			"return; " +
+			"fi; " +
+			"if [ \"$agent\" = \"" + string(parser.AgentRooCode) + "\" ]; then " +
+			"av_emit_roocode_target \"$target\"; " +
+			"return; " +
+			"fi; " +
+			"if [ \"$agent\" = \"" + string(parser.AgentKiloLegacy) + "\" ]; then " +
+			"av_emit_kilo_legacy_target \"$target\"; " +
+			"return; " +
+			"fi; " +
+			"if [ \"$agent\" = \"" + string(parser.AgentPoolside) + "\" ]; then " +
+			"av_emit_poolside_target \"$target\"; " +
+			"return; " +
+			"fi; " +
+			"[ -d \"$target\" ] && printf '%s\\000' \"$agent:$target\"; " +
+			"}\n" +
+			"av_emit_extra_file() { " +
+			"file=\"$1\"; " +
+			"[ -f \"$file\" ] && printf '%s\\000' \"" + resolveFilePrefix + ":$file\"; " +
+			"}\n" +
+			"av_has_hermes_transcript() { " +
+			"av_hermes_transcript_dir=\"$1\"; " +
+			"[ -d \"$av_hermes_transcript_dir\" ] || return 1; " +
+			"for av_hermes_transcript in \"$av_hermes_transcript_dir\"/*.jsonl \"$av_hermes_transcript_dir\"/session_*.json; do " +
+			"[ -f \"$av_hermes_transcript\" ] && return 0; done; return 1; " +
+			"}\n" +
+			"av_emit_hermes_target() { " +
+			"target=\"$1\"; " +
+			"av_hermes_allow_flat=\"${2:-1}\"; " +
+			"while [ \"$target\" != \"/\" ] && [ \"${target%/}\" != \"$target\" ]; do target=\"${target%/}\"; done; " +
+			"av_hermes_parent=\"${target%/*}\"; av_hermes_grandparent=\"${av_hermes_parent%/*}\"; " +
+			"if [ \"${av_hermes_parent##*/}\" = profiles ] && [ \"${av_hermes_grandparent##*/}\" = .hermes ]; then av_hermes_allow_flat=0; fi; " +
+			"if [ \"$av_hermes_allow_flat\" -eq 0 ]; then " +
+			"av_hermes_root=\"$target\"; av_hermes_sessions=\"$target/sessions\"; " +
+			"else case \"$target\" in " +
+			"*/sessions) av_hermes_root=\"${target%/*}\"; av_hermes_sessions=\"$target\";; " +
+			"*/state.db) av_hermes_root=\"${target%/*}\"; av_hermes_sessions=\"$av_hermes_root/sessions\";; " +
+			"*) av_hermes_root=\"$target\"; av_hermes_sessions=\"$target/sessions\";; " +
+			"esac; fi; " +
+			"av_hermes_state=\"$av_hermes_root/state.db\"; " +
+			"if [ -d \"$av_hermes_sessions\" ]; then " +
+			"av_emit_target \"" + string(parser.AgentHermes) + "\" \"$av_hermes_sessions\"; " +
+			"for av_hermes_file in \"$av_hermes_state\" \"$av_hermes_state-wal\" \"$av_hermes_state-shm\" \"$av_hermes_state-journal\"; do " +
+			"av_emit_extra_file \"$av_hermes_file\"; done; " +
+			"elif [ -f \"$av_hermes_state\" ]; then " +
+			"printf '%s\\000' \"" + string(parser.AgentHermes) + ":$av_hermes_state\"; " +
+			"for av_hermes_file in \"$av_hermes_state-wal\" \"$av_hermes_state-shm\" \"$av_hermes_state-journal\"; do " +
+			"av_emit_extra_file \"$av_hermes_file\"; done; " +
+			"elif [ \"$av_hermes_allow_flat\" -eq 1 ] && av_has_hermes_transcript \"$target\"; then " +
+			"av_emit_target \"" + string(parser.AgentHermes) + "\" \"$target\"; fi; " +
+			"}\n" +
+			"av_emit_hermes_profiles() { " +
+			"av_hermes_profiles=\"$1\"; " +
+			"for av_hermes_prof in \"$av_hermes_profiles\"/*; do " +
+			"[ -L \"$av_hermes_prof\" ] && continue; " +
+			"[ -d \"$av_hermes_prof\" ] || continue; " +
+			"av_emit_hermes_target \"$av_hermes_prof\" 0; " +
+			"done; " +
+			"}\n" +
+			"av_emit_hermes_dir() { " +
+			"dir=\"$1\"; [ -n \"$dir\" ] || dir=\"$2\"; " +
+			"while [ \"$dir\" != \"/\" ] && [ \"${dir%/}\" != \"$dir\" ]; do dir=\"${dir%/}\"; done; " +
+			"av_hermes_parent=\"${dir%/*}\"; " +
+			"if [ \"${dir##*/}\" = profiles ] && [ \"${av_hermes_parent##*/}\" = .hermes ]; then " +
+			"av_emit_hermes_profiles \"$dir\"; return; fi; " +
+			"av_emit_hermes_target \"$dir\"; " +
+			"}\n" +
+			"av_emit_dir() { " +
+			"dir=\"$1\"; " +
+			"[ -n \"$dir\" ] || dir=\"$2\"; " +
+			"av_emit_target \"$3\" \"$dir\"; " +
+			"}\n" +
+			"av_emit_rooted_dir() { " +
+			"dir=\"$1\"; " +
+			"root=\"$2\"; " +
+			"[ -z \"$dir\" ] && [ -n \"$root\" ] && dir=\"$root$3\"; " +
+			"[ -n \"$dir\" ] || dir=\"$4\"; " +
+			"av_emit_target \"$5\" \"$dir\"; " +
+			"}\n" +
+			"av_emit_codex_index() { " +
+			"idx=\"${dir%/*}/" + parser.CodexSessionIndexFilename + "\"; " +
+			"[ -f \"$idx\" ] && printf '%s\\000' \"" + resolveFilePrefix + ":$idx\"; " +
+			"}\n",
+	)
 	for _, def := range parser.Registry {
 		if !resolveAgentHasOnDiskSource(def) {
 			continue
@@ -96,39 +282,30 @@ func buildResolveScript() string {
 		}
 		for _, rel := range def.DefaultDirs {
 			defaultDir := "$HOME/" + rel
+			if def.Type == parser.AgentHermes {
+				fmt.Fprintf(&b,
+					"av_emit_hermes_dir \"%s\" \"%s\"\n",
+					remoteEnvExpansion(def.EnvVar), defaultDir,
+				)
+				continue
+			}
 			if def.DefaultRootEnvVar != "" {
 				rootTail := remoteDefaultRootTail(rel)
-				fmt.Fprintf(&b, "dir=\"")
-				if def.EnvVar != "" {
-					fmt.Fprintf(&b, "${%s:-}", def.EnvVar)
-				}
-				fmt.Fprintf(&b, "\"; ")
-				fmt.Fprintf(&b, "root=\"${%s:-}\"; ", def.DefaultRootEnvVar)
+				rootSuffix := ""
 				if rootTail != "" {
-					fmt.Fprintf(&b,
-						"[ -z \"$dir\" ] && [ -n \"$root\" ] && dir=\"$root/%s\"; ",
-						rootTail,
-					)
-				} else {
-					fmt.Fprintf(&b,
-						"[ -z \"$dir\" ] && [ -n \"$root\" ] && dir=\"$root\"; ",
-					)
+					rootSuffix = "/" + rootTail
 				}
 				fmt.Fprintf(&b,
-					"[ -n \"$dir\" ] || dir=\"%s\"; [ -d \"$dir\" ] && "+
-						"printf '%%s\\000' \"%s:$dir\"\n",
-					defaultDir, string(def.Type),
+					"av_emit_rooted_dir \"%s\" \"%s\" \"%s\" \"%s\" %s\n",
+					remoteEnvExpansion(def.EnvVar),
+					remoteEnvExpansion(def.DefaultRootEnvVar),
+					rootSuffix, defaultDir, string(def.Type),
 				)
 			} else {
-				dirExpr := defaultDir
-				if def.EnvVar != "" {
-					// env var overrides default
-					dirExpr = fmt.Sprintf("${%s:-%s}", def.EnvVar, defaultDir)
-				}
 				fmt.Fprintf(&b,
-					"dir=\"%s\"; [ -d \"$dir\" ] && "+
-						"printf '%%s\\000' \"%s:$dir\"\n",
-					dirExpr, string(def.Type),
+					"av_emit_dir \"%s\" \"%s\" %s\n",
+					remoteEnvExpansion(def.EnvVar), defaultDir,
+					string(def.Type),
 				)
 			}
 			// Codex stores renameable session titles in
@@ -136,20 +313,31 @@ func buildResolveScript() string {
 			// sessions/ and archived_sessions/. Emit it so renames
 			// import on remote hosts too. ${dir%/*} is the parent.
 			if def.Type == parser.AgentCodex {
-				fmt.Fprintf(&b,
-					"idx=\"${dir%%/*}/%s\"; "+
-						"[ -f \"$idx\" ] && "+
-						"printf '%%s\\000' \"%s:$idx\"\n",
-					parser.CodexSessionIndexFilename,
-					resolveFilePrefix,
-				)
+				b.WriteString("av_emit_codex_index\n")
 			}
+		}
+		// Hermes named defaults are replacements, not additions, when the
+		// sessions override is set. Each emitted profile includes its state DB
+		// and live SQLite companions as well as transcript sessions.
+		if def.Type == parser.AgentHermes {
+			fmt.Fprintf(&b,
+				"if [ -z \"%s\" ]; then "+
+					"av_emit_hermes_profiles \"$HOME/.hermes/profiles\"; fi\n",
+				remoteEnvExpansion(def.EnvVar),
+			)
 		}
 	}
 	// Ensure exit 0 — the last [ -d ]/[ -f ] test may fail if that
 	// path doesn't exist, which would make sh exit non-zero.
 	b.WriteString("true\n")
 	return b.String()
+}
+
+func remoteEnvExpansion(envVar string) string {
+	if envVar == "" {
+		return ""
+	}
+	return "${" + envVar + ":-}"
 }
 
 // BuildResolveScriptForTest exposes the SSH resolver script to
@@ -169,6 +357,9 @@ func remoteDefaultRootTail(rel string) string {
 // resolveAgentHasOnDiskSource reports whether a file-backed agent has local
 // sources the resolve script should probe via the provider facade.
 func resolveAgentHasOnDiskSource(def parser.AgentDef) bool {
+	if def.Type == parser.AgentTrae {
+		return false
+	}
 	if !def.FileBased {
 		return false
 	}
@@ -181,20 +372,23 @@ func resolveAgentHasOnDiskSource(def parser.AgentDef) bool {
 	}
 }
 
-// parseResolvedDirs parses script output into a map of agent type to transfer
-// target paths plus a deduplicated list of extra files (records tagged with
-// resolveFilePrefix). Generated resolver output is NUL-delimited so remote
-// paths containing newlines cannot inject extra records; newline-delimited input
-// is accepted only for older tests and defensive compatibility. Most agent
-// targets are directories; Aider targets are individual .aider.chat.history.md
-// files. Skips empty records, empty values, and values containing record
-// separators.
-func parseResolvedDirs(
+// parseResolvedTargets parses script output into deduplicated agent root paths,
+// agent-scoped files, and extra files (records tagged with resolveFilePrefix).
+// Generated resolver output is
+// NUL-delimited so remote paths containing newlines cannot inject extra
+// records; newline-delimited input is accepted only for older tests and
+// defensive compatibility. Most agent targets are directories; Aider
+// targets are individual .aider.chat.history.md files. Skips empty
+// records, empty values, and values containing record separators.
+func parseResolvedTargets(
 	output string,
-) (map[parser.AgentType][]string, []string) {
+) (map[parser.AgentType][]string, map[parser.AgentType][]string, []string) {
 	dirs := make(map[parser.AgentType][]string)
+	files := make(map[parser.AgentType][]string)
 	var extraFiles []string
+	seenDir := make(map[parser.AgentType]map[string]struct{})
 	seenFile := make(map[string]struct{})
+	seenAgentFile := make(map[parser.AgentType]map[string]struct{})
 	for _, record := range resolveOutputRecords(output) {
 		record = strings.TrimSpace(record)
 		if record == "" {
@@ -212,13 +406,50 @@ func parseResolvedDirs(
 			extraFiles = append(extraFiles, value)
 			continue
 		}
+		if key == resolveAgentFilePrefix {
+			agent, pathValue, ok := strings.Cut(value, ":")
+			if !ok || invalidResolvedPath(pathValue) {
+				continue
+			}
+			at := parser.AgentType(agent)
+			if at == "" {
+				continue
+			}
+			seen, ok := seenAgentFile[at]
+			if !ok {
+				seen = make(map[string]struct{})
+				seenAgentFile[at] = seen
+			}
+			if _, dup := seen[pathValue]; dup {
+				continue
+			}
+			seen[pathValue] = struct{}{}
+			files[at] = append(files[at], pathValue)
+			continue
+		}
 		at := parser.AgentType(key)
 		if at == parser.AgentAider &&
 			path.Base(value) != parser.AiderHistoryFileName() {
 			continue
 		}
+		seen, ok := seenDir[at]
+		if !ok {
+			seen = make(map[string]struct{})
+			seenDir[at] = seen
+		}
+		if _, dup := seen[value]; dup {
+			continue
+		}
+		seen[value] = struct{}{}
 		dirs[at] = append(dirs[at], value)
 	}
+	return dirs, files, extraFiles
+}
+
+func parseResolvedDirs(
+	output string,
+) (map[parser.AgentType][]string, []string) {
+	dirs, _, extraFiles := parseResolvedTargets(output)
 	return dirs, extraFiles
 }
 
@@ -226,6 +457,12 @@ func parseResolvedDirs(
 // internal/remotesync parity tests.
 func ParseResolvedTargetsForTest(output string) (map[parser.AgentType][]string, []string) {
 	return parseResolvedDirs(output)
+}
+
+func ParseResolvedTargetsWithFilesForTest(
+	output string,
+) (map[parser.AgentType][]string, map[parser.AgentType][]string, []string) {
+	return parseResolvedTargets(output)
 }
 
 func resolveOutputRecords(output string) []string {
@@ -245,12 +482,12 @@ func invalidResolvedPath(value string) bool {
 func resolveDirs(
 	ctx context.Context,
 	host, user string, port int, sshOpts []string,
-) (map[parser.AgentType][]string, []string, error) {
+) (map[parser.AgentType][]string, map[parser.AgentType][]string, []string, error) {
 	script := buildResolveScript()
-	out, err := runSSH(ctx, host, user, port, sshOpts, script)
+	out, err := runSSHScript(ctx, host, user, port, sshOpts, script)
 	if err != nil {
-		return nil, nil, fmt.Errorf("resolve dirs: %w", err)
+		return nil, nil, nil, fmt.Errorf("resolve dirs: %w", err)
 	}
-	dirs, extraFiles := parseResolvedDirs(string(out))
-	return dirs, extraFiles, nil
+	dirs, files, extraFiles := parseResolvedTargets(string(out))
+	return dirs, files, extraFiles, nil
 }

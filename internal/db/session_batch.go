@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -27,6 +28,7 @@ type SessionBatchWrite struct {
 type SessionBatchResult struct {
 	WrittenSessions  int
 	WrittenMessages  int
+	WrittenIndexes   []int
 	ExcludedSessions int
 	ExcludedIDs      []string
 	FailedSessions   int
@@ -60,6 +62,7 @@ func (db *DB) WriteSessionBatch(
 		return result, fmt.Errorf("beginning batch tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	var pendingRecallRevocations recallEvidenceRevocationEvents
 
 	for i, write := range writes {
 		write = sanitizeSessionBatchWrite(write)
@@ -70,7 +73,12 @@ func (db *DB) WriteSessionBatch(
 			)
 		}
 
-		messagesWritten, err := writeOneSessionBatchTx(tx, write)
+		var sessionRecallRevocations recallEvidenceRevocationEvents
+		messagesWritten, err := writeOneSessionBatchTx(
+			tx,
+			write,
+			&sessionRecallRevocations,
+		)
 		switch {
 		case err == nil:
 			if _, err := tx.Exec("RELEASE SAVEPOINT " + savepoint); err != nil {
@@ -79,8 +87,13 @@ func (db *DB) WriteSessionBatch(
 					savepoint, err,
 				)
 			}
+			pendingRecallRevocations = append(
+				pendingRecallRevocations,
+				sessionRecallRevocations...,
+			)
 			result.WrittenSessions++
 			result.WrittenMessages += messagesWritten
+			result.WrittenIndexes = append(result.WrittenIndexes, i)
 		case errors.Is(err, ErrSessionExcluded),
 			errors.Is(err, ErrSessionTrashed):
 			if rerr := rollbackSavepoint(tx, savepoint); rerr != nil {
@@ -103,6 +116,7 @@ func (db *DB) WriteSessionBatch(
 	if err := tx.Commit(); err != nil {
 		return result, fmt.Errorf("committing batch tx: %w", err)
 	}
+	pendingRecallRevocations.flush()
 	return result, nil
 }
 
@@ -129,13 +143,19 @@ func (db *DB) WriteSessionBatchAtomic(
 		return result, fmt.Errorf("beginning batch tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	var pendingRecallRevocations recallEvidenceRevocationEvents
 
-	for _, write := range writes {
+	for i, write := range writes {
 		write = sanitizeSessionBatchWrite(write)
-		messagesWritten, err := writeOneSessionBatchTx(tx, write)
+		messagesWritten, err := writeOneSessionBatchTx(
+			tx,
+			write,
+			&pendingRecallRevocations,
+		)
 		if err != nil {
 			result.WrittenSessions = 0
 			result.WrittenMessages = 0
+			result.WrittenIndexes = nil
 			switch {
 			case errors.Is(err, ErrSessionExcluded),
 				errors.Is(err, ErrSessionTrashed):
@@ -152,12 +172,14 @@ func (db *DB) WriteSessionBatchAtomic(
 		}
 		result.WrittenSessions++
 		result.WrittenMessages += messagesWritten
+		result.WrittenIndexes = append(result.WrittenIndexes, i)
 	}
 
 	if len(beforeCommit) > 0 && beforeCommit[0] != nil {
 		if err := beforeCommit[0](); err != nil {
 			result.WrittenSessions = 0
 			result.WrittenMessages = 0
+			result.WrittenIndexes = nil
 			return result, err
 		}
 	}
@@ -165,6 +187,7 @@ func (db *DB) WriteSessionBatchAtomic(
 	if err := tx.Commit(); err != nil {
 		return result, fmt.Errorf("committing batch tx: %w", err)
 	}
+	pendingRecallRevocations.flush()
 	return result, nil
 }
 
@@ -266,7 +289,9 @@ func rollbackSavepoint(tx *sql.Tx, savepoint string) error {
 }
 
 func writeOneSessionBatchTx(
-	tx *sql.Tx, write SessionBatchWrite,
+	tx *sql.Tx,
+	write SessionBatchWrite,
+	pendingRecallRevocations *recallEvidenceRevocationEvents,
 ) (int, error) {
 	var excluded int
 	err := tx.QueryRow(
@@ -282,11 +307,11 @@ func writeOneSessionBatchTx(
 	if excluded == 1 {
 		return 0, ErrSessionExcluded
 	}
-	var deletedAt sql.NullString
+	var deletedAt, deletionCause sql.NullString
 	err = tx.QueryRow(
-		"SELECT deleted_at FROM sessions WHERE id = ?",
+		"SELECT deleted_at, deletion_cause FROM sessions WHERE id = ?",
 		write.Session.ID,
-	).Scan(&deletedAt)
+	).Scan(&deletedAt, &deletionCause)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, fmt.Errorf(
 			"checking trash for %s: %w",
@@ -294,8 +319,23 @@ func writeOneSessionBatchTx(
 		)
 	}
 	sessionExists := err == nil
-	if deletedAt.Valid {
+	if deletedAt.Valid &&
+		(!deletionCause.Valid || deletionCause.String != deletionCauseSourceMissing) {
 		return 0, ErrSessionTrashed
+	}
+	replaceMessages := write.ReplaceMessages ||
+		(deletionCause.Valid && deletionCause.String == deletionCauseSourceMissing)
+	replacementTranscriptChanged := false
+	if replaceMessages && sessionExists {
+		stored, err := sessionMessagesTx(
+			context.Background(), tx, write.Session.ID,
+		)
+		if err != nil {
+			return 0, err
+		}
+		replacementTranscriptChanged = !transcriptMessagesEqual(
+			stored, write.Messages,
+		)
 	}
 
 	if _, err := tx.Exec(
@@ -322,7 +362,7 @@ func writeOneSessionBatchTx(
 
 	msgs := write.Messages
 	var pins []savedPin
-	if write.ReplaceMessages && sessionExists {
+	if replaceMessages && sessionExists {
 		pins, err = savePinsTx(tx, write.Session.ID)
 		if err != nil {
 			return 0, err
@@ -336,6 +376,10 @@ func writeOneSessionBatchTx(
 			return 0, err
 		}
 		msgs = messagesAfterOrdinal(msgs, maxOrd)
+	}
+	transcriptChanged := len(msgs) > 0
+	if replaceMessages && sessionExists {
+		transcriptChanged = replacementTranscriptChanged
 	}
 
 	if len(msgs) > 0 {
@@ -352,7 +396,22 @@ func writeOneSessionBatchTx(
 			return 0, err
 		}
 	}
-	if write.ReplaceMessages {
+	if transcriptChanged {
+		if err := bumpTranscriptRevisionTx(tx, write.Session.ID); err != nil {
+			return 0, err
+		}
+	}
+	if replaceMessages && sessionExists {
+		if err := reconcileRecallEvidenceForSessionTx(
+			context.Background(),
+			tx,
+			write.Session.ID,
+			pendingRecallRevocations,
+		); err != nil {
+			return 0, err
+		}
+	}
+	if replaceMessages {
 		if err := restorePinsTx(tx, write.Session.ID, pins); err != nil {
 			return 0, err
 		}
@@ -394,6 +453,34 @@ func writeOneSessionBatchTx(
 	}
 
 	return len(msgs), nil
+}
+
+func sessionMessagesTx(
+	ctx context.Context, tx *sql.Tx, sessionID string,
+) ([]Message, error) {
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
+		SELECT %s
+		FROM messages
+		WHERE session_id = ?
+		ORDER BY ordinal ASC`, selectMessageCols), sessionID)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"querying stored batch messages for %s: %w",
+			sessionID, err,
+		)
+	}
+	msgs, scanErr := scanMessages(rows)
+	closeErr := rows.Close()
+	if scanErr != nil {
+		return nil, scanErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	if err := attachToolCallsWithQuerier(ctx, tx, msgs); err != nil {
+		return nil, err
+	}
+	return msgs, nil
 }
 
 func maxOrdinalTx(tx *sql.Tx, sessionID string) (int, error) {

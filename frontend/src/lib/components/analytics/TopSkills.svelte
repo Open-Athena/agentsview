@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { Chip } from "@kenn-io/kit-ui";
   import { analytics } from "../../stores/analytics.svelte.js";
   import type {
     SkillAgentBreakdown,
@@ -8,7 +9,6 @@
   import { m } from "../../i18n/index.js";
 
   const skills = $derived(analytics.skills?.by_skill ?? []);
-  const trendEntries = $derived(analytics.skills?.trend ?? []);
 
   const maxCount = $derived(
     skills.length > 0
@@ -16,37 +16,8 @@
       : 1,
   );
 
-  const trendMax = $derived.by(() => {
-    let max = 1;
-    for (const entry of trendEntries) {
-      let total = 0;
-      for (const v of Object.values(entry.by_skill)) {
-        total += v;
-      }
-      if (total > max) max = total;
-    }
-    return max;
-  });
-
   function barWidth(count: number): number {
     return (count / maxCount) * 100;
-  }
-
-  function trendBarHeight(total: number): number {
-    return Math.max((total / trendMax) * 100, 2);
-  }
-
-  function trendTotal(bySkill: Record<string, number>): number {
-    let total = 0;
-    for (const v of Object.values(bySkill)) {
-      total += v;
-    }
-    return total;
-  }
-
-  function formatWeek(date: string): string {
-    if (date.length < 10) return date;
-    return date.slice(5);
   }
 
   function formatLastUsed(value: string): string {
@@ -106,25 +77,6 @@
     );
   }
 
-  function handleTrendHover(
-    e: MouseEvent,
-    entry: { date: string; by_skill: Record<string, number> },
-  ) {
-    const total = trendTotal(entry.by_skill);
-    const parts = Object.entries(entry.by_skill)
-      .sort(([, a], [, b]) => b - a)
-      .slice(0, 4)
-      .map(([skill, count]) => `${skill}: ${count}`);
-    showTooltip(
-      e,
-      m.analytics_tool_usage_trend_tooltip({
-        date: entry.date,
-        total,
-        parts: parts.join(", "),
-      }),
-    );
-  }
-
   function handleLeave() {
     tooltip = null;
   }
@@ -156,86 +108,58 @@
       </button>
     </div>
   {:else if skills.length > 0}
-    <div class="sections">
-      <div class="section">
-        <div class="skill-list">
-          {#each skills.slice(0, 8) as skill}
-            <!-- svelte-ignore a11y_no_static_element_interactions -->
-            <div
-              class="skill-row"
-              onmouseenter={(e) => handleSkillHover(e, skill)}
-              onmouseleave={handleLeave}
-            >
-              <span class="skill-name">{skill.skill_name}</span>
-              <span class="bar-track">
-                <span
-                  class="bar-fill"
-                  style="width: {barWidth(skill.call_count)}%"
-                ></span>
-              </span>
-              <span class="bar-value">
-                {skill.call_count.toLocaleString()}
-              </span>
-              <span class="session-value">
-                {m.analytics_session_shape_session_count({
-                  count: skill.session_count,
-                  countLabel: skill.session_count.toLocaleString(),
-                })}
-              </span>
-              <span class="last-used">
-                {formatLastUsed(skill.last_used_at)}
-              </span>
-            </div>
-            <div class="breakdowns">
-              <div class="agent-breakdown" aria-label={m.analytics_top_skills_agent_breakdown()}>
-                <span class="breakdown-label">{m.analytics_top_skills_agents()}</span>
-                {#if skill.agent_breakdown?.length}
-                  {#each skill.agent_breakdown as agent}
-                    <span class="agent-chip">
-                      <span class="agent-name">{agent.agent}</span>
-                      <span class="agent-count">{agent.count.toLocaleString()}</span>
-                      <span class="agent-pct">
-                        {agentPct(agent, skill.call_count)}
-                      </span>
-                    </span>
-                  {/each}
-                {:else}
-                  <span class="muted">{m.shared_none()}</span>
-                {/if}
-              </div>
-              <span class="project-breakdown">
-                {m.analytics_top_skills_projects({
-                  projects: projectBreakdownLabel(skill.project_breakdown),
-                })}
-              </span>
-            </div>
-          {/each}
+    <div class="skill-list">
+      {#each skills.slice(0, 8) as skill}
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div
+          class="skill-row"
+          onmouseenter={(e) => handleSkillHover(e, skill)}
+          onmouseleave={handleLeave}
+        >
+          <span class="skill-name">{skill.skill_name}</span>
+          <span class="bar-track">
+            <span
+              class="bar-fill"
+              style="width: {barWidth(skill.call_count)}%"
+            ></span>
+          </span>
+          <span class="bar-value">
+            {skill.call_count.toLocaleString()}
+          </span>
+          <span class="session-value">
+            {m.analytics_session_shape_session_count({
+              count: skill.session_count,
+              countLabel: skill.session_count.toLocaleString(),
+            })}
+          </span>
+          <span class="last-used">
+            {formatLastUsed(skill.last_used_at)}
+          </span>
         </div>
-      </div>
-
-      {#if trendEntries.length > 1}
-        <div class="section">
-          <h4 class="section-title">{m.analytics_weekly_trend()}</h4>
-          <div class="trend-chart">
-            {#each trendEntries as entry}
-              <!-- svelte-ignore a11y_no_static_element_interactions -->
-              <div
-                class="trend-bar-wrapper"
-                onmouseenter={(e) => handleTrendHover(e, entry)}
-                onmouseleave={handleLeave}
-              >
-                <div
-                  class="trend-bar"
-                  style="height: {trendBarHeight(trendTotal(entry.by_skill))}%"
-                ></div>
-                <span class="trend-label">
-                  {formatWeek(entry.date)}
-                </span>
-              </div>
-            {/each}
+        <div class="breakdowns">
+          <div class="agent-breakdown" aria-label={m.analytics_top_skills_agent_breakdown()}>
+            <span class="breakdown-label">{m.analytics_top_skills_agents()}</span>
+            {#if skill.agent_breakdown?.length}
+              {#each skill.agent_breakdown as agent}
+                <Chip size="xs" uppercase={false} class="agent-chip">
+                  <span class="agent-name">{agent.agent}</span>
+                  <span class="agent-count">{agent.count.toLocaleString()}</span>
+                  <span class="agent-pct">
+                    {agentPct(agent, skill.call_count)}
+                  </span>
+                </Chip>
+              {/each}
+            {:else}
+              <span class="muted">{m.shared_none()}</span>
+            {/if}
           </div>
+          <span class="project-breakdown">
+            {m.analytics_top_skills_projects({
+              projects: projectBreakdownLabel(skill.project_breakdown),
+            })}
+          </span>
         </div>
-      {/if}
+      {/each}
     </div>
 
     {#if tooltip}
@@ -275,21 +199,6 @@
     font-size: 10px;
     color: var(--text-muted);
     white-space: nowrap;
-  }
-
-  .sections {
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
-  }
-
-  .section-title {
-    font-size: 10px;
-    font-weight: 600;
-    color: var(--text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    margin-bottom: 6px;
   }
 
   .skill-list {
@@ -377,15 +286,8 @@
     color: var(--text-secondary);
   }
 
-  .agent-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
+  :global(.agent-chip.kit-chip) {
     max-width: 160px;
-    padding: 2px 5px;
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
-    background: var(--bg-inset);
     color: var(--text-secondary);
   }
 
@@ -405,43 +307,6 @@
   .agent-pct,
   .muted {
     color: var(--text-muted);
-  }
-
-  .trend-chart {
-    display: flex;
-    align-items: flex-end;
-    gap: var(--space-2);
-    height: 72px;
-    padding-top: 4px;
-  }
-
-  .trend-bar-wrapper {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    height: 100%;
-    justify-content: flex-end;
-    cursor: default;
-  }
-
-  .trend-bar {
-    width: 100%;
-    max-width: 32px;
-    background: var(--accent-green, #10b981);
-    border-radius: 2px 2px 0 0;
-    min-height: 2px;
-  }
-
-  .trend-bar-wrapper:hover .trend-bar {
-    opacity: 0.8;
-  }
-
-  .trend-label {
-    font-size: 8px;
-    color: var(--text-muted);
-    margin-top: 2px;
-    white-space: nowrap;
   }
 
   .tooltip {

@@ -156,7 +156,7 @@ agentsview session get <id> [--format json]
 {
   "id": "abc-123",
   "project": "myapp",
-  "machine": "local",
+  "machine": "workstation",
   "agent": "claude",
   "first_message": "...",
   "display_name": "...",
@@ -212,8 +212,17 @@ agentsview session list [flags]
 }
 ```
 
-One-shot and automated sessions are excluded by default. Use the
-`--include-*` flags to opt back in.
+One-shot and automated sessions are excluded by default. When the first CLI
+page hides any, `session list` writes an advisory to stderr with the hidden
+count for each category and the `--include-one-shot` or `--include-automated`
+flag that reveals it. Human and JSON stdout are unchanged, so redirecting or
+piping structured output remains safe. The JSON `total` continues to describe
+the filtered result, not the excluded sessions. Use the `--include-*` flags to
+opt back in.
+
+Date filters match a session when its activity window overlaps the selected
+date or range. Sessions that start before midnight and remain active after it
+therefore appear on both dates.
 
 | Flag                  | HTTP param          | Notes                             |
 |-----------------------|---------------------|-----------------------------------|
@@ -226,6 +235,7 @@ One-shot and automated sessions are excluded by default. Use the
 | `--date-from`         | `date_from`         | `YYYY-MM-DD`                      |
 | `--date-to`           | `date_to`           | `YYYY-MM-DD`                      |
 | `--active-since`      | `active_since`      | RFC3339 timestamp                 |
+| `--since`             | `active_since`      | Relative — `Nh` hours, `Nd` days, `Nw` weeks, `Nm` calendar months (not minutes), `Ny` years — or `YYYY-MM-DD`; resolved against now and mutually exclusive with `--active-since` |
 | `--resume`            | `active_since`      | CLI shortcut for sessions active in the last 15 minutes |
 | `--active`            | `active_since`      | Alias for `--resume`              |
 | `--min-messages`      | `min_messages`      | int                               |
@@ -274,12 +284,29 @@ Return a window of messages. Response shape matches
 
 ```bash
 agentsview session messages <id> [--from N] [--limit N] [--direction asc|desc]
+agentsview session messages <id> --around N [--before N] [--after N] [--role user,assistant]
 ```
 
 `--from` is pointer-valued at the service layer: omitting it means
 "start at the beginning" for ascending and "start at the newest
 page" for descending; an explicit `--from 0` means "start at ordinal
 0" in both directions. `--direction` is validated to `asc` or `desc`.
+
+Window and role flags (see
+[Semantic Search](/semantic-search/#cursor-follow-from-a-hit-to-its-surrounding-conversation)
+for the cursor-follow workflow they support):
+
+| Flag       | HTTP param | Notes                                                        |
+|------------|------------|--------------------------------------------------------------|
+| `--around` | `around`   | Center a window on this ordinal; mutually exclusive with `--from`/`--direction` |
+| `--before` | `before`   | Messages before the anchor (default 5); requires `--around`  |
+| `--after`  | `after`    | Messages after the anchor (default 5); requires `--around`   |
+| `--role`   | `roles`    | Comma-separated roles to include, e.g. `user,assistant`      |
+
+With a `--role` filter, `--before`/`--after` count filtered messages;
+the anchor message is always included. Responses report the window's
+`first_ordinal`/`last_ordinal` so callers can continue paging with
+`--from <last_ordinal + 1>`.
 
 ```json
 {
@@ -519,6 +546,7 @@ agentsview session search <pattern> [flags]
       "session_id": "abc-123",
       "project": "myapp",
       "ordinal": 17,
+      "ordinal_range": [12, 24],
       "location": "tool_result",
       "tool_name": "Bash",
       "snippet": "...connecting to db with token ***REDACTED***..."
@@ -535,6 +563,10 @@ default; opt back in with `--include-one-shot`,
 |-----------------------|---------------------|--------------------------------------------------------|
 | `--regex`             | `mode=regex`        | Treat pattern as an RE2 regex                          |
 | `--fts`               | `mode=fts`          | Tokenized FTS5 search; messages-only                   |
+| `--semantic`          | `mode=semantic`     | Vector search over user/assistant messages; messages-only — see [Semantic Search](/semantic-search/) |
+| `--hybrid`            | `mode=hybrid`       | Semantic + FTS reciprocal rank fusion; messages-only — see [Semantic Search](/semantic-search/) |
+| `--scope`             | `scope`             | `top`, `all` (default), or `subordinate` — semantic/hybrid only; supersedes `include_children` in those modes |
+| `--context`           | `context`           | int — N messages of context before/after each match (max 10) |
 | `--in`                | `in`                | Comma-separated: `messages,tool_input,tool_result` (default all) |
 | `--exclude-system`    | `exclude_system`    | Drop system messages from the scan                     |
 | `--reveal`            | `reveal`            | Show full secret values (localhost-only; warning to stderr) |
@@ -547,17 +579,38 @@ default; opt back in with `--include-one-shot`,
 | `--date-from`         | `date_from`         | `YYYY-MM-DD`                                           |
 | `--date-to`           | `date_to`           | `YYYY-MM-DD`                                           |
 | `--active-since`      | `active_since`      | RFC3339 timestamp                                      |
+| `--since`             | `active_since`      | Relative — `Nh` hours, `Nd` days, `Nw` weeks, `Nm` calendar months (not minutes), `Ny` years — or `YYYY-MM-DD`; resolved against now and mutually exclusive with `--active-since` |
 | `--include-children`  | `include_children`  | bool                                                   |
 | `--include-automated` | `include_automated` | bool                                                   |
 | `--include-one-shot`  | `include_one_shot`  | bool                                                   |
 | `--limit`             | `limit`             | int; default 50, max 500                               |
 | `--cursor`            | `cursor`            | int — pagination cursor from a previous response       |
 
-`--regex` and `--fts` are mutually exclusive. `--fts` is the
-fastest mode on large archives but only searches message bodies;
-substring (the default) and regex modes also walk
-`tool_calls.input_json`, `tool_calls.result_content`, and the
-`tool_result_events` rows.
+`--regex`, `--fts`, `--semantic`, and `--hybrid` are mutually
+exclusive. `--fts` is the fastest mode on large archives but only
+searches message bodies; substring (the default) and regex modes
+also walk `tool_calls.input_json`, `tool_calls.result_content`,
+and the `tool_result_events` rows. `--semantic` and `--hybrid`
+require an embedding index and return a single ranked page
+(`--cursor` is rejected) — see [Semantic Search](/semantic-search/)
+for setup, scoring, and limitations.
+
+Every match, in every mode, carries the conversation-unit
+citation described in
+[Hit shape](/semantic-search/#hit-shape-ranges-and-anchors):
+`ordinal_range` — `[start, end]` of the conversation unit
+containing the match, always present, `[ordinal, ordinal]` when
+the match is its own unit — plus the lineage fields
+`subordinate`, `relationship`, `parent_session_id`, and
+`is_sidechain`. `ordinal` stays the anchor (the exact matched
+message) in every mode. Only the lineage fields are `omitempty`:
+a missing key unambiguously means top-level with no lineage,
+while `ordinal_range` is never omitted, even at `[0, 0]`.
+`score` is the one field only `--semantic`/`--hybrid` emit.
+`--scope` is rejected outside `--semantic`/`--hybrid`; in those
+modes it supersedes `--include-children`, and
+subagent/fork-typed or parent-linked sessions are exempt from
+the default one-shot exclusion.
 
 Snippets carry ~60 characters of context on each side of the
 match, snapped to rune boundaries. Any substring that matches
@@ -573,6 +626,13 @@ only honored on a localhost-bound daemon.
 Per-session token usage and cost estimate. Output shape is
 stable for the fields shown below; new fields may be added.
 
+The REST endpoint is `GET /api/v1/sessions/{id}/usage`. Add
+`?rollup=true` there to include the selected session's explicit
+`subagent` descendants recursively. `breakdown=true` remains scoped to
+the selected session; descendant usage is loaded as totals only. The CLI
+subcommand keeps its existing own-session output and does not expose the
+rollup fields below.
+
 ```bash
 agentsview session usage <id> [--format json]
 ```
@@ -585,10 +645,28 @@ agentsview session usage <id> [--format json]
   "total_output_tokens": 15230,
   "peak_context_tokens": 84000,
   "has_token_data": true,
-  "cost_usd": 2.41,
+  "cost": {"microdollars": 2410000},
   "has_cost": true,
+  "cost_source": "computed",
   "models": ["claude-opus-4-7"],
   "unpriced_models": [],
+  "breakdown_count": 42,
+  "breakdown": [
+    {
+      "ordinal": 0,
+      "message_ordinal": 0,
+      "source": "message",
+      "label": "Prompt 1",
+      "timestamp": "2026-07-08T14:03:21Z",
+      "model": "claude-opus-4-7",
+      "input_tokens": 1200,
+      "output_tokens": 640,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 43000,
+      "cost": {"microdollars": 580000},
+      "has_cost": true
+    }
+  ],
   "server_running": false
 }
 ```
@@ -598,11 +676,28 @@ agentsview session usage <id> [--format json]
 | `total_output_tokens` | Sum of generated output tokens across the session                    |
 | `peak_context_tokens` | Highest context-token count observed during the session              |
 | `has_token_data`      | `false` when the session has no per-message token usage              |
-| `cost_usd`            | Model-pricing estimate in USD; `0` when `has_cost` is `false`        |
+| `cost`                | Model-pricing estimate as an integer microdollar object; zero when `has_cost` is `false` |
 | `has_cost`            | `false` if any contributing row is unpriced — never reports a partial total as complete |
-| `models`              | Models that contributed to the cost estimate, sorted by model name      |
+| `cost_source`         | Omitted without a complete cost; `reported` for an authoritative session total, otherwise `computed`, `reported`, or `mixed` for the contributing rows |
+| `ai_credits`          | Omitted unless the priced agent uses AI Credits; derived from `cost_usd` at 100 credits per dollar |
+| `models`              | Models with contributing usage, sorted by model name                    |
 | `unpriced_models`     | Omitted from JSON when empty; lists models seen but missing from pricing |
+| `breakdown_count`     | Number of per-step usage rows in the session; always populated       |
+| `breakdown`           | Per-step usage rows, in session order; when a reported session total exists, row costs are estimated allocations that sum to it; CLI JSON always includes them (added in 0.37.1) |
 | `server_running`      | `true` when the report came from an already-running daemon           |
+| `rollup_cost`          | REST only, with `rollup=true`; integer microdollar object present only when `has_rollup_cost` is true, carrying the complete cost across the root and explicit subagent descendants |
+| `has_rollup_cost`      | REST only, with `rollup=true`; true only when at least one contributing row exists and every contributing row is priced |
+| `rollup_subagent_count`| REST only, with `rollup=true`; count of reachable explicit subagent descendants, including those without usage rows |
+
+Each `breakdown` row carries the fields shown in the example:
+
+| Row field         | Notes                                                            |
+|-------------------|------------------------------------------------------------------|
+| `ordinal`         | Position of the row in the session's deduplicated usage stream   |
+| `message_ordinal` | Ordinal of the originating message; omitted when the row is not tied to one |
+| `source`          | `message` for per-message token usage; otherwise the usage-event source |
+| `label`           | Display label — `Prompt N` for message rows, `Step N` for other rows tied to a message, else the source name |
+| `cost`            | Per-row integer microdollar object; zero with `has_cost: false` when the model is unpriced |
 
 Human output is a five-line summary:
 
@@ -614,10 +709,13 @@ Peak ctx:      84000
 Cost:          ~$2.41 (claude-opus-4-7)
 ```
 
-The leading `~` on the cost line marks the figure as a
-model-pricing estimate. When some contributing models are
-unpriced, the cost line reads `n/a (unpriced: model-x)`; when
-the session has no token data at all, it reads `n/a`.
+The leading `~` on the cost line marks a computed or mixed figure. A reported
+cost omits it. The parenthesized model list is
+shown only when contributing models exist, so a cost-only reported session does
+not render empty parentheses. When some contributing models are unpriced, the
+cost line reads `n/a (unpriced: model-x)`; when the session has no token data at
+all, it reads `n/a`. Priced Copilot-family sessions add an `AI Credits` line
+after the cost.
 
 **HTTP endpoint** — as of 0.32.0, the same data is available
 over REST:
@@ -629,7 +727,14 @@ GET /api/v1/sessions/{id}/usage
 The response uses the same JSON fields shown above and is
 available from both local SQLite-backed `agentsview serve` and
 read-only [`agentsview pg serve`](/pg-sync/#agentsview-pg-serve).
-HTTP responses set `server_running: true`. Existing sessions
+HTTP responses set `server_running: true`. As of 0.37.1, pass
+`?breakdown=true` to include the per-step `breakdown` rows;
+without it `breakdown` is `[]` while `breakdown_count` still
+reports the row count. The CLI requests the breakdown on every
+path (local, `--server`, and `--pg`), so its `--format json`
+output always includes the rows. The session detail header uses
+this endpoint to render its
+[per-step usage breakdown](/usage/#token-usage). Existing sessions
 return `200 OK` even when token or cost data is absent; inspect
 `has_token_data`, `has_cost`, and `unpriced_models` to decide
 how to present that state. Missing sessions return `404` with:
@@ -708,7 +813,7 @@ Response excerpt:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "pricing": {
     "source": "fetched",
     "table_version": "litellm-398a0b15378c",

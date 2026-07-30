@@ -13,6 +13,7 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/insight"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/timeutil"
 )
 
@@ -28,6 +29,7 @@ type generateInsightRequest struct {
 	DateTo         string                        `json:"date_to"`
 	Project        string                        `json:"project,omitempty"`
 	Prompt         string                        `json:"prompt,omitempty"`
+	SessionID      string                        `json:"session_id,omitempty"`
 	Agent          string                        `json:"agent,omitempty"`
 	Kind           string                        `json:"kind,omitempty"`
 	LLMOptIn       bool                          `json:"llm_opt_in,omitempty"`
@@ -320,29 +322,34 @@ func (s *Server) generateCannedInsight(
 		promptPtr = &req.Prompt
 	}
 
-	id, err := s.db.InsertInsight(db.Insight{
-		Type:            insight.CannedType,
-		DateFrom:        req.DateFrom,
-		DateTo:          req.DateTo,
-		Project:         project,
-		Agent:           result.Agent,
-		Model:           modelPtr,
-		Prompt:          promptPtr,
-		Content:         insight.RenderCannedMarkdown(envelope, prov),
-		Kind:            string(kind),
-		SchemaVersion:   insight.CannedSchemaVersion,
-		TemplateID:      prov.TemplateID,
-		TemplateVersion: prov.TemplateVersion,
-		AggregateHash:   aggregateHash,
-		CacheKey:        cacheKey,
-		CacheStatus:     "fresh",
-		ProvenanceJSON:  string(provJSON),
-		StructuredJSON:  string(structuredJSON),
+	var id int64
+	err = s.serializeArchiveWrite(func() error {
+		var insertErr error
+		id, insertErr = s.db.InsertInsight(db.Insight{
+			Type:            insight.CannedType,
+			DateFrom:        req.DateFrom,
+			DateTo:          req.DateTo,
+			Project:         project,
+			Agent:           result.Agent,
+			Model:           modelPtr,
+			Prompt:          promptPtr,
+			Content:         insight.RenderCannedMarkdown(envelope, prov),
+			Kind:            string(kind),
+			SchemaVersion:   insight.CannedSchemaVersion,
+			TemplateID:      prov.TemplateID,
+			TemplateVersion: prov.TemplateVersion,
+			AggregateHash:   aggregateHash,
+			CacheKey:        cacheKey,
+			CacheStatus:     "fresh",
+			ProvenanceJSON:  string(provJSON),
+			StructuredJSON:  string(structuredJSON),
+		})
+		return insertErr
 	})
 	if err != nil {
 		log.Printf("canned insight insert error: %v", err)
 		sendJSON("error", map[string]string{
-			"message": "failed to save insight",
+			"message": insightSaveErrorMessage(err),
 		})
 		return
 	}
@@ -434,6 +441,10 @@ func (s *Server) buildCannedPayload(
 	if err != nil {
 		return insight.CannedAggregatePayload{}, "", "", err
 	}
+	modelBreakdowns, err := foldCannedModelBreakdowns(usageResult.Daily)
+	if err != nil {
+		return insight.CannedAggregatePayload{}, "", "", err
+	}
 	usageSummary := &insight.CannedUsageSummary{
 		InputTokens:         usageResult.Totals.InputTokens,
 		OutputTokens:        usageResult.Totals.OutputTokens,
@@ -441,7 +452,7 @@ func (s *Server) buildCannedPayload(
 		CacheReadTokens:     usageResult.Totals.CacheReadTokens,
 		TotalCost:           usageResult.Totals.TotalCost,
 		CacheSavings:        usageResult.Totals.CacheSavings,
-		ModelBreakdowns:     foldCannedModelBreakdowns(usageResult.Daily),
+		ModelBreakdowns:     modelBreakdowns,
 		TopSessionsByCost:   topSessions,
 	}
 	coachSessions, err := s.listCannedCoachSessions(ctx, req)
@@ -484,13 +495,13 @@ func (s *Server) buildCannedPayload(
 
 func foldCannedModelBreakdowns(
 	daily []db.DailyUsageEntry,
-) []insight.CannedModelBreakdown {
+) ([]insight.CannedModelBreakdown, error) {
 	type modelAccum struct {
 		inputTok  int
 		outputTok int
 		cacheCr   int
 		cacheRd   int
-		cost      float64
+		cost      money.Money
 	}
 	byModel := make(map[string]*modelAccum)
 	for _, day := range daily {
@@ -504,7 +515,11 @@ func foldCannedModelBreakdowns(
 			acc.outputTok += model.OutputTokens
 			acc.cacheCr += model.CacheCreationTokens
 			acc.cacheRd += model.CacheReadTokens
-			acc.cost += model.Cost
+			var err error
+			acc.cost, err = money.Add(acc.cost, model.Cost)
+			if err != nil {
+				return nil, fmt.Errorf("summing canned insight model cost: %w", err)
+			}
 		}
 	}
 	out := make([]insight.CannedModelBreakdown, 0, len(byModel))
@@ -519,12 +534,12 @@ func foldCannedModelBreakdowns(
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].Cost != out[j].Cost {
-			return out[i].Cost > out[j].Cost
+		if out[i].Cost.Microdollars != out[j].Cost.Microdollars {
+			return out[i].Cost.Microdollars > out[j].Cost.Microdollars
 		}
 		return out[i].ModelName < out[j].ModelName
 	})
-	return out
+	return out, nil
 }
 
 func (s *Server) listCannedCoachSessions(

@@ -3,6 +3,464 @@ title: Changelog
 description: Release history for AgentsView
 ---
 
+## Unreleased
+
+---
+
+## 0.39.0
+<small>2026-07-26</small>
+
+**New features**
+
+- Add session support for **Poolside Agent CLI**, **RooCode**, the **Kilo
+  (legacy)** VS Code extension, and **Trae**. Trae's legacy inline-message
+  layout is supported; modern encrypted layouts are detected and reported
+  clearly instead of being silently skipped.
+- Add experimental **Recall extraction** with opt-in, scheduled local-model
+  processing, generation management, provenance checks, lexical/vector/hybrid
+  retrieval, and a read-only session evidence panel. Recall remains an
+  experimental local-SQLite feature; see [Recall](/recall/) for its current
+  limits.
+- Add **French localization** across the application.
+- Guide first-time **semantic search** setup directly in the command palette.
+  The palette supplies configuration and restart steps, can start an embedding
+  build, follows build progress, and retries the query when the index is ready.
+- Add per-machine breakdowns to `agentsview usage daily --json --breakdown`,
+  and roll explicit subagent costs into the parent session total shown in the
+  session header.
+- Show recorded **repository and worktree context** in Session Vital Signs, and
+  add an `AGE` column to human-readable `agentsview session search` results.
+- Introduce an experimental portable artifact envelope and local
+  DocBank-backed store as internal foundations for future workflows. This
+  release does not add an export/import user workflow for the format.
+
+**Improvements**
+
+- Bound filesystem-event sync work by the changed batch, and bound Gemini
+  reconciliation by affected roots, so passive daemon memory and work do not
+  scale with the full archive.
+- Improve semantic search with role-aware query/document prefixes, automatic
+  detection and repair of invalid stored vectors, and incremental
+  PostgreSQL vector reconciliation.
+- Start analysis **Calls** details collapsed, label inline teammate messages
+  distinctly, and assign stable, visually distinct colors across active
+  attribution series.
+- Preserve Claude session identity metadata and include the recorded model in
+  generated resume commands.
+- Make the API write timeout configurable and include clearer timeout details
+  in server responses.
+- Simplify DuckDB into a disposable, safely rebuildable local mirror. This is a
+  user-visible compatibility change: **`duckdb push` now writes only the local
+  mirror file** and rejects `[duckdb].url`; `duckdb status` and `duckdb serve`
+  can still read from a configured remote Quack endpoint. Project-filter scope
+  changes rebuild the mirror so it exactly matches the latest push scope.
+
+**Bug fixes**
+
+- Fix session date filtering across browser time zones and stop persisted
+  rolling date ranges from becoming stale.
+- Fix project selection when a project has an empty name, and preserve project
+  names when opening sessions from search results.
+- Detect failed and invalid OpenCode tool calls correctly, and prefer the
+  session's recorded directory over the project worktree.
+- Align Grok Build parsing with current persistence formats, ingest usage
+  snapshots from `updates.jsonl`, and emit usage per turn instead of treating
+  the last snapshot as the whole session.
+- Treat Copilot-reported billing as the authoritative session cost.
+- Preserve remote Markdown export links and keep legacy archives intact during
+  schema repair.
+- Fix daemon startup readiness and preserve full-resync progress details.
+- Correct Poolside's Linux default directory and remove duplicate resolved
+  Poolside targets during SSH discovery.
+- Fail faster when DuckDB remote endpoints are unavailable, and return
+  actionable errors for unsupported URLs and remote schema incompatibilities.
+
+**Acknowledgements**
+
+- Thanks to [Wes McKinney](https://github.com/wesm) for Recall extraction,
+  retrieval, and evidence work; the portable artifact foundation; bounded
+  daemon sync and Gemini reconciliation; DuckDB simplification; and release
+  documentation.
+- Thanks to [Matthew Jacobs](https://github.com/mjacobs) for guided semantic
+  setup, the session-search age column, Poolside target deduplication, daemon
+  startup reliability, Antigravity parent links, and clearer DuckDB remote
+  failures.
+- Thanks to [Tyler Gibbs](https://github.com/tylergibbs1) for keeping Claude
+  IDE context out of generated session titles.
+- Thanks to [ajinkyajacob](https://github.com/ajinkyajacob) for detecting
+  invalid and failed OpenCode tool calls.
+- Thanks to [Stephen Cross](https://github.com/scross01) for Poolside Agent CLI,
+  RooCode, Kilo legacy, and the corrected Poolside Linux directory.
+- Thanks to [Berend de Boer](https://github.com/berenddeboer) for using
+  OpenCode's actual session directory.
+- Thanks to [Gabriel Mitelman Tkacz](https://github.com/gtkacz) for fixing
+  browser-timezone session date filters.
+- Thanks to [Marius van Niekerk](https://github.com/mariusvniekerk) for
+  collapsed analysis call details, repository context, Grok format alignment,
+  invalid-vector repair, and provider-format provenance.
+- Thanks to [Rod Boev](https://github.com/rodboev) for Trae support, teammate
+  labels, subagent cost rollups, project-selection fixes, Claude identity and
+  resume-model preservation, server timeout detail, Grok usage ingestion,
+  incremental PostgreSQL vector reconciliation, and attribution colors.
+- Thanks to [Daniel Delattre](https://github.com/delattre1) for correcting
+  Grok's per-turn usage accounting.
+- Thanks to [TzeKei Lee](https://github.com/chikei) for parsing OhMyPi subagent
+  transcripts as nested sessions.
+- Thanks to [Erik Krogen](https://github.com/xkrogen) for using
+  Copilot-reported billing as the authoritative session cost.
+- Thanks to [David Riordan](https://github.com/riordan) for role-aware
+  embedding prefixes.
+- Thanks to [serverless83](https://github.com/serverless83) for tracking Hermes
+  `skill_view` usage.
+- Thanks to [kai](https://github.com/dpanbug) for French localization and the
+  localized analytics model filter.
+- Thanks to [Phillip Cloud](https://github.com/cpcloud) for canceling obsolete
+  frontend reads and refreshing pricing before PostgreSQL pushes.
+- Thanks to [Kushida](https://github.com/ShiroKSH) for preserving legacy
+  archives during schema repair and preserving remote Markdown export links.
+- Thanks to [TechnoPhobe01](https://github.com/Technophobe01) for making API
+  write timeouts configurable.
+- Thanks to [bangddong](https://github.com/bangddong) for fixing stale rolling
+  session date bounds.
+- Thanks to [jahabdank](https://github.com/jahabdank) for Hermes profile
+  snapshots and the SSH-sync deprecation.
+- Thanks to [matt wilkie](https://github.com/maphew) for collaboration on the
+  portable artifact foundation.
+
+---
+
+## 0.38.1
+<small>2026-07-13</small>
+
+**Bug fixes**
+
+- Restore correct **parent-child lineage and titles for Codex subagent
+  sessions**, including current multi-agent metadata and addressed agent
+  messages. Opaque encrypted tool payloads remain excluded from transcripts
+  and search.
+
+**Acknowledgements**
+
+- Thanks to [Wes McKinney](https://github.com/wesm) for restoring Codex
+  subagent lineage and titles and for release documentation.
+
+---
+
+## 0.38.0
+<small>2026-07-13</small>
+
+**New features**
+
+- Add **desktop deep links** for opening local Codex threads in Codex Desktop
+  and local Claude workspaces in Claude Code. On macOS, closing the desktop
+  window now keeps AgentsView available from a menu-bar status item with
+  actions to show the window, open logs, check for updates, and quit.
+- Add config-driven **`agentsview daemon start|status|restart|stop`** commands
+  for the writable SQLite daemon. The commands use the effective
+  `config.toml`, leave read-only PostgreSQL and DuckDB servers alone, and
+  report startup state, URL, PID, live daemon version, and uptime.
+- Add an experimental **Recall** substrate for provenance-linked durable
+  knowledge. Recall supports lexical query and task briefs, exact
+  transcript-evidence validation, host-owned review states, supersession,
+  measurement events, dry-run extraction, and guarded reviewed imports.
+- Add **PostgreSQL semantic and hybrid search** through pgvector. `pg push`
+  copies changed chunks from the active local embedding generation,
+  `pg serve` and `--pg` reads search a matching generation, and
+  `pg vectors list|drop` manages stored generations.
+- Add **Semantic** and **Hybrid** modes to the web command palette alongside
+  Full text search, with remembered mode selection and actionable index or
+  configuration errors.
+- Track **transcript reading progress** in the browser, mark sessions with new
+  content, place a boundary at the first unread message, and add
+  `Shift+J`/`Shift+K` navigation between user prompts.
+- Show the active **embedding build** in Settings, including phase, model,
+  dimensions, chunk progress, throughput, elapsed time, estimated completion,
+  and local generations.
+- Add `request_dimensions` for embedding models and endpoints that support
+  **Matryoshka-reduced vectors**, keeping the requested dimension in the
+  generation fingerprint and validating every response.
+- Add interactive **skill usage trends** to Analytics with day, week, and month
+  grouping plus per-skill series controls.
+- Import **Grok Build** sessions through a metadata-first provider, including
+  full messages, thinking, tool calls, and usage when `chat_history.jsonl` and
+  `signals.json` are available.
+- Import **ZCode** transcript messages, thinking, tool calls, tool results, and
+  usage from its local SQLite archive.
+- Add a stable v1 JSON contract for **`agentsview version --json`**.
+- Upgrade content-free **`agentsview export sessions`** JSON/NDJSON with
+  privacy-bounded project, repository, worktree, checkout, pricing, usage,
+  cursor, and archive-generation evidence without transcript text. Releases
+  0.38.0 and 0.38.1 mislabeled this incompatible shape as v1; current builds
+  report it as v2.
+
+**Improvements**
+
+- Speed up configured HTTP **full remote syncs** by rebuilding local and
+  remote sessions together with FTS suspended, while avoiding retransfers of
+  unchanged files from manifest-capable remotes.
+- Bound **passive daemon memory and background sync work** by changed paths and
+  provider capabilities instead of repeatedly materializing archive-wide
+  session state.
+- Reuse JSONL reader workspaces, apply **Codex appends** incrementally, and
+  update **Claude subagent linkage** incrementally to reduce parser and sync
+  work on active transcripts.
+- Let Analytics, Usage, Activity, Trends, and Insights date ranges be linked
+  globally or controlled independently from Settings.
+- Keep **`daemon restart` startup progress** attached to the terminal until
+  the replacement daemon is ready, with periodic phase and elapsed-time
+  updates during long migrations or initial syncs.
+
+**Bug fixes**
+
+- Keep Activity's calendar-relative views current when the local date changes
+  without requiring a page refresh.
+- Align `agentsview stats` session totals with the default visibility rules
+  used by session lists, including one-shot, automated, child, and deleted
+  sessions.
+- Report the running daemon's **actual live version** in lifecycle status
+  output instead of trusting a possibly stale runtime-record value.
+- Recover safely when a writable daemon still owns the archive but its runtime
+  record is missing, and surface runtime-record publication warnings in server
+  logs.
+- Retry desktop backend shutdown before installing an update, avoiding failed
+  updates while the sidecar is still exiting.
+- Replay replaced JSONL segments from **VS Code Copilot** instead of treating
+  same-length splices as append-only transcript growth.
+- Export only the requested **Hermes** session when one transcript file
+  contains multiple sessions.
+- Prevent missing hashed SPA assets from falling back to stale HTML content.
+- Recognize trusted **Windows directory owners** correctly through the updated
+  filesystem trust checks.
+
+**Acknowledgements**
+
+- Thanks to [i.an](https://github.com/randomradio) for desktop deep links and
+  the macOS menu-bar status item.
+- Thanks to [Rod Boev](https://github.com/rodboev) for transcript reading
+  progress, user-prompt navigation, Grok and ZCode ingestion, stats visibility
+  parity, Hermes export fixes, Claude linkage performance, and daemon recovery.
+- Thanks to [Marius van Niekerk](https://github.com/mariusvniekerk) for the
+  stable version and session-evidence contracts, embedding build status,
+  reduced output dimensions, and JSONL parser workspace reuse.
+- Thanks to [ArBing Xie](https://github.com/arbing) for full Grok Build
+  transcript ingestion.
+- Thanks to [Kajetan Świerk](https://github.com/k0zmo) for VS Code Copilot
+  splice-replacement replay.
+- Thanks to [Leuconoe](https://github.com/Leuconoe) for reliable desktop update
+  installation while the backend exits.
+- Thanks to [Wes McKinney](https://github.com/wesm) for Recall, PostgreSQL and
+  command-palette semantic search, skill trends, daemon lifecycle and progress,
+  independent date ranges, remote-sync and background-memory improvements,
+  Codex append performance, Activity date rollover, live daemon version
+  reporting, SPA fallback and Windows owner fixes, and release documentation.
+
+---
+
+## 0.37.5
+<small>2026-07-09</small>
+
+**New features**
+
+- Prefer richer **`agy-reader` trajectory sidecars** when parsing Antigravity
+  IDE sessions, falling back to the existing heuristic decode when a sidecar is
+  missing, malformed, or does not cover the session's database steps.
+
+**Bug fixes**
+
+- Identify locally ingested sessions by the machine's hostname instead of the
+  ambiguous `local` label, and keep full-rebuild safety independent when a
+  configured remote has the same hostname as the collector.
+
+- Remove **recommended-plugin context injected into Codex sessions** from
+  parsed transcripts so it no longer appears as user-authored content.
+- Include **overnight session activity** in date-filtered results by matching
+  dates against session activity windows instead of only session start dates.
+
+**Acknowledgements**
+
+- Thanks to [Matthew Jacobs](https://github.com/mjacobs) for `agy-reader`
+  trajectory sidecar support in Antigravity IDE sessions.
+- Thanks to [Wes McKinney](https://github.com/wesm) for Codex
+  recommended-plugin filtering, overnight date-filter support, and release
+  documentation.
+
+---
+
+## 0.37.4
+<small>2026-07-09</small>
+
+**New features**
+
+- Add **incremental HTTP remote sync** backed by a persistent per-host mirror.
+  After the initial archive download, the collector compares a remote manifest
+  with its mirror and requests only changed files when fewer than half of the
+  manifest files need fetching. Deleted remote files are removed from the
+  mirror without deleting sessions already stored in the local archive.
+
+**Improvements**
+
+- Include **GPT-5.6 model pricing** for the base alias and the Sol, Terra, and
+  Luna variants in the embedded fallback catalog, so fresh installs and offline
+  usage reports can estimate their costs without a network fetch.
+- Explain **default `session list` exclusions** on stderr when one-shot or
+  automated sessions are hidden, including the number in each category and the
+  flags that include them. Structured stdout remains unchanged for scripts.
+
+**Acknowledgements**
+
+- Thanks to [Wes McKinney](https://github.com/wesm) for incremental HTTP remote
+  sync, GPT-5.6 fallback pricing, and release documentation.
+- Thanks to [Marius van Niekerk](https://github.com/mariusvniekerk) for making
+  the `session list` default exclusions visible.
+
+---
+
+## 0.37.3
+<small>2026-07-09</small>
+
+**Bug fixes**
+
+- Restore **optimized SQLite builds for Linux release binaries and Docker
+  images** by preserving Go's default `-O2 -g` cgo flags when overriding
+  `CGO_CFLAGS`, improving full-text search and query performance in those
+  artifacts.
+
+**Acknowledgements**
+
+- Thanks to [Wes McKinney](https://github.com/wesm) for restoring optimized
+  release and Docker SQLite builds.
+
+---
+
+## 0.37.2
+<small>2026-07-08</small>
+
+**Improvements**
+
+- Speed up **periodic syncs for unchanged OpenCode-family SQLite containers**.
+  Once a full pass has verified every session in a shared OpenCode-format
+  SQLite database, later idle passes can skip the container before per-session
+  fingerprinting by comparing SQLite write markers for the database and WAL.
+- Reduce **heap retention after large sync backfills** by periodically
+  returning memory to the operating system while archived signal and secret
+  recomputations walk large message and tool-result payloads.
+
+**Bug fixes**
+
+- Show **OpenCode tool-call skill names** in tool analytics by extracting the
+  dedicated `skill` tool input and applying the existing `SKILL.md` inference
+  heuristics to OpenCode read and shell calls.
+- Shut down **watcher-triggered syncs** cleanly by threading the server run
+  context through changed-path syncs, prioritizing watcher stop signals, and
+  making unwatched-directory polling exit on cancellation.
+- Fix **desktop app icon spacing** by insetting the shared icon artwork and
+  regenerating the checked-in PNG, ICNS, and ICO assets.
+
+**Acknowledgements**
+
+- Thanks to [Marius van Niekerk](https://github.com/mariusvniekerk) for
+  speeding up unchanged OpenCode-family SQLite container syncs.
+- Thanks to [Rod Boev](https://github.com/rodboev) for OpenCode skill-name
+  extraction and large-backfill memory reductions.
+- Thanks to [Wes McKinney](https://github.com/wesm) for watcher shutdown fixes,
+  desktop icon spacing, and release documentation.
+
+---
+
+## 0.37.1
+<small>2026-07-08</small>
+
+**New features**
+
+- Add **semantic and hybrid search** backed by an opt-in local embeddings
+  index. AgentsView now embeds user-message units and grouped assistant runs,
+  supports `agentsview embeddings build|list|activate|retire`, adds
+  `session search --semantic` and `--hybrid`, and returns conversation-unit
+  citation ranges with lineage metadata for sidechain and subagent hits.
+- Add **content-free session summary export** with a v1 JSON/NDJSON contract.
+  `agentsview export sessions` emits session metadata, usage totals, pricing
+  provenance, project identity, stable cursors, and reset errors without
+  transcript text.
+- Add **single-session insight analysis** from the session header. Session
+  analysis uses the existing insight-generation pipeline with
+  `agent_analysis` plus `session_id`, builds a prompt from that session's
+  messages, timing, and usage, and stores the result with the other insights.
+- Add **Posit Assistant, Windsurf workspace chat, Qoder, and ZCode session
+  support**. These providers cover Posit Assistant workspace conversations,
+  Windsurf `workspaceStorage` chat state, Qoder project transcripts and
+  sidecars, and ZCode's local SQLite session database.
+- Add **Korean (`ko`) localization** and register it alongside English,
+  Simplified Chinese, and Traditional Chinese.
+- Render **Mermaid fenced code blocks** in markdown messages while keeping the
+  source readable if the Mermaid runtime cannot load.
+- Show **session context and detailed token breakdowns** in usage views,
+  including session-level output-token and peak-context details.
+- Add **copy buttons for tool blocks**, with separate affordances for tool
+  input and output content.
+- Add **worktree layout mappings** in Settings. Worktree mappings now support
+  both explicit path-prefix mappings and the `repo_dot_worktrees` layout for
+  paths like `<prefix>/<repo>.worktrees/<branch>/...`.
+- Add **`sync_include_cwd_prefixes`** to `config.toml` so local sync can ingest
+  only sessions whose working directory falls under an allowed path prefix.
+
+**Improvements**
+
+- Render **CLI session search results as an aligned table** for the default
+  no-context human output, with terminal-width-aware truncation.
+- Reduce **push sync churn** by ignoring volatile stat fields when deciding
+  PostgreSQL push candidates and by lowering DuckDB write amplification.
+- Keep **unchanged OpenCode-family container sessions** out of sync updates, so
+  container rows that did not change no longer churn during sync.
+
+**Bug fixes**
+
+- Parse **Codex custom tool calls** correctly so custom tool invocations are
+  preserved as tool blocks instead of falling through malformed paths.
+- Apply **`config.toml` port settings** to the active server config before
+  startup, so configured ports affect the runtime server just like CLI flags.
+- Preserve **calendar range picker selections** after range changes in the
+  frontend.
+- Apply **agent exclusions consistently in usage filters**, including Usage API
+  and frontend paths that previously missed the exclusion set.
+- Include **subagent sessions in activity report cost totals**, matching the
+  session rows that contribute to the report.
+- Map **OhMyPi `parentSession` headers** to `parent_session_id`, preserving
+  parent-child lineage for OMP transcripts.
+- Skip **local git discovery for sessions from other machines**, avoiding
+  host-local repository probes for synced foreign-machine sessions.
+- Fix **Linux release builds** by compiling the sqlite-vec cgo bindings
+  against the SQLite header bundled with `mattn/go-sqlite3`. This is why the
+  release ships as 0.37.1: the 0.37.0 tag never produced binaries.
+
+**Acknowledgements**
+
+- Thanks to [Wes McKinney](https://github.com/wesm) for semantic search,
+  session summary export, activity cost fixes, foreign-machine git-discovery
+  safeguards, the Linux release-build fix, and release documentation.
+- Thanks to [Rod Boev](https://github.com/rodboev) for Windsurf workspace chat,
+  Qoder and ZCode support, Mermaid rendering, usage context and token
+  breakdowns, worktree layout mappings, tool-block copy buttons,
+  single-session insight analysis, and the Codex custom tool-call fix.
+- Thanks to [Matthew Jacobs](https://github.com/mjacobs) for aligned CLI
+  session search output and OMP parent-session lineage mapping.
+- Thanks to [Elliot Murphy](https://github.com/statik) for Posit Assistant
+  session support.
+- Thanks to [Rob Schilder](https://github.com/RobSchilderr) for
+  `sync_include_cwd_prefixes` ingestion filtering.
+- Thanks to [Phillip Cloud](https://github.com/cpcloud) for PostgreSQL and
+  DuckDB push-churn reductions, OpenCode-family sync churn fixes, and calendar
+  range picker preservation.
+- Thanks to [Mr Koala](https://github.com/Mr-Koala) for applying configured
+  port settings to the active runtime config.
+- Thanks to [Prateek Rungta](https://github.com/prateek) for consistent usage
+  agent-exclusion filtering.
+- Thanks to [Leuconoe](https://github.com/Leuconoe) for the Korean (`ko`)
+  localization.
+- Thanks to [Marius van Niekerk](https://github.com/mariusvniekerk) for
+  recurring sync and database performance benchmark gates.
+
+---
+
 ## 0.36.1
 <small>2026-07-03</small>
 

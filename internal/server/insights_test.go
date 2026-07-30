@@ -23,6 +23,7 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/insight"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/server"
 )
 
@@ -368,6 +369,58 @@ func TestGenerateInsight_DefaultAgent(t *testing.T) {
 	assertBodyContains(t, w, "stub: no CLI")
 }
 
+func TestGenerateInsight_SessionValidation(t *testing.T) {
+	te := setup(t)
+
+	for _, body := range []string{
+		`{"type":"daily_activity","session_id":"missing","date_from":"2025-01-15","date_to":"2025-01-15"}`,
+		`{"type":"llm_canned","kind":"prompt_maturity_review","llm_opt_in":true,"session_id":"missing","date_from":"2025-01-15","date_to":"2025-01-15"}`,
+	} {
+		w := te.post(t, "/api/v1/insights/generate", body)
+		assertStatus(t, w, http.StatusBadRequest)
+		assertBodyContains(t, w, "session_id is only supported for agent_analysis")
+	}
+}
+
+func TestGenerateInsight_SingleSessionUsesSessionPrompt(t *testing.T) {
+	te := setupWithServerOpts(t, []server.Option{
+		server.WithGenerateFunc(func(
+			_ context.Context, agent, prompt string,
+		) (insight.Result, error) {
+			assert.Equal(t, "claude", agent)
+			assert.Contains(t, prompt, "## Session: session-1")
+			return insight.Result{
+				Agent:   "claude",
+				Content: "single-session analysis",
+			}, nil
+		}),
+	})
+	te.seedSession(t, "session-1", "my-app", 2)
+
+	w := te.post(t, "/api/v1/insights/generate",
+		`{"type":"agent_analysis","session_id":"session-1","date_from":"","date_to":""}`)
+	assertStatus(t, w, http.StatusOK)
+
+	events := parseSSE(w.Body.String())
+	require.NotEmpty(t, events)
+	require.Equal(t, "done", events[len(events)-1].Event)
+
+	var saved db.Insight
+	require.NoError(t, json.Unmarshal([]byte(events[len(events)-1].Data), &saved))
+	assert.Equal(t, "2025-01-15", saved.DateFrom)
+	assert.Equal(t, "2025-01-15", saved.DateTo)
+	assert.Equal(t, "my-app", *saved.Project)
+}
+
+func TestGenerateInsight_SingleSessionMissingSession(t *testing.T) {
+	te := setup(t)
+
+	w := te.post(t, "/api/v1/insights/generate",
+		`{"type":"agent_analysis","session_id":"missing","date_from":"","date_to":""}`)
+	assertStatus(t, w, http.StatusNotFound)
+	assertBodyContains(t, w, "session not found")
+}
+
 func TestGenerateInsight_PersistsWithReadOnlyStore(t *testing.T) {
 	dir := tempDirWithRetryCleanup(t)
 	dbPath := filepath.Join(dir, "test.db")
@@ -684,17 +737,17 @@ func TestGenerateCannedInsight_ModelCostPromptIncludesModelBreakdown(t *testing.
 	if err := te.db.UpsertModelPricing([]db.ModelPricing{
 		{
 			ModelPattern:         "claude-opus-4-7",
-			InputPerMTok:         15,
-			OutputPerMTok:        75,
-			CacheCreationPerMTok: 18.75,
-			CacheReadPerMTok:     1.5,
+			InputPerMTok:         money.MustParseDollars("15"),
+			OutputPerMTok:        money.MustParseDollars("75"),
+			CacheCreationPerMTok: money.MustParseDollars("18.75"),
+			CacheReadPerMTok:     money.MustParseDollars("1.5"),
 		},
 		{
 			ModelPattern:         "claude-sonnet-4-6",
-			InputPerMTok:         3,
-			OutputPerMTok:        15,
-			CacheCreationPerMTok: 3.75,
-			CacheReadPerMTok:     0.3,
+			InputPerMTok:         money.MustParseDollars("3"),
+			OutputPerMTok:        money.MustParseDollars("15"),
+			CacheCreationPerMTok: money.MustParseDollars("3.75"),
+			CacheReadPerMTok:     money.MustParseDollars("0.3"),
 		},
 	}); err != nil {
 		t.Fatalf("UpsertModelPricing: %v", err)
@@ -1474,8 +1527,15 @@ func TestGenerateInsight_LogDropSummaryAndCompletion(t *testing.T) {
 			Agent:   "claude",
 		}, nil
 	}
+	// The 1ms-per-write client drains the buffered log backlog far
+	// slower on Windows, where time.Sleep rounds up to ~15ms timer
+	// granularity. This test protects drop reporting plus completion,
+	// not drain-deadline behavior (covered by the LogDrainTimeout
+	// tests), so give the drain a generous ceiling to keep the done
+	// event deterministic across platforms.
 	te := setupWithServerOpts(t, []server.Option{
 		server.WithGenerateStreamFunc(stubGen),
+		server.WithInsightLogDrainTimeouts(30*time.Second, time.Second),
 	})
 
 	req := httptest.NewRequest(
@@ -1498,7 +1558,7 @@ func TestGenerateInsight_LogDropSummaryAndCompletion(t *testing.T) {
 
 	select {
 	case <-done:
-	case <-time.After(8 * time.Second):
+	case <-time.After(40 * time.Second):
 		require.Fail(t, "timed out waiting for generate handler")
 	}
 

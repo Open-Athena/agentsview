@@ -26,11 +26,14 @@ var providerMigrationModes = map[AgentType]ProviderMigrationMode{
 	AgentMiMoCode:       ProviderMigrationProviderAuthoritative,
 	AgentOpenCode:       ProviderMigrationProviderAuthoritative,
 	AgentKilo:           ProviderMigrationProviderAuthoritative,
+	AgentKiloLegacy:     ProviderMigrationProviderAuthoritative,
 	AgentIcodemate:      ProviderMigrationProviderAuthoritative,
 	AgentIflow:          ProviderMigrationProviderAuthoritative,
 	AgentAmp:            ProviderMigrationProviderAuthoritative,
 	AgentZencoder:       ProviderMigrationProviderAuthoritative,
 	AgentVSCodeCopilot:  ProviderMigrationProviderAuthoritative,
+	AgentWindsurf:       ProviderMigrationProviderAuthoritative,
+	AgentTrae:           ProviderMigrationProviderAuthoritative,
 	AgentVSCopilot:      ProviderMigrationProviderAuthoritative,
 	AgentPi:             ProviderMigrationProviderAuthoritative,
 	AgentQwen:           ProviderMigrationProviderAuthoritative,
@@ -45,22 +48,28 @@ var providerMigrationModes = map[AgentType]ProviderMigrationMode{
 	AgentKiroIDE:        ProviderMigrationProviderAuthoritative,
 	AgentCortex:         ProviderMigrationProviderAuthoritative,
 	AgentHermes:         ProviderMigrationProviderAuthoritative,
+	AgentGrok:           ProviderMigrationProviderAuthoritative,
 	AgentWorkBuddy:      ProviderMigrationProviderAuthoritative,
 	AgentForge:          ProviderMigrationProviderAuthoritative,
 	AgentDevin:          ProviderMigrationProviderAuthoritative,
 	AgentPiebald:        ProviderMigrationProviderAuthoritative,
 	AgentWarp:           ProviderMigrationProviderAuthoritative,
 	AgentPositron:       ProviderMigrationProviderAuthoritative,
+	AgentPositAssistant: ProviderMigrationProviderAuthoritative,
+	AgentZCode:          ProviderMigrationProviderAuthoritative,
 	AgentAntigravity:    ProviderMigrationProviderAuthoritative,
 	AgentAntigravityCLI: ProviderMigrationProviderAuthoritative,
 	AgentVibe:           ProviderMigrationProviderAuthoritative,
 	AgentZed:            ProviderMigrationProviderAuthoritative,
 	AgentQwenPaw:        ProviderMigrationProviderAuthoritative,
 	AgentGptme:          ProviderMigrationProviderAuthoritative,
+	AgentQoder:          ProviderMigrationProviderAuthoritative,
 	AgentShelley:        ProviderMigrationProviderAuthoritative,
 	AgentAider:          ProviderMigrationProviderAuthoritative,
 	AgentOMP:            ProviderMigrationProviderAuthoritative,
 	AgentReasonix:       ProviderMigrationProviderAuthoritative,
+	AgentRooCode:        ProviderMigrationProviderAuthoritative,
+	AgentPoolside:       ProviderMigrationProviderAuthoritative,
 }
 
 // ProviderMigrationModes returns the current provider migration manifest.
@@ -117,6 +126,39 @@ func validateProviderMigrationMode(
 				"%s: %s requires provider source lookup",
 				def.Type, mode,
 			)
+		}
+		if caps.StreamingDiscovery == CapabilitySupported {
+			provider := factory.NewProvider(ProviderConfig{})
+			if sourceSetProvider, ok := provider.(*SourceSetProvider); ok {
+				if _, ok := sourceSetProvider.sources.(StreamingDiscoverer); !ok {
+					return fmt.Errorf(
+						"%s: streaming discovery capability requires underlying source set StreamingDiscoverer",
+						def.Type,
+					)
+				}
+			}
+			if _, ok := provider.(StreamingDiscoverer); !ok {
+				return fmt.Errorf(
+					"%s: streaming discovery capability requires StreamingDiscoverer",
+					def.Type,
+				)
+			}
+			if caps.SharedContainerSource == CapabilitySupported {
+				if sourceSetProvider, ok := provider.(*SourceSetProvider); ok {
+					if _, ok := sourceSetProvider.sources.(ReconciliationSourceResolver); !ok {
+						return fmt.Errorf(
+							"%s: shared-container streaming requires underlying source set exact reconciliation rehydration",
+							def.Type,
+						)
+					}
+				}
+				if _, ok := provider.(ReconciliationSourceResolver); !ok {
+					return fmt.Errorf(
+						"%s: shared-container streaming requires exact reconciliation rehydration",
+						def.Type,
+					)
+				}
+			}
 		}
 	case ProviderMigrationImportOnly:
 		if !isImportOnlyAgentType(def.Type) {

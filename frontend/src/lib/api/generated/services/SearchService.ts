@@ -74,6 +74,8 @@ export class SearchService {
   public static getApiV1SearchContent({
     pattern,
     mode,
+    scope,
+    xAgentsViewSearchIntent,
     _in,
     excludeSystem,
     reveal,
@@ -85,12 +87,14 @@ export class SearchService {
     date,
     dateFrom,
     dateTo,
+    timezone,
     activeSince,
     includeChildren,
     includeAutomated,
     includeOneShot,
     limit,
     cursor,
+    context,
   }: {
     /**
      * Pattern to search for
@@ -99,7 +103,15 @@ export class SearchService {
     /**
      * Search mode
      */
-    mode?: 'substring' | 'regex' | 'fts',
+    mode?: 'substring' | 'regex' | 'fts' | 'semantic' | 'hybrid',
+    /**
+     * Semantic/hybrid result scope: top, all, or subordinate (default all)
+     */
+    scope?: 'top' | 'all' | 'subordinate',
+    /**
+     * Required for semantic/hybrid GET searches
+     */
+    xAgentsViewSearchIntent?: string,
     /**
      * Comma-separated content sources
      */
@@ -133,17 +145,21 @@ export class SearchService {
      */
     agent?: string,
     /**
-     * Filter to a single YYYY-MM-DD date
+     * Filter sessions active on this YYYY-MM-DD date
      */
     date?: string,
     /**
-     * Filter start date
+     * Filter sessions active on or after this date
      */
     dateFrom?: string,
     /**
-     * Filter end date
+     * Filter sessions active on or before this date
      */
     dateTo?: string,
+    /**
+     * IANA timezone for calendar-date filters; defaults to UTC
+     */
+    timezone?: string,
     /**
      * Filter sessions active since this RFC3339 timestamp
      */
@@ -168,13 +184,21 @@ export class SearchService {
      * Pagination cursor
      */
     cursor?: number,
+    /**
+     * Include N messages of context before and after each match (max 10)
+     */
+    context?: number,
   }): CancelablePromise<ServiceContentSearchResult> {
     return __request(OpenAPI, {
       method: 'GET',
       url: '/api/v1/search/content',
+      headers: {
+        'X-AgentsView-Search-Intent': xAgentsViewSearchIntent,
+      },
       query: {
         'pattern': pattern,
         'mode': mode,
+        'scope': scope,
         'in': _in,
         'exclude_system': excludeSystem,
         'reveal': reveal,
@@ -186,12 +210,14 @@ export class SearchService {
         'date': date,
         'date_from': dateFrom,
         'date_to': dateTo,
+        'timezone': timezone,
         'active_since': activeSince,
         'include_children': includeChildren,
         'include_automated': includeAutomated,
         'include_one_shot': includeOneShot,
         'limit': limit,
         'cursor': cursor,
+        'context': context,
       },
       errors: {
         400: `Bad Request`,

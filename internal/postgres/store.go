@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -13,6 +14,11 @@ import (
 
 // Compile-time check: *Store satisfies db.Store.
 var _ db.Store = (*Store)(nil)
+
+// deletionCauseSourceMissing mirrors the recoverable watcher-tombstone cause
+// written by the SQLite archive (internal/db). Kept package-local because the
+// db package does not export it.
+const deletionCauseSourceMissing = "source_missing"
 
 // NewStore opens a PostgreSQL connection using the shared Open()
 // helper and returns a Store.
@@ -336,6 +342,52 @@ func (s *Store) GetCachedInsight(
 	return &insight, nil
 }
 
+func (s *Store) ListRecallEntries(
+	_ context.Context, _ db.RecallQuery,
+) ([]db.RecallEntry, error) {
+	return nil, db.ErrReadOnly
+}
+
+func (s *Store) GetRecallEntry(
+	_ context.Context, _ string,
+) (*db.RecallEntry, error) {
+	return nil, db.ErrReadOnly
+}
+
+func (s *Store) QueryRecallEntries(
+	_ context.Context, _ db.RecallQuery,
+) (db.RecallPage, error) {
+	return db.RecallPage{}, db.ErrReadOnly
+}
+
+func (s *Store) RecordRecallQueryEvent(
+	_ context.Context, _ db.RecallQueryEvent,
+) (string, error) {
+	return "", db.ErrReadOnly
+}
+
+func (s *Store) InsertRecallEntry(_ db.RecallEntry) (string, error) {
+	return "", db.ErrReadOnly
+}
+
+func (s *Store) ImportAcceptedRecallEntriesJSONL(
+	_ context.Context, _ io.Reader,
+) (db.RecallImportResult, error) {
+	return db.RecallImportResult{}, db.ErrReadOnly
+}
+
+func (s *Store) ImportAcceptedRecallEntriesJSONLWithOptions(
+	_ context.Context, _ io.Reader, _ db.RecallImportOptions,
+) (db.RecallImportResult, error) {
+	return db.RecallImportResult{}, db.ErrReadOnly
+}
+
+func (s *Store) IngestEvalTrajectory(
+	_ context.Context, _ db.EvalTrajectoryIngest,
+) (db.EvalTrajectoryIngestResult, error) {
+	return db.EvalTrajectoryIngestResult{}, db.ErrReadOnly
+}
+
 // RenameSession updates the visible session name in PG.
 func (s *Store) RenameSession(
 	id string, displayName *string,
@@ -359,13 +411,16 @@ func (s *Store) SetSessionPrivate(_ string, _ bool) error {
 	return db.ErrReadOnly
 }
 
-// SoftDeleteSession moves a session to the trash.
+// SoftDeleteSession moves a session to user trash, including conversion from
+// a recoverable source-missing tombstone.
 func (s *Store) SoftDeleteSession(id string) error {
 	_, err := s.pg.Exec(
 		`UPDATE sessions
 		 SET deleted_at = NOW(),
+		     deletion_cause = NULL,
 		     updated_at = NOW()
-		 WHERE id = $1 AND deleted_at IS NULL`,
+		 WHERE id = $1
+		   AND (deleted_at IS NULL OR deletion_cause = '`+deletionCauseSourceMissing+`')`,
 		id,
 	)
 	if err != nil {
@@ -376,7 +431,8 @@ func (s *Store) SoftDeleteSession(id string) error {
 	return nil
 }
 
-// SoftDeleteSessions moves multiple sessions to the trash.
+// SoftDeleteSessions moves multiple sessions to user trash, including
+// conversion from recoverable source-missing tombstones.
 func (s *Store) SoftDeleteSessions(ids []string) (int, error) {
 	if len(ids) == 0 {
 		return 0, nil
@@ -393,9 +449,11 @@ func (s *Store) SoftDeleteSessions(ids []string) (int, error) {
 		res, err := s.pg.Exec(
 			`UPDATE sessions
 			 SET deleted_at = NOW(),
+			     deletion_cause = NULL,
 			     updated_at = NOW()
 			 WHERE id IN (`+strings.Join(placeholders, ",")+
-				`) AND deleted_at IS NULL`,
+				`)
+			   AND (deleted_at IS NULL OR deletion_cause = '`+deletionCauseSourceMissing+`')`,
 			pb.args...,
 		)
 		if err != nil {
@@ -415,8 +473,10 @@ func (s *Store) RestoreSession(id string) (int64, error) {
 	res, err := s.pg.Exec(
 		`UPDATE sessions
 		 SET deleted_at = NULL,
+		     deletion_cause = NULL,
 		     updated_at = NOW()
-		 WHERE id = $1 AND deleted_at IS NOT NULL`,
+		 WHERE id = $1 AND deleted_at IS NOT NULL
+		   AND deletion_cause IS NULL`,
 		id,
 	)
 	if err != nil {
@@ -446,7 +506,9 @@ func (s *Store) DeleteSessionIfTrashed(
 	defer func() { _ = tx.Rollback() }()
 
 	sessionIDs, excludedIDs, err := readPGTrashedSessionExclusions(
-		ctx, tx, "s.id = $1 AND s.deleted_at IS NOT NULL", id,
+		ctx, tx,
+		"s.id = $1 AND s.deleted_at IS NOT NULL AND s.deletion_cause IS NULL",
+		id,
 	)
 	if err != nil {
 		return 0, mapPGWriteError(
@@ -492,6 +554,7 @@ func (s *Store) ListTrashedSessions(
 	rows, err := s.pg.QueryContext(ctx,
 		"SELECT "+pgSessionCols+
 			" FROM sessions WHERE deleted_at IS NOT NULL"+
+			" AND deletion_cause IS NULL"+
 			" ORDER BY deleted_at DESC LIMIT 500",
 	)
 	if err != nil {
@@ -511,7 +574,7 @@ func (s *Store) EmptyTrash() (int, error) {
 	defer func() { _ = tx.Rollback() }()
 
 	sessionIDs, excludedIDs, err := readPGTrashedSessionExclusions(
-		ctx, tx, "s.deleted_at IS NOT NULL",
+		ctx, tx, "s.deleted_at IS NOT NULL AND s.deletion_cause IS NULL",
 	)
 	if err != nil {
 		return 0, mapPGWriteError("locking trashed sessions", err)
@@ -611,7 +674,8 @@ func deletePGTrashedSessionRows(
 	}
 	res, err := tx.ExecContext(ctx,
 		`DELETE FROM sessions
-		 WHERE id = ANY($1) AND deleted_at IS NOT NULL`,
+		 WHERE id = ANY($1) AND deleted_at IS NOT NULL
+		   AND deletion_cause IS NULL`,
 		ids,
 	)
 	if err != nil {

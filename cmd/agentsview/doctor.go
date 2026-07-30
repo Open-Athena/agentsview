@@ -52,6 +52,7 @@ type doctorSyncReport struct {
 	doctorDBInspection
 	TempFiles           []string
 	AgentRoots          []doctorAgentRoot
+	TraeEncryptedRoots  []string
 	DebugLines          []string
 	DebugLogErr         error
 	HasResyncFailureLog bool
@@ -100,6 +101,7 @@ func collectDoctorSyncReport(cfg config.Config) doctorSyncReport {
 	report.doctorDBInspection = inspectDoctorDB(cfg.DBPath)
 	report.TempFiles = listDoctorResyncTempFiles(cfg.DBPath)
 	report.AgentRoots = collectDoctorAgentRoots(cfg)
+	report.TraeEncryptedRoots = collectDoctorTraeEncryptedRoots(report.AgentRoots)
 	report.DebugLines, report.DebugLogErr = readDoctorDebugLines(
 		filepath.Join(cfg.DataDir, "debug.log"),
 	)
@@ -202,12 +204,17 @@ func inspectDoctorDB(path string) doctorDBInspection {
 	return insp
 }
 
+// doctorReadOnlyDSN builds a read-only sqlite3 DSN. The file: scheme is
+// required for mattn/go-sqlite3 to honor mode=ro (a bare path silently opens
+// read-write), and the path is percent-encoded so `%`, `?`, or `#` in a real
+// path cannot be misparsed as URI syntax.
 func doctorReadOnlyDSN(path string) string {
 	params := url.Values{}
 	params.Set("mode", "ro")
 	params.Set("_busy_timeout", "5000")
 	params.Set("_foreign_keys", "ON")
-	return path + "?" + params.Encode()
+	escaped := (&url.URL{Path: path}).EscapedPath()
+	return "file:" + escaped + "?" + params.Encode()
 }
 
 func listDoctorResyncTempFiles(dbPath string) []string {
@@ -327,11 +334,29 @@ func writeDoctorSyncReport(w io.Writer, report doctorSyncReport) {
 	writeDoctorSummaryMode(w, report)
 	writeDoctorUnknownSchema(w, report)
 	writeDoctorMissingSecretScans(w, report)
+	writeDoctorTraeEncryptedLayouts(w, report)
 	writeDoctorTempFiles(w, report.TempFiles)
 	writeDoctorAgentRoots(w, report.AgentRoots)
 	writeDoctorDebugEvidence(w, report)
 	fmt.Fprintf(w, "Likely cause: %s\n",
 		doctorLikelyCause(report, currentVersion))
+}
+
+func writeDoctorTraeEncryptedLayouts(w io.Writer, report doctorSyncReport) {
+	for _, root := range report.TraeEncryptedRoots {
+		fmt.Fprintf(w, "Trae: unsupported encrypted transcript layout detected at %s\n", root)
+		fmt.Fprintln(w, "  -> legacy inline-message parsing is supported; modern encrypted transcripts are not readable")
+	}
+}
+
+func collectDoctorTraeEncryptedRoots(roots []doctorAgentRoot) []string {
+	var detected []string
+	for _, root := range roots {
+		if root.Agent == parser.AgentTrae && root.Exists && parser.TraeEncryptedLayoutDetected(root.Path) {
+			detected = append(detected, root.Path)
+		}
+	}
+	return detected
 }
 
 func doctorStartupDecision(
@@ -492,7 +517,10 @@ func doctorLikelyCause(
 		return "SQLite user_version is stale; inspect debug.log for resync aborts or failures"
 	}
 	if *report.UserVersion > currentVersion {
-		return "SQLite user_version is newer than this binary. Run \"agentsview update\" or install the latest AgentsView release before serving or syncing"
+		return fmt.Sprintf(
+			"SQLite user_version is newer than this binary. Use an AgentsView build with data version %d or newer, or restore an archive backup compatible with data version %d",
+			*report.UserVersion, currentVersion,
+		)
 	}
 	return "data-version resync is not expected; Running initial sync... is normal incremental startup work"
 }

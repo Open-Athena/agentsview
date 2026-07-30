@@ -1,8 +1,8 @@
 import { describe, it, expect } from "vite-plus/test";
 import {
   projectColor,
-  disambiguateColors,
   PROJECT_PALETTE,
+  seriesColorMap,
 } from "./projectColor.js";
 
 describe("projectColor", () => {
@@ -28,38 +28,44 @@ describe("projectColor", () => {
     expect(seen.size).toBeGreaterThanOrEqual(6);
   });
 
-  it("palette has at least 24 distinct colors", () => {
+  it("palette entries are all distinct", () => {
     expect(new Set(PROJECT_PALETTE).size).toBe(PROJECT_PALETTE.length);
-    expect(PROJECT_PALETTE.length).toBeGreaterThanOrEqual(24);
   });
 });
 
-describe("disambiguateColors", () => {
-  it("returns one color per input item", () => {
-    const items = [{ id: "a" }, { id: "b" }, { id: "c" }];
-    expect(disambiguateColors(items)).toHaveLength(items.length);
+describe("seriesColorMap", () => {
+  it("resolves the reported model collision", () => {
+    const ids = ["claude-sonnet-5", "claude-opus-4-8"];
+    expect(projectColor(ids[0]!)).toBe(projectColor(ids[1]!));
+    expect(seriesColorMap(ids).get(ids[0]!)).not.toBe(
+      seriesColorMap(ids).get(ids[1]!),
+    );
   });
 
-  it("gives every top-N item a unique color", () => {
-    // Pick names that previously collided; whatever the hash does
-    // the top window must come out fully distinct.
-    const items = Array.from({ length: 12 }, (_, i) => ({
-      id: `proj-${i}`,
-    }));
-    const colors = disambiguateColors(items, 12);
-    expect(new Set(colors).size).toBe(items.length);
+  it("is stable across permutations and duplicates", () => {
+    const ids = ["claude-sonnet-5", "claude-opus-4-8", "claude-sonnet-5"];
+    expect([...seriesColorMap(ids)]).toEqual([
+      ...seriesColorMap([...ids].reverse()),
+    ]);
   });
 
-  it("leaves items past the window alone", () => {
-    const items = Array.from({ length: 30 }, (_, i) => ({
-      id: `p${i}`,
-    }));
-    const colors = disambiguateColors(items, 8);
-    // First 8 must be unique
-    expect(new Set(colors.slice(0, 8)).size).toBe(8);
-    // Past the window, color is just projectColor() of the id
-    for (let i = 8; i < items.length; i++) {
-      expect(colors[i]).toBe(projectColor(items[i]!.id));
-    }
+  it("keeps empty and other identifiers muted", () => {
+    const colors = seriesColorMap(["", "__other__"]);
+    expect(colors.get("")).toBe("var(--text-muted)");
+    expect(colors.get("__other__")).toBe("var(--text-muted)");
+  });
+
+  it("uses every palette slot before deterministic overflow", () => {
+    const ids = Array.from({ length: PROJECT_PALETTE.length }, (_, i) => `id-${i}`);
+    const atCapacity = seriesColorMap(ids);
+    expect(new Set(ids.map((id) => atCapacity.get(id))).size).toBe(
+      PROJECT_PALETTE.length,
+    );
+
+    const overflowIds = [...ids, "id-overflow"];
+    const overflow = seriesColorMap(overflowIds);
+    const repeat = seriesColorMap([...overflowIds].reverse());
+    expect(overflow).toEqual(repeat);
+    expect(PROJECT_PALETTE).toContain(overflow.get("id-overflow"));
   });
 });

@@ -49,6 +49,8 @@ export const ALL_BLOCK_TYPES: BlockType[] = [
 const BLOCK_FILTER_KEY = "agentsview-block-filters";
 const TRANSCRIPT_MODE_KEY = "agentsview-transcript-mode";
 const VITALS_KEY = "agentsview-session-vitals";
+const VITALS_CALLS_EXPANDED_KEY =
+  "agentsview-session-vitals-calls-expanded";
 const SIGNAL_PANEL_KEY = "agentsview-signal-panel";
 const FOLLOW_LATEST_KEY = "agentsview-follow-latest";
 
@@ -282,6 +284,9 @@ class UIStore {
   vitalsOpen: boolean = $state(
     readStoredBool(VITALS_KEY, false),
   );
+  vitalsCallsExpanded: boolean = $state(
+    readStoredBool(VITALS_CALLS_EXPANDED_KEY, true),
+  );
   signalPanelOpen: boolean = $state(
     readStoredBool(SIGNAL_PANEL_KEY, false),
   );
@@ -374,6 +379,17 @@ class UIStore {
           localStorage?.setItem(
             VITALS_KEY,
             String(this.vitalsOpen),
+          );
+        } catch {
+          // ignore
+        }
+      });
+
+      $effect(() => {
+        try {
+          localStorage?.setItem(
+            VITALS_CALLS_EXPANDED_KEY,
+            String(this.vitalsCallsExpanded),
           );
         } catch {
           // ignore
@@ -602,6 +618,10 @@ class UIStore {
 
   closeVitals() {
     this.vitalsOpen = false;
+  }
+
+  toggleVitalsCalls() {
+    this.vitalsCallsExpanded = !this.vitalsCallsExpanded;
   }
 
   toggleSignalPanel() {

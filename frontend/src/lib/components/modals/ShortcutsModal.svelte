@@ -15,6 +15,8 @@
     { key: escapeKey, action: m.shortcuts_close_palette() },
     { key: "j / \u2193", action: m.shortcuts_next_message() },
     { key: "k / \u2191", action: m.shortcuts_prev_message() },
+    { key: "Shift J", action: m.shortcuts_next_user_prompt() },
+    { key: "Shift K", action: m.shortcuts_prev_user_prompt() },
     { key: "]", action: m.shortcuts_next_session() },
     { key: "[", action: m.shortcuts_prev_session() },
     { key: "o", action: m.shortcuts_toggle_sort() },

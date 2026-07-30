@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+
+	"go.kenn.io/agentsview/internal/money"
 )
 
 // ModelPricing holds per-model token pricing (per million tokens).
@@ -15,13 +17,13 @@ import (
 // price 5m and 1h tokens separately. Aggregate-only sources
 // (Codex usage_events) fall back to the 5m rate.
 type ModelPricing struct {
-	ModelPattern           string  `json:"model_pattern"`
-	InputPerMTok           float64 `json:"input_per_mtok"`
-	OutputPerMTok          float64 `json:"output_per_mtok"`
-	CacheCreationPerMTok   float64 `json:"cache_creation_per_mtok"`
-	CacheCreation1hPerMTok float64 `json:"cache_creation_1h_per_mtok"`
-	CacheReadPerMTok       float64 `json:"cache_read_per_mtok"`
-	UpdatedAt              string  `json:"updated_at"`
+	ModelPattern           string      `json:"model_pattern"`
+	InputPerMTok           money.Money `json:"input_per_mtok"`
+	OutputPerMTok          money.Money `json:"output_per_mtok"`
+	CacheCreationPerMTok   money.Money `json:"cache_creation_per_mtok"`
+	CacheCreation1hPerMTok money.Money `json:"cache_creation_1h_per_mtok"`
+	CacheReadPerMTok       money.Money `json:"cache_read_per_mtok"`
+	UpdatedAt              string      `json:"updated_at"`
 }
 
 // PricingChangeSummary describes how desired pricing rows compare
@@ -86,11 +88,11 @@ func sqlitePricingValues(
 		)
 		*args = append(*args,
 			p.ModelPattern,
-			p.InputPerMTok,
-			p.OutputPerMTok,
-			p.CacheCreationPerMTok,
-			p.CacheCreation1hPerMTok,
-			p.CacheReadPerMTok,
+			p.InputPerMTok.Microdollars,
+			p.OutputPerMTok.Microdollars,
+			p.CacheCreationPerMTok.Microdollars,
+			p.CacheCreation1hPerMTok.Microdollars,
+			p.CacheReadPerMTok.Microdollars,
 		)
 	}
 }
@@ -98,28 +100,29 @@ func sqlitePricingValues(
 func sqlitePricingUpsertStatement(prices []ModelPricing) (string, []any) {
 	var b strings.Builder
 	b.WriteString(`INSERT INTO model_pricing
-		(model_pattern, input_per_mtok, output_per_mtok,
-		 cache_creation_per_mtok, cache_creation_1h_per_mtok,
-		 cache_read_per_mtok, updated_at)
+		(model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
+		 cache_creation_microdollars_per_mtok,
+		 cache_creation_1h_microdollars_per_mtok,
+		 cache_read_microdollars_per_mtok, updated_at)
 	VALUES `)
-	args := make([]any, 0, len(prices)*6)
+	args := make([]any, 0, len(prices)*7)
 	sqlitePricingValues(&b, &args, prices)
 	b.WriteString(`
 	ON CONFLICT(model_pattern) DO UPDATE SET
-		input_per_mtok             = excluded.input_per_mtok,
-		output_per_mtok            = excluded.output_per_mtok,
-		cache_creation_per_mtok    = excluded.cache_creation_per_mtok,
-		cache_creation_1h_per_mtok = excluded.cache_creation_1h_per_mtok,
-		cache_read_per_mtok        = excluded.cache_read_per_mtok,
-		updated_at                 = excluded.updated_at
-	WHERE model_pricing.input_per_mtok IS NOT excluded.input_per_mtok
-		OR model_pricing.output_per_mtok IS NOT excluded.output_per_mtok
-		OR model_pricing.cache_creation_per_mtok IS NOT
-			excluded.cache_creation_per_mtok
-		OR model_pricing.cache_creation_1h_per_mtok IS NOT
-			excluded.cache_creation_1h_per_mtok
-		OR model_pricing.cache_read_per_mtok IS NOT
-			excluded.cache_read_per_mtok`)
+		input_microdollars_per_mtok             = excluded.input_microdollars_per_mtok,
+		output_microdollars_per_mtok            = excluded.output_microdollars_per_mtok,
+		cache_creation_microdollars_per_mtok    = excluded.cache_creation_microdollars_per_mtok,
+		cache_creation_1h_microdollars_per_mtok = excluded.cache_creation_1h_microdollars_per_mtok,
+		cache_read_microdollars_per_mtok        = excluded.cache_read_microdollars_per_mtok,
+		updated_at                              = excluded.updated_at
+	WHERE model_pricing.input_microdollars_per_mtok IS NOT excluded.input_microdollars_per_mtok
+		OR model_pricing.output_microdollars_per_mtok IS NOT excluded.output_microdollars_per_mtok
+		OR model_pricing.cache_creation_microdollars_per_mtok IS NOT
+			excluded.cache_creation_microdollars_per_mtok
+		OR model_pricing.cache_creation_1h_microdollars_per_mtok IS NOT
+			excluded.cache_creation_1h_microdollars_per_mtok
+		OR model_pricing.cache_read_microdollars_per_mtok IS NOT
+			excluded.cache_read_microdollars_per_mtok`)
 	return b.String(), args
 }
 
@@ -128,9 +131,10 @@ func sqlitePricingInsertMissingStatement(
 ) (string, []any) {
 	var b strings.Builder
 	b.WriteString(`INSERT INTO model_pricing
-		(model_pattern, input_per_mtok, output_per_mtok,
-		 cache_creation_per_mtok, cache_creation_1h_per_mtok,
-		 cache_read_per_mtok, updated_at)
+		(model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
+		 cache_creation_microdollars_per_mtok,
+		 cache_creation_1h_microdollars_per_mtok,
+		 cache_read_microdollars_per_mtok, updated_at)
 	VALUES `)
 	args := make([]any, 0, len(prices)*6)
 	sqlitePricingValues(&b, &args, prices)
@@ -208,8 +212,8 @@ func (db *DB) GetPricingMeta(key string) (string, error) {
 func (db *DB) SetPricingMeta(key, value string) error {
 	_, err := db.getWriter().Exec(
 		`INSERT INTO model_pricing
-			(model_pattern, input_per_mtok, output_per_mtok,
-			 cache_creation_per_mtok, cache_read_per_mtok,
+			(model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
+			 cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok,
 			 updated_at)
 		 VALUES (?, 0, 0, 0, 0, ?)
 		 ON CONFLICT(model_pattern) DO UPDATE SET
@@ -255,11 +259,15 @@ func (db *DB) CopyModelPricingFrom(sourcePath string) error {
 
 	if _, err := conn.ExecContext(ctx, `
 		INSERT OR REPLACE INTO model_pricing
-			(model_pattern, input_per_mtok, output_per_mtok,
-			 cache_creation_per_mtok, cache_read_per_mtok,
+			(model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
+			 cache_creation_microdollars_per_mtok,
+			 cache_creation_1h_microdollars_per_mtok,
+			 cache_read_microdollars_per_mtok,
 			 updated_at)
-		SELECT model_pattern, input_per_mtok, output_per_mtok,
-			cache_creation_per_mtok, cache_read_per_mtok,
+		SELECT model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
+			cache_creation_microdollars_per_mtok,
+			cache_creation_1h_microdollars_per_mtok,
+			cache_read_microdollars_per_mtok,
 			updated_at
 		FROM old_db.model_pricing`,
 	); err != nil {
@@ -321,10 +329,10 @@ func (db *DB) GetModelPricing(
 ) (*ModelPricing, error) {
 	var p ModelPricing
 	err := db.getReader().QueryRow(
-		`SELECT model_pattern, input_per_mtok,
-			output_per_mtok, cache_creation_per_mtok,
-			cache_creation_1h_per_mtok,
-			cache_read_per_mtok, updated_at
+		`SELECT model_pattern, input_microdollars_per_mtok,
+			output_microdollars_per_mtok, cache_creation_microdollars_per_mtok,
+			cache_creation_1h_microdollars_per_mtok,
+			cache_read_microdollars_per_mtok, updated_at
 		 FROM model_pricing
 		 WHERE model_pattern = ?`,
 		model,

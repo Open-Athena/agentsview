@@ -2,16 +2,18 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { MoneyMoney } from './MoneyMoney';
 export type DbDailyUsageEntry = {
-  agentBreakdowns?: any[] | null;
+  agentBreakdowns: any[] | null;
   cacheCreationTokens: number;
   cacheReadTokens: number;
   date: string;
   inputTokens: number;
-  modelBreakdowns?: any[] | null;
+  machineBreakdowns: any[] | null;
+  modelBreakdowns: any[] | null;
   modelsUsed: any[] | null;
   outputTokens: number;
-  projectBreakdowns?: any[] | null;
-  totalCost: number;
+  projectBreakdowns: any[] | null;
+  totalCost: MoneyMoney;
 };
 

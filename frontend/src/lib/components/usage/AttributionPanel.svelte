@@ -4,17 +4,11 @@
     type GroupBy,
     type AttributionView,
   } from "../../stores/usage.svelte.js";
-  import {
-    projectColor,
-    disambiguateColors,
-  } from "../../utils/projectColor.js";
+  import { seriesColorMap } from "../../utils/projectColor.js";
   import Treemap from "./Treemap.svelte";
   import { m } from "../../i18n/index.js";
-
-  function fmtCost(v: number): string {
-    if (v >= 100) return `$${v.toFixed(0)}`;
-    return `$${v.toFixed(2)}`;
-  }
+  import type { Money } from "../../money.js";
+  import { formatMoney, moneyFromMicrodollars } from "../../money.js";
 
   function fmtPct(v: number, total: number): string {
     if (total <= 0) return "";
@@ -32,19 +26,19 @@
     pct: number;
   }
 
-  const rows = $derived.by((): Row[] => {
+  const rowItems = $derived.by(() => {
     const s = usage.summary;
     if (!s) return [];
 
     let items: Array<{
       id: string;
       label: string;
-      cost: number;
+      cost: Money;
     }> = [];
 
     if (groupBy === "project") {
       items = s.projectTotals.map((p) => ({
-        id: p.project,
+        id: p.project_key,
         label: p.project,
         cost: p.cost,
       }));
@@ -62,21 +56,26 @@
       }));
     }
 
-    items.sort((a, b) => b.cost - a.cost);
-    const total = items.reduce((s, d) => s + d.cost, 0);
+    items.sort((a, b) => b.cost.microdollars - a.cost.microdollars);
+    return items;
+  });
 
-    // disambiguateColors guarantees the top-N (by cost) tiles all
-    // get distinct hues, so adjacent same-color blobs don't read
-    // as one giant tile in the treemap. Past the window, items
-    // fall back to the stable hash-based projectColor() so they
-    // stay consistent across renderings.
-    const colors = disambiguateColors(items);
-    return items.map((d, i) => ({
+  const colorMap = $derived(
+    seriesColorMap(rowItems.map((item) => item.id).sort()),
+  );
+
+  const rows = $derived.by((): Row[] => {
+    const items = rowItems;
+    const total = items.reduce((s, d) => s + d.cost.microdollars, 0);
+
+    // colorMap (seriesColorMap) guarantees the tiles get distinct hues
+    // and stays stable across renderings.
+    return items.map((d) => ({
       id: d.id,
       label: d.label,
-      cost: d.cost,
-      color: colors[i] ?? projectColor(d.id),
-      pct: total > 0 ? d.cost / total : 0,
+      cost: d.cost.microdollars,
+      color: colorMap.get(d.id) ?? "var(--text-muted)",
+      pct: total > 0 ? d.cost.microdollars / total : 0,
     }));
   });
 
@@ -94,7 +93,7 @@
 
   function handleSelect(id: string) {
     if (groupBy === "project") {
-      usage.toggleProject(id);
+      usage.toggleProjectKey(id);
     } else if (groupBy === "agent") {
       usage.toggleAgent(id);
     } else {
@@ -185,7 +184,7 @@
                 style="background: {row.color}"
               ></span>
               <span class="rail-label">{row.label}</span>
-              <span class="rail-cost">{fmtCost(row.cost)}</span>
+              <span class="rail-cost">{formatMoney(moneyFromMicrodollars(row.cost))}</span>
             </div>
           {/each}
         </div>
@@ -218,7 +217,7 @@
             <span class="list-pct">
               {(row.pct * 100).toFixed(1)}%
             </span>
-            <span class="list-cost">{fmtCost(row.cost)}</span>
+            <span class="list-cost">{formatMoney(moneyFromMicrodollars(row.cost))}</span>
           </div>
         {/each}
       </div>

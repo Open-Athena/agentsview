@@ -51,13 +51,14 @@ type SyncResult struct {
 // produced at least one session — used by ResyncAll to compare
 // against Failed on the same unit.
 type SyncStats struct {
-	TotalSessions  int      `json:"total_sessions"`
-	Synced         int      `json:"synced"`
-	Skipped        int      `json:"skipped"`
-	Failed         int      `json:"failed"`
-	OrphanedCopied int      `json:"orphaned_copied,omitempty"`
-	Warnings       []string `json:"warnings,omitempty"`
-	Aborted        bool     `json:"aborted,omitempty"`
+	TotalSessions  int                 `json:"total_sessions"`
+	Synced         int                 `json:"synced"`
+	Skipped        int                 `json:"skipped"`
+	Failed         int                 `json:"failed"`
+	OrphanedCopied int                 `json:"orphaned_copied,omitempty"`
+	Warnings       []string            `json:"warnings,omitempty"`
+	Aborted        bool                `json:"aborted,omitempty"`
+	RebuildPhases  []RebuildPhaseStats `json:"rebuild_phases,omitempty"`
 
 	// Anomalies aggregates per-run parser/sanitizer anomaly signals
 	// surfaced in the CLI sync summary. These are live per-run counters
@@ -65,8 +66,13 @@ type SyncStats struct {
 	// run and is omitted from the summary.
 	Anomalies AnomalyStats `json:"anomalies,omitzero"`
 
-	filesOK         int // unexported: file-level success counter
-	filesDiscovered int // file-based total, excludes DB-backed agents
+	filesOK int // unexported: file-level success counter
+	// sourceMissingTombstoned counts stored virtual members tombstoned
+	// during this run because their member source vanished from a
+	// still-existing shared container. Changed-path syncs use it to emit
+	// a sessions event even when nothing else was written.
+	sourceMissingTombstoned int
+	filesDiscovered         int // file-based total, excludes DB-backed agents
 	// nonContainerDiscovered counts discovered files that are not part of
 	// a self-preserving container store (OpenCode-format storage and its
 	// SQLite virtual paths). The resync empty-discovery guard uses it so a
@@ -76,6 +82,27 @@ type SyncStats struct {
 	messagesIndexed        int // unexported: progress message counter
 	parserExcludedFiles    int // file-level intentional parser exclusions
 	parserExcludedIDs      []string
+	providerFailures       int // authoritative discoveries that did not complete
+	// ArchiveRebuilt records a completed full-resync database swap. A rebuild
+	// can preserve/copy durable corpus rows while syncing zero session files,
+	// so downstream refresh consumers cannot infer it from Synced. It is not
+	// serialized in sync API responses; parent-side worker coordination sets it
+	// only after the replacement archive has been installed successfully.
+	ArchiveRebuilt bool `json:"-"`
+	// cwdFilteredSessions counts sessions vetoed by the
+	// sync_include_cwd_prefixes allow-list. The resync abort guard uses
+	// it so a run where every discovered session is filtered reads as
+	// an intentional result rather than an unsafe empty rebuild.
+	cwdFilteredSessions int
+	// cwdFilteredFiles counts files whose every parsed session was
+	// vetoed by the allow-list. Together with parserExcludedFiles it
+	// must account for all of filesOK before the resync abort guard
+	// treats a zero-write run as intentional.
+	cwdFilteredFiles int
+}
+
+func (s SyncStats) shouldEmitSync() bool {
+	return !s.Aborted && (s.Synced > 0 || s.ArchiveRebuilt)
 }
 
 // AnomalyStats aggregates parser-output anomaly signals observed during a
@@ -85,6 +112,8 @@ type SyncStats struct {
 // the central validateAndSanitize pass. It is a per-run summary only; no
 // new persisted columns back it.
 type AnomalyStats struct {
+	UnsupportedSourceLayoutsByAgent map[string]int `json:"unsupported_source_layouts_by_agent,omitempty"`
+	UnsupportedSourceLayoutsTotal   int            `json:"unsupported_source_layouts_total,omitempty"`
 	// MalformedLinesByAgent maps an agent type to the total number of
 	// parser malformed lines reported by sessions of that agent in this
 	// run. Only non-zero agents are present.
@@ -143,10 +172,22 @@ func (s SanitizeStats) IsZero() bool {
 // IsZero reports whether the run observed no anomalies at all, so the CLI
 // summary can omit the anomaly section entirely on clean runs.
 func (a AnomalyStats) IsZero() bool {
-	return a.MalformedLinesTotal == 0 &&
+	return a.UnsupportedSourceLayoutsTotal == 0 &&
+		a.MalformedLinesTotal == 0 &&
 		a.UnknownSchemaSessionsTotal == 0 &&
 		a.GenMetadataWithoutUsageTotal == 0 &&
 		a.Sanitize.IsZero()
+}
+
+func (a *AnomalyStats) RecordUnsupportedSourceLayouts(agent string, n int) {
+	if n <= 0 {
+		return
+	}
+	if a.UnsupportedSourceLayoutsByAgent == nil {
+		a.UnsupportedSourceLayoutsByAgent = make(map[string]int)
+	}
+	a.UnsupportedSourceLayoutsByAgent[agent] += n
+	a.UnsupportedSourceLayoutsTotal += n
 }
 
 // RecordMalformedLines attributes n parser malformed lines to the given
@@ -203,6 +244,9 @@ func (a *AnomalyStats) addSanitize(v validationStats) {
 
 // merge folds another AnomalyStats into the receiver.
 func (a *AnomalyStats) merge(o AnomalyStats) {
+	for agent, n := range o.UnsupportedSourceLayoutsByAgent {
+		a.RecordUnsupportedSourceLayouts(agent, n)
+	}
 	for agent, n := range o.MalformedLinesByAgent {
 		a.RecordMalformedLines(agent, n)
 	}
@@ -232,7 +276,8 @@ type anomalyAccumulator struct {
 	// malformedFiles tracks source paths whose malformed-line count has
 	// already been recorded this run, so a file that forks into several
 	// sessions counts its malformed lines once. Reset each run.
-	malformedFiles map[string]bool
+	malformedFiles     map[string]bool
+	unsupportedSources map[string]bool
 }
 
 // reset clears the accumulator at the start of a sync run.
@@ -240,7 +285,21 @@ func (a *anomalyAccumulator) reset() {
 	a.mu.Lock()
 	a.stats = AnomalyStats{}
 	a.malformedFiles = nil
+	a.unsupportedSources = nil
 	a.mu.Unlock()
+}
+
+func (a *anomalyAccumulator) recordUnsupportedSourceLayout(agent, source string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.unsupportedSources == nil {
+		a.unsupportedSources = make(map[string]bool)
+	}
+	if a.unsupportedSources[source] {
+		return
+	}
+	a.unsupportedSources[source] = true
+	a.stats.RecordUnsupportedSourceLayouts(agent, 1)
 }
 
 // recordMalformedLines accumulates an agent's parser malformed-line count for

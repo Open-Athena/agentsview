@@ -28,6 +28,14 @@
       name: "zh-TW",
       label: m.settings_language_traditional_chinese(),
     },
+    {
+      name: "ko",
+      label: m.settings_language_korean(),
+    },
+    {
+      name: "fr",
+      label: m.settings_language_french(),
+    },
   ]);
 
   function handleLocaleSelect(value: string) {

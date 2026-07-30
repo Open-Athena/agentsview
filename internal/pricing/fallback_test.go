@@ -9,7 +9,16 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/money"
 )
+
+func testRate(dollars string) money.Money {
+	rate, err := money.ParseDollars(dollars)
+	if err != nil {
+		panic(err)
+	}
+	return rate
+}
 
 func TestFallbackPricing_Opus46Rates(t *testing.T) {
 	prices := requireEmbeddedFallbackPricing(t)
@@ -27,11 +36,11 @@ func TestFallbackPricing_Opus46Rates(t *testing.T) {
 	// ephemeral cache write is 2x input, vs 1.25x for 5m).
 	want := ModelPricing{
 		ModelPattern:           "claude-opus-4-6",
-		InputPerMTok:           5.0,
-		OutputPerMTok:          25.0,
-		CacheCreationPerMTok:   6.25,
-		CacheCreation1hPerMTok: 10.0,
-		CacheReadPerMTok:       0.50,
+		InputPerMTok:           testRate("5"),
+		OutputPerMTok:          testRate("25"),
+		CacheCreationPerMTok:   testRate("6.25"),
+		CacheCreation1hPerMTok: testRate("10"),
+		CacheReadPerMTok:       testRate("0.50"),
 	}
 	assert.Equal(t, want, *got)
 }
@@ -52,11 +61,11 @@ func TestFallbackPricing_Opus47Rates(t *testing.T) {
 	// pricing covers the whole current Opus generation.
 	want := ModelPricing{
 		ModelPattern:           "claude-opus-4-7",
-		InputPerMTok:           5.0,
-		OutputPerMTok:          25.0,
-		CacheCreationPerMTok:   6.25,
-		CacheCreation1hPerMTok: 10.0,
-		CacheReadPerMTok:       0.50,
+		InputPerMTok:           testRate("5"),
+		OutputPerMTok:          testRate("25"),
+		CacheCreationPerMTok:   testRate("6.25"),
+		CacheCreation1hPerMTok: testRate("10"),
+		CacheReadPerMTok:       testRate("0.50"),
 	}
 	assert.Equal(t, want, *got)
 }
@@ -77,11 +86,11 @@ func TestFallbackPricing_Opus48Rates(t *testing.T) {
 	// price it at the current Opus tier (incl. 1h cache rate).
 	want := ModelPricing{
 		ModelPattern:           "claude-opus-4-8",
-		InputPerMTok:           5.0,
-		OutputPerMTok:          25.0,
-		CacheCreationPerMTok:   6.25,
-		CacheCreation1hPerMTok: 10.0,
-		CacheReadPerMTok:       0.50,
+		InputPerMTok:           testRate("5"),
+		OutputPerMTok:          testRate("25"),
+		CacheCreationPerMTok:   testRate("6.25"),
+		CacheCreation1hPerMTok: testRate("10"),
+		CacheReadPerMTok:       testRate("0.50"),
 	}
 	assert.Equal(t, want, *got)
 }
@@ -103,11 +112,11 @@ func TestFallbackPricing_Fable5Rates(t *testing.T) {
 	// 1h = 2x input (1.6x the 5m rate), derived at snapshot load.
 	want := ModelPricing{
 		ModelPattern:           "claude-fable-5",
-		InputPerMTok:           10.0,
-		OutputPerMTok:          50.0,
-		CacheCreationPerMTok:   12.50,
-		CacheCreation1hPerMTok: 20.0,
-		CacheReadPerMTok:       1.0,
+		InputPerMTok:           testRate("10"),
+		OutputPerMTok:          testRate("50"),
+		CacheCreationPerMTok:   testRate("12.50"),
+		CacheCreation1hPerMTok: testRate("20"),
+		CacheReadPerMTok:       testRate("1"),
 	}
 	assert.Equal(t, want, *got)
 }
@@ -122,9 +131,9 @@ func TestFallbackPricing_HermesModels(t *testing.T) {
 	// standard tier — input $5.00, cached input $0.50, output $30.00 per MTok.
 	gpt, ok := byPattern["gpt-5.5"]
 	require.True(t, ok, "gpt-5.5 entry missing from FallbackPricing")
-	assert.Equal(t, 5.0, gpt.InputPerMTok)
-	assert.Equal(t, 30.0, gpt.OutputPerMTok)
-	assert.Equal(t, 0.50, gpt.CacheReadPerMTok)
+	assert.Equal(t, testRate("5"), gpt.InputPerMTok)
+	assert.Equal(t, testRate("30"), gpt.OutputPerMTok)
+	assert.Equal(t, testRate("0.50"), gpt.CacheReadPerMTok)
 
 	// openrouter/owl-alpha is a free model: a known $0 (present with
 	// zero rates) rather than an unpriced/unknown model.
@@ -212,21 +221,21 @@ func TestFallbackPricing_OverlayOnlyRates(t *testing.T) {
 
 	cases := []struct {
 		model  string
-		input  float64
-		output float64
+		input  money.Money
+		output money.Money
 	}{
-		{"gpt-5.4-mini", 0.75, 4.50},
-		{"gpt-5.4-nano", 0.20, 1.25},
-		{"claude-haiku-3-5-20241022", 0.80, 4.0},
-		{"mistral-medium-3.5", 1.5, 7.5},
-		{"gpt-5.3-codex", 1.75, 14.0},
+		{"gpt-5.4-mini", testRate("0.75"), testRate("4.50")},
+		{"gpt-5.4-nano", testRate("0.20"), testRate("1.25")},
+		{"claude-haiku-3-5-20241022", testRate("0.80"), testRate("4")},
+		{"mistral-medium-3.5", testRate("1.5"), testRate("7.5")},
+		{"gpt-5.3-codex", testRate("1.75"), testRate("14")},
 	}
 
 	for _, tc := range cases {
 		got, ok := byPattern[tc.model]
 		require.True(t, ok, "%s missing", tc.model)
-		assert.InDelta(t, tc.input, got.InputPerMTok, 0.001, "%s input rate", tc.model)
-		assert.InDelta(t, tc.output, got.OutputPerMTok, 0.001, "%s output rate", tc.model)
+		assert.Equal(t, tc.input, got.InputPerMTok, "%s input rate", tc.model)
+		assert.Equal(t, tc.output, got.OutputPerMTok, "%s output rate", tc.model)
 	}
 }
 
@@ -234,8 +243,8 @@ func TestDecodeFallbackSnapshotFromFS(t *testing.T) {
 	snapshot := []byte(`{
 		"version": "litellm-test",
 		"models": [
-			{"ModelPattern": "z-model", "InputPerMTok": 2},
-			{"ModelPattern": "a-model", "InputPerMTok": 1}
+			{"ModelPattern": "z-model", "InputPerMTok": {"microdollars": 2000000}},
+			{"ModelPattern": "a-model", "InputPerMTok": {"microdollars": 1000000}}
 		]
 	}`)
 

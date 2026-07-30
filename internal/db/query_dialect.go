@@ -32,9 +32,9 @@ type QueryDialect struct {
 	placeholderStyle   placeholderStyle
 	trueLiteral        string
 	falseLiteral       string
-	dateExpr           string
+	dateStartExpr      func(func(string) string) string
+	dateEndExpr        func(func(string) string) string
 	dateParam          func(string) string
-	activityExpr       string
 	activityParam      func(string) string
 	cursorActivityExpr string
 	cursorParam        func(string) string
@@ -54,6 +54,14 @@ type QueryDialect struct {
 	nullsLast                   bool
 }
 
+func outerSessionID(q func(string) string) string {
+	id := q("id")
+	if id == "id" {
+		return "sessions.id"
+	}
+	return id
+}
+
 // SQLiteQueryDialect returns the SQLite SQL fragments used by the local store.
 func SQLiteQueryDialect() QueryDialect {
 	return QueryDialect{
@@ -61,10 +69,19 @@ func SQLiteQueryDialect() QueryDialect {
 		placeholderStyle: placeholderQuestion,
 		trueLiteral:      "1",
 		falseLiteral:     "0",
-		dateExpr: "date(COALESCE(NULLIF(started_at, ''), " +
-			"created_at))",
-		dateParam:              func(ph string) string { return ph },
-		activityExpr:           "COALESCE(NULLIF(ended_at, ''), NULLIF(started_at, ''), created_at)",
+		dateStartExpr: func(q func(string) string) string {
+			return "julianday(COALESCE(NULLIF(" + q("started_at") +
+				", ''), " + q("created_at") + "))"
+		},
+		dateEndExpr: func(q func(string) string) string {
+			return "julianday(COALESCE(NULLIF(" + q("ended_at") +
+				", ''), (SELECT m.timestamp FROM messages m" +
+				" WHERE m.session_id = " + outerSessionID(q) +
+				" AND m.timestamp != '' ORDER BY julianday(m.timestamp)" +
+				" DESC, m.timestamp DESC LIMIT 1), NULLIF(" + q("started_at") +
+				", ''), " + q("created_at") + "))"
+		},
+		dateParam:              func(ph string) string { return "julianday(" + ph + ")" },
 		activityParam:          func(ph string) string { return ph },
 		cursorActivityExpr:     "COALESCE(NULLIF(ended_at, ''), NULLIF(started_at, ''), created_at)",
 		cursorParam:            func(ph string) string { return ph },
@@ -90,10 +107,18 @@ func PostgresQueryDialect() QueryDialect {
 		placeholderStyle: placeholderDollar,
 		trueLiteral:      "TRUE",
 		falseLiteral:     "FALSE",
-		dateExpr: "DATE(COALESCE(started_at, created_at) " +
-			"AT TIME ZONE 'UTC')",
-		dateParam:    func(ph string) string { return ph + "::date" },
-		activityExpr: "COALESCE(ended_at, started_at, created_at)",
+		dateStartExpr: func(q func(string) string) string {
+			return "COALESCE(" + q("started_at") + ", " +
+				q("created_at") + ")"
+		},
+		dateEndExpr: func(q func(string) string) string {
+			return "COALESCE(" + q("ended_at") +
+				", (SELECT MAX(m.timestamp) FROM messages m" +
+				" WHERE m.session_id = " + outerSessionID(q) +
+				" AND m.timestamp IS NOT NULL), " + q("started_at") +
+				", " + q("created_at") + ")"
+		},
+		dateParam: func(ph string) string { return ph + "::timestamptz" },
 		activityParam: func(ph string) string {
 			return ph + "::timestamptz"
 		},
@@ -123,11 +148,20 @@ func DuckDBQueryDialect() QueryDialect {
 		placeholderStyle: placeholderQuestion,
 		trueLiteral:      "TRUE",
 		falseLiteral:     "FALSE",
-		dateExpr:         "CAST(COALESCE(started_at, created_at) AS DATE)",
-		dateParam: func(ph string) string {
-			return "CAST(" + ph + " AS DATE)"
+		dateStartExpr: func(q func(string) string) string {
+			return "CAST(COALESCE(" + q("started_at") + ", " +
+				q("created_at") + ") AS TIMESTAMP)"
 		},
-		activityExpr:       "COALESCE(ended_at, started_at, created_at)",
+		dateEndExpr: func(q func(string) string) string {
+			return "CAST(COALESCE(" + q("ended_at") +
+				", (SELECT MAX(m.timestamp) FROM messages m" +
+				" WHERE m.session_id = " + outerSessionID(q) +
+				" AND m.timestamp IS NOT NULL), " + q("started_at") +
+				", " + q("created_at") + ") AS TIMESTAMP)"
+		},
+		dateParam: func(ph string) string {
+			return "CAST(" + ph + " AS TIMESTAMP)"
+		},
 		activityParam:      func(ph string) string { return "CAST(" + ph + " AS TIMESTAMP)" },
 		cursorActivityExpr: "COALESCE(ended_at, started_at, created_at)",
 		cursorParam: func(ph string) string {
@@ -172,6 +206,50 @@ func (d QueryDialect) Qualify(parts ...string) string {
 }
 
 var safeIdentifierRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// NormalizeSessionTimezone validates an IANA timezone name and returns the
+// canonical UTC default used when callers omit it. "Local" is intentionally
+// rejected because it depends on the server environment rather than naming a
+// browser-selected zone.
+func NormalizeSessionTimezone(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "UTC", nil
+	}
+	if name == "Local" {
+		return "", fmt.Errorf("invalid timezone: %s", name)
+	}
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		return "", fmt.Errorf("invalid timezone: %s", name)
+	}
+	return loc.String(), nil
+}
+
+func sessionDateBoundary(date, timezone string, nextDay bool) string {
+	name, err := NormalizeSessionTimezone(timezone)
+	if err != nil {
+		// Public HTTP and service inputs validate before reaching the store.
+		// Keep internal store callers deterministic if they violate that
+		// contract rather than making SQL construction panic.
+		name = "UTC"
+	}
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		loc = time.UTC
+	}
+	boundary, err := time.ParseInLocation(time.DateOnly, date, loc)
+	if err != nil {
+		// Dates are likewise validated at public boundaries. Returning the
+		// original value preserves the historical behavior for invalid
+		// internal filters.
+		return date
+	}
+	if nextDay {
+		boundary = boundary.AddDate(0, 0, 1)
+	}
+	return boundary.UTC().Format(time.RFC3339)
+}
 
 // QueryBuilder allocates dialect placeholders and collects bind parameters.
 type QueryBuilder struct {
@@ -453,6 +531,11 @@ func buildSessionFilterWithBuilder(
 	rootMatchParts = append(rootMatchParts,
 		BuildCanonicalRootWhere(b.dialect, "root_session", f.IncludeOrphans))
 	rootMatch := strings.Join(rootMatchParts, " AND ")
+	childAutomationPred := automationScopePredicate(f, b.dialect, "s")
+	childAutomationWhere := ""
+	if childAutomationPred != "" {
+		childAutomationWhere = " AND " + childAutomationPred
+	}
 
 	cte := "WITH RECURSIVE tree(id) AS (" +
 		"SELECT root_session.id FROM sessions root_session" +
@@ -463,9 +546,27 @@ func buildSessionFilterWithBuilder(
 		"SELECT s.id FROM sessions s" +
 		" JOIN tree t ON s.parent_session_id = t.id" +
 		" WHERE s.message_count > 0 AND s.deleted_at IS NULL" +
+		childAutomationWhere +
 		") SELECT id FROM tree"
 
 	return baseWhere + " AND " + q("id") + " IN (" + cte + ")"
+}
+
+func automationScopePredicate(
+	f SessionFilter, dialect QueryDialect, sessionAlias string,
+) string {
+	col := "is_automated"
+	if sessionAlias != "" {
+		col = sessionAlias + "." + col
+	}
+	switch normalizeAutomatedScope(f.AutomatedScope, f.ExcludeAutomated) {
+	case "human":
+		return col + " = " + dialect.falseLiteral
+	case "automated":
+		return col + " = " + dialect.trueLiteral
+	default:
+		return ""
+	}
 }
 
 func sessionFilterPredicates(
@@ -493,20 +594,30 @@ func sessionFilterPredicates(
 			inPredicate(q("agent"), splitCSV(f.Agent), b))
 	}
 	if f.Date != "" {
-		preds = append(preds, b.dialect.dateExpr+" = "+
-			b.dialect.dateParam(b.Add(f.Date)))
+		preds = append(preds, "("+b.dialect.dateEndExpr(q)+" >= "+
+			b.dialect.dateParam(b.Add(sessionDateBoundary(
+				f.Date, f.Timezone, false,
+			)))+" AND "+
+			b.dialect.dateStartExpr(q)+" < "+
+			b.dialect.dateParam(b.Add(sessionDateBoundary(
+				f.Date, f.Timezone, true,
+			)))+")")
 	}
 	if f.DateFrom != "" {
-		preds = append(preds, b.dialect.dateExpr+" >= "+
-			b.dialect.dateParam(b.Add(f.DateFrom)))
+		preds = append(preds, b.dialect.dateEndExpr(q)+" >= "+
+			b.dialect.dateParam(b.Add(sessionDateBoundary(
+				f.DateFrom, f.Timezone, false,
+			))))
 	}
 	if f.DateTo != "" {
-		preds = append(preds, b.dialect.dateExpr+" <= "+
-			b.dialect.dateParam(b.Add(f.DateTo)))
+		preds = append(preds, b.dialect.dateStartExpr(q)+" < "+
+			b.dialect.dateParam(b.Add(sessionDateBoundary(
+				f.DateTo, f.Timezone, true,
+			))))
 	}
 	if f.ActiveSince != "" {
-		preds = append(preds, b.dialect.activityExpr+" >= "+
-			b.dialect.activityParam(b.Add(f.ActiveSince)))
+		preds = append(preds, b.dialect.dateEndExpr(q)+" >= "+
+			b.dialect.dateParam(b.Add(f.ActiveSince)))
 	}
 	if f.MinMessages > 0 {
 		preds = append(preds,
@@ -524,29 +635,9 @@ func sessionFilterPredicates(
 		preds = append(preds, pred)
 	}
 
-	scope := normalizeAutomatedScope(f.AutomatedScope, f.ExcludeAutomated)
-	oneShotPred := ""
-	if f.ExcludeOneShot {
-		pred := q("user_message_count") + " > 1"
-		if scope != "human" {
-			pred = "(" + q("user_message_count") + " > 1 OR " +
-				q("is_automated") + " = " +
-				b.dialect.trueLiteral + ")"
-		}
-		if f.IncludeChildren {
-			oneShotPred = pred
-		} else {
-			preds = append(preds, pred)
-		}
-	}
-	switch scope {
-	case "human":
-		preds = append(preds, q("is_automated")+" = "+
-			b.dialect.falseLiteral)
-	case "automated":
-		preds = append(preds, q("is_automated")+" = "+
-			b.dialect.trueLiteral)
-	}
+	preds, oneShotPred := appendSessionVisibilityPredicates(
+		preds, f, b, q,
+	)
 	if len(f.Outcome) > 0 {
 		preds = append(preds,
 			inPredicate(q("outcome"), f.Outcome, b))
@@ -575,6 +666,61 @@ func sessionFilterPredicates(
 				q("id")+")")
 	}
 	return preds, oneShotPred
+}
+
+func appendSessionVisibilityPredicates(
+	preds []string,
+	f SessionFilter,
+	b *QueryBuilder,
+	q func(string) string,
+) ([]string, string) {
+	scope := normalizeAutomatedScope(f.AutomatedScope, f.ExcludeAutomated)
+	oneShotPred := ""
+	if f.ExcludeOneShot {
+		pred := oneShotPredicate(f, b, q, scope)
+		if f.IncludeChildren {
+			oneShotPred = pred
+		} else {
+			preds = append(preds, pred)
+		}
+	}
+	switch scope {
+	case "human":
+		preds = append(preds, q("is_automated")+" = "+
+			b.dialect.falseLiteral)
+	case "automated":
+		preds = append(preds, q("is_automated")+" = "+
+			b.dialect.trueLiteral)
+	}
+	return preds, oneShotPred
+}
+
+// oneShotPredicate builds the ExcludeOneShot predicate: sessions with a
+// single user message are dropped unless automated (outside "human" scope)
+// or, when ChildExemptOneShot is set (semantic/hybrid content-search scope
+// only), the session is a child — nearly all non-automated subagent
+// transcripts carry exactly one user message, so without the carve-out the
+// one-shot gate would hide the subordinate units the Scope filter governs.
+// With ChildExemptOneShot false the emitted SQL is byte-identical to the
+// historical predicate.
+func oneShotPredicate(
+	f SessionFilter, b *QueryBuilder, q func(string) string, scope string,
+) string {
+	conds := []string{q("user_message_count") + " > 1"}
+	if scope != "human" {
+		conds = append(conds,
+			q("is_automated")+" = "+b.dialect.trueLiteral)
+	}
+	if f.ChildExemptOneShot {
+		conds = append(conds,
+			q("relationship_type")+" IN ("+
+				b.dialect.SidebarChildRelationshipsSQL()+")",
+			q("parent_session_id")+" <> ''")
+	}
+	if len(conds) == 1 {
+		return conds[0]
+	}
+	return "(" + strings.Join(conds, " OR ") + ")"
 }
 
 // buildSessionBaseFilter returns a WHERE clause and args containing the base

@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/money"
 )
 
 func ptr(s string) *string { return &s }
@@ -411,7 +412,9 @@ func seedDatedSource(t *testing.T) string {
 	require.NoError(t, err, "open source db")
 
 	require.NoError(t, d.UpsertModelPricing([]db.ModelPricing{{
-		ModelPattern: "claude-test", InputPerMTok: 1000, OutputPerMTok: 1000,
+		ModelPattern:  "claude-test",
+		InputPerMTok:  money.MustParseDollars("1000"),
+		OutputPerMTok: money.MustParseDollars("1000"),
 	}}), "seed pricing")
 
 	started := "2026-01-01T00:00:00Z"
@@ -455,18 +458,20 @@ func seedDatedSource(t *testing.T) string {
 
 // usageTotalCost reads the precomputed usage/summary total out of an
 // export directory.
-func usageTotalCost(t *testing.T, outDir string) float64 {
+func usageTotalCost(t *testing.T, outDir string) int64 {
 	t.Helper()
 	var body struct {
 		Totals struct {
-			TotalCost float64 `json:"totalCost"`
+			TotalCost struct {
+				Microdollars int64 `json:"microdollars"`
+			} `json:"totalCost"`
 		} `json:"totals"`
 	}
 	cachePath := filepath.Join(outDir, "analytics_cache.ndjson")
 	require.NoError(t, json.Unmarshal(
 		[]byte(routeBody(t, cachePath, "usage/summary")), &body),
 		"parse usage/summary")
-	return body.Totals.TotalCost
+	return body.Totals.TotalCost.Microdollars
 }
 
 // analyticsSessionCount reads the precomputed analytics summary's session
@@ -499,9 +504,10 @@ func TestExportDateWindowScopesUsage(t *testing.T) {
 	require.NoError(t, err, "export windowed")
 
 	// All four messages are priced when the span is unbounded; only the
-	// two February ones fall inside the window.
-	assert.Equal(t, 8000.0, usageTotalCost(t, fullOut))
-	assert.Equal(t, 4000.0, usageTotalCost(t, winOut))
+	// two February ones fall inside the window. Cost is microdollars:
+	// $8000 = 8e9, $4000 = 4e9.
+	assert.Equal(t, int64(8_000_000_000), usageTotalCost(t, fullOut))
+	assert.Equal(t, int64(4_000_000_000), usageTotalCost(t, winOut))
 
 	// The window must not reach the analytics panels. Their From/To select
 	// sessions by started_at, and s-long started 2026-01-01 — before the

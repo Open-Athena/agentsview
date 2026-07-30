@@ -48,6 +48,33 @@ func NormalizeToolCategory(rawName string) string {
 	case "search_files", "grep", "grep_search":
 		return "Grep"
 
+	// Kilo (legacy) / RooCode (Cline-family) camelCase tool names.
+	// Read-family verbs (appliedDiff → Edit) and list/search share
+	// an embedded "content" payload field; kilo_legacy.go and
+	// roocode.go strip that field before building InputJSON so the
+	// payload stays a clean argument object.
+	case "appliedDiff", "searchAndReplace",
+		"editedExistingFile", "deleteFile":
+		return "Edit"
+	case "insertContent":
+		return "Write"
+	case "readFile", "listFiles", "listCodeDefinitionNames",
+		"listFilesTopLevel", "listFilesRecursive":
+		return "Read"
+	case "searchFiles", "codebaseSearch":
+		return "Grep"
+	case "writeToFile", "createFile", "newFileCreated":
+		return "Write"
+	case "executeCommand":
+		return "Bash"
+	case "useMcpTool", "use_mcp_tool", "search":
+		return "Tool"
+	case "newTask":
+		return "Task"
+	case "fetchInstructions", "updateTodoList", "finishTask",
+		"switchMode":
+		return "Tool"
+
 	// Antigravity tools
 	case "view_file", "read_url_content":
 		return "Read"
@@ -206,6 +233,18 @@ func NormalizeToolCategory(rawName string) string {
 		"browser_accessibility", "browser_profile":
 		return "Tool"
 
+	// Posit Assistant tools (excluding names already handled above:
+	// read→Read, edit→Edit, write→Write, bash→Bash, grep→Grep,
+	// skill→Tool, web_search→Tool)
+	case "ls", "getConsoleContent":
+		return "Read"
+	case "runCode", "executeCode":
+		return "Bash"
+	case "todoWrite", "webfetch", "EnterMode", "ExitMode":
+		return "Tool"
+	case "explore":
+		return "Task"
+
 	// Warp tools
 	case "read_files":
 		return "Read"
@@ -223,6 +262,12 @@ func NormalizeToolCategory(rawName string) string {
 		return "Read"
 	case "use_computer":
 		return "Tool"
+
+	// Poolside tools (only tools not already covered above)
+	case "todo_action", "switch_mode", "question", "exit":
+		return "Tool"
+	case "shell_kill", "shell_status", "shell_tail":
+		return "Bash"
 
 	default:
 		// MCP tools may carry a server prefix (e.g.

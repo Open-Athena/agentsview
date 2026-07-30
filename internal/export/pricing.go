@@ -1,10 +1,12 @@
 package export
 
 import (
+	"math/big"
 	"sort"
 	"strings"
 	"time"
 
+	"go.kenn.io/agentsview/internal/money"
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
 )
 
@@ -17,34 +19,36 @@ const (
 )
 
 type ModelRates struct {
-	InputPerMTok      float64
-	OutputPerMTok     float64
-	CacheWritePerMTok float64
+	InputPerMTok      money.Money
+	OutputPerMTok     money.Money
+	CacheWritePerMTok money.Money
 	// CacheWrite1hPerMTok is the fork-local 1-hour ephemeral cache-write
 	// rate (Anthropic: 2x input vs 1.25x for the 5m rate CacheWritePerMTok
 	// holds). It is deliberately NOT part of the frozen export v1 wire
 	// contract: no canonical-JSON key, no EffectiveModelRate field. It is
 	// consumed only by the SQLite daily/session cost functions, which price
 	// the 5m and 1h cache-write buckets separately.
-	CacheWrite1hPerMTok float64
-	CacheReadPerMTok    float64
+	CacheWrite1hPerMTok money.Money
+	CacheReadPerMTok    money.Money
 	UpdatedAt           *time.Time
 	Source              PricingRowSource
 }
 
 func (r ModelRates) CostForTokens(
 	inputTokens, outputTokens, reasoningTokens, cacheWriteTokens, cacheReadTokens int,
-) float64 {
+) (money.Money, error) {
 	// reasoningTokens is a breakdown of outputTokens for current sources, not
 	// additional billable output. Reasoning-only rows still bill at output rate.
 	billableOutputTokens := outputTokens
 	if billableOutputTokens == 0 {
 		billableOutputTokens = reasoningTokens
 	}
-	return (float64(inputTokens)*r.InputPerMTok +
-		float64(billableOutputTokens)*r.OutputPerMTok +
-		float64(cacheWriteTokens)*r.CacheWritePerMTok +
-		float64(cacheReadTokens)*r.CacheReadPerMTok) / 1_000_000
+	return money.CostPerMillion([]money.RatedTokens{
+		{Tokens: int64(inputTokens), Rate: r.InputPerMTok},
+		{Tokens: int64(billableOutputTokens), Rate: r.OutputPerMTok},
+		{Tokens: int64(cacheWriteTokens), Rate: r.CacheWritePerMTok},
+		{Tokens: int64(cacheReadTokens), Rate: r.CacheReadPerMTok},
+	})
 }
 
 type EffectivePricingRow struct {
@@ -59,10 +63,11 @@ type PricingLookup struct {
 }
 
 type PricingResolver struct {
-	rows        []EffectivePricingRow
-	byModel     map[string]ModelRates
-	lookupCache map[string]PricingLookup
-	recorded    map[string]*pricingRecord
+	rows                 []EffectivePricingRow
+	byModel              map[string]ModelRates
+	lookupCache          map[string]PricingLookup
+	recorded             map[string]*pricingRecord
+	unattributedReported bool
 }
 
 type pricingRecord struct {
@@ -122,6 +127,14 @@ func (r *PricingResolver) RecordReported(model string, lookup PricingLookup) {
 	rec.reported = true
 }
 
+// RecordUnattributedReported records an authoritative aggregate cost that
+// cannot be assigned to a model without inventing an allocation.
+func (r *PricingResolver) RecordUnattributedReported() {
+	if r != nil {
+		r.unattributedReported = true
+	}
+}
+
 func (r *PricingResolver) record(model string, lookup PricingLookup) *pricingRecord {
 	rec := r.recorded[model]
 	if rec == nil {
@@ -138,7 +151,8 @@ func (r *PricingResolver) BuildBlock() (PricingBlock, error) {
 	}
 	models := make(map[string]EffectiveModelRate, len(r.recorded))
 	fallbackSet := make(map[string]struct{})
-	var hasComputed, hasReported bool
+	var hasComputed bool
+	hasReported := r.unattributedReported
 	modelNames := make([]string, 0, len(r.recorded))
 	for model := range r.recorded {
 		modelNames = append(modelNames, model)
@@ -187,7 +201,7 @@ func (r *PricingResolver) BuildBlock() (PricingBlock, error) {
 		CustomOverrideCount: customPricingRowCount(r.rows),
 		EffectiveRowCount:   len(r.rows),
 		Digest:              digest,
-		CostSource:          combinedCostSource(hasComputed, hasReported),
+		CostSource:          CombinedCostSource(hasComputed, hasReported),
 		Fallback: PricingFallback{
 			Used:   len(fallbackModels) > 0,
 			Models: fallbackModels,
@@ -214,10 +228,11 @@ func pricingTableVersion(rows []EffectivePricingRow) string {
 }
 
 func recordCostSource(rec *pricingRecord) CostSource {
-	return combinedCostSource(rec.computed, rec.reported)
+	return CombinedCostSource(rec.computed, rec.reported)
 }
 
-func combinedCostSource(computed, reported bool) CostSource {
+// CombinedCostSource resolves normalized provenance flags into the wire enum.
+func CombinedCostSource(computed, reported bool) CostSource {
 	switch {
 	case computed && reported:
 		return CostSourceMixed
@@ -226,6 +241,55 @@ func combinedCostSource(computed, reported bool) CostSource {
 	default:
 		return CostSourceComputed
 	}
+}
+
+// AllocateCostByWeight distributes a reported aggregate cost across estimated
+// components. The final positive-weight component receives the integer
+// remainder so allocations add back to the authoritative total exactly.
+func AllocateCostByWeight(total money.Money, weights []money.Money) []money.Money {
+	allocated := make([]money.Money, len(weights))
+	if len(weights) == 0 || total.Microdollars == 0 {
+		return allocated
+	}
+
+	weightTotal := new(big.Int)
+	remainderIndex := -1
+	equalWeights := false
+	for i, weight := range weights {
+		if weight.Microdollars > 0 {
+			weightTotal.Add(weightTotal, big.NewInt(weight.Microdollars))
+			remainderIndex = i
+		}
+	}
+	if weightTotal.Sign() == 0 {
+		weightTotal.SetInt64(int64(len(weights)))
+		remainderIndex = len(weights) - 1
+		equalWeights = true
+	}
+
+	assigned := new(big.Int)
+	totalInt := big.NewInt(total.Microdollars)
+	for i, weight := range weights {
+		if equalWeights {
+			weight = money.Money{Microdollars: 1}
+		}
+		if i == remainderIndex || weight.Microdollars <= 0 {
+			continue
+		}
+		share := new(big.Int).Mul(totalInt, big.NewInt(weight.Microdollars))
+		share.Quo(share, weightTotal)
+		if !share.IsInt64() {
+			panic(money.ErrOverflow)
+		}
+		allocated[i] = money.Money{Microdollars: share.Int64()}
+		assigned.Add(assigned, share)
+	}
+	remainder := new(big.Int).Sub(totalInt, assigned)
+	if !remainder.IsInt64() {
+		panic(money.ErrOverflow)
+	}
+	allocated[remainderIndex] = money.Money{Microdollars: remainder.Int64()}
+	return allocated
 }
 
 func pricingSource(rows []EffectivePricingRow) string {

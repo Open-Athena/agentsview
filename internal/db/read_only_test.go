@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"os"
@@ -10,6 +11,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/money"
 )
 
 func tempDBPath(t *testing.T, name string) string {
@@ -93,10 +95,10 @@ func requireReadOnlyOp(t *testing.T, name string, op func() error) {
 func testModelPricing(pattern string) ModelPricing {
 	return ModelPricing{
 		ModelPattern:         pattern,
-		InputPerMTok:         1,
-		OutputPerMTok:        2,
-		CacheCreationPerMTok: 3,
-		CacheReadPerMTok:     4,
+		InputPerMTok:         money.MustParseDollars("1"),
+		OutputPerMTok:        money.MustParseDollars("2"),
+		CacheCreationPerMTok: money.MustParseDollars("3"),
+		CacheReadPerMTok:     money.MustParseDollars("4"),
 	}
 }
 
@@ -122,6 +124,87 @@ func TestOpenReadOnlyExistingDBDoesNotWrite(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, before.Size(), after.Size())
 	assert.Equal(t, before.ModTime(), after.ModTime())
+}
+
+// TestOpenReadOnlyReaderRefusesWritesAtSQLiteLevel pins the read-only
+// contract below the Go-level requireWritable guard: mattn/go-sqlite3 only
+// honors mode=ro when the DSN carries a file: URI prefix, so a bare-path DSN
+// silently handed out writable reader handles. A write attempted directly on
+// the reader pool must fail inside SQLite itself.
+func TestOpenReadOnlyReaderRefusesWritesAtSQLiteLevel(t *testing.T) {
+	path := createClosedTestDB(t, tempDBPath(t, "sessions.db"), nil)
+	readonly := openReadOnlyTestDB(t, path)
+
+	_, err := readonly.rawReader().Exec(
+		`INSERT INTO stats (key, value) VALUES ('ro_probe', 1)`)
+	require.Error(t, err,
+		"a read-only reader connection must refuse writes")
+	assert.Contains(t, err.Error(), "readonly",
+		"the refusal must be SQLite's readonly-database error, got: %v", err)
+}
+
+// TestOpenPathWithSpecialCharacters pins makeDSN's path escaping: SQLite
+// percent-decodes file: URI paths and splits params at `?`, so a directory
+// name containing a space and a literal %-hex sequence ("%41") would, raw,
+// be decoded to a different path ("weArd dir") and fail to open. Both the
+// writable and read-only opens must escape the path, and the read-only
+// reader must still refuse writes.
+func TestOpenPathWithSpecialCharacters(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "we%41rd dir")
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+	path := filepath.Join(dir, "sessions.db")
+
+	rw, err := Open(path)
+	require.NoError(t, err,
+		"writable Open must succeed on a path with %% and space")
+	require.NoError(t, rw.SetSyncState("special_path_probe", "x"))
+	require.NoError(t, rw.Close())
+
+	_, err = os.Stat(path)
+	require.NoError(t, err,
+		"the database file must exist at the literal path, not a decoded one")
+
+	readonly := openReadOnlyTestDB(t, path)
+	got, err := readonly.GetSyncState("special_path_probe")
+	require.NoError(t, err)
+	assert.Equal(t, "x", got)
+
+	_, err = readonly.rawReader().Exec(
+		`INSERT INTO stats (key, value) VALUES ('ro_probe', 1)`)
+	require.Error(t, err,
+		"a read-only reader connection must refuse writes")
+	assert.Contains(t, err.Error(), "readonly",
+		"the refusal must be SQLite's readonly-database error, got: %v", err)
+}
+
+// TestOpenReadOnlyNonWALJournalMode pins that a current-schema database left
+// in a non-WAL journal mode still opens read-only: the ro DSN must not carry
+// _journal_mode=WAL, because PRAGMA journal_mode=WAL is a write and fails on
+// a mode=ro connection. The reader adopts the file's DELETE journal mode and
+// still refuses writes.
+func TestOpenReadOnlyNonWALJournalMode(t *testing.T) {
+	path := createClosedTestDB(t, tempDBPath(t, "sessions.db"), func(d *DB) {
+		require.NoError(t, d.SetSyncState("journal_probe", "delete-mode"))
+	})
+	execRawSQLite(t, path, "PRAGMA journal_mode=DELETE")
+	_, err := os.Stat(path + "-wal")
+	require.ErrorIs(t, err, os.ErrNotExist,
+		"test setup: DELETE journal mode must have removed the WAL file")
+
+	readonly := openReadOnlyTestDB(t, path)
+	assert.True(t, readonly.ReadOnly())
+
+	got, err := readonly.GetSyncState("journal_probe")
+	require.NoError(t, err)
+	assert.Equal(t, "delete-mode", got)
+
+	require.ErrorIs(t, readonly.SetSyncState("journal_probe", "x"), ErrReadOnly)
+	_, err = readonly.rawReader().Exec(
+		`INSERT INTO stats (key, value) VALUES ('ro_probe', 1)`)
+	require.Error(t, err,
+		"a read-only reader connection must refuse writes")
+	assert.Contains(t, err.Error(), "readonly",
+		"the refusal must be SQLite's readonly-database error, got: %v", err)
 }
 
 func TestOpenReadOnlyWriteMethodsReturnErrReadOnly(t *testing.T) {
@@ -170,8 +253,17 @@ func TestOpenReadOnlyWriteMethodsReturnErrReadOnly(t *testing.T) {
 	requireReadOnlyOp(t, "ReplaceSkippedFiles", func() error {
 		return readonly.ReplaceSkippedFiles(map[string]int64{"x": 1})
 	})
+	requireReadOnlyOp(t, "ClearRemoteSkippedFiles", func() error {
+		return readonly.ClearRemoteSkippedFiles("remote-host")
+	})
 	requireReadOnlyOp(t, "UpdateSessionIncremental", func() error {
 		return readonly.UpdateSessionIncremental("s", IncrementalSessionUpdate{})
+	})
+	requireReadOnlyOp(t, "RecordRecallQueryEvent", func() error {
+		_, err := readonly.RecordRecallQueryEvent(
+			context.Background(), RecallQueryEvent{Surface: "query"},
+		)
+		return err
 	})
 }
 
@@ -203,6 +295,11 @@ func TestReadOnlySchemaCompatibilityRejectsMissingReadColumn(t *testing.T) {
 		{"pg sync state", "pg_sync_state", "value"},
 		{"model pricing", "model_pricing", "updated_at"},
 		{"secret finding", "secret_findings", "rules_version"},
+		{"recall entry", "recall_entries", "uncertainty"},
+		{"recall evidence", "recall_evidence", "snippet"},
+		{"extract generation", "recall_extract_generations", "state"},
+		{"extract progress stamp", "recall_extract_progress",
+			"content_stamped_at"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -228,6 +325,10 @@ func TestOpenReadOnlyRejectsMissingReadTable(t *testing.T) {
 		{"secret_findings", "id"},
 		{"pg_sync_state", "key"},
 		{"model_pricing", "model_pattern"},
+		{"recall_query_events", "id"},
+		{"recall_query_exposures", "query_id"},
+		{"recall_extract_generations", "fingerprint"},
+		{"recall_extract_progress", "session_id"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.table, func(t *testing.T) {
@@ -302,6 +403,9 @@ func requireReadOnlySchemaCompatibilityFails(
 
 func TestOpenReadOnlyAllowsMissingFTSTable(t *testing.T) {
 	path := createClosedTestDB(t, tempDBPath(t, "sessions.db"), nil)
+	execRawSQLite(t, path, "DROP TRIGGER IF EXISTS messages_ai")
+	execRawSQLite(t, path, "DROP TRIGGER IF EXISTS messages_au")
+	execRawSQLite(t, path, "DROP TRIGGER IF EXISTS messages_ad")
 	execRawSQLite(t, path, "DROP TABLE IF EXISTS messages_fts")
 
 	readonly, err := OpenReadOnly(path)

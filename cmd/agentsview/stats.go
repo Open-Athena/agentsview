@@ -25,6 +25,7 @@ func newStatsCommand() *cobra.Command {
 	var (
 		since, until, agent, timezone         string
 		includeProjects, excludeProjects      []string
+		includeOneShot, includeAutomated      bool
 		includeGitOutcomes, includeGHOutcomes bool
 	)
 	cmd := &cobra.Command{
@@ -57,15 +58,18 @@ func newStatsCommand() *cobra.Command {
 				ghToken = resolveGitHubToken(cmd.Context())
 			}
 			stats, err := svc.Stats(cmd.Context(), service.StatsFilter{
-				Since:                 since,
-				Until:                 until,
-				Agent:                 agentFilter,
-				IncludeProjects:       includeProjects,
-				ExcludeProjects:       excludeProjects,
-				Timezone:              timezone,
-				IncludeGitOutcomes:    includeGitOutcomes,
-				IncludeGitHubOutcomes: includeGHOutcomes,
-				GHToken:               ghToken,
+				ApplyDefaultVisibility: true,
+				Since:                  since,
+				Until:                  until,
+				Agent:                  agentFilter,
+				IncludeOneShot:         includeOneShot,
+				IncludeAutomated:       includeAutomated,
+				IncludeProjects:        includeProjects,
+				ExcludeProjects:        excludeProjects,
+				Timezone:               timezone,
+				IncludeGitOutcomes:     includeGitOutcomes,
+				IncludeGitHubOutcomes:  includeGHOutcomes,
+				GHToken:                ghToken,
 			})
 			if err != nil {
 				return err
@@ -80,6 +84,7 @@ func newStatsCommand() *cobra.Command {
 	registerFormatFlags(cmd.Flags())
 	registerStatsFlags(cmd,
 		&since, &until, &agent, &timezone,
+		&includeOneShot, &includeAutomated,
 		&includeProjects, &excludeProjects,
 		&includeGitOutcomes, &includeGHOutcomes,
 	)
@@ -116,6 +121,7 @@ func resolveGitHubToken(ctx context.Context) string {
 func registerStatsFlags(
 	cmd *cobra.Command,
 	since, until, agent, timezone *string,
+	includeOneShot, includeAutomated *bool,
 	includeProjects, excludeProjects *[]string,
 	includeGitOutcomes, includeGHOutcomes *bool,
 ) {
@@ -126,6 +132,10 @@ func registerStatsFlags(
 		"End of window (YYYY-MM-DD; default: now)")
 	f.StringVar(agent, "agent", "all",
 		"Filter by agent (claude, codex, cursor, ... or 'all')")
+	f.BoolVar(includeOneShot, "include-one-shot", false,
+		"Include one-shot sessions (excluded by default)")
+	f.BoolVar(includeAutomated, "include-automated", false,
+		"Include automated sessions (excluded by default)")
 	f.StringArrayVar(includeProjects, "include-project", nil,
 		"Restrict to these projects (repeatable)")
 	f.StringArrayVar(excludeProjects, "exclude-project", nil,
@@ -388,9 +398,9 @@ func printCacheEconomics(w io.Writer, c *db.StatsCacheEconomics) {
 	fmt.Fprintln(w, "Cache economics (claude-only)")
 	fmt.Fprintf(w, "  Overall hit ratio:   %.2f\n",
 		c.CacheHitRatio.Overall)
-	fmt.Fprintf(w, "  $ spent:             $%.2f\n", c.DollarsSpent)
-	fmt.Fprintf(w, "  $ saved vs uncached: $%.2f\n",
-		c.DollarsSavedVsUncached)
+	fmt.Fprintf(w, "  $ spent:             %s\n", fmtCost(c.DollarsSpent))
+	fmt.Fprintf(w, "  $ saved vs uncached: %s\n",
+		fmtCost(c.DollarsSavedVsUncached))
 	fmt.Fprintln(w)
 }
 

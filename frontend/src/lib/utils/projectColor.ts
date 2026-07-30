@@ -1,26 +1,19 @@
-// Palette uses the golden-angle hue rotation (137.5°) so
-// PALETTE_SIZE evenly-spaced hues maximally separate any two
-// consecutive entries — adjacent hash buckets land in
-// perceptually distant hues. PALETTE_SIZE = 24 was chosen so a
-// session with ~50 projects expects ~2 projects per color slot
-// (down from ~4 with the prior 12-color CSS-var palette).
-//
-// The first 12 hues align with the prior named-accent palette
-// so existing per-project colors don't shift much in practice;
-// the next 12 fill in between for the new collision relief.
-const GOLDEN_ANGLE = 137.508;
-const PALETTE_SIZE = 24;
+import { hashColor } from "@kenn-io/kit-ui/utils/color-hash";
 
-function generatePalette(): string[] {
-  return Array.from({ length: PALETTE_SIZE }, (_, i) => {
-    const hue = (i * GOLDEN_ANGLE) % 360;
-    return `hsl(${hue.toFixed(1)}, 65%, 60%)`;
-  });
-}
-
-export const PROJECT_PALETTE: readonly string[] = generatePalette();
-
-const FALLBACK = "var(--text-muted)";
+export const PROJECT_PALETTE: readonly string[] = [
+  "var(--accent-blue)",
+  "var(--accent-purple)",
+  "var(--accent-amber)",
+  "var(--accent-teal)",
+  "var(--accent-rose)",
+  "var(--accent-green)",
+  "var(--accent-indigo)",
+  "var(--accent-orange)",
+  "var(--accent-sky)",
+  "var(--accent-pink)",
+  "var(--accent-coral)",
+  "var(--accent-lime)",
+] as const;
 
 function djb2(s: string): number {
   let h = 5381;
@@ -35,7 +28,7 @@ function djb2(s: string): number {
 // A published view can group projects by GitHub org / tag (see view/meta):
 // each org gets a base hue and its projects render as deterministic *shades*
 // of it, so the treemap/charts read as "OA orange, HCCS green, ...". Projects
-// not in any org keep the golden-angle palette.
+// not in any org keep the hash-based palette.
 
 const COLOR_HUES: Record<string, number> = {
   red: 0, orange: 30, amber: 45, yellow: 55, lime: 90, green: 140,
@@ -80,54 +73,44 @@ function orgShade(name: string, hue: number): string {
   return `hsl(${((hue + jitter + 360) % 360).toFixed(0)}, 62%, ${light}%)`;
 }
 
+// projectColor delegates to kit-ui's hashColor over the app palette, except
+// when an org theme is installed (published views): org projects render as a
+// deterministic shade of their org hue instead.
 export function projectColor(name: string): string {
-  if (!name) return FALLBACK;
+  if (!name) return "var(--text-muted)";
   const hue = projectHue.get(name);
   if (hue !== undefined) return orgShade(name, hue);
-  return PROJECT_PALETTE[djb2(name) % PROJECT_PALETTE.length]!;
+  return hashColor(name, PROJECT_PALETTE);
 }
 
-// disambiguateColors guarantees that the top `n` items in a
-// sorted list each get a unique color, even when their
-// hash-derived colors collide. Walks in order; if an item's
-// preferred color is already taken by an earlier item in the
-// window, advance through the palette to the next unused color.
-// Items past index `n` keep their hash-derived color.
-//
-// Use this for displays where adjacent same-colored tiles
-// visually merge (treemap, stacked-area legend). Time-series
-// where a project's color must stay stable across windows
-// should keep calling projectColor() directly.
-export function disambiguateColors(
-  items: { id: string }[],
-  n: number = PALETTE_SIZE,
-): string[] {
-  const used = new Set<string>();
-  const out: string[] = [];
-  const cap = Math.min(n, items.length);
-  for (let i = 0; i < items.length; i++) {
-    const preferred = projectColor(items[i]!.id);
-    if (i >= cap) {
-      out.push(preferred);
-      continue;
-    }
-    if (!used.has(preferred)) {
-      used.add(preferred);
-      out.push(preferred);
-      continue;
-    }
-    // Walk forward from preferred's slot for the first free color.
-    const startIdx = PROJECT_PALETTE.indexOf(preferred);
-    let picked = preferred;
-    for (let off = 1; off < PROJECT_PALETTE.length; off++) {
-      const c = PROJECT_PALETTE[(startIdx + off) % PROJECT_PALETTE.length]!;
-      if (!used.has(c)) {
-        picked = c;
+export function seriesColorMap(
+  ids: readonly string[],
+): ReadonlyMap<string, string> {
+  const colors = new Map<string, string>();
+  const occupied = new Set<number>();
+  const uniqueIds = [...new Set(ids)]
+    .filter((id) => id !== "" && id !== "__other__")
+    .sort();
+
+  for (const id of uniqueIds) {
+    const preferred = PROJECT_PALETTE.indexOf(projectColor(id));
+    if (preferred < 0) continue;
+
+    let slot = preferred;
+    for (let offset = 0; offset < PROJECT_PALETTE.length; offset++) {
+      const candidate = (preferred + offset) % PROJECT_PALETTE.length;
+      if (!occupied.has(candidate)) {
+        slot = candidate;
+        occupied.add(candidate);
         break;
       }
     }
-    used.add(picked);
-    out.push(picked);
+    colors.set(id, PROJECT_PALETTE[slot]!);
   }
-  return out;
+
+  for (const id of ids) {
+    if (id === "" || id === "__other__") colors.set(id, "var(--text-muted)");
+  }
+
+  return colors;
 }

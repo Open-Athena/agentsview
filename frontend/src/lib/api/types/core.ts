@@ -23,7 +23,10 @@ export interface Session {
   id: string;
   project: string;
   machine: string;
+  cwd?: string;
   agent: string;
+  agent_label?: string;
+  entrypoint?: string;
   first_message: string | null;
   display_name?: string | null;
   started_at: string | null;
@@ -34,6 +37,7 @@ export interface Session {
   relationship_type?: string;
   deleted_at?: string | null;
   termination_status?: string | null;
+  transcript_revision?: string;
   file_path?: string;
   file_size?: number;
   file_mtime?: number;
@@ -92,6 +96,8 @@ export interface SidebarSessionIndexRow {
   project: string;
   machine: string;
   agent: string;
+  agent_label?: string | null;
+  entrypoint?: string | null;
   display_name?: string | null;
   started_at: string | null;
   ended_at: string | null;
@@ -99,6 +105,7 @@ export interface SidebarSessionIndexRow {
   termination_status?: string | null;
   message_count: number;
   user_message_count: number;
+  transcript_revision?: string;
   is_automated: boolean;
   is_teammate?: boolean;
 }

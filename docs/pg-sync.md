@@ -84,6 +84,7 @@ agentsview pg push [target] [flags]
 |------|---------|-------------|
 | `--all` | `false` | Push every configured PG target sequentially |
 | `--full` | `false` | Force full local resync and re-push, bypassing change detection |
+| `--no-vectors` | `false` | Skip the semantic-search vector phase for this run |
 | `--projects` | | Comma-separated projects to push (inclusive) |
 | `--exclude-projects` | | Comma-separated projects to exclude |
 | `--all-projects` | `false` | Ignore configured project filters for this run |
@@ -227,6 +228,23 @@ per-session `secret_leak_count`, and the
 [`has-secret`](/session-api/#agentsview-session-list) list
 filter).
 
+#### Vector Push
+
+When `[vector]` is enabled locally, `pg push` runs a vector phase
+after the session and message phases, copying the machine's
+active embedding generation from `vectors.db` into pgvector so a
+shared PostgreSQL deployment can answer `--semantic`/`--hybrid`.
+Only changed sessions are re-sent. Skip the phase for one run
+with `--no-vectors`, or disable it persistently with
+`push_vectors = false` under `[pg]`. Databases without pgvector
+(for example CockroachDB) skip the phase and keep syncing session
+content. See
+[semantic search: PostgreSQL](/semantic-search/#postgresql) for
+the full push, serve, and maintenance workflow.
+
+`pg vectors list` and `pg vectors drop <id>` inspect and remove
+pushed generations.
+
 ### `agentsview pg status`
 
 Show the current sync state.
@@ -369,6 +387,24 @@ the analytics and usage queries to perform well on CockroachDB
 aggregation, batched pricing writes) without changing any
 report semantics on PostgreSQL or SQLite.
 
+In a multi-tenant deployment behind PostgreSQL row-level
+security, slow analytics or usage panels usually point at the
+policy shape rather than at agentsview itself. The read-side
+queries are already session-id-shaped, so expose child rows
+through a set-based predicate such as `session_id IN (SELECT
+...)`, not a per-row `SECURITY DEFINER` call that runs once
+per scanned row. If shared-dataset aggregates still need more
+time, raise the API deadline with `--write-timeout`; the
+[Remote Access](/remote-access/#slow-aggregates-behind-a-proxy)
+page covers the flag and the larger troubleshooting path.
+
+When a reverse proxy reaches the backend by an internal
+hostname or service name, keep `--public-url` on the browser
+origin and add the proxy's upstream origin with
+`--public-origin`. The forwarded-access contract and
+troubleshooting details live in
+[Remote Access](/remote-access/#public-url-and-trusted-origins).
+
 !!! warning
     Query-parameter tokens can leak through server logs, browser
     history, and Referer headers. Prefer the `Authorization`
@@ -407,6 +443,14 @@ agentsview pg serve \
 # Requires require_auth = true; only use behind a VPN or on a
 # private LAN because tokens cross the wire in cleartext.
 agentsview pg serve --host 0.0.0.0 --port 8080
+
+# External reverse proxy under a subpath; the browser origin
+# and the proxy's upstream origin are different.
+agentsview pg serve \
+  --host 0.0.0.0 \
+  --base-path /agentsview \
+  --public-url https://console.example.com \
+  --public-origin http://agentsview:8080
 ```
 
 ---
@@ -518,12 +562,12 @@ A typical team setup:
 # Developer A's machine
 agentsview pg service install
 
-# Team server
+# Team server behind an external reverse proxy
 agentsview pg serve \
-  --proxy caddy \
-  --public-url https://viewer.team.internal \
-  --tls-cert /etc/certs/viewer.pem \
-  --tls-key /etc/certs/viewer-key.pem
+  --host 0.0.0.0 \
+  --base-path /agentsview \
+  --public-url https://console.example.com \
+  --public-origin http://agentsview:8080
 ```
 
 ---

@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"os"
@@ -17,6 +18,8 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/tidwall/gjson"
+
+	"go.kenn.io/agentsview/internal/money"
 )
 
 type hermesStateSession struct {
@@ -52,6 +55,47 @@ type hermesStateMessage struct {
 	reasoningDetails    string
 	codexReasoningItems string
 	codexMessageItems   string
+}
+
+func hermesToolInputJSON(tc gjson.Result) string {
+	for _, path := range []string{"function.arguments", "arguments", "input"} {
+		input := tc.Get(path)
+		if !input.Exists() {
+			continue
+		}
+		if input.Type == gjson.String {
+			if input.Str == "" {
+				continue
+			}
+			return input.Str
+		}
+		if input.Raw != "" {
+			return input.Raw
+		}
+	}
+	return ""
+}
+
+func parseHermesToolCall(tc gjson.Result) (ParsedToolCall, bool) {
+	name := tc.Get("function.name").Str
+	if name == "" {
+		name = tc.Get("name").Str
+	}
+	if name == "" {
+		return ParsedToolCall{}, false
+	}
+
+	inputJSON := hermesToolInputJSON(tc)
+	toolCall := ParsedToolCall{
+		ToolUseID: tc.Get("id").Str,
+		ToolName:  name,
+		Category:  NormalizeToolCategory(name),
+		InputJSON: inputJSON,
+	}
+	if name == "skill_view" {
+		toolCall.SkillName = gjson.Get(inputJSON, "name").Str
+	}
+	return toolCall, true
 }
 
 // parseArchive parses a Hermes root directory. If a state.db is present, it
@@ -139,6 +183,7 @@ func parseHermesJSONLSession(path, project, machine string) (*ParsedSession, []P
 	defer f.Close()
 
 	lr := newLineReader(f, maxLineSize)
+	defer releaseLineReader(lr)
 
 	var (
 		messages        []ParsedMessage
@@ -225,14 +270,8 @@ func parseHermesJSONLSession(path, project, machine string) (*ParsedSession, []P
 			tcArray := gjson.Get(line, "tool_calls")
 			if tcArray.IsArray() {
 				tcArray.ForEach(func(_, tc gjson.Result) bool {
-					name := tc.Get("function.name").Str
-					if name != "" {
-						toolCalls = append(toolCalls, ParsedToolCall{
-							ToolUseID: tc.Get("id").Str,
-							ToolName:  name,
-							Category:  NormalizeToolCategory(name),
-							InputJSON: tc.Get("function.arguments").Str,
-						})
+					if toolCall, ok := parseHermesToolCall(tc); ok {
+						toolCalls = append(toolCalls, toolCall)
 					}
 					return true
 				})
@@ -425,14 +464,8 @@ func parseHermesJSONSession(path, project, machine string) (*ParsedSession, []Pa
 			tcArray := msg.Get("tool_calls")
 			if tcArray.IsArray() {
 				tcArray.ForEach(func(_, tc gjson.Result) bool {
-					name := tc.Get("function.name").Str
-					if name != "" {
-						toolCalls = append(toolCalls, ParsedToolCall{
-							ToolUseID: tc.Get("id").Str,
-							ToolName:  name,
-							Category:  NormalizeToolCategory(name),
-							InputJSON: tc.Get("function.arguments").Str,
-						})
+					if toolCall, ok := parseHermesToolCall(tc); ok {
+						toolCalls = append(toolCalls, toolCall)
 					}
 					return true
 				})
@@ -683,35 +716,230 @@ func readHermesStateMessages(
 	return out, rows.Err()
 }
 
+func readHermesStateSession(
+	conn *sql.DB, rawSessionID string,
+) (hermesStateSession, bool, error) {
+	row := conn.QueryRow(`
+		SELECT id, source, COALESCE(model, ''),
+			COALESCE(parent_session_id, ''), started_at,
+			COALESCE(ended_at, 0), COALESCE(message_count, 0),
+			COALESCE(input_tokens, 0), COALESCE(output_tokens, 0),
+			COALESCE(cache_read_tokens, 0),
+			COALESCE(cache_write_tokens, 0),
+			COALESCE(reasoning_tokens, 0),
+			estimated_cost_usd, actual_cost_usd,
+			COALESCE(cost_status, ''), COALESCE(cost_source, ''),
+			COALESCE(title, ''), COALESCE(api_call_count, 0)
+		FROM sessions
+		WHERE id = ?`,
+		rawSessionID,
+	)
+	var ss hermesStateSession
+	var started, ended float64
+	err := row.Scan(
+		&ss.id, &ss.source, &ss.model,
+		&ss.parentSessionID, &started, &ended,
+		&ss.messageCount, &ss.inputTokens, &ss.outputTokens,
+		&ss.cacheReadTokens, &ss.cacheWriteTokens,
+		&ss.reasoningTokens, &ss.estimatedCost, &ss.actualCost,
+		&ss.costStatus, &ss.costSource, &ss.title, &ss.apiCallCount,
+	)
+	if err == sql.ErrNoRows {
+		return hermesStateSession{}, false, nil
+	}
+	if err != nil {
+		return hermesStateSession{}, false, fmt.Errorf(
+			"query hermes session %s: %w", rawSessionID, err,
+		)
+	}
+	ss.startedAt = hermesUnixTime(started)
+	ss.endedAt = hermesUnixTime(ended)
+	return ss, true, nil
+}
+
+func readHermesStateMessagesForSession(
+	conn *sql.DB, rawSessionID string,
+) ([]hermesStateMessage, error) {
+	rows, err := conn.Query(`
+		SELECT role, COALESCE(content, ''), COALESCE(tool_call_id, ''),
+			COALESCE(tool_calls, ''), timestamp,
+			COALESCE(finish_reason, ''), COALESCE(reasoning, ''),
+			COALESCE(reasoning_content, ''),
+			COALESCE(reasoning_details, ''),
+			COALESCE(codex_reasoning_items, ''),
+			COALESCE(codex_message_items, '')
+		FROM messages
+		WHERE session_id = ?
+		ORDER BY timestamp ASC, id ASC`,
+		rawSessionID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"query hermes messages for %s: %w", rawSessionID, err,
+		)
+	}
+	defer rows.Close()
+
+	var out []hermesStateMessage
+	for rows.Next() {
+		var hm hermesStateMessage
+		var ts float64
+		if err := rows.Scan(
+			&hm.role, &hm.content, &hm.toolCallID, &hm.toolCalls, &ts,
+			&hm.finishReason, &hm.reasoning, &hm.reasoningContent,
+			&hm.reasoningDetails, &hm.codexReasoningItems,
+			&hm.codexMessageItems,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"scan hermes message for %s: %w", rawSessionID, err,
+			)
+		}
+		hm.timestamp = hermesUnixTime(ts)
+		out = append(out, hm)
+	}
+	return out, rows.Err()
+}
+
+func writeHermesStateSessionJSONL(
+	w io.Writer, stateDB, rawSessionID string,
+) error {
+	ss, messages, selectedPath, err := readHermesStateSessionSource(
+		stateDB, rawSessionID,
+	)
+	if err != nil {
+		return err
+	}
+	if selectedPath != stateDB {
+		return copyHermesTranscriptFile(w, selectedPath)
+	}
+	return encodeHermesStateSessionJSONL(w, ss, messages)
+}
+
+func readHermesStateSessionSource(
+	stateDB, rawSessionID string,
+) (hermesStateSession, []hermesStateMessage, string, error) {
+	conn, err := sql.Open("sqlite3", "file:"+sqliteURIPath(stateDB)+"?mode=ro")
+	if err != nil {
+		return hermesStateSession{}, nil, "", hermesStateLookupError{
+			err: fmt.Errorf("open hermes state db: %w", err),
+		}
+	}
+	defer conn.Close()
+	return readHermesStateSessionSourceConn(conn, stateDB, rawSessionID)
+}
+
+// readHermesStateSessionSourceConn is readHermesStateSessionSource on an
+// already-open connection, so per-pass callers can reuse one state.db open
+// across every member instead of opening the database per session.
+func readHermesStateSessionSourceConn(
+	conn *sql.DB, stateDB, rawSessionID string,
+) (hermesStateSession, []hermesStateMessage, string, error) {
+	ss, found, err := readHermesStateSession(conn, rawSessionID)
+	if err != nil {
+		return hermesStateSession{}, nil, "", hermesStateLookupError{err: err}
+	}
+	if !found {
+		return hermesStateSession{}, nil, "", fmt.Errorf(
+			"hermes session %s not found in %s: %w",
+			rawSessionID, stateDB, os.ErrNotExist,
+		)
+	}
+	messages, err := readHermesStateMessagesForSession(conn, rawSessionID)
+	if err != nil {
+		return hermesStateSession{}, nil, "", hermesStateLookupError{err: err}
+	}
+	selectedPath, _, _, _ := chooseHermesStateSessionSource(
+		ss,
+		messages,
+		filepath.Join(filepath.Dir(stateDB), "sessions"),
+		stateDB,
+		"",
+		"",
+	)
+	return ss, messages, selectedPath, nil
+}
+
+func copyHermesTranscriptFile(w io.Writer, path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("open %s: %w", path, os.ErrNotExist)
+		}
+		return fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+	_, err = io.Copy(w, f)
+	return err
+}
+
+func encodeHermesStateSessionJSONL(
+	w io.Writer, ss hermesStateSession, messages []hermesStateMessage,
+) error {
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+
+	meta := map[string]any{"role": "session_meta"}
+	if ss.model != "" {
+		meta["model"] = ss.model
+	}
+	if ts := timeString(ss.startedAt, time.Time{}); ts != "" {
+		meta["timestamp"] = ts
+	}
+	if err := enc.Encode(meta); err != nil {
+		return fmt.Errorf("encode hermes session meta: %w", err)
+	}
+	for _, hm := range messages {
+		record := map[string]any{"role": hm.role}
+		if hm.content != "" {
+			record["content"] = hm.content
+		}
+		if hm.toolCallID != "" {
+			record["tool_call_id"] = hm.toolCallID
+		}
+		if hm.toolCalls != "" && json.Valid([]byte(hm.toolCalls)) {
+			record["tool_calls"] = json.RawMessage(hm.toolCalls)
+		}
+		if ts := timeString(hm.timestamp, time.Time{}); ts != "" {
+			record["timestamp"] = ts
+		}
+		if hm.finishReason != "" {
+			record["finish_reason"] = hm.finishReason
+		}
+		if hm.reasoning != "" {
+			record["reasoning"] = hm.reasoning
+		}
+		if hm.reasoningContent != "" {
+			record["reasoning_content"] = hm.reasoningContent
+		}
+		if hm.reasoningDetails != "" {
+			record["reasoning_details"] = hm.reasoningDetails
+		}
+		if hm.codexReasoningItems != "" &&
+			json.Valid([]byte(hm.codexReasoningItems)) {
+			record["codex_reasoning_items"] = json.RawMessage(
+				hm.codexReasoningItems,
+			)
+		}
+		if hm.codexMessageItems != "" &&
+			json.Valid([]byte(hm.codexMessageItems)) {
+			record["codex_message_items"] = json.RawMessage(
+				hm.codexMessageItems,
+			)
+		}
+		if err := enc.Encode(record); err != nil {
+			return fmt.Errorf("encode hermes session %s: %w", ss.id, err)
+		}
+	}
+	return nil
+}
+
 func buildHermesStateResult(
 	ss hermesStateSession, stateMessages []hermesStateMessage,
 	sessionsDir, stateDB, project, machine string,
 ) (ParseResult, bool) {
-	jsonPath := filepath.Join(sessionsDir, "session_"+ss.id+".json")
-	jsonlPath := filepath.Join(sessionsDir, ss.id+".jsonl")
-
-	var sess *ParsedSession
-	var msgs []ParsedMessage
-	var err error
-	selectedPath := stateDB
-	if IsRegularFile(jsonPath) {
-		sess, msgs, err = parseHermesJSONSession(jsonPath, project, machine)
-		if err == nil && sess != nil &&
-			hermesMessageQuality(msgs) >= hermesStateQuality(stateMessages) {
-			selectedPath = jsonPath
-		} else {
-			sess, msgs = nil, nil
-		}
-	}
-	if sess == nil && IsRegularFile(jsonlPath) {
-		sess, msgs, err = parseHermesJSONLSession(jsonlPath, project, machine)
-		if err == nil && sess != nil &&
-			(hermesMessageQuality(msgs) >= hermesStateQuality(stateMessages) || len(stateMessages) == 0) {
-			selectedPath = jsonlPath
-		} else {
-			sess, msgs = nil, nil
-		}
-	}
+	selectedPath, sess, msgs, _ := chooseHermesStateSessionSource(
+		ss, stateMessages, sessionsDir, stateDB, project, machine,
+	)
 	usageEvents := hermesUsageEvents(ss, "hermes:"+ss.id)
 	if sess == nil {
 		msgs = convertHermesStateMessages(stateMessages)
@@ -736,6 +964,31 @@ func buildHermesStateResult(
 		Messages:    msgs,
 		UsageEvents: usageEvents,
 	}, true
+}
+
+func chooseHermesStateSessionSource(
+	ss hermesStateSession,
+	stateMessages []hermesStateMessage,
+	sessionsDir, stateDB, project, machine string,
+) (selectedPath string, sess *ParsedSession, msgs []ParsedMessage, err error) {
+	selectedPath = stateDB
+	jsonPath := filepath.Join(sessionsDir, "session_"+ss.id+".json")
+	jsonlPath := filepath.Join(sessionsDir, ss.id+".jsonl")
+	if IsRegularFile(jsonPath) {
+		sess, msgs, err = parseHermesJSONSession(jsonPath, project, machine)
+		if err == nil && sess != nil &&
+			hermesMessageQuality(msgs) >= hermesStateQuality(stateMessages) {
+			return jsonPath, sess, msgs, nil
+		}
+	}
+	if IsRegularFile(jsonlPath) {
+		sess, msgs, err = parseHermesJSONLSession(jsonlPath, project, machine)
+		if err == nil && sess != nil &&
+			(hermesMessageQuality(msgs) >= hermesStateQuality(stateMessages) || len(stateMessages) == 0) {
+			return jsonlPath, sess, msgs, nil
+		}
+	}
+	return selectedPath, nil, nil, nil
 }
 
 func applyHermesStateMetadata(
@@ -823,17 +1076,21 @@ func hermesUsageEvents(
 	// price (e.g. gpt-5.5), which is NOT a confident $0 and must fall
 	// through to catalog pricing. Likewise "unknown"/empty with a 0
 	// estimate is not a real figure and must not masquerade as $0.
-	var cost *float64
+	var cost *money.Money
 	switch {
 	case ss.actualCost.Valid:
-		v := ss.actualCost.Float64
-		cost = &v
+		v, err := money.FromFloatDollars(ss.actualCost.Float64)
+		if err == nil {
+			cost = &v
+		}
 	case ss.costStatus == "included" && hermesHasCostSource(ss.costSource):
-		zero := 0.0
+		zero := money.Money{}
 		cost = &zero
 	case ss.estimatedCost.Valid && ss.estimatedCost.Float64 > 0:
-		v := ss.estimatedCost.Float64
-		cost = &v
+		v, err := money.FromFloatDollars(ss.estimatedCost.Float64)
+		if err == nil {
+			cost = &v
+		}
 	}
 	return []ParsedUsageEvent{{
 		SessionID:                sessionID,
@@ -844,7 +1101,7 @@ func hermesUsageEvents(
 		CacheCreationInputTokens: max(ss.cacheWriteTokens, 0),
 		CacheReadInputTokens:     max(ss.cacheReadTokens, 0),
 		ReasoningTokens:          max(ss.reasoningTokens, 0),
-		CostUSD:                  cost,
+		Cost:                     cost,
 		CostStatus:               ss.costStatus,
 		CostSource:               ss.costSource,
 		OccurredAt:               timeString(ss.endedAt, ss.startedAt),
@@ -893,17 +1150,8 @@ func convertHermesStateMessages(
 			if gjson.Valid(hm.toolCalls) {
 				gjson.Parse(hm.toolCalls).ForEach(
 					func(_, tc gjson.Result) bool {
-						name := tc.Get("function.name").Str
-						if name == "" {
-							name = tc.Get("name").Str
-						}
-						if name != "" {
-							toolCalls = append(toolCalls, ParsedToolCall{
-								ToolUseID: tc.Get("id").Str,
-								ToolName:  name,
-								Category:  NormalizeToolCategory(name),
-								InputJSON: tc.Get("function.arguments").Str,
-							})
+						if toolCall, ok := parseHermesToolCall(tc); ok {
+							toolCalls = append(toolCalls, toolCall)
 						}
 						return true
 					},

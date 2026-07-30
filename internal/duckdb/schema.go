@@ -8,18 +8,48 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-
-	"go.kenn.io/agentsview/internal/export"
 )
 
 // SchemaVersion is the version of the DuckDB mirror schema created by
-// EnsureSchema. Increment it when a non-optional DuckDB column/table is added.
-const SchemaVersion = 1
+// createSchema. Mirror schema v6 is create-only: there are no in-place
+// migrations between versions. A version mismatch means the mirror file
+// must be rebuilt with 'agentsview duckdb push --full'.
+const SchemaVersion = 6
 
 const schemaVersionMetadataKey = "agentsview_schema_version"
-const defaultRepairMetadataKey = "agentsview_default_repair_v1"
-const usageDedupIndexMetadataKey = "agentsview_usage_dedup_index_v1"
-const projectIdentityRemoteScrubMetadataKey = "agentsview_project_identity_remote_scrub_v1"
+
+// Mirror metadata keys recorded by writeMirrorMetadata and read back by
+// readMirrorMetadata / ProbeMirror.
+const (
+	dataVersionMetadataKey      = "agentsview_source_data_version"
+	sourceDatabaseIDMetadataKey = "agentsview_source_database_id"
+	pushScopeMetadataKey        = "agentsview_push_scope"
+	lastPushAtMetadataKey       = "agentsview_last_push_at"
+	lastPushMachineMetadataKey  = "agentsview_last_push_machine"
+	lastPushCutoffMetadataKey   = "agentsview_last_push_cutoff"
+	deletionRevisionMetadataKey = "agentsview_session_deletion_revision"
+	identityRevisionMetadataKey = "agentsview_project_identity_revision"
+)
+
+// curationFingerprintMetadataKey stores a hash of the local in-scope
+// curation state (starred session ids, pinned message ids) as of the last
+// push that actually refreshed starred_sessions/pinned_messages. It is read
+// and written directly via readMetadataKey/recordMetadataKey rather than
+// through mirrorMetadata/writeMirrorMetadata: unlike the fields in that
+// struct, it is not part of the rebuild-vs-incremental decision (see
+// rebuildReason in probe.go), only of the incremental curation-refresh
+// skip (see refreshCurationIfChanged in push.go).
+const curationFingerprintMetadataKey = "agentsview_curation_fingerprint"
+
+// cursorUsageMaxIDMetadataKey stores the largest local cursor_usage_events
+// id the mirror has consumed. The local table is append-only with a
+// monotonic integer primary key, so this high-water mark lets every push
+// load only appended rows instead of the full history (see
+// syncCursorUsageEvents in push.go). Like the curation fingerprint, it is
+// read and written directly and plays no part in the rebuild-vs-incremental
+// decision; a fresh rebuild file has no metadata, so its first sync loads
+// the full history.
+const cursorUsageMaxIDMetadataKey = "agentsview_cursor_usage_max_id"
 
 // DuckDB schema notes:
 //
@@ -47,18 +77,6 @@ type columnSpec struct {
 	def  string
 }
 
-type timestampDefaultSpec struct {
-	table  string
-	column string
-}
-
-var quackIncompatibleTimestampDefaults = []timestampDefaultSpec{
-	{"sessions", "created_at"},
-	{"secret_findings", "created_at"},
-	{"starred_sessions", "created_at"},
-	{"pinned_messages", "created_at"},
-}
-
 var mirrorTables = []tableSpec{
 	{
 		name: "sync_metadata",
@@ -72,12 +90,25 @@ var mirrorTables = []tableSpec{
 		},
 	},
 	{
+		name: "source_archives",
+		create: `CREATE TABLE IF NOT EXISTS source_archives (
+			source_archive_id TEXT PRIMARY KEY,
+			source_archive_salt TEXT NOT NULL
+		)`,
+		columns: []columnSpec{
+			{"source_archive_id", "source_archive_id TEXT"},
+			{"source_archive_salt", "source_archive_salt TEXT NOT NULL DEFAULT ''"},
+		},
+	},
+	{
 		name: "sessions",
 		create: `CREATE TABLE IF NOT EXISTS sessions (
 			id TEXT PRIMARY KEY,
 			project TEXT NOT NULL,
 			machine TEXT NOT NULL DEFAULT 'local',
 			agent TEXT NOT NULL DEFAULT 'claude',
+			agent_label TEXT NOT NULL DEFAULT '',
+			entrypoint TEXT NOT NULL DEFAULT '',
 			first_message TEXT,
 			display_name TEXT,
 			session_name TEXT,
@@ -92,6 +123,7 @@ var mirrorTables = []tableSpec{
 			file_device BIGINT,
 			file_hash TEXT,
 			local_modified_at TIMESTAMP,
+			transcript_revision TEXT NOT NULL DEFAULT '0',
 			parent_session_id TEXT,
 			relationship_type TEXT NOT NULL DEFAULT '',
 			total_output_tokens INTEGER NOT NULL DEFAULT 0,
@@ -132,16 +164,20 @@ var mirrorTables = []tableSpec{
 			parser_malformed_lines INTEGER NOT NULL DEFAULT 0,
 			is_truncated BOOLEAN NOT NULL DEFAULT FALSE,
 			deleted_at TIMESTAMP,
+			deletion_cause TEXT,
 			created_at TIMESTAMP,
 			termination_status TEXT,
 			secret_leak_count INTEGER NOT NULL DEFAULT 0,
-			secrets_rules_version TEXT NOT NULL DEFAULT ''
+			secrets_rules_version TEXT NOT NULL DEFAULT '',
+			agentsview_push_fingerprint TEXT
 		)`,
 		columns: []columnSpec{
 			{"id", "id TEXT"},
 			{"project", "project TEXT NOT NULL DEFAULT ''"},
 			{"machine", "machine TEXT NOT NULL DEFAULT 'local'"},
 			{"agent", "agent TEXT NOT NULL DEFAULT 'claude'"},
+			{"agent_label", "agent_label TEXT NOT NULL DEFAULT ''"},
+			{"entrypoint", "entrypoint TEXT NOT NULL DEFAULT ''"},
 			{"first_message", "first_message TEXT"},
 			{"display_name", "display_name TEXT"},
 			{"session_name", "session_name TEXT"},
@@ -156,6 +192,7 @@ var mirrorTables = []tableSpec{
 			{"file_device", "file_device BIGINT"},
 			{"file_hash", "file_hash TEXT"},
 			{"local_modified_at", "local_modified_at TIMESTAMP"},
+			{"transcript_revision", "transcript_revision TEXT NOT NULL DEFAULT '0'"},
 			{"parent_session_id", "parent_session_id TEXT"},
 			{"relationship_type", "relationship_type TEXT NOT NULL DEFAULT ''"},
 			{"total_output_tokens", "total_output_tokens INTEGER NOT NULL DEFAULT 0"},
@@ -196,10 +233,12 @@ var mirrorTables = []tableSpec{
 			{"parser_malformed_lines", "parser_malformed_lines INTEGER NOT NULL DEFAULT 0"},
 			{"is_truncated", "is_truncated BOOLEAN NOT NULL DEFAULT FALSE"},
 			{"deleted_at", "deleted_at TIMESTAMP"},
+			{"deletion_cause", "deletion_cause TEXT"},
 			{"created_at", "created_at TIMESTAMP"},
 			{"termination_status", "termination_status TEXT"},
 			{"secret_leak_count", "secret_leak_count INTEGER NOT NULL DEFAULT 0"},
 			{"secrets_rules_version", "secrets_rules_version TEXT NOT NULL DEFAULT ''"},
+			{"agentsview_push_fingerprint", "agentsview_push_fingerprint TEXT"},
 		},
 		indexes: []string{
 			"CREATE INDEX IF NOT EXISTS idx_sessions_ended ON sessions(ended_at, id)",
@@ -287,7 +326,7 @@ var mirrorTables = []tableSpec{
 			cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
 			cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
 			reasoning_tokens INTEGER NOT NULL DEFAULT 0,
-			cost_usd DOUBLE,
+			cost_microdollars BIGINT,
 			cost_status TEXT NOT NULL DEFAULT '',
 			cost_source TEXT NOT NULL DEFAULT '',
 			occurred_at TIMESTAMP,
@@ -304,7 +343,7 @@ var mirrorTables = []tableSpec{
 			{"cache_creation_input_tokens", "cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0"},
 			{"cache_read_input_tokens", "cache_read_input_tokens INTEGER NOT NULL DEFAULT 0"},
 			{"reasoning_tokens", "reasoning_tokens INTEGER NOT NULL DEFAULT 0"},
-			{"cost_usd", "cost_usd DOUBLE"},
+			{"cost_microdollars", "cost_microdollars BIGINT"},
 			{"cost_status", "cost_status TEXT NOT NULL DEFAULT ''"},
 			{"cost_source", "cost_source TEXT NOT NULL DEFAULT ''"},
 			{"occurred_at", "occurred_at TIMESTAMP"},
@@ -327,8 +366,8 @@ var mirrorTables = []tableSpec{
 			output_tokens INTEGER NOT NULL DEFAULT 0,
 			cache_write_tokens INTEGER NOT NULL DEFAULT 0,
 			cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-			charged_cents DOUBLE NOT NULL DEFAULT 0,
-			cursor_token_fee DOUBLE NOT NULL DEFAULT 0,
+			charged_microdollars BIGINT NOT NULL DEFAULT 0,
+			cursor_token_fee_microdollars BIGINT NOT NULL DEFAULT 0,
 			user_id TEXT NOT NULL DEFAULT '',
 			user_email TEXT NOT NULL DEFAULT '',
 			is_headless BOOLEAN NOT NULL DEFAULT FALSE,
@@ -343,8 +382,8 @@ var mirrorTables = []tableSpec{
 			{"output_tokens", "output_tokens INTEGER NOT NULL DEFAULT 0"},
 			{"cache_write_tokens", "cache_write_tokens INTEGER NOT NULL DEFAULT 0"},
 			{"cache_read_tokens", "cache_read_tokens INTEGER NOT NULL DEFAULT 0"},
-			{"charged_cents", "charged_cents DOUBLE NOT NULL DEFAULT 0"},
-			{"cursor_token_fee", "cursor_token_fee DOUBLE NOT NULL DEFAULT 0"},
+			{"charged_microdollars", "charged_microdollars BIGINT NOT NULL DEFAULT 0"},
+			{"cursor_token_fee_microdollars", "cursor_token_fee_microdollars BIGINT NOT NULL DEFAULT 0"},
 			{"user_id", "user_id TEXT NOT NULL DEFAULT ''"},
 			{"user_email", "user_email TEXT NOT NULL DEFAULT ''"},
 			{"is_headless", "is_headless BOOLEAN NOT NULL DEFAULT FALSE"},
@@ -360,52 +399,121 @@ var mirrorTables = []tableSpec{
 		name: "model_pricing",
 		create: `CREATE TABLE IF NOT EXISTS model_pricing (
 			model_pattern TEXT PRIMARY KEY,
-			input_per_mtok DOUBLE NOT NULL DEFAULT 0,
-			output_per_mtok DOUBLE NOT NULL DEFAULT 0,
-			cache_creation_per_mtok DOUBLE NOT NULL DEFAULT 0,
-			cache_read_per_mtok DOUBLE NOT NULL DEFAULT 0,
+			input_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+			output_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+			cache_creation_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+			cache_read_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
 			updated_at TEXT NOT NULL DEFAULT ''
 		)`,
 		columns: []columnSpec{
 			{"model_pattern", "model_pattern TEXT"},
-			{"input_per_mtok", "input_per_mtok DOUBLE NOT NULL DEFAULT 0"},
-			{"output_per_mtok", "output_per_mtok DOUBLE NOT NULL DEFAULT 0"},
-			{"cache_creation_per_mtok", "cache_creation_per_mtok DOUBLE NOT NULL DEFAULT 0"},
-			{"cache_read_per_mtok", "cache_read_per_mtok DOUBLE NOT NULL DEFAULT 0"},
+			{"input_microdollars_per_mtok", "input_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
+			{"output_microdollars_per_mtok", "output_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
+			{"cache_creation_microdollars_per_mtok", "cache_creation_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
+			{"cache_read_microdollars_per_mtok", "cache_read_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
 			{"updated_at", "updated_at TEXT NOT NULL DEFAULT ''"},
 		},
 	},
 	{
-		name: "project_identity_observations",
-		create: `CREATE TABLE IF NOT EXISTS project_identity_observations (
+		name: "source_project_identity_observations",
+		create: `CREATE TABLE IF NOT EXISTS source_project_identity_observations (
+			source_archive_id TEXT NOT NULL DEFAULT '',
+			source_archive_salt TEXT NOT NULL DEFAULT '',
 			project TEXT NOT NULL,
 			machine TEXT NOT NULL,
 			root_path TEXT NOT NULL DEFAULT '',
 			git_remote TEXT NOT NULL DEFAULT '',
 			git_remote_name TEXT NOT NULL DEFAULT '',
+			repository_path TEXT NOT NULL DEFAULT '',
 			worktree_name TEXT NOT NULL DEFAULT '',
 			worktree_root_path TEXT NOT NULL DEFAULT '',
+			worktree_relationship TEXT NOT NULL DEFAULT 'unknown',
+			checkout_state TEXT NOT NULL DEFAULT 'unknown',
+			git_branch TEXT NOT NULL DEFAULT '',
+			remote_resolution TEXT NOT NULL DEFAULT 'unknown',
+			remote_candidate_count INTEGER NOT NULL DEFAULT 0,
 			observed_at TIMESTAMP NOT NULL,
 			normalized_remote TEXT NOT NULL DEFAULT '',
 			key_source TEXT NOT NULL DEFAULT '',
 			key TEXT NOT NULL DEFAULT '',
-			PRIMARY KEY (project, machine, root_path, git_remote)
+			PRIMARY KEY (source_archive_id, project, machine, root_path, git_remote)
 		)`,
 		columns: []columnSpec{
+			{"source_archive_id", "source_archive_id TEXT NOT NULL DEFAULT ''"},
+			{"source_archive_salt", "source_archive_salt TEXT NOT NULL DEFAULT ''"},
 			{"project", "project TEXT NOT NULL DEFAULT ''"},
 			{"machine", "machine TEXT NOT NULL DEFAULT ''"},
 			{"root_path", "root_path TEXT NOT NULL DEFAULT ''"},
 			{"git_remote", "git_remote TEXT NOT NULL DEFAULT ''"},
 			{"git_remote_name", "git_remote_name TEXT NOT NULL DEFAULT ''"},
+			{"repository_path", "repository_path TEXT NOT NULL DEFAULT ''"},
 			{"worktree_name", "worktree_name TEXT NOT NULL DEFAULT ''"},
 			{"worktree_root_path", "worktree_root_path TEXT NOT NULL DEFAULT ''"},
+			{"worktree_relationship", "worktree_relationship TEXT NOT NULL DEFAULT 'unknown'"},
+			{"checkout_state", "checkout_state TEXT NOT NULL DEFAULT 'unknown'"},
+			{"git_branch", "git_branch TEXT NOT NULL DEFAULT ''"},
+			{"remote_resolution", "remote_resolution TEXT NOT NULL DEFAULT 'unknown'"},
+			{"remote_candidate_count", "remote_candidate_count INTEGER NOT NULL DEFAULT 0"},
 			{"observed_at", "observed_at TIMESTAMP"},
 			{"normalized_remote", "normalized_remote TEXT NOT NULL DEFAULT ''"},
 			{"key_source", "key_source TEXT NOT NULL DEFAULT ''"},
 			{"key", "key TEXT NOT NULL DEFAULT ''"},
 		},
 		indexes: []string{
-			"CREATE INDEX IF NOT EXISTS idx_project_identity_observations_project ON project_identity_observations(project)",
+			"CREATE INDEX IF NOT EXISTS idx_source_project_identity_observations_project ON source_project_identity_observations(project)",
+		},
+	},
+	{
+		name: "source_session_project_identity_snapshots",
+		create: `CREATE TABLE IF NOT EXISTS source_session_project_identity_snapshots (
+			source_archive_id TEXT NOT NULL,
+			source_database_generation TEXT NOT NULL,
+			source_session_id TEXT NOT NULL,
+			project TEXT NOT NULL,
+			machine TEXT NOT NULL,
+			root_path TEXT NOT NULL DEFAULT '',
+			git_remote TEXT NOT NULL DEFAULT '',
+			git_remote_name TEXT NOT NULL DEFAULT '',
+			repository_path TEXT NOT NULL DEFAULT '',
+			worktree_name TEXT NOT NULL DEFAULT '',
+			worktree_root_path TEXT NOT NULL DEFAULT '',
+			worktree_relationship TEXT NOT NULL DEFAULT 'unknown',
+			checkout_state TEXT NOT NULL DEFAULT 'unknown',
+			git_branch TEXT NOT NULL DEFAULT '',
+			remote_resolution TEXT NOT NULL DEFAULT 'unknown',
+			remote_candidate_count INTEGER NOT NULL DEFAULT 0,
+			observed_at TIMESTAMP NOT NULL,
+			normalized_remote TEXT NOT NULL DEFAULT '',
+			key_source TEXT NOT NULL DEFAULT '',
+			key TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY (
+				source_archive_id, source_database_generation, source_session_id
+			)
+		)`,
+		columns: []columnSpec{
+			{"source_archive_id", "source_archive_id TEXT NOT NULL DEFAULT ''"},
+			{"source_database_generation", "source_database_generation TEXT NOT NULL DEFAULT ''"},
+			{"source_session_id", "source_session_id TEXT NOT NULL DEFAULT ''"},
+			{"project", "project TEXT NOT NULL DEFAULT ''"},
+			{"machine", "machine TEXT NOT NULL DEFAULT ''"},
+			{"root_path", "root_path TEXT NOT NULL DEFAULT ''"},
+			{"git_remote", "git_remote TEXT NOT NULL DEFAULT ''"},
+			{"git_remote_name", "git_remote_name TEXT NOT NULL DEFAULT ''"},
+			{"repository_path", "repository_path TEXT NOT NULL DEFAULT ''"},
+			{"worktree_name", "worktree_name TEXT NOT NULL DEFAULT ''"},
+			{"worktree_root_path", "worktree_root_path TEXT NOT NULL DEFAULT ''"},
+			{"worktree_relationship", "worktree_relationship TEXT NOT NULL DEFAULT 'unknown'"},
+			{"checkout_state", "checkout_state TEXT NOT NULL DEFAULT 'unknown'"},
+			{"git_branch", "git_branch TEXT NOT NULL DEFAULT ''"},
+			{"remote_resolution", "remote_resolution TEXT NOT NULL DEFAULT 'unknown'"},
+			{"remote_candidate_count", "remote_candidate_count INTEGER NOT NULL DEFAULT 0"},
+			{"observed_at", "observed_at TIMESTAMP"},
+			{"normalized_remote", "normalized_remote TEXT NOT NULL DEFAULT ''"},
+			{"key_source", "key_source TEXT NOT NULL DEFAULT ''"},
+			{"key", "key TEXT NOT NULL DEFAULT ''"},
+		},
+		indexes: []string{
+			"CREATE INDEX IF NOT EXISTS idx_source_session_project_identity_snapshots_project ON source_session_project_identity_snapshots(source_archive_id, project)",
 		},
 	},
 	{
@@ -567,114 +675,32 @@ var mirrorTables = []tableSpec{
 	},
 }
 
-type schemaOptions struct {
-	createIndexes bool
-}
-
-// EnsureSchema creates and additively migrates the DuckDB mirror schema.
+// EnsureSchema creates the DuckDB mirror schema. It has no production
+// callers: Sync.Push always goes through ProbeMirror to pick rebuildMirror
+// (create-only, via createSchema) or incrementalPush against an
+// already-valid mirror, and 'duckdb serve'/'duckdb quack serve' probe
+// instead of migrating (see ProbeMirror, WatchMirrorReplacement). It is
+// kept exported as a convenient fixture builder for tests that need a
+// fresh, schema-compatible, empty mirror file to seed with raw INSERTs.
 func EnsureSchema(ctx context.Context, db *sql.DB) error {
-	return ensureSchema(ctx, db, schemaOptions{createIndexes: true})
+	return createSchema(ctx, db)
 }
 
-func ensureSchema(ctx context.Context, db *sql.DB, opts schemaOptions) error {
+// createSchema creates the DuckDB mirror schema on a fresh file. Mirror
+// schema v4 has no in-place migrations: an existing file whose shape or
+// version does not match is rejected by CheckSchemaCompat and must be
+// rebuilt with 'agentsview duckdb push --full' rather than patched here.
+func createSchema(ctx context.Context, db *sql.DB) error {
 	for _, table := range mirrorTables {
 		if _, err := db.ExecContext(ctx, table.create); err != nil {
 			return fmt.Errorf("creating duckdb table %s: %w", table.name, err)
 		}
 	}
-	if !opts.createIndexes {
-		if err := checkSchemaShapeCompat(ctx, db); err != nil {
-			return err
-		}
-		return checkSchemaRepairsViaQuack(ctx, db)
-	}
-
-	existing, err := loadColumns(ctx, db)
-	if err != nil {
-		return err
-	}
-	defaultRepairDone, err := metadataKeyExists(ctx, db, defaultRepairMetadataKey)
-	if err != nil {
-		return err
-	}
-	for _, table := range mirrorTables {
-		have := existing[table.name]
-		if have == nil {
-			have = make(map[string]bool)
-			existing[table.name] = have
-		}
-		for _, column := range table.columns {
-			added := false
-			if !have[column.name] {
-				stmt := fmt.Sprintf(
-					"ALTER TABLE %s ADD COLUMN %s",
-					table.name, relaxedColumnDef(column.def),
-				)
-				if _, err := db.ExecContext(ctx, stmt); err != nil {
-					return fmt.Errorf(
-						"adding duckdb column %s.%s: %w",
-						table.name, column.name, err,
-					)
-				}
-				have[column.name] = true
-				added = true
-			}
-			if added || !defaultRepairDone {
-				if err := backfillAddedColumnDefault(ctx, db, table.name, column); err != nil {
-					return err
-				}
-			}
-		}
-	}
-
-	if err := migrateMessagesIDPrimaryKey(ctx, db); err != nil {
-		return err
-	}
-
-	if err := dropQuackIncompatibleTimestampDefaults(ctx, db); err != nil {
-		return err
-	}
-
-	projectIdentityRemoteScrubDone, err := metadataKeyExists(
-		ctx, db, projectIdentityRemoteScrubMetadataKey,
-	)
-	if err != nil {
-		return err
-	}
-	if !projectIdentityRemoteScrubDone {
-		if err := scrubProjectIdentityGitRemoteCredentials(ctx, db); err != nil {
-			return err
-		}
-	}
-
-	recordUsageDedupIndexMigration, err := migrateUsageEventsDedupIndex(ctx, db)
-	if err != nil {
-		return err
-	}
-
 	for _, table := range mirrorTables {
 		for _, stmt := range table.indexes {
 			if _, err := db.ExecContext(ctx, stmt); err != nil {
 				return fmt.Errorf("creating duckdb index for %s: %w", table.name, err)
 			}
-		}
-	}
-
-	if !defaultRepairDone {
-		if err := recordMetadataKey(ctx, db, defaultRepairMetadataKey, "1"); err != nil {
-			return err
-		}
-	}
-	if recordUsageDedupIndexMigration {
-		if err := recordMetadataKey(ctx, db, usageDedupIndexMetadataKey, "1"); err != nil {
-			return err
-		}
-	}
-	if !projectIdentityRemoteScrubDone {
-		if err := recordMetadataKey(
-			ctx, db, projectIdentityRemoteScrubMetadataKey, "1",
-		); err != nil {
-			return err
 		}
 	}
 	if err := recordMetadataKey(
@@ -683,213 +709,6 @@ func ensureSchema(ctx context.Context, db *sql.DB, opts schemaOptions) error {
 		return fmt.Errorf("recording duckdb schema version: %w", err)
 	}
 	return nil
-}
-
-func migrateUsageEventsDedupIndex(ctx context.Context, db *sql.DB) (bool, error) {
-	done, err := metadataKeyExists(ctx, db, usageDedupIndexMetadataKey)
-	if err != nil {
-		return false, err
-	}
-	if done {
-		return false, nil
-	}
-	if _, err := db.ExecContext(ctx, `DROP INDEX IF EXISTS idx_usage_events_dedup`); err != nil {
-		return false, fmt.Errorf("dropping duckdb usage_events dedup index: %w", err)
-	}
-	return true, nil
-}
-
-func scrubProjectIdentityGitRemoteCredentials(
-	ctx context.Context, db *sql.DB,
-) error {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf(
-			"beginning duckdb project identity remote scrub: %w", err,
-		)
-	}
-	defer func() {
-		_ = tx.Rollback()
-	}()
-
-	rows, err := tx.QueryContext(ctx, `
-		SELECT project, machine, root_path, git_remote, git_remote_name,
-			worktree_name, worktree_root_path, observed_at,
-			normalized_remote, key_source, key
-		FROM project_identity_observations
-		WHERE git_remote != ''`)
-	if err != nil {
-		return fmt.Errorf(
-			"listing duckdb project identity remotes for scrub: %w", err,
-		)
-	}
-	rowsClosed := false
-	defer func() {
-		if !rowsClosed {
-			_ = rows.Close()
-		}
-	}()
-
-	type pendingScrub struct {
-		obs       export.ProjectIdentityObservation
-		rawRemote string
-	}
-	var pending []pendingScrub
-	for rows.Next() {
-		var obs export.ProjectIdentityObservation
-		if err := rows.Scan(
-			&obs.Project,
-			&obs.Machine,
-			&obs.RootPath,
-			&obs.GitRemote,
-			&obs.GitRemoteName,
-			&obs.WorktreeName,
-			&obs.WorktreeRootPath,
-			&obs.ObservedAt,
-			&obs.NormalizedRemote,
-			&obs.KeySource,
-			&obs.Key,
-		); err != nil {
-			return fmt.Errorf(
-				"scanning duckdb project identity remote for scrub: %w", err,
-			)
-		}
-		sanitized := export.SanitizeGitRemoteForStorage(obs.GitRemote)
-		if sanitized == obs.GitRemote {
-			continue
-		}
-		pending = append(pending, pendingScrub{
-			obs:       obs,
-			rawRemote: obs.GitRemote,
-		})
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf(
-			"iterating duckdb project identity remotes for scrub: %w", err,
-		)
-	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf(
-			"closing duckdb project identity remotes scrub rows: %w", err,
-		)
-	}
-	rowsClosed = true
-
-	for _, scrub := range pending {
-		obs := export.SanitizeStoredProjectIdentityObservation(scrub.obs)
-		if err := upsertProjectIdentityObservation(
-			func(stmt string, args ...any) error {
-				_, err := tx.ExecContext(ctx, stmt, args...)
-				return err
-			},
-			func(stmt string, args ...any) *sql.Row {
-				return tx.QueryRowContext(ctx, stmt, args...)
-			},
-			obs, scrub.rawRemote,
-		); err != nil {
-			return fmt.Errorf(
-				"upserting scrubbed duckdb project identity remote: %w", err,
-			)
-		}
-		if _, err := tx.ExecContext(ctx, `
-			DELETE FROM project_identity_observations
-			WHERE project = ? AND machine = ? AND root_path = ?
-			  AND git_remote = ?`,
-			scrub.obs.Project, scrub.obs.Machine, scrub.obs.RootPath,
-			scrub.rawRemote,
-		); err != nil {
-			return fmt.Errorf(
-				"removing raw duckdb project identity remote: %w", err,
-			)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf(
-			"committing duckdb project identity remote scrub: %w", err,
-		)
-	}
-	return nil
-}
-
-func migrateMessagesIDPrimaryKey(ctx context.Context, db *sql.DB) error {
-	hasPrimary, err := tableHasPrimaryKey(ctx, db, "messages")
-	if err != nil {
-		return err
-	}
-	if !hasPrimary {
-		return nil
-	}
-	if _, err := db.ExecContext(ctx, `ALTER TABLE messages RENAME TO messages_with_id_pk`); err != nil {
-		return fmt.Errorf("renaming duckdb messages table for rekey: %w", err)
-	}
-	create := mirrorTableCreate("messages")
-	cols := mirrorTableColumns("messages")
-	if create == "" || len(cols) == 0 {
-		return fmt.Errorf("missing duckdb messages table spec")
-	}
-	if _, err := db.ExecContext(ctx, create); err != nil {
-		return fmt.Errorf("creating rekeyed duckdb messages table: %w", err)
-	}
-	colList := strings.Join(cols, ", ")
-	if _, err := db.ExecContext(ctx, fmt.Sprintf(
-		`INSERT INTO messages (%[1]s) SELECT %[1]s FROM messages_with_id_pk`,
-		colList,
-	)); err != nil {
-		return fmt.Errorf("copying rekeyed duckdb messages: %w", err)
-	}
-	if _, err := db.ExecContext(ctx, `DROP TABLE messages_with_id_pk`); err != nil {
-		return fmt.Errorf("dropping old duckdb messages table: %w", err)
-	}
-	return nil
-}
-
-func tableHasPrimaryKey(ctx context.Context, db *sql.DB, table string) (bool, error) {
-	var count int
-	if err := db.QueryRowContext(ctx, `
-		SELECT COUNT(*)
-		FROM information_schema.table_constraints
-		WHERE table_schema = current_schema()
-		  AND table_name = ?
-		  AND constraint_type = 'PRIMARY KEY'`,
-		strings.ToLower(table),
-	).Scan(&count); err != nil {
-		return false, fmt.Errorf("checking duckdb primary key for %s: %w", table, err)
-	}
-	return count > 0, nil
-}
-
-func mirrorTableCreate(name string) string {
-	for _, table := range mirrorTables {
-		if table.name == name {
-			return table.create
-		}
-	}
-	return ""
-}
-
-func mirrorTableColumns(name string) []string {
-	for _, table := range mirrorTables {
-		if table.name != name {
-			continue
-		}
-		cols := make([]string, len(table.columns))
-		for i, column := range table.columns {
-			cols[i] = column.name
-		}
-		return cols
-	}
-	return nil
-}
-
-func metadataKeyExists(ctx context.Context, db *sql.DB, key string) (bool, error) {
-	var exists bool
-	if err := db.QueryRowContext(ctx,
-		`SELECT COUNT(*) > 0 FROM sync_metadata WHERE key = ?`,
-		key,
-	).Scan(&exists); err != nil {
-		return false, fmt.Errorf("checking duckdb metadata key %s: %w", key, err)
-	}
-	return exists, nil
 }
 
 func recordMetadataKey(
@@ -917,123 +736,170 @@ func recordMetadataKey(
 	return nil
 }
 
-func dropQuackIncompatibleTimestampDefaults(ctx context.Context, db *sql.DB) error {
-	for _, spec := range quackIncompatibleTimestampDefaults {
-		defaultValue, err := columnDefault(ctx, db, spec.table, spec.column)
-		if err != nil {
+// mirrorMetadata captures the push-scope bookkeeping written to
+// sync_metadata by writeMirrorMetadata and read back by readMirrorMetadata /
+// ProbeMirror. It records what a mirror file contains (schema/data version,
+// push scope) and how it got that way (cutoff, last push time/machine) plus
+// the source revisions needed to detect deletions and identity changes that
+// happened after the mirror was built.
+type mirrorMetadata struct {
+	SchemaVersion int
+	DataVersion   int
+	// SourceDatabaseID is the archive_metadata database_id of the SQLite
+	// archive the mirror was built from. It identifies the archive
+	// GENERATION, not just the path: a resync builds a fresh archive with a
+	// new database_id (see internal/db/orphaned.go, which deliberately does
+	// not copy the old id), so a recorded id that no longer matches the
+	// local archive means the mirror's cutoff and journal cursors describe a
+	// different archive's history and only a full rebuild is sound (see
+	// rebuildReason).
+	SourceDatabaseID string
+	Scope            string
+	LastPushCutoff   string
+	LastPushAt       string
+	LastPushMachine  string
+	DeletionRevision int64
+	IdentityRevision int64
+}
+
+// writeMirrorMetadata upserts every mirrorMetadata field into sync_metadata.
+func writeMirrorMetadata(ctx context.Context, db *sql.DB, meta mirrorMetadata) error {
+	fields := []struct {
+		key   string
+		value string
+	}{
+		{schemaVersionMetadataKey, strconv.Itoa(meta.SchemaVersion)},
+		{dataVersionMetadataKey, strconv.Itoa(meta.DataVersion)},
+		{sourceDatabaseIDMetadataKey, meta.SourceDatabaseID},
+		{pushScopeMetadataKey, meta.Scope},
+		{lastPushCutoffMetadataKey, meta.LastPushCutoff},
+		{lastPushAtMetadataKey, meta.LastPushAt},
+		{lastPushMachineMetadataKey, meta.LastPushMachine},
+		{deletionRevisionMetadataKey, strconv.FormatInt(meta.DeletionRevision, 10)},
+		{identityRevisionMetadataKey, strconv.FormatInt(meta.IdentityRevision, 10)},
+	}
+	for _, field := range fields {
+		if err := recordMetadataKey(ctx, db, field.key, field.value); err != nil {
 			return err
-		}
-		if !strings.Contains(strings.ToLower(defaultValue), "current_timestamp") {
-			continue
-		}
-		stmt := fmt.Sprintf(
-			"ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT",
-			spec.table,
-			spec.column,
-		)
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf(
-				"dropping quack-incompatible duckdb default %s.%s: %w",
-				spec.table,
-				spec.column,
-				err,
-			)
 		}
 	}
 	return nil
 }
 
-func columnDefault(
-	ctx context.Context, db *sql.DB, table, column string,
-) (string, error) {
-	var defaultValue sql.NullString
-	err := db.QueryRowContext(ctx, `
-		SELECT column_default
-		FROM information_schema.columns
-		WHERE table_schema = current_schema()
-		  AND lower(table_name) = ?
-		  AND lower(column_name) = ?`,
-		strings.ToLower(table),
-		strings.ToLower(column),
-	).Scan(&defaultValue)
+// readMirrorMetadata reads mirrorMetadata back from sync_metadata. Missing
+// keys read back as zero values; malformed integer fields are reported as
+// errors so callers (ProbeMirror) can surface them as shape issues rather
+// than silently treating a corrupt mirror as version 0.
+func readMirrorMetadata(ctx context.Context, db *sql.DB) (mirrorMetadata, error) {
+	raw := make(map[string]string, 8)
+	for _, key := range []string{
+		schemaVersionMetadataKey, dataVersionMetadataKey,
+		sourceDatabaseIDMetadataKey, pushScopeMetadataKey,
+		lastPushCutoffMetadataKey, lastPushAtMetadataKey, lastPushMachineMetadataKey,
+		deletionRevisionMetadataKey, identityRevisionMetadataKey,
+	} {
+		value, err := readMetadataKey(ctx, db, key)
+		if err != nil {
+			return mirrorMetadata{}, err
+		}
+		raw[key] = value
+	}
+	meta := mirrorMetadata{
+		SourceDatabaseID: raw[sourceDatabaseIDMetadataKey],
+		Scope:            raw[pushScopeMetadataKey],
+		LastPushCutoff:   raw[lastPushCutoffMetadataKey],
+		LastPushAt:       raw[lastPushAtMetadataKey],
+		LastPushMachine:  raw[lastPushMachineMetadataKey],
+	}
+	var err error
+	if meta.SchemaVersion, err = parseMirrorMetadataInt(
+		schemaVersionMetadataKey, raw[schemaVersionMetadataKey],
+	); err != nil {
+		return mirrorMetadata{}, err
+	}
+	if meta.DataVersion, err = parseMirrorMetadataInt(
+		dataVersionMetadataKey, raw[dataVersionMetadataKey],
+	); err != nil {
+		return mirrorMetadata{}, err
+	}
+	if meta.DeletionRevision, err = parseMirrorMetadataInt64(
+		deletionRevisionMetadataKey, raw[deletionRevisionMetadataKey],
+	); err != nil {
+		return mirrorMetadata{}, err
+	}
+	if meta.IdentityRevision, err = parseMirrorMetadataInt64(
+		identityRevisionMetadataKey, raw[identityRevisionMetadataKey],
+	); err != nil {
+		return mirrorMetadata{}, err
+	}
+	return meta, nil
+}
+
+func readMetadataKey(ctx context.Context, db *sql.DB, key string) (string, error) {
+	var value string
+	err := db.QueryRowContext(ctx,
+		`SELECT value FROM sync_metadata WHERE key = ?`, key,
+	).Scan(&value)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
 	if err != nil {
-		return "", fmt.Errorf(
-			"checking duckdb column default %s.%s: %w",
-			table,
-			column,
-			err,
-		)
+		return "", fmt.Errorf("reading duckdb metadata key %s: %w", key, err)
 	}
-	if !defaultValue.Valid {
-		return "", nil
-	}
-	return defaultValue.String, nil
+	return value, nil
 }
 
-func relaxedColumnDef(def string) string {
-	def = strings.ReplaceAll(def, " NOT NULL", "")
-	if i := strings.Index(def, " DEFAULT "); i >= 0 {
-		def = def[:i]
+func parseMirrorMetadataInt(key, value string) (int, error) {
+	if value == "" {
+		return 0, nil
 	}
-	return def
-}
-
-func backfillAddedColumnDefault(
-	ctx context.Context, db *sql.DB, table string, column columnSpec,
-) error {
-	defaultValue, ok := columnDefaultLiteral(column.def)
-	if !ok {
-		return nil
-	}
-	stmt := fmt.Sprintf(
-		"UPDATE %s SET %s = %s WHERE %s IS NULL",
-		table, column.name, defaultValue, column.name,
-	)
-	if _, err := db.ExecContext(ctx, stmt); err != nil {
-		return fmt.Errorf(
-			"backfilling duckdb column %s.%s default: %w",
-			table, column.name, err,
-		)
-	}
-	return nil
-}
-
-func columnDefaultLiteral(def string) (string, bool) {
-	idx := strings.Index(strings.ToUpper(def), " DEFAULT ")
-	if idx < 0 {
-		return "", false
-	}
-	value := strings.TrimSpace(def[idx+len(" DEFAULT "):])
-	if value == "" || strings.Contains(strings.ToLower(value), "current_timestamp") {
-		return "", false
-	}
-	return value, true
-}
-
-// CheckSchemaCompat verifies that the DuckDB mirror has the required
-// read/push tables and columns. It does not mutate the database.
-func CheckSchemaCompat(ctx context.Context, db *sql.DB) error {
-	if err := checkSchemaShapeCompat(ctx, db); err != nil {
-		return err
-	}
-	pendingRepairs, err := pendingSchemaRepairs(ctx, db)
+	parsed, err := strconv.Atoi(value)
 	if err != nil {
-		return err
+		return 0, fmt.Errorf("parsing duckdb metadata key %s value %q: %w", key, value, err)
 	}
-	return schemaRepairError(pendingRepairs)
+	return parsed, nil
 }
 
+func parseMirrorMetadataInt64(key, value string) (int64, error) {
+	if value == "" {
+		return 0, nil
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parsing duckdb metadata key %s value %q: %w", key, value, err)
+	}
+	return parsed, nil
+}
+
+// CheckSchemaCompat verifies that the local DuckDB mirror file has the
+// required tables, columns, and schema version. It does not mutate the
+// database. The mirror schema is create-only, so a mismatch of any kind
+// means the mirror must be rebuilt rather than migrated in place.
+func CheckSchemaCompat(ctx context.Context, db *sql.DB) error {
+	return checkSchemaShapeCompat(ctx, db, localSchema)
+}
+
+// CheckSchemaCompatViaQuack verifies schema compatibility of a remote Quack
+// server's underlying mirror file.
 func CheckSchemaCompatViaQuack(ctx context.Context, db *sql.DB) error {
-	if err := checkSchemaShapeCompat(ctx, db); err != nil {
-		return err
-	}
-	return checkSchemaRepairsViaQuack(ctx, db)
+	return checkSchemaShapeCompat(ctx, db, remoteSchema)
 }
 
-func checkSchemaShapeCompat(ctx context.Context, db *sql.DB) error {
+// schemaLocation says whether a compat failure is against the local mirror
+// file or a remote Quack server, which changes only the missing-table/column
+// hint: a remote server's shape is fixed by upgrading and restarting it, but
+// its schema *version* is a property of the mirror file it serves, which
+// only 'agentsview duckdb push --full' on the owning machine can fix.
+type schemaLocation bool
+
+const (
+	localSchema  schemaLocation = false
+	remoteSchema schemaLocation = true
+)
+
+func checkSchemaShapeCompat(
+	ctx context.Context, db *sql.DB, location schemaLocation,
+) error {
 	existing, err := loadColumns(ctx, db)
 	if err != nil {
 		return err
@@ -1053,8 +919,16 @@ func checkSchemaShapeCompat(ctx context.Context, db *sql.DB) error {
 	}
 	if len(missing) > 0 {
 		sort.Strings(missing)
+		if location == remoteSchema {
+			return fmt.Errorf(
+				"duckdb schema incompatible; the DuckDB server is on an "+
+					"older AgentsView build; upgrade and restart the DuckDB "+
+					"server so it migrates its schema at startup; missing: %s",
+				strings.Join(missing, ", "),
+			)
+		}
 		return fmt.Errorf(
-			"duckdb schema incompatible; run agentsview duckdb push to migrate; missing: %s",
+			"duckdb schema incompatible; rebuild with 'agentsview duckdb push --full'; missing: %s",
 			strings.Join(missing, ", "),
 		)
 	}
@@ -1065,6 +939,14 @@ func checkSchemaShapeCompat(ctx context.Context, db *sql.DB) error {
 		schemaVersionMetadataKey,
 	).Scan(&version)
 	if errors.Is(err, sql.ErrNoRows) {
+		if location == remoteSchema {
+			return fmt.Errorf(
+				"duckdb schema incompatible; missing %s in sync_metadata; "+
+					"upgrade and restart the DuckDB server so it migrates "+
+					"its schema at startup",
+				schemaVersionMetadataKey,
+			)
+		}
 		return fmt.Errorf(
 			"duckdb schema incompatible; missing %s in sync_metadata",
 			schemaVersionMetadataKey,
@@ -1080,109 +962,15 @@ func checkSchemaShapeCompat(ctx context.Context, db *sql.DB) error {
 			version,
 		)
 	}
-	if got < SchemaVersion {
+	if got != SchemaVersion {
 		return fmt.Errorf(
-			"duckdb schema incompatible; version %d is older than required %d",
+			"mirror schema version %d does not match this build's %d; "+
+				"rebuild with 'agentsview duckdb push --full'",
 			got, SchemaVersion,
 		)
 	}
 
 	return nil
-}
-
-func checkSchemaRepairsViaQuack(ctx context.Context, db *sql.DB) error {
-	rows, err := db.QueryContext(ctx,
-		"SELECT issue FROM "+quackAttachmentName+".query(?)",
-		pendingSchemaRepairsQuery(),
-	)
-	if err != nil {
-		return fmt.Errorf("checking duckdb schema repairs through quack: %w", err)
-	}
-	pendingRepairs, err := collectSchemaRepairIssues(rows)
-	if err != nil {
-		return err
-	}
-	return schemaRepairError(pendingRepairs)
-}
-
-func pendingSchemaRepairs(ctx context.Context, db *sql.DB) ([]string, error) {
-	rows, err := db.QueryContext(ctx, pendingSchemaRepairsQuery())
-	if err != nil {
-		return nil, fmt.Errorf("checking duckdb schema repairs: %w", err)
-	}
-	return collectSchemaRepairIssues(rows)
-}
-
-func collectSchemaRepairIssues(rows *sql.Rows) ([]string, error) {
-	defer func() {
-		_ = rows.Close()
-	}()
-	var pendingRepairs []string
-	for rows.Next() {
-		var issue string
-		if err := rows.Scan(&issue); err != nil {
-			return nil, fmt.Errorf("scanning duckdb schema repair check: %w", err)
-		}
-		pendingRepairs = append(pendingRepairs, issue)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterating duckdb schema repair check: %w", err)
-	}
-	return pendingRepairs, nil
-}
-
-func schemaRepairError(pendingRepairs []string) error {
-	if len(pendingRepairs) == 0 {
-		return nil
-	}
-	sort.Strings(pendingRepairs)
-	return fmt.Errorf(
-		"duckdb schema incompatible; run full DuckDB schema migration on the base database; pending repairs: %s",
-		strings.Join(pendingRepairs, ", "),
-	)
-}
-
-func pendingSchemaRepairsQuery() string {
-	metadataValues := []string{
-		"(" + duckLiteral(defaultRepairMetadataKey) + ")",
-		"(" + duckLiteral(usageDedupIndexMetadataKey) + ")",
-		"(" + duckLiteral(projectIdentityRemoteScrubMetadataKey) + ")",
-	}
-	defaultValues := make([]string, len(quackIncompatibleTimestampDefaults))
-	for i, spec := range quackIncompatibleTimestampDefaults {
-		defaultValues[i] = "(" + duckLiteral(spec.table) + ", " +
-			duckLiteral(spec.column) + ")"
-	}
-	return `
-		WITH required_metadata(key) AS (
-			VALUES ` + strings.Join(metadataValues, ", ") + `
-		),
-		checked_defaults(table_name, column_name) AS (
-			VALUES ` + strings.Join(defaultValues, ", ") + `
-		)
-		SELECT 'missing ' || key AS issue
-		FROM required_metadata m
-		WHERE NOT EXISTS (
-			SELECT 1 FROM sync_metadata sm WHERE sm.key = m.key
-		)
-		UNION ALL
-		SELECT 'messages.id primary key' AS issue
-		WHERE EXISTS (
-			SELECT 1
-			FROM information_schema.table_constraints
-			WHERE table_schema = current_schema()
-			  AND lower(table_name) = 'messages'
-			  AND constraint_type = 'PRIMARY KEY'
-		)
-		UNION ALL
-		SELECT lower(c.table_name) || '.' || lower(c.column_name) ||
-			' current_timestamp default' AS issue
-		FROM information_schema.columns c
-		JOIN checked_defaults d
-		  ON lower(c.table_name) = d.table_name
-		 AND lower(c.column_name) = d.column_name
-		WHERE c.table_schema = current_schema()
-		  AND lower(coalesce(c.column_default, '')) LIKE '%current_timestamp%'`
 }
 
 func loadColumns(ctx context.Context, db *sql.DB) (map[string]map[string]bool, error) {

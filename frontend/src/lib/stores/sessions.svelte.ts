@@ -6,6 +6,7 @@ import {
 import {
   callGenerated,
   configureGeneratedClient,
+  isAbortError,
 } from "../api/runtime.js";
 import type {
   Session,
@@ -18,6 +19,12 @@ import { sync } from "./sync.svelte.js";
 import { events } from "./events.svelte.js";
 import { starred } from "./starred.svelte.js";
 import { yokedDates } from "./yokedDates.svelte.js";
+import {
+  SESSION_ANALYTICS_WINDOW_PARAM,
+  parseWindowDaysParam,
+} from "./sessionRouteParams.js";
+import { rollingRange } from "../utils/dates.js";
+import { LatestRead } from "../utils/latest-read.js";
 
 type SidebarIndexParams = Parameters<
   typeof SessionsService.getApiV1SessionsSidebarIndex
@@ -45,6 +52,8 @@ export interface SessionGroupInput {
   project: string;
   machine: string;
   agent: string;
+  agent_label?: string | null;
+  entrypoint?: string | null;
   first_message?: string | null;
   display_name?: string | null;
   started_at: string | null;
@@ -53,6 +62,7 @@ export interface SessionGroupInput {
   termination_status?: string | null;
   message_count: number;
   user_message_count?: number;
+  transcript_revision?: string;
   is_automated?: boolean;
   is_teammate?: boolean;
   is_index_only?: boolean;
@@ -115,23 +125,73 @@ function defaultFilters(): Filters {
 }
 
 const SESSION_FILTERS_KEY = "session-filters";
+// v2 marks entries whose date bounds carry provenance: rolling bounds are
+// persisted as intent (`windowDays`) and rematerialized on load, never as
+// pinned dates. Unversioned entries predate that guarantee and may hold
+// rolling bounds saved as if explicit (#1086).
+const SESSION_FILTERS_VERSION = 2;
 
-function loadSavedFilters(): Filters {
+interface SavedFilters {
+  filters: Filters;
+  windowDays: number | null;
+}
+
+function validWindowDays(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0;
+}
+
+function loadSavedFilters(): SavedFilters {
   try {
     const raw = localStorage.getItem(SESSION_FILTERS_KEY);
     if (raw) {
-      const saved = JSON.parse(raw) as Partial<Filters>;
-      return { ...defaultFilters(), ...saved };
+      const { version, windowDays, ...saved } = JSON.parse(
+        raw,
+      ) as Partial<Filters> & { version?: unknown; windowDays?: unknown };
+      const filters = { ...defaultFilters(), ...saved };
+      // Deliberately `!==`, not `<`: an entry written by a newer (or older)
+      // format is not trusted either way — dropping date bounds is the
+      // fail-safe direction in both.
+      if (version !== SESSION_FILTERS_VERSION) {
+        // Legacy bounds have unknown provenance. Dropping them once is the
+        // safe direction: an intentional range is re-picked in one click,
+        // while a poisoned one keeps silently hiding new sessions.
+        filters.date = "";
+        filters.dateFrom = "";
+        filters.dateTo = "";
+        saveFilters(filters);
+        return { filters, windowDays: null };
+      }
+      if (validWindowDays(windowDays)) {
+        // Rolling intent survives restarts; its bounds are recomputed
+        // against the current date so the window keeps rolling forward.
+        const range = rollingRange(windowDays);
+        filters.date = "";
+        filters.dateFrom = range.from;
+        filters.dateTo = range.to;
+        return { filters, windowDays };
+      }
+      return { filters, windowDays: null };
     }
   } catch {
     // Corrupted localStorage — fall back to defaults.
   }
-  return defaultFilters();
+  return { filters: defaultFilters(), windowDays: null };
 }
 
-function saveFilters(f: Filters): void {
+function saveFilters(f: Filters, windowDays: number | null = null): void {
+  // Rolling bounds are persisted as intent (windowDays) and rematerialized
+  // on load; the materialized dates themselves are session-scoped. Storing
+  // them verbatim would pin the window to the day it was saved, silently
+  // hiding newer sessions (#1086).
+  const toSave =
+    windowDays !== null
+      ? { ...f, date: "", dateFrom: "", dateTo: "", windowDays }
+      : f;
   try {
-    localStorage.setItem(SESSION_FILTERS_KEY, JSON.stringify(f));
+    localStorage.setItem(
+      SESSION_FILTERS_KEY,
+      JSON.stringify({ ...toSave, version: SESSION_FILTERS_VERSION }),
+    );
   } catch {
     // localStorage full or unavailable — silently skip.
   }
@@ -236,11 +296,19 @@ class SessionsStore {
   agents: AgentInfo[] = $state([]);
   machines: string[] = $state([]);
   activeSessionId: string | null = $state(null);
+  activeSessionUsageVersion: number = $state(0);
   childSessions: Map<string, Session> = $state(new Map());
   nextCursor: string | null = $state(null);
   total: number = $state(0);
   loading: boolean = $state(false);
-  filters: Filters = $state(loadSavedFilters());
+  #savedFilters = loadSavedFilters();
+  filters: Filters = $state(this.#savedFilters.filters);
+  /** Rolling window (in days) behind the current date bounds, or null when
+   *  the bounds were chosen explicitly. Persisted as intent and
+   *  rematerialized on load so the window keeps rolling forward (#1086). */
+  dateFiltersWindowDays: number | null = $state(
+    this.#savedFilters.windowDays,
+  );
 
   private signalDetailCache = new Map<
     string,
@@ -278,6 +346,10 @@ class SessionsStore {
   private sidebarLoadPromise: Promise<void> | null = null;
   private sidebarLoadSignature: string | null = null;
   private sidebarAbort: AbortController | null = null;
+  private routeAbort: AbortController | null = null;
+  private navigateRead = new LatestRead();
+  private refreshRead = new LatestRead();
+  private childSessionsRead = new LatestRead();
 
   private liveRefreshStarted = false;
   private unsubEvents: (() => void) | null = null;
@@ -309,6 +381,7 @@ class SessionsStore {
       date: f.date || undefined,
       dateFrom: f.dateFrom || undefined,
       dateTo: f.dateTo || undefined,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       activeSince: f.recentlyActive
         ? new Date(
             Date.now() - 24 * 60 * 60 * 1000,
@@ -346,11 +419,31 @@ class SessionsStore {
     };
   }
 
+  /** Set date filters materialized from a panel date state. `windowDays`
+   *  carries the rolling intent behind the bounds (null for explicitly
+   *  chosen fixed ranges). */
+  applyPanelDateFilters(
+    dateParams: Record<string, string>,
+    windowDays: number | null,
+  ): void {
+    this.filters.date = dateParams["date"] ?? "";
+    this.filters.dateFrom = dateParams["date_from"] ?? "";
+    this.filters.dateTo = dateParams["date_to"] ?? "";
+    this.dateFiltersWindowDays = windowDays;
+    // Persist immediately: a provenance flip with identical bounds does
+    // not register as a filter change, so callers that diff serialized
+    // filters may never trigger a load() and its save.
+    saveFilters(this.filters, windowDays);
+  }
+
   initFromParams(params: Record<string, string>) {
     const prevOneShot = this.filters.includeOneShot;
     const prevAutomated = this.filters.includeAutomated;
     const next = parseFiltersFromParams(params);
     this.filters = next;
+    this.dateFiltersWindowDays = parseWindowDaysParam(
+      params[SESSION_ANALYTICS_WINDOW_PARAM],
+    );
     if (prevOneShot !== next.includeOneShot ||
         prevAutomated !== next.includeAutomated) {
       this.invalidateFilterCaches();
@@ -359,7 +452,7 @@ class SessionsStore {
   }
 
   async load(options: LoadOptions = {}) {
-    saveFilters(this.filters);
+    saveFilters(this.filters, this.dateFiltersWindowDays);
 
     const params = {
       ...this.apiParams,
@@ -434,6 +527,20 @@ class SessionsStore {
       this.sessions = index.sessions.map((row) =>
         sidebarIndexRowToSession(row, existing.get(row.id))
       );
+      this.sidebarIndexIds = new Set(index.sessions.map((row) => row.id));
+      // Keep the active session's hydrated row when the new index
+      // page doesn't contain it: navigateToSession appends deep-linked,
+      // cross-page, and subagent targets, and dropping them here would
+      // revert activeSession to undefined mid-view. It stays outside
+      // sidebarIndexIds, so later pages keep it at the tail until
+      // pagination reaches its real position.
+      const activeId = this.activeSessionId;
+      if (activeId && !this.sessions.some((s) => s.id === activeId)) {
+        const kept = existing.get(activeId);
+        if (kept && !kept.is_index_only) {
+          this.sessions = [...this.sessions, kept];
+        }
+      }
       this.nextCursor = index.next_cursor ?? null;
       this.total = index.total;
     } catch {
@@ -452,6 +559,10 @@ class SessionsStore {
   }
 
   sidebarIndexVersion: number = $state(0);
+  // Session ids supplied by the loaded sidebar index pages; rows in
+  // this.sessions outside this set were appended out of position
+  // (see loadSidebarPage / loadMore).
+  private sidebarIndexIds: Set<string> = new Set();
   hydratedSessionsByVersion: Map<number, Map<string, Session>> =
     $state(new Map());
 
@@ -485,6 +596,7 @@ class SessionsStore {
       new Map<string, Promise<void>>();
     this.sidebarHydrationInflightByVersion.set(version, inflight);
     const epoch = this.sidebarHydrationEpochByVersion.get(version) ?? 0;
+    const signal = this.routeSignal();
 
     await Promise.all(uniqueIds.map((id) => {
       if (cache.has(id)) return;
@@ -492,11 +604,13 @@ class SessionsStore {
       if (existing) return existing;
 
       const promise = this.runSidebarHydration(async () => {
+        if (signal.aborted) return;
         try {
           configureGeneratedClient();
-          const hydrated = await SessionsService.getApiV1SessionsId({
-            id,
-          }) as unknown as Session;
+          const hydrated = await callGenerated(
+            () => SessionsService.getApiV1SessionsId({ id }),
+            signal,
+          ) as unknown as Session;
           if (
             version !== this.sidebarIndexVersion ||
             epoch !== (this.sidebarHydrationEpochByVersion.get(version) ?? 0)
@@ -561,24 +675,49 @@ class SessionsStore {
   async loadMore() {
     if (!this.nextCursor || this.loading) return;
     const version = ++this.loadVersion;
+    const signal = this.routeSignal();
     this.loading = true;
     try {
       configureGeneratedClient();
-      const index = await SessionsService.getApiV1SessionsSidebarIndex({
-        ...this.apiParams,
-        cursor: this.nextCursor,
-        limit: SESSION_PAGE_SIZE,
-      }) as unknown as SidebarSessionIndexResponse;
+      const index = await callGenerated(
+        () => SessionsService.getApiV1SessionsSidebarIndex({
+          ...this.apiParams,
+          cursor: this.nextCursor!,
+          limit: SESSION_PAGE_SIZE,
+        }),
+        signal,
+      ) as unknown as SidebarSessionIndexResponse;
       if (this.loadVersion !== version) return;
-      this.sessions.push(
-        ...index.sessions.map((row) =>
-          sidebarIndexRowToSession(row, this.sessions.find(
-            (existing) => existing.id === row.id,
-          ))
-        ),
+      // Merge index-page order first, appended rows last. Rows outside
+      // sidebarIndexIds were appended out of position (the active
+      // session kept by loadSidebarPage, navigateToSession targets);
+      // they stay at the tail until pagination reaches their real
+      // position, then merge in place carrying their hydrated fields.
+      const existingById = new Map(
+        this.sessions.map((session) => [session.id, session]),
       );
+      for (const row of index.sessions) {
+        this.sidebarIndexIds.add(row.id);
+      }
+      const paged = this.sessions.filter(
+        (s) => this.sidebarIndexIds.has(s.id) &&
+          !index.sessions.some((row) => row.id === s.id),
+      );
+      const appended = this.sessions.filter(
+        (s) => !this.sidebarIndexIds.has(s.id),
+      );
+      this.sessions = [
+        ...paged,
+        ...index.sessions.map((row) =>
+          sidebarIndexRowToSession(row, existingById.get(row.id))
+        ),
+        ...appended,
+      ];
       this.nextCursor = index.next_cursor ?? null;
       this.total = index.total;
+    } catch (error) {
+      if (signal.aborted || isAbortError(error)) return;
+      throw error;
     } finally {
       if (this.loadVersion === version) {
         this.loading = false;
@@ -687,7 +826,11 @@ class SessionsStore {
 
   private setActiveSession(id: string | null) {
     if (id === this.activeSessionId) return;
+    this.navigateRead.cancel();
+    this.refreshRead.cancel();
+    this.childSessionsRead.cancel();
     this.activeSessionId = id;
+    this.activeSessionUsageVersion = 0;
     this.refreshVersion++;
     this.childSessionsVersion++;
   }
@@ -697,33 +840,56 @@ class SessionsStore {
     void this.hydrateSelectedIndexOnlySession(id);
   }
 
+  private navigateInFlight: { id: string; promise: Promise<void> } | null =
+    null;
+
   /**
    * Navigate to a session by ID, loading it into the sessions list if
    * not already present (e.g. subagent sessions filtered from groups).
+   * Re-invocations for the same still-active session join the in-flight
+   * fetch instead of restarting it, so reactive callers can re-request
+   * hydration without duplicating requests.
    */
   async navigateToSession(id: string) {
+    if (this.navigateInFlight?.id === id && this.activeSessionId === id) {
+      return this.navigateInFlight.promise;
+    }
     this.setActiveSession(id);
     const existing = this.sessions.find((s) => s.id === id);
     if (existing) {
       await this.hydrateSelectedIndexOnlySession(id);
       return;
     }
-    try {
-      configureGeneratedClient();
-      const session = await SessionsService.getApiV1SessionsId({
-        id,
-      }) as unknown as Session;
-      if (this.activeSessionId === id) {
-        const idx = this.sessions.findIndex((s) => s.id === id);
-        if (idx >= 0) {
-          this.mergeHydratedSession(session);
-        } else {
-          this.sessions = [...this.sessions, session];
+    const signal = this.navigateRead.begin();
+    const entry = { id, promise: Promise.resolve() };
+    entry.promise = (async () => {
+      try {
+        configureGeneratedClient();
+        const session = await callGenerated(
+          () => SessionsService.getApiV1SessionsId({ id }),
+          signal,
+        ) as unknown as Session;
+        if (
+          this.activeSessionId === id && this.navigateRead.isCurrent(signal)
+        ) {
+          const idx = this.sessions.findIndex((s) => s.id === id);
+          if (idx >= 0) {
+            this.mergeHydratedSession(session);
+          } else {
+            this.sessions = [...this.sessions, session];
+          }
+        }
+      } catch {
+        // Session not found — selection stands without metadata
+      } finally {
+        this.navigateRead.finish(signal);
+        if (this.navigateInFlight === entry) {
+          this.navigateInFlight = null;
         }
       }
-    } catch {
-      // Session not found — selection stands without metadata
-    }
+    })();
+    this.navigateInFlight = entry;
+    return entry.promise;
   }
 
   private async hydrateSelectedIndexOnlySession(id: string) {
@@ -741,14 +907,17 @@ class SessionsStore {
     const id = this.activeSessionId;
     if (!id) return;
     const version = ++this.refreshVersion;
+    const signal = this.refreshRead.begin();
     try {
       configureGeneratedClient();
-      const session = await SessionsService.getApiV1SessionsId({
-        id,
-      }) as unknown as Session;
+      const session = await callGenerated(
+        () => SessionsService.getApiV1SessionsId({ id }),
+        signal,
+      ) as unknown as Session;
       if (
         this.refreshVersion !== version ||
-        this.activeSessionId !== id
+        this.activeSessionId !== id ||
+        !this.refreshRead.isCurrent(signal)
       ) {
         return;
       }
@@ -758,19 +927,24 @@ class SessionsStore {
       }
     } catch {
       // Session may have been deleted
+    } finally {
+      this.refreshRead.finish(signal);
     }
   }
 
   async loadChildSessions(parentId: string) {
     const version = ++this.childSessionsVersion;
+    const signal = this.childSessionsRead.begin();
     try {
       configureGeneratedClient();
-      const children = await SessionsService.getApiV1SessionsIdChildren({
-        id: parentId,
-      }) as unknown as Session[];
+      const children = await callGenerated(
+        () => SessionsService.getApiV1SessionsIdChildren({ id: parentId }),
+        signal,
+      ) as unknown as Session[];
       if (
         this.childSessionsVersion !== version ||
-        this.activeSessionId !== parentId
+        this.activeSessionId !== parentId ||
+        !this.childSessionsRead.isCurrent(signal)
       ) {
         return;
       }
@@ -787,6 +961,8 @@ class SessionsStore {
         return;
       }
       this.childSessions = new Map();
+    } finally {
+      this.childSessionsRead.finish(signal);
     }
   }
 
@@ -803,16 +979,27 @@ class SessionsStore {
     if (inflight) return inflight;
     const promise = this.doFetchSignalDetail(id);
     this.signalDetailInflight.set(id, promise);
-    await promise;
+    try {
+      await promise;
+    } finally {
+      if (this.signalDetailInflight.get(id) === promise) {
+        this.signalDetailInflight.delete(id);
+      }
+      this.signalDetailLoading =
+        this.signalDetailInflight.size > 0;
+    }
   }
 
   private async doFetchSignalDetail(id: string) {
+    const signal = this.routeSignal();
     this.signalDetailLoading = true;
     try {
       configureGeneratedClient();
-      const session = await SessionsService.getApiV1SessionsId({
-        id,
-      }) as unknown as Session;
+      const session = await callGenerated(
+        () => SessionsService.getApiV1SessionsId({ id }),
+        signal,
+      ) as unknown as Session;
+      if (signal.aborted) return;
       this.signalDetailCache.set(id, {
         basis: session.health_score_basis ?? null,
         penalties: session.health_penalties ?? null,
@@ -820,10 +1007,6 @@ class SessionsStore {
       this.mergeDetailIntoList(id);
     } catch {
       // Signal detail is non-critical
-    } finally {
-      this.signalDetailInflight.delete(id);
-      this.signalDetailLoading =
-        this.signalDetailInflight.size > 0;
     }
   }
 
@@ -877,6 +1060,7 @@ class SessionsStore {
   setProjectFilter(project: string) {
     const prev = this.filters;
     this.filters = { ...defaultFilters(), project, agent: prev.agent };
+    this.dateFiltersWindowDays = null;
     this.setActiveSession(null);
     if (prev.includeOneShot !== this.filters.includeOneShot ||
         prev.includeAutomated !== this.filters.includeAutomated) {
@@ -1039,6 +1223,7 @@ class SessionsStore {
       yokedDates.clear();
     }
     this.filters = { ...defaultFilters(), project };
+    this.dateFiltersWindowDays = null;
     this.setActiveSession(null);
     if (wasOneShot !== this.filters.includeOneShot || wasAutomated) {
       this.invalidateFilterCaches();
@@ -1260,7 +1445,11 @@ class SessionsStore {
       this.handleLiveRefreshEvent(event);
     });
     this.safetyNetTimer = setInterval(
-      () => { this.load(); },
+      () => {
+        this.load();
+        this.refreshActiveChildSessions();
+        this.bumpActiveSessionUsageVersion();
+      },
       SAFETY_NET_REFRESH_MS,
     );
   }
@@ -1268,10 +1457,14 @@ class SessionsStore {
   private handleLiveRefreshEvent(event: DataChangedEvent) {
     if (event.scope === "messages") {
       this.invalidateHydratedSessionDetails();
+      this.bumpActiveSessionUsageVersion();
+      this.refreshActiveChildSessions();
       return;
     }
     if (event.scope === "sessions" || event.scope === "sync") {
       this.scheduleIndexRefresh();
+      this.bumpActiveSessionUsageVersion();
+      this.refreshActiveChildSessions();
     }
   }
 
@@ -1284,6 +1477,49 @@ class SessionsStore {
       this.liveRefreshTimer = null;
       this.load();
     }, LIVE_REFRESH_DEBOUNCE_MS);
+  }
+
+  private refreshActiveChildSessions() {
+    const id = this.activeSessionId;
+    if (!id) return;
+    void this.loadChildSessions(id);
+  }
+
+  private bumpActiveSessionUsageVersion() {
+    if (!this.activeSessionId) return;
+    this.activeSessionUsageVersion++;
+  }
+
+  private routeSignal(): AbortSignal {
+    if (!this.routeAbort || this.routeAbort.signal.aborted) {
+      this.routeAbort = new AbortController();
+    }
+    return this.routeAbort.signal;
+  }
+
+  cancelRouteReads(): void {
+    this.sidebarAbort?.abort();
+    this.sidebarAbort = null;
+    this.sidebarLoadPromise = null;
+    this.sidebarLoadSignature = null;
+    this.routeAbort?.abort();
+    this.routeAbort = null;
+    this.navigateRead.cancel();
+    this.refreshRead.cancel();
+    this.childSessionsRead.cancel();
+    this.loadVersion++;
+    this.refreshVersion++;
+    this.childSessionsVersion++;
+    this.loading = false;
+    this.signalDetailInflight.clear();
+    this.signalDetailLoading = false;
+    for (const version of this.sidebarHydrationEpochByVersion.keys()) {
+      this.sidebarHydrationEpochByVersion.set(
+        version,
+        (this.sidebarHydrationEpochByVersion.get(version) ?? 0) + 1,
+      );
+    }
+    for (const resume of this.sidebarHydrationQueue.splice(0)) resume();
   }
 
   dispose() {
@@ -1299,11 +1535,7 @@ class SessionsStore {
       clearInterval(this.safetyNetTimer);
       this.safetyNetTimer = null;
     }
-    this.sidebarAbort?.abort();
-    this.sidebarAbort = null;
-    this.sidebarLoadPromise = null;
-    this.sidebarLoadSignature = null;
-    this.loadVersion++;
+    this.cancelRouteReads();
     this.liveRefreshStarted = false;
   }
 }
@@ -1321,6 +1553,8 @@ function sidebarIndexRowToSession(
     project: row.project,
     machine: row.machine,
     agent: row.agent,
+    agent_label: row.agent_label ?? undefined,
+    entrypoint: row.entrypoint ?? undefined,
     first_message: null,
     display_name: row.display_name ?? null,
     started_at: row.started_at,
@@ -1334,6 +1568,7 @@ function sidebarIndexRowToSession(
     peak_context_tokens: 0,
     has_total_output_tokens: false,
     has_peak_context_tokens: false,
+    transcript_revision: row.transcript_revision,
     is_automated: row.is_automated,
     is_teammate: row.is_teammate ?? false,
     is_index_only: true,
@@ -1346,6 +1581,8 @@ function sidebarIndexRowToSession(
     project: skinny.project,
     machine: skinny.machine,
     agent: skinny.agent,
+    agent_label: skinny.agent_label,
+    entrypoint: skinny.entrypoint,
     display_name: skinny.display_name,
     started_at: skinny.started_at,
     ended_at: skinny.ended_at,
@@ -1354,6 +1591,7 @@ function sidebarIndexRowToSession(
     parent_session_id: skinny.parent_session_id,
     relationship_type: skinny.relationship_type,
     termination_status: skinny.termination_status,
+    transcript_revision: skinny.transcript_revision,
     is_automated: skinny.is_automated,
     is_teammate: skinny.is_teammate ?? existing.is_teammate,
     is_index_only: false,

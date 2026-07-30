@@ -71,14 +71,26 @@ consistent across panels.
 
 ![Date range picker](/assets/generated/screenshots/date-range.png)
 
-Preset ranges are **rolling** by default: a page left open
-across midnight rolls the window forward at the next refresh
-tick, sync event, or manual refresh, instead of staying
-anchored to the day it loaded. Manually editing either date
-input pins the range; on the Usage and Activity pages,
-navigating to explicit range URLs also pins the range while the
-bare page URL returns to rolling mode. The `All` preset always
-pins to `(earliest_session, today)`.
+Preset ranges are **rolling** by default: a page left open across midnight rolls
+the window forward at the next refresh tick, sync event, or manual refresh,
+instead of staying anchored to the day it loaded. Manually editing either date
+input pins the range. On Usage and Activity, explicit date parameters remain
+authoritative. A bare Usage URL returns to its rolling 30-day default; a bare
+Activity URL returns to its current-day calendar default unless an enabled
+shared range supplies another selection. The `All` preset always pins to
+`(earliest_session, today)`.
+
+Bare pages use independent defaults: the Sessions dashboard opens
+to a rolling 1-year range, Usage opens to a rolling 30-day range,
+and Activity opens to the current day. Cross-page linking is
+disabled by default because applying a broad range automatically
+can make some pages run substantially more expensive queries.
+
+To carry selections among Sessions, Usage, Activity, Trends, and
+Insights, enable **Settings > Date ranges > Link date ranges across
+pages**. An explicit dated URL always controls the target page. With
+linking enabled, that selection can then carry to date-aware pages
+opened later at their bare URLs.
 
 ### Model Filter
 
@@ -193,14 +205,21 @@ chart showing tool usage over time.
 ### Top Skills
 
 The Top Skills panel ranks skill-backed tool calls by call count,
-session count, recency, agent mix, project mix, and week-by-week
-trend. It is populated from normalized `skill_name` metadata on
-tool calls and from inferred skill names when Codex or Cursor reads
-a `SKILL.md` file through a read-like tool call. It appears when
-your local transcripts include either explicit skill metadata or
-enough `SKILL.md` reads for AgentsView to infer the skill name.
+session count, recency, agent mix, and project mix. The adjacent
+Skill Usage Over Time chart plots the leading skills, folds
+the long tail into Other, and lets you switch between day, week,
+and month buckets or hide individual series. Both views follow the
+active Analytics date and session filters.
+
+Skill analytics is populated from normalized `skill_name` metadata
+on tool calls and from inferred skill names when Codex or Cursor
+reads a `SKILL.md` file through a read-like tool call. It appears
+when your local transcripts include either explicit skill metadata
+or enough `SKILL.md` reads for AgentsView to infer the skill name.
 
 ![Top Skills](/assets/generated/screenshots/top-skills.png)
+
+![Skill usage trends](/assets/generated/screenshots/skill-trends.png)
 
 ### Velocity Metrics
 
@@ -532,7 +551,7 @@ Available URL filters:
 | `agent` | comma-separated agent ids |
 | `machine` | comma-separated machine names |
 | `termination` | comma-separated [status](#session-status-indicator) tiers — any of `active`, `stale`, `unclean`, `clean`, `awaiting_user` |
-| `date`, `date_from`, `date_to` | ISO date or range bounds |
+| `date`, `date_from`, `date_to` | ISO date or activity-overlap range bounds |
 | `active_since` | `true` to limit to the last 24 hours |
 | `min_messages`, `max_messages` | numeric message count bounds |
 | `min_user_messages` | numeric user-message threshold |
@@ -567,6 +586,13 @@ CLI sessions decoded from an unrecognized SQLite schema fingerprint,
 the header also shows **Unverified schema**. That badge means the
 session was decoded heuristically from a newer schema and may be
 incomplete.
+
+AgentsView stores reading progress for the most recent 500 sessions in the
+current browser. When a transcript changes after you have read it, the sidebar
+shows an unread dot and the transcript places a **New messages** boundary at the
+first unread region. In newest-first order the same boundary is labeled
+**Earlier messages**. The marker clears after you traverse the new region; it is
+browser-local and is not synced through SQLite or PostgreSQL.
 
 ### Message Layouts
 
@@ -606,6 +632,10 @@ The header shows the role label, timestamp, and a **copy
 button** that appears on hover. Click it to copy the full
 message content to the clipboard — a checkmark confirms the
 copy for 1.5 seconds.
+
+Inline `<teammate-message>` content and messages from teammate session ancestry
+are labeled **Teammate**, keeping peer-agent replies distinct from user prompts
+and ordinary subagent output.
 
 Claude Code sessions also show a fork action on each message header
 when the local server can launch or return a command. Clicking it
@@ -647,6 +677,11 @@ the full command text, including multi-line commands like
 heredocs that would otherwise be truncated. Tool result content
 is stored alongside the tool call when available, giving a
 complete view of input and output.
+
+Hover or focus a tool block to reveal copy buttons for the
+structured input and, when present, the tool output.
+
+![Copy buttons on a tool block](/assets/generated/screenshots/tool-block-copy-btn.png)
 
 Codex tool calls receive special formatting: bash commands,
 write_stdin operations, and apply_patch calls display with
@@ -696,6 +731,13 @@ highlighting is skipped for blocks over 50 KB or 800 lines,
 and the highlighter loads lazily so it costs nothing until the
 first code fence renders.
 
+Fenced code blocks labeled `mermaid` render as Mermaid diagrams
+in an interactive viewer with source-copy and expanded-view
+controls. If the Mermaid runtime cannot load, AgentsView keeps
+the escaped diagram source readable in the message. When
+in-session search is active, Mermaid fences render as source code
+so matches can be highlighted.
+
 ![Copy button on a code block](/assets/generated/screenshots/code-block-copy-btn.png)
 
 ### Block-Type Filtering
@@ -725,7 +767,12 @@ current direction.
 
 - `j` or `↓` — next message
 - `k` or `↑` — previous message
+- `Shift+J` — next user prompt
+- `Shift+K` — previous user prompt
 - Click a message to select it (blue outline)
+
+Prompt navigation follows the visible transcript, so it respects Focused mode
+and the active block-type filter.
 
 ### In-Session Search
 
@@ -756,6 +803,22 @@ Costs under a cent display as `<$0.01`, costs up to $100 with
 two decimals, and larger costs as whole dollars. The badge is
 hidden when the session has no token data or its models have
 no pricing.
+
+When the selected session has explicit `subagent` descendants, the
+automatic header request adds `rollup=true`. A complete priced aggregate
+shows a localized total marker and the descendant count. If any contributing
+row is unpriced, the header keeps the root session's own cost when available
+and does not label it as a total. Sessions without explicit subagent
+descendants keep the existing badge.
+
+As of 0.37.1, sessions with per-step usage rows also show a
+**step count** next to the token summary. Click it to expand a
+per-step breakdown: each row lists the prompt or usage event,
+the model that served it, its context size (input tokens plus
+cache reads and writes), its output tokens, and a per-step cost
+estimate when the model is priced. The rows come from the same
+session usage API with `?breakdown=true` — see
+[`agentsview session usage`](/session-api/#agentsview-session-usage).
 
 For aggregate token usage and estimated cost reports across
 all sessions, see the
@@ -793,12 +856,16 @@ timestamps. Toggle it from the session header.
 
 ![Session Vital Signs in context](/assets/generated/screenshots/session-vital-signs.png)
 
-It has four stacked sections:
+It has five stacked sections when experimental Recall is available:
 
-- **Session summary** — total wall-clock, turn count, tool call
-  count, sub-agent count, and the slowest call as a clickable
-  link that scrolls the conversation to that call. Live sessions
-  show a `running …+` indicator that ticks forward.
+- **Session summary** — repository and worktree context recorded by the trace,
+  total wall-clock, turn count, tool call count, sub-agent count, and the
+  slowest call as a clickable link that scrolls the conversation to that call.
+  Live sessions show a `running …+` indicator that ticks forward.
+- **Recall (experimental)** — provenance-linked entries whose evidence comes
+  from the current session. Evidence-range links jump to the supporting
+  transcript message. An empty state appears when the local archive has no
+  matching entries.
 - **Time spent** — per-category aggregate bars across the
   normalized taxonomy (`Read`, `Edit`, `Write`, `Bash`, `Grep`,
   `Glob`, `Task`, `Tool`, `Other`, plus a `Mixed` bucket for
@@ -810,8 +877,8 @@ It has four stacked sections:
   scroll the conversation to that turn.
 - **Calls** — chronological list of tool calls with horizontal
   duration bars. Parallel `tool_use` runs are bracketed as a
-  single group. Sub-agent rows expand inline to show the child
-  session's calls.
+  single group. Call details start collapsed for quicker transcript navigation.
+  Sub-agent rows expand inline to show the child session's calls.
 
 ![Vital Signs panel detail](/assets/generated/screenshots/vital-signs-panel.png)
 
@@ -878,11 +945,19 @@ With an empty or short query (under 3 characters), the palette
 shows your 10 most recent sessions. Type to filter by project
 name or first message.
 
-### Full-Text Search
+### Search Modes
 
-Type 3 or more characters to search across all message content
-and session names. Results appear in real time with 300ms
-debounce.
+Type 3 or more characters to search in one of three modes:
+
+- **Full text** searches indexed message content with FTS5. It
+  also matches session display names and first messages.
+- **Semantic** ranks message content by meaning using the active
+  embeddings index.
+- **Hybrid** combines semantic and full-text rankings so that
+  both conceptual and exact-term matches can surface.
+
+The palette remembers the last mode you selected across openings
+and browser sessions. Results update after a 300ms typing pause.
 
 !!! tip
     For deeper searches across full transcripts — including tool
@@ -897,20 +972,30 @@ debounce.
 
 Results are grouped by session — each session shows its best
 matching result. This prevents a single long session from
-dominating the results list. The search also matches against
+dominating the results list. Full text also matches against
 session display names and first messages, so you can find
 sessions by title.
 
-Use the sort toggle in the palette header to switch between
-**Relevance** (best matches first) and **Recency** (newest
-sessions first).
+In Full text mode, use the sort toggle in the palette header to
+switch between **Relevance** (best matches first) and **Recency**
+(newest sessions first). Semantic and Hybrid use their backend
+rankings, so this toggle is hidden in those modes.
 
-Each result shows:
+Semantic and Hybrid require an enabled [`[vector]`](semantic-search.md#enabling-vector)
+configuration and an active embeddings index. If setup, index
+state, or the embeddings service prevents a search, the palette
+keeps the selected mode and shows actionable remediation rather
+than silently falling back to Full text.
 
-- **Role badge** — U (user) or A (assistant) in a colored box
-- **Snippet** — matching text with highlighted search terms
-- **Session name** — the session this result belongs to
-- **Project name** — right-aligned
+Results use a compact row:
+
+- **Full text** may show the session name and a sanitized snippet
+  with highlighted search terms.
+- **Semantic and Hybrid** lead with a plain-text matching snippet.
+  Content search does not return a session name or highlight
+  markup.
+- **All modes** show an agent-colored dot, project and result
+  time, and a copyable session ID.
 
 Select a result to jump to that session and scroll directly to
 the matching message.
@@ -970,24 +1055,21 @@ message in its session.
 
 ### Session Resume Menu
 
-Right-click a session in the sidebar to open a context menu
-with three resume actions:
+Select a session and open **Resume** in the detail header. For supported local
+agents, the menu can launch the configured terminal, use the default terminal,
+or copy the exact resume command. Cursor resume resolves the original workspace
+path and passes it as `--workspace` to `cursor agent --resume`. The same menu
+can copy the session directory and open it in detected editors or file
+browsers.
 
-- **Reopen** — reopen the session in the agent that created it
-- **Terminal** — launch a terminal in the session's working
-  directory
-- **Open Directory** — open the session's working directory in
-  Finder (macOS) or Explorer (Windows)
+Local Codex sessions add **Open in Codex Desktop**, which deep-links to the
+stored thread. Local Claude sessions add **Open in Claude Code**, which opens a
+new Code session for the stored working directory; when the native Claude
+Desktop opener is detected, it remains available as a separate resume target.
+Desktop deep links are intentionally hidden for remote sessions because a local
+desktop app cannot open another machine's transcript or directory.
 
-GitHub Copilot CLI and Cursor sessions also appear in the
-resume dropdown. Cursor resume resolves the original workspace
-path automatically and passes it as `--workspace` to
-`cursor agent --resume`.
-
-For Claude sessions on macOS, a **Claude Desktop** option
-appears at the bottom of the resume menu. It opens the session
-in Claude Desktop's Code tab via the `claude://resume` URL
-scheme.
+![Session resume menu](/assets/generated/screenshots/session-resume-menu.png)
 
 The `agentsview session list --resume` and `--active` CLI modes use
 the same recent-activity signal to produce a compact terminal table
@@ -1112,6 +1194,8 @@ Press `?` to see all shortcuts in a modal overlay.
 | `Esc` | Close modal / deselect session |
 | `j` / `↓` | Next message |
 | `k` / `↑` | Previous message |
+| `Shift+J` | Next user prompt |
+| `Shift+K` | Previous user prompt |
 | `]` | Next session |
 | `[` | Previous session |
 | `o` | Toggle sort order |
@@ -1137,19 +1221,26 @@ Settings are organized into sections:
 
 | Section | What You Can Configure |
 |---------|----------------------|
-| Language | Interface language (English or Simplified Chinese) |
+| Language | Interface language (English, French, Simplified Chinese, Traditional Chinese, or Korean) |
 | Appearance | Theme (light/dark), high-contrast mode, message layout, text size, block visibility, desktop zoom level |
+| Date ranges | Browser-local checkbox for linking date selections across Sessions, Usage, Activity, Trends, and Insights |
 | Agent Directories | Custom paths for each agent's session files. For Devin CLI, point at the local root that contains `cli/` (for example a redacted `.../Application Support/devin` path), not copied config or OAuth files. |
 | Terminal | Default terminal emulator for session resume |
 | Worktree Mappings | Map worktree paths back to their main project (see [Worktree Project Mappings](/configuration/#worktree-project-mappings)) |
+| Embeddings | Current semantic-index build phase, progress, throughput, ETA, last result, and local generations |
 | GitHub | Personal access token for Gist publishing |
 | Remote Access | Remote connections toggle, auth token, connect to remote server |
 
+![Embedding build progress](/assets/generated/screenshots/settings-embeddings.png)
+
 ![Settings remote access section](/assets/generated/screenshots/settings-remote.png)
 
-Changes are persisted to `~/.agentsview/config.toml` and
-survive restarts. See [Remote Access](/remote-access/) for
-details on the remote access settings.
+Language, Appearance, and Date ranges preferences are stored in the browser and
+do not write `~/.agentsview/config.toml`. Agent directory overrides, terminal
+settings, the saved GitHub token, and the local server's remote-access
+authentication settings use `~/.agentsview/config.toml`. Worktree Mappings live
+separately in the local archive database. See
+[Remote Access](/remote-access/) for details on the remote access settings.
 
 ---
 

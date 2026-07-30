@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"path/filepath"
 	"slices"
@@ -51,6 +52,8 @@ func NewDirectBackend(d *db.DB, engine *sync.Engine) SessionService {
 func NewReadOnlyBackend(d db.Store) SessionService {
 	return &directBackend{db: d}
 }
+
+func (b *directBackend) SupportsRecallQueries() bool { return b.local != nil }
 
 func (b *directBackend) Get(
 	ctx context.Context, id string,
@@ -136,6 +139,11 @@ func (b *directBackend) List(
 			"list: invalid active_since %q: use RFC3339", f.ActiveSince,
 		)
 	}
+	timezone, err := db.NormalizeSessionTimezone(f.Timezone)
+	if err != nil {
+		return nil, fmt.Errorf("list: %w", err)
+	}
+	f.Timezone = timezone
 	if _, err := db.ParseSortSpec(f.OrderBy); err != nil {
 		return nil, fmt.Errorf(
 			"list: invalid sort %q: %v (valid keys: %s)",
@@ -177,6 +185,7 @@ func listFilterToDB(f ListFilter) db.SessionFilter {
 		Date:                 f.Date,
 		DateFrom:             f.DateFrom,
 		DateTo:               f.DateTo,
+		Timezone:             f.Timezone,
 		ActiveSince:          f.ActiveSince,
 		MinMessages:          f.MinMessages,
 		MaxMessages:          f.MaxMessages,
@@ -229,9 +238,19 @@ func hideStaleSecretCount(s *db.Session, activeVersions []string) {
 	s.SecretLeakCount = 0
 }
 
+// defaultAroundSpan is the number of messages returned on each side of the
+// anchor when Around is set but Before/After are omitted.
+const defaultAroundSpan = 5
+
 func (b *directBackend) Messages(
 	ctx context.Context, id string, f MessageFilter,
 ) (*MessageList, error) {
+	if f.Around != nil && (f.From != nil || f.Direction != "") {
+		return nil, ErrAroundMutuallyExclusive
+	}
+	if (f.Before != nil || f.After != nil) && f.Around == nil {
+		return nil, ErrBeforeAfterRequireAround
+	}
 	switch f.Direction {
 	case "", "asc", "desc":
 	default:
@@ -248,21 +267,90 @@ func (b *directBackend) Messages(
 	if limit > db.MaxMessageLimit {
 		limit = db.MaxMessageLimit
 	}
-	// An omitted From means "newest" in descending mode and 0 in
-	// ascending mode. An explicit 0 is a real ordinal and must be
-	// honored in both directions.
-	var from int
-	switch {
-	case f.From != nil:
-		from = *f.From
-	case !asc:
-		from = math.MaxInt32
+
+	w := db.MessageWindow{Limit: limit, Asc: asc, Roles: f.Roles}
+	if f.Around != nil {
+		w.Around = f.Around
+		w.Before = defaultAroundSpan
+		if f.Before != nil {
+			w.Before = *f.Before
+		}
+		w.After = defaultAroundSpan
+		if f.After != nil {
+			w.After = *f.After
+		}
+		w.Before, w.After = clampAroundSpan(w.Before, w.After)
+	} else {
+		// An omitted From means "newest" in descending mode and 0 in
+		// ascending mode. An explicit 0 is a real ordinal and must be
+		// honored in both directions.
+		var from int
+		switch {
+		case f.From != nil:
+			from = *f.From
+		case !asc:
+			from = math.MaxInt32
+		}
+		w.From = &from
 	}
-	msgs, err := b.db.GetMessages(ctx, id, from, limit, asc)
+
+	msgs, err := b.db.GetMessagesWindow(ctx, id, w)
 	if err != nil {
 		return nil, err
 	}
-	return &MessageList{Messages: msgs, Count: len(msgs)}, nil
+	list := &MessageList{Messages: msgs, Count: len(msgs)}
+	if len(msgs) > 0 {
+		first := msgs[0].Ordinal
+		last := msgs[len(msgs)-1].Ordinal
+		list.FirstOrdinal = &first
+		list.LastOrdinal = &last
+	}
+	return list, nil
+}
+
+// clampAroundSpan bounds a requested Before/After pair for an around window
+// so the resulting response (before + after + 1 anchor row) can never exceed
+// db.MaxMessageLimit, the same cap the linear path silently clamps Limit to
+// (see the limit clamp a few lines up in Messages). Negative values
+// (reachable via a direct SessionService caller or a negative CLI/API flag)
+// are floored to 0 first, matching the floor the db layer already applies
+// via max(w.Before, 0).
+//
+// Before and After share one budget rather than each independently capping
+// to the max (which would still let the combined window reach ~2x the max),
+// so an oversized request on one side (e.g. before=10^9) must not be able to
+// starve a modest request on the other side down toward zero. This is a
+// two-sided water-fill: a side asking for at most its fair (even) share of
+// the budget gets exactly what it asked for, and the other side absorbs
+// whatever budget remains; only when both sides exceed their fair share
+// does the budget get split evenly between them.
+func clampAroundSpan(before, after int) (int, int) {
+	if before < 0 {
+		before = 0
+	}
+	if after < 0 {
+		after = 0
+	}
+	const budget = db.MaxMessageLimit - 1 // reserve the anchor row
+	// Compare each side against budget individually rather than summing
+	// before+after: before and after are untrusted ints (reachable via a
+	// direct SessionService caller or the API), and before+after can
+	// overflow and wrap negative when either side is near math.MaxInt,
+	// which would slip an unbounded window past this cap.
+	if before <= budget && after <= budget-before {
+		return before, after
+	}
+	fairShare := budget / 2
+	switch {
+	case before <= fairShare:
+		after = budget - before
+	case after <= fairShare:
+		before = budget - after
+	default:
+		before = fairShare
+		after = budget - fairShare
+	}
+	return before, after
 }
 
 func (b *directBackend) ToolCalls(
@@ -326,6 +414,14 @@ func (b *directBackend) Sync(
 		// conversation scope and follows it across sibling trace files.
 		if _, _, ok :=
 			parser.SplitVisualStudioCopilotVirtualPath(storedPath); ok {
+			if err := b.engine.SyncSingleSessionContext(
+				ctx, in.ID,
+			); err != nil {
+				return nil, err
+			}
+			return b.Get(ctx, in.ID)
+		}
+		if _, _, ok := parser.SplitWindsurfVirtualPath(storedPath); ok {
 			if err := b.engine.SyncSingleSessionContext(
 				ctx, in.ID,
 			); err != nil {
@@ -412,12 +508,12 @@ func (b *directBackend) resolveSessionIDByPath(
 		WHERE file_path = ?
 		ORDER BY created_at DESC`
 	queryArgs := []any{path}
-	// Visual Studio Copilot stores file_path as a virtual sync key
-	// <traceFile>#<conversationID>, so an exact match on the physical
-	// container path never resolves. Also match every conversation
-	// synced from that container; multiple matches fall through to the
-	// ambiguity error below, exactly like a multi-session JSONL file.
-	if isVisualStudioCopilotVirtualContainerPath(path) {
+	// Some providers store file_path as a virtual sync key
+	// <container>#<sessionID>, so an exact match on the physical container path
+	// never resolves. Also match every session synced from that container;
+	// multiple matches fall through to the ambiguity error below, exactly like a
+	// multi-session JSONL file.
+	if isVirtualSessionContainerPath(path) {
 		q = `SELECT id FROM sessions
 			WHERE file_path = ? OR file_path LIKE ? ESCAPE '\'
 			ORDER BY created_at DESC`
@@ -462,12 +558,24 @@ func (b *directBackend) resolveSessionIDByPath(
 	}
 }
 
+func isVirtualSessionContainerPath(path string) bool {
+	return isVisualStudioCopilotVirtualContainerPath(path) ||
+		isWindsurfVirtualContainerPath(path)
+}
+
 func isVisualStudioCopilotVirtualContainerPath(path string) bool {
 	if parser.IsVisualStudioCopilotTraceFile(path) {
 		return true
 	}
 	_, _, ok := parser.SplitVisualStudioCopilotVirtualPath(
 		parser.VisualStudioCopilotVirtualPath(path, filepath.Base(path)),
+	)
+	return ok
+}
+
+func isWindsurfVirtualContainerPath(path string) bool {
+	_, _, ok := parser.SplitWindsurfVirtualPath(
+		parser.VirtualSourcePath(path, filepath.Base(path)),
 	)
 	return ok
 }
@@ -577,6 +685,11 @@ func (b *directBackend) Search(
 func (b *directBackend) UsageSummary(
 	ctx context.Context, req UsageRequest,
 ) (*UsageSummaryResult, error) {
+	var err error
+	req, err = ResolveUsageProjectKeys(ctx, b.db, req)
+	if err != nil {
+		return nil, err
+	}
 	f, err := BuildUsageFilter(req)
 	if err != nil {
 		return nil, err
@@ -585,7 +698,10 @@ func (b *directBackend) UsageSummary(
 	if err != nil {
 		return nil, err
 	}
-	summary := buildUsageSummary(f, result)
+	summary, err := buildUsageSummary(f, result)
+	if err != nil {
+		return nil, err
+	}
 	if parser.AgentFilterLacksPerMessageTokenData(f.Agent) &&
 		db.NoTokenData(result.Totals) {
 		matchingSessions, err := b.db.GetUsageMatchingSessionCount(ctx, f)
@@ -604,6 +720,11 @@ func (b *directBackend) UsageSummary(
 func (b *directBackend) UsagePairwiseComparison(
 	ctx context.Context, req UsagePairwiseComparisonRequest,
 ) (*UsagePairwiseComparisonResponse, error) {
+	var err error
+	req, err = ResolveUsagePairwiseProjectKeys(ctx, b.db, req)
+	if err != nil {
+		return nil, err
+	}
 	leftFilter, leftEmpty, rightFilter, rightEmpty, err := BuildUsagePairwiseFilters(req)
 	if err != nil {
 		return nil, err
@@ -628,13 +749,24 @@ func (b *directBackend) UsagePairwiseComparison(
 		}
 	}
 
-	out := BuildUsagePairwiseComparisonResult(leftResult, rightResult)
+	out, err := BuildUsagePairwiseComparisonResult(leftResult, rightResult)
+	if err != nil {
+		return nil, err
+	}
 	return &out, nil
 }
 
+// maxContentSearchContext is the largest --context value SearchContent
+// accepts. Larger requests are rejected rather than silently clamped, so a
+// caller who asks for more context than the store will give is told, rather
+// than getting a page that quietly carries less than requested.
+const maxContentSearchContext = 10
+
 // SearchContent maps the transport-neutral request to a
 // db.ContentSearchFilter, calls the store, and redacts secret-shaped
-// spans from each snippet unless Reveal is set.
+// spans from each snippet unless Reveal is set. When Context > 0, each
+// match is additionally enriched with ContextBefore/ContextAfter (see
+// enrichContentContext).
 func (b *directBackend) SearchContent(
 	ctx context.Context, req ContentSearchRequest,
 ) (*ContentSearchResult, error) {
@@ -647,6 +779,20 @@ func (b *directBackend) SearchContent(
 		}
 		req.Sources = []string{"messages"}
 	}
+	// Context < 0 (reachable via `--context -5` or a direct SessionService
+	// caller) is treated as "off" rather than rejected; only exceeding the
+	// max is a hard error.
+	if req.Context < 0 {
+		req.Context = 0
+	}
+	if req.Context > maxContentSearchContext {
+		return nil, &db.SearchInputError{Msg: "context: maximum is 10"}
+	}
+	timezone, err := db.NormalizeSessionTimezone(req.Timezone)
+	if err != nil {
+		return nil, &db.SearchInputError{Msg: "search: " + err.Error()}
+	}
+	req.Timezone = timezone
 	page, err := b.db.SearchContent(ctx, db.ContentSearchFilter{
 		Pattern:          req.Pattern,
 		Mode:             req.Mode,
@@ -660,10 +806,12 @@ func (b *directBackend) SearchContent(
 		Date:             req.Date,
 		DateFrom:         req.DateFrom,
 		DateTo:           req.DateTo,
+		Timezone:         req.Timezone,
 		ActiveSince:      req.ActiveSince,
 		IncludeChildren:  req.IncludeChildren,
 		IncludeAutomated: req.IncludeAutomated,
 		IncludeOneShot:   req.IncludeOneShot,
+		Scope:            req.Scope,
 		// The store builds snippets from the full source field and redacts
 		// secrets (including ones straddling the snippet window) unless reveal
 		// is set. Redacting the pre-truncated snippet here would miss those.
@@ -674,10 +822,189 @@ func (b *directBackend) SearchContent(
 	if err != nil {
 		return nil, err
 	}
+	if req.Context > 0 {
+		if err := b.enrichContentContext(
+			ctx, page.Matches, req.Context, req.Reveal,
+		); err != nil {
+			return nil, err
+		}
+	}
 	return &ContentSearchResult{
 		Matches:    page.Matches,
 		NextCursor: page.NextCursor,
 	}, nil
+}
+
+// enrichContentContext populates ContextBefore/ContextAfter on each match
+// with a non-negative Ordinal, fetching n messages of context on each side
+// of the match's ordinal and splitting the returned (ascending, anchor
+// included) window on the anchor -- the anchor row is dropped from both
+// slices since it duplicates the match already in the page. Matches with a
+// negative ordinal are left unenriched: no current search path produces
+// one, but a defensive skip here means a future one (e.g. a name-only
+// match with no message row) degrades gracefully instead of panicking on
+// the *w.Around dereference or fetching the wrong window.
+//
+// Unlike the match's own Snippet, context messages are full db.Message
+// values pulled straight from GetMessagesWindow with no redaction applied
+// by the store -- they were never part of the search hit, so
+// ContentSearchFilter.RevealSecrets (which only governs snippet redaction)
+// never touches them. When reveal is false, every context message is
+// redacted here via redactMessageSecrets before being attached to the
+// match, so context_before/context_after never leak a secret from an
+// adjacent message regardless of transport (HTTP, CLI, MCP all share this
+// path). When reveal is true the raw messages are attached unchanged, same
+// as the snippet path.
+func (b *directBackend) enrichContentContext(
+	ctx context.Context, matches []db.ContentMatch, n int, reveal bool,
+) error {
+	for i := range matches {
+		m := &matches[i]
+		if m.Ordinal < 0 {
+			continue
+		}
+		anchor := m.Ordinal
+		msgs, err := b.db.GetMessagesWindow(ctx, m.SessionID, db.MessageWindow{
+			Around: &anchor, Before: n, After: n,
+		})
+		if err != nil {
+			return fmt.Errorf("content search context: %w", err)
+		}
+		for _, msg := range msgs {
+			if !reveal {
+				msg = redactMessageSecrets(msg)
+			}
+			switch {
+			case msg.Ordinal < anchor:
+				m.ContextBefore = append(m.ContextBefore, msg)
+			case msg.Ordinal > anchor:
+				m.ContextAfter = append(m.ContextAfter, msg)
+			}
+		}
+	}
+	return nil
+}
+
+// redactMessageSecrets returns a copy of m with every secret-shaped span
+// masked in its user-visible text fields: message content, thinking text,
+// and each tool call's input/output payloads (InputJSON, ResultContent, and
+// every ResultEvent's Content). It mirrors the masking the search-snippet
+// path already applies via secrets.RedactWindow, but a context message has
+// no known match offset to window around, so the whole-string secrets.Redact
+// scan is used instead. m.ToolResults is not touched: it is a transient
+// parse-time field (json:"-") that GetMessagesWindow never populates, so it
+// never reaches a transport response.
+func redactMessageSecrets(m db.Message) db.Message {
+	m.Content = secrets.Redact(m.Content)
+	m.ThinkingText = secrets.Redact(m.ThinkingText)
+	if len(m.ToolCalls) == 0 {
+		return m
+	}
+	toolCalls := make([]db.ToolCall, len(m.ToolCalls))
+	for i, tc := range m.ToolCalls {
+		tc.InputJSON = secrets.Redact(tc.InputJSON)
+		tc.ResultContent = secrets.Redact(tc.ResultContent)
+		if len(tc.ResultEvents) > 0 {
+			events := make([]db.ToolResultEvent, len(tc.ResultEvents))
+			for j, ev := range tc.ResultEvents {
+				ev.Content = secrets.Redact(ev.Content)
+				events[j] = ev
+			}
+			tc.ResultEvents = events
+		}
+		toolCalls[i] = tc
+	}
+	m.ToolCalls = toolCalls
+	return m
+}
+
+func (b *directBackend) ListRecallEntries(
+	ctx context.Context, f RecallFilter,
+) (*RecallList, error) {
+	if err := ValidateRecallEntryLimit(f.Limit); err != nil {
+		return nil, err
+	}
+	query := recallFilterToDB(f)
+	if err := db.ValidateRecallQuery(query); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(f.Query) == "" {
+		entries, err := b.db.ListRecallEntries(ctx, query)
+		if err != nil {
+			return nil, err
+		}
+		return &RecallList{
+			RecallEntries: recallResultsFromRecallEntries(entries),
+			TrustedOnly:   f.TrustedOnly,
+		}, nil
+	}
+	page, err := b.db.QueryRecallEntries(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	if page.RecallEntries == nil {
+		page.RecallEntries = []db.RecallResult{}
+	}
+	return &RecallList{
+		RecallEntries: page.RecallEntries,
+		TrustedOnly:   f.TrustedOnly,
+	}, nil
+}
+
+func recallResultsFromRecallEntries(entries []db.RecallEntry) []db.RecallResult {
+	out := make([]db.RecallResult, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, db.RecallResult{RecallEntry: entry})
+	}
+	return out
+}
+
+func (b *directBackend) GetRecallEntry(
+	ctx context.Context, id string,
+) (*db.RecallEntry, error) {
+	return b.db.GetRecallEntry(ctx, id)
+}
+
+func (b *directBackend) QueryRecallEntries(
+	ctx context.Context, req RecallQuery,
+) (*RecallQueryResult, error) {
+	return QueryRecallStore(ctx, b.db, req)
+}
+
+func (b *directBackend) ImportRecallEntries(
+	ctx context.Context, r io.Reader, opts db.RecallImportOptions,
+) (*db.RecallImportResult, error) {
+	if b.local == nil {
+		return nil, db.ErrReadOnly
+	}
+	result, err := b.local.ImportAcceptedRecallEntriesJSONLWithOptions(
+		ctx, r, opts,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func recallFilterToDB(f RecallFilter) db.RecallQuery {
+	return db.RecallQuery{
+		Text:                f.Query,
+		Project:             f.Project,
+		CWD:                 f.CWD,
+		GitBranch:           f.GitBranch,
+		Agent:               f.Agent,
+		Type:                f.Type,
+		Scope:               f.Scope,
+		Status:              f.Status,
+		ExtractorMethod:     f.ExtractorMethod,
+		SourceSessionID:     f.SourceSessionID,
+		SourceEpisodeID:     f.SourceEpisodeID,
+		SourceRunID:         f.SourceRunID,
+		SupersedesEntryID:   f.SupersedesEntryID,
+		SupersededByEntryID: f.SupersededByEntryID,
+		TrustedOnly:         f.TrustedOnly,
+		Limit:               f.Limit,
+	}
 }
 
 const secretSourceChanged = "source changed; cannot reveal"
@@ -729,16 +1056,18 @@ func (b *directBackend) ScanSecrets(
 			progress(SecretScanProgress{Scanned: p.Scanned, Total: p.Total})
 		}
 	})
-	if err != nil {
-		return nil, err
-	}
-	return &SecretScanSummary{
+	// The engine commits per-session results as it walks and reports
+	// what landed before a failure or cancellation; the partial summary
+	// travels with the error so callers can tell whether eligibility
+	// already changed.
+	summary := &SecretScanSummary{
 		Scanned:           sum.Scanned,
 		WithSecrets:       sum.WithSecrets,
 		TotalFindings:     sum.TotalFindings,
 		DefiniteFindings:  sum.DefiniteFindings,
 		CandidateFindings: sum.CandidateFindings,
-	}, nil
+	}
+	return summary, err
 }
 
 // revealFinding re-reads the finding's source by its stored coordinates and
@@ -769,15 +1098,18 @@ func (b *directBackend) Stats(
 	}
 	f.Agent = normalizeStatsAgentFilter(f.Agent)
 	stats, err := b.local.GetSessionStats(ctx, db.StatsFilter{
-		Since:                 f.Since,
-		Until:                 f.Until,
-		Agent:                 f.Agent,
-		IncludeProjects:       f.IncludeProjects,
-		ExcludeProjects:       f.ExcludeProjects,
-		Timezone:              f.Timezone,
-		IncludeGitOutcomes:    f.IncludeGitOutcomes,
-		IncludeGitHubOutcomes: f.IncludeGitHubOutcomes,
-		GHToken:               f.GHToken,
+		Since:                  f.Since,
+		Until:                  f.Until,
+		Agent:                  f.Agent,
+		ApplyDefaultVisibility: f.ApplyDefaultVisibility,
+		IncludeOneShot:         f.IncludeOneShot,
+		IncludeAutomated:       f.IncludeAutomated,
+		IncludeProjects:        f.IncludeProjects,
+		ExcludeProjects:        f.ExcludeProjects,
+		Timezone:               f.Timezone,
+		IncludeGitOutcomes:     f.IncludeGitOutcomes,
+		IncludeGitHubOutcomes:  f.IncludeGitHubOutcomes,
+		GHToken:                f.GHToken,
 	})
 	if err != nil {
 		return nil, err

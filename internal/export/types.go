@@ -3,13 +3,17 @@
 // API surfaces depend on their field names.
 package export
 
-import "time"
+import (
+	"time"
 
-const UsageDailySchemaVersion = 1
-const ActivityReportSchemaVersion = 1
-const SessionSummarySchemaVersion = 1
+	"go.kenn.io/agentsview/internal/money"
+)
 
-// CostSource is a closed v1 enum. Adding a value requires a schema version
+const UsageDailySchemaVersion = 3
+const ActivityReportSchemaVersion = 3
+const SessionSummarySchemaVersion = 3
+
+// CostSource is a closed contract enum. Adding a value requires a schema version
 // bump for any export surface that emits it.
 type CostSource string
 
@@ -37,15 +41,15 @@ type PricingFallback struct {
 }
 
 type EffectiveModelRate struct {
-	MatchedPattern        *string    `json:"matched_pattern"`
-	InputCostPerMTok      float64    `json:"input_cost_per_mtok"`
-	OutputCostPerMTok     float64    `json:"output_cost_per_mtok"`
-	CacheWriteCostPerMTok float64    `json:"cache_write_cost_per_mtok"`
-	CacheReadCostPerMTok  float64    `json:"cache_read_cost_per_mtok"`
-	CostSource            CostSource `json:"cost_source"`
+	MatchedPattern        *string     `json:"matched_pattern"`
+	InputCostPerMTok      money.Money `json:"input_cost_per_mtok"`
+	OutputCostPerMTok     money.Money `json:"output_cost_per_mtok"`
+	CacheWriteCostPerMTok money.Money `json:"cache_write_cost_per_mtok"`
+	CacheReadCostPerMTok  money.Money `json:"cache_read_cost_per_mtok"`
+	CostSource            CostSource  `json:"cost_source"`
 }
 
-// ProjectResolution is a closed v1 enum. Adding a value requires a schema
+// ProjectResolution is a closed contract enum. Adding a value requires a schema
 // version bump for any export surface that emits it.
 type ProjectResolution string
 
@@ -55,39 +59,123 @@ const (
 	ProjectResolutionAmbiguous ProjectResolution = "ambiguous"
 )
 
+type ProjectKind string
+
+const (
+	ProjectKindGitRemote   ProjectKind = "git_remote"
+	ProjectKindMachineRoot ProjectKind = "machine_root"
+)
+
+type WorktreeRelationship string
+
+const (
+	WorktreeMain    WorktreeRelationship = "main_worktree"
+	WorktreeLinked  WorktreeRelationship = "linked_worktree"
+	WorktreeNone    WorktreeRelationship = "not_a_worktree"
+	WorktreeUnknown WorktreeRelationship = "unknown"
+)
+
+type CheckoutState string
+
+const (
+	CheckoutBranch   CheckoutState = "branch"
+	CheckoutDetached CheckoutState = "detached"
+	CheckoutUnknown  CheckoutState = "unknown"
+)
+
+type IdentityScope struct {
+	ArchiveID   string
+	ArchiveSalt string
+	MachineID   string
+}
+
 type ProjectIdentity struct {
-	Key              string `json:"key"`
-	KeySource        string `json:"key_source"`
-	NormalizedRemote string `json:"normalized_remote,omitempty"`
-	RootPath         string `json:"root_path,omitempty"`
-	MachineLocal     bool   `json:"machine_local,omitempty"`
+	Key              string      `json:"key"`
+	Kind             ProjectKind `json:"kind"`
+	NormalizedRemote string      `json:"normalized_remote,omitempty"`
+	RootKey          string      `json:"root_key,omitempty"`
+	RepositoryKey    string      `json:"repository_key"`
+}
+
+// StoredProjectIdentity is an internal derivation used by archive migration
+// and UI-oriented legacy queries. It must never be serialized as evidence.
+type StoredProjectIdentity struct {
+	Key              string `json:"-"`
+	KeySource        string `json:"-"`
+	NormalizedRemote string `json:"-"`
+	RootPath         string `json:"-"`
+	MachineLocal     bool   `json:"-"`
+}
+
+type WorktreeReference struct {
+	Relationship  WorktreeRelationship `json:"relationship"`
+	WorktreeKey   string               `json:"worktree_key,omitempty"`
+	RepositoryKey string               `json:"repository_key,omitempty"`
+}
+
+type CheckoutReference struct {
+	State  CheckoutState `json:"state"`
+	Branch string        `json:"branch,omitempty"`
+}
+
+type ProjectReference struct {
+	ProjectKey   string            `json:"project_key"`
+	DisplayLabel string            `json:"display_label"`
+	Resolution   ProjectResolution `json:"resolution"`
+	Identity     *ProjectIdentity  `json:"identity,omitempty"`
+	Worktree     WorktreeReference `json:"worktree"`
+	Checkout     CheckoutReference `json:"checkout"`
+}
+
+type RemoteSelection struct {
+	Resolution ProjectResolution
+	Name       string
+	Raw        string
+	Normalized string
 }
 
 type ProjectMapEntry struct {
-	Resolution ProjectResolution `json:"resolution"`
-	Identity   *ProjectIdentity  `json:"identity"`
+	DisplayLabel string            `json:"display_label"`
+	ProjectKey   string            `json:"-"`
+	Resolution   ProjectResolution `json:"resolution"`
+	Identity     *ProjectIdentity  `json:"identity,omitempty"`
 }
 
 type ProjectIdentityInput struct {
+	DisplayLabel     string
 	RootPath         string
 	GitRemote        string
 	GitRemoteName    string
+	RemoteSelection  RemoteSelection
+	RepositoryPath   string
 	WorktreeName     string
 	WorktreeRootPath string
+	WorktreeKind     WorktreeRelationship
+	GitBranch        string
+	Detached         bool
 }
 
 type ProjectIdentityObservation struct {
-	Project          string    `json:"project"`
-	Machine          string    `json:"machine"`
-	RootPath         string    `json:"root_path"`
-	GitRemote        string    `json:"git_remote"`
-	GitRemoteName    string    `json:"git_remote_name"`
-	WorktreeName     string    `json:"worktree_name"`
-	WorktreeRootPath string    `json:"worktree_root_path"`
-	ObservedAt       time.Time `json:"observed_at"`
-	NormalizedRemote string    `json:"normalized_remote"`
-	KeySource        string    `json:"key_source"`
-	Key              string    `json:"key"`
+	SessionID            string               `json:"session_id"`
+	SourceArchiveID      string               `json:"-"`
+	SourceArchiveSalt    string               `json:"-"`
+	Project              string               `json:"project"`
+	Machine              string               `json:"machine"`
+	RootPath             string               `json:"root_path"`
+	GitRemote            string               `json:"git_remote"`
+	GitRemoteName        string               `json:"git_remote_name"`
+	RepositoryPath       string               `json:"repository_path"`
+	WorktreeName         string               `json:"worktree_name"`
+	WorktreeRootPath     string               `json:"worktree_root_path"`
+	WorktreeRelationship WorktreeRelationship `json:"worktree_relationship"`
+	CheckoutState        CheckoutState        `json:"checkout_state"`
+	GitBranch            string               `json:"git_branch"`
+	RemoteResolution     ProjectResolution    `json:"remote_resolution"`
+	RemoteCandidateCount int                  `json:"remote_candidate_count"`
+	ObservedAt           time.Time            `json:"observed_at"`
+	NormalizedRemote     string               `json:"normalized_remote"`
+	KeySource            string               `json:"key_source"`
+	Key                  string               `json:"key"`
 }
 
 type SessionExportCursor struct {
@@ -100,7 +188,7 @@ type SessionExportError struct {
 	DatabaseID string `json:"database_id,omitempty"`
 }
 
-// SessionClassification is a closed v1 enum. Adding a value requires a schema
+// SessionClassification is a closed contract enum. Adding a value requires a schema
 // version bump for any export surface that emits it.
 type SessionClassification string
 

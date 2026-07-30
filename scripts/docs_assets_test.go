@@ -69,6 +69,15 @@ func TestHydrateAssetsForceFetchesRemoteAssetBranches(t *testing.T) {
 	screenshot, err := os.ReadFile(filepath.Join(localRepo, "docs", "assets", "generated", "screenshots", "dashboard.png"))
 	require.NoError(t, err)
 	assert.Equal(t, "generated", strings.TrimRight(string(screenshot), "\r\n"))
+
+	semanticSetup, err := os.ReadFile(filepath.Join(
+		localRepo, "docs", "assets", "generated", "screenshots",
+		"semantic-search-setup.png",
+	))
+	require.NoError(t, err)
+	assert.Equal(t, "generated", strings.TrimRight(
+		string(semanticSetup), "\r\n",
+	))
 }
 
 func TestAssetPublishersRejectUnexpectedFiles(t *testing.T) {
@@ -110,6 +119,33 @@ func TestAssetPublishersRejectUnexpectedFiles(t *testing.T) {
 			assert.Contains(t, string(output), ".env.local")
 		})
 	}
+}
+
+func TestGeneratedAssetPublisherAcceptsSemanticSetupScreenshot(t *testing.T) {
+	tempDir := t.TempDir()
+	repo := filepath.Join(tempDir, "repo")
+	sourceDir := filepath.Join(tempDir, "source")
+	require.NoError(t, os.MkdirAll(repo, 0o755))
+	git(t, repo, "init")
+	writeGeneratedAssets(t, sourceDir, "asset")
+
+	scriptPath := installScript(
+		t, repo,
+		filepath.Join("docs", "screenshots", "update-generated-assets-branch.sh"),
+	)
+	cmd := exec.Command("bash", scriptPath, "--source", sourceDir)
+	cmd.Dir = repo
+	output, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(output))
+
+	show := exec.Command(
+		"git", "show",
+		"docs-generated-assets:screenshots/semantic-search-setup.png",
+	)
+	show.Dir = repo
+	published, err := show.Output()
+	require.NoError(t, err)
+	assert.Equal(t, "asset", strings.TrimRight(string(published), "\r\n"))
 }
 
 func TestCheckDocsRejectsCorruptedMarkdownSyntax(t *testing.T) {
@@ -207,6 +243,125 @@ func TestBuiltSiteCheckRequiresMarkdownCompanions(t *testing.T) {
 	assert.Contains(t, string(output), "missing route markdown /")
 }
 
+func TestBuiltSiteCheckRejectsSvgUsePlainHref(t *testing.T) {
+	tests := []struct {
+		name     string
+		useTag   string
+		wantPass bool
+	}{
+		{
+			name:     "plain href breaks instant navigation",
+			useTag:   `<svg viewBox="0 0 24 24"><use href="#icon"/></svg>`,
+			wantPass: false,
+		},
+		{
+			name:     "xlink href is allowed",
+			useTag:   `<svg viewBox="0 0 24 24"><use xlink:href="#icon"/></svg>`,
+			wantPass: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			repo := filepath.Join(tempDir, "repo")
+			require.NoError(t, os.MkdirAll(repo, 0o755))
+
+			checkScript := installScript(t, repo, filepath.Join("docs", "scripts", "check_built_site.py"))
+			siteDir := filepath.Join(repo, "docs", "site")
+			writeMinimalBuiltDocsSite(t, siteDir)
+			writeBuiltSiteMarkdownCompanions(t, siteDir)
+
+			indexPath := filepath.Join(siteDir, "index.html")
+			page, err := os.ReadFile(indexPath)
+			require.NoError(t, err)
+			patched := strings.Replace(string(page), "</body>", tt.useTag+"</body>", 1)
+			require.NoError(t, os.WriteFile(indexPath, []byte(patched), 0o644))
+
+			pythonPath := requireRunnablePython3(t)
+			cmd := exec.Command(pythonPath, checkScript)
+			cmd.Dir = filepath.Join(repo, "docs")
+			output, err := cmd.CombinedOutput()
+
+			if tt.wantPass {
+				require.NoError(t, err, string(output))
+				assert.Contains(t, string(output), "built site checks passed")
+			} else {
+				require.Error(t, err, string(output))
+				assert.Contains(t, string(output), "Use xlink:href instead")
+			}
+		})
+	}
+}
+
+func TestZensicalDocsBuildExcludesScreenshotToolchain(t *testing.T) {
+	tempDir := t.TempDir()
+	repo := filepath.Join(tempDir, "repo")
+	docsDir := filepath.Join(repo, "docs")
+	require.NoError(t, os.MkdirAll(docsDir, 0o755))
+
+	scriptPath := installScript(t, repo,
+		filepath.Join("docs", "zensical-docs.sh"))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(docsDir, "zensical.toml"),
+		[]byte("[project]\ndocs_dir = \"docs\"\nsite_dir = \"site\"\n"),
+		0o644,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(docsDir, "index.md"),
+		[]byte("---\ntitle: Home\ndescription: Home page\n---\n"),
+		0o644,
+	))
+
+	toolchainFile := filepath.Join(
+		docsDir, "screenshots", "node_modules", "playwright-core",
+		"trace-viewer.html",
+	)
+	require.NoError(t, os.MkdirAll(filepath.Dir(toolchainFile), 0o755))
+	require.NoError(t, os.WriteFile(
+		toolchainFile, []byte("private screenshot toolchain\n"), 0o644,
+	))
+	testResultFile := filepath.Join(
+		docsDir, "screenshots", "test-results", "trace.zip",
+	)
+	require.NoError(t, os.MkdirAll(filepath.Dir(testResultFile), 0o755))
+	require.NoError(t, os.WriteFile(
+		testResultFile, []byte("private test trace\n"), 0o644,
+	))
+	publicScreenshot := filepath.Join(
+		docsDir, "assets", "generated", "screenshots", "dashboard.png",
+	)
+	require.NoError(t, os.MkdirAll(filepath.Dir(publicScreenshot), 0o755))
+	require.NoError(t, os.WriteFile(
+		publicScreenshot, []byte("public screenshot\n"), 0o644,
+	))
+
+	fakeZensical := filepath.Join(docsDir, ".venv", "bin", "zensical")
+	require.NoError(t, os.MkdirAll(filepath.Dir(fakeZensical), 0o755))
+	require.NoError(t, os.WriteFile(fakeZensical, []byte(`#!/usr/bin/env bash
+set -euo pipefail
+public_docs="$(find . -maxdepth 1 -type d -name 'zensical-public-docs.*' -print -quit)"
+mkdir -p site
+cp -R "$public_docs"/. site/
+`), 0o755))
+
+	cmd := exec.Command("bash", scriptPath, "build")
+	cmd.Dir = docsDir
+	output, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(output))
+	assert.FileExists(t, filepath.Join(docsDir, "site", "index.md"))
+	assert.FileExists(t, filepath.Join(
+		docsDir, "site", "assets", "generated", "screenshots",
+		"dashboard.png",
+	))
+	assert.NoFileExists(t, filepath.Join(
+		docsDir, "site", "screenshots", "node_modules", "playwright-core",
+		"trace-viewer.html",
+	))
+	assert.NoFileExists(t, filepath.Join(
+		docsDir, "site", "screenshots", "test-results", "trace.zip",
+	))
+}
+
 func installScript(t *testing.T, repo, scriptRel string) string {
 	t.Helper()
 	script, err := os.ReadFile(filepath.Join("..", scriptRel))
@@ -233,29 +388,30 @@ func requireRunnablePython3(t *testing.T) string {
 	return pythonPath
 }
 
+var builtDocsRoutes = []string{
+	"/",
+	"/quickstart/",
+	"/usage/",
+	"/activity/",
+	"/recent-edits/",
+	"/session-intelligence/",
+	"/mcp/",
+	"/token-usage/",
+	"/chat-import/",
+	"/insights/",
+	"/commands/",
+	"/stats/",
+	"/session-api/",
+	"/configuration/",
+	"/remote-access/",
+	"/pg-sync/",
+	"/duckdb/",
+	"/changelog/",
+}
+
 func writeMinimalBuiltDocsSite(t *testing.T, siteDir string) {
 	t.Helper()
-	routes := []string{
-		"/",
-		"/quickstart/",
-		"/usage/",
-		"/activity/",
-		"/recent-edits/",
-		"/session-intelligence/",
-		"/mcp/",
-		"/token-usage/",
-		"/chat-import/",
-		"/insights/",
-		"/commands/",
-		"/stats/",
-		"/session-api/",
-		"/configuration/",
-		"/remote-access/",
-		"/pg-sync/",
-		"/duckdb/",
-		"/changelog/",
-	}
-	for _, route := range routes {
+	for _, route := range builtDocsRoutes {
 		path := filepath.Join(siteDir, strings.Trim(route, "/"), "index.html")
 		if route == "/" {
 			path = filepath.Join(siteDir, "index.html")
@@ -278,6 +434,17 @@ func writeMinimalBuiltDocsSite(t *testing.T, siteDir string) {
 		[]byte("<urlset><url><loc>https://agentsview.io/</loc></url></urlset>\n"),
 		0o644,
 	))
+}
+
+func writeBuiltSiteMarkdownCompanions(t *testing.T, siteDir string) {
+	t.Helper()
+	for _, route := range builtDocsRoutes {
+		path := filepath.Join(siteDir, strings.Trim(route, "/")+".md")
+		if route == "/" {
+			path = filepath.Join(siteDir, "index.md")
+		}
+		require.NoError(t, os.WriteFile(path, []byte("# Page\n"), 0o644))
+	}
 }
 
 func minimalDocsHTML(ids []string) string {
@@ -368,17 +535,22 @@ func writeGeneratedAssets(t *testing.T, dir, content string) {
 		"screenshots/resync-modal.png",
 		"screenshots/search-grouped.png",
 		"screenshots/search-results.png",
+		"screenshots/semantic-search-setup.png",
 		"screenshots/session-filtered.png",
 		"screenshots/session-filters-active.png",
 		"screenshots/session-filters.png",
 		"screenshots/session-health.png",
+		"screenshots/session-insight-action.png",
 		"screenshots/session-list.png",
+		"screenshots/session-resume-menu.png",
 		"screenshots/session-shape.png",
 		"screenshots/session-vital-signs.png",
+		"screenshots/settings-embeddings.png",
 		"screenshots/settings-remote.png",
 		"screenshots/settings.png",
 		"screenshots/shortcuts-modal.png",
 		"screenshots/signal-panel.png",
+		"screenshots/skill-trends.png",
 		"screenshots/starred-session.png",
 		"screenshots/subagent-tree.png",
 		"screenshots/summary-cards.png",
@@ -386,6 +558,7 @@ func writeGeneratedAssets(t *testing.T, dir, content string) {
 		"screenshots/theme-light.png",
 		"screenshots/thinking-blocks.png",
 		"screenshots/token-usage.png",
+		"screenshots/tool-block-copy-btn.png",
 		"screenshots/tool-blocks.png",
 		"screenshots/tool-groups.png",
 		"screenshots/tool-usage.png",

@@ -12,22 +12,26 @@ import (
 var _ Provider = (*codexProvider)(nil)
 
 type codexProviderFactory struct {
-	def AgentDef
+	def         AgentDef
+	cursorCache *codexCursorCache
 }
 
 func newCodexProviderFactory(def AgentDef) ProviderFactory {
-	return codexProviderFactory{def: cloneAgentDef(def)}
+	return &codexProviderFactory{
+		def:         cloneAgentDef(def),
+		cursorCache: newProductionCodexCursorCache(),
+	}
 }
 
-func (f codexProviderFactory) Definition() AgentDef {
+func (f *codexProviderFactory) Definition() AgentDef {
 	return cloneAgentDef(f.def)
 }
 
-func (f codexProviderFactory) Capabilities() Capabilities {
+func (f *codexProviderFactory) Capabilities() Capabilities {
 	return codexProviderCapabilities()
 }
 
-func (f codexProviderFactory) NewProvider(cfg ProviderConfig) Provider {
+func (f *codexProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
 	return &codexProvider{
 		ProviderBase: ProviderBase{
@@ -35,17 +39,23 @@ func (f codexProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 			Caps:   codexProviderCapabilities(),
 			Config: cfg,
 		},
-		sources: newCodexSourceSet(cfg.Roots),
+		sources:     newCodexSourceSet(cfg.Roots),
+		cursorCache: f.cursorCache,
 	}
 }
 
 type codexProvider struct {
 	ProviderBase
-	sources codexSourceSet
+	sources     codexSourceSet
+	cursorCache *codexCursorCache
 }
 
 func (p *codexProvider) Discover(ctx context.Context) ([]SourceRef, error) {
 	return p.sources.Discover(ctx)
+}
+
+func (p *codexProvider) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	return p.sources.DiscoverEach(ctx, yield)
 }
 
 func (p *codexProvider) WatchPlan(ctx context.Context) (WatchPlan, error) {
@@ -133,6 +143,9 @@ func (p *codexProvider) Parse(
 	if !ok {
 		return ParseOutcome{}, fmt.Errorf("codex source path unavailable")
 	}
+	if req.ForceParse {
+		EvictCodexSessionIndexForSession(path)
+	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
 	sess, msgs, err := p.parseSession(path, machine, false)
 	if err != nil {
@@ -156,10 +169,10 @@ func (p *codexProvider) Parse(
 			DataVersion: DataVersionCurrent,
 		}},
 		ResultSetComplete: true,
-		// Codex transcripts are append-only and the provider always emits a full
-		// parse (it does not advertise incremental append). A full parse is the
-		// authoritative message set, so force-replace the stored rows; this
-		// preserves the legacy behavior where a late token_count line appended to
+		// A requested full parse is the authoritative message set, so
+		// force-replace the stored rows; this remains distinct from the provider's
+		// incremental append path and preserves the legacy behavior where a late
+		// token_count line appended to
 		// an existing turn rewrites the stored message instead of being dropped by
 		// an append-only write.
 		ForceReplace: true,
@@ -168,12 +181,105 @@ func (p *codexProvider) Parse(
 
 func (p *codexProvider) ParseIncremental(
 	ctx context.Context,
-	_ IncrementalRequest,
+	req IncrementalRequest,
 ) (IncrementalOutcome, IncrementalStatus, error) {
 	if err := ctx.Err(); err != nil {
 		return IncrementalOutcome{}, IncrementalUnsupported, err
 	}
-	return IncrementalOutcome{}, IncrementalUnsupported, nil
+	path, ok := p.sources.pathFromSource(req.Source)
+	if !ok {
+		return IncrementalOutcome{}, IncrementalUnsupported,
+			fmt.Errorf("codex source path unavailable")
+	}
+	if req.Offset < 0 || req.Fingerprint.Size < req.Offset {
+		return IncrementalOutcome{ForceReplace: true},
+			IncrementalNeedsFullParse, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return IncrementalOutcome{}, IncrementalNeedsFullParse, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return IncrementalOutcome{}, IncrementalNeedsFullParse, err
+	}
+	inode, device := sourceFileIdentity(info)
+	if (req.Fingerprint.Inode != 0 && req.Fingerprint.Inode != inode) ||
+		(req.Fingerprint.Device != 0 && req.Fingerprint.Device != device) ||
+		info.Size() < req.Fingerprint.Size {
+		return IncrementalOutcome{ForceReplace: true},
+			IncrementalNeedsFullParse, nil
+	}
+	safe, err := codexSafeResumeOffsetFile(f, req.Offset)
+	if err != nil {
+		return IncrementalOutcome{}, IncrementalNeedsFullParse, err
+	}
+	if !safe {
+		return IncrementalOutcome{ForceReplace: true},
+			IncrementalNeedsFullParse, nil
+	}
+	if req.Fingerprint.Size == req.Offset {
+		return IncrementalOutcome{}, IncrementalNoNewData, nil
+	}
+
+	result, err := p.parseSessionFromSnapshot(
+		path,
+		req.Offset,
+		req.StartOrdinal,
+		false,
+		f,
+		info,
+		req.Fingerprint.Size,
+	)
+	if err != nil {
+		if IsIncrementalFullParseFallback(err) {
+			return IncrementalOutcome{ForceReplace: true},
+				IncrementalNeedsFullParse, nil
+		}
+		return IncrementalOutcome{}, IncrementalNeedsFullParse, err
+	}
+	if !result.initialCursor.firstUserSeen && result.cursor.firstUserSeen {
+		// The stored session has no genuine first prompt yet, so appending this
+		// tail would leave its persisted FirstMessage preview stale. A full parse
+		// can rebuild both the messages and the session summary atomically.
+		return IncrementalOutcome{ForceReplace: true},
+			IncrementalNeedsFullParse, nil
+	}
+	p.cursorCache.Put(
+		path,
+		req.Offset,
+		result.inode,
+		result.device,
+		result.initialCursor,
+	)
+	if result.consumedBytes == 0 {
+		return IncrementalOutcome{}, IncrementalNoNewData, nil
+	}
+	p.cursorCache.Put(
+		path,
+		req.Offset+result.consumedBytes,
+		result.inode,
+		result.device,
+		result.cursor,
+	)
+
+	totalOut, peakCtx, hasTotalOut, hasPeakCtx :=
+		codexProviderTokenTotals(result.messages)
+	termination := codexIncrementalTermination(result.cursor.lastTaskEvent)
+	return IncrementalOutcome{
+		SessionID:            req.SessionID,
+		Messages:             result.messages,
+		EndedAt:              result.endedAt,
+		ConsumedBytes:        result.consumedBytes,
+		MessageCount:         len(result.messages),
+		UserMessageCount:     codexProviderUserMessageCount(result.messages),
+		TotalOutputTokens:    totalOut,
+		PeakContextTokens:    peakCtx,
+		HasTotalOutputTokens: hasTotalOut,
+		HasPeakContextTokens: hasPeakCtx,
+		TerminationStatus:    termination,
+	}, IncrementalApplied, nil
 }
 
 type codexSource struct {
@@ -193,6 +299,46 @@ func newCodexSourceSet(roots []string) codexSourceSet {
 
 func (s codexSourceSet) Discover(ctx context.Context) ([]SourceRef, error) {
 	return s.discover(ctx, func(string) bool { return true })
+}
+
+func (s codexSourceSet) DiscoverEach(
+	ctx context.Context, yield func(SourceRef) error,
+) error {
+	for _, root := range s.roots {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if strings.HasPrefix(root, "s3://") {
+			for _, file := range discoverCodexS3(root) {
+				if err := yield(s3SourceRefFromDiscoveredFile(file)); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		err := streamDirectoryTree(ctx, root, func(path string, entry os.DirEntry) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if !isCodexSessionFilename(entry.Name()) {
+				return nil
+			}
+			source, ok := s.sourceRef(root, path, true)
+			if !ok {
+				if _, _, supported := CodexSessionPathInfo(root, path); supported {
+					source, ok = s.directPathSource(root, path, true)
+				}
+			}
+			if !ok {
+				return nil
+			}
+			return yield(source)
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s codexSourceSet) discover(
@@ -466,10 +612,13 @@ func (s codexSourceSet) Fingerprint(
 	if err != nil {
 		return SourceFingerprint{}, err
 	}
+	inode, device := sourceFileIdentity(info)
 	return SourceFingerprint{
 		Key:     firstNonEmptyJSONLString(source.FingerprintKey, source.Key, path),
 		Size:    info.Size(),
 		MTimeNS: CodexEffectiveMtime(path, info.ModTime().UnixNano()),
+		Inode:   inode,
+		Device:  device,
 		Hash:    hash,
 	}, nil
 }
@@ -602,6 +751,14 @@ func codexSourceKey(uuid string) string {
 	return string(AgentCodex) + ":" + uuid
 }
 
+// CodexSourceKey is the discovery identity of a Codex session UUID. Every
+// on-disk copy of a duplicated UUID shares this key, so the sync engine's
+// reconciliation index resolves same-UUID replacements with one bounded
+// lookup instead of an archive walk.
+func CodexSourceKey(uuid string) string {
+	return codexSourceKey(uuid)
+}
+
 func preferCodexSource(candidate, current SourceRef) bool {
 	cand := candidate.Opaque.(codexSource)
 	curr := current.Opaque.(codexSource)
@@ -611,19 +768,58 @@ func preferCodexSource(candidate, current SourceRef) bool {
 	return candidate.DisplayPath < current.DisplayPath
 }
 
+func codexProviderUserMessageCount(messages []ParsedMessage) int {
+	count := 0
+	for _, message := range messages {
+		if message.Role == RoleUser && message.Content != "" {
+			count++
+		}
+	}
+	return count
+}
+
+func codexProviderTokenTotals(
+	messages []ParsedMessage,
+) (totalOut int, peakCtx int, hasTotalOut bool, hasPeakCtx bool) {
+	for _, message := range messages {
+		if message.HasOutputTokens {
+			totalOut += message.OutputTokens
+			hasTotalOut = true
+		}
+		if message.HasContextTokens &&
+			(!hasPeakCtx || message.ContextTokens > peakCtx) {
+			peakCtx = message.ContextTokens
+			hasPeakCtx = true
+		}
+	}
+	return totalOut, peakCtx, hasTotalOut, hasPeakCtx
+}
+
+func codexIncrementalTermination(
+	lastTaskEvent string,
+) *TerminationStatus {
+	status := classifyCodexTermination(lastTaskEvent)
+	if status == "" {
+		return nil
+	}
+	return &status
+}
+
 func codexProviderCapabilities() Capabilities {
 	return Capabilities{
 		Source: SourceCapabilities{
 			DiscoverSources:      CapabilitySupported,
+			StreamingDiscovery:   CapabilitySupported,
 			WatchSources:         CapabilitySupported,
 			ClassifyChangedPath:  CapabilitySupported,
 			FindSource:           CapabilitySupported,
 			CompositeFingerprint: CapabilitySupported,
-			IncrementalAppend:    CapabilityNotApplicable,
+			IncrementalAppend:    CapabilitySupported,
 			MultiSessionSource:   CapabilityNotApplicable,
 			PerSessionErrors:     CapabilityNotApplicable,
 			ExcludedSessions:     CapabilityNotApplicable,
 			ForceReplaceOnParse:  CapabilitySupported,
+			VerifiedLocalStat:    CapabilitySupported,
 		},
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
