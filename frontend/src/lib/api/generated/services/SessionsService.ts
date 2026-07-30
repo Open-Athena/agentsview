@@ -77,6 +77,9 @@ export class SessionsService {
     termination,
     minToolFailures,
     hasSecret,
+    starred,
+    orderBy = 'recent',
+    descending,
   }: {
     /**
      * Filter by project
@@ -162,6 +165,18 @@ export class SessionsService {
      * Filter sessions with secret findings
      */
     hasSecret?: boolean,
+    /**
+     * Filter sessions by starred status
+     */
+    starred?: boolean,
+    /**
+     * Sort field
+     */
+    orderBy?: 'recent' | 'started' | 'messages' | 'user-messages' | 'output-tokens' | 'peak-context' | 'failures' | 'retries' | 'edit-churn' | 'compactions' | 'context-pressure' | 'health' | 'secrets' | 'id',
+    /**
+     * Sort descending; overrides the sort field's default direction
+     */
+    descending?: boolean,
   }): CancelablePromise<ServiceSessionList> {
     return __request(OpenAPI, {
       method: 'GET',
@@ -188,6 +203,9 @@ export class SessionsService {
         'termination': termination,
         'min_tool_failures': minToolFailures,
         'has_secret': hasSecret,
+        'starred': starred,
+        'order_by': orderBy,
+        'descending': descending,
       },
       errors: {
         400: `Bad Request`,
@@ -231,6 +249,9 @@ export class SessionsService {
     termination,
     minToolFailures,
     hasSecret,
+    starred,
+    orderBy = 'recent',
+    descending,
   }: {
     /**
      * Filter by project
@@ -316,6 +337,18 @@ export class SessionsService {
      * Filter sessions with secret findings
      */
     hasSecret?: boolean,
+    /**
+     * Filter sessions by starred status
+     */
+    starred?: boolean,
+    /**
+     * Sort field
+     */
+    orderBy?: 'recent' | 'started' | 'messages' | 'user-messages' | 'output-tokens' | 'peak-context' | 'failures' | 'retries' | 'edit-churn' | 'compactions' | 'context-pressure' | 'health' | 'secrets' | 'id',
+    /**
+     * Sort descending; overrides the sort field's default direction
+     */
+    descending?: boolean,
   }): CancelablePromise<DbSidebarSessionIndex> {
     return __request(OpenAPI, {
       method: 'GET',
@@ -342,6 +375,9 @@ export class SessionsService {
         'termination': termination,
         'min_tool_failures': minToolFailures,
         'has_secret': hasSecret,
+        'starred': starred,
+        'order_by': orderBy,
+        'descending': descending,
       },
       errors: {
         400: `Bad Request`,
@@ -821,17 +857,25 @@ export class SessionsService {
    */
   public static postApiV1SessionsIdPublish({
     id,
+    secret,
   }: {
     /**
      * Session ID
      */
     id: string,
+    /**
+     * Create a secret gist instead of a public one
+     */
+    secret?: boolean,
   }): CancelablePromise<PublishResponse> {
     return __request(OpenAPI, {
       method: 'POST',
       url: '/api/v1/sessions/{id}/publish',
       path: {
         'id': id,
+      },
+      query: {
+        'secret': secret,
       },
       errors: {
         400: `Bad Request`,

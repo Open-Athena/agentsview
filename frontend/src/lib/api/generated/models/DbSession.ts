@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { DbQualitySignals } from './DbQualitySignals';
 export type DbSession = {
   agent: string;
   compaction_count: number;
@@ -41,6 +42,7 @@ export type DbSession = {
   peak_context_tokens: number;
   private: boolean;
   project: string;
+  quality_signals?: DbQualitySignals;
   relationship_type?: string;
   secret_leak_count: number;
   signals_pending_since?: string;

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"math"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,6 +28,90 @@ func TestGetDailyUsageEmpty(t *testing.T) {
 	require.NotNil(t, result.Daily, "Daily should be non-nil empty slice")
 	assert.Len(t, result.Daily, 0, "got")
 	assert.Equal(t, 0.0, result.Totals.TotalCost, "TotalCost")
+}
+
+func TestUsageRowQueryPushesDateBoundsIntoUnion(t *testing.T) {
+	query, args := usageRowQuery(UsageFilter{
+		From:             "2024-06-01",
+		To:               "2024-06-30",
+		ExcludeAutomated: true,
+	})
+
+	normalized := strings.ToLower(query)
+	assert.NotContains(t, normalized, "and u.ts >=")
+	assert.NotContains(t, normalized, "and u.ts <=")
+	assert.NotContains(t, normalized, " or ")
+	assert.NotContains(t, normalized, "display_name")
+	assert.NotContains(t, normalized, "first_message")
+	assert.NotContains(t, normalized, "cost_status")
+	assert.NotContains(t, normalized, "cost_source")
+	assert.NotContains(t, normalized, "reasoning_tokens")
+	assert.NotContains(t, normalized, "user_message_count")
+	assert.NotContains(t, normalized, "session_activity_at")
+	assert.NotContains(t, normalized, " as started_at")
+	assert.NotContains(t, normalized, "u.machine")
+	assert.Contains(t, normalized, "message_timestamp_rows as materialized")
+	assert.Contains(t, normalized, "usage_event_timestamp_rows as materialized")
+	assert.Contains(t, normalized, "from message_timestamp_rows m\njoin sessions s")
+	assert.Contains(t, normalized, "from usage_event_timestamp_rows ue\njoin sessions s")
+	assert.Contains(t, normalized, "m.timestamp is not null")
+	assert.Contains(t, normalized, "ue.occurred_at is not null")
+	assert.Contains(t, normalized, "m.timestamp is null")
+	assert.Contains(t, normalized, "ue.occurred_at is null")
+	assert.Contains(t, normalized, "m.timestamp >= ?")
+	assert.Contains(t, normalized, "ue.occurred_at >= ?")
+	assert.Contains(t, normalized, "s.started_at >= ?")
+	assert.Contains(t, normalized, "m.timestamp <= ?")
+	assert.Contains(t, normalized, "ue.occurred_at <= ?")
+	assert.Contains(t, normalized, "s.started_at <= ?")
+	require.Len(t, args, 8)
+	assert.Equal(t, "2024-05-31T10:00:00Z", args[0])
+	assert.Equal(t, "2024-07-01T13:59:59Z", args[1])
+	assert.Equal(t, "2024-05-31T10:00:00Z", args[2])
+	assert.Equal(t, "2024-07-01T13:59:59Z", args[3])
+	assert.Equal(t, "2024-05-31T10:00:00Z", args[4])
+	assert.Equal(t, "2024-07-01T13:59:59Z", args[5])
+	assert.Equal(t, "2024-05-31T10:00:00Z", args[6])
+	assert.Equal(t, "2024-07-01T13:59:59Z", args[7])
+}
+
+func TestTopSessionsUsageRowQueryUsesNarrowScan(t *testing.T) {
+	query, args := topSessionsUsageRowQuery(UsageFilter{
+		From: "2024-06-01",
+		To:   "2024-06-30",
+	})
+
+	normalized := strings.ToLower(query)
+	assert.NotContains(t, normalized, "display_name")
+	assert.NotContains(t, normalized, "first_message")
+	assert.NotContains(t, normalized, "cost_status")
+	assert.NotContains(t, normalized, "cost_source")
+	assert.NotContains(t, normalized, "reasoning_tokens")
+	assert.NotContains(t, normalized, "user_message_count")
+	assert.NotContains(t, normalized, "session_activity_at")
+	assert.NotContains(t, normalized, " as started_at")
+	assert.NotContains(t, normalized, "u.machine")
+	assert.Contains(t, normalized, "m.timestamp is not null")
+	assert.Contains(t, normalized, "ue.occurred_at is not null")
+	assert.Contains(t, normalized, "m.timestamp is null")
+	assert.Contains(t, normalized, "ue.occurred_at is null")
+	assert.Contains(t, normalized, "m.timestamp >= ?")
+	assert.Contains(t, normalized, "ue.occurred_at >= ?")
+	assert.Contains(t, normalized,
+		"m.timestamp is null\n\tand s.started_at >= ?")
+	assert.Contains(t, normalized,
+		"ue.occurred_at is null\n\tand s.started_at >= ?")
+	assert.Contains(t, normalized, "m.timestamp <= ?")
+	assert.Contains(t, normalized, "ue.occurred_at <= ?")
+	require.Len(t, args, 8)
+	assert.Equal(t, "2024-05-31T10:00:00Z", args[0])
+	assert.Equal(t, "2024-07-01T13:59:59Z", args[1])
+	assert.Equal(t, "2024-05-31T10:00:00Z", args[2])
+	assert.Equal(t, "2024-07-01T13:59:59Z", args[3])
+	assert.Equal(t, "2024-05-31T10:00:00Z", args[4])
+	assert.Equal(t, "2024-07-01T13:59:59Z", args[5])
+	assert.Equal(t, "2024-05-31T10:00:00Z", args[6])
+	assert.Equal(t, "2024-07-01T13:59:59Z", args[7])
 }
 
 func TestUsageEventsReplaceAndList(t *testing.T) {
@@ -564,6 +649,46 @@ func TestGetDailyUsageTruncatedTokenJSON(t *testing.T) {
 	assert.Equal(t, 4742, day.OutputTokens, "OutputTokens")
 }
 
+func TestParseUsageTokenCounters(t *testing.T) {
+	in, out, cacheCreate, cacheRead, cr5m, cr1h := parseUsageTokenCounters(
+		`{"input_tokens":100,"output_tokens":50,` +
+			`"cache_creation_input_tokens":20,` +
+			`"cache_read_input_tokens":300}`,
+	)
+	assert.Equal(t, 100, in)
+	assert.Equal(t, 50, out)
+	assert.Equal(t, 20, cacheCreate)
+	assert.Equal(t, 300, cacheRead)
+	assert.Zero(t, cr5m, "no ephemeral split present")
+	assert.Zero(t, cr1h, "no ephemeral split present")
+
+	in, out, cacheCreate, cacheRead, cr5m, cr1h = parseUsageTokenCounters(
+		`{"input_tokens":9999,"output_tokens":4242,"ca`,
+	)
+	assert.Equal(t, 9999, in)
+	assert.Equal(t, 4242, out)
+	assert.Zero(t, cacheCreate)
+	assert.Zero(t, cacheRead)
+	assert.Zero(t, cr5m)
+	assert.Zero(t, cr1h)
+
+	// The nested cache_creation object splits the total by ephemeral TTL;
+	// the flat scanner picks up both keys wherever they appear.
+	in, out, cacheCreate, cacheRead, cr5m, cr1h = parseUsageTokenCounters(
+		`{"input_tokens":10,"output_tokens":5,` +
+			`"cache_creation_input_tokens":40,` +
+			`"cache_creation":{"ephemeral_5m_input_tokens":30,` +
+			`"ephemeral_1h_input_tokens":10},` +
+			`"cache_read_input_tokens":7}`,
+	)
+	assert.Equal(t, 10, in)
+	assert.Equal(t, 5, out)
+	assert.Equal(t, 40, cacheCreate)
+	assert.Equal(t, 7, cacheRead)
+	assert.Equal(t, 30, cr5m)
+	assert.Equal(t, 10, cr1h)
+}
+
 func TestGetDailyUsage_DedupesByClaudeMessageAndRequestID(t *testing.T) {
 	d := testDB(t)
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
@@ -605,6 +730,65 @@ func TestGetDailyUsage_DedupesByClaudeMessageAndRequestID(t *testing.T) {
 			VALUES (?, ?, 'assistant', '', ?, 'claude-opus-4-6', ?, ?, ?, 1, 1)`,
 			row.sid, row.ord, row.ts, row.usage, row.mid, row.rid)
 	}
+
+	result, err := d.GetDailyUsage(context.Background(), UsageFilter{
+		From: "2026-04-10", To: "2026-04-10", Timezone: "UTC",
+	})
+	require.NoError(t, err, "GetDailyUsage")
+	require.Len(t, result.Daily, 1, "daily entries =")
+	day := result.Daily[0]
+	assert.Equal(t, 120, day.InputTokens, "input")
+	assert.Equal(t, 580, day.OutputTokens, "output")
+	assert.Equal(t, 1200, day.CacheCreationTokens, "cache_cr")
+	assert.Equal(t, 55000, day.CacheReadTokens, "cache_rd")
+}
+
+func TestGetDailyUsage_DedupesBySourceUUIDWhenClaudePairIncomplete(t *testing.T) {
+	d := testDB(t)
+	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
+		ModelPattern:         "claude-opus-4-6",
+		InputPerMTok:         15.0,
+		OutputPerMTok:        75.0,
+		CacheCreationPerMTok: 18.75,
+		CacheReadPerMTok:     1.50,
+	}}), "seed pricing")
+
+	insertSession(t, d, "s-main", "proj", func(s *Session) {
+		s.Agent = "claude"
+		s.StartedAt = new("2026-04-10T10:00:00Z")
+		s.EndedAt = new("2026-04-10T10:05:00Z")
+	})
+	insertSession(t, d, "s-fork", "proj", func(s *Session) {
+		s.Agent = "claude"
+		s.StartedAt = new("2026-04-10T10:01:00Z")
+		s.EndedAt = new("2026-04-10T10:06:00Z")
+		s.ParentSessionID = new("s-main")
+		s.RelationshipType = "fork"
+	})
+
+	shared := json.RawMessage(`{"input_tokens":100,"output_tokens":500,"cache_creation_input_tokens":1000,"cache_read_input_tokens":50000}`)
+	unique := json.RawMessage(`{"input_tokens":20,"output_tokens":80,"cache_creation_input_tokens":200,"cache_read_input_tokens":5000}`)
+
+	insertMessages(t, d,
+		Message{
+			SessionID: "s-main", Ordinal: 0,
+			Role: "assistant", Timestamp: "2026-04-10T10:02:00Z",
+			Model: "claude-opus-4-6", TokenUsage: shared,
+			ClaudeMessageID: "msg_dup", SourceUUID: "source_dup",
+		},
+		Message{
+			SessionID: "s-fork", Ordinal: 0,
+			Role: "assistant", Timestamp: "2026-04-10T10:02:00Z",
+			Model: "claude-opus-4-6", TokenUsage: shared,
+			ClaudeMessageID: "msg_dup", SourceUUID: "source_dup",
+		},
+		Message{
+			SessionID: "s-fork", Ordinal: 1,
+			Role: "assistant", Timestamp: "2026-04-10T10:03:00Z",
+			Model: "claude-opus-4-6", TokenUsage: unique,
+			ClaudeMessageID: "msg_uniq", SourceUUID: "source_uniq",
+		},
+	)
 
 	result, err := d.GetDailyUsage(context.Background(), UsageFilter{
 		From: "2026-04-10", To: "2026-04-10", Timezone: "UTC",
@@ -1048,7 +1232,7 @@ func TestGetTopSessionsByCost(t *testing.T) {
 	// Expensive session
 	insertSession(t, d, "sBig", "proj-a", func(s *Session) {
 		s.Agent = "claude"
-		s.DisplayName = new("Big Session")
+		s.SessionName = new("Big Session")
 		s.StartedAt = new("2024-06-15T10:00:00Z")
 	})
 	insertMessages(t, d, Message{
@@ -1064,7 +1248,7 @@ func TestGetTopSessionsByCost(t *testing.T) {
 	// Cheap session
 	insertSession(t, d, "sSmall", "proj-b", func(s *Session) {
 		s.Agent = "codex"
-		s.DisplayName = new("Small Session")
+		s.SessionName = new("Small Session")
 		s.StartedAt = new("2024-06-15T11:00:00Z")
 	})
 	insertMessages(t, d, Message{
@@ -1114,10 +1298,10 @@ func TestGetTopSessionsByCost_DisplayNameFallback(t *testing.T) {
 	tokenJSON := `{"input_tokens":100,"output_tokens":50,` +
 		`"cache_creation_input_tokens":0,"cache_read_input_tokens":0}`
 
-	// Session with display_name set — should use display_name.
+	// Session with session_name set — should use session_name via COALESCE.
 	insertSession(t, d, "s-dn", "proj-a", func(s *Session) {
 		s.Agent = "claude"
-		s.DisplayName = new("My Custom Name")
+		s.SessionName = new("My Custom Name")
 		s.FirstMessage = new("some first message")
 		s.StartedAt = new("2024-06-15T10:00:00Z")
 	})
@@ -1289,6 +1473,79 @@ func TestGetTopSessionsByCost_DedupesByClaudeMessageAndRequestID(
 	assert.Equal(t, 4730, total, "sum of per-session totals")
 }
 
+func TestGetTopSessionsByCost_DedupesBySourceUUIDWhenClaudePairIncomplete(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
+		ModelPattern:         "claude-sonnet",
+		InputPerMTok:         3.0,
+		OutputPerMTok:        15.0,
+		CacheCreationPerMTok: 3.75,
+		CacheReadPerMTok:     0.30,
+	}}), "UpsertModelPricing")
+
+	insertSession(t, d, "s-parent", "proj", func(s *Session) {
+		s.Agent = "claude"
+		s.StartedAt = new("2024-06-15T10:00:00Z")
+	})
+	insertSession(t, d, "s-fork", "proj", func(s *Session) {
+		s.Agent = "claude"
+		s.StartedAt = new("2024-06-15T10:01:00Z")
+		s.ParentSessionID = new("s-parent")
+		s.RelationshipType = "fork"
+	})
+
+	shared := json.RawMessage(
+		`{"input_tokens":1000,"output_tokens":500,` +
+			`"cache_creation_input_tokens":200,` +
+			`"cache_read_input_tokens":3000}`)
+	unique := json.RawMessage(
+		`{"input_tokens":10,"output_tokens":20,` +
+			`"cache_creation_input_tokens":0,` +
+			`"cache_read_input_tokens":0}`)
+
+	insertMessages(t, d, Message{
+		SessionID: "s-parent", Ordinal: 0,
+		Role: "assistant", Timestamp: "2024-06-15T10:02:00Z",
+		Model: "claude-sonnet", TokenUsage: shared,
+		ClaudeMessageID: "msg_dup", SourceUUID: "source_dup",
+	})
+	insertMessages(t, d, Message{
+		SessionID: "s-fork", Ordinal: 0,
+		Role: "assistant", Timestamp: "2024-06-15T10:03:00Z",
+		Model: "claude-sonnet", TokenUsage: shared,
+		ClaudeMessageID: "msg_dup", SourceUUID: "source_dup",
+	})
+	insertMessages(t, d, Message{
+		SessionID: "s-fork", Ordinal: 1,
+		Role: "assistant", Timestamp: "2024-06-15T10:04:00Z",
+		Model: "claude-sonnet", TokenUsage: unique,
+		ClaudeMessageID: "msg_uniq", SourceUUID: "source_uniq",
+	})
+
+	top, err := d.GetTopSessionsByCost(ctx, UsageFilter{
+		From: "2024-06-15", To: "2024-06-15", Timezone: "UTC",
+	}, 20)
+	requireNoError(t, err, "GetTopSessionsByCost")
+
+	require.Len(t, top, 2, "len")
+	byID := map[string]TopSessionEntry{}
+	for _, e := range top {
+		byID[e.SessionID] = e
+	}
+
+	parent, ok := byID["s-parent"]
+	require.True(t, ok, "s-parent missing from top sessions")
+	assert.Equal(t, 4700, parent.TotalTokens, "parent.TotalTokens")
+
+	fork, ok := byID["s-fork"]
+	require.True(t, ok, "s-fork missing from top sessions")
+	assert.Equal(t, 30, fork.TotalTokens, "fork.TotalTokens want 30")
+}
+
 func TestGetTopSessionsByCostLimit(t *testing.T) {
 	d := testDB(t)
 	ctx := context.Background()
@@ -1386,6 +1643,43 @@ func TestGetUsageSessionCounts(t *testing.T) {
 	assert.Equal(t, 1, counts.ByProject["proj-b"], "ByProject[proj-b]")
 	assert.Equal(t, 2, counts.ByAgent["claude"], "ByAgent[claude]")
 	assert.Equal(t, 1, counts.ByAgent["codex"], "ByAgent[codex]")
+
+	daily, err := d.GetDailyUsage(ctx, UsageFilter{
+		From: "2024-06-01",
+		To:   "2024-06-30",
+	})
+	requireNoError(t, err, "GetDailyUsage")
+	assert.Equal(t, counts, daily.SessionCounts)
+
+	dailyNoCounts, err := d.GetDailyUsage(ctx, UsageFilter{
+		From:              "2024-06-01",
+		To:                "2024-06-30",
+		SkipSessionCounts: true,
+	})
+	requireNoError(t, err, "GetDailyUsage skip counts")
+	assert.Equal(t, daily.Daily, dailyNoCounts.Daily)
+	assert.Equal(t, daily.Totals, dailyNoCounts.Totals)
+	assert.Zero(t, dailyNoCounts.SessionCounts.Total)
+	assert.Nil(t, dailyNoCounts.SessionCounts.ByProject)
+	assert.Nil(t, dailyNoCounts.SessionCounts.ByAgent)
+}
+
+func TestNewUsageSessionCounts(t *testing.T) {
+	counts := NewUsageSessionCounts(map[string]UsageSessionInfo{
+		"s1": {Project: "proj-a", Agent: "claude"},
+		"s2": {Project: "proj-a", Agent: "codex"},
+		"s3": {Project: "proj-b", Agent: "claude"},
+	})
+
+	assert.Equal(t, 3, counts.Total, "Total")
+	assert.Equal(t, map[string]int{
+		"proj-a": 2,
+		"proj-b": 1,
+	}, counts.ByProject, "ByProject")
+	assert.Equal(t, map[string]int{
+		"claude": 2,
+		"codex":  1,
+	}, counts.ByAgent, "ByAgent")
 }
 
 // TestGetUsageSessionCounts_DedupesByClaudeMessageAndRequestID
@@ -1442,6 +1736,48 @@ func TestGetUsageSessionCounts_DedupesByClaudeMessageAndRequestID(
 
 	assert.Equal(t, 1, counts.Total,
 		"Total want 1 (fork should dedup out)")
+	assert.Equal(t, 1, counts.ByProject["proj"], "ByProject[proj]")
+	assert.Equal(t, 1, counts.ByAgent["claude"], "ByAgent[claude]")
+}
+
+func TestGetUsageSessionCounts_DedupesBySourceUUIDWhenClaudePairIncomplete(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "s-parent", "proj", func(s *Session) {
+		s.Agent = "claude"
+		s.StartedAt = new("2024-06-15T10:00:00Z")
+	})
+	insertSession(t, d, "s-fork", "proj", func(s *Session) {
+		s.Agent = "claude"
+		s.StartedAt = new("2024-06-15T10:01:00Z")
+		s.ParentSessionID = new("s-parent")
+		s.RelationshipType = "fork"
+	})
+
+	shared := json.RawMessage(`{"input_tokens":100,"output_tokens":50}`)
+
+	insertMessages(t, d, Message{
+		SessionID: "s-parent", Ordinal: 0,
+		Role: "assistant", Timestamp: "2024-06-15T10:02:00Z",
+		Model: "claude-sonnet", TokenUsage: shared,
+		ClaudeMessageID: "msg_dup", SourceUUID: "source_dup",
+	})
+	insertMessages(t, d, Message{
+		SessionID: "s-fork", Ordinal: 0,
+		Role: "assistant", Timestamp: "2024-06-15T10:03:00Z",
+		Model: "claude-sonnet", TokenUsage: shared,
+		ClaudeMessageID: "msg_dup", SourceUUID: "source_dup",
+	})
+
+	counts, err := d.GetUsageSessionCounts(ctx, UsageFilter{
+		From: "2024-06-15", To: "2024-06-15", Timezone: "UTC",
+	})
+	requireNoError(t, err, "GetUsageSessionCounts")
+
+	assert.Equal(t, 1, counts.Total, "Total want 1 (fork should dedup out)")
 	assert.Equal(t, 1, counts.ByProject["proj"], "ByProject[proj]")
 	assert.Equal(t, 1, counts.ByAgent["claude"], "ByAgent[claude]")
 }
@@ -1702,6 +2038,128 @@ func TestUsageSessionFilters(t *testing.T) {
 	counts, err := d.GetUsageSessionCounts(ctx, filter)
 	requireNoError(t, err, "GetUsageSessionCounts session filters")
 	assert.Equal(t, 1, counts.Total, "counts.Total")
+}
+
+func TestUsageTerminationFilter(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
+		ModelPattern:  "claude-sonnet",
+		InputPerMTok:  3.0,
+		OutputPerMTok: 15.0,
+	}}), "UpsertModelPricing")
+
+	clean := "clean"
+	unclean := "tool_call_pending"
+	tokenUsage := json.RawMessage(
+		`{"input_tokens":1000,"output_tokens":500}`,
+	)
+	insertSession(t, d, "usage-filter-clean", "proj", func(s *Session) {
+		s.MessageCount = 4
+		s.UserMessageCount = 3
+		s.TerminationStatus = &clean
+		s.StartedAt = new("2024-06-15T10:00:00Z")
+	})
+	insertSession(t, d, "usage-filter-unclean", "proj", func(s *Session) {
+		s.MessageCount = 4
+		s.UserMessageCount = 3
+		s.TerminationStatus = &unclean
+		s.StartedAt = new("2024-06-15T10:00:00Z")
+	})
+	for _, sid := range []string{
+		"usage-filter-clean",
+		"usage-filter-unclean",
+	} {
+		insertMessages(t, d, Message{
+			SessionID:  sid,
+			Ordinal:    0,
+			Role:       "assistant",
+			Timestamp:  "2024-06-15T10:30:00Z",
+			Model:      "claude-sonnet",
+			TokenUsage: tokenUsage,
+		})
+	}
+
+	filter := UsageFilter{
+		From:        "2024-06-01",
+		To:          "2024-06-30",
+		Termination: "clean",
+	}
+	daily, err := d.GetDailyUsage(ctx, filter)
+	requireNoError(t, err, "GetDailyUsage termination filter")
+	if daily.Totals.InputTokens != 1000 {
+		t.Errorf("InputTokens = %d, want 1000",
+			daily.Totals.InputTokens)
+	}
+
+	top, err := d.GetTopSessionsByCost(ctx, filter, 10)
+	requireNoError(t, err, "GetTopSessionsByCost termination filter")
+	if len(top) != 1 || top[0].SessionID != "usage-filter-clean" {
+		t.Fatalf("top sessions = %+v, want only usage-filter-clean", top)
+	}
+
+	counts, err := d.GetUsageSessionCounts(ctx, filter)
+	requireNoError(t, err, "GetUsageSessionCounts termination filter")
+	if counts.Total != 1 {
+		t.Errorf("counts.Total = %d, want 1", counts.Total)
+	}
+}
+
+// TestUsageActivityFallbackEmptyEndedAt guards the SQLite usage activity-time
+// fallback. A session whose ended_at was never persisted is stored as the empty
+// string, so COALESCE(s.ended_at, ...) returned ” and strftime('%s', ”)
+// yielded NULL, silently dropping it from active_since and the active/stale/
+// unclean termination filters. NULLIF must let the fallback reach started_at.
+func TestUsageActivityFallbackEmptyEndedAt(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
+		ModelPattern:  "claude-sonnet",
+		InputPerMTok:  3.0,
+		OutputPerMTok: 15.0,
+	}}), "UpsertModelPricing")
+
+	flagged := "tool_call_pending"
+	// started_at set; ended_at persisted as the empty string, the legacy
+	// state every other read query guards with NULLIF(ended_at, '').
+	insertSession(t, d, "untimed", "proj", func(s *Session) {
+		s.MessageCount = 4
+		s.UserMessageCount = 3
+		s.TerminationStatus = &flagged
+		s.StartedAt = new("2024-06-15T10:00:00Z")
+		s.EndedAt = new("")
+	})
+	insertMessages(t, d, Message{
+		SessionID:  "untimed",
+		Ordinal:    0,
+		Role:       "assistant",
+		Timestamp:  "2024-06-15T10:30:00Z",
+		Model:      "claude-sonnet",
+		TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
+	})
+
+	// active_since before started_at must keep the session via the fallback.
+	activeCounts, err := d.GetUsageSessionCounts(ctx, UsageFilter{
+		From:        "2024-06-01",
+		To:          "2024-06-30",
+		ActiveSince: "2024-06-01T00:00:00Z",
+	})
+	require.NoError(t, err, "GetUsageSessionCounts active_since")
+	assert.Equal(t, 1, activeCounts.Total,
+		"active_since must match empty-ended_at session via started_at")
+
+	// The unclean filter evaluates the activity epoch expression; the flagged
+	// session with an old started_at must be matched.
+	uncleanCounts, err := d.GetUsageSessionCounts(ctx, UsageFilter{
+		From:        "2024-06-01",
+		To:          "2024-06-30",
+		Termination: "unclean",
+	})
+	require.NoError(t, err, "GetUsageSessionCounts unclean")
+	assert.Equal(t, 1, uncleanCounts.Total,
+		"unclean must match flagged empty-ended_at session via started_at")
 }
 
 func TestUsageExcludeOneShotUsesUserMessageCount(t *testing.T) {
@@ -2180,6 +2638,34 @@ func TestGetSessionUsage_DedupesDuplicateClaudeRows(t *testing.T) {
 	assert.True(t, u.HasCost, "HasCost = false, want true")
 }
 
+func TestGetSessionUsage_DedupesBySourceUUIDWhenClaudePairIncomplete(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	seedOpusPricing(t, d)
+	insertSession(t, d, "claude:s7", "proj", func(s *Session) {
+		s.Agent = "claude-code"
+		s.StartedAt = new("2026-05-20T10:00:00Z")
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "claude:s7", Ordinal: 0, Role: "assistant",
+			Timestamp: "2026-05-20T10:30:00Z", Model: "claude-opus-4-6",
+			ClaudeMessageID: "msg-1", SourceUUID: "source-1",
+			TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
+		},
+		Message{
+			SessionID: "claude:s7", Ordinal: 1, Role: "assistant",
+			Timestamp: "2026-05-20T10:31:00Z", Model: "claude-opus-4-6",
+			ClaudeMessageID: "msg-1", SourceUUID: "source-1",
+			TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
+		},
+	)
+	u, err := d.GetSessionUsage(ctx, "claude:s7")
+	requireNoError(t, err, "GetSessionUsage")
+	assert.InDelta(t, 0.0175, u.CostUSD, 1e-9, "CostUSD want 0.0175 (deduped)")
+	assert.True(t, u.HasCost, "HasCost = false, want true")
+}
+
 func TestGetSessionUsage_NoTokenRowsKeepsMetadata(t *testing.T) {
 	d := testDB(t)
 	ctx := context.Background()
@@ -2285,4 +2771,91 @@ func TestGetDailyUsage_RollsUpSubagentToParentProject(t *testing.T) {
 		"rollup input tokens")
 	assert.Equal(t, 200, projects["display"].OutputTokens,
 		"rollup output tokens")
+}
+
+// TestGetDailyUsage_CopilotAICreditsComputed verifies AI credits are computed
+// from priced Copilot usage: costUSD / 0.01.
+func TestGetDailyUsage_CopilotAICreditsComputed(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
+		ModelPattern:         "gpt-4",
+		InputPerMTok:         15.0,
+		OutputPerMTok:        60.0,
+		CacheCreationPerMTok: 15.0,
+		CacheReadPerMTok:     6.0,
+	}}))
+
+	insertSession(t, d, "copilot:aicredits", "proj", func(s *Session) {
+		s.Agent = "copilot"
+		s.StartedAt = new("2024-06-15T10:00:00Z")
+		s.EndedAt = new("2024-06-15T11:00:00Z")
+	})
+
+	insertMessages(t, d, Message{
+		SessionID: "copilot:aicredits",
+		Ordinal:   0,
+		Role:      "assistant",
+		Timestamp: "2024-06-15T10:30:00Z",
+		Model:     "gpt-4",
+		TokenUsage: json.RawMessage(`{
+			"input_tokens": 1000,
+			"output_tokens": 500
+		}`),
+	})
+
+	result, err := d.GetDailyUsage(ctx, UsageFilter{
+		From: "2024-06-01",
+		To:   "2024-06-30",
+	})
+	requireNoError(t, err, "GetDailyUsage")
+
+	wantCost := (1000*15.0 + 500*60.0) / 1_000_000
+	wantCredits := wantCost / 0.01
+	assert.InDelta(t, wantCost, result.Totals.TotalCost, 1e-9, "TotalCost")
+	assert.InDelta(t, wantCredits, result.Totals.CopilotAICredits, 1e-6, "CopilotAICredits")
+}
+
+// TestGetDailyUsage_NoAICreditsNonCopilot verifies non-Copilot agents do
+// not emit CopilotAICredits even when priced.
+func TestGetDailyUsage_NoAICreditsNonCopilot(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
+		ModelPattern:         "claude-opus-4-6",
+		InputPerMTok:         3.0,
+		OutputPerMTok:        15.0,
+		CacheCreationPerMTok: 3.75,
+		CacheReadPerMTok:     0.30,
+	}}))
+
+	insertSession(t, d, "claude:nocredits", "proj", func(s *Session) {
+		s.Agent = "claude-code"
+		s.StartedAt = new("2024-06-15T10:00:00Z")
+		s.EndedAt = new("2024-06-15T11:00:00Z")
+	})
+
+	insertMessages(t, d, Message{
+		SessionID: "claude:nocredits",
+		Ordinal:   0,
+		Role:      "assistant",
+		Timestamp: "2024-06-15T10:30:00Z",
+		Model:     "claude-opus-4-6",
+		TokenUsage: json.RawMessage(`{
+			"input_tokens": 1000,
+			"output_tokens": 500
+		}`),
+	})
+
+	result, err := d.GetDailyUsage(ctx, UsageFilter{
+		From: "2024-06-01",
+		To:   "2024-06-30",
+	})
+	requireNoError(t, err, "GetDailyUsage")
+
+	wantCost := (1000*3.0 + 500*15.0) / 1_000_000
+	assert.InDelta(t, wantCost, result.Totals.TotalCost, 1e-9, "TotalCost")
+	assert.Equal(t, 0.0, result.Totals.CopilotAICredits, "CopilotAICredits should be 0")
 }

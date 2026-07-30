@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { onDestroy } from "svelte";
+  import { onDestroy, tick, untrack } from "svelte";
   import { copyToClipboard } from "../../utils/clipboard.js";
-  import { applyHighlight, escapeHTML } from "../../utils/highlight.js";
+  import { applyHighlight, applyMarks, clearMarks, escapeHTML } from "../../utils/highlight.js";
+  import { highlightToHtml } from "../../utils/syntax-highlight.js";
   import CopyButton from "../shared/CopyButton.svelte";
 
   interface Props {
@@ -14,6 +15,40 @@
   let { content, language, highlightQuery = "", isCurrentHighlight = false }: Props = $props();
   let copied = $state(false);
   let copyTimer: ReturnType<typeof setTimeout> | undefined;
+
+  let highlighted = $state<string | null>(null);
+  let preEl = $state<HTMLElement | undefined>(undefined);
+
+  $effect(() => {
+    highlighted = null;
+    if (!language) return;
+
+    const effectContent = content;
+    const effectLang = language;
+    let cancelled = false;
+
+    highlightToHtml(effectContent, effectLang).then(async (html) => {
+      if (cancelled) return;
+      highlighted = html;
+      // Flush the {@html} swap to the DOM before re-applying marks.
+      await tick();
+      if (cancelled) return;
+      // Read current prop values after the await — intentionally untracked
+      // because we are inside an async continuation, not during the sync
+      // reactive evaluation.
+      const q = untrack(() => highlightQuery);
+      const current = untrack(() => isCurrentHighlight);
+      const el = untrack(() => preEl);
+      if (el && q.trim()) {
+        clearMarks(el);
+        applyMarks(el, q, current);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  });
 
   async function handleCopy() {
     const ok = await copyToClipboard(content);
@@ -46,8 +81,9 @@
   {/if}
   <pre
     class="code-content"
+    bind:this={preEl}
     use:applyHighlight={{ q: highlightQuery, current: isCurrentHighlight, content }}
-  ><code>{@html escapeHTML(content)}</code></pre>
+  ><code>{@html highlighted ?? escapeHTML(content)}</code></pre>
 </div>
 
 <style>

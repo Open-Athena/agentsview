@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "vite-plus/test";
 import {
   truncate,
   extractToolParamMeta,
@@ -257,6 +257,17 @@ describe("generateFallbackContent", () => {
     expect(
       generateFallbackContent("Task", { prompt: "do stuff" }),
     ).toBeNull();
+  });
+
+  it("renders Cursor ApplyPatch patch text from input_json", () => {
+    const patch = "@@ -1,1 +1,1 @@\n-old\n+new";
+
+    expect(
+      generateFallbackContent("Edit", {
+        path: "src/app.ts",
+        patch,
+      }),
+    ).toBe(patch);
   });
 
   it("shows diff for Edit tool", () => {

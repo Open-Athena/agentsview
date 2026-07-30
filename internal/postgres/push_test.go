@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -27,8 +28,18 @@ func (s syncStateReaderStub) SetSyncState(
 	return nil
 }
 
+func (s syncStateReaderStub) GetOrCreateSyncState(
+	key, defaultValue string,
+) (string, error) {
+	if s.value != "" || s.err != nil {
+		return s.value, s.err
+	}
+	return defaultValue, nil
+}
+
 type syncStateStoreStub struct {
-	values map[string]string
+	values      map[string]string
+	createValue string
 }
 
 func (s *syncStateStoreStub) GetSyncState(
@@ -45,6 +56,38 @@ func (s *syncStateStoreStub) SetSyncState(
 	}
 	s.values[key] = value
 	return nil
+}
+
+func (s *syncStateStoreStub) GetOrCreateSyncState(
+	key, defaultValue string,
+) (string, error) {
+	if s.values == nil {
+		s.values = make(map[string]string)
+	}
+	if value := s.values[key]; value != "" {
+		return value, nil
+	}
+	if s.createValue != "" {
+		s.values[key] = s.createValue
+		return s.createValue, nil
+	}
+	s.values[key] = defaultValue
+	return defaultValue, nil
+}
+
+func TestPushMarkerIDReturnsInsertWinner(t *testing.T) {
+	local, err := db.Open(filepath.Join(t.TempDir(), "local.db"))
+	require.NoError(t, err, "db.Open")
+	defer local.Close()
+	require.NoError(t, local.SetSyncState(pushMarkerIDStateKey, "winner-marker"))
+	sync := &Sync{local: local}
+
+	got, err := sync.pushMarkerID()
+	require.NoError(t, err, "pushMarkerID")
+	assert.Equal(t, "winner-marker", got)
+	stored, err := local.GetSyncState(pushMarkerIDStateKey)
+	require.NoError(t, err, "GetSyncState")
+	assert.Equal(t, "winner-marker", stored)
 }
 
 func TestReadPushBoundaryStateValidity(t *testing.T) {
@@ -125,7 +168,7 @@ func TestSessionPushFingerprintDiffers(t *testing.T) {
 		CreatedAt:        "2026-03-11T12:00:00Z",
 	}
 
-	fp1 := sessionPushFingerprint(base, "")
+	fp1 := sessionPushFingerprint(base, base.Machine, "", "")
 
 	tests := []struct {
 		name   string
@@ -143,6 +186,14 @@ func TestSessionPushFingerprintDiffers(t *testing.T) {
 			modify: func(s db.Session) db.Session {
 				name := "new name"
 				s.DisplayName = &name
+				return s
+			},
+		},
+		{
+			name: "session_name change",
+			modify: func(s db.Session) db.Session {
+				n := "agent-provided-title"
+				s.SessionName = &n
 				return s
 			},
 		},
@@ -177,18 +228,41 @@ func TestSessionPushFingerprintDiffers(t *testing.T) {
 				return s
 			},
 		},
+		{
+			name: "quality signal version change",
+			modify: func(s db.Session) db.Session {
+				s.QualitySignalVersion = db.CurrentQualitySignalVersion
+				return s
+			},
+		},
+		{
+			name: "quality signal count change",
+			modify: func(s db.Session) db.Session {
+				s.QualitySignalVersion = db.CurrentQualitySignalVersion
+				s.DuplicatePromptCount = 1
+				return s
+			},
+		},
+		{
+			name: "quality signal boolean change",
+			modify: func(s db.Session) db.Session {
+				s.QualitySignalVersion = db.CurrentQualitySignalVersion
+				s.UnstructuredStart = true
+				return s
+			},
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			modified := tc.modify(base)
-			fp2 := sessionPushFingerprint(modified, "")
+			fp2 := sessionPushFingerprint(modified, modified.Machine, "", "")
 			require.NotEqual(t, fp1, fp2,
 				"fingerprint should differ after %s", tc.name)
 		})
 	}
 
-	assert.Equal(t, fp1, sessionPushFingerprint(base, ""),
+	assert.Equal(t, fp1, sessionPushFingerprint(base, base.Machine, "", ""),
 		"identical sessions should produce identical fingerprints")
 }
 
@@ -205,10 +279,79 @@ func TestSessionPushFingerprintIncludesUsageEventFingerprint(
 		CreatedAt:        "2026-03-11T12:00:00Z",
 	}
 
-	withoutUsage := sessionPushFingerprint(base, "")
-	withUsage := sessionPushFingerprint(base, "usage-fp")
+	withoutUsage := sessionPushFingerprint(base, base.Machine, "", "")
+	withUsage := sessionPushFingerprint(base, base.Machine, "usage-fp", "")
 	assert.NotEqual(t, withoutUsage, withUsage,
 		"usage event fingerprint should affect session fingerprint")
+}
+
+func TestSessionPushFingerprintTracksResolvedMachine(t *testing.T) {
+	sentinel := db.Session{
+		ID:        "sess-001",
+		Project:   "proj",
+		Machine:   "local",
+		Agent:     "claude",
+		CreatedAt: "2026-03-11T12:00:00Z",
+	}
+	fpA := sessionPushFingerprint(
+		sentinel, pushedSessionMachine(sentinel, "host-a"), "", "")
+	fpB := sessionPushFingerprint(
+		sentinel, pushedSessionMachine(sentinel, "host-b"), "", "")
+	assert.NotEqual(t, fpA, fpB,
+		"sentinel session fingerprint must change with the fallback machine")
+
+	real := db.Session{
+		ID:        "sess-002",
+		Project:   "proj",
+		Machine:   "real-host",
+		Agent:     "claude",
+		CreatedAt: "2026-03-11T12:00:00Z",
+	}
+	fp1 := sessionPushFingerprint(
+		real, pushedSessionMachine(real, "host-a"), "", "")
+	fp2 := sessionPushFingerprint(
+		real, pushedSessionMachine(real, "host-b"), "", "")
+	assert.Equal(t, fp1, fp2,
+		"a session with a real machine ignores the fallback")
+}
+
+func TestPushedSessionMachine(t *testing.T) {
+	tests := []struct {
+		name     string
+		session  db.Session
+		fallback string
+		want     string
+	}{
+		{
+			name: "preserves source machine",
+			session: db.Session{
+				Machine: "remote-host",
+			},
+			fallback: "push-host",
+			want:     "remote-host",
+		},
+		{
+			name:     "falls back for empty machine",
+			session:  db.Session{},
+			fallback: "push-host",
+			want:     "push-host",
+		},
+		{
+			name: "falls back for local sentinel",
+			session: db.Session{
+				Machine: "local",
+			},
+			fallback: "push-host",
+			want:     "push-host",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want,
+				pushedSessionMachine(tc.session, tc.fallback))
+		})
+	}
 }
 
 func TestSessionPushFingerprintNoFieldCollisions(
@@ -225,9 +368,45 @@ func TestSessionPushFingerprintNoFieldCollisions(
 		CreatedAt: "2026-03-11T12:00:00Z",
 	}
 	assert.NotEqual(t,
-		sessionPushFingerprint(s1, ""),
-		sessionPushFingerprint(s2, ""),
+		sessionPushFingerprint(s1, s1.Machine, "", ""),
+		sessionPushFingerprint(s2, s2.Machine, "", ""),
 		"length-prefixed fingerprints should not collide")
+}
+
+func TestLocalMessageRoleTimePGFingerprintNormalizesNanoseconds(
+	t *testing.T,
+) {
+	localDB, err := db.Open(filepath.Join(t.TempDir(), "local.db"))
+	require.NoError(t, err, "db.Open")
+	defer localDB.Close()
+
+	const sessID = "pg-role-time-nanos"
+	require.NoError(t, localDB.UpsertSession(db.Session{
+		ID:        sessID,
+		Project:   "proj",
+		Machine:   "host",
+		Agent:     "shelley",
+		CreatedAt: "2026-03-11T12:34:56Z",
+	}), "UpsertSession")
+	require.NoError(t, localDB.InsertMessages([]db.Message{{
+		SessionID:     sessID,
+		Ordinal:       1,
+		Role:          "assistant",
+		Content:       "answer",
+		ContentLength: len("answer"),
+		Timestamp:     "2026-03-11T12:34:56.123456789Z",
+	}}), "InsertMessages")
+
+	got, err := localMessageRoleTimePGFingerprint(localDB, sessID)
+	require.NoError(t, err)
+	assert.Equal(t,
+		"1|9:assistant|27:2026-03-11T12:34:56.123456Z;",
+		got)
+
+	raw, err := localDB.MessageRoleTimeFingerprint(sessID)
+	require.NoError(t, err)
+	assert.NotEqual(t, raw, got,
+		"PG push fingerprint must not use raw nanosecond text")
 }
 
 func TestFinalizePushStatePersistsEmptyBoundary(
@@ -248,6 +427,86 @@ func TestFinalizePushStatePersistsEmptyBoundary(
 	require.NoError(t, json.Unmarshal([]byte(raw), &state))
 	assert.Equal(t, cutoff, state.Cutoff)
 	assert.Empty(t, state.Fingerprints)
+}
+
+func TestPushTargetState(t *testing.T) {
+	tests := []struct {
+		name       string
+		lastPush   string
+		boundary   string
+		stored     string
+		current    string
+		wantReset  bool
+		wantReason string
+	}{
+		{
+			name:      "first push has no reset",
+			stored:    "",
+			current:   "v1:new",
+			wantReset: false,
+		},
+		{
+			name:      "missing runtime fingerprint skips reset",
+			lastPush:  "2026-03-11T12:34:56.123Z",
+			stored:    "v1:old",
+			current:   "",
+			wantReset: false,
+		},
+		{
+			name:       "legacy watermark without fingerprint resets",
+			lastPush:   "2026-03-11T12:34:56.123Z",
+			current:    "v1:new",
+			wantReset:  true,
+			wantReason: "local push state exists without a stored PG target fingerprint",
+		},
+		{
+			name:       "legacy filtered boundary without fingerprint resets",
+			boundary:   `{"cutoff":"2026-03-11T12:34:56.123Z","fingerprints":{"sess-001":"fp"}}`,
+			current:    "v1:new",
+			wantReset:  true,
+			wantReason: "local push state exists without a stored PG target fingerprint",
+		},
+		{
+			name:       "changed target resets",
+			lastPush:   "2026-03-11T12:34:56.123Z",
+			stored:     "v1:old",
+			current:    "v1:new",
+			wantReset:  true,
+			wantReason: "PG target fingerprint changed",
+		},
+		{
+			name:      "same target keeps watermark",
+			lastPush:  "2026-03-11T12:34:56.123Z",
+			stored:    "v1:same",
+			current:   "v1:same",
+			wantReset: false,
+		},
+		{
+			name:      "filtered boundary keeps same target state",
+			boundary:  `{"cutoff":"2026-03-11T12:34:56.123Z","fingerprints":{"sess-001":"fp"}}`,
+			stored:    "v1:same",
+			current:   "v1:same",
+			wantReset: false,
+		},
+		{
+			name:       "filtered boundary resets on target change",
+			boundary:   `{"cutoff":"2026-03-11T12:34:56.123Z","fingerprints":{"sess-001":"fp"}}`,
+			stored:     "v1:old",
+			current:    "v1:new",
+			wantReset:  true,
+			wantReason: "PG target fingerprint changed",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotReset, gotReason := pushTargetState(
+				tc.lastPush, tc.boundary, tc.stored, tc.current,
+			)
+			assert.Equal(t, tc.wantReset, gotReset)
+			assert.Equal(t, tc.wantReason, gotReason)
+		})
+	}
 }
 
 func TestFinalizePushStateMergesPriorFingerprints(
@@ -271,7 +530,7 @@ func TestFinalizePushStateMergesPriorFingerprints(
 	require.NoError(t, finalizePushState(
 		store, cutoff, cycle2Sessions,
 		priorFingerprints,
-		map[string]string{"sess-002": sessionPushFingerprint(cycle2Sessions[0], "")},
+		map[string]string{"sess-002": sessionPushFingerprint(cycle2Sessions[0], cycle2Sessions[0].Machine, "", "")},
 	))
 
 	raw := store.values[lastPushBoundaryStateKey]
@@ -359,4 +618,65 @@ func TestNilStrSanitizes(t *testing.T) {
 	// should return nil.
 	nul := "\x00"
 	assert.Nil(t, nilStr(&nul), "nilStr(\"\\x00\") should be nil")
+}
+
+func TestShouldSkipSessionMessagesInBatchedPush(t *testing.T) {
+	const sessionID = "sess-batched"
+	baseComparisons := &pushMessageComparison{
+		MessageAggregates: map[string]pushMessageAggregate{
+			sessionID: {Count: 2, Sum: 12, Max: 6, Min: 1},
+		},
+		MessageContentHash: map[string]string{
+			sessionID: "abc",
+		},
+		MessageRoleTime: map[string]string{
+			sessionID: "role-time",
+		},
+		MessageFlags: map[string]string{
+			sessionID: "flags",
+		},
+		MessageSystemOrdinals: map[string]string{
+			sessionID: "0,1",
+		},
+		MessageTokenFingerprint: map[string]string{
+			sessionID: "tokens",
+		},
+		ToolCallAggregates: map[string]pushToolCallAggregate{
+			sessionID: {Count: 1, Sum: 99},
+		},
+		ToolCallFingerprint: map[string]string{
+			sessionID: "toolcalls",
+		},
+		UsageEventFingerprint: map[string]string{
+			sessionID: "usage",
+		},
+	}
+	unchangedFP := pushLocalMessageFingerprint{
+		Sum:           12,
+		Max:           6,
+		Min:           1,
+		ContentHashFP: "abc",
+		RoleTimeFP:    "role-time",
+		FlagsFP:       "flags",
+		SystemFP:      "0,1",
+		ToolCallCount: 1,
+		ToolCallSum:   99,
+		ToolCallFP:    "toolcalls",
+		TokenFP:       "tokens",
+		UsageEventFP:  "usage",
+	}
+
+	assert.True(t, shouldSkipSessionMessages(
+		sessionID, 2, unchangedFP, false, baseComparisons,
+	), "unchanged sessions should be skipped as unchanged")
+
+	changedFP := unchangedFP
+	changedFP.ToolCallSum = 100
+	assert.False(t, shouldSkipSessionMessages(
+		sessionID, 2, changedFP, false, baseComparisons,
+	), "tool-call sum mismatch should force push")
+
+	assert.False(t, shouldSkipSessionMessages(
+		sessionID, 2, unchangedFP, true, baseComparisons,
+	), "full mode should not skip by fingerprint check")
 }

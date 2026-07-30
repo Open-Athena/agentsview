@@ -11,9 +11,7 @@ import (
 
 	"github.com/gofrs/flock"
 	"go.kenn.io/agentsview/internal/config"
-	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/postgres"
-	"go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/kit/daemon"
 )
 
@@ -64,21 +62,42 @@ func (p *pgPusher) push(
 		return fmt.Errorf("push: %w", err)
 	}
 	if res.Errors > 0 {
-		log.Printf(
-			"pg watch: pushed %d sessions, %d messages, %d errors (%s)",
-			res.SessionsPushed, res.MessagesPushed, res.Errors, reason,
-		)
+		logPGWatchPushResult(res, reason)
 		log.Printf(
 			"pg watch: %d session(s) failed to push; will retry",
 			res.Errors,
 		)
 		return nil
 	}
+	logPGWatchPushResult(res, reason)
+	return nil
+}
+
+func logPGWatchPushResult(res postgres.PushResult, reason pushReason) {
+	if res.SkippedConflicts > 0 {
+		log.Printf(
+			"pg watch: pushed %d sessions, %d messages, skipped %d ownership conflict(s), %d errors (%s)",
+			res.SessionsPushed, res.MessagesPushed,
+			res.SkippedConflicts, res.Errors, reason,
+		)
+		log.Printf(
+			"pg watch: %d session(s) skipped due to PostgreSQL ownership conflicts",
+			res.SkippedConflicts,
+		)
+		return
+	}
+	if res.Errors > 0 {
+		log.Printf(
+			"pg watch: pushed %d sessions, %d messages, %d errors (%s)",
+			res.SessionsPushed, res.MessagesPushed,
+			res.Errors, reason,
+		)
+		return
+	}
 	log.Printf(
 		"pg watch: pushed %d sessions, %d messages (%s)",
 		res.SessionsPushed, res.MessagesPushed, reason,
 	)
-	return nil
 }
 
 func (p *pgPusher) reset() {
@@ -162,102 +181,24 @@ func runPGPushWatch(cfg PGPushConfig) {
 		}
 	}()
 
-	applyClassifierConfig(appCfg)
-	database := mustOpenDB(appCfg)
-	defer database.Close()
-
-	for _, def := range parser.Registry {
-		if !appCfg.IsUserConfigured(def.Type) {
-			continue
-		}
-		warnMissingDirs(appCfg.ResolveDirs(def.Type), string(def.Type))
-	}
-	cleanResyncTemp(appCfg.DBPath)
-
 	ctx, stop := signal.NotifyContext(
 		context.Background(), os.Interrupt, syscall.SIGTERM,
 	)
 	defer stop()
 
-	engine := sync.NewEngine(database, sync.EngineConfig{
-		AgentDirs:               appCfg.AgentDirs,
-		Machine:                 "local",
-		BlockedResultCategories: appCfg.ResultContentBlockedCategories,
-	})
-
-	// Initial local sync. A data-version change forces a full push.
-	didResync := cfg.Full || database.NeedsResync()
-	if didResync {
-		engine.ResyncAll(ctx, nil)
-	} else {
-		engine.SyncAll(ctx, nil)
-	}
-	if ctx.Err() != nil {
-		return
-	}
-
-	pusher := &pgPusher{
-		localSync: func(c context.Context) error {
-			engine.SyncAll(c, nil)
-			return nil
-		},
-		connect: func() (pgTarget, error) {
-			// Repeated inside this closure (not only in the outer
-			// body) because TestEveryStoreOpenPathIsWired scans each
-			// function literal independently and requires a
-			// classifier-wiring call in the same body as postgres.New.
-			applyClassifierConfig(appCfg)
-			s, cErr := postgres.New(
-				pgCfg.URL, pgCfg.Schema, database,
-				pgCfg.MachineName, pgCfg.AllowInsecure,
-				postgres.SyncOptions{
-					Projects:        projects,
-					ExcludeProjects: exclude,
-				},
-			)
-			if cErr != nil {
-				return nil, cErr
-			}
-			return s, nil
-		},
-	}
-	defer pusher.reset()
-
 	log.Printf(
 		"pg watch: starting (machine=%q debounce=%s interval=%s)",
 		pgCfg.MachineName, debounce, interval,
 	)
-	fmt.Printf(
-		"agentsview pg watch: pushing to PostgreSQL as %q "+
-			"(debounce %s, floor %s)\n",
-		pgCfg.MachineName, debounce, interval,
-	)
 
-	// Initial catch-up push (full if a resync just happened).
-	if err := pusher.push(ctx, reasonStartup, didResync); err != nil {
-		log.Printf("pg watch: initial push failed: %v", err)
+	backend, cleanup, err := resolveArchiveWriteBackend(ctx, appCfg)
+	if err != nil {
+		fatal("opening writer: %v", err)
 	}
-
-	loop, ticker := newPushLoop(debounce, interval,
-		func(c context.Context, r pushReason) error {
-			return pusher.push(c, r, false)
-		},
-	)
-	defer ticker.Stop()
-
-	stopWatcher, unwatchedDirs := startFileWatcher(appCfg, engine,
-		func(paths []string) {
-			engine.SyncPaths(paths)
-			loop.NotifyDirty()
-		},
-	)
-	defer stopWatcher()
-	if len(unwatchedDirs) > 0 {
-		log.Printf(
-			"pg watch: %d root(s) not watched; relying on the %s floor for coverage",
-			len(unwatchedDirs), interval,
-		)
+	defer cleanup()
+	if err := backend.PGPushWatch(
+		ctx, pgCfg, cfg, projects, exclude, debounce, interval,
+	); err != nil {
+		fatal("pg push --watch: %v", err)
 	}
-
-	loop.Run(ctx)
 }

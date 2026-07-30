@@ -2,17 +2,17 @@ package main
 
 import (
 	"bytes"
-	"errors"
-	"io"
+	"context"
 	"log"
 	"os"
 	"path/filepath"
-	"syscall"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/sync"
 )
 
@@ -53,7 +53,7 @@ func TestMustLoadConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv("AGENTSVIEW_DATA_DIR", t.TempDir())
+			testDataDir(t)
 			cmd := newServeCommand()
 			require.NoError(t, cmd.Flags().Parse(tt.args), "Parse")
 			cfg := mustLoadConfig(cmd)
@@ -94,43 +94,13 @@ func TestPrepareServeRuntimeConfigPortZeroUsesAssignedPort(t *testing.T) {
 		"missing ephemeral port message")
 }
 
-func captureStdout(t *testing.T, fn func()) string {
-	t.Helper()
-
-	orig := os.Stdout
-	r, w, err := os.Pipe()
-	require.NoError(t, err, "pipe")
-	os.Stdout = w
-	t.Cleanup(func() {
-		os.Stdout = orig
-	})
-
-	fn()
-
-	require.NoError(t, w.Close(), "close stdout pipe writer")
-	os.Stdout = orig
-
-	data, err := io.ReadAll(r)
-	require.NoError(t, err, "read stdout pipe")
-	require.NoError(t, r.Close(), "close stdout pipe reader")
-	return string(data)
-}
-
 func TestSetupLogFile(t *testing.T) {
-	origOutput := log.Writer()
-
 	dir := t.TempDir()
-	setupLogFile(dir)
+	// Register after TempDir so LIFO cleanup closes the log file before
+	// TempDir removes the directory. On Windows, open files can't be deleted.
+	restoreTestLogOutput(t)
 
-	// Close the log file before TempDir cleanup removes the
-	// directory. On Windows, open files can't be deleted.
-	// Registered after TempDir so LIFO ordering runs this first.
-	t.Cleanup(func() {
-		if c, ok := log.Writer().(io.Closer); ok {
-			c.Close()
-		}
-		log.SetOutput(origOutput)
-	})
+	setupLogFile(dir)
 
 	// Log something and verify it reaches the file.
 	log.Print("test-log-message")
@@ -143,17 +113,13 @@ func TestSetupLogFile(t *testing.T) {
 }
 
 func TestSetupLogFileOpenFailure(t *testing.T) {
-	origOutput := log.Writer()
-	t.Cleanup(func() { log.SetOutput(origOutput) })
-
 	// Capture log output to verify warning is emitted.
-	var buf bytes.Buffer
-	log.SetOutput(io.MultiWriter(origOutput, &buf))
+	buf := captureLogOutput(t)
 
 	// Pass a path that can't be opened (dir doesn't exist
 	// and we use a file as the "dir").
 	tmpFile := filepath.Join(t.TempDir(), "notadir")
-	os.WriteFile(tmpFile, []byte("x"), 0o644)
+	writeTestFile(t, tmpFile, []byte("x"))
 
 	setupLogFile(tmpFile)
 
@@ -167,7 +133,7 @@ func TestTruncateLogFile(t *testing.T) {
 
 	// Write a file larger than the limit.
 	big := bytes.Repeat([]byte("x"), 1024)
-	os.WriteFile(path, big, 0o644)
+	writeTestFile(t, path, big)
 
 	// Truncate with limit smaller than file size.
 	truncateLogFile(path, 512)
@@ -182,7 +148,7 @@ func TestTruncateLogFileUnderLimit(t *testing.T) {
 	path := filepath.Join(dir, "test.log")
 
 	content := []byte("small log content")
-	os.WriteFile(path, content, 0o644)
+	writeTestFile(t, path, content)
 
 	// File is under limit: should not be truncated.
 	truncateLogFile(path, 1024)
@@ -205,17 +171,8 @@ func TestTruncateLogFileSymlink(t *testing.T) {
 
 	// Write a target file larger than the limit.
 	big := bytes.Repeat([]byte("x"), 1024)
-	require.NoError(t, os.WriteFile(target, big, 0o644), "write target")
-	if err := os.Symlink(target, link); err != nil {
-		if errors.Is(err, syscall.EPERM) ||
-			errors.Is(err, syscall.EACCES) ||
-			errors.Is(err, os.ErrPermission) ||
-			errors.Is(err, syscall.ENOSYS) ||
-			errors.Is(err, syscall.ENOTSUP) {
-			t.Skip("symlinks not supported:", err)
-		}
-		t.Fatalf("symlink: %v", err)
-	}
+	writeTestFile(t, target, big)
+	requireSymlinkOrSkip(t, target, link)
 
 	// Truncate via symlink: should be a no-op.
 	truncateLogFile(link, 512)
@@ -223,6 +180,60 @@ func TestTruncateLogFileSymlink(t *testing.T) {
 	data, err := os.ReadFile(target)
 	require.NoError(t, err, "read target")
 	assert.Len(t, data, 1024, "symlink target was truncated")
+}
+
+type fakeUnwatchedPollSyncer struct {
+	roots     []string
+	since     time.Time
+	calls     int
+	callRoots [][]string
+	callSince []time.Time
+}
+
+func (f *fakeUnwatchedPollSyncer) SyncRootsSince(
+	ctx context.Context, roots []string, since time.Time,
+	onProgress sync.ProgressFunc,
+) sync.SyncStats {
+	f.calls++
+	f.roots = append([]string(nil), roots...)
+	f.since = since
+	f.callRoots = append(f.callRoots, append([]string(nil), roots...))
+	f.callSince = append(f.callSince, since)
+	return sync.SyncStats{}
+}
+
+func TestPollUnwatchedRootsOnceUsesScopedFullSync(t *testing.T) {
+	fake := &fakeUnwatchedPollSyncer{}
+	roots := []string{"/tmp/claude", "/tmp/codex"}
+
+	pollUnwatchedRootsOnce(fake, roots)
+	pollUnwatchedRootsOnce(fake, roots)
+
+	require.Equal(t, 2, fake.calls)
+	assert.Equal(t, roots, fake.callRoots[0])
+	assert.True(t, fake.callSince[0].IsZero(), "first poll cutoff = %v", fake.callSince[0])
+	assert.Equal(t, roots, fake.callRoots[1])
+	assert.True(t, fake.callSince[1].IsZero(), "second poll cutoff = %v", fake.callSince[1])
+}
+
+func TestCollectWatchRootsPreservesDirsSharingWatchRoot(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "codex-state")
+	require.NoError(t, os.Mkdir(parent, 0o755), "mkdir parent")
+
+	sessionsDir := filepath.Join(parent, "sessions")
+	archivedDir := filepath.Join(parent, "archived_sessions")
+	cfg := config.Config{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {sessionsDir, archivedDir},
+		},
+	}
+
+	roots, unwatchedDirs := collectWatchRoots(cfg)
+
+	require.Empty(t, unwatchedDirs, "unwatched dirs before watcher setup")
+	require.Len(t, roots, 1, "shared watch root should be represented once")
+	assert.Equal(t, parent, roots[0].root)
+	assert.ElementsMatch(t, []string{sessionsDir, archivedDir}, roots[0].dirs)
 }
 
 func TestResyncCoversSignals(t *testing.T) {

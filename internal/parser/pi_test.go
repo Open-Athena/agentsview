@@ -3,6 +3,8 @@ package parser
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -35,6 +37,9 @@ func TestParsePiSession_SessionHeader(t *testing.T) {
 	assert.Equal(t, "pi:pi-test-session-uuid", sess.ID, "PRSR-01: session ID")
 	assert.Equal(t, AgentPi, sess.Agent, "PRSR-11: agent type")
 
+	assert.Equal(t, "/Users/alice/code/my-project", sess.Cwd,
+		"PRSR-01: cwd from session header")
+
 	// ExtractProjectFromCwd("/Users/alice/code/my-project") -> "my_project"
 	assert.Equal(t, "my_project", sess.Project, "PRSR-01: project from cwd")
 
@@ -50,6 +55,86 @@ func TestParsePiSession_SessionHeader(t *testing.T) {
 	assert.False(t, sess.StartedAt.IsZero(), "PRSR-01: StartedAt non-zero")
 
 	_ = msgs // not the focus of this sub-test
+}
+
+func TestOMPRegistryMetadata(t *testing.T) {
+	def, ok := AgentByType(AgentOMP)
+	require.True(t, ok)
+
+	assert.Equal(t, AgentOMP, def.Type)
+	assert.Equal(t, "OhMyPi", def.DisplayName)
+	assert.Equal(t, "OMP_DIR", def.EnvVar)
+	assert.Equal(t, "omp_dirs", def.ConfigKey)
+	assert.Equal(t, []string{".omp/agent/sessions"}, def.DefaultDirs)
+	assert.Equal(t, "omp:", def.IDPrefix)
+	assert.True(t, def.FileBased)
+	require.NotNil(t, def.DiscoverFunc)
+	require.NotNil(t, def.FindSourceFunc)
+}
+
+func TestParseOMPSession_SessionIdentity(t *testing.T) {
+	fixturePath := createTestFile(
+		t, "omp-test-session-uuid.jsonl",
+		loadFixture(t, "pi/session.jsonl"),
+	)
+	sess, msgs, err := ParseOMPSession(fixturePath, "", "local")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+
+	assert.Equal(t, "omp:pi-test-session-uuid", sess.ID)
+	assert.Equal(t, AgentOMP, sess.Agent)
+	assert.Equal(t, "omp:2025-01-01T09-00-00-000Z_parent-uuid", sess.ParentSessionID)
+	assert.Equal(t, "/Users/alice/code/my-project", sess.Cwd)
+	assert.Equal(t, "my_project", sess.Project)
+	require.NotEmpty(t, msgs)
+}
+
+func TestDiscoverOMPSessions(t *testing.T) {
+	root := t.TempDir()
+	projectDir := filepath.Join(root, "-Users-alice-code-my-project")
+	require.NoError(t, os.MkdirAll(projectDir, 0o755))
+	path := filepath.Join(projectDir, "omp-test-session-uuid.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte(loadFixture(t, "pi/session.jsonl")), 0o644))
+
+	files := DiscoverOMPSessions(root)
+	require.Len(t, files, 1)
+	assert.Equal(t, path, files[0].Path)
+	assert.Equal(t, AgentOMP, files[0].Agent)
+	assert.Empty(t, files[0].Project)
+	assert.Equal(t, path, FindOMPSourceFile(root, "omp-test-session-uuid"))
+}
+
+func TestParsePiSession_SessionInfoName(t *testing.T) {
+	content := strings.Join([]string{
+		`{"type":"session","version":3,"id":"named-sess","timestamp":"2025-01-01T10:00:00Z","cwd":"/Users/alice/code/my-project"}`,
+		`{"type":"session_info","id":"info-1","parentId":null,"timestamp":"2025-01-01T10:00:01Z","name":"Original name"}`,
+		`{"type":"message","id":"msg-1","parentId":"info-1","timestamp":"2025-01-01T10:00:02Z","message":{"role":"user","content":"hello"}}`,
+		`{"type":"session_info","id":"info-2","parentId":"msg-1","timestamp":"2025-01-01T10:00:03Z","name":"Renamed session"}`,
+		"",
+	}, "\n")
+
+	sess, msgs := runPiParserTest(t, content)
+
+	assert.Equal(t, "Renamed session", sess.SessionName)
+	assert.Equal(t, 1, sess.MessageCount,
+		"session_info entries must not count as messages")
+	require.Len(t, msgs, 1)
+	assert.Equal(t, RoleUser, msgs[0].Role)
+}
+
+func TestParsePiSession_SessionInfoLastNameWins(t *testing.T) {
+	content := strings.Join([]string{
+		`{"type":"session","version":3,"id":"renamed-sess","timestamp":"2025-01-01T10:00:00Z","cwd":"/Users/alice/code/my-project"}`,
+		`{"type":"session_info","id":"info-1","parentId":null,"timestamp":"2025-01-01T10:00:01Z","name":"Initial name"}`,
+		`{"type":"session_info","id":"info-2","parentId":"info-1","timestamp":"2025-01-01T10:00:02Z","name":"Second name"}`,
+		`{"type":"session_info","id":"info-3","parentId":"info-2","timestamp":"2025-01-01T10:00:03Z","name":"Final name"}`,
+		`{"type":"message","id":"msg-1","parentId":"info-3","timestamp":"2025-01-01T10:00:04Z","message":{"role":"user","content":"hello"}}`,
+		"",
+	}, "\n")
+
+	sess, _ := runPiParserTest(t, content)
+
+	assert.Equal(t, "Final name", sess.SessionName)
 }
 
 // TestParsePiSession_UserMessages verifies user message content and ordinals

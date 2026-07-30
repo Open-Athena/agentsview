@@ -11,18 +11,25 @@ type AgentType string
 
 const (
 	AgentClaude         AgentType = "claude"
+	AgentCowork         AgentType = "cowork"
 	AgentCodex          AgentType = "codex"
 	AgentCopilot        AgentType = "copilot"
 	AgentGemini         AgentType = "gemini"
+	AgentMiMoCode       AgentType = "mimocode"
 	AgentOpenCode       AgentType = "opencode"
+	AgentKilo           AgentType = "kilo"
 	AgentOpenHands      AgentType = "openhands"
 	AgentCursor         AgentType = "cursor"
 	AgentIflow          AgentType = "iflow"
 	AgentAmp            AgentType = "amp"
 	AgentZencoder       AgentType = "zencoder"
 	AgentVSCodeCopilot  AgentType = "vscode-copilot"
+	AgentVSCopilot      AgentType = "visualstudio-copilot"
 	AgentPi             AgentType = "pi"
+	AgentOMP            AgentType = "omp"
 	AgentQwen           AgentType = "qwen"
+	AgentCommandCode    AgentType = "commandcode"
+	AgentDeepSeekTUI    AgentType = "deepseek-tui"
 	AgentOpenClaw       AgentType = "openclaw"
 	AgentQClaw          AgentType = "qclaw"
 	AgentKimi           AgentType = "kimi"
@@ -39,6 +46,13 @@ const (
 	AgentPositron       AgentType = "positron"
 	AgentAntigravity    AgentType = "antigravity"
 	AgentAntigravityCLI AgentType = "antigravity-cli"
+	AgentVibe           AgentType = "vibe"
+	AgentZed            AgentType = "zed"
+	AgentQwenPaw        AgentType = "qwenpaw"
+	AgentGptme          AgentType = "gptme"
+	AgentShelley        AgentType = "shelley"
+	AgentAider          AgentType = "aider"
+	AgentReasonix       AgentType = "reasonix"
 )
 
 // AgentDef describes a supported coding agent's filesystem
@@ -62,6 +76,20 @@ type AgentDef struct {
 	// given a root directory and the raw session ID (prefix
 	// already stripped). Nil for non-file-based agents.
 	FindSourceFunc func(string, string) string
+
+	// WatchRootsFunc resolves the directories to watch for live
+	// updates under a configured root, for agents whose watch
+	// targets depend on the on-disk layout rather than a static
+	// WatchSubdirs list. When set, it takes precedence over
+	// WatchSubdirs. Nil for agents that use WatchSubdirs.
+	WatchRootsFunc func(string) []string
+
+	// ShallowWatchRootsFunc resolves directories to watch shallowly
+	// (root only) for a configured root, in addition to the agent's
+	// normal recursive watch. Used for sibling metadata files that
+	// live outside the session tree, such as Codex's
+	// session_index.jsonl. Nil for agents with no such files.
+	ShallowWatchRootsFunc func(string) []string
 }
 
 // Registry lists all supported agents. Order is stable and
@@ -79,6 +107,18 @@ var Registry = []AgentDef{
 		FindSourceFunc: FindClaudeSourceFile,
 	},
 	{
+		Type:           AgentCowork,
+		DisplayName:    "Claude Cowork",
+		EnvVar:         "COWORK_DIR",
+		ConfigKey:      "cowork_dirs",
+		DefaultDirs:    coworkDefaultDirs(),
+		IDPrefix:       "cowork:",
+		FileBased:      true,
+		ShallowWatch:   true,
+		DiscoverFunc:   DiscoverCoworkSessions,
+		FindSourceFunc: FindCoworkSourceFile,
+	},
+	{
 		Type:        AgentCodex,
 		DisplayName: "Codex",
 		EnvVar:      "CODEX_SESSIONS_DIR",
@@ -87,10 +127,11 @@ var Registry = []AgentDef{
 			".codex/sessions",
 			".codex/archived_sessions",
 		},
-		IDPrefix:       "codex:",
-		FileBased:      true,
-		DiscoverFunc:   DiscoverCodexSessions,
-		FindSourceFunc: FindCodexSourceFile,
+		IDPrefix:              "codex:",
+		FileBased:             true,
+		DiscoverFunc:          DiscoverCodexSessions,
+		FindSourceFunc:        FindCodexSourceFile,
+		ShallowWatchRootsFunc: ResolveCodexShallowWatchRoots,
 	},
 	{
 		Type:           AgentCopilot,
@@ -117,6 +158,23 @@ var Registry = []AgentDef{
 		FindSourceFunc: FindGeminiSourceFile,
 	},
 	{
+		Type:        AgentMiMoCode,
+		DisplayName: "MiMoCode",
+		EnvVar:      "MIMOCODE_DIR",
+		ConfigKey:   "mimocode_dirs",
+		DefaultDirs: []string{".local/share/mimocode"},
+		IDPrefix:    "mimocode:",
+		WatchSubdirs: []string{
+			"storage/session_diff",
+			"storage/message",
+			"storage/part",
+		},
+		FileBased:      true,
+		DiscoverFunc:   DiscoverMiMoCodeSessions,
+		FindSourceFunc: FindMiMoCodeSourceFile,
+		WatchRootsFunc: ResolveMiMoCodeWatchRoots,
+	},
+	{
 		Type:        AgentOpenCode,
 		DisplayName: "OpenCode",
 		EnvVar:      "OPENCODE_DIR",
@@ -131,6 +189,24 @@ var Registry = []AgentDef{
 		FileBased:      true,
 		DiscoverFunc:   DiscoverOpenCodeSessions,
 		FindSourceFunc: FindOpenCodeSourceFile,
+		WatchRootsFunc: ResolveOpenCodeWatchRoots,
+	},
+	{
+		Type:        AgentKilo,
+		DisplayName: "Kilo",
+		EnvVar:      "KILO_DIR",
+		ConfigKey:   "kilo_dirs",
+		DefaultDirs: []string{".local/share/kilo"},
+		IDPrefix:    "kilo:",
+		WatchSubdirs: []string{
+			"storage/session",
+			"storage/message",
+			"storage/part",
+		},
+		FileBased:      true,
+		DiscoverFunc:   DiscoverKiloSessions,
+		FindSourceFunc: FindKiloSourceFile,
+		WatchRootsFunc: ResolveKiloWatchRoots,
 	},
 	{
 		Type:           AgentOpenHands,
@@ -217,6 +293,24 @@ var Registry = []AgentDef{
 		FindSourceFunc: FindVSCodeCopilotSourceFile,
 	},
 	{
+		Type:        AgentVSCopilot,
+		DisplayName: "Visual Studio Copilot",
+		EnvVar:      "VISUALSTUDIO_COPILOT_DIR",
+		ConfigKey:   "visualstudio_copilot_dirs",
+		DefaultDirs: []string{
+			// Windows
+			"AppData/Local/Temp/VSGitHubCopilotLogs/traces",
+			// macOS
+			"Library/Caches/VSGitHubCopilotLogs/traces",
+			// Linux
+			".cache/VSGitHubCopilotLogs/traces",
+		},
+		IDPrefix:       "visualstudio-copilot:",
+		FileBased:      true,
+		DiscoverFunc:   DiscoverVisualStudioCopilotSessions,
+		FindSourceFunc: FindVisualStudioCopilotSourceFile,
+	},
+	{
 		Type:           AgentPi,
 		DisplayName:    "Pi",
 		EnvVar:         "PI_DIR",
@@ -226,6 +320,17 @@ var Registry = []AgentDef{
 		FileBased:      true,
 		DiscoverFunc:   DiscoverPiSessions,
 		FindSourceFunc: FindPiSourceFile,
+	},
+	{
+		Type:           AgentOMP,
+		DisplayName:    "OhMyPi",
+		EnvVar:         "OMP_DIR",
+		ConfigKey:      "omp_dirs",
+		DefaultDirs:    []string{".omp/agent/sessions"},
+		IDPrefix:       "omp:",
+		FileBased:      true,
+		DiscoverFunc:   DiscoverOMPSessions,
+		FindSourceFunc: FindOMPSourceFile,
 	},
 	{
 		Type:        AgentQwen,
@@ -242,11 +347,39 @@ var Registry = []AgentDef{
 		FindSourceFunc: FindQwenSourceFile,
 	},
 	{
-		Type:           AgentOpenClaw,
-		DisplayName:    "OpenClaw",
-		EnvVar:         "OPENCLAW_DIR",
-		ConfigKey:      "openclaw_dirs",
-		DefaultDirs:    []string{".openclaw/agents"},
+		Type:           AgentCommandCode,
+		DisplayName:    "Command Code",
+		EnvVar:         "COMMANDCODE_PROJECTS_DIR",
+		ConfigKey:      "commandcode_project_dirs",
+		DefaultDirs:    []string{".commandcode/projects"},
+		IDPrefix:       "commandcode:",
+		FileBased:      true,
+		DiscoverFunc:   DiscoverCommandCodeSessions,
+		FindSourceFunc: FindCommandCodeSourceFile,
+	},
+	{
+		Type:        AgentDeepSeekTUI,
+		DisplayName: "DeepSeek TUI",
+		EnvVar:      "DEEPSEEK_TUI_SESSIONS_DIR",
+		ConfigKey:   "deepseek_tui_sessions_dirs",
+		DefaultDirs: []string{
+			".codewhale/sessions",
+			".deepseek/sessions",
+		},
+		IDPrefix:       "deepseek-tui:",
+		FileBased:      true,
+		DiscoverFunc:   DiscoverDeepSeekTUISessions,
+		FindSourceFunc: FindDeepSeekTUISourceFile,
+	},
+	{
+		Type:        AgentOpenClaw,
+		DisplayName: "OpenClaw",
+		EnvVar:      "OPENCLAW_DIR",
+		ConfigKey:   "openclaw_dirs",
+		DefaultDirs: []string{
+			".openclaw/agents",
+			".kimi_openclaw/agents",
+		},
 		IDPrefix:       "openclaw:",
 		FileBased:      true,
 		DiscoverFunc:   DiscoverOpenClawSessions,
@@ -264,11 +397,14 @@ var Registry = []AgentDef{
 		FindSourceFunc: FindQClawSourceFile,
 	},
 	{
-		Type:           AgentKimi,
-		DisplayName:    "Kimi",
-		EnvVar:         "KIMI_DIR",
-		ConfigKey:      "kimi_dirs",
-		DefaultDirs:    []string{".kimi/sessions"},
+		Type:        AgentKimi,
+		DisplayName: "Kimi",
+		EnvVar:      "KIMI_DIR",
+		ConfigKey:   "kimi_dirs",
+		DefaultDirs: []string{
+			".kimi/sessions",
+			".kimi-code/sessions",
+		},
 		IDPrefix:       "kimi:",
 		FileBased:      true,
 		DiscoverFunc:   DiscoverKimiSessions,
@@ -395,6 +531,18 @@ var Registry = []AgentDef{
 		FindSourceFunc: FindPositronSourceFile,
 	},
 	{
+		Type:           AgentZed,
+		DisplayName:    "Zed",
+		EnvVar:         "ZED_DIR",
+		ConfigKey:      "zed_dirs",
+		DefaultDirs:    zedDefaultDirs(),
+		IDPrefix:       "zed:",
+		FileBased:      true,
+		WatchSubdirs:   []string{"threads"},
+		DiscoverFunc:   DiscoverZedSessions,
+		FindSourceFunc: FindZedSourceFile,
+	},
+	{
 		Type:        AgentAntigravity,
 		DisplayName: "Antigravity",
 		EnvVar:      "ANTIGRAVITY_DIR",
@@ -425,6 +573,91 @@ var Registry = []AgentDef{
 		FileBased:      true,
 		DiscoverFunc:   DiscoverAntigravityCLISessions,
 		FindSourceFunc: FindAntigravityCLISourceFile,
+	},
+	{
+		Type:           AgentQwenPaw,
+		DisplayName:    "QwenPaw",
+		EnvVar:         "QWENPAW_DIR",
+		ConfigKey:      "qwenpaw_dirs",
+		DefaultDirs:    []string{".copaw/workspaces"},
+		IDPrefix:       "qwenpaw:",
+		FileBased:      true,
+		DiscoverFunc:   DiscoverQwenPawSessions,
+		FindSourceFunc: FindQwenPawSourceFile,
+	},
+	{
+		Type:           AgentGptme,
+		DisplayName:    "gptme",
+		EnvVar:         "GPTME_DIR",
+		ConfigKey:      "gptme_dirs",
+		DefaultDirs:    []string{".local/share/gptme/logs"},
+		IDPrefix:       "gptme:",
+		FileBased:      true,
+		DiscoverFunc:   DiscoverGptmeSessions,
+		FindSourceFunc: FindGptmeSourceFile,
+	},
+	{
+		// Shelley (exe.dev) stores all conversations in a single
+		// SQLite DB at ~/.config/shelley/shelley.db. Like Zed, each
+		// conversation is addressed by a virtual path (dbPath#id).
+		Type:           AgentShelley,
+		DisplayName:    "Shelley",
+		EnvVar:         "SHELLEY_DIR",
+		ConfigKey:      "shelley_dirs",
+		DefaultDirs:    []string{".config/shelley"},
+		IDPrefix:       "shelley:",
+		FileBased:      true,
+		DiscoverFunc:   DiscoverShelleySessions,
+		FindSourceFunc: FindShelleySourceFile,
+	},
+	{
+		Type:           AgentVibe,
+		DisplayName:    "Mistral Vibe",
+		EnvVar:         "VIBE_SESSIONS_DIR",
+		ConfigKey:      "vibe_session_dirs",
+		DefaultDirs:    []string{".vibe/logs/session"},
+		IDPrefix:       "vibe:",
+		FileBased:      true,
+		DiscoverFunc:   DiscoverVibeSessions,
+		FindSourceFunc: FindVibeSourceFile,
+	},
+	{
+		// Aider has no central session store. It writes one Markdown
+		// chat log per repo at <repo>/.aider.chat.history.md. There is
+		// no canonical home dir, so discovery defaults to a bounded,
+		// symlink-safe walk of $HOME (DefaultDirs below); point
+		// AIDER_DIR (or the aider_dirs config key) at a narrower code
+		// root to scope and speed up the scan. The walk is depth-capped,
+		// time-budgeted, and skips vendor/build/VCS directories by name.
+		//
+		// ShallowWatch is true: DefaultDirs [""] resolves to $HOME, and a
+		// recursive live watch there would inotify-register the entire home
+		// tree (the watcher walk ignores the discovery skip-set and depth
+		// cap). Watch the root only and rely on the 15-minute periodic
+		// sync to pick up new repos' history files; aider history is
+		// append-mostly, so this is an acceptable latency tradeoff.
+		Type:           AgentAider,
+		DisplayName:    "Aider",
+		EnvVar:         "AIDER_DIR",
+		ConfigKey:      "aider_dirs",
+		DefaultDirs:    []string{""},
+		IDPrefix:       "aider:",
+		FileBased:      true,
+		ShallowWatch:   true,
+		DiscoverFunc:   DiscoverAiderSessions,
+		FindSourceFunc: FindAiderSourceFile,
+	},
+	{
+		Type:           AgentReasonix,
+		DisplayName:    "Reasonix",
+		EnvVar:         "REASONIX_DIR",
+		ConfigKey:      "reasonix_dirs",
+		DefaultDirs:    []string{".reasonix", "AppData/Roaming/reasonix"},
+		IDPrefix:       "reasonix:",
+		WatchSubdirs:   []string{"sessions", "archive", "projects"},
+		FileBased:      true,
+		DiscoverFunc:   DiscoverReasonixSessions,
+		FindSourceFunc: FindReasonixSourceFile,
 	},
 }
 
@@ -528,7 +761,7 @@ type ParsedSession struct {
 	MalformedLines   int
 	IsTruncated      bool
 	FirstMessage     string
-	DisplayName      string
+	SessionName      string
 	StartedAt        time.Time
 	EndedAt          time.Time
 	MessageCount     int
@@ -544,6 +777,12 @@ type ParsedSession struct {
 	PeakContextTokens    int
 	HasTotalOutputTokens bool
 	HasPeakContextTokens bool
+
+	// UsageEvents carries parser-emitted aggregate usage rows for
+	// agents whose session-level accounting is computed inline
+	// (e.g. VSCode Copilot). The sync engine forwards these into
+	// the usage_events table for catalog-based cost pricing.
+	UsageEvents []ParsedUsageEvent
 
 	// aggregateTokenPresenceKnown marks session aggregate token
 	// coverage as parser-owned and authoritative.
@@ -669,6 +908,54 @@ func accumulateMessageTokenUsage(
 				sess.PeakContextTokens = m.ContextTokens
 			}
 		}
+	}
+}
+
+// applyUsageEventTokenTotals recomputes session token totals from the
+// usage-event set whenever events exist. Callers must only use it when
+// events are a superset of per-message token metadata — true for the
+// Antigravity gen_metadata parsers, where every token-bearing message
+// derives from a gen row that also emits an event and undecodable
+// steps emit events with no message. Deriving totals from events
+// therefore covers transcripts that dropped steps (sidecar wins,
+// undecodable rows) without double counting. Message-derived totals
+// are kept where the events are silent.
+//
+// Peak context counts the full context window per event: fresh input
+// plus cache-creation and cache-read tokens. That keeps event-derived
+// session totals consistent with per-message ContextTokens attribution
+// (input + cacheRead) from parsers whose events carry cache fields,
+// such as the Antigravity CLI sidecar parser.
+func applyUsageEventTokenTotals(
+	sess *ParsedSession,
+	events []ParsedUsageEvent,
+) {
+	totalOutput := 0
+	peakContext := 0
+	hasOutput := false
+	hasContext := false
+	for _, ev := range events {
+		if ev.OutputTokens > 0 {
+			hasOutput = true
+			totalOutput += ev.OutputTokens
+		}
+		context := ev.InputTokens +
+			ev.CacheCreationInputTokens +
+			ev.CacheReadInputTokens
+		if context > 0 {
+			hasContext = true
+			if context > peakContext {
+				peakContext = context
+			}
+		}
+	}
+	if hasOutput {
+		sess.HasTotalOutputTokens = true
+		sess.TotalOutputTokens = totalOutput
+	}
+	if hasContext {
+		sess.HasPeakContextTokens = true
+		sess.PeakContextTokens = peakContext
 	}
 }
 

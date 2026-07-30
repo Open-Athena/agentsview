@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/signals"
 )
 
 // maxPGVars is the maximum bind variables per IN clause.
@@ -130,44 +131,37 @@ func buildAnalyticsWhereWithDate(
 			dateCol+" <= "+pb.add(utcTo)+"::timestamptz")
 	}
 	if f.Machine != "" {
-		preds = append(preds,
-			"machine = "+pb.add(f.Machine))
+		preds = appendPGAnalyticsCSVFilter(
+			preds, "machine", f.Machine, pb)
 	}
 	if f.Project != "" {
 		preds = append(preds,
 			"project = "+pb.add(f.Project))
 	}
 	if f.Agent != "" {
-		agents := strings.Split(f.Agent, ",")
-		if len(agents) == 1 {
-			preds = append(preds,
-				"agent = "+pb.add(agents[0]))
-		} else {
-			phs := make([]string, len(agents))
-			for i, a := range agents {
-				phs[i] = pb.add(a)
-			}
-			preds = append(preds,
-				"agent IN ("+
-					strings.Join(phs, ",")+
-					")")
-		}
+		preds = appendPGAnalyticsCSVFilter(
+			preds, "agent", f.Agent, pb)
 	}
 	if f.MinUserMessages > 0 {
 		preds = append(preds,
 			"user_message_count >= "+
 				pb.add(f.MinUserMessages))
 	}
+	scope := normalizePGAutomatedScope(
+		f.AutomatedScope, f.ExcludeAutomated)
 	if f.ExcludeOneShot {
-		if !f.ExcludeAutomated {
+		if scope != "human" {
 			preds = append(preds,
 				"(user_message_count > 1 OR is_automated = TRUE)")
 		} else {
 			preds = append(preds, "user_message_count > 1")
 		}
 	}
-	if f.ExcludeAutomated {
-		preds = append(preds, "is_automated = FALSE")
+	if pred := pgAutomatedScopePredicate(scope, "is_automated"); pred != "" {
+		preds = append(preds, pred)
+	}
+	if f.ExcludeInteractive {
+		preds = append(preds, "is_automated = TRUE")
 	}
 	if f.ActiveSince != "" {
 		preds = append(preds,
@@ -179,6 +173,39 @@ func buildAnalyticsWhereWithDate(
 		preds = append(preds, pred)
 	}
 	return strings.Join(preds, " AND ")
+}
+
+func appendPGAnalyticsCSVFilter(
+	preds []string,
+	col string,
+	raw string,
+	pb *paramBuilder,
+) []string {
+	values := pgAnalyticsCSVValues(raw)
+	if len(values) == 0 {
+		return preds
+	}
+	if len(values) == 1 {
+		return append(preds, col+" = "+pb.add(values[0]))
+	}
+	phs := make([]string, len(values))
+	for i, value := range values {
+		phs[i] = pb.add(value)
+	}
+	return append(preds,
+		col+" IN ("+strings.Join(phs, ",")+")")
+}
+
+func pgAnalyticsCSVValues(raw string) []string {
+	values := strings.Split(raw, ",")
+	out := values[:0]
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 // localTime parses a UTC timestamp string and converts it to
@@ -1468,6 +1495,7 @@ func (s *Store) GetAnalyticsTools(
 	type toolRow struct {
 		sessionID string
 		category  string
+		count     int
 	}
 	var toolRows []toolRow
 
@@ -1475,9 +1503,10 @@ func (s *Store) GetAnalyticsTools(
 		func(chunk []string) error {
 			chunkPB := &paramBuilder{}
 			ph := pgInPlaceholders(chunk, chunkPB)
-			q := `SELECT session_id, category
+			q := `SELECT session_id, category, COUNT(*)
 				FROM tool_calls
-				WHERE session_id IN ` + ph
+				WHERE session_id IN ` + ph + `
+				GROUP BY session_id, category`
 			rows, qErr := s.pg.QueryContext(
 				ctx, q, chunkPB.args...,
 			)
@@ -1489,13 +1518,18 @@ func (s *Store) GetAnalyticsTools(
 			defer rows.Close()
 			for rows.Next() {
 				var sid, cat string
-				if err := rows.Scan(&sid, &cat); err != nil {
+				var count int
+				if err := rows.Scan(
+					&sid, &cat, &count,
+				); err != nil {
 					return fmt.Errorf(
 						"scanning tool_call: %w", err,
 					)
 				}
 				toolRows = append(toolRows, toolRow{
-					sessionID: sid, category: cat,
+					sessionID: sid,
+					category:  cat,
+					count:     count,
 				})
 			}
 			return rows.Err()
@@ -1514,21 +1548,23 @@ func (s *Store) GetAnalyticsTools(
 
 	for _, tr := range toolRows {
 		info := sessionMap[tr.sessionID]
-		catCounts[tr.category]++
+		catCounts[tr.category] += tr.count
 
 		if agentCats[info.agent] == nil {
 			agentCats[info.agent] = make(map[string]int)
 		}
-		agentCats[info.agent][tr.category]++
+		agentCats[info.agent][tr.category] += tr.count
 
 		week := bucketDate(info.date, "week")
 		if trendBuckets[week] == nil {
 			trendBuckets[week] = make(map[string]int)
 		}
-		trendBuckets[week][tr.category]++
+		trendBuckets[week][tr.category] += tr.count
 	}
 
-	resp.TotalCalls = len(toolRows)
+	for _, count := range catCounts {
+		resp.TotalCalls += count
+	}
 
 	resp.ByCategory = make(
 		[]db.ToolCategoryCount, 0, len(catCounts),
@@ -1608,6 +1644,119 @@ func (s *Store) GetAnalyticsTools(
 	return resp, nil
 }
 
+// GetAnalyticsSkills returns skill usage analytics.
+func (s *Store) GetAnalyticsSkills(
+	ctx context.Context, f db.AnalyticsFilter,
+) (db.SkillsAnalyticsResponse, error) {
+	pb := &paramBuilder{}
+	where := buildAnalyticsWhereWithoutDate(f, pb)
+
+	sessQ := `SELECT id, ` + pgDateCol + `, agent, project
+		FROM sessions WHERE ` + where
+
+	sessRows, err := s.pg.QueryContext(ctx, sessQ, pb.args...)
+	if err != nil {
+		return db.SkillsAnalyticsResponse{},
+			fmt.Errorf("querying skill sessions: %w", err)
+	}
+	defer sessRows.Close()
+
+	type sessInfo struct {
+		ts      string
+		agent   string
+		project string
+	}
+	sessionMap := make(map[string]sessInfo)
+	var sessionIDs []string
+
+	for sessRows.Next() {
+		var id, agent, project string
+		var ts *time.Time
+		if err := sessRows.Scan(
+			&id, &ts, &agent, &project,
+		); err != nil {
+			return db.SkillsAnalyticsResponse{},
+				fmt.Errorf("scanning skill session: %w", err)
+		}
+		sessionMap[id] = sessInfo{
+			ts:      scanDateCol(ts),
+			agent:   agent,
+			project: project,
+		}
+		sessionIDs = append(sessionIDs, id)
+	}
+	if err := sessRows.Err(); err != nil {
+		return db.SkillsAnalyticsResponse{},
+			fmt.Errorf("iterating skill sessions: %w", err)
+	}
+	if len(sessionIDs) == 0 {
+		return db.BuildSkillsAnalytics(nil), nil
+	}
+
+	var skillRows []db.SkillAnalyticsRow
+	err = pgQueryChunked(sessionIDs,
+		func(chunk []string) error {
+			chunkPB := &paramBuilder{}
+			ph := pgInPlaceholders(chunk, chunkPB)
+			q := `SELECT tc.session_id,
+					TRIM(COALESCE(tc.skill_name, '')),
+					COUNT(*),
+					m.timestamp
+				FROM tool_calls tc
+				LEFT JOIN messages m
+					ON m.session_id = tc.session_id
+					AND m.ordinal = tc.message_ordinal
+				WHERE tc.session_id IN ` + ph + `
+					AND TRIM(COALESCE(tc.skill_name, '')) != ''
+				GROUP BY tc.session_id,
+					TRIM(COALESCE(tc.skill_name, '')),
+					m.timestamp`
+			rows, qErr := s.pg.QueryContext(
+				ctx, q, chunkPB.args...,
+			)
+			if qErr != nil {
+				return fmt.Errorf(
+					"querying skill tool_calls: %w", qErr,
+				)
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var sid, skill string
+				var count int
+				var lastTS *time.Time
+				if err := rows.Scan(
+					&sid, &skill, &count, &lastTS,
+				); err != nil {
+					return fmt.Errorf(
+						"scanning skill tool_call: %w", err,
+					)
+				}
+				info := sessionMap[sid]
+				usedTS, date, keep := f.ResolveSkillRowTime(
+					scanDateCol(lastTS), info.ts,
+				)
+				if !keep {
+					continue
+				}
+				skillRows = append(skillRows, db.SkillAnalyticsRow{
+					SessionID:  sid,
+					SkillName:  skill,
+					Agent:      info.agent,
+					Project:    info.project,
+					Date:       date,
+					LastUsedAt: usedTS,
+					Count:      count,
+				})
+			}
+			return rows.Err()
+		})
+	if err != nil {
+		return db.SkillsAnalyticsResponse{}, err
+	}
+
+	return db.BuildSkillsAnalytics(skillRows), nil
+}
+
 // --- Velocity ---
 
 // velocityMsg holds per-message data needed for velocity.
@@ -1629,8 +1778,7 @@ func (s *Store) queryVelocityMsgs(
 	pb := &paramBuilder{}
 	ph := pgInPlaceholders(chunk, pb)
 	q := `SELECT session_id, ordinal, role,
-		TO_CHAR(timestamp AT TIME ZONE 'UTC',
-			'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+		timestamp,
 		content_length
 		FROM messages
 		WHERE session_id IN ` + ph + `
@@ -1648,7 +1796,7 @@ func (s *Store) queryVelocityMsgs(
 		var sid string
 		var ordinal int
 		var role string
-		var ts *string
+		var ts *time.Time
 		var cl int
 		if err := rows.Scan(
 			&sid, &ordinal, &role, &ts, &cl,
@@ -1657,11 +1805,12 @@ func (s *Store) queryVelocityMsgs(
 				"scanning velocity msg: %w", err,
 			)
 		}
-		tsStr := ""
+		t := time.Time{}
+		ok := false
 		if ts != nil {
-			tsStr = *ts
+			t = ts.In(loc)
+			ok = true
 		}
-		t, ok := localTime(tsStr, loc)
 		sessionMsgs[sid] = append(sessionMsgs[sid],
 			velocityMsg{
 				role: role, ts: t, valid: ok,
@@ -2065,8 +2214,9 @@ func (s *Store) GetAnalyticsTopSessions(
 		limitClause = ""
 	}
 	query := `SELECT id, ` + pgDateCol + `, project,
-		first_message, message_count,
-		total_output_tokens,
+		first_message,
+		COALESCE(display_name, session_name) AS display_name,
+		message_count, total_output_tokens,
 		EXTRACT(EPOCH FROM ended_at - started_at)
 			AS duration_sec,
 		started_at, ended_at,
@@ -2090,13 +2240,13 @@ func (s *Store) GetAnalyticsTopSessions(
 		var id, project string
 		var ts *time.Time
 		var startedAt, endedAt *time.Time
-		var firstMsg, termStatus *string
+		var firstMsg, displayName, termStatus *string
 		var mc, outputTokens int
 		var durationSec *float64
 		if err := rows.Scan(
 			&id, &ts, &project, &firstMsg,
-			&mc, &outputTokens, &durationSec,
-			&startedAt, &endedAt,
+			&displayName, &mc, &outputTokens,
+			&durationSec, &startedAt, &endedAt,
 			&termStatus,
 		); err != nil {
 			return db.TopSessionsResponse{},
@@ -2130,6 +2280,7 @@ func (s *Store) GetAnalyticsTopSessions(
 			ID:                id,
 			Project:           project,
 			FirstMessage:      firstMsg,
+			DisplayName:       displayName,
 			MessageCount:      mc,
 			OutputTokens:      outputTokens,
 			DurationMin:       durMin,
@@ -2174,13 +2325,19 @@ func (s *Store) GetAnalyticsSignals(
 		}
 	}
 
-	query := `SELECT id, agent, project, ` + pgDateCol + `,
+	query := `SELECT id, agent, project, first_message, is_automated,
+		` + pgDateCol + `,
 		health_score, health_grade, outcome,
 		outcome_confidence,
 		tool_failure_signal_count, tool_retry_count,
 		edit_churn_count, compaction_count,
 		mid_task_compaction_count,
-		context_pressure_max
+		context_pressure_max,
+		quality_signal_version,
+		short_prompt_count, unstructured_start,
+		missing_success_criteria_count,
+		missing_verification_count, duplicate_prompt_count,
+		no_code_context_count, runaway_tool_loop_count
 		FROM sessions WHERE ` + where
 
 	rows, err := s.pg.QueryContext(ctx, query, pb.args...)
@@ -2198,13 +2355,20 @@ func (s *Store) GetAnalyticsSignals(
 			ts *time.Time
 		)
 		if err := rows.Scan(
-			&r.ID, &r.Agent, &r.Project, &ts,
+			&r.ID, &r.Agent, &r.Project,
+			&r.FirstMessage, &r.IsAutomated, &ts,
 			&r.HealthScore, &r.HealthGrade,
 			&r.Outcome, &r.OutcomeConfidence,
 			&r.ToolFailureSignalCount,
 			&r.ToolRetryCount, &r.EditChurnCount,
 			&r.CompactionCount, &r.MidTaskCompactionCount,
 			&r.ContextPressureMax,
+			&r.QualitySignalVersion,
+			&r.ShortPromptCount, &r.UnstructuredStart,
+			&r.MissingSuccessCriteriaCount,
+			&r.MissingVerificationCount,
+			&r.DuplicatePromptCount,
+			&r.NoCodeContextCount, &r.RunawayToolLoopCount,
 		); err != nil {
 			return db.SignalsAnalyticsResponse{}, fmt.Errorf(
 				"scanning signals row: %w", err,
@@ -2224,8 +2388,245 @@ func (s *Store) GetAnalyticsSignals(
 			"iterating signals rows: %w", err,
 		)
 	}
+	if err := s.populateFrustrationMarkers(ctx, all); err != nil {
+		return db.SignalsAnalyticsResponse{}, err
+	}
 
 	return db.AggregateSignals(all), nil
+}
+
+func (s *Store) GetAnalyticsSignalSessions(
+	ctx context.Context,
+	f db.AnalyticsFilter,
+	signal string,
+	limit int,
+) (db.SignalSessionsResponse, error) {
+	if !db.IsSupportedAnalyticsSignal(signal) {
+		return db.SignalSessionsResponse{},
+			db.ErrUnsupportedAnalyticsSignal
+	}
+	if limit <= 0 || limit > 20 {
+		limit = 10
+	}
+	rows, err := s.signalRows(ctx, f)
+	if err != nil {
+		return db.SignalSessionsResponse{}, err
+	}
+	if err := s.populateFrustrationMarkers(ctx, rows); err != nil {
+		return db.SignalSessionsResponse{}, err
+	}
+	candidates := db.SignalCandidates(rows, signal, limit)
+	messages, err := s.signalMessages(ctx, candidates)
+	if err != nil {
+		return db.SignalSessionsResponse{}, err
+	}
+	return db.SignalSessionsResponse{
+		Signal:   signal,
+		Sessions: db.BuildSignalExamples(candidates, messages, signal),
+	}, nil
+}
+
+func (s *Store) signalRows(
+	ctx context.Context,
+	f db.AnalyticsFilter,
+) ([]db.SignalRow, error) {
+	loc := analyticsLocation(f)
+	pb := &paramBuilder{}
+	where := buildAnalyticsWhere(f, pgDateCol, pb)
+	var timeIDs map[string]bool
+	if f.HasTimeFilter() {
+		var err error
+		timeIDs, err = s.filteredSessionIDs(ctx, f)
+		if err != nil {
+			return nil, err
+		}
+	}
+	query := `SELECT id, agent, project, first_message, is_automated,
+		` + pgDateCol + `,
+		health_score, health_grade, outcome,
+		outcome_confidence,
+		tool_failure_signal_count, tool_retry_count,
+		edit_churn_count, compaction_count,
+		mid_task_compaction_count,
+		context_pressure_max,
+		quality_signal_version,
+		short_prompt_count, unstructured_start,
+		missing_success_criteria_count,
+		missing_verification_count, duplicate_prompt_count,
+		no_code_context_count, runaway_tool_loop_count
+		FROM sessions WHERE ` + where
+	rows, err := s.pg.QueryContext(ctx, query, pb.args...)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"querying analytics signal rows: %w", err,
+		)
+	}
+	defer rows.Close()
+	var all []db.SignalRow
+	for rows.Next() {
+		r, err := scanPGSignalRow(rows, loc)
+		if err != nil {
+			return nil, err
+		}
+		if !inDateRange(r.Date, f.From, f.To) {
+			continue
+		}
+		if timeIDs != nil && !timeIDs[r.ID] {
+			continue
+		}
+		all = append(all, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"iterating analytics signal rows: %w", err,
+		)
+	}
+	return all, nil
+}
+
+func scanPGSignalRow(
+	rows interface{ Scan(dest ...any) error },
+	loc *time.Location,
+) (db.SignalRow, error) {
+	var (
+		r  db.SignalRow
+		ts *time.Time
+	)
+	if err := rows.Scan(
+		&r.ID, &r.Agent, &r.Project,
+		&r.FirstMessage, &r.IsAutomated, &ts,
+		&r.HealthScore, &r.HealthGrade,
+		&r.Outcome, &r.OutcomeConfidence,
+		&r.ToolFailureSignalCount,
+		&r.ToolRetryCount, &r.EditChurnCount,
+		&r.CompactionCount, &r.MidTaskCompactionCount,
+		&r.ContextPressureMax,
+		&r.QualitySignalVersion,
+		&r.ShortPromptCount, &r.UnstructuredStart,
+		&r.MissingSuccessCriteriaCount,
+		&r.MissingVerificationCount,
+		&r.DuplicatePromptCount,
+		&r.NoCodeContextCount, &r.RunawayToolLoopCount,
+	); err != nil {
+		return db.SignalRow{}, fmt.Errorf(
+			"scanning signal row: %w", err,
+		)
+	}
+	r.Date = localDate(scanDateCol(ts), loc)
+	return r, nil
+}
+
+func (s *Store) signalMessages(
+	ctx context.Context,
+	rows []db.SignalRow,
+) (map[string][]db.SignalMessage, error) {
+	out := make(map[string][]db.SignalMessage, len(rows))
+	if len(rows) == 0 {
+		return out, nil
+	}
+	ids := make([]string, 0, len(rows))
+	for _, r := range rows {
+		ids = append(ids, r.ID)
+	}
+	err := pgQueryChunked(ids, func(chunk []string) error {
+		pb := &paramBuilder{}
+		placeholders := make([]string, 0, len(chunk))
+		for _, id := range chunk {
+			placeholders = append(placeholders, pb.add(id))
+		}
+		q := `SELECT session_id, ordinal, role, content,
+					COALESCE(to_char(timestamp AT TIME ZONE 'UTC',
+						'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'), ''),
+					is_system, has_tool_use
+				FROM messages
+				WHERE session_id IN (` + strings.Join(placeholders, ",") + `)
+				ORDER BY session_id, ordinal`
+		msgRows, err := s.pg.QueryContext(ctx, q, pb.args...)
+		if err != nil {
+			return fmt.Errorf(
+				"querying signal messages: %w", err,
+			)
+		}
+		defer msgRows.Close()
+		for msgRows.Next() {
+			var m db.SignalMessage
+			if err := msgRows.Scan(
+				&m.SessionID, &m.Ordinal, &m.Role,
+				&m.Content, &m.Timestamp,
+				&m.IsSystem, &m.HasToolUse,
+			); err != nil {
+				return fmt.Errorf(
+					"scanning signal message: %w", err,
+				)
+			}
+			out[m.SessionID] = append(out[m.SessionID], m)
+		}
+		if err := msgRows.Err(); err != nil {
+			return fmt.Errorf(
+				"iterating signal messages: %w", err,
+			)
+		}
+		return nil
+	})
+	return out, err
+}
+
+func (s *Store) populateFrustrationMarkers(
+	ctx context.Context,
+	rows []db.SignalRow,
+) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	idx := make(map[string]int, len(rows))
+	ids := make([]string, 0, len(rows))
+	for i := range rows {
+		idx[rows[i].ID] = i
+		ids = append(ids, rows[i].ID)
+	}
+	return pgQueryChunked(ids, func(chunk []string) error {
+		pb := &paramBuilder{}
+		placeholders := make([]string, 0, len(chunk))
+		for _, id := range chunk {
+			placeholders = append(placeholders, pb.add(id))
+		}
+		q := `SELECT session_id, ordinal, content, is_system
+			FROM messages
+			WHERE role = 'user'
+			  AND session_id IN (` + strings.Join(placeholders, ",") + `)`
+		msgRows, err := s.pg.QueryContext(ctx, q, pb.args...)
+		if err != nil {
+			return fmt.Errorf(
+				"querying frustration markers: %w", err,
+			)
+		}
+		defer msgRows.Close()
+		for msgRows.Next() {
+			var sessionID, content string
+			var ordinal int
+			var isSystem bool
+			if err := msgRows.Scan(
+				&sessionID, &ordinal, &content, &isSystem,
+			); err != nil {
+				return fmt.Errorf(
+					"scanning frustration marker: %w", err,
+				)
+			}
+			i, ok := idx[sessionID]
+			if !ok || isSystem {
+				continue
+			}
+			if signals.IsFrustrationMarker(content) {
+				rows[i].FrustrationMarkerCount++
+			}
+		}
+		if err := msgRows.Err(); err != nil {
+			return fmt.Errorf(
+				"iterating frustration markers: %w", err,
+			)
+		}
+		return nil
+	})
 }
 
 // rankTopSessions sorts sessions by duration (if

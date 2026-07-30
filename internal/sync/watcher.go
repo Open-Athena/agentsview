@@ -34,6 +34,7 @@ type Watcher struct {
 	debounce time.Duration
 	excludes []string
 	roots    []string
+	shallow  []string
 	rootsMu  sync.RWMutex
 	pending  map[string]time.Time
 	mu       sync.Mutex
@@ -133,6 +134,7 @@ func isWatchResourceExhaustion(err error) bool {
 func (w *Watcher) WatchShallow(root string) bool {
 	root = filepath.Clean(root)
 	w.addRoot(root)
+	w.addShallowRoot(root)
 	return w.watcher.Add(root) == nil
 }
 
@@ -207,6 +209,9 @@ func (w *Watcher) watchIfDir(path string) (isDir bool, excluded bool) {
 	if err != nil || !info.IsDir() {
 		return false, false
 	}
+	if w.isUnderShallowRoot(path) {
+		return true, false
+	}
 	if w.shouldExclude(path) {
 		return true, true
 	}
@@ -237,6 +242,30 @@ func (w *Watcher) addRoot(root string) {
 	if !slices.Contains(w.roots, root) {
 		w.roots = append(w.roots, root)
 	}
+}
+
+func (w *Watcher) addShallowRoot(root string) {
+	w.rootsMu.Lock()
+	defer w.rootsMu.Unlock()
+	if !slices.Contains(w.shallow, root) {
+		w.shallow = append(w.shallow, root)
+	}
+}
+
+// isUnderShallowRoot reports whether path's most specific containing watch
+// root is a shallow root. A path that also sits under a more specific
+// recursive root (for example a new sessions/YYYY/MM/DD directory beneath a
+// recursive sessions root that itself lives inside a shallow parent root) is
+// NOT shadowed, so auto-watching still adds new subdirectories of recursive
+// roots.
+func (w *Watcher) isUnderShallowRoot(path string) bool {
+	root, ok := w.mostSpecificContainingRoot(path)
+	if !ok {
+		return false
+	}
+	w.rootsMu.RLock()
+	defer w.rootsMu.RUnlock()
+	return slices.Contains(w.shallow, root)
 }
 
 func (w *Watcher) shouldExclude(path string) bool {

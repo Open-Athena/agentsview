@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect } from "vite-plus/test";
 import {
   KNOWN_AGENTS,
   agentColor,
@@ -10,6 +10,7 @@ describe("KNOWN_AGENTS", () => {
     const names = KNOWN_AGENTS.map((a) => a.name);
     expect(names).toEqual([
       "claude",
+      "cowork",
       "codex",
       "copilot",
       "gemini",
@@ -18,9 +19,13 @@ describe("KNOWN_AGENTS", () => {
       "cursor",
       "amp",
       "zencoder",
+      "zed",
       "vscode-copilot",
+      "visualstudio-copilot",
       "pi",
       "qwen",
+      "qwenpaw",
+      "deepseek-tui",
       "openclaw",
       "qclaw",
       "iflow",
@@ -34,6 +39,7 @@ describe("KNOWN_AGENTS", () => {
       "piebald",
       "antigravity",
       "antigravity-cli",
+      "vibe",
     ]);
   });
 
@@ -73,14 +79,26 @@ describe("agentColor", () => {
     expect(agentColor("zencoder")).toBe(
       "var(--accent-red)",
     );
+    expect(agentColor("zed")).toBe(
+      "var(--accent-green)",
+    );
     expect(agentColor("pi")).toBe(
       "var(--accent-indigo)",
     );
     expect(agentColor("qwen")).toBe(
       "var(--accent-cyan)",
     );
+    expect(agentColor("qwenpaw")).toBe(
+      "var(--accent-cyan)",
+    );
+    expect(agentColor("deepseek-tui")).toBe(
+      "var(--accent-cyan)",
+    );
     expect(agentColor("vscode-copilot")).toBe(
       "var(--accent-teal)",
+    );
+    expect(agentColor("visualstudio-copilot")).toBe(
+      "var(--accent-blue)",
     );
     expect(agentColor("qclaw")).toBe(
       "var(--accent-orange)",
@@ -106,13 +124,19 @@ describe("agentLabel", () => {
     expect(agentLabel("vscode-copilot")).toBe(
       "VS Code Copilot",
     );
+    expect(agentLabel("visualstudio-copilot")).toBe(
+      "Visual Studio Copilot",
+    );
     expect(agentLabel("openhands")).toBe("OpenHands");
     expect(agentLabel("openclaw")).toBe("OpenClaw");
     expect(agentLabel("qclaw")).toBe("QClaw");
     expect(agentLabel("iflow")).toBe("iFlow");
     expect(agentLabel("workbuddy")).toBe("WorkBuddy");
     expect(agentLabel("piebald")).toBe("Piebald");
+    expect(agentLabel("zed")).toBe("Zed");
     expect(agentLabel("qwen")).toBe("Qwen Code");
+    expect(agentLabel("qwenpaw")).toBe("QwenPaw");
+    expect(agentLabel("deepseek-tui")).toBe("DeepSeek TUI");
   });
 
   it("capitalizes simple agent names", () => {

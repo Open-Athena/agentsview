@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"log"
 	"net/http"
 	"time"
 
@@ -14,6 +13,7 @@ func (s *Server) registerUsageRoutes() {
 	group := newRouteGroup(s.api, "/api/v1/usage", "Usage")
 
 	get(s, group, "/summary", "Get usage summary", s.humaUsageSummary)
+	get(s, group, "/comparison", "Get usage comparison", s.humaUsageComparison)
 	get(s, group, "/top-sessions", "Get top usage sessions", s.humaUsageTopSessions)
 }
 
@@ -30,13 +30,22 @@ type UsageFilterInput struct {
 	Model            string `query:"model" doc:"Filter by model"`
 	MinUserMessages  int    `query:"min_user_messages" minimum:"0" doc:"Minimum user message count"`
 	ActiveSince      string `query:"active_since" format:"date-time" doc:"Filter sessions active since this RFC3339 timestamp"`
+	Termination      string `query:"termination" doc:"Filter by termination status"`
 	IncludeOneShot   bool   `query:"include_one_shot" default:"true" doc:"Include one-shot sessions"`
 	IncludeAutomated bool   `query:"include_automated" doc:"Include automated sessions"`
+	NoDefaultRange   bool   `query:"no_default_range" doc:"Preserve omitted from/to without applying default range"`
+	Breakdowns       bool   `query:"breakdowns" default:"true" doc:"Include per-model, per-project, and per-agent breakdowns"`
+	SessionCounts    bool   `query:"session_counts" default:"true" doc:"Include distinct session counts"`
 }
 
 type usageTopSessionsInput struct {
 	UsageFilterInput
 	Limit int `query:"limit" minimum:"0" maximum:"100" default:"20" doc:"Maximum number of sessions"`
+}
+
+type usageComparisonInput struct {
+	UsageFilterInput
+	CurrentCost float64 `query:"current_cost" required:"true" doc:"Current period total cost"`
 }
 
 func usageFilterFromInput(in UsageFilterInput) (db.UsageFilter, error) {
@@ -47,32 +56,41 @@ func usageFilterFromInput(in UsageFilterInput) (db.UsageFilter, error) {
 	if _, err := time.LoadLocation(tz); err != nil {
 		return db.UsageFilter{}, apiError(http.StatusBadRequest, "invalid timezone: "+tz)
 	}
-	from, to := defaultDateRange(in.From, in.To)
-	if !timeutil.IsValidDate(from) || !timeutil.IsValidDate(to) {
-		return db.UsageFilter{}, apiError(http.StatusBadRequest, "invalid date format: use YYYY-MM-DD")
+	from, to := in.From, in.To
+	if !in.NoDefaultRange {
+		from, to = defaultDateRange(in.From, in.To)
 	}
-	if from > to {
+	if (from != "" && !timeutil.IsValidDate(from)) ||
+		(to != "" && !timeutil.IsValidDate(to)) {
+		return db.UsageFilter{}, apiError(
+			http.StatusBadRequest,
+			"invalid date format: use YYYY-MM-DD",
+		)
+	}
+	if from != "" && to != "" && from > to {
 		return db.UsageFilter{}, apiError(http.StatusBadRequest, "from must not be after to")
 	}
 	if in.ActiveSince != "" && !timeutil.IsValidTimestamp(in.ActiveSince) {
 		return db.UsageFilter{}, apiError(http.StatusBadRequest, "invalid active_since: use RFC3339 timestamp")
 	}
 	return db.UsageFilter{
-		From:             from,
-		To:               to,
-		Agent:            in.Agent,
-		Project:          in.Project,
-		Machine:          in.Machine,
-		ExcludeProject:   in.ExcludeProject,
-		ExcludeAgent:     in.ExcludeAgent,
-		ExcludeModel:     in.ExcludeModel,
-		Model:            in.Model,
-		Timezone:         tz,
-		MinUserMessages:  in.MinUserMessages,
-		ExcludeOneShot:   !in.IncludeOneShot,
-		ExcludeAutomated: !in.IncludeAutomated,
-		ActiveSince:      in.ActiveSince,
-		Breakdowns:       true,
+		From:              from,
+		To:                to,
+		Agent:             in.Agent,
+		Project:           in.Project,
+		Machine:           in.Machine,
+		ExcludeProject:    in.ExcludeProject,
+		ExcludeAgent:      in.ExcludeAgent,
+		ExcludeModel:      in.ExcludeModel,
+		Model:             in.Model,
+		Timezone:          tz,
+		MinUserMessages:   in.MinUserMessages,
+		ExcludeOneShot:    !in.IncludeOneShot,
+		ExcludeAutomated:  !in.IncludeAutomated,
+		ActiveSince:       in.ActiveSince,
+		Termination:       in.Termination,
+		Breakdowns:        in.Breakdowns,
+		SkipSessionCounts: !in.SessionCounts,
 	}, nil
 }
 
@@ -84,10 +102,7 @@ func (s *Server) humaUsageSummary(
 	if err != nil {
 		return nil, err
 	}
-	// BuildUsageSummary is shared with the snapshot exporter so both
-	// produce the identical shape; the comparison needs the request
-	// context, so it is layered on here.
-	resp, err := BuildUsageSummary(ctx, s.db, f)
+	result, err := s.db.GetDailyUsage(ctx, f)
 	if err != nil {
 		if handled := handleHumaContextError(err); handled != nil {
 			return nil, handled
@@ -97,22 +112,65 @@ func (s *Server) humaUsageSummary(
 		}
 		return nil, internalError("usage summary error", err)
 	}
-	resp.Comparison = s.computeUsageComparison(ctx, f, resp.Totals.TotalCost)
+	resp := UsageSummaryResponse{
+		From:          f.From,
+		To:            f.To,
+		Totals:        result.Totals,
+		Daily:         result.Daily,
+		SessionCounts: result.SessionCounts,
+		CacheStats:    computeCacheStats(result.Totals),
+	}
+	if f.Breakdowns {
+		resp.ProjectTotals = foldProjectTotals(result.Daily)
+		resp.ModelTotals = foldModelTotals(result.Daily)
+		resp.AgentTotals = foldAgentTotals(result.Daily)
+	} else {
+		resp.ProjectTotals = []ProjectTotal{}
+		resp.ModelTotals = []ModelTotal{}
+		resp.AgentTotals = []AgentTotal{}
+	}
 	return &jsonOutput[UsageSummaryResponse]{Body: resp}, nil
+}
+
+func (s *Server) humaUsageComparison(
+	ctx context.Context,
+	in *usageComparisonInput,
+) (*jsonOutput[Comparison], error) {
+	f, err := usageFilterFromInput(in.UsageFilterInput)
+	if err != nil {
+		return nil, err
+	}
+	if in.NoDefaultRange && (f.From == "" || f.To == "") {
+		return nil, apiError(
+			http.StatusBadRequest,
+			"usage comparison requires from and to when no_default_range is true",
+		)
+	}
+	comparison, err := s.computeUsageComparison(ctx, f, in.CurrentCost)
+	if err != nil {
+		if handled := handleHumaContextError(err); handled != nil {
+			return nil, handled
+		}
+		if handled := handleHumaReadOnly(err); handled != nil {
+			return nil, handled
+		}
+		return nil, internalError("usage comparison error", err)
+	}
+	return &jsonOutput[Comparison]{Body: *comparison}, nil
 }
 
 func (s *Server) computeUsageComparison(
 	ctx context.Context,
 	f db.UsageFilter,
 	currentCost float64,
-) *Comparison {
+) (*Comparison, error) {
 	fromT, err := time.Parse("2006-01-02", f.From)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	toT, err := time.Parse("2006-01-02", f.To)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	days := int(toT.Sub(fromT).Hours()/24) + 1
 	priorTo := fromT.AddDate(0, 0, -1)
@@ -132,12 +190,12 @@ func (s *Server) computeUsageComparison(
 		ExcludeOneShot:   f.ExcludeOneShot,
 		ExcludeAutomated: f.ExcludeAutomated,
 		ActiveSince:      f.ActiveSince,
+		Termination:      f.Termination,
 		Breakdowns:       false,
 	}
 	priorResult, err := s.db.GetDailyUsage(ctx, priorFilter)
 	if err != nil {
-		log.Printf("usage comparison error: %v", err)
-		return nil
+		return nil, err
 	}
 	c := &Comparison{
 		PriorFrom:      priorFilter.From,
@@ -147,7 +205,7 @@ func (s *Server) computeUsageComparison(
 	if c.PriorTotalCost > 0 {
 		c.DeltaPct = (currentCost - c.PriorTotalCost) / c.PriorTotalCost
 	}
-	return c
+	return c, nil
 }
 
 func (s *Server) humaUsageTopSessions(

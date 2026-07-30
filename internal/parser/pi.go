@@ -17,6 +17,23 @@ import (
 func ParsePiSession(
 	path, project, machine string,
 ) (*ParsedSession, []ParsedMessage, error) {
+	return parsePiLikeSession(path, project, machine, AgentPi, "pi:")
+}
+
+// ParseOMPSession parses an OhMyPi JSONL session file. OMP uses the
+// same on-disk session format as Pi, but sessions are identified with
+// the omp agent type and omp: session ID prefix.
+func ParseOMPSession(
+	path, project, machine string,
+) (*ParsedSession, []ParsedMessage, error) {
+	return parsePiLikeSession(path, project, machine, AgentOMP, "omp:")
+}
+
+func parsePiLikeSession(
+	path, project, machine string,
+	agent AgentType,
+	idPrefix string,
+) (*ParsedSession, []ParsedMessage, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("stat %s: %w", path, err)
@@ -73,7 +90,7 @@ func ParsePiSession(
 	branchedFrom := gjson.Get(headerLine, "branchedFrom").Str
 	if branchedFrom != "" {
 		base := filepath.Base(branchedFrom)
-		parentSessionID = "pi:" + strings.TrimSuffix(base, filepath.Ext(base))
+		parentSessionID = idPrefix + strings.TrimSuffix(base, filepath.Ext(base))
 	}
 
 	// V1 detection: if header has no id, we may need to derive from filename.
@@ -83,6 +100,7 @@ func ParsePiSession(
 	var (
 		messages     []ParsedMessage
 		firstMessage string
+		sessionName  string
 		ordinal      int
 		userCount    int
 		currentModel string
@@ -158,6 +176,11 @@ func ParsePiSession(
 		case "compaction":
 			continue
 
+		case "session_info":
+			if name := gjson.Get(line, "name"); name.Exists() {
+				sessionName = name.Str
+			}
+
 		default:
 			// skip silently (e.g., thinking_level_change)
 		}
@@ -188,12 +211,14 @@ func ParsePiSession(
 	}
 
 	sess := &ParsedSession{
-		ID:               "pi:" + sessionID,
+		ID:               idPrefix + sessionID,
 		Project:          project,
 		Machine:          machine,
-		Agent:            AgentPi,
+		Agent:            agent,
 		ParentSessionID:  parentSessionID,
+		Cwd:              cwd,
 		FirstMessage:     firstMessage,
+		SessionName:      sessionName,
 		StartedAt:        startedAt,
 		EndedAt:          endedAt,
 		MessageCount:     len(messages),

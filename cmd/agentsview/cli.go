@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -20,6 +21,36 @@ const (
 	groupUsage = "usage"
 	groupMeta  = "meta"
 )
+
+const dataVersionTooNewExitCode = 3
+
+type cliExitError struct {
+	code int
+	err  error
+}
+
+func (e *cliExitError) Error() string {
+	return e.err.Error()
+}
+
+func (e *cliExitError) Unwrap() error {
+	return e.err
+}
+
+func withExitCode(err error, code int) error {
+	if err == nil {
+		return nil
+	}
+	return &cliExitError{code: code, err: err}
+}
+
+func exitCodeFromError(err error) int {
+	var exitErr *cliExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.code
+	}
+	return 1
+}
 
 func newRootCommand() *cobra.Command {
 	var showVersion bool
@@ -65,11 +96,15 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(newProjectsCommand())
 	root.AddCommand(newHealthCommand())
 	root.AddCommand(newUsageCommand())
+	root.AddCommand(newActivityCommand())
 	root.AddCommand(newPGCommand())
+	root.AddCommand(newDuckDBCommand())
 	root.AddCommand(newSessionCommand())
 	root.AddCommand(newStatsCommand())
+	root.AddCommand(newParseDiffCommand())
 	root.AddCommand(newClassifierCommand())
 	root.AddCommand(newSecretsCommand())
+	root.AddCommand(newDoctorCommand())
 	root.AddCommand(newVersionCommand())
 	root.AddCommand(newOpenAPICommand())
 
@@ -86,18 +121,82 @@ func newRootCommand() *cobra.Command {
 }
 
 func newServeCommand() *cobra.Command {
+	var background bool
+	var checkDataVersion bool
 	cmd := &cobra.Command{
 		Use:          "serve",
 		Short:        "Start server",
 		GroupID:      groupCore,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
-		Run: func(cmd *cobra.Command, args []string) {
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if checkDataVersion {
+				cfg, err := config.LoadReadOnly()
+				if err != nil {
+					return err
+				}
+				return runServeDataVersionCheck(cfg)
+			}
+			if background {
+				// Acquire the launch lock before loading config; config
+				// loading writes config.toml and must be single-writer
+				// across concurrent launches.
+				runServeBackgroundCommand(cmd)
+				return nil
+			}
 			runServe(mustLoadConfig(cmd))
+			return nil
 		},
 	}
+	cmd.Flags().BoolVar(
+		&background,
+		"background",
+		false,
+		"Start server in the background and return to the shell",
+	)
+	cmd.Flags().BoolVar(
+		&checkDataVersion,
+		"check-data-version",
+		false,
+		"Check whether the configured database is compatible with this binary",
+	)
+	_ = cmd.Flags().MarkHidden("check-data-version")
 	config.RegisterServePFlags(cmd.Flags())
+	cmd.AddCommand(newServeStatusCommand())
+	cmd.AddCommand(newServeStopCommand())
 	return cmd
+}
+
+func runServeDataVersionCheck(cfg config.Config) error {
+	err := db.CheckDataVersion(cfg.DBPath)
+	if db.IsDataVersionTooNew(err) {
+		return withExitCode(err, dataVersionTooNewExitCode)
+	}
+	return err
+}
+
+func newServeStatusCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:          "status",
+		Short:        "Show whether a server is running and where to reach it",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		Run: func(cmd *cobra.Command, args []string) {
+			runServeStatus(mustLoadConfig(cmd))
+		},
+	}
+}
+
+func newServeStopCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:          "stop",
+		Short:        "Stop the running server",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		Run: func(cmd *cobra.Command, args []string) {
+			runServeStop(mustLoadConfig(cmd))
+		},
+	}
 }
 
 func newOpenAPICommand() *cobra.Command {
@@ -125,8 +224,18 @@ func newOpenAPICommand() *cobra.Command {
 func newSyncCommand() *cobra.Command {
 	var cfg SyncConfig
 	cmd := &cobra.Command{
-		Use:          "sync",
-		Short:        "Sync session data without serving",
+		Use:   "sync",
+		Short: "Sync session data without serving",
+		Long: "Sync session data into the local database without starting the\n" +
+			"HTTP server.\n\n" +
+			"With no --host, sync runs the local sync and then fans out to\n" +
+			"every host listed in the [[remote_hosts]] array in config.toml,\n" +
+			"syncing each over SSH. A failure on one configured host is logged\n" +
+			"and the run continues; the command exits non-zero if any\n" +
+			"configured host failed.\n\n" +
+			"With --host, sync ignores remote_hosts and syncs only that host.\n\n" +
+			"Remote sync uses your existing SSH configuration and requires\n" +
+			"key-based (passwordless) auth; it never prompts for a password.",
 		GroupID:      groupCore,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
@@ -447,6 +556,47 @@ func newUsageStatuslineCommand() *cobra.Command {
 	return cmd
 }
 
+func newActivityCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:          "activity",
+		Short:        "Activity and concurrency reporting",
+		GroupID:      groupUsage,
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cmd.Help()
+		},
+	}
+	cmd.AddCommand(newActivityReportCommand())
+	return cmd
+}
+
+func newActivityReportCommand() *cobra.Command {
+	var cfg ActivityReportConfig
+	cmd := &cobra.Command{
+		Use:          "report",
+		Short:        "Activity report over a date range",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		Run: func(cmd *cobra.Command, args []string) {
+			runActivityReport(cfg)
+		},
+	}
+	cmd.Flags().StringVar(&cfg.Preset, "preset", "", "Range preset: day, week, month, custom")
+	cmd.Flags().StringVar(&cfg.Date, "date", "", "Anchor date for presets (YYYY-MM-DD)")
+	cmd.Flags().StringVar(&cfg.From, "from", "", "Start instant for custom range (RFC3339)")
+	cmd.Flags().StringVar(&cfg.To, "to", "", "End instant for custom range (RFC3339)")
+	cmd.Flags().StringVar(&cfg.Timezone, "timezone", "", "IANA timezone for range bucketing")
+	cmd.Flags().StringVar(&cfg.Bucket, "bucket", "", "Bucket size: 5m, 15m, 1h, 1d, 1w")
+	cmd.Flags().StringVar(&cfg.Project, "project", "", "Filter by project")
+	cmd.Flags().StringVar(&cfg.Agent, "agent", "", "Filter by agent name")
+	cmd.Flags().StringVar(&cfg.Machine, "machine", "", "Filter by machine name")
+	cmd.Flags().BoolVar(&cfg.JSON, "json", false, "Output as JSON")
+	cmd.Flags().BoolVar(&cfg.NoSync, "no-sync", false, "Skip on-demand sync before querying")
+	cmd.Flags().BoolVar(&cfg.Offline, "offline", false, "Use fallback pricing only")
+	return cmd
+}
+
 func newPGCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "pg",
@@ -529,6 +679,118 @@ func newPGServeCommand() *cobra.Command {
 	return cmd
 }
 
+func newDuckDBCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:          "duckdb",
+		Short:        "DuckDB sync and serve commands",
+		GroupID:      groupData,
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cmd.Help()
+		},
+	}
+	cmd.AddCommand(newDuckDBPushCommand())
+	cmd.AddCommand(newDuckDBStatusCommand())
+	cmd.AddCommand(newDuckDBServeCommand())
+	cmd.AddCommand(newDuckDBQuackCommand())
+	return cmd
+}
+
+func newDuckDBPushCommand() *cobra.Command {
+	var cfg DuckDBPushConfig
+	cmd := &cobra.Command{
+		Use:          "push",
+		Short:        "Push local data to DuckDB",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		Run: func(cmd *cobra.Command, args []string) {
+			runDuckDBPush(cfg)
+		},
+	}
+	cmd.Flags().BoolVar(&cfg.Full, "full", false, "Force full local resync and DuckDB push")
+	cmd.Flags().StringVar(&cfg.ProjectsFlag, "projects", "", "Comma-separated list of projects to push (inclusive)")
+	cmd.Flags().StringVar(&cfg.ExcludeProjects, "exclude-projects", "", "Comma-separated list of projects to exclude from push")
+	cmd.Flags().BoolVar(&cfg.AllProjects, "all-projects", false, "Ignore configured project filters for this run")
+	return cmd
+}
+
+func newDuckDBStatusCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:          "status",
+		Short:        "Show DuckDB sync status",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		Run: func(cmd *cobra.Command, args []string) {
+			runDuckDBStatus()
+		},
+	}
+}
+
+func newDuckDBServeCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:          "serve",
+		Short:        "Serve from DuckDB (read-only)",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			appCfg, basePath, err := loadDuckDBServeConfig(cmd)
+			if err != nil {
+				fatal("%v", err)
+			}
+			runDuckDBServe(appCfg, basePath)
+			return nil
+		},
+	}
+	cmd.Flags().String(
+		"base-path",
+		"",
+		"URL prefix for reverse-proxy subpath (e.g. /agentsview)",
+	)
+	config.RegisterServePFlags(cmd.Flags())
+	return cmd
+}
+
+func newDuckDBQuackCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:          "quack",
+		Short:        "Quack remote protocol commands",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cmd.Help()
+		},
+	}
+	var serveCfg DuckDBQuackServeConfig
+	serveCmd := &cobra.Command{
+		Use:          "serve",
+		Short:        "Expose local DuckDB over Quack",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		Run: func(cmd *cobra.Command, args []string) {
+			runDuckDBQuackServe(serveCfg)
+		},
+	}
+	serveCmd.Flags().StringVar(
+		&serveCfg.Bind, "bind", "quack:127.0.0.1:9494",
+		"Quack bind URI",
+	)
+	serveCmd.Flags().StringVar(
+		&serveCfg.Path, "path", "",
+		"DuckDB mirror path (defaults to [duckdb].path)",
+	)
+	serveCmd.Flags().StringVar(
+		&serveCfg.Token, "token", "",
+		"Quack authentication token (generated if omitted)",
+	)
+	serveCmd.Flags().BoolVar(
+		&serveCfg.AllowInsecure, "allow-insecure", false,
+		"Allow non-loopback Quack binding",
+	)
+	cmd.AddCommand(serveCmd)
+	return cmd
+}
+
 func newVersionCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:          "version",
@@ -572,7 +834,12 @@ func writeRootHelp(w io.Writer, root *cobra.Command) {
 	fmt.Fprintln(w, "  CURSOR_PROJECTS_DIR     Cursor projects directory")
 	fmt.Fprintln(w, "  IFLOW_DIR               iFlow projects directory")
 	fmt.Fprintln(w, "  AMP_DIR                 Amp threads directory")
+	fmt.Fprintln(w, "  ZED_DIR                 Zed data directory")
 	fmt.Fprintln(w, "  QWEN_PROJECTS_DIR       Qwen Code projects directory")
+	fmt.Fprintln(w, "  QWENPAW_DIR             QwenPaw workspaces directory")
+	fmt.Fprintln(w, "  OMP_DIR                 OhMyPi sessions directory")
+	fmt.Fprintln(w, "  DEEPSEEK_TUI_SESSIONS_DIR")
+	fmt.Fprintln(w, "                          DeepSeek TUI sessions directory")
 	fmt.Fprintln(w, "  QCLAW_DIR               QClaw agents directory")
 	fmt.Fprintln(w, "  WORKBUDDY_PROJECTS_DIR  WorkBuddy projects directory")
 	fmt.Fprintln(w, "  PIEBALD_DIR             Piebald data directory")
@@ -580,6 +847,11 @@ func writeRootHelp(w io.Writer, root *cobra.Command) {
 	fmt.Fprintln(w, "  AGENTSVIEW_PG_URL       PostgreSQL connection URL for sync")
 	fmt.Fprintln(w, "  AGENTSVIEW_PG_MACHINE   Machine name for PG sync")
 	fmt.Fprintln(w, "  AGENTSVIEW_PG_SCHEMA    PG schema name (default \"agentsview\")")
+	fmt.Fprintln(w, "  AGENTSVIEW_DUCKDB_PATH  DuckDB mirror database path")
+	fmt.Fprintln(w, "  AGENTSVIEW_DUCKDB_URL   Quack connection URL for DuckDB serve")
+	fmt.Fprintln(w, "  AGENTSVIEW_DUCKDB_TOKEN Quack authentication token")
+	fmt.Fprintln(w, "  AGENTSVIEW_DUCKDB_MACHINE")
+	fmt.Fprintln(w, "                          Machine name for DuckDB sync")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Watcher excludes:")
 	fmt.Fprintln(w, "  Add \"watch_exclude_patterns\" to ~/.agentsview/config.toml")
@@ -593,6 +865,16 @@ func writeRootHelp(w io.Writer, root *cobra.Command) {
 	fmt.Fprintln(w, "  codex_sessions_dirs = [\"/codex/a\", \"/codex/b\"]")
 	fmt.Fprintln(w, "  When set, these override default directory. Environment variables")
 	fmt.Fprintln(w, "  override config file arrays.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Remote hosts:")
+	fmt.Fprintln(w, "  Add a [[remote_hosts]] array to ~/.agentsview/config.toml so that")
+	fmt.Fprintln(w, "  \"agentsview sync\" (no --host) also syncs each host over SSH:")
+	fmt.Fprintln(w, "  [[remote_hosts]]")
+	fmt.Fprintln(w, "  host = \"devbox1\"")
+	fmt.Fprintln(w, "  user = \"jesse\"  # optional")
+	fmt.Fprintln(w, "  port = 22        # optional")
+	fmt.Fprintln(w, "  Each host must be unique.")
+	fmt.Fprintln(w, "  Requires key-based (passwordless) SSH to each host.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Data stored in ~/.agentsview/ by default.")
 }

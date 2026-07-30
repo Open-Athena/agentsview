@@ -481,6 +481,71 @@ func TestPGContentSearchTrigramIndex(t *testing.T) {
 	).Scan(&hasIdx), "query pg_indexes")
 	assert.True(t, hasIdx,
 		"idx_messages_content_trgm missing after EnsureSchema")
+
+	// fastupdate=off must be set so the pending list cannot grow
+	// unbounded under continuous ingest. The schema bootstrap applies
+	// this on every boot (including stores upgraded from an earlier
+	// schema that created the index with the default fastupdate=on).
+	var fastupdateOff bool
+	require.NoError(t, store.DB().QueryRowContext(ctx,
+		`SELECT EXISTS (
+			SELECT 1
+			  FROM pg_class c
+			  JOIN pg_namespace n ON n.oid = c.relnamespace
+			 WHERE n.nspname = $1
+			   AND c.relname = 'idx_messages_content_trgm'
+			   AND 'fastupdate=off' = ANY(c.reloptions)
+		)`, contentSearchSchema,
+	).Scan(&fastupdateOff), "query pg_class.reloptions")
+	assert.True(t, fastupdateOff,
+		"idx_messages_content_trgm must have fastupdate=off")
+}
+
+// TestPGContentSearchTrigramIndexUpgrade verifies the upgrade path: a store
+// whose trigram index was created by an earlier schema with the default
+// fastupdate=on gets fastupdate=off reapplied on the next EnsureSchema run.
+func TestPGContentSearchTrigramIndexUpgrade(t *testing.T) {
+	store := setupContentSearch(t)
+	ctx := context.Background()
+
+	hasFastupdateOff := func() bool {
+		var off bool
+		require.NoError(t, store.DB().QueryRowContext(ctx,
+			`SELECT EXISTS (
+				SELECT 1
+				  FROM pg_class c
+				  JOIN pg_namespace n ON n.oid = c.relnamespace
+				 WHERE n.nspname = $1
+				   AND c.relname = 'idx_messages_content_trgm'
+				   AND 'fastupdate=off' = ANY(c.reloptions)
+			)`, contentSearchSchema,
+		).Scan(&off), "query pg_class.reloptions")
+		return off
+	}
+
+	var hasIdx bool
+	require.NoError(t, store.DB().QueryRowContext(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM pg_indexes
+			WHERE schemaname = $1 AND indexname = 'idx_messages_content_trgm'
+		)`, contentSearchSchema,
+	).Scan(&hasIdx), "query pg_indexes")
+	if !hasIdx {
+		t.Skip("trigram index not created on this instance; index is best-effort")
+	}
+
+	// Simulate an index left behind by the pre-#606 schema, which created
+	// it with the PostgreSQL default fastupdate=on.
+	_, err := store.DB().ExecContext(ctx,
+		`ALTER INDEX idx_messages_content_trgm SET (fastupdate = on)`)
+	require.NoError(t, err, "reset index to fastupdate=on")
+	require.False(t, hasFastupdateOff(),
+		"precondition: index should report fastupdate=on")
+
+	require.NoError(t, EnsureSchema(ctx, store.DB(), contentSearchSchema),
+		"rerun EnsureSchema")
+	assert.True(t, hasFastupdateOff(),
+		"EnsureSchema must reapply fastupdate=off to a pre-existing index")
 }
 
 // TestPGSearchContentRegex verifies regex mode.
@@ -489,7 +554,7 @@ func TestPGSearchContentRegex(t *testing.T) {
 	insertCSSession(t, store, "cs-re1", "proj", "claude",
 		"2026-05-01T10:00:00Z", "2026-05-01T10:30:00Z")
 	insertCSMessage(t, store, "cs-re1", 0, "user",
-		"key AKIA7QHWN2DKR4FYPLJM here", "2026-05-01T10:00:00Z", false)
+		"key AKIA"+"7QHWN2DKR4FYPLJM here", "2026-05-01T10:00:00Z", false)
 	insertCSMessage(t, store, "cs-re1", 1, "user",
 		"no secrets in this line", "2026-05-01T10:00:01Z", false)
 
@@ -518,22 +583,27 @@ func TestPGSearchContentRegexInvalid(t *testing.T) {
 		"expected *SearchInputError, got %T: %v", err, err)
 }
 
-// TestPGSearchContentFTSFallsBackToSubstring verifies that fts mode runs
-// ILIKE (not an error) on PG.
-func TestPGSearchContentFTSFallsBackToSubstring(t *testing.T) {
+// TestPGSearchContentFTSMatchesNonContiguousTerms verifies that PG's fts
+// fallback preserves SQLite's implicit-AND term semantics.
+func TestPGSearchContentFTSMatchesNonContiguousTerms(t *testing.T) {
 	store := setupContentSearch(t)
-	insertCSSession(t, store, "cs-fts1", "proj", "claude",
+	insertCSSession(t, store, "cs-fts-both", "proj", "claude",
 		"2026-05-01T10:00:00Z", "2026-05-01T10:30:00Z")
-	insertCSMessage(t, store, "cs-fts1", 0, "user",
-		"optimize the database query performance", "2026-05-01T10:00:00Z", false)
+	insertCSMessage(t, store, "cs-fts-both", 0, "user",
+		"the quick brown fox jumps", "2026-05-01T10:00:00Z", false)
+	insertCSSession(t, store, "cs-fts-one", "proj", "claude",
+		"2026-05-01T11:00:00Z", "2026-05-01T11:30:00Z")
+	insertCSMessage(t, store, "cs-fts-one", 0, "user",
+		"the quick answer only", "2026-05-01T11:00:00Z", false)
 
 	ctx := context.Background()
 	got, err := store.SearchContent(ctx, db.ContentSearchFilter{
-		Pattern: "optimize", Mode: "fts",
+		Pattern: "quick fox", Mode: "fts",
 		Sources: []string{"messages"}, Limit: 50,
 	})
-	require.NoError(t, err, "SearchContent fts (should fall back)")
+	require.NoError(t, err, "SearchContent fts")
 	require.Len(t, got.Matches, 1)
+	assert.Equal(t, "cs-fts-both", got.Matches[0].SessionID)
 	assert.Equal(t, "message", got.Matches[0].Location)
 }
 

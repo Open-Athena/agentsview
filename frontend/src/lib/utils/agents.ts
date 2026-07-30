@@ -6,6 +6,7 @@ export interface AgentMeta {
 
 export const KNOWN_AGENTS: readonly AgentMeta[] = [
   { name: "claude", color: "var(--accent-blue)" },
+  { name: "cowork", color: "var(--accent-sky)", label: "Claude Cowork" },
   { name: "codex", color: "var(--accent-green)" },
   { name: "copilot", color: "var(--accent-amber)" },
   { name: "gemini", color: "var(--accent-rose)" },
@@ -14,13 +15,25 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
   { name: "cursor", color: "var(--accent-black)" },
   { name: "amp", color: "var(--accent-coral)", label: "Amp" },
   { name: "zencoder", color: "var(--accent-red)", label: "Zencoder" },
+  { name: "zed", color: "var(--accent-green)", label: "Zed" },
   {
     name: "vscode-copilot",
     color: "var(--accent-teal)",
     label: "VS Code Copilot",
   },
+  {
+    name: "visualstudio-copilot",
+    color: "var(--accent-blue)",
+    label: "Visual Studio Copilot",
+  },
   { name: "pi", color: "var(--accent-indigo)", label: "Pi" },
   { name: "qwen", color: "var(--accent-cyan)", label: "Qwen Code" },
+  { name: "qwenpaw", color: "var(--accent-cyan)", label: "QwenPaw" },
+  {
+    name: "deepseek-tui",
+    color: "var(--accent-cyan)",
+    label: "DeepSeek TUI",
+  },
   {
     name: "openclaw",
     color: "var(--accent-orange)",
@@ -50,6 +63,7 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
     color: "var(--accent-violet)",
     label: "Antigravity CLI",
   },
+  { name: "vibe", color: "var(--accent-orange)", label: "Mistral Vibe" },
 ];
 
 const agentColorMap = new Map(

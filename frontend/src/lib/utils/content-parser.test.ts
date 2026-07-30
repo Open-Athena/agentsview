@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect } from "vite-plus/test";
 import {
   parseContent,
   isToolOnly,
@@ -81,7 +81,7 @@ describe("parseContent", () => {
 
   it("preserves leading whitespace in tail text", () => {
     const segments =
-      parseContent("```code\ncontent```\n  Trailing text");
+      parseContent("```code\ncontent\n```\n  Trailing text");
     expect(segments).toHaveLength(2);
     expect(segments[0]).toMatchObject({ type: "code" });
     expect(segments[1]).toEqual({
@@ -111,6 +111,38 @@ describe("parseContent", () => {
     ]);
   });
 
+  it("keeps nested shorter fences inside longer code blocks", () => {
+    const content =
+      "````markdown\nSome context paragraph.\n\n```qmd\nauthor: \"Jane Doe\"\n```\n\nMore context here.\n````";
+    const segments = parseContent(content);
+    expect(segments).toEqual([
+      {
+        type: "code",
+        content:
+          "Some context paragraph.\n\n```qmd\nauthor: \"Jane Doe\"\n```\n\nMore context here.\n",
+        label: "markdown",
+      },
+    ]);
+  });
+
+  it("keeps inline same-length backtick runs inside code blocks", () => {
+    const content =
+      "```javascript\nconst fence = \"```\";\n[Thinking]\nnot parsed\n```\nAfter";
+    const segments = parseContent(content);
+    expect(segments).toEqual([
+      {
+        type: "code",
+        content:
+          "const fence = \"```\";\n[Thinking]\nnot parsed\n",
+        label: "javascript",
+      },
+      {
+        type: "text",
+        content: "\nAfter",
+      },
+    ]);
+  });
+
   it("omits label for code blocks without language", () => {
     const segments = parseContent("```\nplain code\n```");
     expect(segments[0]).toEqual({
@@ -135,6 +167,15 @@ describe("parseContent", () => {
       type: "tool",
       content: "$ rg --files",
       label: "Bash",
+    });
+  });
+
+  it("parses patch markers emitted for apply-patch tools", () => {
+    const segments = parseContent("[Patch: src/app.ts]\n@@\n-old\n+new");
+    expect(segments[0]).toEqual({
+      type: "tool",
+      content: "@@\n-old\n+new",
+      label: "Edit : src/app.ts",
     });
   });
 

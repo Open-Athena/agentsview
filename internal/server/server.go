@@ -29,27 +29,30 @@ import (
 
 // VersionInfo holds build-time version metadata.
 type VersionInfo struct {
-	Version   string `json:"version"`
-	Commit    string `json:"commit"`
-	BuildDate string `json:"build_date"`
-	ReadOnly  bool   `json:"read_only,omitempty"`
+	Version     string `json:"version"`
+	Commit      string `json:"commit"`
+	BuildDate   string `json:"build_date"`
+	ReadOnly    bool   `json:"read_only,omitempty"`
+	APIVersion  int    `json:"api_version"`
+	DataVersion int    `json:"data_version"`
 }
 
 const daemonService = "agentsview"
 
 // Server is the HTTP server that serves the SPA and REST API.
 type Server struct {
-	mu          gosync.RWMutex
-	cfg         config.Config
-	db          db.Store
-	engine      *sync.Engine
-	sessions    service.SessionService
-	broadcaster *Broadcaster
-	mux         *http.ServeMux
-	api         huma.API
-	httpSrv     *http.Server
-	version     VersionInfo
-	dataDir     string
+	mu             gosync.RWMutex
+	cfg            config.Config
+	db             db.Store
+	engine         *sync.Engine
+	onDemandEngine *sync.Engine
+	sessions       service.SessionService
+	broadcaster    *Broadcaster
+	mux            *http.ServeMux
+	api            huma.API
+	httpSrv        *http.Server
+	version        VersionInfo
+	dataDir        string
 
 	// baseCtx, when set, is used as the base context for all
 	// incoming requests. Cancelling it causes SSE handlers to
@@ -75,6 +78,7 @@ type Server struct {
 	// under this prefix and a <base href> tag is injected
 	// into the SPA's index.html.
 	basePath string
+	idle     *IdleTracker
 }
 
 // New creates a new Server.
@@ -122,6 +126,12 @@ func New(
 	for _, opt := range opts {
 		opt(s)
 	}
+	if s.version.APIVersion == 0 {
+		s.version.APIVersion = 1
+	}
+	if s.version.DataVersion == 0 {
+		s.version.DataVersion = db.CurrentDataVersion()
+	}
 	s.routes()
 	return s
 }
@@ -142,9 +152,12 @@ func insightAgentConfig(
 	return agents
 }
 
-// WithVersion sets the build-time version metadata.
+// WithVersion sets the build-time version metadata. Zero-valued fields are
+// filled with defaults in New after all options have been applied.
 func WithVersion(v VersionInfo) Option {
-	return func(s *Server) { s.version = v }
+	return func(s *Server) {
+		s.version = v
+	}
 }
 
 // WithDataDir sets the data directory used for update caching.
@@ -206,6 +219,10 @@ func WithGenerateStreamFunc(f insight.GenerateStreamFunc) Option {
 			s.generateStreamFunc = f
 		}
 	}
+}
+
+func WithIdleTracker(t *IdleTracker) Option {
+	return func(s *Server) { s.idle = t }
 }
 
 func (s *Server) humaConfig() huma.Config {
@@ -346,12 +363,15 @@ func (s *Server) Handler() http.Handler {
 	if bindAll {
 		bindAllIPs = localInterfaceIPs()
 	}
-	h := cspMiddleware(s.cfg.Host, s.cfg.Port, s.basePath,
+	h := cspMiddleware(
+		s.cfg.Host, s.cfg.Port, s.basePath,
+		s.cfg.PublicURL, s.cfg.PublicOrigins,
 		s.authMiddleware(
 			hostCheckMiddleware(
 				allowedHosts, bindAll, s.cfg.Port, bindAllIPs,
 				corsMiddleware(
-					allowedOrigins, bindAll, s.cfg.Port, bindAllIPs, logMiddleware(s.mux),
+					allowedOrigins, bindAll, s.cfg.Port, bindAllIPs,
+					gzipMiddleware(logMiddleware(s.mux)),
 				),
 			),
 		),
@@ -379,6 +399,7 @@ func (s *Server) Handler() http.Handler {
 				ServeHTTP(w, r)
 		})
 	}
+	h = s.idle.Wrap(h)
 	return h
 }
 
@@ -386,8 +407,15 @@ func (s *Server) Handler() http.Handler {
 // responses. The policy pins the exact host:port origin so that
 // even if Tauri's compile-time CSP uses a wildcard port, the
 // intersection narrows to the actual runtime port.
-func cspMiddleware(host string, port int, basePath string, next http.Handler) http.Handler {
-	policy := buildCSPPolicy(host, port, basePath)
+func cspMiddleware(
+	host string,
+	port int,
+	basePath string,
+	publicURL string,
+	publicOrigins []string,
+	next http.Handler,
+) http.Handler {
+	policy := buildCSPPolicy(host, port, basePath, publicURL, publicOrigins)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/api/") {
 			w.Header().Set("Content-Security-Policy", policy)
@@ -415,12 +443,20 @@ func cspMiddleware(host string, port int, basePath string, next http.Handler) ht
 // if an XSS ever executed in the app, exfiltration would be easier;
 // the other directives stay pinned so script execution remains gated
 // to 'self'.
-func buildCSPPolicy(host string, port int, basePath string) string {
-	// serverOrigin is the pinned http origin for the configured
-	// host:port, used in the resource directives so resources load
-	// correctly regardless of how the webview resolves 'self'.
-	serverOrigin := "http://" + net.JoinHostPort(host, strconv.Itoa(port))
-	resourceSrc := "'self' " + serverOrigin
+func buildCSPPolicy(
+	host string,
+	port int,
+	basePath string,
+	publicURL string,
+	publicOrigins []string,
+) string {
+	// serverOrigins are the pinned origins used in the resource
+	// directives so resources load correctly regardless of how the
+	// webview resolves 'self'. Public origins are included for
+	// reverse-proxy deployments; concrete local origins are preserved
+	// for desktop webviews that need the backend socket pinned.
+	serverOrigins := cspPinnedOrigins(host, port, publicURL, publicOrigins)
+	resourceSrc := "'self' " + strings.Join(serverOrigins, " ")
 
 	baseURI := "'none'"
 	if basePath != "" {
@@ -439,6 +475,53 @@ func buildCSPPolicy(host string, port int, basePath string) string {
 			"frame-ancestors 'none'",
 		resourceSrc, baseURI,
 	)
+}
+
+func cspPinnedOrigins(
+	host string,
+	port int,
+	publicURL string,
+	publicOrigins []string,
+) []string {
+	origins := make([]string, 0, 1+len(publicOrigins)+1)
+	seen := make(map[string]bool)
+	add := func(origin string) {
+		if origin == "" || seen[origin] {
+			return
+		}
+		seen[origin] = true
+		origins = append(origins, origin)
+	}
+	for _, raw := range append([]string{publicURL}, publicOrigins...) {
+		add(normalizedOrigin(raw))
+	}
+	if !isUnspecifiedHost(host) {
+		add("http://" + net.JoinHostPort(host, strconv.Itoa(port)))
+	}
+	if len(origins) == 0 {
+		add("http://" + net.JoinHostPort(host, strconv.Itoa(port)))
+	}
+	return origins
+}
+
+func isUnspecifiedHost(host string) bool {
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsUnspecified()
+}
+
+func normalizedOrigin(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 // buildAllowedHosts returns the set of Host header values that

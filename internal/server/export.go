@@ -26,24 +26,37 @@ type gistResponse struct {
 	} `json:"owner"`
 }
 
+func githubHTTPClient(timeout time.Duration) *http.Client {
+	transport := http.DefaultTransport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = base.Clone()
+	}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+	}
+}
+
 func createGist(
 	ctx context.Context,
 	token, filename, description, content string,
+	public bool,
 ) (*gistResponse, error) {
 	return createGistWithURL(
 		ctx,
 		"https://api.github.com/gists",
-		token, filename, description, content,
+		token, filename, description, content, public,
 	)
 }
 
 func createGistWithURL(
 	ctx context.Context,
 	apiURL, token, filename, description, content string,
+	public bool,
 ) (*gistResponse, error) {
 	payload, err := json.Marshal(map[string]any{
 		"description": description,
-		"public":      true,
+		"public":      public,
 		"files": map[string]any{
 			filename: map[string]string{"content": content},
 		},
@@ -63,7 +76,7 @@ func createGistWithURL(
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "agentsview")
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := githubHTTPClient(30 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("github request failed: %w", err)
@@ -104,7 +117,7 @@ func validateGithubTokenWithURL(
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 	req.Header.Set("User-Agent", "agentsview")
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := githubHTTPClient(10 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("validating token: %w", err)

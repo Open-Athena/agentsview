@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -12,7 +13,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/agentsview/internal/config"
-	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/service"
 	"go.kenn.io/agentsview/internal/sync"
 )
@@ -24,13 +24,15 @@ func newSessionSyncCommand() *cobra.Command {
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			svc, cleanup, err := resolveWritableService(cmd)
+			svc, cleanup, err := resolveFreshWritableService(cmd)
 			if err != nil {
 				return err
 			}
 			defer cleanup()
 
-			detail, err := svc.Sync(cmd.Context(), classifySyncArg(args[0]))
+			detail, err := svc.Sync(
+				cmd.Context(), classifySyncArgForCommand(cmd, args[0]),
+			)
 			if err != nil {
 				return err
 			}
@@ -42,6 +44,16 @@ func newSessionSyncCommand() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func classifySyncArgForCommand(
+	cmd *cobra.Command, arg string,
+) service.SyncInput {
+	remote, _ := cmd.Flags().GetString("server")
+	if remote != "" && looksLikePath(arg) {
+		return service.SyncInput{Path: arg}
+	}
+	return classifySyncArg(arg)
 }
 
 // syncService resembles newService but constructs a real
@@ -56,8 +68,7 @@ func syncService(
 		return service.NewHTTPBackend(tr.URL, cfg.AuthToken, tr.ReadOnly),
 			func() {}, nil
 	}
-	applyClassifierConfig(cfg)
-	d, err := db.Open(cfg.DBPath)
+	d, lock, err := openWriteDB(context.Background(), cfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("opening db: %w", err)
 	}
@@ -65,7 +76,7 @@ func syncService(
 		AgentDirs: cfg.AgentDirs,
 		Machine:   "local",
 	})
-	cleanup := func() { d.Close() }
+	cleanup := func() { closeWriteDB(d, lock) }
 	return service.NewDirectBackend(d, engine), cleanup, nil
 }
 

@@ -48,24 +48,40 @@ func ExtractTextContent(
 				parts = append(parts,
 					"[Thinking]\n"+thinking+"\n[/Thinking]")
 			}
-		case "tool_use":
+		case "tool_use", "toolCall":
+			// "tool_use" is the Anthropic block type; "toolCall" is
+			// the camelCase variant emitted by OpenClaw. OpenClaw
+			// usually carries the call arguments under "input", but
+			// some tools populate only "arguments", so fall back to
+			// it when "input" is missing or empty.
 			hasToolUse = true
 			name := block.Get("name").Str
 			if name != "" {
+				input := block.Get("input")
+				if input.Raw == "" || input.Raw == "{}" {
+					if args := block.Get("arguments"); args.Exists() {
+						input = args
+					}
+				}
 				tc := ParsedToolCall{
 					ToolUseID: block.Get("id").Str,
 					ToolName:  name,
 					Category:  NormalizeToolCategory(name),
-					InputJSON: block.Get("input").Raw,
+					InputJSON: input.Raw,
 				}
 				switch name {
 				case "Skill":
-					tc.SkillName = block.Get("input.skill").Str
+					tc.SkillName = input.Get("skill").Str
 				case "skill":
-					tc.SkillName = block.Get("input.skill").Str
+					tc.SkillName = input.Get("skill").Str
 					if tc.SkillName == "" {
-						tc.SkillName = block.Get("input.name").Str
+						tc.SkillName = input.Get("name").Str
 					}
+				default:
+					tc.SkillName = inferToolSkillName(
+						name,
+						tc.InputJSON,
+					)
 				}
 				toolCalls = append(toolCalls, tc)
 			}
@@ -151,6 +167,13 @@ var todoIcons = map[string]string{
 func formatToolUse(block gjson.Result) string {
 	name := block.Get("name").Str
 	input := block.Get("input")
+	if input.Raw == "" || input.Raw == "{}" {
+		// OpenClaw emits some tool calls with args only under
+		// "arguments" rather than "input".
+		if args := block.Get("arguments"); args.Exists() {
+			input = args
+		}
+	}
 
 	switch name {
 	case "AskUserQuestion":
@@ -194,7 +217,9 @@ func formatToolUse(block gjson.Result) string {
 	case "look_at":
 		return fmt.Sprintf("[Read: %s]", input.Get("path").Str)
 	case "apply_patch":
-		return fmt.Sprintf("[Patch: %s]", input.Get("path").Str)
+		return formatPatch(input)
+	case "ApplyPatch":
+		return formatPatch(input)
 	case "undo_edit":
 		return fmt.Sprintf("[Undo: %s]", input.Get("path").Str)
 	case "finder":
@@ -324,6 +349,17 @@ func formatBash(input gjson.Result) string {
 		return fmt.Sprintf("[Bash: %s]\n$ %s", desc, cmd)
 	}
 	return fmt.Sprintf("[Bash]\n$ %s", cmd)
+}
+
+func formatPatch(input gjson.Result) string {
+	path := resolveFilePath(input)
+	if path == "" {
+		path = input.Get("file").Str
+	}
+	if path == "" {
+		return "[Patch]"
+	}
+	return fmt.Sprintf("[Patch: %s]", path)
 }
 
 func formatTask(input gjson.Result) string {

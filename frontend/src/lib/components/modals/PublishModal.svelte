@@ -7,6 +7,7 @@
   } from "../../api/generated/index";
   import { configureGeneratedClient } from "../../api/runtime.js";
   import type { PublishResponse } from "../../api/types.js";
+  import { XIcon } from "../../icons.js";
 
   type View = "setup" | "progress" | "success" | "error";
 
@@ -61,6 +62,7 @@
       result =
         await SessionsService.postApiV1SessionsIdPublish({
           id,
+          secret: ui.publishSecret,
         }) as unknown as PublishResponse;
       view = "success";
     } catch (err) {
@@ -97,14 +99,16 @@
 >
   <div class="modal-panel publish-panel">
     <div class="modal-header">
-      <h3 class="modal-title">Publish to GitHub Gist</h3>
+      <h3 class="modal-title">
+        Publish to {ui.publishSecret ? "secret" : "public"} GitHub Gist
+      </h3>
       <button
         class="modal-close"
         onclick={() => ui.activeModal = null}
         title="Close publish dialog"
         aria-label="Close publish dialog"
       >
-        &times;
+        <XIcon size="14" strokeWidth="2.2" aria-hidden="true" />
       </button>
     </div>
 
@@ -144,7 +148,9 @@
       {:else if view === "progress"}
         <div class="progress-view">
           <div class="modal-spinner"></div>
-          <p>Creating GitHub Gist...</p>
+          <p>
+            Creating {ui.publishSecret ? "secret" : "public"} GitHub Gist...
+          </p>
         </div>
 
       {:else if view === "success" && result}

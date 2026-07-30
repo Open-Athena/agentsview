@@ -8,16 +8,6 @@ import (
 
 // splitCSV trims and returns the non-empty fields of a
 // comma-separated string. Local helper to avoid a runtime dep.
-func splitCSV(s string) []string {
-	var out []string
-	for _, p := range strings.Split(s, ",") {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
 
 // placeholders returns n comma-separated "?" tokens for a
 // SQL IN (...) clause. Caller appends the matching args.

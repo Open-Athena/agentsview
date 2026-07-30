@@ -7,12 +7,14 @@
     "node": "^20.19 || ^22.12 || >=24"
   },
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
+    "dev": "vp dev",
+    "build": "vp build",
+    "i18n:compile": "paraglide-js compile --project ./project.inlang --outdir ./src/lib/paraglide --strategy localStorage preferredLanguage baseLocale --emit-ts-declarations --silent",
     "generate:api": "node scripts/generate-api-client.mjs",
-    "preview": "vite preview",
+    "preview": "vp preview",
+    "precheck": "npm run i18n:compile",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "test": "vitest run",
+    "test": "vp test run",
     "e2e": "playwright test",
     "e2e:snapshot": "playwright test -c playwright.snapshot.config.ts",
     "e2e:snapshot-public": "playwright test -c playwright.snapshot-public.config.ts"
@@ -20,21 +22,30 @@
   "dependencies": {
     "@lucide/svelte": "1.17.0",
     "@tanstack/virtual-core": "3.17.0",
-    "dompurify": "3.4.8",
-    "marked": "18.0.4"
+    "dompurify": "3.4.11",
+    "marked": "18.0.5",
+    "shiki": "4.2.0"
   },
   "devDependencies": {
+    "@inlang/paraglide-js": "^2.19.0",
+    "@inlang/plugin-m-function-matcher": "^2.2.9",
+    "@inlang/plugin-message-format": "^4.4.0",
     "@playwright/test": "1.60.0",
     "@sveltejs/vite-plugin-svelte": "7.1.2",
     "@testing-library/svelte": "^5.3.1",
     "@tsconfig/svelte": "5.0.8",
-    "@types/dompurify": "3.2.0",
     "jsdom": "29.1.1",
     "openapi-typescript-codegen": "^0.30.0",
-    "svelte": "5.55.10",
+    "svelte": "5.56.1",
     "svelte-check": "4.6.0",
     "typescript": "6.0.3",
-    "vite": "^8.0.14",
-    "vitest": "^4.1.8"
-  }
+    "vite": "npm:@voidzero-dev/vite-plus-core@0.1.24",
+    "vite-plus": "0.1.24",
+    "vitest": "npm:@voidzero-dev/vite-plus-test@0.1.24"
+  },
+  "overrides": {
+    "vite": "npm:@voidzero-dev/vite-plus-core@0.1.24",
+    "vitest": "npm:@voidzero-dev/vite-plus-test@0.1.24"
+  },
+  "packageManager": "npm@11.17.0"
 }

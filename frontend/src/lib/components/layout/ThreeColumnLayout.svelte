@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
+  import { m } from "../../i18n/index.js";
   import {
     SIDEBAR_DESKTOP_BREAKPOINT,
     SIDEBAR_WIDTH_DEFAULT,
@@ -13,6 +14,7 @@
   import type { Route } from "../../stores/router.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
   import {
+    ActivityIcon,
     ChartColumnIcon,
     Grid2x2Icon,
     LayoutGridIcon,
@@ -231,6 +233,7 @@
 
   $effect(() => {
     if (!layoutElement) return;
+    // eslint-disable-next-line @typescript-eslint/no-unused-expressions -- reactive dependency: re-measure layout when viewport width changes
     viewportWidth;
     measureLayoutWidth();
   });
@@ -289,7 +292,7 @@
   {#if ui.isMobileViewport && ui.sidebarOpen}
     <button
       class="sidebar-backdrop"
-      aria-label="Close sidebar"
+      aria-label={m.nav_close_sidebar()}
       onclick={handleBackdropClick}
     ></button>
   {/if}
@@ -306,7 +309,7 @@
         onclick={() => mobileNav("sessions")}
       >
         <LayoutGridIcon size="12" strokeWidth="2" aria-hidden="true" />
-        Sessions
+        {m.nav_sessions()}
       </button>
       <button
         class="mobile-nav-btn"
@@ -314,7 +317,15 @@
         onclick={() => mobileNav("usage")}
       >
         <Grid2x2Icon size="12" strokeWidth="2" aria-hidden="true" />
-        Usage
+        {m.nav_usage()}
+      </button>
+      <button
+        class="mobile-nav-btn"
+        class:active={router.route === "activity"}
+        onclick={() => mobileNav("activity")}
+      >
+        <ActivityIcon size="12" strokeWidth="2" aria-hidden="true" />
+        {m.nav_activity()}
       </button>
       <button
         class="mobile-nav-btn"
@@ -322,7 +333,7 @@
         onclick={() => mobileNav("trends")}
       >
         <ChartColumnIcon size="12" strokeWidth="2" aria-hidden="true" />
-        Trends
+        {m.nav_trends()}
       </button>
       <button
         class="mobile-nav-btn"
@@ -330,7 +341,7 @@
         onclick={() => mobileNav("pinned")}
       >
         <PinIcon size="12" strokeWidth="2" aria-hidden="true" />
-        Pinned
+        {m.nav_pinned()}
       </button>
       <button
         class="mobile-nav-btn"
@@ -338,7 +349,7 @@
         onclick={() => mobileNav("insights")}
       >
         <LogsIcon size="12" strokeWidth="2" aria-hidden="true" />
-        Insights
+        {m.nav_insights()}
       </button>
       <button
         class="mobile-nav-btn"
@@ -346,7 +357,7 @@
         onclick={() => mobileNav("trash")}
       >
         <TrashIcon size="12" strokeWidth="2" aria-hidden="true" />
-        Trash
+        {m.nav_trash()}
       </button>
     </nav>
     {@render sidebar()}
@@ -358,7 +369,7 @@
       bind:this={resizeHandleElement}
       data-testid="sidebar-resize-handle"
       role="separator"
-      aria-label="Resize sidebar"
+      aria-label={m.nav_resize_sidebar()}
       aria-orientation="vertical"
       aria-valuemin={SIDEBAR_WIDTH_MIN}
       aria-valuemax={SIDEBAR_WIDTH_STORAGE_MAX}

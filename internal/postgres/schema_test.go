@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"io"
 	"strings"
 	"sync"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	localdb "go.kenn.io/agentsview/internal/db"
 )
 
 type schemaProbeDriver struct{}
@@ -28,9 +30,12 @@ type schemaProbeRows struct {
 type schemaProbeState struct {
 	mu                  sync.Mutex
 	informationQueries  int
+	execs               []string
 	alterTableExecs     []string
 	currentSchema       string
 	existingColumnNames map[string][]string
+	maxDataVersion      int
+	maxDataVersionErr   error
 }
 
 var (
@@ -93,6 +98,9 @@ func (c *schemaProbeConn) Begin() (driver.Tx, error) {
 func (c *schemaProbeConn) ExecContext(
 	_ context.Context, query string, _ []driver.NamedValue,
 ) (driver.Result, error) {
+	c.state.mu.Lock()
+	c.state.execs = append(c.state.execs, query)
+	c.state.mu.Unlock()
 	if strings.Contains(strings.ToLower(query), "alter table") {
 		c.state.mu.Lock()
 		c.state.alterTableExecs = append(
@@ -134,12 +142,26 @@ func (c *schemaProbeConn) QueryContext(
 		return &schemaProbeRows{
 			columns: []string{"value"},
 		}, nil
+	case strings.Contains(normalized, "max(data_version)"):
+		if c.state.maxDataVersionErr != nil {
+			return nil, c.state.maxDataVersionErr
+		}
+		return &schemaProbeRows{
+			columns: []string{"max"},
+			values:  [][]driver.Value{{int64(c.state.maxDataVersion)}},
+		}, nil
 	case strings.Contains(normalized, "select id, first_message"):
 		return &schemaProbeRows{
 			columns: []string{
 				"id", "first_message",
 				"user_message_count", "is_automated",
 			},
+		}, nil
+	case strings.Contains(normalized, "select exists") &&
+		strings.Contains(normalized, "from sync_metadata"):
+		return &schemaProbeRows{
+			columns: []string{"exists"},
+			values:  [][]driver.Value{{true}},
 		}, nil
 	case strings.Contains(normalized, "select exists"):
 		return &schemaProbeRows{
@@ -176,9 +198,22 @@ func (s *schemaProbeState) alterTableExecCount() int {
 	return len(s.alterTableExecs)
 }
 
+func (s *schemaProbeState) execCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.execs)
+}
+
+func (s *schemaProbeState) executedSQL() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return strings.Join(s.execs, "\n")
+}
+
 func TestEnsureSchemaBatchesColumnIntrospection(t *testing.T) {
 	existing := map[string][]string{
 		"sessions": {
+			"owner_marker",
 			"created_at", "deleted_at",
 			"total_output_tokens", "peak_context_tokens",
 			"has_total_output_tokens",
@@ -192,6 +227,12 @@ func TestEnsureSchemaBatchesColumnIntrospection(t *testing.T) {
 			"context_pressure_max", "health_score",
 			"health_grade", "has_tool_calls",
 			"has_context_data", "data_version", "cwd",
+			"quality_signal_version", "short_prompt_count",
+			"unstructured_start",
+			"missing_success_criteria_count",
+			"missing_verification_count",
+			"duplicate_prompt_count", "no_code_context_count",
+			"runaway_tool_loop_count",
 			"git_branch", "source_session_id",
 			"source_version", "parser_malformed_lines",
 			"is_truncated",
@@ -217,9 +258,95 @@ func TestEnsureSchemaBatchesColumnIntrospection(t *testing.T) {
 		"information_schema.columns queries")
 }
 
+func TestCheckDataVersionCompatRejectsNewerPGRows(t *testing.T) {
+	pg, state := newSchemaProbeDB(t, nil)
+	state.maxDataVersion = localdb.CurrentDataVersion() + 10
+
+	err := CheckDataVersionCompat(context.Background(), pg)
+
+	require.Error(t, err, "newer PG data version must be rejected")
+	assert.True(t, localdb.IsDataVersionTooNew(err),
+		"expected too-new data version error")
+}
+
+func TestCheckDataVersionCompatAllowsMissingDataVersionColumn(t *testing.T) {
+	pg, state := newSchemaProbeDB(t, nil)
+	state.maxDataVersionErr = errors.New(
+		`ERROR: column "data_version" does not exist (SQLSTATE 42703)`,
+	)
+
+	err := CheckDataVersionCompat(context.Background(), pg)
+
+	require.NoError(t, err,
+		"legacy PG schemas without sessions.data_version should migrate")
+}
+
+func TestEnsureSchemaChecksDataVersionBeforeDDL(t *testing.T) {
+	pg, state := newSchemaProbeDB(t, nil)
+	state.maxDataVersion = localdb.CurrentDataVersion() + 10
+
+	err := EnsureSchema(context.Background(), pg, "agentsview")
+
+	require.Error(t, err, "newer PG data version must be rejected")
+	assert.True(t, localdb.IsDataVersionTooNew(err),
+		"expected too-new data version error")
+	assert.Equal(t, 0, state.execCount(),
+		"EnsureSchema must not mutate PG before data-version refusal")
+}
+
+func TestEnsureSchemaCreatesAnalyticsCoveringIndexes(t *testing.T) {
+	db, state := newSchemaProbeDB(t, map[string][]string{
+		"sessions": {
+			"owner_marker",
+			"total_output_tokens", "peak_context_tokens",
+			"has_total_output_tokens",
+			"has_peak_context_tokens",
+		},
+		"messages": {
+			"context_tokens", "output_tokens",
+			"has_context_tokens", "has_output_tokens",
+		},
+		"tool_calls": {},
+	})
+
+	require.NoError(t, EnsureSchema(context.Background(), db, "agentsview"))
+
+	sql := state.executedSQL()
+	assert.Contains(t, sql,
+		"CREATE INDEX IF NOT EXISTS idx_tool_calls_session_category")
+	assert.Contains(t, sql,
+		"CREATE INDEX IF NOT EXISTS idx_messages_velocity")
+	assert.Contains(t, sql,
+		"CREATE INDEX IF NOT EXISTS idx_messages_usage_covering")
+	assert.Contains(t, sql,
+		"DROP INDEX IF EXISTS idx_messages_usage_timestamp")
+}
+
+func TestEnsureSchemaCreatesSessionTraversalIndex(t *testing.T) {
+	db, state := newSchemaProbeDB(t, map[string][]string{
+		"sessions": {
+			"owner_marker",
+			"total_output_tokens", "peak_context_tokens",
+			"has_total_output_tokens",
+			"has_peak_context_tokens",
+		},
+		"messages": {
+			"context_tokens", "output_tokens",
+			"has_context_tokens", "has_output_tokens",
+		},
+		"tool_calls": {},
+	})
+
+	require.NoError(t, EnsureSchema(context.Background(), db, "agentsview"))
+
+	assert.Contains(t, state.executedSQL(),
+		"CREATE INDEX IF NOT EXISTS idx_sessions_parent")
+}
+
 func TestEnsureSchemaGroupsMissingColumnMigrationsByTable(t *testing.T) {
 	db, state := newSchemaProbeDB(t, map[string][]string{
 		"sessions": {
+			"owner_marker",
 			"created_at", "deleted_at",
 			"total_output_tokens", "peak_context_tokens",
 			"has_total_output_tokens",
@@ -233,6 +360,12 @@ func TestEnsureSchemaGroupsMissingColumnMigrationsByTable(t *testing.T) {
 			"context_pressure_max", "health_score",
 			"health_grade", "has_tool_calls",
 			"has_context_data", "data_version", "cwd",
+			"quality_signal_version", "short_prompt_count",
+			"unstructured_start",
+			"missing_success_criteria_count",
+			"missing_verification_count",
+			"duplicate_prompt_count", "no_code_context_count",
+			"runaway_tool_loop_count",
 			"git_branch", "source_session_id",
 			"source_version", "parser_malformed_lines",
 			"is_truncated",

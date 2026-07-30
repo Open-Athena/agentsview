@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vite-plus/test';
 import { messages } from './messages.svelte.js';
 import { parseContent } from '../utils/content-parser.js';
 import type {
@@ -310,7 +310,7 @@ describe('MessagesStore', () => {
       createDeferred<Session>();
     vi.mocked(api.getSession).mockReturnValue(p1Promise);
 
-    const p1 = messages.reload();
+    messages.reload();
 
     // 3. Switch to Session B
     vi.mocked(api.getSession).mockResolvedValue(

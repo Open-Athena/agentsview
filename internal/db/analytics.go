@@ -2,16 +2,50 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
+
+	"go.kenn.io/agentsview/internal/signals"
 )
 
 // maxSQLVars is the maximum bind variables per IN clause to stay
 // within SQLite's default SQLITE_MAX_VARIABLE_NUMBER (999).
 const maxSQLVars = 500
+
+var ErrUnsupportedAnalyticsSignal = errors.New(
+	"unsupported analytics signal",
+)
+
+var supportedAnalyticsSignals = map[string]struct{}{
+	"outcome_errored":                {},
+	"outcome_abandoned":              {},
+	"outcome_completed":              {},
+	"tool_failure_signals":           {},
+	"tool_retries":                   {},
+	"edit_churn":                     {},
+	"sessions_with_compaction":       {},
+	"mid_task_compaction_count":      {},
+	"high_pressure_sessions":         {},
+	"short_prompt_count":             {},
+	"unstructured_start":             {},
+	"missing_success_criteria_count": {},
+	"missing_verification_count":     {},
+	"duplicate_prompt_count":         {},
+	"no_code_context_count":          {},
+	"runaway_tool_loop_count":        {},
+	"frustration_marker_count":       {},
+}
+
+func IsSupportedAnalyticsSignal(signal string) bool {
+	_, ok := supportedAnalyticsSignals[signal]
+	return ok
+}
 
 // inPlaceholders returns a "(?,?,...)" string and []any args for
 // a slice of string IDs.
@@ -31,8 +65,19 @@ func queryChunked(
 	ids []string,
 	fn func(chunk []string) error,
 ) error {
-	for i := 0; i < len(ids); i += maxSQLVars {
-		end := min(i+maxSQLVars, len(ids))
+	return queryChunkedSize(ids, maxSQLVars, fn)
+}
+
+// queryChunkedSize is queryChunked with an explicit per-chunk size, for
+// queries that bind each ID more than once (and so need a smaller chunk to
+// keep the total bind count within SQLite's variable limit).
+func queryChunkedSize(
+	ids []string,
+	size int,
+	fn func(chunk []string) error,
+) error {
+	for i := 0; i < len(ids); i += size {
+		end := min(i+size, len(ids))
 		if err := fn(ids[i:end]); err != nil {
 			return err
 		}
@@ -53,8 +98,13 @@ type AnalyticsFilter struct {
 	MinUserMessages  int    // user_message_count >= N
 	ExcludeOneShot   bool   // exclude sessions with user_message_count <= 1
 	ExcludeAutomated bool   // exclude automated (roborev) sessions
-	ActiveSince      string // ISO timestamp cutoff
-	Termination      string // "", "clean", or "unclean"
+	// ExcludeInteractive is the mirror of ExcludeAutomated: it keeps only
+	// automated sessions. The two are never set together (that would match
+	// nothing); the activity report uses them for its automation filter.
+	ExcludeInteractive bool
+	AutomatedScope     string // "", "human", "all", or "automated"
+	ActiveSince        string // ISO timestamp cutoff
+	Termination        string // "", "clean", or "unclean"
 }
 
 // location loads the timezone or returns UTC on error.
@@ -186,11 +236,11 @@ func (f AnalyticsFilter) buildWhereWithDate(
 	}
 
 	if f.Agent != "" {
-		agents := strings.Split(f.Agent, ",")
+		agents := csvFilterValues(f.Agent)
 		if len(agents) == 1 {
 			preds = append(preds, "agent = ?")
 			args = append(args, agents[0])
-		} else {
+		} else if len(agents) > 1 {
 			placeholders := make(
 				[]string, len(agents),
 			)
@@ -210,16 +260,20 @@ func (f AnalyticsFilter) buildWhereWithDate(
 		preds = append(preds, "user_message_count >= ?")
 		args = append(args, f.MinUserMessages)
 	}
+	scope := normalizeAutomatedScope(f.AutomatedScope, f.ExcludeAutomated)
 	if f.ExcludeOneShot {
-		if !f.ExcludeAutomated {
+		if scope != "human" {
 			preds = append(preds,
 				"(user_message_count > 1 OR is_automated = 1)")
 		} else {
 			preds = append(preds, "user_message_count > 1")
 		}
 	}
-	if f.ExcludeAutomated {
-		preds = append(preds, "is_automated = 0")
+	if pred := automatedScopePredicate(scope, "is_automated"); pred != "" {
+		preds = append(preds, pred)
+	}
+	if f.ExcludeInteractive {
+		preds = append(preds, "is_automated = 1")
 	}
 
 	if f.ActiveSince != "" {
@@ -234,6 +288,28 @@ func (f AnalyticsFilter) buildWhereWithDate(
 	}
 
 	return strings.Join(preds, " AND "), args
+}
+
+func normalizeAutomatedScope(scope string, excludeAutomated bool) string {
+	switch strings.TrimSpace(scope) {
+	case "human", "all", "automated":
+		return strings.TrimSpace(scope)
+	}
+	if excludeAutomated {
+		return "human"
+	}
+	return "all"
+}
+
+func automatedScopePredicate(scope, col string) string {
+	switch scope {
+	case "human":
+		return col + " = 0"
+	case "automated":
+		return col + " = 1"
+	default:
+		return ""
+	}
 }
 
 // HasTimeFilter returns true when hour-of-day or day-of-week
@@ -259,6 +335,116 @@ func (f AnalyticsFilter) matchesTimeFilter(
 		}
 	}
 	return true
+}
+
+func (f AnalyticsFilter) canUseSQLiteTimeSQL() bool {
+	_, ok := f.sqliteTimeModifier()
+	return ok
+}
+
+func (f AnalyticsFilter) sqliteTimeModifier() (string, bool) {
+	if f.Timezone == "" || f.Timezone == "UTC" {
+		return "", true
+	}
+	if f.From == "" || f.To == "" {
+		return "", false
+	}
+	loc, err := time.LoadLocation(f.Timezone)
+	if err != nil {
+		return "", false
+	}
+	start, err := time.Parse("2006-01-02", f.From)
+	if err != nil {
+		return "", false
+	}
+	end, err := time.Parse("2006-01-02", f.To)
+	if err != nil {
+		return "", false
+	}
+	var offset *int
+	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
+		checks := []time.Time{
+			time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, loc),
+			time.Date(d.Year(), d.Month(), d.Day(), 23, 59, 59, 0, loc),
+		}
+		for _, local := range checks {
+			_, current := local.Zone()
+			if current%60 != 0 {
+				return "", false
+			}
+			if offset == nil {
+				v := current
+				offset = &v
+				continue
+			}
+			if *offset != current {
+				return "", false
+			}
+		}
+	}
+	if offset == nil {
+		return "", false
+	}
+	sign := "+"
+	value := *offset
+	if value < 0 {
+		sign = "-"
+		value = -value
+	}
+	return fmt.Sprintf("%s%02d:%02d", sign, value/3600, (value%3600)/60), true
+}
+
+func sqliteDateExpr(dateCol string, modifier string) string {
+	if modifier == "" {
+		return "strftime('%Y-%m-%d', " + dateCol + ")"
+	}
+	return "strftime('%Y-%m-%d', " + dateCol + ", '" + modifier + "')"
+}
+
+func sqliteAnalyticsWhereSQL(
+	f AnalyticsFilter,
+	dateCol string,
+	sessionIDExpr string,
+	includeTime bool,
+) (string, []any) {
+	where, args := f.buildWhere(dateCol)
+	modifier, _ := f.sqliteTimeModifier()
+	dateExpr := sqliteDateExpr(dateCol, modifier)
+	if f.From != "" {
+		where += " AND " + dateExpr + " >= ?"
+		args = append(args, f.From)
+	}
+	if f.To != "" {
+		where += " AND " + dateExpr + " <= ?"
+		args = append(args, f.To)
+	}
+	if includeTime && f.HasTimeFilter() {
+		preds := []string{
+			"m.session_id = " + sessionIDExpr,
+			"m.timestamp != ''",
+		}
+		if f.DayOfWeek != nil {
+			dowExpr := "strftime('%w', m.timestamp)"
+			if modifier != "" {
+				dowExpr = "strftime('%w', m.timestamp, '" + modifier + "')"
+			}
+			preds = append(preds,
+				"((CAST("+dowExpr+" AS INTEGER) + 6) % 7) = ?")
+			args = append(args, *f.DayOfWeek)
+		}
+		if f.Hour != nil {
+			hourExpr := "strftime('%H', m.timestamp)"
+			if modifier != "" {
+				hourExpr = "strftime('%H', m.timestamp, '" + modifier + "')"
+			}
+			preds = append(preds,
+				"CAST("+hourExpr+" AS INTEGER) = ?")
+			args = append(args, *f.Hour)
+		}
+		where += " AND EXISTS (SELECT 1 FROM messages m WHERE " +
+			strings.Join(preds, " AND ") + ")"
+	}
+	return where, args
 }
 
 // filteredSessionIDs returns the set of session IDs that have
@@ -406,6 +592,148 @@ type AnalyticsSummary struct {
 
 // GetAnalyticsSummary returns aggregate statistics.
 func (db *DB) GetAnalyticsSummary(
+	ctx context.Context, f AnalyticsFilter,
+) (AnalyticsSummary, error) {
+	if !f.canUseSQLiteTimeSQL() {
+		return db.getAnalyticsSummaryGo(ctx, f)
+	}
+	dateCol := "COALESCE(NULLIF(started_at, ''), created_at)"
+	where, args := sqliteAnalyticsWhereSQL(f, dateCol, "sessions.id", true)
+	modifier, _ := f.sqliteTimeModifier()
+	dateExpr := sqliteDateExpr(dateCol, modifier)
+
+	query := `
+		WITH filtered AS (
+			SELECT id, project, agent, message_count,
+				total_output_tokens, has_total_output_tokens,
+				` + dateExpr + ` AS local_date
+			FROM sessions
+			WHERE ` + where + `
+		),
+		ranked AS (
+			SELECT message_count,
+				ROW_NUMBER() OVER (ORDER BY message_count ASC) AS rn,
+				COUNT(*) OVER () AS n
+			FROM filtered
+		),
+		project_totals AS (
+			SELECT project, SUM(message_count) AS messages
+			FROM filtered
+			GROUP BY project
+		)
+		SELECT
+			COUNT(*) AS total_sessions,
+			COALESCE(SUM(message_count), 0) AS total_messages,
+			COALESCE(SUM(CASE WHEN has_total_output_tokens
+				THEN total_output_tokens ELSE 0 END), 0) AS total_output_tokens,
+			COALESCE(SUM(CASE WHEN has_total_output_tokens
+				THEN 1 ELSE 0 END), 0) AS token_reporting_sessions,
+			COUNT(DISTINCT project) AS active_projects,
+			COUNT(DISTINCT local_date) AS active_days,
+			COALESCE(ROUND(AVG(message_count), 1), 0) AS avg_messages,
+			COALESCE((
+				SELECT CAST(AVG(message_count) AS INTEGER)
+				FROM ranked
+				WHERE rn IN (
+					CAST(((n + 1) / 2) AS INTEGER),
+					CAST(((n + 2) / 2) AS INTEGER)
+				)
+			), 0) AS median_messages,
+			COALESCE((
+				SELECT message_count
+				FROM ranked
+				WHERE rn = MIN(CAST(n * 0.9 AS INTEGER) + 1, n)
+				LIMIT 1
+			), 0) AS p90_messages,
+			COALESCE((
+				SELECT project
+				FROM project_totals
+				ORDER BY messages DESC, project ASC
+				LIMIT 1
+			), '') AS most_active,
+			COALESCE(ROUND((
+				SELECT SUM(messages)
+				FROM (
+					SELECT messages
+					FROM project_totals
+					ORDER BY messages DESC
+					LIMIT 3
+				)
+			) * 1.0 / NULLIF(SUM(message_count), 0), 3), 0) AS concentration
+		FROM filtered`
+
+	rows, err := db.getReader().QueryContext(ctx, query, args...)
+	if err != nil {
+		return AnalyticsSummary{},
+			fmt.Errorf("querying analytics summary: %w", err)
+	}
+	s := AnalyticsSummary{Agents: make(map[string]*AgentSummary)}
+	if !rows.Next() {
+		rows.Close()
+		return s, nil
+	}
+	if err := rows.Scan(
+		&s.TotalSessions,
+		&s.TotalMessages,
+		&s.TotalOutputTokens,
+		&s.TokenReportingSessions,
+		&s.ActiveProjects,
+		&s.ActiveDays,
+		&s.AvgMessages,
+		&s.MedianMessages,
+		&s.P90Messages,
+		&s.MostActive,
+		&s.Concentration,
+	); err != nil {
+		rows.Close()
+		return AnalyticsSummary{},
+			fmt.Errorf("scanning summary row: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return AnalyticsSummary{},
+			fmt.Errorf("iterating summary rows: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return AnalyticsSummary{},
+			fmt.Errorf("closing summary rows: %w", err)
+	}
+
+	agentRows, err := db.getReader().QueryContext(ctx, `
+		WITH filtered AS (
+			SELECT agent, message_count
+			FROM sessions
+			WHERE `+where+`
+		)
+		SELECT agent, COUNT(*), COALESCE(SUM(message_count), 0)
+		FROM filtered
+		GROUP BY agent`,
+		args...,
+	)
+	if err != nil {
+		return AnalyticsSummary{},
+			fmt.Errorf("querying analytics summary agents: %w", err)
+	}
+	defer agentRows.Close()
+	for agentRows.Next() {
+		var agent string
+		var summary AgentSummary
+		if err := agentRows.Scan(
+			&agent, &summary.Sessions, &summary.Messages,
+		); err != nil {
+			return AnalyticsSummary{},
+				fmt.Errorf("scanning summary agent: %w", err)
+		}
+		s.Agents[agent] = &summary
+	}
+	if err := agentRows.Err(); err != nil {
+		return AnalyticsSummary{},
+			fmt.Errorf("iterating summary agents: %w", err)
+	}
+	return s, nil
+}
+
+func (db *DB) getAnalyticsSummaryGo(
 	ctx context.Context, f AnalyticsFilter,
 ) (AnalyticsSummary, error) {
 	loc := f.location()
@@ -1491,6 +1819,223 @@ type ToolsAnalyticsResponse struct {
 	Trend      []ToolTrendEntry     `json:"trend"`
 }
 
+// SkillAgentBreakdown holds skill usage for one agent.
+type SkillAgentBreakdown struct {
+	Agent string `json:"agent"`
+	Count int    `json:"count"`
+}
+
+// SkillProjectBreakdown holds skill usage for one project.
+type SkillProjectBreakdown struct {
+	Project string `json:"project"`
+	Count   int    `json:"count"`
+}
+
+// SkillUsage holds usage metrics for one skill name.
+type SkillUsage struct {
+	SkillName        string                  `json:"skill_name"`
+	CallCount        int                     `json:"call_count"`
+	SessionCount     int                     `json:"session_count"`
+	AgentBreakdown   []SkillAgentBreakdown   `json:"agent_breakdown"`
+	ProjectBreakdown []SkillProjectBreakdown `json:"project_breakdown"`
+	LastUsedAt       string                  `json:"last_used_at"`
+	Pct              float64                 `json:"pct"`
+}
+
+// SkillTrendEntry holds skill call counts for one time bucket.
+type SkillTrendEntry struct {
+	Date    string         `json:"date"`
+	BySkill map[string]int `json:"by_skill"`
+}
+
+// SkillsAnalyticsResponse wraps skill usage analytics.
+type SkillsAnalyticsResponse struct {
+	TotalSkillCalls int               `json:"total_skill_calls"`
+	DistinctSkills  int               `json:"distinct_skills"`
+	BySkill         []SkillUsage      `json:"by_skill"`
+	Trend           []SkillTrendEntry `json:"trend"`
+}
+
+// SkillAnalyticsRow is a backend-neutral intermediate row used to
+// aggregate skill usage after each store applies its native filters.
+type SkillAnalyticsRow struct {
+	SessionID  string
+	SkillName  string
+	Agent      string
+	Project    string
+	Date       string
+	LastUsedAt string
+	Count      int
+}
+
+type skillUsageAccumulator struct {
+	callCount     int
+	sessionIDs    map[string]struct{}
+	agentCounts   map[string]int
+	projectCounts map[string]int
+	lastUsedAt    string
+}
+
+// timestampAfter reports whether timestamp a is chronologically later
+// than b. Both are parsed as UTC timestamps so callers stay correct when
+// stores feed differing precisions (for example fractional seconds). It
+// falls back to lexical comparison only when a value cannot be parsed.
+func timestampAfter(a, b string) bool {
+	if b == "" {
+		return a != ""
+	}
+	if a == "" {
+		return false
+	}
+	ta, aok := localTime(a, time.UTC)
+	tb, bok := localTime(b, time.UTC)
+	if aok && bok {
+		return ta.After(tb)
+	}
+	return a > b
+}
+
+// BuildSkillsAnalytics folds backend-neutral skill rows into the public
+// response shape. Skill names are trimmed and empty names are ignored.
+func BuildSkillsAnalytics(rows []SkillAnalyticsRow) SkillsAnalyticsResponse {
+	resp := SkillsAnalyticsResponse{
+		BySkill: []SkillUsage{},
+		Trend:   []SkillTrendEntry{},
+	}
+	if len(rows) == 0 {
+		return resp
+	}
+
+	bySkill := map[string]*skillUsageAccumulator{}
+	trendBuckets := map[string]map[string]int{}
+
+	for _, row := range rows {
+		name := strings.TrimSpace(row.SkillName)
+		if name == "" || row.Count <= 0 {
+			continue
+		}
+		acc := bySkill[name]
+		if acc == nil {
+			acc = &skillUsageAccumulator{
+				sessionIDs:    map[string]struct{}{},
+				agentCounts:   map[string]int{},
+				projectCounts: map[string]int{},
+			}
+			bySkill[name] = acc
+		}
+		acc.callCount += row.Count
+		resp.TotalSkillCalls += row.Count
+		if row.SessionID != "" {
+			acc.sessionIDs[row.SessionID] = struct{}{}
+		}
+		if row.Agent != "" {
+			acc.agentCounts[row.Agent] += row.Count
+		}
+		if row.Project != "" {
+			acc.projectCounts[row.Project] += row.Count
+		}
+		if timestampAfter(row.LastUsedAt, acc.lastUsedAt) {
+			acc.lastUsedAt = row.LastUsedAt
+		}
+		if row.Date != "" {
+			week := bucketDate(row.Date, "week")
+			if trendBuckets[week] == nil {
+				trendBuckets[week] = map[string]int{}
+			}
+			trendBuckets[week][name] += row.Count
+		}
+	}
+
+	resp.DistinctSkills = len(bySkill)
+	for name, acc := range bySkill {
+		usage := SkillUsage{
+			SkillName:        name,
+			CallCount:        acc.callCount,
+			SessionCount:     len(acc.sessionIDs),
+			AgentBreakdown:   skillAgentBreakdowns(acc.agentCounts),
+			ProjectBreakdown: skillProjectBreakdowns(acc.projectCounts),
+			LastUsedAt:       acc.lastUsedAt,
+			Pct: math.Round(
+				float64(acc.callCount)/
+					float64(resp.TotalSkillCalls)*1000,
+			) / 10,
+		}
+		resp.BySkill = append(resp.BySkill, usage)
+	}
+	sort.Slice(resp.BySkill, func(i, j int) bool {
+		if resp.BySkill[i].CallCount != resp.BySkill[j].CallCount {
+			return resp.BySkill[i].CallCount > resp.BySkill[j].CallCount
+		}
+		return resp.BySkill[i].SkillName < resp.BySkill[j].SkillName
+	})
+
+	for week, skills := range trendBuckets {
+		resp.Trend = append(resp.Trend, SkillTrendEntry{
+			Date: week, BySkill: skills,
+		})
+	}
+	sort.Slice(resp.Trend, func(i, j int) bool {
+		return resp.Trend[i].Date < resp.Trend[j].Date
+	})
+
+	return resp
+}
+
+func skillAgentBreakdowns(
+	counts map[string]int,
+) []SkillAgentBreakdown {
+	out := make([]SkillAgentBreakdown, 0, len(counts))
+	for agent, count := range counts {
+		out = append(out, SkillAgentBreakdown{
+			Agent: agent, Count: count,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		return out[i].Agent < out[j].Agent
+	})
+	return out
+}
+
+func skillProjectBreakdowns(
+	counts map[string]int,
+) []SkillProjectBreakdown {
+	out := make([]SkillProjectBreakdown, 0, len(counts))
+	for project, count := range counts {
+		out = append(out, SkillProjectBreakdown{
+			Project: project, Count: count,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		return out[i].Project < out[j].Project
+	})
+	return out
+}
+
+func analyticsToolsQuery(placeholders string) string {
+	return `SELECT session_id, category, COUNT(*)
+		FROM tool_calls
+		WHERE session_id IN ` + placeholders + `
+		GROUP BY session_id, category`
+}
+
+func analyticsSkillsQuery(placeholders string) string {
+	return `SELECT tc.session_id, TRIM(tc.skill_name), COUNT(*),
+			COALESCE(m.timestamp, '')
+		FROM tool_calls tc
+		LEFT JOIN messages m
+			ON m.session_id = tc.session_id AND m.id = tc.message_id
+		WHERE tc.session_id IN ` + placeholders + `
+			AND TRIM(COALESCE(tc.skill_name, '')) != ''
+		GROUP BY tc.session_id, TRIM(tc.skill_name),
+			COALESCE(m.timestamp, '')`
+}
+
 // GetAnalyticsTools returns tool usage analytics aggregated
 // from the tool_calls table.
 func (db *DB) GetAnalyticsTools(
@@ -1562,15 +2107,14 @@ func (db *DB) GetAnalyticsTools(
 	type toolRow struct {
 		sessionID string
 		category  string
+		count     int
 	}
 	var toolRows []toolRow
 
 	err = queryChunked(sessionIDs,
 		func(chunk []string) error {
 			ph, chunkArgs := inPlaceholders(chunk)
-			q := `SELECT session_id, category
-				FROM tool_calls
-				WHERE session_id IN ` + ph
+			q := analyticsToolsQuery(ph)
 			rows, qErr := db.getReader().QueryContext(
 				ctx, q, chunkArgs...,
 			)
@@ -1582,13 +2126,18 @@ func (db *DB) GetAnalyticsTools(
 			defer rows.Close()
 			for rows.Next() {
 				var sid, cat string
-				if err := rows.Scan(&sid, &cat); err != nil {
+				var count int
+				if err := rows.Scan(
+					&sid, &cat, &count,
+				); err != nil {
 					return fmt.Errorf(
 						"scanning tool_call: %w", err,
 					)
 				}
 				toolRows = append(toolRows, toolRow{
-					sessionID: sid, category: cat,
+					sessionID: sid,
+					category:  cat,
+					count:     count,
 				})
 			}
 			return rows.Err()
@@ -1608,21 +2157,23 @@ func (db *DB) GetAnalyticsTools(
 
 	for _, tr := range toolRows {
 		info := sessionMap[tr.sessionID]
-		catCounts[tr.category]++
+		catCounts[tr.category] += tr.count
 
 		if agentCats[info.agent] == nil {
 			agentCats[info.agent] = make(map[string]int)
 		}
-		agentCats[info.agent][tr.category]++
+		agentCats[info.agent][tr.category] += tr.count
 
 		week := bucketDate(info.date, "week")
 		if trendBuckets[week] == nil {
 			trendBuckets[week] = make(map[string]int)
 		}
-		trendBuckets[week][tr.category]++
+		trendBuckets[week][tr.category] += tr.count
 	}
 
-	resp.TotalCalls = len(toolRows)
+	for _, count := range catCounts {
+		resp.TotalCalls += count
+	}
 
 	// Build ByCategory sorted by count desc.
 	resp.ByCategory = make(
@@ -1700,6 +2251,136 @@ func (db *DB) GetAnalyticsTools(
 	return resp, nil
 }
 
+// ResolveSkillRowTime resolves the timestamp for a single skill call and
+// applies the date and hour/day-of-week filters to it. The message
+// timestamp is authoritative; the session timestamp is used only when the
+// message has none. Because skill rows are bucketed by the call's own
+// timestamp, the date/time filters must be applied here rather than to the
+// owning session, so a session that started outside the range still
+// contributes its in-range calls and drops its out-of-range ones.
+//
+// It returns the resolved timestamp, its local date, and whether the call
+// passes the filters.
+func (f AnalyticsFilter) ResolveSkillRowTime(
+	messageTS, sessionTS string,
+) (usedTS, date string, keep bool) {
+	loc := f.location()
+	usedTS = messageTS
+	if strings.TrimSpace(usedTS) == "" {
+		usedTS = sessionTS
+	}
+	date = localDate(usedTS, loc)
+	if !inDateRange(date, f.From, f.To) {
+		return usedTS, date, false
+	}
+	if f.HasTimeFilter() {
+		t, ok := localTime(usedTS, loc)
+		if !ok || !f.matchesTimeFilter(t) {
+			return usedTS, date, false
+		}
+	}
+	return usedTS, date, true
+}
+
+// GetAnalyticsSkills returns skill usage analytics aggregated
+// from non-empty tool_calls.skill_name values.
+func (db *DB) GetAnalyticsSkills(
+	ctx context.Context, f AnalyticsFilter,
+) (SkillsAnalyticsResponse, error) {
+	dateCol := "COALESCE(NULLIF(started_at, ''), created_at)"
+	where, args := f.buildWhereWithoutDate()
+
+	sessQ := `SELECT id, ` + dateCol + `, agent, project
+		FROM sessions WHERE ` + where
+
+	sessRows, err := db.getReader().QueryContext(ctx, sessQ, args...)
+	if err != nil {
+		return SkillsAnalyticsResponse{},
+			fmt.Errorf("querying skill sessions: %w", err)
+	}
+	defer sessRows.Close()
+
+	type sessInfo struct {
+		ts      string
+		agent   string
+		project string
+	}
+	sessionMap := make(map[string]sessInfo)
+	var sessionIDs []string
+
+	for sessRows.Next() {
+		var id, ts, agent, project string
+		if err := sessRows.Scan(
+			&id, &ts, &agent, &project,
+		); err != nil {
+			return SkillsAnalyticsResponse{},
+				fmt.Errorf("scanning skill session: %w", err)
+		}
+		sessionMap[id] = sessInfo{
+			ts:      ts,
+			agent:   agent,
+			project: project,
+		}
+		sessionIDs = append(sessionIDs, id)
+	}
+	if err := sessRows.Err(); err != nil {
+		return SkillsAnalyticsResponse{},
+			fmt.Errorf("iterating skill sessions: %w", err)
+	}
+	if len(sessionIDs) == 0 {
+		return BuildSkillsAnalytics(nil), nil
+	}
+
+	var skillRows []SkillAnalyticsRow
+	err = queryChunked(sessionIDs,
+		func(chunk []string) error {
+			ph, chunkArgs := inPlaceholders(chunk)
+			q := analyticsSkillsQuery(ph)
+			rows, qErr := db.getReader().QueryContext(
+				ctx, q, chunkArgs...,
+			)
+			if qErr != nil {
+				return fmt.Errorf(
+					"querying skill tool_calls: %w", qErr,
+				)
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var sid, skill, lastTS string
+				var count int
+				if err := rows.Scan(
+					&sid, &skill, &count, &lastTS,
+				); err != nil {
+					return fmt.Errorf(
+						"scanning skill tool_call: %w", err,
+					)
+				}
+				info := sessionMap[sid]
+				usedTS, date, keep := f.ResolveSkillRowTime(
+					lastTS, info.ts,
+				)
+				if !keep {
+					continue
+				}
+				skillRows = append(skillRows, SkillAnalyticsRow{
+					SessionID:  sid,
+					SkillName:  skill,
+					Agent:      info.agent,
+					Project:    info.project,
+					Date:       date,
+					LastUsedAt: usedTS,
+					Count:      count,
+				})
+			}
+			return rows.Err()
+		})
+	if err != nil {
+		return SkillsAnalyticsResponse{}, err
+	}
+
+	return BuildSkillsAnalytics(skillRows), nil
+}
+
 // --- Velocity ---
 
 // velocityMsg holds per-message data needed for velocity
@@ -1720,8 +2401,14 @@ func (db *DB) queryVelocityMsgs(
 	sessionMsgs map[string][]velocityMsg,
 ) error {
 	ph, args := inPlaceholders(chunk)
+	// COALESCE the nullable timestamp column to '' so a NULL (only present
+	// on imported/migrated archives) does not fail rows.Scan with
+	// "converting NULL to string is unsupported". localTime treats "" as
+	// invalid, so the row is excluded from velocity stats rather than
+	// crashing the analytics endpoint. This matches the NULL-safe
+	// PostgreSQL and DuckDB velocity twins.
 	q := `SELECT session_id, ordinal, role,
-		timestamp, content_length
+		COALESCE(timestamp, ''), content_length
 		FROM messages
 		WHERE session_id IN ` + ph + `
 		ORDER BY session_id, ordinal`
@@ -2233,17 +2920,19 @@ func (db *DB) GetAnalyticsVelocity(
 
 // SignalsAnalyticsResponse holds aggregated session signal data.
 type SignalsAnalyticsResponse struct {
-	ScoredSessions                int                  `json:"scored_sessions"`
-	UnscoredSessions              int                  `json:"unscored_sessions"`
-	GradeDistribution             map[string]int       `json:"grade_distribution"`
-	AvgHealthScore                *float64             `json:"avg_health_score"`
-	OutcomeDistribution           map[string]int       `json:"outcome_distribution"`
-	OutcomeConfidenceDistribution map[string]int       `json:"outcome_confidence_distribution"`
-	ToolHealth                    SignalsToolHealth    `json:"tool_health"`
-	ContextHealth                 SignalsContextHealth `json:"context_health"`
-	Trend                         []SignalsTrendBucket `json:"trend"`
-	ByAgent                       []SignalsAgentRow    `json:"by_agent"`
-	ByProject                     []SignalsProjectRow  `json:"by_project"`
+	ScoredSessions                int                          `json:"scored_sessions"`
+	UnscoredSessions              int                          `json:"unscored_sessions"`
+	GradeDistribution             map[string]int               `json:"grade_distribution"`
+	AvgHealthScore                *float64                     `json:"avg_health_score"`
+	OutcomeDistribution           map[string]int               `json:"outcome_distribution"`
+	OutcomeConfidenceDistribution map[string]int               `json:"outcome_confidence_distribution"`
+	ToolHealth                    SignalsToolHealth            `json:"tool_health"`
+	ContextHealth                 SignalsContextHealth         `json:"context_health"`
+	QualityHealth                 SignalsQualityHealth         `json:"quality_health"`
+	Trend                         []SignalsTrendBucket         `json:"trend"`
+	ByAgent                       []SignalsAgentRow            `json:"by_agent"`
+	ByProject                     []SignalsProjectRow          `json:"by_project"`
+	Calibration                   map[string]SignalCalibration `json:"calibration"`
 }
 
 // SignalsToolHealth holds aggregate tool failure metrics.
@@ -2264,6 +2953,74 @@ type SignalsContextHealth struct {
 	SessionsWithContextData   int      `json:"sessions_with_context_data"`
 	AvgContextPressure        *float64 `json:"avg_context_pressure"`
 	HighPressureSessions      int      `json:"high_pressure_sessions"`
+}
+
+// SignalsQualityHealth holds aggregate deterministic quality-signal
+// metrics. Totals are raw signal sums; SessionsWithSignal counts
+// sessions where each signal was non-zero.
+type SignalsQualityHealth struct {
+	ComputedSessions   int                 `json:"computed_sessions"`
+	Totals             QualitySignalTotals `json:"totals"`
+	SessionsWithSignal QualitySignalTotals `json:"sessions_with_signal"`
+}
+
+// QualitySignalTotals is shared by aggregate quality-signal totals.
+type QualitySignalTotals struct {
+	ShortPromptCount            int `json:"short_prompt_count"`
+	UnstructuredStart           int `json:"unstructured_start"`
+	MissingSuccessCriteriaCount int `json:"missing_success_criteria_count"`
+	MissingVerificationCount    int `json:"missing_verification_count"`
+	DuplicatePromptCount        int `json:"duplicate_prompt_count"`
+	NoCodeContextCount          int `json:"no_code_context_count"`
+	RunawayToolLoopCount        int `json:"runaway_tool_loop_count"`
+	FrustrationMarkerCount      int `json:"frustration_marker_count"`
+}
+
+// SignalCalibration compares sessions with a signal to sessions
+// without it for the active filter slice.
+type SignalCalibration struct {
+	Signal                 string   `json:"signal"`
+	AffectedSessions       int      `json:"affected_sessions"`
+	BaselineSessions       int      `json:"baseline_sessions"`
+	AffectedIncompleteRate float64  `json:"affected_incomplete_rate"`
+	BaselineIncompleteRate float64  `json:"baseline_incomplete_rate"`
+	IncompleteLift         *float64 `json:"incomplete_lift"`
+	AvgScoreDelta          *float64 `json:"avg_score_delta"`
+}
+
+// SignalSessionsResponse returns concrete sessions that triggered
+// an aggregate signal, including the best available message excerpt.
+type SignalSessionsResponse struct {
+	Signal   string                 `json:"signal"`
+	Sessions []SignalSessionExample `json:"sessions" nullable:"false"`
+}
+
+type SignalSessionExample struct {
+	SessionID      string  `json:"session_id"`
+	Project        string  `json:"project"`
+	Agent          string  `json:"agent"`
+	Date           string  `json:"date"`
+	IsAutomated    bool    `json:"is_automated"`
+	Outcome        string  `json:"outcome"`
+	HealthScore    *int    `json:"health_score"`
+	HealthGrade    *string `json:"health_grade"`
+	SignalTotal    int     `json:"signal_total"`
+	ReasonCode     string  `json:"reason_code"`
+	Excerpt        string  `json:"excerpt"`
+	MessageOrdinal *int    `json:"message_ordinal,omitempty"`
+	FailureSignals int     `json:"failure_signals"`
+	Retries        int     `json:"retries"`
+	EditChurn      int     `json:"edit_churn"`
+}
+
+type SignalMessage struct {
+	SessionID  string
+	Ordinal    int
+	Role       string
+	Content    string
+	Timestamp  string
+	IsSystem   bool
+	HasToolUse bool
 }
 
 // SignalsTrendBucket holds signal data for one date bucket.
@@ -2300,20 +3057,31 @@ type SignalsProjectRow struct {
 // from its own SELECT and feed them into AggregateSignals
 // without duplicating the aggregation logic.
 type SignalRow struct {
-	ID                     string
-	Agent                  string
-	Project                string
-	Date                   string
-	HealthScore            *int
-	HealthGrade            *string
-	Outcome                string
-	OutcomeConfidence      string
-	ToolFailureSignalCount int
-	ToolRetryCount         int
-	EditChurnCount         int
-	CompactionCount        int
-	MidTaskCompactionCount int
-	ContextPressureMax     *float64
+	ID                          string
+	Agent                       string
+	Project                     string
+	Date                        string
+	FirstMessage                *string
+	IsAutomated                 bool
+	HealthScore                 *int
+	HealthGrade                 *string
+	Outcome                     string
+	OutcomeConfidence           string
+	ToolFailureSignalCount      int
+	ToolRetryCount              int
+	EditChurnCount              int
+	CompactionCount             int
+	MidTaskCompactionCount      int
+	ContextPressureMax          *float64
+	QualitySignalVersion        int
+	ShortPromptCount            int
+	UnstructuredStart           bool
+	MissingSuccessCriteriaCount int
+	MissingVerificationCount    int
+	DuplicatePromptCount        int
+	NoCodeContextCount          int
+	RunawayToolLoopCount        int
+	FrustrationMarkerCount      int
 }
 
 // GetAnalyticsSignals returns aggregated session signal data.
@@ -2333,14 +3101,19 @@ func (db *DB) GetAnalyticsSignals(
 		}
 	}
 
-	query := `SELECT id, agent, project,
+	query := `SELECT id, agent, project, first_message, is_automated,
 		` + dateCol + `,
 		health_score, health_grade, outcome,
 		outcome_confidence,
 		tool_failure_signal_count, tool_retry_count,
 		edit_churn_count, compaction_count,
 		mid_task_compaction_count,
-		context_pressure_max
+		context_pressure_max,
+		quality_signal_version,
+		short_prompt_count, unstructured_start,
+		missing_success_criteria_count,
+		missing_verification_count, duplicate_prompt_count,
+		no_code_context_count, runaway_tool_loop_count
 		FROM sessions WHERE ` + where
 
 	rows, err := db.getReader().QueryContext(
@@ -2359,13 +3132,20 @@ func (db *DB) GetAnalyticsSignals(
 		var r SignalRow
 		var ts string
 		if err := rows.Scan(
-			&r.ID, &r.Agent, &r.Project, &ts,
+			&r.ID, &r.Agent, &r.Project,
+			&r.FirstMessage, &r.IsAutomated, &ts,
 			&r.HealthScore, &r.HealthGrade,
 			&r.Outcome, &r.OutcomeConfidence,
 			&r.ToolFailureSignalCount,
 			&r.ToolRetryCount, &r.EditChurnCount,
 			&r.CompactionCount, &r.MidTaskCompactionCount,
 			&r.ContextPressureMax,
+			&r.QualitySignalVersion,
+			&r.ShortPromptCount, &r.UnstructuredStart,
+			&r.MissingSuccessCriteriaCount,
+			&r.MissingVerificationCount,
+			&r.DuplicatePromptCount,
+			&r.NoCodeContextCount, &r.RunawayToolLoopCount,
 		); err != nil {
 			return SignalsAnalyticsResponse{},
 				fmt.Errorf(
@@ -2387,8 +3167,659 @@ func (db *DB) GetAnalyticsSignals(
 				"iterating signals rows: %w", err,
 			)
 	}
+	if err := db.populateFrustrationMarkers(ctx, all); err != nil {
+		return SignalsAnalyticsResponse{}, err
+	}
 
 	return AggregateSignals(all), nil
+}
+
+// GetAnalyticsSignalSessions returns concrete examples for a
+// signal within the current analytics filter.
+func (db *DB) GetAnalyticsSignalSessions(
+	ctx context.Context,
+	f AnalyticsFilter,
+	signal string,
+	limit int,
+) (SignalSessionsResponse, error) {
+	if !IsSupportedAnalyticsSignal(signal) {
+		return SignalSessionsResponse{}, ErrUnsupportedAnalyticsSignal
+	}
+	if limit <= 0 || limit > 20 {
+		limit = 10
+	}
+	rows, err := db.signalRows(ctx, f)
+	if err != nil {
+		return SignalSessionsResponse{}, err
+	}
+	if err := db.populateFrustrationMarkers(ctx, rows); err != nil {
+		return SignalSessionsResponse{}, err
+	}
+	candidates := SignalCandidates(rows, signal, limit)
+	messages, err := db.signalMessages(ctx, candidates)
+	if err != nil {
+		return SignalSessionsResponse{}, err
+	}
+	return SignalSessionsResponse{
+		Signal:   signal,
+		Sessions: BuildSignalExamples(candidates, messages, signal),
+	}, nil
+}
+
+func (db *DB) signalRows(
+	ctx context.Context,
+	f AnalyticsFilter,
+) ([]SignalRow, error) {
+	loc := f.location()
+	dateCol := "COALESCE(NULLIF(started_at, ''), created_at)"
+	where, args := f.buildWhere(dateCol)
+
+	var timeIDs map[string]bool
+	if f.HasTimeFilter() {
+		var err error
+		timeIDs, err = db.filteredSessionIDs(ctx, f)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	query := `SELECT id, agent, project, first_message, is_automated,
+		` + dateCol + `,
+		health_score, health_grade, outcome,
+		outcome_confidence,
+		tool_failure_signal_count, tool_retry_count,
+		edit_churn_count, compaction_count,
+		mid_task_compaction_count,
+		context_pressure_max,
+		quality_signal_version,
+		short_prompt_count, unstructured_start,
+		missing_success_criteria_count,
+		missing_verification_count, duplicate_prompt_count,
+		no_code_context_count, runaway_tool_loop_count
+		FROM sessions WHERE ` + where
+
+	rows, err := db.getReader().QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"querying analytics signal rows: %w", err,
+		)
+	}
+	defer rows.Close()
+	var all []SignalRow
+	for rows.Next() {
+		r, err := scanSignalRow(rows, loc)
+		if err != nil {
+			return nil, err
+		}
+		if !inDateRange(r.Date, f.From, f.To) {
+			continue
+		}
+		if timeIDs != nil && !timeIDs[r.ID] {
+			continue
+		}
+		all = append(all, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"iterating analytics signal rows: %w", err,
+		)
+	}
+	return all, nil
+}
+
+func (db *DB) populateFrustrationMarkers(
+	ctx context.Context,
+	rows []SignalRow,
+) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	idx := make(map[string]int, len(rows))
+	ids := make([]string, 0, len(rows))
+	for i := range rows {
+		idx[rows[i].ID] = i
+		ids = append(ids, rows[i].ID)
+	}
+	return queryChunked(ids, func(chunk []string) error {
+		ph, args := inPlaceholders(chunk)
+		q := `SELECT session_id, ordinal, content, is_system
+			FROM messages
+			WHERE role = 'user' AND session_id IN ` + ph
+		msgRows, err := db.getReader().QueryContext(ctx, q, args...)
+		if err != nil {
+			return fmt.Errorf(
+				"querying frustration markers: %w", err,
+			)
+		}
+		defer msgRows.Close()
+		for msgRows.Next() {
+			var sessionID, content string
+			var ordinal int
+			var isSystem bool
+			if err := msgRows.Scan(
+				&sessionID, &ordinal, &content, &isSystem,
+			); err != nil {
+				return fmt.Errorf(
+					"scanning frustration marker: %w", err,
+				)
+			}
+			i, ok := idx[sessionID]
+			if !ok || isSystem {
+				continue
+			}
+			if signals.IsFrustrationMarker(content) {
+				rows[i].FrustrationMarkerCount++
+			}
+		}
+		if err := msgRows.Err(); err != nil {
+			return fmt.Errorf(
+				"iterating frustration markers: %w", err,
+			)
+		}
+		return nil
+	})
+}
+
+func scanSignalRow(rs rowScanner, loc *time.Location) (SignalRow, error) {
+	var r SignalRow
+	var ts string
+	if err := rs.Scan(
+		&r.ID, &r.Agent, &r.Project,
+		&r.FirstMessage, &r.IsAutomated, &ts,
+		&r.HealthScore, &r.HealthGrade,
+		&r.Outcome, &r.OutcomeConfidence,
+		&r.ToolFailureSignalCount,
+		&r.ToolRetryCount, &r.EditChurnCount,
+		&r.CompactionCount, &r.MidTaskCompactionCount,
+		&r.ContextPressureMax,
+		&r.QualitySignalVersion,
+		&r.ShortPromptCount, &r.UnstructuredStart,
+		&r.MissingSuccessCriteriaCount,
+		&r.MissingVerificationCount,
+		&r.DuplicatePromptCount,
+		&r.NoCodeContextCount, &r.RunawayToolLoopCount,
+	); err != nil {
+		return SignalRow{}, fmt.Errorf(
+			"scanning signal row: %w", err,
+		)
+	}
+	r.Date = localDate(ts, loc)
+	return r, nil
+}
+
+func SignalCandidates(
+	rows []SignalRow,
+	signal string,
+	limit int,
+) []SignalRow {
+	candidates := make([]SignalRow, 0)
+	for _, r := range rows {
+		if signalValue(r, signal) > 0 {
+			candidates = append(candidates, r)
+		}
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		iv := signalValue(candidates[i], signal)
+		jv := signalValue(candidates[j], signal)
+		if iv != jv {
+			return iv > jv
+		}
+		ib := isIncompleteOrLowQuality(candidates[i])
+		jb := isIncompleteOrLowQuality(candidates[j])
+		if ib != jb {
+			return ib
+		}
+		if candidates[i].HealthScore != nil &&
+			candidates[j].HealthScore != nil &&
+			*candidates[i].HealthScore != *candidates[j].HealthScore {
+			return *candidates[i].HealthScore <
+				*candidates[j].HealthScore
+		}
+		return candidates[i].Date > candidates[j].Date
+	})
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	return candidates
+}
+
+func (db *DB) signalMessages(
+	ctx context.Context,
+	rows []SignalRow,
+) (map[string][]SignalMessage, error) {
+	out := make(map[string][]SignalMessage, len(rows))
+	if len(rows) == 0 {
+		return out, nil
+	}
+	ids := make([]string, 0, len(rows))
+	for _, r := range rows {
+		ids = append(ids, r.ID)
+	}
+	err := queryChunked(ids, func(chunk []string) error {
+		ph, args := inPlaceholders(chunk)
+		q := `SELECT session_id, ordinal, role, content,
+					COALESCE(timestamp, ''), is_system, has_tool_use
+				FROM messages
+				WHERE session_id IN ` + ph + `
+				ORDER BY session_id, ordinal`
+		msgRows, err := db.getReader().QueryContext(ctx, q, args...)
+		if err != nil {
+			return fmt.Errorf(
+				"querying signal messages: %w", err,
+			)
+		}
+		defer msgRows.Close()
+		for msgRows.Next() {
+			var m SignalMessage
+			if err := msgRows.Scan(
+				&m.SessionID, &m.Ordinal, &m.Role,
+				&m.Content, &m.Timestamp,
+				&m.IsSystem, &m.HasToolUse,
+			); err != nil {
+				return fmt.Errorf(
+					"scanning signal message: %w", err,
+				)
+			}
+			out[m.SessionID] = append(out[m.SessionID], m)
+		}
+		if err := msgRows.Err(); err != nil {
+			return fmt.Errorf(
+				"iterating signal messages: %w", err,
+			)
+		}
+		return nil
+	})
+	return out, err
+}
+
+func BuildSignalExamples(
+	rows []SignalRow,
+	messages map[string][]SignalMessage,
+	signal string,
+) []SignalSessionExample {
+	examples := make([]SignalSessionExample, 0, len(rows))
+	for _, r := range rows {
+		excerpt, ordinal := signalExcerpt(
+			signal, r, messages[r.ID],
+		)
+		examples = append(examples, SignalSessionExample{
+			SessionID:      r.ID,
+			Project:        r.Project,
+			Agent:          r.Agent,
+			Date:           r.Date,
+			IsAutomated:    r.IsAutomated,
+			Outcome:        r.Outcome,
+			HealthScore:    r.HealthScore,
+			HealthGrade:    r.HealthGrade,
+			SignalTotal:    signalValue(r, signal),
+			ReasonCode:     signalReason(signal),
+			Excerpt:        truncateExcerpt(excerpt, 180),
+			MessageOrdinal: ordinal,
+			FailureSignals: r.ToolFailureSignalCount,
+			Retries:        r.ToolRetryCount,
+			EditChurn:      r.EditChurnCount,
+		})
+	}
+	return examples
+}
+
+func signalExcerpt(
+	signal string,
+	r SignalRow,
+	messages []SignalMessage,
+) (string, *int) {
+	switch signal {
+	case "frustration_marker_count":
+		if content, ordinal, ok := firstFrustrationPrompt(messages); ok {
+			return content, ordinal
+		}
+	case "short_prompt_count":
+		if content, ordinal, ok := firstShortPrompt(messages); ok {
+			return content, ordinal
+		}
+	case "duplicate_prompt_count":
+		if content, ordinal, ok := firstRepeatedPrompt(messages); ok {
+			return content, ordinal
+		}
+	case "tool_failure_signals", "tool_retries", "edit_churn",
+		"runaway_tool_loop_count":
+		if content, ordinal, ok := firstToolUseMessage(messages); ok {
+			return content, ordinal
+		}
+	case "outcome_errored", "outcome_abandoned", "outcome_completed",
+		"sessions_with_compaction", "mid_task_compaction_count",
+		"high_pressure_sessions":
+		if content, ordinal, ok := lastSessionMessage(messages); ok {
+			return content, ordinal
+		}
+	}
+	if content, ordinal, ok := firstSubstantiveUserMessage(messages); ok {
+		return content, ordinal
+	}
+	if r.FirstMessage != nil {
+		return *r.FirstMessage, nil
+	}
+	return "", nil
+}
+
+func firstFrustrationPrompt(
+	messages []SignalMessage,
+) (string, *int, bool) {
+	for _, m := range messages {
+		if !isUserEvidenceMessage(m) {
+			continue
+		}
+		if signals.IsFrustrationMarker(m.Content) {
+			content, ordinal := messageEvidence(m)
+			return content, ordinal, true
+		}
+	}
+	return "", nil, false
+}
+
+func firstShortPrompt(
+	messages []SignalMessage,
+) (string, *int, bool) {
+	firstUserOrdinal, ok := firstSubstantiveUserOrdinal(messages)
+	if !ok {
+		return "", nil, false
+	}
+	var previousAssistantTimestamp string
+	hasPreviousAssistant := false
+	userSinceLastAssistant := false
+	for _, m := range messages {
+		if m.IsSystem {
+			continue
+		}
+		if m.Role == "assistant" {
+			previousAssistantTimestamp = m.Timestamp
+			hasPreviousAssistant = true
+			userSinceLastAssistant = false
+			continue
+		}
+		if !isUserEvidenceMessage(m) {
+			continue
+		}
+		firstAfterAssistant := !userSinceLastAssistant
+		normalized := normalizeEvidenceText(m.Content)
+		if isControlEvidencePrompt(normalized) {
+			continue
+		}
+		userSinceLastAssistant = true
+		if len(normalized) >= 30 {
+			continue
+		}
+		if m.Ordinal == firstUserOrdinal ||
+			(firstAfterAssistant &&
+				hasStaleEvidenceAssistantBefore(
+					m.Timestamp,
+					previousAssistantTimestamp,
+					hasPreviousAssistant,
+				)) {
+			content, ordinal := messageEvidence(m)
+			return content, ordinal, true
+		}
+	}
+	return "", nil, false
+}
+
+func firstSubstantiveUserOrdinal(
+	messages []SignalMessage,
+) (int, bool) {
+	for _, m := range messages {
+		if !isUserEvidenceMessage(m) {
+			continue
+		}
+		if isControlEvidencePrompt(normalizeEvidenceText(m.Content)) {
+			continue
+		}
+		return m.Ordinal, true
+	}
+	return 0, false
+}
+
+func hasStaleEvidenceAssistantBefore(
+	userTimestamp string,
+	assistantTimestamp string,
+	hasPreviousAssistant bool,
+) bool {
+	if !hasPreviousAssistant {
+		return false
+	}
+	userTime, ok := parseEvidenceTime(userTimestamp)
+	if !ok {
+		return false
+	}
+	assistantTime, ok := parseEvidenceTime(assistantTimestamp)
+	if !ok {
+		return false
+	}
+	return userTime.Sub(assistantTime) > 30*time.Minute
+}
+
+func parseEvidenceTime(raw string) (time.Time, bool) {
+	if raw == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05.999999999-07:00",
+		"2006-01-02 15:04:05-07:00",
+	} {
+		t, err := time.Parse(layout, raw)
+		if err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+func firstRepeatedPrompt(
+	messages []SignalMessage,
+) (string, *int, bool) {
+	type prompt struct {
+		normalized string
+		tokens     []string
+	}
+	seen := make([]prompt, 0, len(messages))
+	for _, m := range messages {
+		if !isUserEvidenceMessage(m) {
+			continue
+		}
+		key := evidencePromptKey(m.Content)
+		if key == "" {
+			continue
+		}
+		tokens := evidencePromptTokens(key)
+		if len(tokens) < 4 {
+			continue
+		}
+		for _, prev := range seen {
+			if key == prev.normalized ||
+				evidenceJaccard(tokens, prev.tokens) >= 0.85 {
+				content, ordinal := messageEvidence(m)
+				return content, ordinal, true
+			}
+		}
+		seen = append(seen, prompt{
+			normalized: key,
+			tokens:     tokens,
+		})
+	}
+	return "", nil, false
+}
+
+func firstToolUseMessage(
+	messages []SignalMessage,
+) (string, *int, bool) {
+	for _, m := range messages {
+		if m.IsSystem || !m.HasToolUse {
+			continue
+		}
+		content, ordinal := messageEvidence(m)
+		return content, ordinal, true
+	}
+	return "", nil, false
+}
+
+func lastSessionMessage(
+	messages []SignalMessage,
+) (string, *int, bool) {
+	for _, v := range slices.Backward(messages) {
+		m := v
+		if m.IsSystem {
+			continue
+		}
+		if !isSubstantiveEvidence(m.Content) && !m.HasToolUse {
+			continue
+		}
+		content, ordinal := messageEvidence(m)
+		return content, ordinal, true
+	}
+	return "", nil, false
+}
+
+func firstSubstantiveUserMessage(
+	messages []SignalMessage,
+) (string, *int, bool) {
+	for _, m := range messages {
+		if !isUserEvidenceMessage(m) {
+			continue
+		}
+		content, ordinal := messageEvidence(m)
+		return content, ordinal, true
+	}
+	return "", nil, false
+}
+
+func isUserEvidenceMessage(m SignalMessage) bool {
+	return m.Role == "user" &&
+		!m.IsSystem &&
+		isSubstantiveEvidence(m.Content)
+}
+
+func isSubstantiveEvidence(content string) bool {
+	return normalizeEvidenceText(content) != ""
+}
+
+func evidencePromptKey(content string) string {
+	key := normalizeEvidenceText(content)
+	if len(key) < 20 || isControlEvidencePrompt(key) {
+		return ""
+	}
+	return key
+}
+
+func evidencePromptTokens(normalized string) []string {
+	return strings.FieldsFunc(normalized, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+}
+
+func evidenceJaccard(a, b []string) float64 {
+	if len(a) == 0 || len(b) == 0 {
+		return 0
+	}
+	seen := map[string]struct{}{}
+	for _, token := range a {
+		seen[token] = struct{}{}
+	}
+	intersections := 0
+	union := len(seen)
+	for _, token := range b {
+		if _, ok := seen[token]; ok {
+			intersections++
+		} else {
+			union++
+		}
+	}
+	if union == 0 {
+		return 0
+	}
+	return float64(intersections) / float64(union)
+}
+
+func isControlEvidencePrompt(normalized string) bool {
+	switch normalized {
+	case "yes", "y", "no", "n", "ok", "okay",
+		"continue", "go ahead", "proceed",
+		"do it", "done", "thanks", "thank you",
+		"please continue", "keep going":
+		return true
+	default:
+		return false
+	}
+}
+
+func messageEvidence(m SignalMessage) (string, *int) {
+	ordinal := m.Ordinal
+	content := strings.TrimSpace(m.Content)
+	if content == "" && m.HasToolUse {
+		content = "Tool-use turn"
+	}
+	return content, &ordinal
+}
+
+func signalReason(signal string) string {
+	switch signal {
+	case "short_prompt_count":
+		return "short-start-contextual"
+	case "unstructured_start":
+		return "unstructured-task-start"
+	case "missing_success_criteria_count":
+		return "missing-observable-acceptance"
+	case "missing_verification_count":
+		return "missing-targeted-verification-path"
+	case "duplicate_prompt_count":
+		return "possible-stuck-reask"
+	case "no_code_context_count":
+		return "code-task-without-context"
+	case "runaway_tool_loop_count":
+		return "repeated-failing-tool-cycle"
+	case "frustration_marker_count":
+		return "frustration-marker"
+	case "outcome_errored":
+		return "errored-outcome"
+	case "outcome_abandoned":
+		return "abandoned-outcome"
+	case "outcome_completed":
+		return "completed-outcome"
+	case "tool_failure_signals":
+		return "tool-failure-signal"
+	case "tool_retries":
+		return "tool-retry"
+	case "edit_churn":
+		return "edit-churn"
+	case "sessions_with_compaction":
+		return "context-compaction"
+	case "mid_task_compaction_count":
+		return "mid-task-compaction"
+	case "high_pressure_sessions":
+		return "high-context-pressure"
+	default:
+		return signal
+	}
+}
+
+func normalizeEvidenceText(content string) string {
+	lower := strings.ToLower(strings.TrimSpace(content))
+	return spaceReplacer(lower)
+}
+
+func truncateExcerpt(s string, max int) string {
+	s = strings.TrimSpace(spaceReplacer(s))
+	if len(s) <= max {
+		return s
+	}
+	if max <= 3 {
+		return s[:max]
+	}
+	return s[:max-3] + "..."
+}
+
+func spaceReplacer(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // AggregateSignals builds the response from collected rows.
@@ -2401,6 +3832,7 @@ func AggregateSignals(
 		GradeDistribution:             make(map[string]int),
 		OutcomeDistribution:           make(map[string]int),
 		OutcomeConfidenceDistribution: make(map[string]int),
+		Calibration:                   make(map[string]SignalCalibration),
 	}
 
 	if len(all) == 0 {
@@ -2482,6 +3914,8 @@ func AggregateSignals(
 				resp.ContextHealth.HighPressureSessions++
 			}
 		}
+
+		accumulateQualityHealth(&resp.QualityHealth, r)
 
 		// Accumulate by agent
 		ga := agentMap[r.Agent]
@@ -2691,8 +4125,208 @@ func AggregateSignals(
 		return resp.ByProject[i].Project <
 			resp.ByProject[j].Project
 	})
+	resp.Calibration = buildSignalCalibrations(all)
 
 	return resp
+}
+
+func accumulateQualityHealth(
+	q *SignalsQualityHealth, r SignalRow,
+) {
+	if r.QualitySignalVersion <= 0 {
+		return
+	}
+	q.ComputedSessions++
+	q.Totals.ShortPromptCount += r.ShortPromptCount
+	if r.ShortPromptCount > 0 {
+		q.SessionsWithSignal.ShortPromptCount++
+	}
+	if r.UnstructuredStart {
+		q.Totals.UnstructuredStart++
+		q.SessionsWithSignal.UnstructuredStart++
+	}
+	q.Totals.MissingSuccessCriteriaCount +=
+		r.MissingSuccessCriteriaCount
+	if r.MissingSuccessCriteriaCount > 0 {
+		q.SessionsWithSignal.MissingSuccessCriteriaCount++
+	}
+	q.Totals.MissingVerificationCount += r.MissingVerificationCount
+	if r.MissingVerificationCount > 0 {
+		q.SessionsWithSignal.MissingVerificationCount++
+	}
+	q.Totals.DuplicatePromptCount += r.DuplicatePromptCount
+	if r.DuplicatePromptCount > 0 {
+		q.SessionsWithSignal.DuplicatePromptCount++
+	}
+	q.Totals.NoCodeContextCount += r.NoCodeContextCount
+	if r.NoCodeContextCount > 0 {
+		q.SessionsWithSignal.NoCodeContextCount++
+	}
+	q.Totals.RunawayToolLoopCount += r.RunawayToolLoopCount
+	if r.RunawayToolLoopCount > 0 {
+		q.SessionsWithSignal.RunawayToolLoopCount++
+	}
+	q.Totals.FrustrationMarkerCount += r.FrustrationMarkerCount
+	if r.FrustrationMarkerCount > 0 {
+		q.SessionsWithSignal.FrustrationMarkerCount++
+	}
+}
+
+func buildSignalCalibrations(
+	rows []SignalRow,
+) map[string]SignalCalibration {
+	signals := []string{
+		"tool_failure_signals",
+		"tool_retries",
+		"edit_churn",
+		"sessions_with_compaction",
+		"mid_task_compaction_count",
+		"high_pressure_sessions",
+		"short_prompt_count",
+		"unstructured_start",
+		"missing_success_criteria_count",
+		"missing_verification_count",
+		"duplicate_prompt_count",
+		"no_code_context_count",
+		"runaway_tool_loop_count",
+		"frustration_marker_count",
+	}
+	out := make(map[string]SignalCalibration, len(signals))
+	for _, signal := range signals {
+		out[signal] = calibrateSignal(rows, signal)
+	}
+	return out
+}
+
+func calibrateSignal(rows []SignalRow, signal string) SignalCalibration {
+	type side struct {
+		count      int
+		incomplete int
+		scoreSum   int
+		scoreCount int
+	}
+	var affected, baseline side
+	for _, r := range rows {
+		target := &baseline
+		if signalValue(r, signal) > 0 {
+			target = &affected
+		}
+		target.count++
+		if isIncompleteOrLowQuality(r) {
+			target.incomplete++
+		}
+		if r.HealthScore != nil {
+			target.scoreSum += *r.HealthScore
+			target.scoreCount++
+		}
+	}
+	result := SignalCalibration{
+		Signal:           signal,
+		AffectedSessions: affected.count,
+		BaselineSessions: baseline.count,
+	}
+	if affected.count > 0 {
+		result.AffectedIncompleteRate = round1(
+			float64(affected.incomplete) /
+				float64(affected.count) * 100,
+		)
+	}
+	if baseline.count > 0 {
+		result.BaselineIncompleteRate = round1(
+			float64(baseline.incomplete) /
+				float64(baseline.count) * 100,
+		)
+	}
+	if baseline.count > 0 &&
+		result.BaselineIncompleteRate > 0 &&
+		affected.count > 0 {
+		lift := round1(
+			result.AffectedIncompleteRate /
+				result.BaselineIncompleteRate,
+		)
+		result.IncompleteLift = &lift
+	}
+	if affected.scoreCount > 0 && baseline.scoreCount > 0 {
+		delta := round1(
+			float64(affected.scoreSum)/
+				float64(affected.scoreCount) -
+				float64(baseline.scoreSum)/
+					float64(baseline.scoreCount),
+		)
+		result.AvgScoreDelta = &delta
+	}
+	return result
+}
+
+func signalValue(r SignalRow, signal string) int {
+	switch signal {
+	case "outcome_errored":
+		if r.Outcome == "errored" {
+			return 1
+		}
+	case "outcome_abandoned":
+		if r.Outcome == "abandoned" {
+			return 1
+		}
+	case "outcome_completed":
+		if r.Outcome == "completed" {
+			return 1
+		}
+	case "tool_failure_signals":
+		return r.ToolFailureSignalCount
+	case "tool_retries":
+		return r.ToolRetryCount
+	case "edit_churn":
+		return r.EditChurnCount
+	case "sessions_with_compaction":
+		if r.CompactionCount > 0 {
+			return 1
+		}
+	case "mid_task_compaction_count":
+		return r.MidTaskCompactionCount
+	case "high_pressure_sessions":
+		if r.ContextPressureMax != nil &&
+			*r.ContextPressureMax >= 0.8 {
+			return 1
+		}
+	case "short_prompt_count":
+		return r.ShortPromptCount
+	case "unstructured_start":
+		if r.UnstructuredStart {
+			return 1
+		}
+	case "missing_success_criteria_count":
+		return r.MissingSuccessCriteriaCount
+	case "missing_verification_count":
+		return r.MissingVerificationCount
+	case "duplicate_prompt_count":
+		return r.DuplicatePromptCount
+	case "no_code_context_count":
+		return r.NoCodeContextCount
+	case "runaway_tool_loop_count":
+		return r.RunawayToolLoopCount
+	case "frustration_marker_count":
+		return r.FrustrationMarkerCount
+	}
+	return 0
+}
+
+func SignalValue(r SignalRow, signal string) int {
+	return signalValue(r, signal)
+}
+
+func isIncompleteOrLowQuality(r SignalRow) bool {
+	if r.Outcome == "errored" || r.Outcome == "abandoned" {
+		return true
+	}
+	if r.HealthGrade == nil {
+		return false
+	}
+	return *r.HealthGrade == "D" || *r.HealthGrade == "F"
+}
+
+func round1(v float64) float64 {
+	return math.Round(v*10) / 10
 }
 
 // --- Top Sessions ---
@@ -2702,6 +4336,7 @@ type TopSession struct {
 	ID           string  `json:"id"`
 	Project      string  `json:"project"`
 	FirstMessage *string `json:"first_message"`
+	DisplayName  *string `json:"display_name,omitempty"`
 	MessageCount int     `json:"message_count"`
 	OutputTokens int     `json:"output_tokens"`
 	DurationMin  float64 `json:"duration_min"`
@@ -2729,6 +4364,69 @@ func (db *DB) GetAnalyticsTopSessions(
 	if metric == "" {
 		metric = "messages"
 	}
+	if !f.canUseSQLiteTimeSQL() {
+		return db.getAnalyticsTopSessionsGo(ctx, f, metric)
+	}
+	dateCol := "COALESCE(NULLIF(started_at, ''), created_at)"
+	where, args := sqliteAnalyticsWhereSQL(f, dateCol, "sessions.id", true)
+
+	durationExpr := `ROUND((julianday(ended_at) -
+		julianday(started_at)) * 1440, 1)`
+	durationSelectExpr := "COALESCE(" + durationExpr + ", 0)"
+	var orderExpr string
+	switch metric {
+	case "output_tokens":
+		where += " AND has_total_output_tokens = TRUE"
+		orderExpr = "total_output_tokens DESC, id ASC"
+	case "duration":
+		orderExpr = durationExpr + " DESC, id ASC"
+		where += " AND NULLIF(started_at, '') IS NOT NULL" +
+			" AND NULLIF(ended_at, '') IS NOT NULL" +
+			" AND julianday(ended_at) >= julianday(started_at)"
+	default:
+		metric = "messages"
+		orderExpr = "message_count DESC, id ASC"
+	}
+
+	query := `SELECT id, project, first_message,
+		COALESCE(display_name, session_name) AS display_name,
+		message_count, total_output_tokens, ` + durationSelectExpr + `,
+		started_at, ended_at, termination_status
+		FROM sessions WHERE ` + where +
+		` ORDER BY ` + orderExpr + ` LIMIT 10`
+
+	rows, err := db.getReader().QueryContext(ctx, query, args...)
+	if err != nil {
+		return TopSessionsResponse{},
+			fmt.Errorf("querying top sessions: %w", err)
+	}
+	defer rows.Close()
+
+	resp := TopSessionsResponse{Metric: metric}
+	for rows.Next() {
+		var row TopSession
+		if err := rows.Scan(
+			&row.ID, &row.Project, &row.FirstMessage,
+			&row.DisplayName, &row.MessageCount,
+			&row.OutputTokens, &row.DurationMin,
+			&row.StartedAt, &row.EndedAt,
+			&row.TerminationStatus,
+		); err != nil {
+			return TopSessionsResponse{},
+				fmt.Errorf("scanning top session: %w", err)
+		}
+		resp.Sessions = append(resp.Sessions, row)
+	}
+	if err := rows.Err(); err != nil {
+		return TopSessionsResponse{},
+			fmt.Errorf("iterating top sessions: %w", err)
+	}
+	return resp, nil
+}
+
+func (db *DB) getAnalyticsTopSessionsGo(
+	ctx context.Context, f AnalyticsFilter, metric string,
+) (TopSessionsResponse, error) {
 	loc := f.location()
 	dateCol := "COALESCE(NULLIF(started_at, ''), created_at)"
 	where, args := f.buildWhere(dateCol)
@@ -2758,9 +4456,10 @@ func (db *DB) GetAnalyticsTopSessions(
 	}
 
 	query := `SELECT id, ` + dateCol + `, project,
-		first_message, message_count,
-		total_output_tokens, started_at, ended_at,
-		termination_status
+		first_message,
+		COALESCE(display_name, session_name) AS display_name,
+		message_count, total_output_tokens,
+		started_at, ended_at, termination_status
 		FROM sessions WHERE ` + where +
 		` ORDER BY ` + orderExpr + ` LIMIT 200`
 
@@ -2774,12 +4473,13 @@ func (db *DB) GetAnalyticsTopSessions(
 	var sessions []TopSession
 	for rows.Next() {
 		var id, ts, project string
-		var firstMsg, startedAt, endedAt, termStatus *string
+		var firstMsg, displayName, startedAt, endedAt *string
+		var termStatus *string
 		var mc, outputTokens int
 		if err := rows.Scan(
 			&id, &ts, &project, &firstMsg,
-			&mc, &outputTokens, &startedAt, &endedAt,
-			&termStatus,
+			&displayName, &mc, &outputTokens,
+			&startedAt, &endedAt, &termStatus,
 		); err != nil {
 			return TopSessionsResponse{},
 				fmt.Errorf("scanning top session: %w", err)
@@ -2804,6 +4504,7 @@ func (db *DB) GetAnalyticsTopSessions(
 			ID:                id,
 			Project:           project,
 			FirstMessage:      firstMsg,
+			DisplayName:       displayName,
 			MessageCount:      mc,
 			OutputTokens:      outputTokens,
 			DurationMin:       durMin,

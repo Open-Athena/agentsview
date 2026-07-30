@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -130,16 +131,28 @@ func setupWithServerOpts(
 	srvOpts = append([]server.Option{server.WithBroadcaster(broadcaster)}, srvOpts...)
 	srv := server.New(cfg, database, engine, srvOpts...)
 
-	// Wrap handler to set default Host header for all test
-	// requests, matching the test config (127.0.0.1:0).
-	// Individual tests can override by setting req.Host
-	// before calling ServeHTTP directly.
+	return &testEnv{
+		srv:         srv,
+		handler:     wrapTestHandler(cfg, srv.Handler()),
+		db:          database,
+		engine:      engine,
+		broadcaster: broadcaster,
+		claudeDir:   claudeDir,
+		dataDir:     dir,
+	}
+}
+
+// wrapTestHandler wraps the server handler so test requests default
+// to the configured Host and a loopback RemoteAddr, matching the test
+// config (e.g. 127.0.0.1:0), and so mutating requests get an Origin
+// matching that config. Individual tests can override by setting these
+// on the request before calling te.srv.Handler() directly.
+func wrapTestHandler(cfg config.Config, base http.Handler) http.Handler {
 	defaultHost := net.JoinHostPort(
 		cfg.Host, fmt.Sprintf("%d", cfg.Port),
 	)
 	defaultOrigin := fmt.Sprintf("http://%s", defaultHost)
-	baseHandler := srv.Handler()
-	wrappedHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Host == "example.com" || r.Host == "" {
 			r.Host = defaultHost
 		}
@@ -159,18 +172,8 @@ func setupWithServerOpts(
 				r.Header.Set("Origin", defaultOrigin)
 			}
 		}
-		baseHandler.ServeHTTP(w, r)
+		base.ServeHTTP(w, r)
 	})
-
-	return &testEnv{
-		srv:         srv,
-		handler:     wrappedHandler,
-		db:          database,
-		engine:      engine,
-		broadcaster: broadcaster,
-		claudeDir:   claudeDir,
-		dataDir:     dir,
-	}
 }
 
 // setupPGMode builds a testEnv with engine == nil and no
@@ -197,34 +200,46 @@ func setupPGMode(t *testing.T) *testEnv {
 	}
 	srv := server.New(cfg, database, nil)
 
-	defaultHost := net.JoinHostPort(
-		cfg.Host, fmt.Sprintf("%d", cfg.Port),
-	)
-	defaultOrigin := fmt.Sprintf("http://%s", defaultHost)
-	baseHandler := srv.Handler()
-	wrappedHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Host == "example.com" || r.Host == "" {
-			r.Host = defaultHost
-		}
-		if r.RemoteAddr == "192.0.2.1:1234" {
-			r.RemoteAddr = "127.0.0.1:1234"
-		}
-		if r.Header.Get("Origin") == "" {
-			switch r.Method {
-			case http.MethodPost, http.MethodPut,
-				http.MethodPatch, http.MethodDelete:
-				r.Header.Set("Origin", defaultOrigin)
-			}
-		}
-		baseHandler.ServeHTTP(w, r)
-	})
-
 	return &testEnv{
 		srv:         srv,
-		handler:     wrappedHandler,
+		handler:     wrapTestHandler(cfg, srv.Handler()),
 		db:          database,
 		engine:      nil,
 		broadcaster: nil,
+		dataDir:     dir,
+	}
+}
+
+func setupNoSyncMode(t *testing.T) *testEnv {
+	t.Helper()
+	dir := tempDirWithRetryCleanup(t)
+	dbPath := filepath.Join(dir, "test.db")
+
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("opening db: %v", err)
+	}
+	t.Cleanup(func() { database.Close() })
+
+	cfg := config.Config{
+		Host:         "127.0.0.1",
+		Port:         0,
+		DataDir:      dir,
+		DBPath:       dbPath,
+		WriteTimeout: 30 * time.Second,
+	}
+	broadcaster := server.NewBroadcaster(0)
+	srv := server.New(
+		cfg, database, nil,
+		server.WithBroadcaster(broadcaster),
+	)
+
+	return &testEnv{
+		srv:         srv,
+		handler:     wrapTestHandler(cfg, srv.Handler()),
+		db:          database,
+		engine:      nil,
+		broadcaster: broadcaster,
 		dataDir:     dir,
 	}
 }
@@ -419,6 +434,14 @@ func (te *testEnv) seedMessages(
 		sessionID, msgs,
 	); err != nil {
 		t.Fatalf("seeding messages: %v", err)
+	}
+}
+
+// requireFTS skips the test when the database lacks FTS5 support.
+func (te *testEnv) requireFTS(t *testing.T) {
+	t.Helper()
+	if !te.db.HasFTS() {
+		t.Skip("skipping search test: no FTS support")
 	}
 }
 
@@ -631,6 +654,49 @@ func TestOpenAPIEndpointDocumentsEnumsAndRequestBodies(t *testing.T) {
 	assert.Equal(t, []string{"auto", "custom", "clipboard"}, mode.Enum)
 }
 
+func TestOpenAPIEndpointDocumentsQualitySignalResponses(t *testing.T) {
+	te := setup(t)
+
+	w := te.get(t, "/api/openapi.json")
+
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	type openAPISchema struct {
+		Ref        string                   `json:"$ref"`
+		Type       any                      `json:"type"`
+		Items      *openAPISchema           `json:"items"`
+		Properties map[string]openAPISchema `json:"properties"`
+	}
+	var spec struct {
+		Components struct {
+			Schemas map[string]openAPISchema `json:"schemas"`
+		} `json:"components"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &spec))
+
+	for _, schemaName := range []string{"DbSession", "ServiceSessionDetail"} {
+		schema, ok := spec.Components.Schemas[schemaName]
+		require.True(t, ok, "schema %s missing", schemaName)
+		require.Contains(t, schema.Properties, "quality_signals",
+			"schema %s should expose runtime quality_signals", schemaName)
+		assert.Equal(t,
+			"#/components/schemas/DbQualitySignals",
+			schema.Properties["quality_signals"].Ref,
+			"schema %s quality_signals ref", schemaName)
+	}
+
+	response, ok := spec.Components.Schemas["DbSignalSessionsResponse"]
+	require.True(t, ok, "schema DbSignalSessionsResponse missing")
+	sessions, ok := response.Properties["sessions"]
+	require.True(t, ok, "DbSignalSessionsResponse.sessions missing")
+	assert.Equal(t, "array", sessions.Type,
+		"sessions should be a non-null array so the generated client keeps item type")
+	require.NotNil(t, sessions.Items, "sessions.items missing")
+	assert.Equal(t,
+		"#/components/schemas/DbSignalSessionExample",
+		sessions.Items.Ref,
+		"sessions item schema")
+}
+
 func TestOpenAPIEndpointDocumentsImportResponseContentTypes(t *testing.T) {
 	te := setup(t)
 
@@ -687,6 +753,56 @@ func (te *testEnv) del(
 	return w
 }
 
+// requestOpt customizes a request built by rawRequest/wrappedRequest.
+type requestOpt func(*http.Request)
+
+func withOrigin(origin string) requestOpt {
+	return func(r *http.Request) { r.Header.Set("Origin", origin) }
+}
+
+func withHost(host string) requestOpt {
+	return func(r *http.Request) { r.Host = host }
+}
+
+func withRemoteAddr(addr string) requestOpt {
+	return func(r *http.Request) { r.RemoteAddr = addr }
+}
+
+func withBearer(token string) requestOpt {
+	return func(r *http.Request) {
+		r.Header.Set("Authorization", "Bearer "+token)
+	}
+}
+
+// rawRequest serves a request through srv.Handler() directly, bypassing
+// the test wrapper that defaults Host/Origin/RemoteAddr. Use it for
+// host-check, CORS, and auth tests that must control those values.
+func (te *testEnv) rawRequest(
+	method, path string, opts ...requestOpt,
+) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, nil)
+	for _, opt := range opts {
+		opt(req)
+	}
+	w := httptest.NewRecorder()
+	te.srv.Handler().ServeHTTP(w, req)
+	return w
+}
+
+// wrappedRequest serves a request through the wrapped test handler,
+// which defaults Host/Origin/RemoteAddr to the test config.
+func (te *testEnv) wrappedRequest(
+	method, path string, opts ...requestOpt,
+) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, nil)
+	for _, opt := range opts {
+		opt(req)
+	}
+	w := httptest.NewRecorder()
+	te.handler.ServeHTTP(w, req)
+	return w
+}
+
 // uploadFile creates a multipart upload request.
 func (te *testEnv) upload(
 	t *testing.T, filename, content, query string,
@@ -737,6 +853,16 @@ func sidebarIndexRowsByID(
 		rows[s.ID] = s
 	}
 	return rows
+}
+
+func sidebarIndexRowIDs(
+	sessions []db.SidebarSessionIndexRow,
+) []string {
+	ids := make([]string, 0, len(sessions))
+	for _, s := range sessions {
+		ids = append(ids, s.ID)
+	}
+	return ids
 }
 
 func assertStatus(
@@ -900,7 +1026,8 @@ type projectListResponse struct {
 }
 
 type syncStatusResponse struct {
-	LastSync string `json:"last_sync"`
+	LastSync string         `json:"last_sync"`
+	Progress *sync.Progress `json:"progress"`
 }
 
 type githubConfigResponse struct {
@@ -919,9 +1046,12 @@ type machineListResponse struct {
 }
 
 type syncResultResponse struct {
-	TotalSessions int `json:"total_sessions"`
-	Synced        int `json:"synced"`
-	Skipped       int `json:"skipped"`
+	TotalSessions int      `json:"total_sessions"`
+	Synced        int      `json:"synced"`
+	Skipped       int      `json:"skipped"`
+	Failed        int      `json:"failed"`
+	Aborted       bool     `json:"aborted,omitempty"`
+	Warnings      []string `json:"warnings,omitempty"`
 }
 
 // --- Tests ---
@@ -1046,9 +1176,9 @@ func TestListSessions_ExcludeOneShotDefault(t *testing.T) {
 func TestSidebarIndexReturnsSkinnyRows(t *testing.T) {
 	te := setup(t)
 
-	displayName := "Important investigation"
+	sessionName := "Important investigation"
 	te.seedSession(t, "named", "my-app", 5, func(s *db.Session) {
-		s.DisplayName = &displayName
+		s.SessionName = &sessionName
 		s.UserMessageCount = 2
 	})
 	teammateFirstMessage := "<teammate-message from=\"codex\">review"
@@ -1067,8 +1197,8 @@ func TestSidebarIndexReturnsSkinnyRows(t *testing.T) {
 	resp := decode[db.SidebarSessionIndex](t, w)
 	rows := sidebarIndexRowsByID(resp.Sessions)
 
-	if got := rows["named"].DisplayName; got == nil || *got != displayName {
-		t.Fatalf("display_name = %v, want %q", got, displayName)
+	if got := rows["named"].DisplayName; got == nil || *got != sessionName {
+		t.Fatalf("display_name = %v, want %q", got, sessionName)
 	}
 	if !rows["teammate"].IsTeammate {
 		t.Fatal("teammate is_teammate = false, want true")
@@ -1084,6 +1214,135 @@ func TestSidebarIndexReturnsSkinnyRows(t *testing.T) {
 	if _, ok := rows["review"]; !ok {
 		t.Fatal("automated review row missing with include_automated=true")
 	}
+}
+
+func TestSidebarIndexPaginatesRootCompleteTrees(t *testing.T) {
+	te := setup(t)
+
+	rootNewEnd := "2024-01-04T00:00:00Z"
+	childNewEnd := "2024-01-08T00:00:00Z"
+	rootOldEnd := "2024-01-01T00:00:00Z"
+	childOldEnd := "2024-01-07T00:00:00Z"
+	te.seedSession(t, "root-new", "my-app", 5, func(s *db.Session) {
+		s.EndedAt = &rootNewEnd
+	})
+	te.seedSession(t, "child-new", "my-app", 3, func(s *db.Session) {
+		s.ParentSessionID = new("root-new")
+		s.RelationshipType = "subagent"
+		s.EndedAt = &childNewEnd
+	})
+	te.seedSession(t, "root-old", "my-app", 5, func(s *db.Session) {
+		s.EndedAt = &rootOldEnd
+	})
+	te.seedSession(t, "child-old", "my-app", 3, func(s *db.Session) {
+		s.ParentSessionID = new("root-old")
+		s.RelationshipType = "subagent"
+		s.EndedAt = &childOldEnd
+	})
+
+	type sidebarPage struct {
+		Sessions   []db.SidebarSessionIndexRow `json:"sessions"`
+		NextCursor string                      `json:"next_cursor,omitempty"`
+		Total      int                         `json:"total"`
+	}
+
+	w := te.get(t, "/api/v1/sessions/sidebar-index?limit=1")
+	assertStatus(t, w, http.StatusOK)
+	first := decode[sidebarPage](t, w)
+	firstIDs := sidebarIndexRowIDs(first.Sessions)
+	assert.Equal(t, 2, first.Total)
+	assert.NotEmpty(t, first.NextCursor)
+	assert.ElementsMatch(t, []string{"root-new", "child-new"}, firstIDs)
+	assert.NotContains(t, firstIDs, "root-old")
+	assert.NotContains(t, firstIDs, "child-old")
+
+	w = te.get(t,
+		"/api/v1/sessions/sidebar-index?limit=1&cursor="+
+			url.QueryEscape(first.NextCursor),
+	)
+	assertStatus(t, w, http.StatusOK)
+	second := decode[sidebarPage](t, w)
+	secondIDs := sidebarIndexRowIDs(second.Sessions)
+	assert.Equal(t, 2, second.Total)
+	assert.Empty(t, second.NextCursor)
+	assert.ElementsMatch(t, []string{"root-old", "child-old"}, secondIDs)
+}
+
+func TestSidebarIndexPaginationTreatsContinuationsAsDescendants(t *testing.T) {
+	te := setup(t)
+
+	rootEnd := "2024-01-01T00:00:00Z"
+	continuationEnd := "2024-01-10T00:00:00Z"
+	otherEnd := "2024-01-05T00:00:00Z"
+	te.seedSession(t, "root", "my-app", 5, func(s *db.Session) {
+		s.EndedAt = &rootEnd
+	})
+	te.seedSession(t, "continuation", "my-app", 3, func(s *db.Session) {
+		s.ParentSessionID = new("root")
+		s.RelationshipType = "continuation"
+		s.EndedAt = &continuationEnd
+	})
+	te.seedSession(t, "other", "my-app", 5, func(s *db.Session) {
+		s.EndedAt = &otherEnd
+	})
+
+	w := te.get(t, "/api/v1/sessions/sidebar-index?limit=1")
+	assertStatus(t, w, http.StatusOK)
+	first := decode[db.SidebarSessionIndex](t, w)
+	firstIDs := sidebarIndexRowIDs(first.Sessions)
+	assert.Equal(t, 2, first.Total)
+	assert.NotEmpty(t, first.NextCursor)
+	assert.ElementsMatch(t, []string{"root", "continuation"}, firstIDs)
+
+	w = te.get(t,
+		"/api/v1/sessions/sidebar-index?limit=1&cursor="+
+			url.QueryEscape(first.NextCursor),
+	)
+	assertStatus(t, w, http.StatusOK)
+	second := decode[db.SidebarSessionIndex](t, w)
+	secondIDs := sidebarIndexRowIDs(second.Sessions)
+	assert.Equal(t, 2, second.Total)
+	assert.Empty(t, second.NextCursor)
+	assert.Equal(t, []string{"other"}, secondIDs)
+	assert.NotContains(t, secondIDs, "continuation")
+}
+
+func TestSidebarIndexPaginatesByDescendantFreshness(t *testing.T) {
+	te := setup(t)
+
+	rootEnd := "2024-01-01T00:00:00Z"
+	childEnd := "2024-01-10T00:00:00Z"
+	otherEnd := "2024-01-05T00:00:00Z"
+	te.seedSession(t, "root", "my-app", 5, func(s *db.Session) {
+		s.EndedAt = &rootEnd
+	})
+	te.seedSession(t, "child", "my-app", 3, func(s *db.Session) {
+		s.ParentSessionID = new("root")
+		s.RelationshipType = "subagent"
+		s.EndedAt = &childEnd
+	})
+	te.seedSession(t, "other", "my-app", 5, func(s *db.Session) {
+		s.EndedAt = &otherEnd
+	})
+
+	w := te.get(t, "/api/v1/sessions/sidebar-index?limit=1")
+	assertStatus(t, w, http.StatusOK)
+	first := decode[db.SidebarSessionIndex](t, w)
+	firstIDs := sidebarIndexRowIDs(first.Sessions)
+	assert.Equal(t, 2, first.Total)
+	assert.NotEmpty(t, first.NextCursor)
+	assert.ElementsMatch(t, []string{"root", "child"}, firstIDs)
+
+	w = te.get(t,
+		"/api/v1/sessions/sidebar-index?limit=1&cursor="+
+			url.QueryEscape(first.NextCursor),
+	)
+	assertStatus(t, w, http.StatusOK)
+	second := decode[db.SidebarSessionIndex](t, w)
+	secondIDs := sidebarIndexRowIDs(second.Sessions)
+	assert.Equal(t, 2, second.Total)
+	assert.Empty(t, second.NextCursor)
+	assert.Equal(t, []string{"other"}, secondIDs)
 }
 
 func TestSidebarIndexValidatesParams(t *testing.T) {
@@ -1383,9 +1642,7 @@ func TestSearch_InvalidParams(t *testing.T) {
 
 func TestSearch_WithResults(t *testing.T) {
 	te := setup(t)
-	if !te.db.HasFTS() {
-		t.Skip("skipping search test: no FTS support")
-	}
+	te.requireFTS(t)
 	te.seedSession(t, "s1", "my-app", 3)
 	te.seedMessages(t, "s1", 3, func(i int, m *db.Message) {
 		switch i {
@@ -1418,9 +1675,7 @@ func TestSearch_WithResults(t *testing.T) {
 
 func TestSearch_Limits(t *testing.T) {
 	te := setup(t)
-	if !te.db.HasFTS() {
-		t.Skip("skipping search test: no FTS support")
-	}
+	te.requireFTS(t)
 	// Seed 600 distinct sessions, each with one matching message.
 	// Under session-grouped search, each session produces exactly one result,
 	// so limit/pagination operates at the session level.
@@ -1467,9 +1722,7 @@ func TestSearch_Limits(t *testing.T) {
 
 func TestSearch_CanceledContext(t *testing.T) {
 	te := setup(t)
-	if !te.db.HasFTS() {
-		t.Skip("skipping search test: no FTS support")
-	}
+	te.requireFTS(t)
 	te.seedSession(t, "s1", "my-app", 1)
 	te.seedMessages(t, "s1", 1, func(i int, m *db.Message) {
 		m.Content = "searchable content"
@@ -1491,9 +1744,7 @@ func TestSearch_CanceledContext(t *testing.T) {
 
 func TestSearch_DeadlineExceeded(t *testing.T) {
 	te := setup(t)
-	if !te.db.HasFTS() {
-		t.Skip("skipping search test: no FTS support")
-	}
+	te.requireFTS(t)
 	te.seedSession(t, "s1", "my-app", 1)
 	te.seedMessages(t, "s1", 1, func(i int, m *db.Message) {
 		m.Content = "searchable content"
@@ -1510,9 +1761,7 @@ func TestSearch_DeadlineExceeded(t *testing.T) {
 
 func TestSearch_ZeroResults(t *testing.T) {
 	te := setup(t)
-	if !te.db.HasFTS() {
-		t.Skip("skipping search test: no FTS support")
-	}
+	te.requireFTS(t)
 	te.seedSession(t, "s1", "my-app", 1)
 	te.seedMessages(t, "s1", 1)
 
@@ -1534,9 +1783,7 @@ func TestSearch_ZeroResults(t *testing.T) {
 // for the same session_id.
 func TestSearch_Deduplication(t *testing.T) {
 	te := setup(t)
-	if !te.db.HasFTS() {
-		t.Skip("skipping search test: no FTS support")
-	}
+	te.requireFTS(t)
 
 	// Session s1: many messages all containing the search term.
 	te.seedSession(t, "s1", "proj-a", 1)
@@ -1712,14 +1959,56 @@ func TestSyncStatus(t *testing.T) {
 	}
 }
 
+func TestSyncStatusIncludesCurrentProgress(t *testing.T) {
+	te := setup(t)
+
+	te.writeSessionFile(t, "status-proj", "status.jsonl",
+		testjsonl.NewSessionBuilder().
+			AddClaudeUser(tsZero, "status progress"),
+	)
+
+	progressSeen := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		te.engine.SyncAll(context.Background(), func(p sync.Progress) {
+			if p.SessionsTotal == 0 {
+				return
+			}
+			select {
+			case <-progressSeen:
+			default:
+				close(progressSeen)
+				<-release
+			}
+		})
+	}()
+
+	select {
+	case <-progressSeen:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for sync progress")
+	}
+
+	w := te.get(t, "/api/v1/sync/status")
+	assertStatus(t, w, http.StatusOK)
+
+	close(release)
+	<-done
+
+	resp := decode[syncStatusResponse](t, w)
+	require.NotNil(t, resp.Progress, "expected current progress")
+	assert.Equal(t, sync.PhaseSyncing, resp.Progress.Phase)
+	assert.Equal(t, 1, resp.Progress.SessionsTotal)
+}
+
 func TestCORSHeaders(t *testing.T) {
 	te := setup(t)
 
 	// Request with matching origin should get CORS header.
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
-	req.Header.Set("Origin", "http://127.0.0.1:0")
-	w := httptest.NewRecorder()
-	te.handler.ServeHTTP(w, req)
+	w := te.wrappedRequest(http.MethodGet, "/api/v1/stats",
+		withOrigin("http://127.0.0.1:0"))
 	assertStatus(t, w, http.StatusOK)
 
 	cors := w.Header().Get("Access-Control-Allow-Origin")
@@ -1732,10 +2021,8 @@ func TestCORSRejectsUnknownOrigin(t *testing.T) {
 	te := setup(t)
 
 	// GET from a foreign origin: allowed (read-only) but no CORS header.
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
-	req.Header.Set("Origin", "http://evil-site.com")
-	w := httptest.NewRecorder()
-	te.handler.ServeHTTP(w, req)
+	w := te.wrappedRequest(http.MethodGet, "/api/v1/stats",
+		withOrigin("http://evil-site.com"))
 	assertStatus(t, w, http.StatusOK)
 
 	cors := w.Header().Get("Access-Control-Allow-Origin")
@@ -1748,12 +2035,8 @@ func TestCORSBlocksMutatingFromUnknownOrigin(t *testing.T) {
 	te := setup(t)
 
 	// POST from a foreign origin should be blocked (CSRF protection).
-	req := httptest.NewRequest(
-		http.MethodPost, "/api/v1/sync", nil,
-	)
-	req.Header.Set("Origin", "http://evil-site.com")
-	w := httptest.NewRecorder()
-	te.handler.ServeHTTP(w, req)
+	w := te.wrappedRequest(http.MethodPost, "/api/v1/sync",
+		withOrigin("http://evil-site.com"))
 	assertStatus(t, w, http.StatusForbidden)
 }
 
@@ -1761,28 +2044,38 @@ func TestCORSAllowsMutatingFromKnownOrigin(t *testing.T) {
 	te := setup(t)
 
 	// POST from the legitimate origin should succeed.
-	req := httptest.NewRequest(
-		http.MethodPost, "/api/v1/sync", nil,
-	)
-	req.Header.Set("Origin", "http://127.0.0.1:0")
-	w := httptest.NewRecorder()
-	te.handler.ServeHTTP(w, req)
+	w := te.wrappedRequest(http.MethodPost, "/api/v1/sync",
+		withOrigin("http://127.0.0.1:0"))
 	// Sync returns 200 or 202, not 403.
 	if w.Code == http.StatusForbidden {
 		t.Fatal("legitimate origin should not be blocked")
 	}
 }
 
+func TestSyncEndpointLocalNoSyncDaemonUsesOnDemandEngine(t *testing.T) {
+	te := setupPGMode(t)
+
+	w := te.post(t, "/api/v1/sync", "{}")
+
+	assert.NotEqual(t, http.StatusNotImplemented, w.Code)
+	assertStatus(t, w, http.StatusOK)
+}
+
+func TestPGPushLocalNoSyncDaemonReachesConfigValidation(t *testing.T) {
+	te := setupPGMode(t)
+
+	w := te.post(t, "/api/v1/push/pg", `{"full":false}`)
+
+	assertStatus(t, w, http.StatusBadRequest)
+	assert.Contains(t, w.Body.String(), "pg push: url not configured")
+}
+
 func TestCORSPreflightRejectsBadOrigin(t *testing.T) {
 	te := setup(t)
 
 	// OPTIONS preflight from foreign origin should return 403.
-	req := httptest.NewRequest(
-		http.MethodOptions, "/api/v1/sessions", nil,
-	)
-	req.Header.Set("Origin", "http://evil-site.com")
-	w := httptest.NewRecorder()
-	te.handler.ServeHTTP(w, req)
+	w := te.wrappedRequest(http.MethodOptions, "/api/v1/sessions",
+		withOrigin("http://evil-site.com"))
 	assertStatus(t, w, http.StatusForbidden)
 }
 
@@ -1790,14 +2083,10 @@ func TestCORSBlocksMutatingWithNoOrigin(t *testing.T) {
 	te := setup(t)
 
 	// POST with no Origin header should be blocked (prevents
-	// CSRF where browser omits Origin). Use srv.Handler()
-	// directly to bypass the test wrapper that auto-sets Origin.
-	req := httptest.NewRequest(
-		http.MethodPost, "/api/v1/sync", nil,
-	)
-	req.Host = "127.0.0.1:0"
-	w := httptest.NewRecorder()
-	te.srv.Handler().ServeHTTP(w, req)
+	// CSRF where browser omits Origin). Use rawRequest to
+	// bypass the test wrapper that auto-sets Origin.
+	w := te.rawRequest(http.MethodPost, "/api/v1/sync",
+		withHost("127.0.0.1:0"))
 	assertStatus(t, w, http.StatusForbidden)
 }
 
@@ -1806,10 +2095,8 @@ func TestHostHeaderRejectsDNSRebinding(t *testing.T) {
 
 	// A DNS rebinding attack uses a custom domain that resolves
 	// to 127.0.0.1. The Host header carries the attacker's domain.
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
-	req.Host = "evil.attacker.com:8080"
-	w := httptest.NewRecorder()
-	te.srv.Handler().ServeHTTP(w, req)
+	w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+		withHost("evil.attacker.com:8080"))
 	assertStatus(t, w, http.StatusForbidden)
 }
 
@@ -1817,10 +2104,8 @@ func TestHostHeaderRejectionBodyIsDescriptive(t *testing.T) {
 	te := setup(t)
 
 	// A forwarded port produces a Host the server does not trust.
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
-	req.Host = "127.0.0.1:18080"
-	w := httptest.NewRecorder()
-	te.srv.Handler().ServeHTTP(w, req)
+	w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+		withHost("127.0.0.1:18080"))
 
 	assertStatus(t, w, http.StatusForbidden)
 	body := w.Body.String()
@@ -1838,13 +2123,8 @@ func TestHostHeaderAllowsLegitimate(t *testing.T) {
 		"127.0.0.1:0",
 		"localhost:0",
 	} {
-		req := httptest.NewRequest(
-			http.MethodGet, "/api/v1/stats", nil,
-		)
-		req.Host = host
-		req.RemoteAddr = "127.0.0.1:1234"
-		w := httptest.NewRecorder()
-		te.srv.Handler().ServeHTTP(w, req)
+		w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+			withHost(host), withRemoteAddr("127.0.0.1:1234"))
 		if w.Code == http.StatusForbidden {
 			t.Errorf("host %s should be allowed, got 403", host)
 		}
@@ -1854,25 +2134,21 @@ func TestHostHeaderAllowsLegitimate(t *testing.T) {
 func TestHostHeaderAllowsConfiguredPublicOriginHost(t *testing.T) {
 	te := setup(t, withPublicURL("http://viewer.example.test:8004"))
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
-	req.Host = "viewer.example.test:8004"
 	// In the managed Caddy flow, the backend only accepts loopback
 	// connections. Set RemoteAddr to loopback so authMiddleware
 	// passes the request through to the host-check layer.
-	req.RemoteAddr = "127.0.0.1:1234"
-	w := httptest.NewRecorder()
-	te.srv.Handler().ServeHTTP(w, req)
+	w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+		withHost("viewer.example.test:8004"),
+		withRemoteAddr("127.0.0.1:1234"))
 	assertStatus(t, w, http.StatusOK)
 }
 
 func TestHostHeaderPublicOriginsExpandTrustedHosts(t *testing.T) {
 	te := setup(t, withPublicOrigins("http://viewer.example.test:8004"))
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
-	req.Host = "viewer.example.test:8004"
-	req.RemoteAddr = "127.0.0.1:1234"
-	w := httptest.NewRecorder()
-	te.srv.Handler().ServeHTTP(w, req)
+	w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+		withHost("viewer.example.test:8004"),
+		withRemoteAddr("127.0.0.1:1234"))
 	// public_origins should expand the host allowlist so
 	// reverse proxies forwarding the origin's Host are allowed.
 	assertStatus(t, w, http.StatusOK)
@@ -1892,13 +2168,8 @@ func TestHostHeaderHTTPSPublicOriginExpandsTrustedHosts(
 		"viewer.example.test:443",
 	} {
 		t.Run(host, func(t *testing.T) {
-			req := httptest.NewRequest(
-				http.MethodGet, "/api/v1/stats", nil,
-			)
-			req.Host = host
-			req.RemoteAddr = "127.0.0.1:1234"
-			w := httptest.NewRecorder()
-			te.srv.Handler().ServeHTTP(w, req)
+			w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+				withHost(host), withRemoteAddr("127.0.0.1:1234"))
 			assertStatus(t, w, http.StatusOK)
 		})
 	}
@@ -1907,10 +2178,8 @@ func TestHostHeaderHTTPSPublicOriginExpandsTrustedHosts(
 func TestCORSAllowsConfiguredHTTPSPublicOrigin(t *testing.T) {
 	te := setup(t, withPublicOrigins("https://viewer.example.test"))
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/sync", nil)
-	req.Header.Set("Origin", "https://viewer.example.test")
-	w := httptest.NewRecorder()
-	te.handler.ServeHTTP(w, req)
+	w := te.wrappedRequest(http.MethodPost, "/api/v1/sync",
+		withOrigin("https://viewer.example.test"))
 	if w.Code == http.StatusForbidden {
 		t.Fatal("configured public origin should not be blocked")
 	}
@@ -1920,10 +2189,8 @@ func TestCORSAllowsLocalhost(t *testing.T) {
 	te := setup(t)
 
 	// localhost variant should also be allowed when bound to 127.0.0.1.
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
-	req.Header.Set("Origin", "http://localhost:0")
-	w := httptest.NewRecorder()
-	te.handler.ServeHTTP(w, req)
+	w := te.wrappedRequest(http.MethodGet, "/api/v1/stats",
+		withOrigin("http://localhost:0"))
 	assertStatus(t, w, http.StatusOK)
 
 	cors := w.Header().Get("Access-Control-Allow-Origin")
@@ -1948,13 +2215,8 @@ func TestHostHeaderBindAllPort80AllowsPortlessLoopback(t *testing.T) {
 				"[::1]:80",
 				"[::1]",
 			} {
-				req := httptest.NewRequest(
-					http.MethodGet, "/api/v1/stats", nil,
-				)
-				req.Host = host
-				req.RemoteAddr = "127.0.0.1:1234"
-				w := httptest.NewRecorder()
-				te.srv.Handler().ServeHTTP(w, req)
+				w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+					withHost(host), withRemoteAddr("127.0.0.1:1234"))
 				assertStatus(t, w, http.StatusOK)
 			}
 		})
@@ -1977,12 +2239,8 @@ func TestCORSBindAllPort80AllowsPortlessLoopbackOrigins(t *testing.T) {
 				"http://[::1]:80",
 				"http://[::1]",
 			} {
-				req := httptest.NewRequest(
-					http.MethodGet, "/api/v1/stats", nil,
-				)
-				req.Header.Set("Origin", origin)
-				w := httptest.NewRecorder()
-				te.handler.ServeHTTP(w, req)
+				w := te.wrappedRequest(http.MethodGet, "/api/v1/stats",
+					withOrigin(origin))
 				assertStatus(t, w, http.StatusOK)
 
 				cors := w.Header().Get("Access-Control-Allow-Origin")
@@ -2008,10 +2266,8 @@ func TestCORSBindAllPort80AllowsPortlessLANOrigin(t *testing.T) {
 				c.Port = 80
 			})
 
-			req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
-			req.Header.Set("Origin", origin)
-			w := httptest.NewRecorder()
-			te.handler.ServeHTTP(w, req)
+			w := te.wrappedRequest(http.MethodGet, "/api/v1/stats",
+				withOrigin(origin))
 			assertStatus(t, w, http.StatusOK)
 
 			cors := w.Header().Get("Access-Control-Allow-Origin")
@@ -2036,12 +2292,9 @@ func TestHostHeaderBindAllPort80AllowsPortlessLANIP(t *testing.T) {
 				c.AuthToken = "test-token"
 			})
 
-			req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
-			req.Host = host
-			req.RemoteAddr = lanIP + ":1234"
-			req.Header.Set("Authorization", "Bearer test-token")
-			w := httptest.NewRecorder()
-			te.srv.Handler().ServeHTTP(w, req)
+			w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+				withHost(host), withRemoteAddr(lanIP+":1234"),
+				withBearer("test-token"))
 			assertStatus(t, w, http.StatusOK)
 		})
 	}
@@ -2057,12 +2310,8 @@ func TestCORSBindAllPort80RejectsNonLocalIPOrigin(t *testing.T) {
 				c.Port = 80
 			})
 
-			req := httptest.NewRequest(
-				http.MethodPost, "/api/v1/sync", nil,
-			)
-			req.Header.Set("Origin", origin)
-			w := httptest.NewRecorder()
-			te.handler.ServeHTTP(w, req)
+			w := te.wrappedRequest(http.MethodPost, "/api/v1/sync",
+				withOrigin(origin))
 			assertStatus(t, w, http.StatusForbidden)
 		})
 	}
@@ -2078,10 +2327,8 @@ func TestHostHeaderBindAllPort80RejectsNonLocalIP(t *testing.T) {
 				c.Port = 80
 			})
 
-			req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
-			req.Host = host
-			w := httptest.NewRecorder()
-			te.srv.Handler().ServeHTTP(w, req)
+			w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+				withHost(host))
 			assertStatus(t, w, http.StatusForbidden)
 		})
 	}
@@ -2101,10 +2348,8 @@ func TestCORSBindAllInterfaces(t *testing.T) {
 				"http://localhost:0",
 				"http://[::1]:0",
 			} {
-				req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
-				req.Header.Set("Origin", origin)
-				w := httptest.NewRecorder()
-				te.handler.ServeHTTP(w, req)
+				w := te.wrappedRequest(http.MethodGet, "/api/v1/stats",
+					withOrigin(origin))
 				assertStatus(t, w, http.StatusOK)
 
 				cors := w.Header().Get("Access-Control-Allow-Origin")
@@ -2126,10 +2371,8 @@ func TestCORSBindAllAllowsLANIPOrigin(t *testing.T) {
 				c.Host = bindHost
 			})
 
-			req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
-			req.Header.Set("Origin", origin)
-			w := httptest.NewRecorder()
-			te.handler.ServeHTTP(w, req)
+			w := te.wrappedRequest(http.MethodGet, "/api/v1/stats",
+				withOrigin(origin))
 			assertStatus(t, w, http.StatusOK)
 
 			cors := w.Header().Get("Access-Control-Allow-Origin")
@@ -2153,12 +2396,9 @@ func TestHostHeaderBindAllAllowsLANIP(t *testing.T) {
 				c.AuthToken = "test-token"
 			})
 
-			req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
-			req.Host = host
-			req.RemoteAddr = lanIP + ":1234"
-			req.Header.Set("Authorization", "Bearer test-token")
-			w := httptest.NewRecorder()
-			te.srv.Handler().ServeHTTP(w, req)
+			w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+				withHost(host), withRemoteAddr(lanIP+":1234"),
+				withBearer("test-token"))
 			assertStatus(t, w, http.StatusOK)
 		})
 	}
@@ -2173,12 +2413,8 @@ func TestCORSBindAllRejectsNonLocalIPOrigin(t *testing.T) {
 				c.Host = bindHost
 			})
 
-			req := httptest.NewRequest(
-				http.MethodPost, "/api/v1/sync", nil,
-			)
-			req.Header.Set("Origin", origin)
-			w := httptest.NewRecorder()
-			te.handler.ServeHTTP(w, req)
+			w := te.wrappedRequest(http.MethodPost, "/api/v1/sync",
+				withOrigin(origin))
 			assertStatus(t, w, http.StatusForbidden)
 		})
 	}
@@ -2193,10 +2429,8 @@ func TestHostHeaderBindAllRejectsNonLocalIP(t *testing.T) {
 				c.Host = bindHost
 			})
 
-			req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
-			req.Host = host
-			w := httptest.NewRecorder()
-			te.srv.Handler().ServeHTTP(w, req)
+			w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+				withHost(host))
 			assertStatus(t, w, http.StatusForbidden)
 		})
 	}
@@ -2209,12 +2443,8 @@ func TestCORSBindAllRejectsForeignOrigin(t *testing.T) {
 				c.Host = bindHost
 			})
 
-			req := httptest.NewRequest(
-				http.MethodPost, "/api/v1/sync", nil,
-			)
-			req.Header.Set("Origin", "http://evil-site.com")
-			w := httptest.NewRecorder()
-			te.handler.ServeHTTP(w, req)
+			w := te.wrappedRequest(http.MethodPost, "/api/v1/sync",
+				withOrigin("http://evil-site.com"))
 			assertStatus(t, w, http.StatusForbidden)
 		})
 	}
@@ -2227,10 +2457,8 @@ func TestHostHeaderBindAllRejectsDNSRebinding(t *testing.T) {
 				c.Host = bindHost
 			})
 
-			req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
-			req.Host = "evil.attacker.com:8080"
-			w := httptest.NewRecorder()
-			te.srv.Handler().ServeHTTP(w, req)
+			w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+				withHost("evil.attacker.com:8080"))
 			assertStatus(t, w, http.StatusForbidden)
 		})
 	}
@@ -2240,10 +2468,8 @@ func TestCORSVaryAlwaysSet(t *testing.T) {
 	te := setup(t)
 
 	// Vary: Origin should be set even for disallowed origins.
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
-	req.Header.Set("Origin", "http://evil-site.com")
-	w := httptest.NewRecorder()
-	te.handler.ServeHTTP(w, req)
+	w := te.wrappedRequest(http.MethodGet, "/api/v1/stats",
+		withOrigin("http://evil-site.com"))
 	assertStatus(t, w, http.StatusOK)
 
 	vary := w.Header().Get("Vary")
@@ -2255,22 +2481,16 @@ func TestCORSVaryAlwaysSet(t *testing.T) {
 func TestCORSPreflight(t *testing.T) {
 	te := setup(t)
 
-	req := httptest.NewRequest(
-		http.MethodOptions, "/api/v1/sessions", nil,
-	)
-	req.Header.Set("Origin", "http://127.0.0.1:0")
-	w := httptest.NewRecorder()
-	te.handler.ServeHTTP(w, req)
+	w := te.wrappedRequest(http.MethodOptions, "/api/v1/sessions",
+		withOrigin("http://127.0.0.1:0"))
 	assertStatus(t, w, http.StatusNoContent)
 }
 
 func TestCORSAllowMethods(t *testing.T) {
 	te := setup(t)
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
-	req.Header.Set("Origin", "http://127.0.0.1:0")
-	w := httptest.NewRecorder()
-	te.handler.ServeHTTP(w, req)
+	w := te.wrappedRequest(http.MethodGet, "/api/v1/stats",
+		withOrigin("http://127.0.0.1:0"))
 	assertStatus(t, w, http.StatusOK)
 
 	methods := w.Header().Get(
@@ -2297,14 +2517,10 @@ func TestAuthErrorIncludesCORSHeaders(t *testing.T) {
 	})
 
 	// Request with wrong token from a cross-origin remote client.
-	req := httptest.NewRequest(
-		http.MethodGet, "/api/v1/stats", nil,
-	)
-	req.Header.Set("Origin", "http://192.168.1.50:8080")
-	req.Header.Set("Authorization", "Bearer wrong-token")
-	req.RemoteAddr = "192.168.1.50:9999"
-	w := httptest.NewRecorder()
-	te.srv.Handler().ServeHTTP(w, req)
+	w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+		withOrigin("http://192.168.1.50:8080"),
+		withBearer("wrong-token"),
+		withRemoteAddr("192.168.1.50:9999"))
 	assertStatus(t, w, http.StatusUnauthorized)
 
 	cors := w.Header().Get("Access-Control-Allow-Origin")
@@ -2324,13 +2540,9 @@ func TestAuthErrorNoCORSWithoutOrigin(t *testing.T) {
 	})
 
 	// Request without Origin header should not get CORS headers.
-	req := httptest.NewRequest(
-		http.MethodGet, "/api/v1/stats", nil,
-	)
-	req.Header.Set("Authorization", "Bearer wrong-token")
-	req.RemoteAddr = "192.168.1.50:9999"
-	w := httptest.NewRecorder()
-	te.srv.Handler().ServeHTTP(w, req)
+	w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+		withBearer("wrong-token"),
+		withRemoteAddr("192.168.1.50:9999"))
 	assertStatus(t, w, http.StatusUnauthorized)
 
 	cors := w.Header().Get("Access-Control-Allow-Origin")
@@ -2349,16 +2561,12 @@ func TestNoAuthWhenRemoteDisabled(t *testing.T) {
 		// non-loopback requests pass through without a token.
 	})
 
-	req := httptest.NewRequest(
-		http.MethodGet, "/api/v1/stats", nil,
-	)
 	// Use localhost Host header to pass host-check; the point
 	// of this test is that auth middleware doesn't block when
 	// require_auth is off.
-	req.Host = "127.0.0.1:0"
-	req.RemoteAddr = "192.168.1.50:9999"
-	w := httptest.NewRecorder()
-	te.srv.Handler().ServeHTTP(w, req)
+	w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+		withHost("127.0.0.1:0"),
+		withRemoteAddr("192.168.1.50:9999"))
 
 	if w.Code == http.StatusForbidden ||
 		w.Code == http.StatusUnauthorized {
@@ -2376,12 +2584,8 @@ func TestAuthRequiredButNoToken(t *testing.T) {
 		// AuthToken intentionally left empty.
 	})
 
-	req := httptest.NewRequest(
-		http.MethodGet, "/api/v1/stats", nil,
-	)
-	req.Host = "127.0.0.1:0"
-	w := httptest.NewRecorder()
-	te.srv.Handler().ServeHTTP(w, req)
+	w := te.rawRequest(http.MethodGet, "/api/v1/stats",
+		withHost("127.0.0.1:0"))
 
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf(
@@ -2397,15 +2601,11 @@ func TestAuthRequiredProtectsPing(t *testing.T) {
 		c.AuthToken = "secret-token"
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/api/ping", nil)
-	w := httptest.NewRecorder()
-	te.srv.Handler().ServeHTTP(w, req)
+	w := te.rawRequest(http.MethodGet, "/api/ping")
 	assertStatus(t, w, http.StatusUnauthorized)
 
-	req = httptest.NewRequest(http.MethodGet, "/api/ping", nil)
-	req.Header.Set("Authorization", "Bearer secret-token")
-	w = httptest.NewRecorder()
-	te.srv.Handler().ServeHTTP(w, req)
+	w = te.rawRequest(http.MethodGet, "/api/ping",
+		withBearer("secret-token"))
 	assertStatus(t, w, http.StatusOK)
 }
 
@@ -3010,6 +3210,31 @@ func (f *flushRecorder) BodyString() string {
 	return f.Body.String()
 }
 
+func newFlushRecorder() *flushRecorder {
+	return &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+}
+
+// postSSE issues a POST to path through the wrapped handler and returns
+// the flushRecorder after the handler finishes writing the SSE stream.
+func (te *testEnv) postSSE(path string) *flushRecorder {
+	req := httptest.NewRequest(http.MethodPost, path, nil)
+	w := newFlushRecorder()
+	te.handler.ServeHTTP(w, req)
+	return w
+}
+
+// syncSSE triggers /api/v1/sync and returns the parsed "done" stats.
+func (te *testEnv) syncSSE(t *testing.T) syncResultResponse {
+	t.Helper()
+	return parseSSEDoneStats(t, te.postSSE("/api/v1/sync").BodyString())
+}
+
+// resyncSSE triggers /api/v1/resync and returns the parsed "done" stats.
+func (te *testEnv) resyncSSE(t *testing.T) syncResultResponse {
+	t.Helper()
+	return parseSSEDoneStats(t, te.postSSE("/api/v1/resync").BodyString())
+}
+
 func TestTriggerSync_SSE(t *testing.T) {
 	te := setup(t)
 
@@ -3018,9 +3243,7 @@ func TestTriggerSync_SSE(t *testing.T) {
 			AddClaudeUser(tsZero, "msg"),
 	)
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/sync", nil)
-	w := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-	te.handler.ServeHTTP(w, req)
+	w := te.postSSE("/api/v1/sync")
 
 	te.waitForSSEEvent(t, w, "done", 5*time.Second)
 	te.waitForSSEEvent(t, w, "progress", 5*time.Second)
@@ -3051,7 +3274,7 @@ func TestWatchSession_Events(t *testing.T) {
 	req := httptest.NewRequest(
 		http.MethodGet, "/api/v1/sessions/watch-sess/watch", nil,
 	).WithContext(ctx)
-	w := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	w := newFlushRecorder()
 
 	done := make(chan struct{})
 	go func() {
@@ -3104,7 +3327,7 @@ func TestWatchSession_FileDisappearAndResolve(t *testing.T) {
 	req := httptest.NewRequest(
 		http.MethodGet, "/api/v1/sessions/vanish-sess/watch", nil,
 	).WithContext(ctx)
-	w := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	w := newFlushRecorder()
 
 	done := make(chan struct{})
 	go func() {
@@ -3147,9 +3370,7 @@ func TestTriggerSync_SSEEvents(t *testing.T) {
 		)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/sync", nil)
-	w := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-	te.handler.ServeHTTP(w, req)
+	w := te.postSSE("/api/v1/sync")
 
 	events := parseSSE(w.BodyString())
 	hasDone := false
@@ -3179,41 +3400,46 @@ func TestResyncEndpoint(t *testing.T) {
 	)
 
 	// Initial sync — session gets processed normally.
-	syncReq := httptest.NewRequest(http.MethodPost, "/api/v1/sync", nil)
-	syncW := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-	te.handler.ServeHTTP(syncW, syncReq)
-
-	syncStats := parseSSEDoneStats(t, syncW.BodyString())
+	syncStats := te.syncSSE(t)
 	if syncStats.Synced != 1 {
 		t.Fatalf("initial sync: synced = %d, want 1",
 			syncStats.Synced)
 	}
 
 	// Second normal sync — file is unchanged so it's skipped.
-	sync2Req := httptest.NewRequest(http.MethodPost, "/api/v1/sync", nil)
-	sync2W := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-	te.handler.ServeHTTP(sync2W, sync2Req)
-
-	sync2Stats := parseSSEDoneStats(t, sync2W.BodyString())
+	sync2Stats := te.syncSSE(t)
 	if sync2Stats.Synced != 0 {
 		t.Fatalf("second sync: synced = %d, want 0 (skipped)",
 			sync2Stats.Synced)
 	}
 
 	// Resync — should re-process the same unchanged file.
-	resyncReq := httptest.NewRequest(
-		http.MethodPost, "/api/v1/resync", nil,
-	)
-	resyncW := &flushRecorder{
-		ResponseRecorder: httptest.NewRecorder(),
-	}
-	te.handler.ServeHTTP(resyncW, resyncReq)
-
-	resyncStats := parseSSEDoneStats(t, resyncW.BodyString())
+	resyncStats := te.resyncSSE(t)
 	if resyncStats.Synced != 1 {
 		t.Fatalf("resync: synced = %d, want 1 (reprocessed)",
 			resyncStats.Synced)
 	}
+}
+
+func TestResyncEndpointFallsBackToIncrementalWhenResyncAborts(t *testing.T) {
+	te := setup(t)
+
+	sessionPath := te.writeSessionFile(t, "resync-proj", "resync.jsonl",
+		testjsonl.NewSessionBuilder().
+			AddClaudeUser(tsZero, "msg resync"),
+	)
+
+	syncStats := te.syncSSE(t)
+	require.Equal(t, 1, syncStats.Synced, "initial sync")
+
+	require.NoError(t, os.Remove(sessionPath), "remove session file")
+	resyncStats := te.resyncSSE(t)
+	assert.False(t, resyncStats.Aborted,
+		"route should return the incremental fallback result")
+	assert.Empty(t, resyncStats.Warnings,
+		"aborted resync warnings should not be the final response")
+	assert.Equal(t, 0, resyncStats.Synced)
+	assert.Equal(t, 0, resyncStats.Failed)
 }
 
 // TestResyncPreservesDataThroughSwap verifies the full resync
@@ -3237,14 +3463,7 @@ func TestResyncPreservesDataThroughSwap(t *testing.T) {
 	)
 
 	// Initial sync.
-	syncReq := httptest.NewRequest(
-		http.MethodPost, "/api/v1/sync", nil,
-	)
-	syncW := &flushRecorder{
-		ResponseRecorder: httptest.NewRecorder(),
-	}
-	te.handler.ServeHTTP(syncW, syncReq)
-	syncStats := parseSSEDoneStats(t, syncW.BodyString())
+	syncStats := te.syncSSE(t)
 	if syncStats.Synced != 2 {
 		t.Fatalf(
 			"initial sync: synced = %d, want 2",
@@ -3266,14 +3485,7 @@ func TestResyncPreservesDataThroughSwap(t *testing.T) {
 	}
 
 	// Resync — rebuilds the database from scratch and swaps.
-	resyncReq := httptest.NewRequest(
-		http.MethodPost, "/api/v1/resync", nil,
-	)
-	resyncW := &flushRecorder{
-		ResponseRecorder: httptest.NewRecorder(),
-	}
-	te.handler.ServeHTTP(resyncW, resyncReq)
-	resyncStats := parseSSEDoneStats(t, resyncW.BodyString())
+	resyncStats := te.resyncSSE(t)
 	if resyncStats.Synced != 2 {
 		t.Fatalf(
 			"resync: synced = %d, want 2",
@@ -3338,13 +3550,7 @@ func TestResyncConcurrentReads(t *testing.T) {
 	)
 
 	// Initial sync.
-	syncReq := httptest.NewRequest(
-		http.MethodPost, "/api/v1/sync", nil,
-	)
-	syncW := &flushRecorder{
-		ResponseRecorder: httptest.NewRecorder(),
-	}
-	te.handler.ServeHTTP(syncW, syncReq)
+	te.postSSE("/api/v1/sync")
 
 	// Spin up concurrent readers with a barrier to ensure
 	// they are actively querying before resync starts.
@@ -3388,16 +3594,7 @@ func TestResyncConcurrentReads(t *testing.T) {
 	readersReady.Wait()
 
 	// Trigger resync while readers are active.
-	resyncReq := httptest.NewRequest(
-		http.MethodPost, "/api/v1/resync", nil,
-	)
-	resyncW := &flushRecorder{
-		ResponseRecorder: httptest.NewRecorder(),
-	}
-	te.handler.ServeHTTP(resyncW, resyncReq)
-
-	// Verify resync actually succeeded.
-	resyncStats := parseSSEDoneStats(t, resyncW.BodyString())
+	resyncStats := te.resyncSSE(t)
 	if resyncStats.Synced != 1 {
 		t.Errorf(
 			"resync: synced = %d, want 1",
@@ -3563,6 +3760,8 @@ func TestGetVersion(t *testing.T) {
 			resp.BuildDate,
 		)
 	}
+	assert.Equal(t, 1, resp.APIVersion)
+	assert.Equal(t, db.CurrentDataVersion(), resp.DataVersion)
 }
 
 func TestGetVersion_Default(t *testing.T) {
@@ -3575,6 +3774,8 @@ func TestGetVersion_Default(t *testing.T) {
 	if resp.Version != "" {
 		t.Errorf("version = %q, want empty", resp.Version)
 	}
+	assert.Equal(t, 1, resp.APIVersion)
+	assert.Equal(t, db.CurrentDataVersion(), resp.DataVersion)
 }
 
 func TestFindAvailablePortSkipsOccupied(t *testing.T) {
@@ -3632,7 +3833,7 @@ func TestEvents_StreamsDataChangedAfterSync(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil).WithContext(ctx)
-	w := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	w := newFlushRecorder()
 
 	done := make(chan struct{})
 	go func() {
@@ -3646,6 +3847,28 @@ func TestEvents_StreamsDataChangedAfterSync(t *testing.T) {
 	// Emit directly via the broadcaster to isolate the handler
 	// from sync engine timing.
 	te.broadcaster.Emit("messages")
+
+	te.waitForSSEEvent(t, w, "data_changed", 3*time.Second)
+	cancel()
+	<-done
+}
+
+func TestEvents_StreamsInLocalNoSyncMode(t *testing.T) {
+	te := setupNoSyncMode(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil).WithContext(ctx)
+	w := newFlushRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		te.handler.ServeHTTP(w, req)
+		close(done)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	te.broadcaster.Emit("sessions")
 
 	te.waitForSSEEvent(t, w, "data_changed", 3*time.Second)
 	cancel()
@@ -3682,7 +3905,7 @@ func TestEvents_AuthViaQueryTokenSucceeds(t *testing.T) {
 	defer cancel()
 	req := httptest.NewRequest(http.MethodGet,
 		"/api/v1/events?token=secret", nil).WithContext(ctx)
-	w := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	w := newFlushRecorder()
 
 	done := make(chan struct{})
 	go func() {
@@ -3706,7 +3929,7 @@ func TestEvents_AuthViaBearerHeaderSucceeds(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet,
 		"/api/v1/events", nil).WithContext(ctx)
 	req.Header.Set("Authorization", "Bearer secret")
-	w := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	w := newFlushRecorder()
 
 	done := make(chan struct{})
 	go func() {
@@ -3759,7 +3982,7 @@ func TestSessionWatch_AuthViaQueryTokenSucceeds(t *testing.T) {
 	defer cancel()
 	req := httptest.NewRequest(http.MethodGet,
 		"/api/v1/sessions/missing/watch?token=secret", nil).WithContext(ctx)
-	w := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	w := newFlushRecorder()
 
 	done := make(chan struct{})
 	go func() {

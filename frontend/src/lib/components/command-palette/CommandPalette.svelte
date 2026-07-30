@@ -1,10 +1,12 @@
 <script lang="ts">
+  import { m } from "../../i18n/index.js";
   import { SearchIcon } from "../../icons.js";
-  import { tick, onDestroy } from "svelte";
+  import { tick, onDestroy, untrack } from "svelte";
   import { ui } from "../../stores/ui.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { searchStore } from "../../stores/search.svelte.js";
   import { messages } from "../../stores/messages.svelte.js";
+  import { router } from "../../stores/router.svelte.js";
   import {
     formatRelativeTime,
     truncate,
@@ -18,10 +20,10 @@
 
   let inputRef: HTMLInputElement | undefined = $state(undefined);
   let selectedIndex: number = $state(0);
-  let inputValue: string = $state("");
+  let inputValue: string = $state(searchStore.query ?? "");
 
   // Clear state and reset sort whenever the palette is unmounted, regardless
-  // of close path (Escape key, overlay click, Cmd+K toggle, or any other
+  // of close path (Escape key, overlay click, command-palette toggle, or any other
   // mechanism). This ensures stale results and in-flight requests are always
   // cancelled even when the caller bypasses close().
   onDestroy(() => {
@@ -37,6 +39,7 @@
         .filter(
           (s) =>
             s.project.toLowerCase().includes(q) ||
+            (s.display_name?.toLowerCase().includes(q) ?? false) ||
             (s.first_message?.toLowerCase().includes(q) ?? false),
         )
         .slice(0, 10);
@@ -100,11 +103,12 @@
 
   function selectSession(s: Session) {
     sessions.selectSession(s.id);
+    router.navigateToSession(s.id);
     close();
   }
 
   function selectSearchResult(r: SearchResult) {
-    sessions.selectSession(r.session_id);
+    void sessions.navigateToSession(r.session_id);
     if (r.ordinal !== -1) {
       ui.scrollToOrdinal(r.ordinal, r.session_id);
     } else {
@@ -112,6 +116,7 @@
       // previously highlighted ordinal is not left active.
       ui.clearScrollState();
     }
+    router.navigateToSession(r.session_id);
     close();
   }
 
@@ -129,6 +134,9 @@
   $effect(() => {
     if (inputRef) {
       inputRef.focus();
+      if (untrack(() => inputValue)) {
+        inputRef.select();
+      }
     }
   });
 
@@ -156,11 +164,11 @@
         bind:this={inputRef}
         type="text"
         class="palette-input"
-        placeholder="Search sessions and messages..."
+        placeholder={m.command_palette_placeholder()}
         value={inputValue}
         oninput={handleInput}
       />
-      <kbd class="esc-hint">Esc</kbd>
+      <kbd class="esc-hint">⎋</kbd>
     </div>
 
     <div class="palette-results">
@@ -171,18 +179,18 @@
             class:active={searchStore.sort === "relevance"}
             onmousedown={(e: MouseEvent) => e.preventDefault()}
             onclick={() => { searchStore.setSort("relevance"); selectedIndex = 0; }}
-          >Relevance</button>
+          >{m.command_palette_relevance()}</button>
           <button
             class="sort-btn"
             class:active={searchStore.sort === "recency"}
             onmousedown={(e: MouseEvent) => e.preventDefault()}
             onclick={() => { searchStore.setSort("recency"); selectedIndex = 0; }}
-          >Recency</button>
+          >{m.command_palette_recency()}</button>
         </div>
         {#if searchStore.isSearching}
-          <div class="palette-empty">Searching...</div>
+          <div class="palette-empty">{m.command_palette_searching()}</div>
         {:else if searchStore.results.length === 0}
-          <div class="palette-empty">No results</div>
+          <div class="palette-empty">{m.command_palette_no_results()}</div>
         {:else}
           {#each searchStore.results as result, i}
             <button
@@ -212,7 +220,7 @@
               <!-- svelte-ignore a11y_no_static_element_interactions -->
               <span
                 class="item-id"
-                title="Copy session ID"
+                title={m.command_palette_copy_session_id()}
                 onclick={(e) => {
                   e.stopPropagation();
                   copyToClipboard(result.session_id);
@@ -222,9 +230,9 @@
           {/each}
         {/if}
       {:else}
-        <div class="palette-section-label">Recent Sessions</div>
+        <div class="palette-section-label">{m.command_palette_recent_sessions()}</div>
         {#each recentSessions as session, i}
-          {@const preview = normalizeMessagePreview(session.first_message)}
+          {@const preview = session.display_name ?? normalizeMessagePreview(session.first_message)}
           <button
             class="palette-item"
             class:selected={i === selectedIndex}

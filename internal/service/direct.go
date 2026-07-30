@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/secrets"
 	"go.kenn.io/agentsview/internal/sessionwatch"
 	"go.kenn.io/agentsview/internal/signals"
@@ -78,11 +79,28 @@ func buildSessionDetail(s *db.Session) *SessionDetail {
 			CompactionCount:        s.CompactionCount,
 			MidTaskCompactionCount: s.MidTaskCompactionCount,
 			PressureMax:            s.ContextPressureMax,
+			Heuristics:             persistedHeuristics(s),
 		})
 		detail.HealthScoreBasis = result.Basis
 		detail.HealthPenalties = result.Penalties
 	}
 	return detail
+}
+
+func persistedHeuristics(s *db.Session) signals.HeuristicSignals {
+	qs := s.StoredQualitySignals()
+	if qs == nil {
+		return signals.HeuristicSignals{}
+	}
+	return signals.HeuristicSignals{
+		ShortPromptCount:            qs.ShortPromptCount,
+		UnstructuredStart:           qs.UnstructuredStart,
+		MissingSuccessCriteriaCount: qs.MissingSuccessCriteriaCount,
+		MissingVerificationCount:    qs.MissingVerificationCount,
+		DuplicatePromptCount:        qs.DuplicatePromptCount,
+		NoCodeContextCount:          qs.NoCodeContextCount,
+		RunawayToolLoopCount:        qs.RunawayToolLoopCount,
+	}
 }
 
 func (b *directBackend) List(
@@ -103,6 +121,12 @@ func (b *directBackend) List(
 	if f.ActiveSince != "" && !timeutil.IsValidTimestamp(f.ActiveSince) {
 		return nil, fmt.Errorf(
 			"list: invalid active_since %q: use RFC3339", f.ActiveSince,
+		)
+	}
+	if _, err := db.ParseSortSpec(f.OrderBy); err != nil {
+		return nil, fmt.Errorf(
+			"list: invalid sort %q: %v (valid keys: %s)",
+			f.OrderBy, err, strings.Join(db.SortKeys(), ", "),
 		)
 	}
 	// Match the HTTP handler's clampLimit semantics: values over
@@ -150,8 +174,19 @@ func listFilterToDB(f ListFilter) db.SessionFilter {
 		Limit:                f.Limit,
 		MinToolFailures:      f.MinToolFailures,
 		HasSecret:            f.HasSecret,
+		Starred:              f.Starred,
 		SecretsRulesVersions: secrets.ActiveRulesVersions(),
 	}
+	// Parse the public sort spec into the structured, per-key form. The spec is
+	// validated in List before this runs, so a parse error here is treated
+	// defensively as the default sort. The legacy Descending param fills the
+	// direction of any term that carries no explicit :asc/:desc suffix; it is
+	// also carried through so an empty order_by + descending still flips the
+	// implicit default recent key.
+	if keys, err := db.ParseSortSpec(f.OrderBy); err == nil {
+		filter.Sort = db.ApplyFallbackDirection(keys, f.Descending)
+	}
+	filter.Descending = f.Descending
 	if f.Outcome != "" {
 		filter.Outcome = strings.Split(f.Outcome, ",")
 	}
@@ -262,12 +297,29 @@ func (b *directBackend) Sync(
 
 	path := in.Path
 	if path == "" {
-		path = b.local.GetSessionFilePath(in.ID)
-		if path == "" {
+		storedPath := b.local.GetSessionFilePath(in.ID)
+		if storedPath == "" {
 			return nil, fmt.Errorf(
 				"sync: no file_path recorded for session %q", in.ID,
 			)
 		}
+		// Visual Studio Copilot stores file_path as a
+		// <traceFile>#<conversationID> virtual key. Stripping it to the
+		// physical trace and syncing the path would reparse every conversation
+		// in that trace, lose the requested conversation's scope, and do
+		// nothing if the representative trace was deleted while the
+		// conversation lives on in a sibling. The single-session path keeps the
+		// conversation scope and follows it across sibling trace files.
+		if _, _, ok :=
+			parser.ParseVisualStudioCopilotVirtualPath(storedPath); ok {
+			if err := b.engine.SyncSingleSessionContext(
+				ctx, in.ID,
+			); err != nil {
+				return nil, err
+			}
+			return b.Get(ctx, in.ID)
+		}
+		path = parser.ResolveSourceFilePath(storedPath)
 	}
 
 	b.engine.SyncPaths([]string{path})
@@ -279,8 +331,57 @@ func (b *directBackend) Sync(
 			return nil, err
 		}
 		id = resolved
+		return b.Get(ctx, id)
 	}
-	return b.Get(ctx, id)
+
+	detail, err := b.Get(ctx, id)
+	if err != nil || detail != nil {
+		return detail, err
+	}
+	// The requested session is gone after sync. Vibe is the only agent that
+	// reassigns a session's canonical ID for an unchanged source file: a
+	// fallback ID is promoted when meta.json appears, and a canonical ID is
+	// demoted to the directory-name fallback when meta.json is removed or
+	// becomes unparseable. For a Vibe ID, resolve the file's current session
+	// and confirm it is the replacement before returning it.
+	if !isVibeSessionID(id) {
+		return nil, syncSessionNotFoundError(id)
+	}
+	resolved, err := b.resolveSessionIDByPath(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	detail, err = b.Get(ctx, resolved)
+	if err != nil || detail == nil {
+		if err != nil {
+			return nil, err
+		}
+		return nil, syncSessionNotFoundError(id)
+	}
+	if !isVibeReplacement(id, detail) {
+		return nil, syncSessionNotFoundError(id)
+	}
+	return detail, nil
+}
+
+func syncSessionNotFoundError(id string) error {
+	return fmt.Errorf("sync: session %q was not found after sync", id)
+}
+
+func isVibeSessionID(id string) bool {
+	return strings.HasPrefix(id, "vibe:")
+}
+
+// isVibeReplacement reports whether detail is the Vibe session that now owns
+// the requested session's source file after a canonical-ID reassignment. The
+// caller resolves detail strictly by the requested session's file_path, so a
+// different-ID Vibe session is the replacement regardless of direction
+// (fallback->canonical when meta.json appears, canonical->fallback when it is
+// removed or unparseable).
+func isVibeReplacement(requestedID string, detail *SessionDetail) bool {
+	return detail != nil &&
+		detail.Agent == "vibe" &&
+		requestedID != detail.ID
 }
 
 // resolveSessionIDByPath returns the single session id whose
@@ -292,10 +393,22 @@ func (b *directBackend) Sync(
 func (b *directBackend) resolveSessionIDByPath(
 	ctx context.Context, path string,
 ) (string, error) {
-	const q = `SELECT id FROM sessions
+	q := `SELECT id FROM sessions
 		WHERE file_path = ?
 		ORDER BY created_at DESC`
-	rows, err := b.local.Reader().QueryContext(ctx, q, path)
+	queryArgs := []any{path}
+	// Visual Studio Copilot stores file_path as a virtual sync key
+	// <traceFile>#<conversationID>, so an exact match on the physical
+	// trace path never resolves. Also match every conversation synced
+	// from that trace; multiple matches fall through to the ambiguity
+	// error below, exactly like a multi-session JSONL file.
+	if parser.IsVisualStudioCopilotTraceFile(path) {
+		q = `SELECT id FROM sessions
+			WHERE file_path = ? OR file_path LIKE ? ESCAPE '\'
+			ORDER BY created_at DESC`
+		queryArgs = append(queryArgs, db.EscapeLikePattern(path)+"#%")
+	}
+	rows, err := b.local.Reader().QueryContext(ctx, q, queryArgs...)
 	if err != nil {
 		return "", fmt.Errorf(
 			"sync: resolving session for path %q: %w", path, err,

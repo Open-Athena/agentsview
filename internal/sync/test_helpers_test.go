@@ -178,9 +178,24 @@ type kiroSQLiteTestDB struct {
 // tables). Returns a handle for inserting test data.
 func createOpenCodeDB(t *testing.T, dir string) *openCodeTestDB {
 	t.Helper()
-	path := filepath.Join(dir, "opencode.db")
+	return createOpenCodeLikeDB(
+		t, filepath.Join(dir, "opencode.db"), "opencode",
+	)
+}
+
+func createKiloDB(t *testing.T, dir string) *openCodeTestDB {
+	t.Helper()
+	return createOpenCodeLikeDB(
+		t, filepath.Join(dir, "kilo.db"), "kilo",
+	)
+}
+
+func createOpenCodeLikeDB(
+	t *testing.T, path, label string,
+) *openCodeTestDB {
+	t.Helper()
 	d, err := sql.Open("sqlite3", path)
-	require.NoError(t, err, "opening opencode test db")
+	require.NoError(t, err, "opening %s test db", label)
 	t.Cleanup(func() { d.Close() })
 
 	schema := `
@@ -211,7 +226,7 @@ func createOpenCodeDB(t *testing.T, dir string) *openCodeTestDB {
 		);
 	`
 	_, err = d.Exec(schema)
-	require.NoError(t, err, "creating opencode schema")
+	require.NoError(t, err, "creating %s schema", label)
 	return &openCodeTestDB{path: path, db: d}
 }
 
@@ -454,14 +469,25 @@ func (oc *openCodeTestDB) replaceTextContent(
 }
 
 type openCodeStorageFixture struct {
-	root string
+	root          string
+	sessionSubdir string
 }
 
 func createOpenCodeStorageFixture(
 	t *testing.T, root string,
 ) *openCodeStorageFixture {
 	t.Helper()
-	return &openCodeStorageFixture{root: root}
+	return &openCodeStorageFixture{root: root, sessionSubdir: "session"}
+}
+
+// createMiMoCodeStorageFixture builds a fixture for MiMoCode, which
+// stores session JSON under storage/session_diff instead of
+// storage/session while sharing the message/part layout.
+func createMiMoCodeStorageFixture(
+	t *testing.T, root string,
+) *openCodeStorageFixture {
+	t.Helper()
+	return &openCodeStorageFixture{root: root, sessionSubdir: "session_diff"}
 }
 
 func (oc *openCodeStorageFixture) writeJSON(
@@ -482,7 +508,7 @@ func (oc *openCodeStorageFixture) addSession(
 ) string {
 	t.Helper()
 	return oc.writeJSON(t, filepath.Join(
-		oc.root, "storage", "session", projectID,
+		oc.root, "storage", oc.sessionSubdir, projectID,
 		sessionID+".json",
 	), map[string]any{
 		"id":        sessionID,

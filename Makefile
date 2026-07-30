@@ -12,6 +12,7 @@ LDFLAGS_RELEASE := $(LDFLAGS) -s -w
 DESKTOP_DIST_DIR := dist/desktop
 GOLANGCI_LINT_VERSION ?= v2.11.4
 CUSTOM_GCL := ./custom-gcl
+PRICING_SNAPSHOT_FILE := internal/pricing/snapshot/litellm_snapshot.json.gz
 
 GOPATH_FIRST := $(shell go env GOPATH | cut -d: -f1)
 AIR_BIN := $(shell if command -v air >/dev/null 2>&1; then command -v air; \
@@ -19,7 +20,7 @@ AIR_BIN := $(shell if command -v air >/dev/null 2>&1; then command -v air; \
 	elif [ -x "$(GOPATH_FIRST)/bin/air" ]; then printf "%s" "$(GOPATH_FIRST)/bin/air"; \
 	fi)
 
-.PHONY: build build-release install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app test test-short test-postgres test-postgres-ci postgres-up postgres-down test-ssh test-ssh-ci ssh-up ssh-down e2e vet lint lint-ci lint-golangci lint-golangci-ci nilaway nilaway-golangci-build lint-tools tidy clean release release-darwin-arm64 release-darwin-amd64 release-linux-amd64 install-hooks ensure-embed-dir dev-snapshot help
+.PHONY: build build-release install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app docs-install docs-build docs-serve docs-check docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy test test-short bench-backends test-postgres test-postgres-ci postgres-up postgres-down test-ssh test-ssh-ci ssh-up ssh-down e2e e2e-duckdb vet lint lint-ci lint-golangci lint-golangci-ci nilaway nilaway-golangci-build lint-tools tidy clean release release-darwin-arm64 release-darwin-amd64 release-linux-amd64 install-hooks ensure-embed-dir pricing-snapshot dev-snapshot help
 
 # Ensure go:embed has at least one file (no-op if frontend is built)
 ensure-embed-dir:
@@ -29,13 +30,18 @@ ensure-embed-dir:
 			'keep embed dir for generated frontend assets' \
 			> internal/web/dist/.keep
 
-# Build the binary (debug, with embedded frontend)
-build: frontend
+# Restore the generated LiteLLM fallback snapshot from its artifact branch.
+# Pinned ref, SHA256, and branch are compiled into the snapshot tool.
+pricing-snapshot:
+	go run ./internal/pricing/cmd/litellm-snapshot -restore
+
+# Build the binary (debug, with embedded pricing snapshot and frontend)
+build: pricing-snapshot frontend
 	CGO_ENABLED=1 go build -tags fts5 -ldflags="$(LDFLAGS)" -o agentsview ./cmd/agentsview
 	@chmod +x agentsview
 
 # Build with optimizations (release)
-build-release: frontend
+build-release: pricing-snapshot frontend
 	CGO_ENABLED=1 go build -tags fts5 -ldflags="$(LDFLAGS_RELEASE)" -trimpath -o agentsview ./cmd/agentsview
 	@chmod +x agentsview
 
@@ -57,14 +63,14 @@ install: build-release
 
 # Build frontend SPA and copy into embed directory
 frontend:
-	cd frontend && npm install && npm run build
+	cd frontend && npm ci && npm run build
 	rm -rf internal/web/dist
 	cp -r frontend/dist internal/web/dist
 	printf '%s\n' \
 		'keep embed dir for generated frontend assets' \
 		> internal/web/dist/.keep
 
-# Run Vite dev server (use alongside `make dev`)
+# Run Vite+ dev server (use alongside `make dev`)
 frontend-dev:
 	cd frontend && npm run dev
 
@@ -137,22 +143,22 @@ air-install:
 
 # Run Go server in dev mode with live reload (use with frontend-dev).
 # Edits to .go files trigger a rebuild + restart via air.
-dev: ensure-embed-dir check-air
+dev: pricing-snapshot ensure-embed-dir check-air
 	"$(AIR_BIN)" -c .air.toml -- $(ARGS)
 
 # Run the Tauri desktop wrapper in development mode
 desktop-dev:
-	cd desktop && npm install && npm run tauri:dev
+	cd desktop && npm ci && npm run tauri:dev
 
 # Build desktop app bundles via Tauri
 desktop-build:
-	cd desktop && npm install && npm run tauri:build
+	cd desktop && npm ci && npm run tauri:build
 
 # Build only the macOS .app bundle (skip DMG packaging).
 # Skips updater artifact signing when TAURI_SIGNING_PRIVATE_KEY
 # is not set so local builds succeed without release keys.
 desktop-macos-app:
-	cd desktop && npm install && npm run tauri:build:macos-app \
+	cd desktop && npm ci && npm run tauri:build:macos-app \
 		$(if $(TAURI_SIGNING_PRIVATE_KEY),,-- --config '{"bundle":{"createUpdaterArtifacts":false}}')
 	mkdir -p $(DESKTOP_DIST_DIR)/macos
 	rm -rf $(DESKTOP_DIST_DIR)/macos/AgentsView.app
@@ -162,7 +168,7 @@ desktop-macos-app:
 
 # Build macOS DMG installer
 desktop-macos-dmg:
-	cd desktop && npm install && npm run tauri:build:macos-dmg
+	cd desktop && npm ci && npm run tauri:build:macos-dmg
 	mkdir -p $(DESKTOP_DIST_DIR)/macos
 	rm -f $(DESKTOP_DIST_DIR)/macos/*.dmg
 	@dmg_count=$$(find desktop/src-tauri/target/release/bundle/dmg \
@@ -179,7 +185,7 @@ desktop-macos-dmg:
 # Build Windows NSIS installer bundle (.exe)
 # Run on Windows runner/host.
 desktop-windows-installer:
-	cd desktop && npm install && npm run tauri:build:windows
+	cd desktop && npm ci && npm run tauri:build:windows
 	mkdir -p $(DESKTOP_DIST_DIR)/windows
 	rm -f $(DESKTOP_DIST_DIR)/windows/*.exe
 	@exe_count=$$(find desktop/src-tauri/target/release/bundle/nsis \
@@ -196,7 +202,7 @@ desktop-windows-installer:
 # Build Linux AppImage bundle
 # Run on a Linux host.
 desktop-linux-appimage:
-	cd desktop && npm install && npm run tauri:build:linux \
+	cd desktop && npm ci && npm run tauri:build:linux \
 		$(if $(TAURI_SIGNING_PRIVATE_KEY),,-- --config '{"bundle":{"createUpdaterArtifacts":false}}')
 	mkdir -p $(DESKTOP_DIST_DIR)/linux
 	rm -f $(DESKTOP_DIST_DIR)/linux/*.AppImage
@@ -215,12 +221,22 @@ desktop-linux-appimage:
 desktop-app: desktop-macos-app
 
 # Run tests
-test: ensure-embed-dir
-	go test -tags fts5 ./... -v -count=1
+test: pricing-snapshot ensure-embed-dir
+	go test -tags "fts5" ./... -v -count=1
 
 # Run fast tests only
-test-short: ensure-embed-dir
-	go test -tags fts5 ./... -short -count=1
+test-short: pricing-snapshot ensure-embed-dir
+	go test -tags "fts5" ./... -short -count=1
+
+# Compare db.Store read-query performance across SQLite, DuckDB, and PostgreSQL.
+# Requires Docker because the PostgreSQL backend is started with testcontainers.
+BENCH_BACKENDS_FLAGS ?= -bench . -run '^$$' -benchmem
+BENCH_BACKENDS_SESSIONS ?= 1000
+BENCH_BACKENDS_MESSAGES_PER_SESSION ?= 64
+bench-backends: pricing-snapshot ensure-embed-dir
+	AGENTSVIEW_BENCH_SESSIONS=$(BENCH_BACKENDS_SESSIONS) \
+		AGENTSVIEW_BENCH_MESSAGES_PER_SESSION=$(BENCH_BACKENDS_MESSAGES_PER_SESSION) \
+		CGO_ENABLED=1 go test -tags "fts5,benchdb" ./internal/backendbench $(BENCH_BACKENDS_FLAGS)
 
 # Start test PostgreSQL container
 postgres-up:
@@ -231,15 +247,15 @@ postgres-down:
 	docker compose -f docker-compose.test.yml down
 
 # Run PostgreSQL integration tests (starts postgres automatically)
-test-postgres: ensure-embed-dir postgres-up
+test-postgres: pricing-snapshot ensure-embed-dir postgres-up
 	@echo "Waiting for postgres to be ready..."
 	@sleep 2
 	TEST_PG_URL="postgres://agentsview_test:agentsview_test_password@localhost:5433/agentsview_test?sslmode=disable" \
-		CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/postgres/... -count=1
+		CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/postgres/... ./internal/activity/... -count=1
 
 # PostgreSQL integration tests for CI (postgres already running as service)
-test-postgres-ci: ensure-embed-dir
-	CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/postgres/... -count=1
+test-postgres-ci: pricing-snapshot ensure-embed-dir
+	CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/postgres/... ./internal/activity/... -count=1
 
 # Start test SSH container
 ssh-up:
@@ -252,13 +268,13 @@ ssh-down:
 	docker compose -f docker-compose.test.yml down sshd
 
 # Run SSH integration tests (starts sshd automatically)
-test-ssh: ensure-embed-dir ssh-up
+test-ssh: pricing-snapshot ensure-embed-dir ssh-up
 	TEST_SSH_HOST=localhost TEST_SSH_PORT=2222 TEST_SSH_USER=testuser \
 		TEST_SSH_KEY=$(CURDIR)/testdata/ssh/test_key \
 		CGO_ENABLED=1 go test -tags "fts5,sshtest" -v ./internal/ssh/... -count=1
 
 # SSH integration tests for CI (sshd already running)
-test-ssh-ci: ensure-embed-dir
+test-ssh-ci: pricing-snapshot ensure-embed-dir
 	CGO_ENABLED=1 go test -tags "fts5,sshtest" -v ./internal/ssh/... -count=1
 
 # Run Playwright E2E tests
@@ -269,15 +285,20 @@ e2e:
 e2e-snapshot:
 	cd frontend && npm run e2e:snapshot && npm run e2e:snapshot-public
 
+# Run focused Playwright smoke tests against duckdb serve.
+e2e-duckdb:
+	cd frontend && AGENTSVIEW_E2E_BACKEND=duckdb npx playwright test \
+		e2e/duckdb-backend.spec.ts e2e/session-list.spec.ts --project=chromium
+
 # Vet
-vet: ensure-embed-dir
+vet: pricing-snapshot ensure-embed-dir
 	go vet -tags fts5 ./...
 
 # Lint Go code and auto-fix where possible (local development)
 lint: lint-golangci nilaway
 
 # Run golangci-lint with auto-fixes for local development.
-lint-golangci: ensure-embed-dir
+lint-golangci: pricing-snapshot ensure-embed-dir
 	@if ! command -v golangci-lint >/dev/null 2>&1; then \
 		echo "golangci-lint not found. Install with: make lint-tools" >&2; \
 		exit 1; \
@@ -288,7 +309,7 @@ lint-golangci: ensure-embed-dir
 lint-ci: lint-golangci-ci nilaway
 
 # Run golangci-lint without auto-fixes for CI.
-lint-golangci-ci: ensure-embed-dir
+lint-golangci-ci: pricing-snapshot ensure-embed-dir
 	@if ! command -v golangci-lint >/dev/null 2>&1; then \
 		echo "golangci-lint not found. Install with: make lint-tools" >&2; \
 		exit 1; \
@@ -314,7 +335,7 @@ nilaway-golangci-build:
 		golangci-lint custom --version "$(GOLANGCI_LINT_VERSION)" --name custom-gcl
 
 # Run NilAway through the custom golangci-lint module plugin.
-nilaway: ensure-embed-dir nilaway-golangci-build
+nilaway: pricing-snapshot ensure-embed-dir nilaway-golangci-build
 	$(CUSTOM_GCL) run --config .golangci.nilaway.yml ./...
 
 # Install pinned local lint tools.
@@ -322,45 +343,73 @@ lint-tools:
 	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
 # Tidy dependencies
-tidy:
+tidy: pricing-snapshot
 	go mod tidy
 
 # Clean build artifacts
 clean:
 	rm -f agentsview agentsv
+	rm -f $(PRICING_SNAPSHOT_FILE)
 	rm -rf internal/web/dist dist/ tmp/
 	mkdir -p internal/web/dist
 	printf '%s\n' \
 		'keep embed dir for generated frontend assets' \
 		> internal/web/dist/.keep
 
+docs-install:
+	cd docs && uv sync --frozen --no-dev
+
+docs-build:
+	cd docs && uv run --frozen bash ./vercel-build.sh
+
+docs-serve:
+	cd docs && bash assets/hydrate-assets.sh && uv run bash ./zensical-docs.sh serve
+
+docs-check:
+	bash scripts/check-docs.sh
+
+docs-screenshots:
+	bash docs/screenshots/run.sh
+
+docs-assets-branch:
+	bash docs/assets/update-static-assets-branch.sh
+
+docs-generated-assets-branch:
+	bash docs/screenshots/update-generated-assets-branch.sh
+
+docs-deploy-staging:
+	vercel deploy docs
+
+docs-deploy:
+	vercel deploy docs --prod
+
 # Build release binary for current platform (CGO required for sqlite3)
-release: frontend
+release: pricing-snapshot frontend
 	mkdir -p dist
 	CGO_ENABLED=1 go build -tags fts5 \
 		-ldflags="$(LDFLAGS_RELEASE)" -trimpath \
 		-o dist/agentsview-$$(go env GOOS)-$$(go env GOARCH) ./cmd/agentsview
 
 # Cross-compile targets (require CC set to target cross-compiler)
-release-darwin-arm64: frontend
+release-darwin-arm64: pricing-snapshot frontend
 	mkdir -p dist
 	GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 go build -tags fts5 \
 		-ldflags="$(LDFLAGS_RELEASE)" -trimpath \
 		-o dist/agentsview-darwin-arm64 ./cmd/agentsview
 
-release-darwin-amd64: frontend
+release-darwin-amd64: pricing-snapshot frontend
 	mkdir -p dist
 	GOOS=darwin GOARCH=amd64 CGO_ENABLED=1 go build -tags fts5 \
 		-ldflags="$(LDFLAGS_RELEASE)" -trimpath \
 		-o dist/agentsview-darwin-amd64 ./cmd/agentsview
 
-release-linux-amd64: frontend
+release-linux-amd64: pricing-snapshot frontend
 	mkdir -p dist
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=1 go build -tags fts5 \
 		-ldflags="$(LDFLAGS_RELEASE)" -trimpath \
 		-o dist/agentsview-linux-amd64 ./cmd/agentsview
 
-# Install pre-commit hooks via prek
+# Install pre-commit and pre-push hooks via prek
 install-hooks:
 	@if ! command -v prek >/dev/null 2>&1; then \
 		echo "prek not found. Install with: brew install prek" >&2; \
@@ -374,13 +423,14 @@ help:
 	@echo ""
 	@echo "  build          - Build with embedded frontend"
 	@echo "  build-release  - Release build (optimized, stripped)"
+	@echo "  pricing-snapshot - Restore LiteLLM snapshot from artifact branch"
 	@echo "  install        - Build and install to ~/.local/bin or GOPATH"
 	@echo ""
 	@echo "  dev            - Run Go server with live reload via air (use with frontend-dev)"
 	@echo "  dev-snapshot   - Run agentsview against a fresh snapshot of prod sessions.db"
 	@echo "  air-install    - Install air for backend live reload"
 	@echo "  frontend       - Build frontend SPA"
-	@echo "  frontend-dev   - Run Vite dev server"
+	@echo "  frontend-dev   - Run Vite+ dev server"
 	@echo "  desktop-dev    - Run Tauri desktop wrapper in dev mode"
 	@echo "  desktop-build  - Build Tauri desktop app bundles"
 	@echo "  desktop-macos-app - Build macOS .app bundle only"
@@ -391,6 +441,7 @@ help:
 	@echo ""
 	@echo "  test           - Run all tests"
 	@echo "  test-short     - Run fast tests only"
+	@echo "  bench-backends - Benchmark SQLite, DuckDB, and PostgreSQL stores"
 	@echo "  test-postgres  - Run PostgreSQL integration tests"
 	@echo "  postgres-up    - Start test PostgreSQL container"
 	@echo "  postgres-down  - Stop test PostgreSQL container"
@@ -398,6 +449,7 @@ help:
 	@echo "  ssh-up         - Start test SSH container"
 	@echo "  ssh-down       - Stop test SSH container"
 	@echo "  e2e            - Run Playwright E2E tests"
+	@echo "  e2e-duckdb     - Run DuckDB-backed Playwright smoke tests"
 	@echo "  vet            - Run go vet"
 	@echo "  lint           - Run golangci-lint and NilAway (auto-fix golangci issues)"
 	@echo "  lint-ci        - Run golangci-lint and NilAway (no fix, for CI)"
@@ -408,4 +460,4 @@ help:
 	@echo ""
 	@echo "  release        - Release build for current platform"
 	@echo "  clean          - Remove build artifacts"
-	@echo "  install-hooks  - Install pre-commit git hooks"
+	@echo "  install-hooks  - Install pre-commit and pre-push git hooks"

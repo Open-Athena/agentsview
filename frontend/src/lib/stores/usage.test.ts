@@ -5,7 +5,11 @@ import {
   expect,
   it,
   vi,
-} from "vitest";
+} from "vite-plus/test";
+import type {
+  UsageComparison,
+  UsageSummaryResponse,
+} from "../api/types/usage.js";
 
 const usageServiceMocks = vi.hoisted(() => ({
   getApiV1UsageSummary: vi.fn().mockResolvedValue({
@@ -36,17 +40,28 @@ const usageServiceMocks = vi.hoisted(() => ({
       savingsVsUncached: 0,
     },
   }),
+  getApiV1UsageComparison: vi.fn().mockResolvedValue({
+    priorFrom: "2023-12-01",
+    priorTo: "2023-12-31",
+    priorTotalCost: 1,
+    deltaPct: 0.5,
+  }),
   getApiV1UsageTopSessions: vi.fn().mockResolvedValue([]),
 }));
 
-vi.mock("../api/runtime.js", () => ({
+const apiRuntimeMocks = vi.hoisted(() => ({
   configureGeneratedClient: vi.fn(),
   callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
+  isAbortError: vi.fn(() => false),
 }));
+
+vi.mock("../api/runtime.js", () => apiRuntimeMocks);
 
 vi.mock("../api/generated/index", () => ({
   UsageService: {
     getApiV1UsageSummary: usageServiceMocks.getApiV1UsageSummary,
+    getApiV1UsageComparison:
+      usageServiceMocks.getApiV1UsageComparison,
     getApiV1UsageTopSessions: usageServiceMocks.getApiV1UsageTopSessions,
   },
 }));
@@ -79,6 +94,52 @@ async function loadStore() {
   vi.resetModules();
   return import("./usage.svelte.js");
 }
+
+function usageSummary(totalCost = 0): UsageSummaryResponse {
+  return {
+    from: "2024-01-01",
+    to: "2024-01-31",
+    totals: {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheCreationTokens: 0,
+      cacheReadTokens: 0,
+      totalCost,
+    },
+    daily: [],
+    projectTotals: [],
+    modelTotals: [],
+    agentTotals: [],
+    sessionCounts: {
+      total: 0,
+      byProject: {},
+      byAgent: {},
+    },
+    cacheStats: {
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      uncachedInputTokens: 0,
+      outputTokens: 0,
+      hitRate: 0,
+      savingsVsUncached: 0,
+    },
+  };
+}
+
+function usageComparison(): UsageComparison {
+  return {
+    priorFrom: "2023-12-01",
+    priorTo: "2023-12-31",
+    priorTotalCost: 1,
+    deltaPct: 0.5,
+  };
+}
+
+afterEach(() => {
+  apiRuntimeMocks.callGenerated.mockImplementation(
+    (request: () => Promise<unknown>) => request(),
+  );
+});
 
 describe("UsageStore filter persistence", () => {
   beforeEach(() => {
@@ -189,6 +250,7 @@ describe("UsageStore session filter params", () => {
     sessions.filters.project = "proj-a";
     sessions.filters.machine = "host-a,host-b";
     sessions.filters.agent = "claude,codex";
+    sessions.filters.termination = "abandoned";
     sessions.filters.minUserMessages = 5;
     sessions.filters.includeOneShot = false;
     sessions.filters.includeAutomated = true;
@@ -201,6 +263,7 @@ describe("UsageStore session filter params", () => {
         project: "proj-a",
         machine: "host-a,host-b",
         agent: "claude,codex",
+        termination: "abandoned",
         minUserMessages: 5,
         includeOneShot: false,
         includeAutomated: true,
@@ -214,11 +277,415 @@ describe("UsageStore session filter params", () => {
         project: "proj-a",
         machine: "host-a,host-b",
         agent: "claude,codex",
+        termination: "abandoned",
         minUserMessages: 5,
         includeOneShot: false,
         includeAutomated: true,
       }),
     );
+  });
+
+  it("records full refresh time and clears new-data hints", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-06-15T16:00:00Z"));
+      const { usage } = await loadStore();
+
+      await usage.fetchAll();
+
+      expect(usage.lastUpdatedAt).toBe(
+        new Date("2026-06-15T16:00:00Z").getTime(),
+      );
+
+      usage.markNewData();
+      expect(usage.hasNewData).toBe(true);
+
+      vi.setSystemTime(new Date("2026-06-15T16:03:00Z"));
+      await usage.fetchAll();
+
+      expect(usage.lastUpdatedAt).toBe(
+        new Date("2026-06-15T16:03:00Z").getTime(),
+      );
+      expect(usage.hasNewData).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not mark cached partial refresh failures as current", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      vi.setSystemTime(new Date("2026-06-15T16:00:00Z"));
+      const { usage } = await loadStore();
+
+      await usage.fetchAll();
+      const previousUpdatedAt = usage.lastUpdatedAt;
+
+      usage.markNewData();
+      usageServiceMocks.getApiV1UsageTopSessions
+        .mockRejectedValueOnce(new Error("top sessions failed"));
+
+      vi.setSystemTime(new Date("2026-06-15T16:05:00Z"));
+      await usage.fetchAll();
+
+      expect(usage.lastUpdatedAt).toBe(previousUpdatedAt);
+      expect(usage.hasNewData).toBe(true);
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("starts summary and top sessions together during full refresh", async () => {
+    const calls: string[] = [];
+    let resolveSummary:
+      | ((value: unknown) => void)
+      | undefined;
+    const summaryPromise = new Promise((resolve) => {
+      resolveSummary = resolve;
+    });
+    usageServiceMocks.getApiV1UsageSummary.mockImplementationOnce(
+      () => {
+        calls.push("summary");
+        return summaryPromise;
+      },
+    );
+    usageServiceMocks.getApiV1UsageTopSessions.mockImplementationOnce(
+      () => {
+        calls.push("topSessions");
+        return Promise.resolve([]);
+      },
+    );
+    usageServiceMocks.getApiV1UsageComparison.mockImplementationOnce(
+      () => {
+        calls.push("comparison");
+        return Promise.resolve({
+          priorFrom: "2023-12-01",
+          priorTo: "2023-12-31",
+          priorTotalCost: 1,
+          deltaPct: 0.5,
+        });
+      },
+    );
+
+    const { usage } = await loadStore();
+    const fetch = usage.fetchAll();
+    await Promise.resolve();
+
+    expect(calls).toEqual(["summary", "topSessions"]);
+    expect(usage.summary).toBeNull();
+
+    resolveSummary?.({
+      from: "2024-01-01",
+      to: "2024-01-31",
+      totals: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheCreationTokens: 0,
+        cacheReadTokens: 0,
+        totalCost: 0,
+      },
+      daily: [],
+      projectTotals: [],
+      modelTotals: [],
+      agentTotals: [],
+      sessionCounts: {
+        total: 0,
+        byProject: {},
+        byAgent: {},
+      },
+      cacheStats: {
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        uncachedInputTokens: 0,
+        outputTokens: 0,
+        hitRate: 0,
+        savingsVsUncached: 0,
+      },
+    });
+    await fetch;
+    await Promise.resolve();
+
+    expect(calls).toEqual(["summary", "topSessions", "comparison"]);
+    expect(usage.summary).not.toBeNull();
+    expect(usage.summary?.comparison).toEqual({
+      priorFrom: "2023-12-01",
+      priorTo: "2023-12-31",
+      priorTotalCost: 1,
+      deltaPct: 0.5,
+    });
+    expect(
+      usageServiceMocks.getApiV1UsageComparison,
+    ).toHaveBeenCalledWith(
+      expect.objectContaining({ currentCost: 0 }),
+    );
+  });
+
+  it("tracks cached usage refetches as querying without first-load skeletons", async () => {
+    const { usage } = await loadStore();
+
+    await usage.fetchAll();
+    expect(usage.summary).not.toBeNull();
+    expect(usage.loading.summary).toBe(false);
+    await vi.waitFor(() => expect(usage.isQuerying).toBe(false));
+
+    let resolveSummary:
+      | ((value: UsageSummaryResponse) => void)
+      | undefined;
+    usageServiceMocks.getApiV1UsageSummary.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveSummary = resolve;
+        }),
+    );
+
+    const refetch = usage.fetchAll();
+    await Promise.resolve();
+
+    expect(usage.loading.summary).toBe(false);
+    expect(usage.querying.summary).toBe(true);
+    expect(usage.isQuerying).toBe(true);
+
+    resolveSummary?.(usageSummary(2));
+    await refetch;
+
+    expect(usage.querying.summary).toBe(false);
+    await vi.waitFor(() => expect(usage.isQuerying).toBe(false));
+    expect(usage.summary?.totals.totalCost).toBe(2);
+  });
+
+  it("aborts stale top sessions when a new full refresh starts", async () => {
+    const signals: (AbortSignal | undefined)[] = [];
+    apiRuntimeMocks.callGenerated.mockImplementation(
+      (request: () => Promise<unknown>, signal?: AbortSignal) => {
+        signals.push(signal);
+        return request();
+      },
+    );
+    usageServiceMocks.getApiV1UsageTopSessions.mockImplementationOnce(
+      () => new Promise(() => {}),
+    );
+    usageServiceMocks.getApiV1UsageSummary.mockImplementationOnce(
+      () => new Promise(() => {}),
+    );
+
+    const { usage } = await loadStore();
+
+    void usage.fetchTopSessions();
+    await Promise.resolve();
+    expect(signals[0]?.aborted).toBe(false);
+
+    void usage.fetchAll();
+    await Promise.resolve();
+
+    expect(signals[0]?.aborted).toBe(true);
+  });
+
+  it("reuses summary params for top sessions during full refresh", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-04-25T12:00:00"));
+      let resolveSummary:
+        | ((value: UsageSummaryResponse) => void)
+        | undefined;
+      usageServiceMocks.getApiV1UsageSummary.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveSummary = resolve;
+          }),
+      );
+
+      const { usage } = await loadStore();
+      const { sessions } = await import("./sessions.svelte.js");
+      sessions.filters.recentlyActive = true;
+
+      const fetch = usage.fetchAll();
+      await Promise.resolve();
+      const summaryParams =
+        usageServiceMocks.getApiV1UsageSummary.mock.lastCall?.[0];
+
+      vi.setSystemTime(new Date("2026-04-26T12:00:00"));
+      resolveSummary?.(usageSummary());
+      await fetch;
+
+      const topSessionParams =
+        usageServiceMocks.getApiV1UsageTopSessions.mock.lastCall?.[0];
+      expect(topSessionParams?.activeSince).toBe(summaryParams?.activeSince);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not let stale comparison abort the current comparison", async () => {
+    const signals: (AbortSignal | undefined)[] = [];
+    apiRuntimeMocks.callGenerated.mockImplementation(
+      (request: () => Promise<unknown>, signal?: AbortSignal) => {
+        signals.push(signal);
+        return request();
+      },
+    );
+
+    const { usage } = await loadStore();
+    const loaded = await usage.fetchSummary({ loadComparison: false });
+    expect(loaded).not.toBeNull();
+    if (!loaded) return;
+    const loadedSummary = loaded;
+
+    let resolveComparison:
+      | ((value: UsageComparison) => void)
+      | undefined;
+    usageServiceMocks.getApiV1UsageComparison.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveComparison = resolve;
+        }),
+    );
+    const compare = usage as unknown as {
+      fetchComparison: (
+        summaryVersion: number,
+        summary: UsageSummaryResponse,
+        params: typeof loadedSummary.params,
+      ) => Promise<void>;
+    };
+
+    const currentComparison = compare.fetchComparison(
+      loadedSummary.version,
+      loadedSummary.summary,
+      loadedSummary.params,
+    );
+    await Promise.resolve();
+    const currentSignal = signals[1];
+    expect(currentSignal).toBeDefined();
+    expect(currentSignal?.aborted).toBe(false);
+
+    await compare.fetchComparison(
+      loadedSummary.version - 1,
+      loadedSummary.summary,
+      loadedSummary.params,
+    );
+
+    expect(currentSignal?.aborted).toBe(false);
+    expect(
+      usageServiceMocks.getApiV1UsageComparison,
+    ).toHaveBeenCalledTimes(1);
+
+    resolveComparison?.(usageComparison());
+    await currentComparison;
+  });
+
+  it("aborts active comparison when a newer summary starts", async () => {
+    const signals: (AbortSignal | undefined)[] = [];
+    apiRuntimeMocks.callGenerated.mockImplementation(
+      (request: () => Promise<unknown>, signal?: AbortSignal) => {
+        signals.push(signal);
+        return request();
+      },
+    );
+
+    const { usage } = await loadStore();
+    const loaded = await usage.fetchSummary({ loadComparison: false });
+    expect(loaded).not.toBeNull();
+    if (!loaded) return;
+    const loadedSummary = loaded;
+
+    usageServiceMocks.getApiV1UsageComparison.mockImplementationOnce(
+      () => new Promise(() => {}),
+    );
+    const compare = usage as unknown as {
+      fetchComparison: (
+        summaryVersion: number,
+        summary: UsageSummaryResponse,
+        params: typeof loadedSummary.params,
+      ) => Promise<void>;
+    };
+    void compare.fetchComparison(
+      loadedSummary.version,
+      loadedSummary.summary,
+      loadedSummary.params,
+    );
+    await Promise.resolve();
+    const comparisonSignal = signals[1];
+    expect(comparisonSignal).toBeDefined();
+    expect(comparisonSignal?.aborted).toBe(false);
+
+    usageServiceMocks.getApiV1UsageSummary.mockImplementationOnce(
+      () => new Promise(() => {}),
+    );
+    void usage.fetchSummary({ loadComparison: false });
+    await Promise.resolve();
+
+    expect(comparisonSignal?.aborted).toBe(true);
+  });
+
+  it("refreshes comparison when summary is refreshed directly", async () => {
+    const { usage } = await loadStore();
+
+    await usage.fetchSummary();
+    await Promise.resolve();
+
+    expect(
+      usageServiceMocks.getApiV1UsageComparison,
+    ).toHaveBeenCalledTimes(1);
+    expect(
+      usageServiceMocks.getApiV1UsageTopSessions,
+    ).not.toHaveBeenCalled();
+    expect(usage.summary?.comparison).toEqual({
+      priorFrom: "2023-12-01",
+      priorTo: "2023-12-31",
+      priorTotalCost: 1,
+      deltaPct: 0.5,
+    });
+  });
+
+  it("aborts stale summary requests when a newer fetch starts", async () => {
+    const signals: (AbortSignal | undefined)[] = [];
+    apiRuntimeMocks.callGenerated.mockImplementation(
+      (request: () => Promise<unknown>, signal?: AbortSignal) => {
+        signals.push(signal);
+        return request();
+      },
+    );
+    usageServiceMocks.getApiV1UsageSummary
+      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockResolvedValueOnce({
+        from: "2024-01-01",
+        to: "2024-01-31",
+        totals: {
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheCreationTokens: 0,
+          cacheReadTokens: 0,
+          totalCost: 0,
+        },
+        daily: [],
+        projectTotals: [],
+        modelTotals: [],
+        agentTotals: [],
+        sessionCounts: {
+          total: 0,
+          byProject: {},
+          byAgent: {},
+        },
+        cacheStats: {
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          uncachedInputTokens: 0,
+          outputTokens: 0,
+          hitRate: 0,
+          savingsVsUncached: 0,
+        },
+      });
+
+    const { usage } = await loadStore();
+
+    void usage.fetchSummary();
+    await Promise.resolve();
+    void usage.fetchSummary();
+    await Promise.resolve();
+
+    expect(signals[0]).toBeDefined();
+    expect(signals[0]?.aborted).toBe(true);
   });
 });
 
@@ -418,6 +885,51 @@ describe("mergeUsageAndSessionUrlParams", () => {
       exclude_project: "alpha,beta,unknown",
       model: "gpt-5.5",
       machine: "host-a",
+    });
+  });
+
+  it("omits hidden session date params from usage URLs", async () => {
+    const { mergeUsageAndSessionUrlParams } = await loadStore();
+
+    expect(
+      mergeUsageAndSessionUrlParams(
+        {
+          from: "2026-02-01",
+          to: "2026-02-07",
+        },
+        {
+          date: "2026-01-15",
+          date_from: "2026-01-01",
+          date_to: "2026-01-31",
+          project: "agentsview",
+        },
+      ),
+    ).toEqual({
+      from: "2026-02-01",
+      to: "2026-02-07",
+      project: "agentsview",
+    });
+  });
+
+  it("preserves supported termination params in usage URLs", async () => {
+    const { mergeUsageAndSessionUrlParams } = await loadStore();
+
+    expect(
+      mergeUsageAndSessionUrlParams(
+        {
+          from: "2026-02-01",
+          to: "2026-02-07",
+        },
+        {
+          termination: "unclean",
+          project: "agentsview",
+        },
+      ),
+    ).toEqual({
+      from: "2026-02-01",
+      to: "2026-02-07",
+      termination: "unclean",
+      project: "agentsview",
     });
   });
 });

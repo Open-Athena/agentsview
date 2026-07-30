@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/gofrs/flock"
 	"github.com/spf13/pflag"
 	"go.kenn.io/agentsview/internal/parser"
 )
@@ -65,6 +66,17 @@ type PGConfig struct {
 	ExcludeProjects []string `toml:"exclude_projects" json:"exclude_projects,omitempty"`
 }
 
+// DuckDBConfig holds DuckDB mirror and Quack connection settings.
+type DuckDBConfig struct {
+	Path            string   `toml:"path" json:"path"`
+	URL             string   `toml:"url" json:"url"`
+	Token           string   `toml:"token" json:"token,omitempty"`
+	MachineName     string   `toml:"machine_name" json:"machine_name"`
+	AllowInsecure   bool     `toml:"allow_insecure" json:"allow_insecure"`
+	Projects        []string `toml:"projects" json:"projects,omitempty"`
+	ExcludeProjects []string `toml:"exclude_projects" json:"exclude_projects,omitempty"`
+}
+
 // AutomatedConfig holds user-supplied additions to the
 // automated-session classifier. Parse-only; all semantic
 // normalization (trim, dedupe, length cap, built-in overlap
@@ -83,6 +95,15 @@ type CustomModelRate struct {
 	Output        float64 `json:"output" toml:"output"`
 	CacheCreation float64 `json:"cache_creation,omitempty" toml:"cache_creation"`
 	CacheRead     float64 `json:"cache_read,omitempty" toml:"cache_read"`
+}
+
+// RemoteHost describes one SSH target for config-driven
+// `agentsview sync` fan-out. Host is required; User and Port are
+// optional (Port 0 means the ssh default of 22).
+type RemoteHost struct {
+	Host string `toml:"host" json:"host"`
+	User string `toml:"user,omitempty" json:"user,omitempty"`
+	Port int    `toml:"port,omitempty" json:"port,omitempty"`
 }
 
 // Config holds all application configuration.
@@ -104,6 +125,7 @@ type Config struct {
 	DisableUpdateCheck   bool                   `json:"disable_update_check" toml:"disable_update_check"`
 	NoSync               bool                   `json:"-" toml:"-"`
 	PG                   PGConfig               `json:"pg,omitempty" toml:"pg"`
+	DuckDB               DuckDBConfig           `json:"duckdb,omitempty" toml:"duckdb"`
 	Automated            AutomatedConfig        `json:"automated,omitempty" toml:"automated"`
 	Agent                map[string]AgentConfig `json:"agent,omitempty" toml:"agent"`
 	WriteTimeout         time.Duration          `json:"-" toml:"-"`
@@ -127,6 +149,12 @@ type Config struct {
 	EventsCoalesceInterval time.Duration `json:"events_coalesce_interval,omitempty" toml:"events_coalesce_interval"`
 
 	CustomModelPricing map[string]CustomModelRate `json:"custom_model_pricing,omitempty" toml:"custom_model_pricing"`
+
+	// RemoteHosts is the config-file list of SSH targets that
+	// `agentsview sync` (with no --host) syncs after the local
+	// pass. CLI/config-file only; never serialized to the
+	// settings API, so there is no web-UI editing of this list.
+	RemoteHosts []RemoteHost `json:"-" toml:"-"`
 
 	// HostExplicit is true when the user passed --host on the CLI.
 	// Used to prevent auto-bind to 0.0.0.0 when the user
@@ -156,6 +184,60 @@ func (c *Config) IsUserConfigured(
 	agent parser.AgentType,
 ) bool {
 	return c.agentDirSource[agent] != dirDefault
+}
+
+// ValidateRemoteHosts checks the configured remote_hosts entries
+// for semantic errors: a non-empty host and a port within 0..65535
+// (0 means the ssh default). It checks the trimmed values that
+// loadFile already normalized, so what is validated here is exactly
+// what is passed to ssh. Returns an aggregated error naming every
+// offending entry, or nil when all entries are valid.
+func (c Config) ValidateRemoteHosts() error {
+	var problems []string
+	seen := make(map[string]int, len(c.RemoteHosts))
+	for i, h := range c.RemoteHosts {
+		if h.Host == "" {
+			problems = append(problems,
+				fmt.Sprintf("entry %d: host is required", i+1))
+		}
+		if trimmed := strings.TrimSpace(h.Host); isSSHOptionShaped(h.Host) {
+			problems = append(problems,
+				fmt.Sprintf("entry %d: host must not begin with '-' (got %q)",
+					i+1, trimmed))
+		}
+		if trimmed := strings.TrimSpace(h.User); isSSHOptionShaped(h.User) {
+			problems = append(problems,
+				fmt.Sprintf("entry %d (%q): user must not begin with '-' (got %q)",
+					i+1, h.Host, trimmed))
+		}
+		if h.Port < 0 || h.Port > 65535 {
+			problems = append(problems,
+				fmt.Sprintf("entry %d (%q): invalid port %d",
+					i+1, h.Host, h.Port))
+		}
+		// Remote sync namespaces sessions and the skip cache by
+		// host alone (see ssh.RemoteSync), so two entries sharing a
+		// host collide regardless of user/port. Reject duplicates
+		// rather than silently share or overwrite cached state.
+		if h.Host != "" {
+			if first, ok := seen[h.Host]; ok {
+				problems = append(problems,
+					fmt.Sprintf("entry %d: duplicate host %q (already at entry %d)",
+						i+1, h.Host, first))
+			} else {
+				seen[h.Host] = i + 1
+			}
+		}
+	}
+	if len(problems) > 0 {
+		return fmt.Errorf("remote_hosts: %s",
+			strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+func isSSHOptionShaped(value string) bool {
+	return strings.HasPrefix(strings.TrimSpace(value), "-")
 }
 
 // Default returns a Config with default values.
@@ -251,6 +333,20 @@ func LoadPGServePFlags(fs *pflag.FlagSet) (Config, error) {
 	return cfg, nil
 }
 
+// LoadDuckDBServePFlags builds a DuckDB serve config from a parsed Cobra/pflag
+// FlagSet. It intentionally uses the same isolated serve defaults as pg serve.
+func LoadDuckDBServePFlags(fs *pflag.FlagSet) (Config, error) {
+	cfg, err := loadPGServeBase()
+	if err != nil {
+		return cfg, err
+	}
+	applyPFlags(&cfg, fs)
+	if err := finalize(&cfg); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
+}
+
 func loadPGServeBase() (Config, error) {
 	cfg, err := Default()
 	if err != nil {
@@ -303,6 +399,26 @@ func LoadMinimal() (Config, error) {
 	return cfg, nil
 }
 
+// LoadReadOnly builds a Config from defaults, env, and config.toml without
+// writing config migrations or generated secrets. Use it for diagnostic
+// commands that must not mutate user state.
+func LoadReadOnly() (Config, error) {
+	cfg, err := Default()
+	if err != nil {
+		return cfg, err
+	}
+	cfg.loadEnv()
+
+	if err := cfg.loadFileReadOnly(); err != nil {
+		return cfg, fmt.Errorf("loading config file: %w", err)
+	}
+	if err := finalize(&cfg); err != nil {
+		return cfg, err
+	}
+	cfg.DBPath = filepath.Join(cfg.DataDir, "sessions.db")
+	return cfg, nil
+}
+
 func (c *Config) configPath() string {
 	return filepath.Join(c.DataDir, "config.toml")
 }
@@ -315,48 +431,94 @@ func (c *Config) jsonConfigPath() string {
 // config.json exists and config.toml does not. The original
 // JSON file is renamed to config.json.bak.
 func (c *Config) migrateJSONToTOML() error {
-	jsonPath := c.jsonConfigPath()
-	tomlPath := c.configPath()
+	return c.withConfigLock(func() error {
+		jsonPath := c.jsonConfigPath()
+		tomlPath := c.configPath()
 
-	if _, err := os.Stat(tomlPath); err == nil {
-		return nil // TOML already exists
-	}
-	data, err := os.ReadFile(jsonPath)
-	if os.IsNotExist(err) {
-		return nil // no JSON to migrate
-	}
-	if err != nil {
-		return fmt.Errorf("reading config.json for migration: %w", err)
-	}
+		if _, err := os.Stat(tomlPath); err == nil {
+			return nil // TOML already exists
+		}
+		data, err := os.ReadFile(jsonPath)
+		if os.IsNotExist(err) {
+			return nil // no JSON to migrate
+		}
+		if err != nil {
+			return fmt.Errorf("reading config.json for migration: %w", err)
+		}
 
-	var m map[string]any
-	if err := json.Unmarshal(data, &m); err != nil {
-		return fmt.Errorf("parsing config.json for migration: %w", err)
-	}
+		var m map[string]any
+		if err := json.Unmarshal(data, &m); err != nil {
+			return fmt.Errorf("parsing config.json for migration: %w", err)
+		}
 
-	var buf bytes.Buffer
-	if err := toml.NewEncoder(&buf).Encode(m); err != nil {
-		return fmt.Errorf("encoding config.toml: %w", err)
-	}
-	if err := os.WriteFile(tomlPath, buf.Bytes(), 0o600); err != nil {
-		return fmt.Errorf("writing config.toml: %w", err)
-	}
-	if err := os.Rename(jsonPath, jsonPath+".bak"); err != nil {
-		return fmt.Errorf("renaming config.json to .bak: %w", err)
-	}
-	return nil
+		var buf bytes.Buffer
+		if err := toml.NewEncoder(&buf).Encode(m); err != nil {
+			return fmt.Errorf("encoding config.toml: %w", err)
+		}
+		if err := os.WriteFile(tomlPath, buf.Bytes(), 0o600); err != nil {
+			return fmt.Errorf("writing config.toml: %w", err)
+		}
+		if err := os.Rename(jsonPath, jsonPath+".bak"); err != nil {
+			return fmt.Errorf("renaming config.json to .bak: %w", err)
+		}
+		return nil
+	})
 }
 
 func (c *Config) loadFile() error {
-	if err := c.migrateJSONToTOML(); err != nil {
-		return err
+	return c.loadFileWithMigration(true)
+}
+
+func (c *Config) loadFileReadOnly() error {
+	return c.loadFileWithMigration(false)
+}
+
+func (c *Config) loadFileWithMigration(migrate bool) error {
+	if migrate {
+		if err := c.migrateJSONToTOML(); err != nil {
+			return err
+		}
 	}
 
 	path := c.configPath()
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return nil
+		if migrate {
+			return nil
+		}
+		return c.loadLegacyJSONReadOnly()
+	} else if err != nil {
+		return fmt.Errorf("checking config: %w", err)
 	}
 
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("reading config: %w", err)
+	}
+	return c.applyConfigTOML(string(data))
+}
+
+func (c *Config) loadLegacyJSONReadOnly() error {
+	data, err := os.ReadFile(c.jsonConfigPath())
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reading config.json: %w", err)
+	}
+
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return fmt.Errorf("parsing config.json: %w", err)
+	}
+
+	var buf bytes.Buffer
+	if err := toml.NewEncoder(&buf).Encode(m); err != nil {
+		return fmt.Errorf("encoding config.json: %w", err)
+	}
+	return c.applyConfigTOML(buf.String())
+}
+
+func (c *Config) applyConfigTOML(data string) error {
 	var file struct {
 		GithubToken                    string                     `toml:"github_token"`
 		CursorSecret                   string                     `toml:"cursor_secret"`
@@ -371,12 +533,14 @@ func (c *Config) loadFile() error {
 		RemoteAccess                   bool                       `toml:"remote_access"`
 		DisableUpdateCheck             bool                       `toml:"disable_update_check"`
 		PG                             PGConfig                   `toml:"pg"`
+		DuckDB                         DuckDBConfig               `toml:"duckdb"`
 		Automated                      AutomatedConfig            `toml:"automated"`
 		Agent                          map[string]AgentConfig     `toml:"agent"`
 		EventsCoalesceInterval         time.Duration              `toml:"events_coalesce_interval"`
 		CustomModelPricing             map[string]CustomModelRate `toml:"custom_model_pricing"`
+		RemoteHosts                    []RemoteHost               `toml:"remote_hosts"`
 	}
-	meta, err := toml.DecodeFile(path, &file)
+	meta, err := toml.Decode(data, &file)
 	if err != nil {
 		return fmt.Errorf("parsing config: %w", err)
 	}
@@ -432,6 +596,29 @@ func (c *Config) loadFile() error {
 	if file.PG.ExcludeProjects != nil && c.PG.ExcludeProjects == nil {
 		c.PG.ExcludeProjects = file.PG.ExcludeProjects
 	}
+	// Merge duckdb field-by-field so env vars override only
+	// the fields they set, preserving config-file settings.
+	if file.DuckDB.Path != "" && c.DuckDB.Path == "" {
+		c.DuckDB.Path = file.DuckDB.Path
+	}
+	if file.DuckDB.URL != "" && c.DuckDB.URL == "" {
+		c.DuckDB.URL = file.DuckDB.URL
+	}
+	if file.DuckDB.Token != "" && c.DuckDB.Token == "" {
+		c.DuckDB.Token = file.DuckDB.Token
+	}
+	if file.DuckDB.MachineName != "" && c.DuckDB.MachineName == "" {
+		c.DuckDB.MachineName = file.DuckDB.MachineName
+	}
+	if file.DuckDB.AllowInsecure {
+		c.DuckDB.AllowInsecure = true
+	}
+	if file.DuckDB.Projects != nil && c.DuckDB.Projects == nil {
+		c.DuckDB.Projects = file.DuckDB.Projects
+	}
+	if file.DuckDB.ExcludeProjects != nil && c.DuckDB.ExcludeProjects == nil {
+		c.DuckDB.ExcludeProjects = file.DuckDB.ExcludeProjects
+	}
 	// IsDefined distinguishes "unset" (leave default 10s) from an
 	// explicit "0s" (disable coalescing). Checking != 0 would silently
 	// ignore the latter.
@@ -457,11 +644,22 @@ func (c *Config) loadFile() error {
 	if len(file.CustomModelPricing) > 0 {
 		c.CustomModelPricing = file.CustomModelPricing
 	}
+	if len(file.RemoteHosts) > 0 {
+		hosts := make([]RemoteHost, len(file.RemoteHosts))
+		for i, h := range file.RemoteHosts {
+			hosts[i] = RemoteHost{
+				Host: strings.TrimSpace(h.Host),
+				User: strings.TrimSpace(h.User),
+				Port: h.Port,
+			}
+		}
+		c.RemoteHosts = hosts
+	}
 
 	// Parse config-file dir arrays for agents that have a
 	// ConfigKey. Only apply when not already set by env var.
 	var raw map[string]any
-	if _, err := toml.DecodeFile(path, &raw); err != nil {
+	if _, err := toml.Decode(data, &raw); err != nil {
 		return fmt.Errorf("parsing config raw: %w", err)
 	}
 	for _, def := range parser.Registry {
@@ -509,24 +707,28 @@ func (c *Config) ensureCursorSecret() error {
 		return nil
 	}
 
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Errorf("generating secret: %w", err)
-	}
-	secret := base64.StdEncoding.EncodeToString(b)
-	c.CursorSecret = secret
+	return c.withConfigLock(func() error {
+		existing, err := c.readConfigMap()
+		if err != nil {
+			return err
+		}
+		if secret, ok := existing["cursor_secret"].(string); ok && secret != "" {
+			c.CursorSecret = secret
+			return nil
+		}
 
-	if err := os.MkdirAll(c.DataDir, 0o700); err != nil {
-		return fmt.Errorf("creating data dir: %w", err)
-	}
-
-	existing, err := c.readConfigMap()
-	if err != nil {
-		return err
-	}
-
-	existing["cursor_secret"] = secret
-	return c.writeConfigMap(existing)
+		b := make([]byte, 32)
+		if _, err := rand.Read(b); err != nil {
+			return fmt.Errorf("generating secret: %w", err)
+		}
+		secret := base64.StdEncoding.EncodeToString(b)
+		existing["cursor_secret"] = secret
+		if err := c.writeConfigMap(existing); err != nil {
+			return err
+		}
+		c.CursorSecret = secret
+		return nil
+	})
 }
 
 // readConfigMap reads the TOML config file into a map. Returns
@@ -558,6 +760,20 @@ func (c *Config) writeConfigMap(m map[string]any) error {
 	return nil
 }
 
+func (c *Config) withConfigLock(fn func() error) error {
+	if err := os.MkdirAll(c.DataDir, 0o700); err != nil {
+		return fmt.Errorf("creating data dir: %w", err)
+	}
+	lock := flock.New(c.configPath() + ".lock")
+	if err := lock.Lock(); err != nil {
+		return fmt.Errorf("locking config: %w", err)
+	}
+	defer func() {
+		_ = lock.Unlock()
+	}()
+	return fn()
+}
+
 // dataDirFromEnv returns the data directory from the environment, preferring
 // AGENTSVIEW_DATA_DIR and falling back to the legacy AGENT_VIEWER_DATA_DIR.
 // Returns "" when neither is set.
@@ -586,6 +802,18 @@ func (c *Config) loadEnv() {
 	}
 	if v := os.Getenv("AGENTSVIEW_PG_MACHINE"); v != "" {
 		c.PG.MachineName = v
+	}
+	if v := os.Getenv("AGENTSVIEW_DUCKDB_PATH"); v != "" {
+		c.DuckDB.Path = v
+	}
+	if v := os.Getenv("AGENTSVIEW_DUCKDB_URL"); v != "" {
+		c.DuckDB.URL = v
+	}
+	if v := os.Getenv("AGENTSVIEW_DUCKDB_TOKEN"); v != "" {
+		c.DuckDB.Token = v
+	}
+	if v := os.Getenv("AGENTSVIEW_DUCKDB_MACHINE"); v != "" {
+		c.DuckDB.MachineName = v
 	}
 	if v := os.Getenv("AGENTSVIEW_DISABLE_UPDATE_CHECK"); v != "" {
 		c.DisableUpdateCheck = v == "1" || v == "true"
@@ -799,6 +1027,10 @@ func applyFlagValue(cfg *Config, name, value string) {
 		if d, err := time.ParseDuration(value); err == nil {
 			cfg.EventsCoalesceInterval = d
 		}
+	case "pg":
+		// Read-routing only. The CLI resolver combines this flag
+		// with cfg.PG from env/config and does not persist a new
+		// config field for it.
 	}
 }
 
@@ -1113,6 +1345,44 @@ func (c *Config) ResolvePG() (PGConfig, error) {
 	return pg, nil
 }
 
+// ResolveDuckDB returns a copy of DuckDB config with defaults applied
+// and environment variables expanded in path, URL, and token.
+func (c *Config) ResolveDuckDB() (DuckDBConfig, error) {
+	duck := c.DuckDB
+	if duck.Path != "" {
+		expanded, err := expandBracedEnv(duck.Path)
+		if err != nil {
+			return duck, fmt.Errorf("expanding path: %w", err)
+		}
+		duck.Path = expanded
+	}
+	if duck.URL != "" {
+		expanded, err := expandBracedEnv(duck.URL)
+		if err != nil {
+			return duck, fmt.Errorf("expanding url: %w", err)
+		}
+		duck.URL = expanded
+	}
+	if duck.Token != "" {
+		expanded, err := expandBracedEnv(duck.Token)
+		if err != nil {
+			return duck, fmt.Errorf("expanding token: %w", err)
+		}
+		duck.Token = expanded
+	}
+	if duck.Path == "" {
+		duck.Path = filepath.Join(c.DataDir, "sessions.duckdb")
+	}
+	if duck.MachineName == "" {
+		h, err := os.Hostname()
+		if err != nil {
+			return duck, fmt.Errorf("os.Hostname failed (%w); set machine_name explicitly in config", err)
+		}
+		duck.MachineName = h
+	}
+	return duck, nil
+}
+
 var (
 	bracedEnvPattern      = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 	bareEnvPattern        = regexp.MustCompile(`^\$([A-Za-z_][A-Za-z0-9_]*)$`)
@@ -1186,80 +1456,76 @@ func expandBracedEnv(s string) (string, error) {
 
 // SaveTerminalConfig persists terminal settings to the config file.
 func (c *Config) SaveTerminalConfig(tc TerminalConfig) error {
-	if err := os.MkdirAll(c.DataDir, 0o700); err != nil {
-		return fmt.Errorf("creating data dir: %w", err)
-	}
+	return c.withConfigLock(func() error {
+		existing, err := c.readConfigMap()
+		if err != nil {
+			return fmt.Errorf("reading config file: %w", err)
+		}
 
-	existing, err := c.readConfigMap()
-	if err != nil {
-		return fmt.Errorf("reading config file: %w", err)
-	}
-
-	existing["terminal"] = tc
-	if err := c.writeConfigMap(existing); err != nil {
-		return err
-	}
-	c.Terminal = tc
-	return nil
+		existing["terminal"] = tc
+		if err := c.writeConfigMap(existing); err != nil {
+			return err
+		}
+		c.Terminal = tc
+		return nil
+	})
 }
 
 // SaveSettings persists a partial settings update to the config file.
 // The patch map contains config keys mapped to their new values. Only
 // the keys present in patch are written; other config keys are preserved.
 func (c *Config) SaveSettings(patch map[string]any) error {
-	if err := os.MkdirAll(c.DataDir, 0o700); err != nil {
-		return fmt.Errorf("creating data dir: %w", err)
-	}
+	return c.withConfigLock(func() error {
+		existing, err := c.readConfigMap()
+		if err != nil {
+			return fmt.Errorf("reading config file: %w", err)
+		}
 
-	existing, err := c.readConfigMap()
-	if err != nil {
-		return fmt.Errorf("reading config file: %w", err)
-	}
+		maps.Copy(existing, patch)
 
-	maps.Copy(existing, patch)
+		// When require_auth is written, remove the legacy
+		// remote_access key so it cannot override on next load.
+		if _, ok := patch["require_auth"]; ok {
+			delete(existing, "remote_access")
+		}
 
-	// When require_auth is written, remove the legacy
-	// remote_access key so it cannot override on next load.
-	if _, ok := patch["require_auth"]; ok {
-		delete(existing, "remote_access")
-	}
+		if err := c.writeConfigMap(existing); err != nil {
+			return err
+		}
 
-	if err := c.writeConfigMap(existing); err != nil {
-		return err
-	}
-
-	// Update in-memory config for known keys.
-	if v, ok := patch["terminal"]; ok {
-		if tc, ok := v.(TerminalConfig); ok {
-			c.Terminal = tc
-		} else if m, ok := v.(map[string]any); ok {
-			if s, ok := m["mode"].(string); ok {
-				c.Terminal.Mode = s
-			}
-			if s, ok := m["custom_bin"].(string); ok {
-				c.Terminal.CustomBin = s
-			}
-			if s, ok := m["custom_args"].(string); ok {
-				c.Terminal.CustomArgs = s
+		// Update in-memory config for known keys.
+		if v, ok := patch["terminal"]; ok {
+			if tc, ok := v.(TerminalConfig); ok {
+				c.Terminal = tc
+			} else if m, ok := v.(map[string]any); ok {
+				if s, ok := m["mode"].(string); ok {
+					c.Terminal.Mode = s
+				}
+				if s, ok := m["custom_bin"].(string); ok {
+					c.Terminal.CustomBin = s
+				}
+				if s, ok := m["custom_args"].(string); ok {
+					c.Terminal.CustomArgs = s
+				}
 			}
 		}
-	}
-	if v, ok := patch["github_token"]; ok {
-		if s, ok := v.(string); ok {
-			c.GithubToken = s
+		if v, ok := patch["github_token"]; ok {
+			if s, ok := v.(string); ok {
+				c.GithubToken = s
+			}
 		}
-	}
-	if v, ok := patch["auth_token"]; ok {
-		if s, ok := v.(string); ok {
-			c.AuthToken = s
+		if v, ok := patch["auth_token"]; ok {
+			if s, ok := v.(string); ok {
+				c.AuthToken = s
+			}
 		}
-	}
-	if v, ok := patch["require_auth"]; ok {
-		if b, ok := v.(bool); ok {
-			c.RequireAuth = b
+		if v, ok := patch["require_auth"]; ok {
+			if b, ok := v.(bool); ok {
+				c.RequireAuth = b
+			}
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 // EnsureAuthToken generates and persists an auth token if one does
@@ -1268,42 +1534,43 @@ func (c *Config) EnsureAuthToken() error {
 	if c.AuthToken != "" {
 		return nil
 	}
+	return c.withConfigLock(func() error {
+		existing, err := c.readConfigMap()
+		if err != nil {
+			return err
+		}
+		if token, ok := existing["auth_token"].(string); ok && token != "" {
+			c.AuthToken = token
+			return nil
+		}
 
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Errorf("generating auth token: %w", err)
-	}
-	token := base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(b)
-	c.AuthToken = token
-
-	if err := os.MkdirAll(c.DataDir, 0o700); err != nil {
-		return fmt.Errorf("creating data dir: %w", err)
-	}
-
-	existing, err := c.readConfigMap()
-	if err != nil {
-		return err
-	}
-
-	existing["auth_token"] = token
-	return c.writeConfigMap(existing)
+		b := make([]byte, 32)
+		if _, err := rand.Read(b); err != nil {
+			return fmt.Errorf("generating auth token: %w", err)
+		}
+		token := base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(b)
+		existing["auth_token"] = token
+		if err := c.writeConfigMap(existing); err != nil {
+			return err
+		}
+		c.AuthToken = token
+		return nil
+	})
 }
 
 // SaveGithubToken persists the GitHub token to the config file.
 func (c *Config) SaveGithubToken(token string) error {
-	if err := os.MkdirAll(c.DataDir, 0o700); err != nil {
-		return fmt.Errorf("creating data dir: %w", err)
-	}
+	return c.withConfigLock(func() error {
+		existing, err := c.readConfigMap()
+		if err != nil {
+			return fmt.Errorf("reading config file: %w", err)
+		}
 
-	existing, err := c.readConfigMap()
-	if err != nil {
-		return fmt.Errorf("reading config file: %w", err)
-	}
-
-	existing["github_token"] = token
-	if err := c.writeConfigMap(existing); err != nil {
-		return fmt.Errorf("writing config: %w", err)
-	}
-	c.GithubToken = token
-	return nil
+		existing["github_token"] = token
+		if err := c.writeConfigMap(existing); err != nil {
+			return fmt.Errorf("writing config: %w", err)
+		}
+		c.GithubToken = token
+		return nil
+	})
 }

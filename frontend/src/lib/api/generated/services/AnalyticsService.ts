@@ -9,6 +9,8 @@ import type { DbHourOfWeekResponse } from '../models/DbHourOfWeekResponse';
 import type { DbProjectsAnalyticsResponse } from '../models/DbProjectsAnalyticsResponse';
 import type { DbSessionShapeResponse } from '../models/DbSessionShapeResponse';
 import type { DbSignalsAnalyticsResponse } from '../models/DbSignalsAnalyticsResponse';
+import type { DbSignalSessionsResponse } from '../models/DbSignalSessionsResponse';
+import type { DbSkillsAnalyticsResponse } from '../models/DbSkillsAnalyticsResponse';
 import type { DbToolsAnalyticsResponse } from '../models/DbToolsAnalyticsResponse';
 import type { DbTopSessionsResponse } from '../models/DbTopSessionsResponse';
 import type { DbVelocityResponse } from '../models/DbVelocityResponse';
@@ -32,6 +34,7 @@ export class AnalyticsService {
     hour,
     minUserMessages,
     activeSince,
+    automatedScope,
     includeOneShot,
     includeAutomated,
     termination,
@@ -78,6 +81,10 @@ export class AnalyticsService {
      */
     activeSince?: string,
     /**
+     * Automation scope
+     */
+    automatedScope?: 'human' | 'all' | 'automated',
+    /**
      * Include one-shot sessions
      */
     includeOneShot?: boolean,
@@ -108,6 +115,7 @@ export class AnalyticsService {
         'hour': hour,
         'min_user_messages': minUserMessages,
         'active_since': activeSince,
+        'automated_scope': automatedScope,
         'include_one_shot': includeOneShot,
         'include_automated': includeAutomated,
         'termination': termination,
@@ -144,6 +152,7 @@ export class AnalyticsService {
     hour,
     minUserMessages,
     activeSince,
+    automatedScope,
     includeOneShot,
     includeAutomated,
     termination,
@@ -190,6 +199,10 @@ export class AnalyticsService {
      */
     activeSince?: string,
     /**
+     * Automation scope
+     */
+    automatedScope?: 'human' | 'all' | 'automated',
+    /**
      * Include one-shot sessions
      */
     includeOneShot?: boolean,
@@ -220,6 +233,7 @@ export class AnalyticsService {
         'hour': hour,
         'min_user_messages': minUserMessages,
         'active_since': activeSince,
+        'automated_scope': automatedScope,
         'include_one_shot': includeOneShot,
         'include_automated': includeAutomated,
         'termination': termination,
@@ -256,6 +270,7 @@ export class AnalyticsService {
     hour,
     minUserMessages,
     activeSince,
+    automatedScope,
     includeOneShot,
     includeAutomated,
     termination,
@@ -301,6 +316,10 @@ export class AnalyticsService {
      */
     activeSince?: string,
     /**
+     * Automation scope
+     */
+    automatedScope?: 'human' | 'all' | 'automated',
+    /**
      * Include one-shot sessions
      */
     includeOneShot?: boolean,
@@ -327,6 +346,7 @@ export class AnalyticsService {
         'hour': hour,
         'min_user_messages': minUserMessages,
         'active_since': activeSince,
+        'automated_scope': automatedScope,
         'include_one_shot': includeOneShot,
         'include_automated': includeAutomated,
         'termination': termination,
@@ -362,6 +382,7 @@ export class AnalyticsService {
     hour,
     minUserMessages,
     activeSince,
+    automatedScope,
     includeOneShot,
     includeAutomated,
     termination,
@@ -407,6 +428,10 @@ export class AnalyticsService {
      */
     activeSince?: string,
     /**
+     * Automation scope
+     */
+    automatedScope?: 'human' | 'all' | 'automated',
+    /**
      * Include one-shot sessions
      */
     includeOneShot?: boolean,
@@ -433,6 +458,7 @@ export class AnalyticsService {
         'hour': hour,
         'min_user_messages': minUserMessages,
         'active_since': activeSince,
+        'automated_scope': automatedScope,
         'include_one_shot': includeOneShot,
         'include_automated': includeAutomated,
         'termination': termination,
@@ -468,6 +494,7 @@ export class AnalyticsService {
     hour,
     minUserMessages,
     activeSince,
+    automatedScope,
     includeOneShot,
     includeAutomated,
     termination,
@@ -513,6 +540,10 @@ export class AnalyticsService {
      */
     activeSince?: string,
     /**
+     * Automation scope
+     */
+    automatedScope?: 'human' | 'all' | 'automated',
+    /**
      * Include one-shot sessions
      */
     includeOneShot?: boolean,
@@ -539,9 +570,134 @@ export class AnalyticsService {
         'hour': hour,
         'min_user_messages': minUserMessages,
         'active_since': activeSince,
+        'automated_scope': automatedScope,
         'include_one_shot': includeOneShot,
         'include_automated': includeAutomated,
         'termination': termination,
+      },
+      errors: {
+        400: `Bad Request`,
+        401: `Unauthorized`,
+        403: `Forbidden`,
+        404: `Not Found`,
+        409: `Conflict`,
+        422: `Unprocessable Entity`,
+        500: `Internal Server Error`,
+        501: `Not Implemented`,
+        502: `Bad Gateway`,
+        503: `Service Unavailable`,
+        504: `Gateway Timeout`,
+      },
+    });
+  }
+  /**
+   * Get signal session examples
+   * @returns DbSignalSessionsResponse OK
+   * @throws ApiError
+   */
+  public static getApiV1AnalyticsSignalSessions({
+    signal,
+    from,
+    to,
+    timezone,
+    machine,
+    project,
+    agent,
+    dow,
+    hour,
+    minUserMessages,
+    activeSince,
+    automatedScope,
+    includeOneShot,
+    includeAutomated,
+    termination,
+    limit = 10,
+  }: {
+    /**
+     * Signal name
+     */
+    signal: string,
+    /**
+     * Range start date
+     */
+    from?: string,
+    /**
+     * Range end date
+     */
+    to?: string,
+    /**
+     * IANA timezone name
+     */
+    timezone?: string,
+    /**
+     * Filter by machine
+     */
+    machine?: string,
+    /**
+     * Filter by project
+     */
+    project?: string,
+    /**
+     * Filter by agent
+     */
+    agent?: string,
+    /**
+     * Day of week, Monday=0 through Sunday=6
+     */
+    dow?: number,
+    /**
+     * Hour of day, 0 through 23
+     */
+    hour?: number,
+    /**
+     * Minimum user message count
+     */
+    minUserMessages?: number,
+    /**
+     * Filter sessions active since this RFC3339 timestamp
+     */
+    activeSince?: string,
+    /**
+     * Automation scope
+     */
+    automatedScope?: 'human' | 'all' | 'automated',
+    /**
+     * Include one-shot sessions
+     */
+    includeOneShot?: boolean,
+    /**
+     * Include automated sessions
+     */
+    includeAutomated?: boolean,
+    /**
+     * Filter by termination reason
+     */
+    termination?: string,
+    /**
+     * Maximum number of session examples
+     */
+    limit?: number,
+  }): CancelablePromise<DbSignalSessionsResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/api/v1/analytics/signal-sessions',
+      query: {
+        'from': from,
+        'to': to,
+        'timezone': timezone,
+        'machine': machine,
+        'project': project,
+        'agent': agent,
+        'dow': dow,
+        'hour': hour,
+        'min_user_messages': minUserMessages,
+        'active_since': activeSince,
+        'automated_scope': automatedScope,
+        'include_one_shot': includeOneShot,
+        'include_automated': includeAutomated,
+        'termination': termination,
+        'signal': signal,
+        'limit': limit,
       },
       errors: {
         400: `Bad Request`,
@@ -574,6 +730,7 @@ export class AnalyticsService {
     hour,
     minUserMessages,
     activeSince,
+    automatedScope,
     includeOneShot,
     includeAutomated,
     termination,
@@ -619,6 +776,10 @@ export class AnalyticsService {
      */
     activeSince?: string,
     /**
+     * Automation scope
+     */
+    automatedScope?: 'human' | 'all' | 'automated',
+    /**
      * Include one-shot sessions
      */
     includeOneShot?: boolean,
@@ -645,6 +806,119 @@ export class AnalyticsService {
         'hour': hour,
         'min_user_messages': minUserMessages,
         'active_since': activeSince,
+        'automated_scope': automatedScope,
+        'include_one_shot': includeOneShot,
+        'include_automated': includeAutomated,
+        'termination': termination,
+      },
+      errors: {
+        400: `Bad Request`,
+        401: `Unauthorized`,
+        403: `Forbidden`,
+        404: `Not Found`,
+        409: `Conflict`,
+        422: `Unprocessable Entity`,
+        500: `Internal Server Error`,
+        501: `Not Implemented`,
+        502: `Bad Gateway`,
+        503: `Service Unavailable`,
+        504: `Gateway Timeout`,
+      },
+    });
+  }
+  /**
+   * Get skill analytics
+   * @returns DbSkillsAnalyticsResponse OK
+   * @throws ApiError
+   */
+  public static getApiV1AnalyticsSkills({
+    from,
+    to,
+    timezone,
+    machine,
+    project,
+    agent,
+    dow,
+    hour,
+    minUserMessages,
+    activeSince,
+    automatedScope,
+    includeOneShot,
+    includeAutomated,
+    termination,
+  }: {
+    /**
+     * Range start date
+     */
+    from?: string,
+    /**
+     * Range end date
+     */
+    to?: string,
+    /**
+     * IANA timezone name
+     */
+    timezone?: string,
+    /**
+     * Filter by machine
+     */
+    machine?: string,
+    /**
+     * Filter by project
+     */
+    project?: string,
+    /**
+     * Filter by agent
+     */
+    agent?: string,
+    /**
+     * Day of week, Monday=0 through Sunday=6
+     */
+    dow?: number,
+    /**
+     * Hour of day, 0 through 23
+     */
+    hour?: number,
+    /**
+     * Minimum user message count
+     */
+    minUserMessages?: number,
+    /**
+     * Filter sessions active since this RFC3339 timestamp
+     */
+    activeSince?: string,
+    /**
+     * Automation scope
+     */
+    automatedScope?: 'human' | 'all' | 'automated',
+    /**
+     * Include one-shot sessions
+     */
+    includeOneShot?: boolean,
+    /**
+     * Include automated sessions
+     */
+    includeAutomated?: boolean,
+    /**
+     * Filter by termination reason
+     */
+    termination?: string,
+  }): CancelablePromise<DbSkillsAnalyticsResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/api/v1/analytics/skills',
+      query: {
+        'from': from,
+        'to': to,
+        'timezone': timezone,
+        'machine': machine,
+        'project': project,
+        'agent': agent,
+        'dow': dow,
+        'hour': hour,
+        'min_user_messages': minUserMessages,
+        'active_since': activeSince,
+        'automated_scope': automatedScope,
         'include_one_shot': includeOneShot,
         'include_automated': includeAutomated,
         'termination': termination,
@@ -680,6 +954,7 @@ export class AnalyticsService {
     hour,
     minUserMessages,
     activeSince,
+    automatedScope,
     includeOneShot,
     includeAutomated,
     termination,
@@ -725,6 +1000,10 @@ export class AnalyticsService {
      */
     activeSince?: string,
     /**
+     * Automation scope
+     */
+    automatedScope?: 'human' | 'all' | 'automated',
+    /**
      * Include one-shot sessions
      */
     includeOneShot?: boolean,
@@ -751,6 +1030,7 @@ export class AnalyticsService {
         'hour': hour,
         'min_user_messages': minUserMessages,
         'active_since': activeSince,
+        'automated_scope': automatedScope,
         'include_one_shot': includeOneShot,
         'include_automated': includeAutomated,
         'termination': termination,
@@ -786,6 +1066,7 @@ export class AnalyticsService {
     hour,
     minUserMessages,
     activeSince,
+    automatedScope,
     includeOneShot,
     includeAutomated,
     termination,
@@ -831,6 +1112,10 @@ export class AnalyticsService {
      */
     activeSince?: string,
     /**
+     * Automation scope
+     */
+    automatedScope?: 'human' | 'all' | 'automated',
+    /**
      * Include one-shot sessions
      */
     includeOneShot?: boolean,
@@ -857,6 +1142,7 @@ export class AnalyticsService {
         'hour': hour,
         'min_user_messages': minUserMessages,
         'active_since': activeSince,
+        'automated_scope': automatedScope,
         'include_one_shot': includeOneShot,
         'include_automated': includeAutomated,
         'termination': termination,
@@ -892,6 +1178,7 @@ export class AnalyticsService {
     hour,
     minUserMessages,
     activeSince,
+    automatedScope,
     includeOneShot,
     includeAutomated,
     termination,
@@ -938,6 +1225,10 @@ export class AnalyticsService {
      */
     activeSince?: string,
     /**
+     * Automation scope
+     */
+    automatedScope?: 'human' | 'all' | 'automated',
+    /**
      * Include one-shot sessions
      */
     includeOneShot?: boolean,
@@ -968,6 +1259,7 @@ export class AnalyticsService {
         'hour': hour,
         'min_user_messages': minUserMessages,
         'active_since': activeSince,
+        'automated_scope': automatedScope,
         'include_one_shot': includeOneShot,
         'include_automated': includeAutomated,
         'termination': termination,
@@ -1004,6 +1296,7 @@ export class AnalyticsService {
     hour,
     minUserMessages,
     activeSince,
+    automatedScope,
     includeOneShot,
     includeAutomated,
     termination,
@@ -1049,6 +1342,10 @@ export class AnalyticsService {
      */
     activeSince?: string,
     /**
+     * Automation scope
+     */
+    automatedScope?: 'human' | 'all' | 'automated',
+    /**
      * Include one-shot sessions
      */
     includeOneShot?: boolean,
@@ -1075,6 +1372,7 @@ export class AnalyticsService {
         'hour': hour,
         'min_user_messages': minUserMessages,
         'active_since': activeSince,
+        'automated_scope': automatedScope,
         'include_one_shot': includeOneShot,
         'include_automated': includeAutomated,
         'termination': termination,

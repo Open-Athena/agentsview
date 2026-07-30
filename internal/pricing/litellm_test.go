@@ -96,14 +96,14 @@ func TestParseLiteLLMPricingSkipsNoCost(t *testing.T) {
 }
 
 func TestFallbackPricing(t *testing.T) {
-	prices := FallbackPricing()
-	require.NotEmpty(t, prices, "FallbackPricing returned empty")
+	prices := requireEmbeddedFallbackPricing(t)
 
 	required := map[string]bool{
 		"claude-sonnet-4-6":         false,
 		"claude-opus-4-6":           false,
 		"claude-opus-4-7":           false,
 		"claude-opus-4-8":           false,
+		"claude-fable-5":            false,
 		"claude-haiku-4-5-20251001": false,
 		"claude-sonnet-4-20250514":  false,
 		"claude-opus-4-20250514":    false,

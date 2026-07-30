@@ -36,7 +36,10 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) SetCustomPricing(p map[string]config.CustomModelRate) {
+	s.pricingMu.Lock()
+	defer s.pricingMu.Unlock()
 	s.customPricing = p
+	s.forgetPricingLoad()
 }
 
 // SetCursorSecret sets the HMAC key used for cursor signing.
@@ -51,8 +54,8 @@ func (s *Store) SetCursorSecret(secret []byte) {
 // and pins) is writable through dedicated methods.
 func (s *Store) ReadOnly() bool { return true }
 
-// GetSessionVersion returns the message count and a hash of
-// updated_at for SSE change detection.
+// GetSessionVersion returns the message count and a compact version
+// marker for SSE change detection.
 func (s *Store) GetSessionVersion(
 	id string,
 ) (int, int64, bool) {
@@ -66,12 +69,7 @@ func (s *Store) GetSessionVersion(
 	if err != nil {
 		return 0, 0, false
 	}
-	formatted := FormatISO8601(updatedAt)
-	var h int64
-	for _, c := range formatted {
-		h = h*31 + int64(c)
-	}
-	return count, h, true
+	return count, db.SessionVersionMarker(FormatISO8601(updatedAt)), true
 }
 
 // ------------------------------------------------------------
@@ -90,16 +88,26 @@ func (s *Store) DeleteInsight(_ int64) error {
 	return db.ErrReadOnly
 }
 
-// ListInsights returns an empty slice.
+// ListInsights returns an empty slice. Saved insights, including
+// llm_canned structured metadata, are local SQLite artifacts; remote
+// PG serve mode does not expose partial insight rows.
 func (s *Store) ListInsights(
 	_ context.Context, _ db.InsightFilter,
 ) ([]db.Insight, error) {
 	return []db.Insight{}, nil
 }
 
-// GetInsight returns nil.
+// GetInsight returns nil because insights are local-only in PG serve mode.
 func (s *Store) GetInsight(
 	_ context.Context, _ int64,
+) (*db.Insight, error) {
+	return nil, nil
+}
+
+// GetCachedInsight returns nil in read-only remote mode; this avoids
+// returning incomplete cache/provenance metadata from PG-backed stores.
+func (s *Store) GetCachedInsight(
+	_ context.Context, _ string,
 ) (*db.Insight, error) {
 	return nil, nil
 }

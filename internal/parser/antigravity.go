@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -76,17 +77,42 @@ func FindAntigravitySourceFile(root, id string) string {
 	return ""
 }
 
+// AntigravityFileInfo returns the effective file info for an IDE
+// session .db, combining the main file with its -wal/-shm sidecars,
+// the annotations/<id>.pbtxt sidecar, and the brain/<id> artifacts
+// the parse renders as messages. WAL-only commits and annotation or
+// brain updates do not touch the main file, so skip checks and
+// persisted file metadata must use this composite or live sessions
+// never reparse.
+func AntigravityFileInfo(path string) (os.FileInfo, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	id := strings.TrimSuffix(filepath.Base(path), ".db")
+	root := filepath.Dir(filepath.Dir(path))
+	companions := []string{
+		path + "-wal",
+		path + "-shm",
+		filepath.Join(root, "annotations", id+".pbtxt"),
+	}
+	companions = append(companions, antigravityBrainCompanions(
+		filepath.Join(root, "brain", id),
+	)...)
+	return antigravityCLICombinedFileInfo(info, companions...), nil
+}
+
 // ParseAntigravitySession parses one IDE session DB.
 func ParseAntigravitySession(
 	path, project, machine string,
-) (*ParsedSession, []ParsedMessage, error) {
+) (*ParsedSession, []ParsedMessage, []ParsedUsageEvent, error) {
 	info, err := os.Stat(path)
 	if err != nil {
-		return nil, nil, fmt.Errorf("stat %s: %w", path, err)
+		return nil, nil, nil, fmt.Errorf("stat %s: %w", path, err)
 	}
 	id := strings.TrimSuffix(filepath.Base(path), ".db")
 	if !IsValidSessionID(id) {
-		return nil, nil, fmt.Errorf(
+		return nil, nil, nil, fmt.Errorf(
 			"invalid Antigravity IDE session filename: %s", path,
 		)
 	}
@@ -97,15 +123,15 @@ func ParseAntigravitySession(
 	dsn := "file:" + path + "?mode=ro&immutable=0"
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
-		return nil, nil, fmt.Errorf(
+		return nil, nil, nil, fmt.Errorf(
 			"open antigravity db %s: %w", path, err,
 		)
 	}
 	defer db.Close()
 
-	messages, err := loadAntigravitySteps(db)
+	messages, usageEvents, err := loadAntigravitySteps(db)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	messages = append(messages,
 		collectAntigravityBrainMessages(
@@ -154,6 +180,16 @@ func ParseAntigravitySession(
 		endedAt = info.ModTime()
 	}
 
+	var size int64
+	var mtime int64
+	if effInfo, statErr := AntigravityFileInfo(path); statErr == nil {
+		size = effInfo.Size()
+		mtime = effInfo.ModTime().UnixNano()
+	} else {
+		size = info.Size()
+		mtime = info.ModTime().UnixNano()
+	}
+
 	sess := &ParsedSession{
 		ID:               antigravityIDPrefix + id,
 		Project:          project,
@@ -166,27 +202,94 @@ func ParseAntigravitySession(
 		UserMessageCount: userCount,
 		File: FileInfo{
 			Path:  path,
-			Size:  info.Size(),
-			Mtime: info.ModTime().UnixNano(),
+			Size:  size,
+			Mtime: mtime,
 		},
 	}
-	if len(messages) == 0 {
-		return sess, nil, nil
+	accumulateMessageTokenUsage(sess, messages)
+	applyUsageEventTokenTotals(sess, usageEvents)
+	for i := range usageEvents {
+		usageEvents[i].SessionID = sess.ID
 	}
-	return sess, messages, nil
+	if len(messages) == 0 {
+		// Usage events still flow for message-less parses (e.g. an
+		// undecodable DB with gen_metadata) so daily usage analytics
+		// match the event-derived session totals stamped above.
+		return sess, nil, usageEvents, nil
+	}
+	return sess, messages, usageEvents, nil
 }
 
-func loadAntigravitySteps(db *sql.DB) ([]ParsedMessage, error) {
+func loadAntigravitySteps(db *sql.DB) ([]ParsedMessage, []ParsedUsageEvent, error) {
 	result, err := loadAntigravityStepsWithRawCount(db)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return result.messages, nil
+	return result.messages, result.usageEvents, nil
 }
 
 type antigravityStepLoadResult struct {
 	messages     []ParsedMessage
+	usageEvents  []ParsedUsageEvent
 	rawStepCount int
+}
+
+type antigravityStepKind int
+
+const (
+	antigravityStepKindUserInput       antigravityStepKind = 14
+	antigravityStepKindPlannerResponse antigravityStepKind = 15
+)
+
+type antigravityStep struct {
+	idx       int
+	kind      antigravityStepKind
+	fields    []agProtoField
+	timestamp time.Time
+	role      RoleType
+}
+
+func newAntigravityStep(
+	idx, stepType int, payload []byte,
+) (antigravityStep, bool) {
+	if len(payload) == 0 {
+		return antigravityStep{}, false
+	}
+	fields, err := agProtoParse(payload)
+	if err != nil || len(fields) == 0 {
+		return antigravityStep{}, false
+	}
+
+	kind := antigravityStepKindFromProto(fields, stepType)
+	role := roleForAntigravityStepKind(kind)
+
+	return antigravityStep{
+		idx:       idx,
+		kind:      kind,
+		fields:    fields,
+		timestamp: earliestAntigravityTimestamp(fields),
+		role:      role,
+	}, true
+}
+
+func antigravityStepKindFromProto(
+	fields []agProtoField, fallbackStepType int,
+) antigravityStepKind {
+	if f, ok := agProtoFind(fields, 1); ok && f.Wire == pbWireVarint {
+		return antigravityStepKind(f.Varint)
+	}
+	return antigravityStepKind(fallbackStepType)
+}
+
+func roleForAntigravityStepKind(kind antigravityStepKind) RoleType {
+	switch kind {
+	case antigravityStepKindUserInput:
+		return RoleUser
+	case antigravityStepKindPlannerResponse:
+		return RoleAssistant
+	default:
+		return RoleAssistant
+	}
 }
 
 func loadAntigravityStepsWithRawCount(
@@ -200,6 +303,21 @@ func loadAntigravityStepsWithRawCount(
 		return antigravityStepLoadResult{}, fmt.Errorf("query steps: %w", err)
 	}
 	defer rows.Close()
+
+	// Gracefully query gen_metadata if the table exists
+	var genMeta map[int][]byte
+	if genRows, err := db.Query("SELECT idx, data FROM gen_metadata"); err == nil {
+		defer genRows.Close()
+		genMeta = make(map[int][]byte)
+		for genRows.Next() {
+			var idx int
+			var data []byte
+			if err := genRows.Scan(&idx, &data); err == nil {
+				genMeta[idx] = data
+			}
+		}
+	}
+
 	var result antigravityStepLoadResult
 	for rows.Next() {
 		var (
@@ -211,8 +329,11 @@ func loadAntigravityStepsWithRawCount(
 			return antigravityStepLoadResult{}, fmt.Errorf("scan step: %w", err)
 		}
 		result.rawStepCount++
-		msg, ok := decodeAntigravityStep(idx, stepType, payload)
-		if !ok {
+		msg, decoded := decodeAntigravityStep(idx, stepType, payload)
+		if data, ok := genMeta[idx]; ok {
+			msg = result.appendGenMetadataUsage(data, msg, decoded)
+		}
+		if !decoded {
 			continue
 		}
 		result.messages = append(result.messages, msg)
@@ -223,44 +344,465 @@ func loadAntigravityStepsWithRawCount(
 	return result, nil
 }
 
+// appendGenMetadataUsage records a usage event from one gen_metadata
+// payload and, when the step decoded into a message, attaches token
+// counts and the model name to the returned copy. Usage extraction is
+// deliberately independent of message decoding: a step the heuristic
+// cannot render can still be rescued by the CLI trajectory sidecar
+// transcript, and its usage must not be dropped.
+func (r *antigravityStepLoadResult) appendGenMetadataUsage(
+	data []byte, msg ParsedMessage, decoded bool,
+) ParsedMessage {
+	genModel := extractModelName(data)
+	block, okUsage := extractTokenUsage(data)
+	if okUsage {
+		// gen_metadata field semantics (cross-validated against sidecar
+		// generatorMetadata ground truth in 550/550 blocks):
+		//   f2 = uncached input (inputTokens)
+		//   f3 = total output including thinking (outputTokens)
+		//   f5 = cache-read (cacheReadTokens, absent when no cache hits)
+		//   f4 = always 0/absent, ignored
+		// No per-field reasoning breakdown is available; f3 already
+		// includes thinking tokens.
+		context := block.UncachedInput + block.CacheRead
+		eventModel := genModel
+		var occurredAt string
+		if decoded {
+			if eventModel == "" {
+				eventModel = msg.Model
+			}
+			if !msg.Timestamp.IsZero() {
+				occurredAt = msg.Timestamp.Format(time.RFC3339Nano)
+			}
+			msg.ContextTokens = context
+			msg.OutputTokens = block.TotalOutput
+			msg.HasContextTokens = context > 0
+			msg.HasOutputTokens = block.TotalOutput > 0
+
+		}
+		r.usageEvents = append(r.usageEvents, ParsedUsageEvent{
+			Source:               "generation",
+			Model:                eventModel,
+			InputTokens:          block.UncachedInput,
+			OutputTokens:         block.TotalOutput,
+			CacheReadInputTokens: block.CacheRead,
+			ReasoningTokens:      0, // not available in gen_metadata
+			OccurredAt:           occurredAt,
+		})
+	}
+	if decoded && genModel != "" {
+		msg.Model = genModel
+	}
+	return msg
+}
+
+// agTokenBlock carries the decoded token usage extracted from one
+// gen_metadata blob. Field semantics are cross-validated against sidecar
+// ground truth (generatorMetadata[].chatModel.usage matches in 550/550
+// blocks):
+//
+//	UncachedInput = f2 (inputTokens, tokens not served from cache)
+//	TotalOutput   = f3 (outputTokens, includes thinking)
+//	CacheRead     = f5 (cacheReadTokens, absent/zero for cache-miss sessions)
+//
+// No per-field reasoning breakdown is available in gen_metadata;
+// TotalOutput already includes thinking tokens.
+type agTokenBlock struct {
+	UncachedInput int // f2: tokens not served from cache
+	TotalOutput   int // f3: total output including thinking
+	CacheRead     int // f5: cache-read tokens (0 when absent)
+}
+
+// maxPlausibleTokens caps the token values accepted by the heuristic.
+// Other nested messages can coincidentally satisfy field1 ∈ [1000, 5000)
+// while carrying large integers (e.g. a nanosecond latency).
+// No real LLM generation involves more than a few million tokens,
+// so blocks with values above this threshold are treated as false
+// positives and skipped.
+const maxPlausibleTokens = 2_000_000
+
+func extractTokenUsage(data []byte) (agTokenBlock, bool) {
+	fields, err := agProtoParse(data)
+	if err != nil {
+		return agTokenBlock{}, false
+	}
+	var found bool
+	var block agTokenBlock
+	var walk func([]agProtoField)
+	walk = func(fs []agProtoField) {
+		if found {
+			return
+		}
+		if b, ok := tokenBlockFrom(fs); ok {
+			block = b
+			found = true
+			return
+		}
+		for _, f := range fs {
+			if f.Nested != nil {
+				walk(f.Nested)
+			}
+		}
+	}
+	walk(fields)
+	return block, found
+}
+
+// tokenBlockFrom reports whether fs is a plausible token usage block.
+//
+// Field semantics are cross-validated against sidecar ground truth
+// (generatorMetadata[].chatModel.usage matches in 550/550 blocks):
+//
+//	f1 = model-kind varint in [1000, 5000)
+//	f2 = uncached input (inputTokens)
+//	f3 = total output including thinking (outputTokens)
+//	f4 = always 0/absent, ignored
+//	f5 = cache-read (cacheReadTokens, absent when no cache hits)
+//
+// No per-field reasoning breakdown is available in gen_metadata;
+// the reasoning return value is always 0.
+//
+// f2 and f3 are required. f5 is optional: proto3 omits zero-valued
+// fields, and a fresh session with no cache hits omits f5 entirely.
+// Requiring f5 (the previous heuristic) caused the parser to miss
+// token blocks in such sessions, which is why the single-generation
+// June-11 archives all have no extracted block under the old mapping.
+func tokenBlockFrom(fs []agProtoField) (agTokenBlock, bool) {
+	f1, ok1 := agProtoFind(fs, 1)
+	f2, ok2 := agProtoFind(fs, 2)
+	f3, ok3 := agProtoFind(fs, 3)
+	// f5 (cache-read) is optional: proto3 omits zero-valued fields, and
+	// cache-read is absent when a session has no cache hits.
+	f5, hasF5 := agProtoFind(fs, 5)
+
+	if !ok1 || !ok2 || !ok3 ||
+		f1.Wire != pbWireVarint || f2.Wire != pbWireVarint ||
+		f3.Wire != pbWireVarint {
+		return agTokenBlock{}, false
+	}
+	if f1.Varint < 1000 || f1.Varint >= 5000 {
+		return agTokenBlock{}, false
+	}
+	if f2.Varint > maxPlausibleTokens || f3.Varint > maxPlausibleTokens {
+		return agTokenBlock{}, false
+	}
+	// f2 (input) and f3 (output) are independent quantities, but an
+	// implausibly large combined footprint (input + output > cap)
+	// signals a decoy block where both values individually pass the
+	// per-field cap but are collectively implausible for a single
+	// generation.
+	if f2.Varint+f3.Varint > maxPlausibleTokens {
+		return agTokenBlock{}, false
+	}
+	// f4 is consistently absent/zero in real blocks and carries no
+	// semantics. Tolerate its presence but ignore the value.
+	if f4, hasF4 := agProtoFind(fs, 4); hasF4 {
+		if f4.Wire != pbWireVarint || f4.Varint > maxPlausibleTokens {
+			return agTokenBlock{}, false
+		}
+	}
+	if hasF5 {
+		if f5.Wire != pbWireVarint || f5.Varint > maxPlausibleTokens {
+			return agTokenBlock{}, false
+		}
+	}
+
+	block := agTokenBlock{
+		UncachedInput: int(f2.Varint),
+		TotalOutput:   int(f3.Varint),
+	}
+	if hasF5 {
+		block.CacheRead = int(f5.Varint)
+	}
+	return block, true
+}
+
+// extractModelName recursively walks fields to extract the model name from Field 21 or Field 19.
+func extractModelName(data []byte) string {
+	fields, err := agProtoParse(data)
+	if err != nil {
+		return ""
+	}
+	var model string
+	var walk func([]agProtoField)
+	walk = func(fs []agProtoField) {
+		if model != "" {
+			return
+		}
+		if f21, ok := agProtoFind(fs, 21); ok {
+			if s, ok := agProtoString(f21); ok &&
+				isPlausibleModelName(s) {
+				model = s
+				return
+			}
+		}
+		if f19, ok := agProtoFind(fs, 19); ok {
+			if s, ok := agProtoString(f19); ok &&
+				isPlausibleModelName(s) {
+				model = s
+				return
+			}
+		}
+		for _, f := range fs {
+			if f.Nested != nil {
+				walk(f.Nested)
+			}
+		}
+	}
+	walk(fields)
+	return model
+}
+
+// isPlausibleModelName reports whether s looks like a human-readable
+// model identifier. Field 21/19 sometimes carries a nested protobuf
+// message whose low bytes (tags, varints, NULs) are valid UTF-8 --
+// agProtoString cannot tell those apart from text, and the raw bytes
+// previously leaked into messages.model (and broke `pg push`, which
+// rejects NUL bytes). Require every rune to be printable, at least
+// one letter to be present, and a reasonable length (<= 64 chars).
+func isPlausibleModelName(s string) bool {
+	if s == "" || len(s) > 64 {
+		return false
+	}
+	hasLetter := false
+	for _, r := range s {
+		if !unicode.IsPrint(r) {
+			return false
+		}
+		if unicode.IsLetter(r) {
+			hasLetter = true
+		}
+	}
+	return hasLetter
+}
+
 // decodeAntigravityStep extracts a ParsedMessage from one step's
 // protobuf payload. Without an upstream .proto we use heuristics:
-//   - role: step_type 14 has been observed to carry user prompts.
-//     Every other type is rendered as assistant. (TODO: refine
-//     when more sample data is available.)
+//   - role: protobuf field 1 carries CortexStepType when present;
+//     USER_INPUT (14) is user, and PLANNER_RESPONSE (15) plus other
+//     non-user step kinds are assistant.
 //   - content: best-effort human-facing strings found in the
 //     payload tree. Internal ids, local Antigravity config paths,
 //     model placeholders, and duplicate payload echoes are filtered
 //     out. User-input steps prefer a single prompt-like string.
 //   - timestamp: earliest google.protobuf.Timestamp-shaped field.
+//   - tool calls: assistant steps whose payloads contain known tool
+//     name strings emit structured ParsedToolCall entries so that
+//     the timing panel can compute turns, categories, and counts.
 func decodeAntigravityStep(
 	idx, stepType int, payload []byte,
 ) (ParsedMessage, bool) {
-	if len(payload) == 0 {
+	step, ok := newAntigravityStep(idx, stepType, payload)
+	if !ok {
 		return ParsedMessage{}, false
 	}
-	fields, err := agProtoParse(payload)
-	if err != nil || len(fields) == 0 {
+
+	// Extract tool calls for assistant steps before the content guard
+	// so that tool-only steps (no displayable text) are not silently
+	// dropped.
+	var calls []ParsedToolCall
+	if step.role == RoleAssistant {
+		calls = extractAntigravityToolCalls(step.idx, step.fields)
+	}
+
+	strs, urlOnly := cleanAntigravityStepStrings(step)
+
+	// A non-user step whose only displayable content is a URL would
+	// otherwise vanish: the URL noise filter drops it and there are no
+	// tool calls to carry the step. Keep the URL rather than losing the
+	// message. Steps with other prose or a tool call keep the URL
+	// suppressed, since the noise filter still applies there.
+	if len(strs) == 0 && len(calls) == 0 {
+		strs = urlOnly
+	}
+
+	// Emit the message if it has displayable content OR tool calls.
+	// Tool-only assistant steps (empty prose) are valid.
+	if len(strs) == 0 && len(calls) == 0 {
 		return ParsedMessage{}, false
 	}
-	strs := cleanAntigravityStepStrings(
-		dedupeStrings(agProtoCollectStrings(fields, 20)), stepType,
-	)
-	ts := earliestAntigravityTimestamp(fields)
-	if len(strs) == 0 {
-		return ParsedMessage{}, false
-	}
-	role := RoleAssistant
-	if stepType == 14 {
-		role = RoleUser
-	}
+
 	content := strings.Join(strs, "\n\n")
-	return ParsedMessage{
-		Role:          role,
+	msg := ParsedMessage{
+		Role:          step.role,
 		Content:       content,
 		ContentLength: len(content),
-		Timestamp:     ts,
-	}, true
+		Timestamp:     step.timestamp,
+	}
+	if len(calls) > 0 {
+		msg.ToolCalls = calls
+		msg.HasToolUse = true
+	}
+	return msg, true
+}
+
+// knownAntigravityToolNames is the set of tool names that Antigravity
+// actually uses. Only strings present in this set are accepted as tool
+// calls; generic taxonomy matches without a known Antigravity name
+// are rejected. This prevents generic strings like "read", "write",
+// "message", or "process" from being falsely matched.
+var knownAntigravityToolNames = map[string]bool{
+	// Antigravity-specific tools
+	"view_file":                  true,
+	"read_url_content":           true,
+	"replace_file_content":       true,
+	"multi_replace_file_content": true,
+	"write_to_file":              true,
+	"define_subagent":            true,
+	"invoke_subagent":            true,
+	"manage_subagents":           true,
+	"send_message":               true,
+	"manage_task":                true,
+	"ask_permission":             true,
+	"ask_question":               true,
+	"schedule":                   true,
+	"search_web":                 true,
+	"generate_image":             true,
+	// Gemini/Antigravity shared tools (also appear in CLI variant)
+	"run_command":       true,
+	"execute_command":   true,
+	"run_shell_command": true,
+	"grep_search":       true,
+	"search_files":      true,
+	"list_directory":    true,
+	// Known CLI JSON structure tool names
+	"edit_file":  true,
+	"read_file":  true,
+	"write_file": true,
+}
+
+// isAntigravityToolName reports whether s is a known Antigravity tool
+// name. Only strings present in knownAntigravityToolNames are accepted;
+// generic taxonomy matches are rejected.
+func isAntigravityToolName(s string) bool {
+	return knownAntigravityToolNames[s]
+}
+
+// extractAntigravityToolCalls walks the decoded protobuf field tree
+// and returns one ParsedToolCall per tool invocation found. Uses the
+// same heuristic-walker approach as extractTokenUsage / extractModelName:
+// we identify strings that exactly match known tool names, collect any
+// adjacent UUID-like string as the ToolUseID, and any adjacent JSON
+// object string as the InputJSON.
+//
+// When no UUID-like ID is found, a synthetic deterministic ID is
+// generated so the timing pipeline still has a stable key per call.
+//
+// Only strings matching Antigravity-known tool names are accepted.
+func extractAntigravityToolCalls(
+	stepIdx int, fields []agProtoField,
+) []ParsedToolCall {
+	// Collect all string values reachable from this step's field tree.
+	// minLen=1 so we catch even short tool names like "Bash" or "Read".
+	all := agProtoCollectStrings(fields, 1)
+
+	var calls []ParsedToolCall
+	seen := map[string]bool{}
+	for i, s := range all {
+		// Reject generic taxonomy matches that are not known Antigravity tools.
+		if !isAntigravityToolName(s) {
+			continue
+		}
+		cat := NormalizeToolCategory(s)
+
+		// Look for an adjacent UUID-like string to use as ToolUseID.
+		// We scan the neighbouring strings (within a small window on
+		// either side) since the proto walker returns siblings in
+		// encounter order. Prefer following siblings so a flat sequence
+		// of tools doesn't mistakenly pick up previous IDs.
+		toolUseID := ""
+		for _, offset := range []int{1, 2, -1, -2} {
+			j := i + offset
+			if j < 0 || j >= len(all) {
+				continue
+			}
+			// Check for intervening tool names to avoid stealing UUID of another tool call
+			interveningTool := false
+			if offset > 0 {
+				for k := i + 1; k < j; k++ {
+					if isAntigravityToolName(all[k]) {
+						interveningTool = true
+						break
+					}
+				}
+			} else {
+				for k := j + 1; k < i; k++ {
+					if isAntigravityToolName(all[k]) {
+						interveningTool = true
+						break
+					}
+				}
+			}
+			if interveningTool {
+				continue
+			}
+
+			if antigravityUUIDLikeRE.MatchString(all[j]) {
+				toolUseID = all[j]
+				break
+			}
+		}
+
+		// Look for an adjacent JSON-object string to use as InputJSON.
+		inputJSON := ""
+		for _, offset := range []int{1, 2, -1} {
+			j := i + offset
+			if j < 0 || j >= len(all) {
+				continue
+			}
+			// Check for intervening tool names to avoid stealing InputJSON of another tool call
+			interveningTool := false
+			if offset > 0 {
+				for k := i + 1; k < j; k++ {
+					if isAntigravityToolName(all[k]) {
+						interveningTool = true
+						break
+					}
+				}
+			} else {
+				for k := j + 1; k < i; k++ {
+					if isAntigravityToolName(all[k]) {
+						interveningTool = true
+						break
+					}
+				}
+			}
+			if interveningTool {
+				continue
+			}
+
+			if strings.HasPrefix(strings.TrimSpace(all[j]), "{") {
+				inputJSON = all[j]
+				break
+			}
+		}
+
+		// Assign a synthetic ID when no UUID was found in the payload,
+		// using the string index to make each invocation unique.
+		if toolUseID == "" {
+			toolUseID = fmt.Sprintf("ag-step-%d-%d", stepIdx, i)
+		}
+
+		// Avoid emitting duplicate tool hits from the same payload
+		// (the walker may surface the same string via multiple paths).
+		// We deduplicate by tool name + ID + Input JSON to avoid collapsing
+		// multiple distinct invocations of the same tool in one step.
+		// This runs after synthetic-ID assignment so that calls without
+		// adjacent UUIDs still get position-unique keys.
+		dedupKey := s + ":" + toolUseID + ":" + inputJSON
+		if seen[dedupKey] {
+			continue
+		}
+		seen[dedupKey] = true
+
+		calls = append(calls, ParsedToolCall{
+			ToolUseID: toolUseID,
+			ToolName:  s,
+			Category:  cat,
+			InputJSON: inputJSON,
+		})
+	}
+	return calls
 }
 
 func dedupeStrings(in []string) []string {
@@ -276,24 +818,50 @@ func dedupeStrings(in []string) []string {
 	return out
 }
 
-func cleanAntigravityStepStrings(
-	strs []string, stepType int,
-) []string {
-	var cleaned []string
-	for _, s := range strs {
+// cleanAntigravityStepStrings returns the displayable strings for a step
+// and, separately, any bare-URL strings that the non-user noise filter
+// removed. Callers fall back to urlOnly when a step would otherwise have
+// no content, so URL-only assistant messages are not silently dropped.
+func cleanAntigravityStepStrings(step antigravityStep) (cleaned, urlOnly []string) {
+	for _, s := range dedupeStrings(agProtoCollectStrings(step.fields, 20)) {
 		s = strings.TrimSpace(s)
 		if isNoisyAntigravityStepString(s) {
+			continue
+		}
+		if step.role != RoleUser && isNoisyAntigravityNonUserStepString(s) {
 			continue
 		}
 		cleaned = append(cleaned, s)
 	}
 	cleaned = dedupeStrings(cleaned)
-	if stepType == 14 {
-		if prompt := bestAntigravityUserPrompt(cleaned); prompt != "" {
-			return []string{prompt}
+	bareURLs := collectAntigravityBareURLs(step.fields)
+	if step.role == RoleUser {
+		// A short URL-only prompt (e.g. "https://go.dev") falls below the
+		// 20-rune prose threshold, so include bare URLs as prompt
+		// candidates; prose, when present, still outscores a bare link.
+		candidates := append(append([]string{}, cleaned...), bareURLs...)
+		if prompt := bestAntigravityUserPrompt(candidates); prompt != "" {
+			return []string{prompt}, nil
+		}
+		return cleaned, nil
+	}
+	return cleaned, bareURLs
+}
+
+// collectAntigravityBareURLs returns bare-URL strings from the step
+// tree regardless of the 20-rune prose threshold used for general
+// content. Short links such as "https://go.dev" fall below that
+// threshold yet are real assistant content, so a URL-only step needs a
+// dedicated low-threshold pass to survive the content guard.
+func collectAntigravityBareURLs(fields []agProtoField) []string {
+	var out []string
+	for _, s := range agProtoCollectStrings(fields, 1) {
+		s = strings.TrimSpace(s)
+		if isNoisyAntigravityNonUserStepString(s) {
+			out = append(out, s)
 		}
 	}
-	return cleaned
+	return dedupeStrings(out)
 }
 
 func isNoisyAntigravityStepString(s string) bool {
@@ -337,6 +905,17 @@ func isNoisyAntigravityStepString(s string) bool {
 		return true
 	}
 	return false
+}
+
+func isNoisyAntigravityNonUserStepString(s string) bool {
+	if !strings.HasPrefix(s, "http://") &&
+		!strings.HasPrefix(s, "https://") {
+		return false
+	}
+	// Only a bare URL is metadata noise (the target echoed by tool
+	// actions). Assistant prose that merely begins with a link, which
+	// always contains whitespace, is real content and must be kept.
+	return !strings.ContainsAny(s, " \t\n")
 }
 
 func looksLikeAntigravityOpaqueID(s string) bool {

@@ -57,27 +57,30 @@ type messageDirection string
 type markdownDepth string
 
 type sessionFilterInput struct {
-	Project          string           `query:"project" doc:"Filter by project"`
-	ExcludeProject   string           `query:"exclude_project" doc:"Exclude a project"`
-	Machine          string           `query:"machine" doc:"Filter by machine"`
-	Agent            string           `query:"agent" doc:"Filter by agent"`
-	Date             string           `query:"date" format:"date" doc:"Filter to a single YYYY-MM-DD date"`
-	DateFrom         string           `query:"date_from" format:"date" doc:"Filter start date"`
-	DateTo           string           `query:"date_to" format:"date" doc:"Filter end date"`
-	ActiveSince      string           `query:"active_since" format:"date-time" doc:"Filter sessions active since this RFC3339 timestamp"`
-	MinMessages      int              `query:"min_messages" minimum:"0" doc:"Minimum total message count"`
-	MaxMessages      int              `query:"max_messages" minimum:"0" doc:"Maximum total message count"`
-	MinUserMessages  int              `query:"min_user_messages" minimum:"0" doc:"Minimum user message count"`
-	IncludeOneShot   bool             `query:"include_one_shot" doc:"Include one-shot sessions"`
-	IncludeAutomated bool             `query:"include_automated" doc:"Include automated sessions"`
-	IncludeChildren  bool             `query:"include_children" doc:"Include child sessions"`
-	Outcome          string           `query:"outcome" doc:"Filter by detected outcome"`
-	HealthGrade      string           `query:"health_grade" doc:"Filter by health grade"`
-	Cursor           string           `query:"cursor" doc:"Opaque pagination cursor"`
-	Limit            int              `query:"limit" minimum:"0" doc:"Maximum number of results"`
-	Termination      string           `query:"termination" doc:"Filter by termination reason"`
-	MinToolFailures  optionalIntParam `query:"min_tool_failures" minimum:"0" doc:"Minimum tool failure count"`
-	HasSecret        bool             `query:"has_secret" doc:"Filter sessions with secret findings"`
+	Project          string            `query:"project" doc:"Filter by project"`
+	ExcludeProject   string            `query:"exclude_project" doc:"Exclude a project"`
+	Machine          string            `query:"machine" doc:"Filter by machine"`
+	Agent            string            `query:"agent" doc:"Filter by agent"`
+	Date             string            `query:"date" format:"date" doc:"Filter to a single YYYY-MM-DD date"`
+	DateFrom         string            `query:"date_from" format:"date" doc:"Filter start date"`
+	DateTo           string            `query:"date_to" format:"date" doc:"Filter end date"`
+	ActiveSince      string            `query:"active_since" format:"date-time" doc:"Filter sessions active since this RFC3339 timestamp"`
+	MinMessages      int               `query:"min_messages" minimum:"0" doc:"Minimum total message count"`
+	MaxMessages      int               `query:"max_messages" minimum:"0" doc:"Maximum total message count"`
+	MinUserMessages  int               `query:"min_user_messages" minimum:"0" doc:"Minimum user message count"`
+	IncludeOneShot   bool              `query:"include_one_shot" doc:"Include one-shot sessions"`
+	IncludeAutomated bool              `query:"include_automated" doc:"Include automated sessions"`
+	IncludeChildren  bool              `query:"include_children" doc:"Include child sessions"`
+	Outcome          string            `query:"outcome" doc:"Filter by detected outcome"`
+	HealthGrade      string            `query:"health_grade" doc:"Filter by health grade"`
+	Cursor           string            `query:"cursor" doc:"Opaque pagination cursor"`
+	Limit            int               `query:"limit" minimum:"0" doc:"Maximum number of results"`
+	Termination      string            `query:"termination" doc:"Filter by termination reason"`
+	MinToolFailures  optionalIntParam  `query:"min_tool_failures" minimum:"0" doc:"Minimum tool failure count"`
+	HasSecret        bool              `query:"has_secret" doc:"Filter sessions with secret findings"`
+	Starred          bool              `query:"starred" doc:"Filter sessions by starred status"`
+	OrderBy          string            `query:"order_by" default:"recent" doc:"Sort order: a comma-separated list of keys, each optionally suffixed :asc or :desc (e.g. messages:desc,started:asc). A key with no suffix uses the descending param, then its natural direction. Valid keys: recent, started, messages, user-messages, output-tokens, peak-context, failures, retries, edit-churn, compactions, context-pressure, health, secrets, id."`
+	Descending       optionalBoolParam `query:"descending" doc:"Default sort direction for keys in order_by that carry no explicit :asc/:desc suffix"`
 }
 
 type messageListInput struct {
@@ -95,6 +98,9 @@ type searchSessionInput struct {
 func (in *sessionFilterInput) listFilter() (service.ListFilter, error) {
 	if err := validateDateFilterValues(in.Date, in.DateFrom, in.DateTo, in.ActiveSince); err != nil {
 		return service.ListFilter{}, err
+	}
+	if _, err := db.ParseSortSpec(in.OrderBy); err != nil {
+		return service.ListFilter{}, apiError(http.StatusBadRequest, "invalid order_by: "+err.Error())
 	}
 	limit := clampLimit(in.Limit, db.DefaultSessionLimit, db.MaxSessionLimit)
 	filter := service.ListFilter{
@@ -118,6 +124,9 @@ func (in *sessionFilterInput) listFilter() (service.ListFilter, error) {
 		Limit:            limit,
 		Termination:      in.Termination,
 		HasSecret:        in.HasSecret,
+		Starred:          in.Starred,
+		OrderBy:          in.OrderBy,
+		Descending:       optionalBoolValue(in.Descending),
 	}
 	if in.MinToolFailures.IsSet {
 		filter.MinToolFailures = &in.MinToolFailures.Value
@@ -128,6 +137,16 @@ func (in *sessionFilterInput) listFilter() (service.ListFilter, error) {
 func (in *sessionFilterInput) dbFilter(includeChildren bool) (db.SessionFilter, error) {
 	if err := validateDateFilterValues(in.Date, in.DateFrom, in.DateTo, in.ActiveSince); err != nil {
 		return db.SessionFilter{}, err
+	}
+	// The order_by param is shared with the list route via this struct; reject
+	// malformed specs here too (the dropped enum used to guard every route),
+	// even though the sidebar index applies its own ordering and ignores it.
+	if _, err := db.ParseSortSpec(in.OrderBy); err != nil {
+		return db.SessionFilter{}, apiError(http.StatusBadRequest, "invalid order_by: "+err.Error())
+	}
+	limit := 0
+	if in.Limit > 0 {
+		limit = clampLimit(in.Limit, db.DefaultSessionLimit, db.MaxSessionLimit)
 	}
 	return db.SessionFilter{
 		Project:          in.Project,
@@ -144,7 +163,10 @@ func (in *sessionFilterInput) dbFilter(includeChildren bool) (db.SessionFilter, 
 		ExcludeOneShot:   !in.IncludeOneShot,
 		ExcludeAutomated: !in.IncludeAutomated,
 		IncludeChildren:  includeChildren,
+		Cursor:           in.Cursor,
+		Limit:            limit,
 		Termination:      in.Termination,
+		Starred:          in.Starred,
 	}, nil
 }
 
@@ -176,6 +198,9 @@ func (s *Server) humaSidebarSessionIndex(
 	}
 	index, err := s.db.GetSidebarSessionIndex(ctx, filter)
 	if err != nil {
+		if errors.Is(err, db.ErrInvalidCursor) {
+			return nil, apiError(http.StatusBadRequest, "invalid cursor")
+		}
 		return nil, serverError(err)
 	}
 	return &jsonOutput[db.SidebarSessionIndex]{Body: index}, nil
@@ -273,6 +298,7 @@ type sessionUsageResponse struct {
 	HasTokenData      bool     `json:"has_token_data"`
 	CostUSD           float64  `json:"cost_usd"`
 	HasCost           bool     `json:"has_cost"`
+	AICredits         float64  `json:"ai_credits,omitempty"`
 	Models            []string `json:"models"`
 	UnpricedModels    []string `json:"unpriced_models"`
 	ServerRunning     bool     `json:"server_running"`
@@ -310,6 +336,7 @@ func newSessionUsageHumaResponse(usage *db.SessionUsage) sessionUsageResponse {
 		HasTokenData:      usage.HasTokenData,
 		CostUSD:           usage.CostUSD,
 		HasCost:           usage.HasCost,
+		AICredits:         usage.AICredits,
 		Models:            usage.Models,
 		UnpricedModels:    unpricedModels,
 		ServerRunning:     true,
@@ -381,6 +408,11 @@ type openSessionResponse struct {
 	Launched bool   `json:"launched"`
 	Opener   string `json:"opener"`
 	Path     string `json:"path"`
+}
+
+type publishSessionInput struct {
+	ID     string `path:"id" required:"true" doc:"Session ID"`
+	Secret bool   `query:"secret" doc:"Create a secret gist instead of a public one"`
 }
 
 type publishResponse struct {
@@ -470,7 +502,7 @@ func (s *Server) humaOpenSession(
 
 func (s *Server) humaPublishSession(
 	ctx context.Context,
-	in *idPathInput,
+	in *publishSessionInput,
 ) (*jsonOutput[publishResponse], error) {
 	token := s.githubToken()
 	if token == "" {
@@ -487,7 +519,7 @@ func (s *Server) humaPublishSession(
 		first = truncateStr(*session.FirstMessage, 100)
 	}
 	description := fmt.Sprintf("Agent session: %s - %s", session.Project, first)
-	gist, err := createGist(ctx, token, filename, description, htmlContent)
+	gist, err := createGist(ctx, token, filename, description, htmlContent, !in.Secret)
 	if err != nil {
 		return nil, apiError(http.StatusBadGateway, err.Error())
 	}
@@ -534,6 +566,7 @@ func (s *Server) humaRenameSession(
 		}
 		return nil, internalError("rename session", err)
 	}
+
 	updated, err := s.db.GetSession(ctx, in.ID)
 	if err != nil {
 		return nil, internalError("rename session readback", err)
@@ -756,7 +789,7 @@ func (s *Server) humaEvents(
 	_ context.Context,
 	_ *emptyInput,
 ) (*huma.StreamResponse, error) {
-	if s.engine == nil || s.broadcaster == nil {
+	if s.broadcaster == nil {
 		return nil, huma.ErrorWithHeaders(
 			apiError(http.StatusServiceUnavailable, "events not available in this mode"),
 			http.Header{"Retry-After": []string{"300"}},

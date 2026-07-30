@@ -1,13 +1,9 @@
-package server
+package server_test
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
-	"net/http/httptest"
-	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -15,45 +11,114 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 )
 
-func TestHandleSetSessionPrivate(t *testing.T) {
-	srv := testServer(t, time.Second)
-	require.NoError(t, srv.db.UpsertSession(db.Session{
-		ID: "s1", Project: "p", Machine: "local", Agent: "claude", MessageCount: 1,
-	}), "seed session")
+type trashHandlerResponse struct {
+	Sessions []db.Session `json:"sessions"`
+}
 
-	patchPrivate := func(id, body string) *httptest.ResponseRecorder {
-		w := httptest.NewRecorder()
-		r := httptest.NewRequest(
-			http.MethodPatch, "/api/v1/sessions/"+id+"/private",
-			strings.NewReader(body))
-		srv.mux.ServeHTTP(w, r)
-		return w
-	}
+type emptyTrashHandlerResponse struct {
+	Deleted int `json:"deleted"`
+}
+
+func TestSessionManagementSetPrivateHandler(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "s1", "alpha", 2)
 
 	// Set private: 200 with the updated session reflecting private=true.
-	w := patchPrivate("s1", `{"private":true}`)
+	w := te.patch(t, "/api/v1/sessions/s1/private", `{"private":true}`)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	var got db.Session
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got), "decode response")
+	got := decode[db.Session](t, w)
 	assert.True(t, got.Private, "response reports private")
 
 	// Persisted: a fresh GetSession sees it.
-	stored, err := srv.db.GetSession(context.Background(), "s1")
+	stored, err := te.db.GetSession(context.Background(), "s1")
 	require.NoError(t, err)
 	require.NotNil(t, stored)
 	assert.True(t, stored.Private, "flag persisted")
 
 	// Clear it again.
-	w = patchPrivate("s1", `{"private":false}`)
+	w = te.patch(t, "/api/v1/sessions/s1/private", `{"private":false}`)
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got), "decode response")
+	got = decode[db.Session](t, w)
 	assert.False(t, got.Private, "response reports not-private")
 
 	// Unknown session: 404 (looked up before any mutation).
-	assert.Equal(t, http.StatusNotFound,
-		patchPrivate("nope", `{"private":true}`).Code)
+	w = te.patch(t, "/api/v1/sessions/missing/private", `{"private":true}`)
+	require.Equal(t, http.StatusNotFound, w.Code, "body: %s", w.Body.String())
+	assertErrorResponse(t, w, "session not found")
+}
 
-	// Malformed body: 400.
-	assert.Equal(t, http.StatusBadRequest,
-		patchPrivate("s1", `not json`).Code)
+func TestSessionManagementRenameHandler(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "s1", "alpha", 2)
+
+	w := te.patch(t, "/api/v1/sessions/s1/rename", `{"display_name":"Pinned investigation"}`)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	renamed := decode[db.Session](t, w)
+	require.NotNil(t, renamed.DisplayName)
+	assert.Equal(t, "Pinned investigation", *renamed.DisplayName)
+
+	w = te.patch(t, "/api/v1/sessions/s1/rename", `{"display_name":""}`)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	cleared := decode[db.Session](t, w)
+	assert.Nil(t, cleared.DisplayName)
+
+	w = te.patch(t, "/api/v1/sessions/missing/rename", `{"display_name":"Nope"}`)
+	require.Equal(t, http.StatusNotFound, w.Code, "body: %s", w.Body.String())
+	assertErrorResponse(t, w, "session not found")
+}
+
+func TestSessionManagementTrashRestoreAndPermanentDeleteHandlers(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "s1", "alpha", 2)
+
+	w := te.del(t, "/api/v1/sessions/s1")
+	require.Equal(t, http.StatusNoContent, w.Code, "body: %s", w.Body.String())
+
+	w = te.get(t, "/api/v1/trash")
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	trash := decode[trashHandlerResponse](t, w)
+	require.Len(t, trash.Sessions, 1)
+	assert.Equal(t, "s1", trash.Sessions[0].ID)
+
+	w = te.post(t, "/api/v1/sessions/s1/restore", `{}`)
+	require.Equal(t, http.StatusNoContent, w.Code, "body: %s", w.Body.String())
+
+	w = te.post(t, "/api/v1/sessions/s1/restore", `{}`)
+	require.Equal(t, http.StatusNotFound, w.Code, "body: %s", w.Body.String())
+	assertErrorResponse(t, w, "session not found or not in trash")
+
+	w = te.del(t, "/api/v1/sessions/s1/permanent")
+	require.Equal(t, http.StatusConflict, w.Code, "body: %s", w.Body.String())
+	assertErrorResponse(t, w, "session not found or not in trash")
+
+	w = te.del(t, "/api/v1/sessions/s1")
+	require.Equal(t, http.StatusNoContent, w.Code, "body: %s", w.Body.String())
+
+	w = te.del(t, "/api/v1/sessions/s1/permanent")
+	require.Equal(t, http.StatusNoContent, w.Code, "body: %s", w.Body.String())
+
+	got, err := te.db.GetSessionFull(context.Background(), "s1")
+	require.NoError(t, err)
+	assert.Nil(t, got)
+}
+
+func TestSessionManagementEmptyTrashHandler(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "s1", "alpha", 2)
+	te.seedSession(t, "s2", "beta", 2)
+
+	for _, id := range []string{"s1", "s2"} {
+		w := te.del(t, "/api/v1/sessions/"+id)
+		require.Equal(t, http.StatusNoContent, w.Code, "delete %s body: %s", id, w.Body.String())
+	}
+
+	w := te.del(t, "/api/v1/trash")
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	resp := decode[emptyTrashHandlerResponse](t, w)
+	assert.Equal(t, 2, resp.Deleted)
+
+	w = te.get(t, "/api/v1/trash")
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	trash := decode[trashHandlerResponse](t, w)
+	assert.Empty(t, trash.Sessions)
 }

@@ -121,6 +121,66 @@ func TestStoreGetDailyUsageWithBreakdowns(t *testing.T) {
 	assert.Len(t, day.AgentBreakdowns, 2)
 	assert.Len(t, day.ModelBreakdowns, 2)
 	assert.Greater(t, day.TotalCost, 0.0)
+
+	noCounts, err := store.GetDailyUsage(ctx, db.UsageFilter{
+		From:              "2026-03-12",
+		To:                "2026-03-12",
+		Timezone:          "UTC",
+		SkipSessionCounts: true,
+	})
+	require.NoError(t, err, "GetDailyUsage skip session counts")
+	assert.Equal(t, result.Totals.InputTokens, noCounts.Totals.InputTokens)
+	assert.Zero(t, noCounts.SessionCounts.Total)
+	assert.Nil(t, noCounts.SessionCounts.ByProject)
+	assert.Nil(t, noCounts.SessionCounts.ByAgent)
+}
+
+func TestStoreGetDailyUsageDedupesBySourceUUIDWhenClaudePairIncomplete(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_usage_source_uuid_daily_test")
+
+	ctx := context.Background()
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO model_pricing (
+			model_pattern, input_per_mtok, output_per_mtok,
+			cache_creation_per_mtok, cache_read_per_mtok, updated_at
+		) VALUES ('test-model-source-daily', 1, 2, 3, 0.5, 'seed')`)
+	require.NoError(t, err, "insert pricing")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at,
+			message_count, user_message_count
+		) VALUES
+			('usage-source-daily-001', 'test-machine', 'proj-a', 'claude',
+			 '2026-03-12T10:00:00Z'::timestamptz, 1, 1),
+			('usage-source-daily-002', 'test-machine', 'proj-b', 'claude',
+			 '2026-03-12T10:01:00Z'::timestamptz, 1, 1)`)
+	require.NoError(t, err, "insert sessions")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO messages (
+			session_id, ordinal, role, content, timestamp, content_length,
+			model, token_usage, claude_message_id, claude_request_id, source_uuid
+		) VALUES
+			('usage-source-daily-001', 0, 'assistant', 'one',
+			 '2026-03-12T10:00:00Z'::timestamptz, 3,
+			 'test-model-source-daily',
+			 '{"input_tokens":1000000,"output_tokens":500000,"cache_creation_input_tokens":250000,"cache_read_input_tokens":250000}',
+			 'msg-1', '', 'source-1'),
+			('usage-source-daily-002', 0, 'assistant', 'two',
+			 '2026-03-12T10:01:00Z'::timestamptz, 3,
+			 'test-model-source-daily',
+			 '{"input_tokens":1000000,"output_tokens":500000,"cache_creation_input_tokens":250000,"cache_read_input_tokens":250000}',
+			 'msg-1', '', 'source-1')`)
+	require.NoError(t, err, "insert messages")
+
+	result, err := store.GetDailyUsage(ctx, db.UsageFilter{
+		From:     "2026-03-12",
+		To:       "2026-03-12",
+		Timezone: "UTC",
+	})
+	require.NoError(t, err, "GetDailyUsage")
+	require.Len(t, result.Daily, 1)
+	assert.Equal(t, 1000000, result.Daily[0].InputTokens)
+	assert.Equal(t, 500000, result.Daily[0].OutputTokens)
 }
 
 func TestStoreGetSessionUsagePricedModel(t *testing.T) {
@@ -170,6 +230,48 @@ func TestStoreGetSessionUsagePricedModel(t *testing.T) {
 	assert.InDelta(t, 0.01134, got.CostUSD, 1e-9)
 	assert.Equal(t, []string{"gpt-5.1"}, got.Models)
 	assert.Empty(t, got.UnpricedModels)
+}
+
+func TestStoreGetSessionUsageDedupesSourceUUIDWhenClaudePairIncomplete(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_session_usage_source_uuid_test")
+
+	ctx := context.Background()
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO model_pricing (
+			model_pattern, input_per_mtok, output_per_mtok,
+			cache_creation_per_mtok, cache_read_per_mtok, updated_at
+		) VALUES ('claude-opus-4-6', 5, 25, 6.25, 0.5, 'seed')`)
+	require.NoError(t, err, "insert pricing")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at,
+			message_count, user_message_count
+		) VALUES (
+			'claude:usage-source', 'test-machine', 'proj', 'claude-code',
+			'2026-03-12T10:00:00Z'::timestamptz, 2, 1
+		)`)
+	require.NoError(t, err, "insert session")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO messages (
+			session_id, ordinal, role, content, timestamp, content_length,
+			model, token_usage, claude_message_id, claude_request_id, source_uuid
+		) VALUES
+			('claude:usage-source', 0, 'assistant', 'one',
+			 '2026-03-12T10:00:00Z'::timestamptz, 3,
+			 'claude-opus-4-6', '{"input_tokens":1000,"output_tokens":500}',
+			 'msg-1', '', 'source-1'),
+			('claude:usage-source', 1, 'assistant', 'two',
+			 '2026-03-12T10:01:00Z'::timestamptz, 3,
+			 'claude-opus-4-6', '{"input_tokens":1000,"output_tokens":500}',
+			 'msg-1', '', 'source-1')`)
+	require.NoError(t, err, "insert messages")
+
+	got, err := store.GetSessionUsage(ctx, "claude:usage-source")
+	require.NoError(t, err, "GetSessionUsage")
+	require.NotNil(t, got, "GetSessionUsage result")
+	assert.True(t, got.HasCost)
+	assert.InDelta(t, 0.0175, got.CostUSD, 1e-9)
+	assert.Equal(t, []string{"claude-opus-4-6"}, got.Models)
 }
 
 func TestStoreGetSessionUsageNoTokenRowsKeepsMetadata(t *testing.T) {
@@ -250,6 +352,49 @@ func TestStoreGetTopSessionsByCostDedupesClaudeKeys(t *testing.T) {
 	assert.Equal(t, "usage-top-001", top[0].SessionID)
 }
 
+func TestStoreGetTopSessionsByCostDedupesSourceUUIDFallback(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_usage_top_source_uuid_test")
+
+	ctx := context.Background()
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO model_pricing (
+			model_pattern, input_per_mtok, output_per_mtok,
+			cache_creation_per_mtok, cache_read_per_mtok, updated_at
+		) VALUES ('test-model-top-source', 1, 0, 0, 0, 'seed')`)
+	require.NoError(t, err, "insert pricing")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at,
+			message_count, user_message_count
+		) VALUES
+			('usage-top-source-001', 'test-machine', 'proj-a', 'claude',
+			 '2026-03-12T10:00:00Z'::timestamptz, 1, 1),
+			('usage-top-source-002', 'test-machine', 'proj-b', 'claude',
+			 '2026-03-12T10:01:00Z'::timestamptz, 1, 1)`)
+	require.NoError(t, err, "insert sessions")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO messages (
+			session_id, ordinal, role, content, timestamp, content_length,
+			model, token_usage, claude_message_id, claude_request_id, source_uuid
+		) VALUES
+			('usage-top-source-001', 0, 'assistant', 'one',
+			 '2026-03-12T10:00:00Z'::timestamptz, 3,
+			 'test-model-top-source', '{"input_tokens":1000000}', 'msg-1', '', 'source-1'),
+			('usage-top-source-002', 0, 'assistant', 'two',
+			 '2026-03-12T10:01:00Z'::timestamptz, 3,
+			 'test-model-top-source', '{"input_tokens":1000000}', 'msg-1', '', 'source-1')`)
+	require.NoError(t, err, "insert messages")
+
+	top, err := store.GetTopSessionsByCost(ctx, db.UsageFilter{
+		From:     "2026-03-12",
+		To:       "2026-03-12",
+		Timezone: "UTC",
+	}, 20)
+	require.NoError(t, err, "GetTopSessionsByCost")
+	require.Len(t, top, 1)
+	assert.Equal(t, "usage-top-source-001", top[0].SessionID)
+}
+
 func TestStoreGetUsageSessionCountsDedupesClaudeKeys(t *testing.T) {
 	_, store := prepareUsageSchema(t, "agentsview_usage_counts_test")
 
@@ -275,6 +420,45 @@ func TestStoreGetUsageSessionCountsDedupesClaudeKeys(t *testing.T) {
 			('usage-counts-002', 0, 'assistant', 'two',
 			 '2026-03-12T10:01:00Z'::timestamptz, 3,
 			 'test-model-counts', '{"input_tokens":1}', 'msg-1', 'req-1')`)
+	require.NoError(t, err, "insert messages")
+
+	counts, err := store.GetUsageSessionCounts(ctx, db.UsageFilter{
+		From:     "2026-03-12",
+		To:       "2026-03-12",
+		Timezone: "UTC",
+	})
+	require.NoError(t, err, "GetUsageSessionCounts")
+	assert.Equal(t, 1, counts.Total)
+	assert.Equal(t, 1, counts.ByProject["proj-a"])
+	_, ok := counts.ByProject["proj-b"]
+	assert.False(t, ok, "proj-b should have been deduped out: %#v", counts.ByProject)
+}
+
+func TestStoreGetUsageSessionCountsDedupesSourceUUIDFallback(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_usage_counts_source_uuid_test")
+
+	ctx := context.Background()
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at,
+			message_count, user_message_count
+		) VALUES
+			('usage-counts-source-001', 'test-machine', 'proj-a', 'claude',
+			 '2026-03-12T10:00:00Z'::timestamptz, 1, 1),
+			('usage-counts-source-002', 'test-machine', 'proj-b', 'claude',
+			 '2026-03-12T10:01:00Z'::timestamptz, 1, 1)`)
+	require.NoError(t, err, "insert sessions")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO messages (
+			session_id, ordinal, role, content, timestamp, content_length,
+			model, token_usage, claude_message_id, claude_request_id, source_uuid
+		) VALUES
+			('usage-counts-source-001', 0, 'assistant', 'one',
+			 '2026-03-12T10:00:00Z'::timestamptz, 3,
+			 'test-model-counts', '{"input_tokens":1}', 'msg-1', '', 'source-1'),
+			('usage-counts-source-002', 0, 'assistant', 'two',
+			 '2026-03-12T10:01:00Z'::timestamptz, 3,
+			 'test-model-counts', '{"input_tokens":1}', 'msg-1', '', 'source-1')`)
 	require.NoError(t, err, "insert messages")
 
 	counts, err := store.GetUsageSessionCounts(ctx, db.UsageFilter{
@@ -442,4 +626,63 @@ func TestPushFallsBackToBuiltinPricingWhenLocalTableEmpty(t *testing.T) {
 	joined := strings.Join(models, ",")
 	assert.Contains(t, joined, "claude-sonnet-4-20250514",
 		"fallback pricing not synced")
+}
+
+func TestStoreGetSessionUsage_CopilotAICreditsComputed(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_copilot_credits_test")
+
+	ctx := context.Background()
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at,
+			message_count, user_message_count
+		) VALUES (
+			'copilot:s1', 'test-machine', 'proj', 'copilot',
+			'2026-03-12T10:00:00Z'::timestamptz, 1, 1
+		)`)
+	require.NoError(t, err, "insert session")
+
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO usage_events (
+			session_id, source, model, input_tokens, output_tokens, cost_usd, occurred_at
+		) VALUES (
+			'copilot:s1', 'api', 'gpt-4', 1000, 500, 0.10, '2026-03-12T10:00:00Z'::timestamptz
+		)`)
+	require.NoError(t, err, "insert usage event")
+
+	u, err := store.GetSessionUsage(ctx, "copilot:s1")
+	require.NoError(t, err, "GetSessionUsage")
+	require.NotNil(t, u, "usage is nil")
+	assert.True(t, u.HasCost, "HasCost")
+	assert.Equal(t, 0.10, u.CostUSD, "CostUSD")
+	assert.Equal(t, 10.0, u.AICredits, "AICredits")
+}
+
+func TestStoreGetSessionUsage_CopilotNoAICreditsUnpriced(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_copilot_unpriced_test")
+
+	ctx := context.Background()
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at,
+			message_count, user_message_count
+		) VALUES (
+			'copilot:s2', 'test-machine', 'proj', 'copilot',
+			'2026-03-12T10:00:00Z'::timestamptz, 1, 1
+		)`)
+	require.NoError(t, err, "insert session")
+
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO usage_events (
+			session_id, source, model, input_tokens, output_tokens, occurred_at
+		) VALUES (
+			'copilot:s2', 'api', 'local-model', 1000, 500, '2026-03-12T10:00:00Z'::timestamptz
+		)`)
+	require.NoError(t, err, "insert usage event")
+
+	u, err := store.GetSessionUsage(ctx, "copilot:s2")
+	require.NoError(t, err, "GetSessionUsage")
+	require.NotNil(t, u, "usage is nil")
+	assert.False(t, u.HasCost, "HasCost should be false")
+	assert.Equal(t, 0.0, u.AICredits, "AICredits should be 0 when unpriced")
 }

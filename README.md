@@ -4,7 +4,7 @@ Browse, search, and track costs across all your AI coding agents. One binary, no
 accounts, everything local.
 
 <p align="center">
-  <img src="https://agentsview.io/screenshots/dashboard.png" alt="Analytics dashboard" width="720">
+  <img src="https://agentsview.io/assets/generated/screenshots/dashboard.png" alt="Analytics dashboard" width="720">
 </p>
 
 ## About this fork
@@ -61,13 +61,29 @@ docker run --rm -p 127.0.0.1:8080:8080 \
 ## Quick Start
 
 ```bash
-agentsview serve           # start server, open web UI
-agentsview usage daily     # print daily cost summary
+agentsview serve               # start foreground server
+agentsview serve --background  # start server and return to the shell
+agentsview serve status        # show whether a server is running
+agentsview serve stop          # stop the running server
+agentsview session list        # read from the daemon if warm, otherwise SQLite
+agentsview usage daily         # print daily cost summary
 ```
 
 On first run, agentsview discovers sessions from every supported agent on your
-machine, syncs them into a local SQLite database, and opens a web UI at
+machine, syncs them into a local SQLite database, and serves a web UI at
 `http://127.0.0.1:8080`.
+
+The desktop app and freshness-sensitive CLI commands share a detached local
+daemon. Read-only CLI commands attach to it when it is already running, but fall
+back to direct read-only SQLite on a cold archive so one-off scripts stay fast.
+Commands that need fresh data or need to write, such as `sync`, `usage`,
+`token-use`, `pg push`, and `duckdb push`, auto-start the daemon when needed.
+
+Use `agentsview serve --background` when you want to start the daemon
+explicitly. The command prints the server URL, process ID, and log path
+(`~/.agentsview/serve.log`). Check on it with `agentsview serve status` and shut
+it down with `agentsview serve stop`. Background daemons self-exit after an idle
+period unless a client request or daemon-owned job is active.
 
 ## Remote / forwarded access
 
@@ -126,6 +142,46 @@ docker run --rm -p 127.0.0.1:8080:8080 \
   -e AGENTSVIEW_PG_URL='postgres://user:password@postgres.example.com:5432/agentsview?sslmode=require' \
   ghcr.io/kenn-io/agentsview:latest
 ```
+
+Example DuckDB mirror startup:
+
+```bash
+# Populate /data/sessions.duckdb from the mounted SQLite archive.
+docker run --rm \
+  -v agentsview-data:/data \
+  -v "$HOME/.claude/projects:/agents/claude:ro" \
+  -e CLAUDE_PROJECTS_DIR=/agents/claude \
+  ghcr.io/kenn-io/agentsview:latest duckdb push --full
+
+# Serve the populated mirror read-only.
+docker run --rm -p 127.0.0.1:8080:8080 \
+  -v agentsview-data:/data \
+  ghcr.io/kenn-io/agentsview:latest duckdb serve
+```
+
+Example Quack startup:
+
+```bash
+# Expose the local DuckDB mirror over Quack from the host/container.
+QUACK_TOKEN="$(openssl rand -base64 32)"
+docker run --rm -p 127.0.0.1:9494:9494 \
+  -v agentsview-data:/data \
+  ghcr.io/kenn-io/agentsview:latest \
+  duckdb quack serve \
+    --bind quack:0.0.0.0:9494 \
+    --token "$QUACK_TOKEN" \
+    --allow-insecure
+
+# Serve the web UI from a remote Quack endpoint.
+docker run --rm -p 127.0.0.1:8080:8080 \
+  -e AGENTSVIEW_DUCKDB_URL='quack:https://duckdb.example.com' \
+  -e AGENTSVIEW_DUCKDB_TOKEN="$QUACK_TOKEN" \
+  ghcr.io/kenn-io/agentsview:latest duckdb serve
+```
+
+Keep Quack on loopback or behind TLS. Plain HTTP Quack on a non-loopback bind
+requires `--allow-insecure` and should only be used behind a trusted tunnel or
+reverse proxy.
 
 ## Token Usage and Cost Tracking
 
@@ -223,13 +279,13 @@ agentsview stats --include-git-outcomes
 
 ## Session Browser
 
-| Dashboard                                                     | Session viewer                                                          |
-| ------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| ![Dashboard](https://agentsview.io/screenshots/dashboard.png) | ![Session viewer](https://agentsview.io/screenshots/message-viewer.png) |
+| Dashboard                                                                      | Session viewer                                                                           |
+| ------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| ![Dashboard](https://agentsview.io/assets/generated/screenshots/dashboard.png) | ![Session viewer](https://agentsview.io/assets/generated/screenshots/message-viewer.png) |
 
-| Search                                                          | Activity heatmap                                          |
-| --------------------------------------------------------------- | --------------------------------------------------------- |
-| ![Search](https://agentsview.io/screenshots/search-results.png) | ![Heatmap](https://agentsview.io/screenshots/heatmap.png) |
+| Search                                                                           | Activity heatmap                                                           |
+| -------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| ![Search](https://agentsview.io/assets/generated/screenshots/search-results.png) | ![Heatmap](https://agentsview.io/assets/generated/screenshots/heatmap.png) |
 
 - **Full-text search** across all message content (FTS5)
 - **Token usage and cost dashboard** -- per-session and per-model cost
@@ -245,43 +301,78 @@ agentsview stats --include-git-outcomes
 
 agentsview auto-discovers sessions from all of these:
 
-| Agent              | Session Directory                                      |
-| ------------------ | ------------------------------------------------------ |
-| Claude Code        | `~/.claude/projects/`                                  |
-| Codex              | `~/.codex/sessions/`                                   |
-| Copilot CLI        | `~/.copilot/`                                          |
-| Gemini CLI         | `~/.gemini/`                                           |
-| OpenCode           | `~/.local/share/opencode/`                             |
-| OpenHands CLI      | `~/.openhands/conversations/`                          |
-| Cursor             | `~/.cursor/projects/`                                  |
-| Amp                | `~/.local/share/amp/threads/`                          |
-| iFlow              | `~/.iflow/projects/`                                   |
-| Zencoder           | `~/.zencoder/sessions/`                                |
-| VSCode Copilot     | `~/Library/Application Support/Code/User/` (macOS)     |
-| Pi                 | `~/.pi/agent/sessions/`                                |
-| Qwen Code          | `~/.qwen/projects/`                                    |
-| OpenClaw           | `~/.openclaw/agents/`                                  |
-| QClaw              | `~/.qclaw/agents/`                                     |
-| Kimi               | `~/.kimi/sessions/`                                    |
-| Kiro CLI           | `~/.kiro/sessions/cli/`, `~/.local/share/kiro-cli/`    |
-| Kiro IDE           | `~/Library/Application Support/Kiro/` (macOS)          |
-| Cortex Code        | `~/.snowflake/cortex/conversations/`                   |
-| Hermes Agent       | `~/.hermes/sessions/`                                  |
-| WorkBuddy          | `~/.workbuddy/projects/`                               |
-| Forge              | `~/.forge/`                                            |
-| Piebald            | `~/.local/share/piebald/`                              |
-| Warp               | `~/.warp/` (platform-dependent)                        |
-| Positron Assistant | `~/Library/Application Support/Positron/User/` (macOS) |
-| Antigravity        | `~/.gemini/antigravity/`                               |
-| Antigravity CLI    | `~/.gemini/antigravity-cli/` (see note below)          |
+| Agent                 | Session Directory                                                                                                                                                       |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Aider                 | `<repo>/.aider.chat.history.md` (per repo; bounded scan of `~`, set `AIDER_DIR` to scope)                                                                               |
+| Amp                   | `~/.local/share/amp/threads/`                                                                                                                                           |
+| Antigravity           | `~/.gemini/antigravity/`                                                                                                                                                |
+| Antigravity CLI       | `~/.gemini/antigravity-cli/` (see note below)                                                                                                                           |
+| Claude Code           | `~/.claude/projects/`                                                                                                                                                   |
+| Claude Cowork         | `~/Library/Application Support/Claude/local-agent-mode-sessions/` (macOS)                                                                                               |
+| Codex                 | `~/.codex/sessions/`                                                                                                                                                    |
+| Copilot CLI           | `~/.copilot/`                                                                                                                                                           |
+| Cortex Code           | `~/.snowflake/cortex/conversations/`                                                                                                                                    |
+| Cursor                | `~/.cursor/projects/`                                                                                                                                                   |
+| DeepSeek TUI          | `~/.codewhale/sessions/`, `~/.deepseek/sessions/`                                                                                                                       |
+| Forge                 | `~/.forge/`                                                                                                                                                             |
+| Gemini CLI            | `~/.gemini/`                                                                                                                                                            |
+| gptme                 | `~/.local/share/gptme/logs/`                                                                                                                                            |
+| Hermes Agent          | `~/.hermes/sessions/`                                                                                                                                                   |
+| iFlow                 | `~/.iflow/projects/`                                                                                                                                                    |
+| Kilo                  | `~/.local/share/kilo/`                                                                                                                                                  |
+| Kimi                  | `~/.kimi/sessions/`                                                                                                                                                     |
+| Kiro CLI              | `~/.kiro/sessions/cli/`, `~/.local/share/kiro-cli/`                                                                                                                     |
+| Kiro IDE              | `~/Library/Application Support/Kiro/` (macOS)                                                                                                                           |
+| MiMoCode              | `~/.local/share/mimocode/`                                                                                                                                              |
+| Mistral Vibe          | `~/.vibe/logs/session/`                                                                                                                                                 |
+| OpenClaw              | `~/.openclaw/agents/`                                                                                                                                                   |
+| OpenCode              | `~/.local/share/opencode/`                                                                                                                                              |
+| OpenHands CLI         | `~/.openhands/conversations/`                                                                                                                                           |
+| OhMyPi                | `~/.omp/agent/sessions/`                                                                                                                                                |
+| Pi                    | `~/.pi/agent/sessions/`                                                                                                                                                 |
+| Piebald               | `~/.local/share/piebald/`                                                                                                                                               |
+| Positron Assistant    | `~/Library/Application Support/Positron/User/` (macOS)                                                                                                                  |
+| QClaw                 | `~/.qclaw/agents/`                                                                                                                                                      |
+| Qwen Code             | `~/.qwen/projects/`                                                                                                                                                     |
+| QwenPaw               | `~/.copaw/workspaces/`, `~/.qwenpaw/workspaces/`                                                                                                                        |
+| Reasonix              | `~/.reasonix/`, `%APPDATA%\\reasonix\\` (Windows)                                                                                                                       |
+| VSCode Copilot        | `~/Library/Application Support/Code/User/` (macOS)                                                                                                                      |
+| Visual Studio Copilot | `%LOCALAPPDATA%\\Temp\\VSGitHubCopilotLogs\\traces\\` (Windows), `~/Library/Caches/VSGitHubCopilotLogs/traces/` (macOS), `~/.cache/VSGitHubCopilotLogs/traces/` (Linux) |
+| Warp                  | `~/.warp/` (platform-dependent)                                                                                                                                         |
+| WorkBuddy             | `~/.workbuddy/projects/`                                                                                                                                                |
+| Zed                   | `~/Library/Application Support/Zed/` (macOS)                                                                                                                            |
+| Zencoder              | `~/.zencoder/sessions/`                                                                                                                                                 |
 
 Each directory can be overridden with an environment variable. See the
 [configuration docs](https://agentsview.io/configuration/) for details.
 
+### Aider: per-repo Markdown logs
+
+Aider has no central session store; it writes one `.aider.chat.history.md`
+Markdown log per repository, and one log accumulates many runs (one per `aider`
+launch, delimited by `# aider chat started at ...` headers). agentsview indexes
+**each run as its own session**.
+
+Discovery is a bounded, symlink-safe walk of your home directory: it descends at
+most four levels below `~`, skips vendor/build/VCS directories by name
+(`node_modules`, `target`, `.git`, `Library`, `go`, `.cargo`, and similar), and
+stops after a two-second wall-clock budget so a large home tree cannot stall the
+scan. **A repository whose `.aider.chat.history.md` sits more than four levels
+under `~`, or outside your home directory, will not be found by the default
+scan.** Point `AIDER_DIR` (or the `aider_dirs` config key) at that code root to
+index it and to scope and speed up the walk. The live file watcher only watches
+the home root shallowly (registering it recursively would inotify the entire
+home tree); new repos are picked up by the periodic sync, which runs every 15
+minutes.
+
+Because the format is Markdown-derived, roles are reconstructed from line
+prefixes and there are no per-message timestamps; a run's start time comes from
+its `# aider chat started at ...` header (written in local time, assumed UTC).
+
 ### Antigravity CLI: high-resolution transcripts
 
-Antigravity CLI sessions now appear in two on-disk formats. Newer releases
-store conversation trajectories as SQLite `.db` files, which agentsview indexes
+Antigravity CLI sessions now appear in two on-disk formats. Newer releases store
+conversation trajectories as SQLite `.db` files, which agentsview indexes
 directly. Older releases stored assistant turns and tool calls in
 AES-GCM-encrypted `.pb` files; for those sessions, agentsview falls back to
 **summary mode** using your prompts from `history.jsonl` plus any plain-text
@@ -324,10 +415,9 @@ agentsview pg serve      # serve web UI from PG (read-only)
 
 ### Automatic push (background service)
 
-To keep a shared PostgreSQL database current without running `pg push` by
-hand, run the auto-push daemon. It watches your session directories and
-pushes shortly after new sessions are recorded, with a periodic floor as a
-safety net:
+To keep a shared PostgreSQL database current without running `pg push` by hand,
+run the auto-push daemon. It watches your session directories and pushes shortly
+after new sessions are recorded, with a periodic floor as a safety net:
 
 ```bash
 agentsview pg push --watch                 # foreground, Ctrl-C to stop
@@ -335,16 +425,16 @@ agentsview pg push --watch --debounce 1m   # custom coalesce window
 agentsview pg push --watch --interval 5m   # custom floor interval
 ```
 
-The daemon reads the same `[pg]` config as `pg push`, so the PostgreSQL
-DSN must be set in your config file (or an environment variable it
-expands). Protect the config file, since it holds credentials:
+The daemon reads the same `[pg]` config as `pg push`, so the PostgreSQL DSN must
+be set in your config file (or an environment variable it expands). Protect the
+config file, since it holds credentials:
 
 ```bash
 chmod 600 ~/.agentsview/config.toml
 ```
 
-To run it unattended as an OS service (launchd on macOS,
-`systemd --user` on Linux):
+To run it unattended as an OS service (launchd on macOS, `systemd --user` on
+Linux):
 
 ```bash
 agentsview pg service install     # generate the unit, enable + start it
@@ -353,9 +443,9 @@ agentsview pg service logs -f     # follow the service log
 agentsview pg service uninstall   # stop and remove
 ```
 
-**Linux headless machines:** systemd `--user` services stop at logout and
-do not start at boot unless lingering is enabled for your user. `install`
-detects this and prints the command; you can also run it yourself:
+**Linux headless machines:** systemd `--user` services stop at logout and do not
+start at boot unless lingering is enabled for your user. `install` detects this
+and prints the command; you can also run it yourself:
 
 ```bash
 loginctl enable-linger "$USER"
@@ -364,11 +454,62 @@ loginctl enable-linger "$USER"
 See [PostgreSQL docs](https://agentsview.io/postgresql/) for setup and
 configuration.
 
+## DuckDB Mirror and Quack
+
+DuckDB support is a mirror backend, not a replacement for the local SQLite
+archive. `agentsview serve` still performs primary ingestion into SQLite. Use
+DuckDB when you want a portable analytics file, read-only local serving from a
+mirror, or remote read access through DuckDB's Quack protocol.
+
+```bash
+agentsview duckdb push          # mirror SQLite into DuckDB
+agentsview duckdb status        # show mirror sync status
+agentsview duckdb serve         # serve web UI from DuckDB (read-only)
+agentsview duckdb quack serve   # expose the local DuckDB file over Quack
+```
+
+`agentsview duckdb serve` reads `[duckdb].path` or `AGENTSVIEW_DUCKDB_PATH`. To
+serve from a remote Quack endpoint, set `AGENTSVIEW_DUCKDB_URL` and
+`AGENTSVIEW_DUCKDB_TOKEN` instead. Quack is still a new DuckDB protocol, so
+agentsview keeps conservative defaults: local Quack serving binds to loopback,
+requires a token, and rejects non-loopback plain HTTP unless `--allow-insecure`
+is explicit. For remote use, prefer a TLS URL or put Quack behind an
+authenticated tunnel/proxy.
+
+Backend modes:
+
+- SQLite: primary local archive, file sync, FTS5 search, and writable UI.
+- PostgreSQL: optional shared team backend; push from SQLite, serve read-only.
+- DuckDB: optional mirror file or Quack endpoint; push from SQLite, serve
+  read-only.
+
+Troubleshooting:
+
+- If `duckdb push` fails to open the mirror, confirm the binary was built with
+  the DuckDB Go driver for your platform and that `AGENTSVIEW_DUCKDB_PATH`
+  points to a writable file location.
+- If Quack commands fail with extension errors, update the agentsview binary so
+  the embedded DuckDB runtime includes the Quack extension.
+- If a remote attach fails, check the token, the `quack:` URL, TLS/proxy
+  termination, and whether the server was intentionally started with
+  `--allow-insecure` for plain non-loopback binds.
+- DuckDB search currently uses substring/regex fallback behavior. SQLite FTS5
+  remains the indexed search path for primary local serving.
+
 ## Privacy
 
-No telemetry, no analytics, no accounts. All data stays on your machine. The
-server binds to `127.0.0.1` by default. The only outbound request is an optional
-update check on startup (disable with `--no-update-check`).
+agentsview sends a limited anonymous `daemon_active` telemetry ping to PostHog
+when the server starts and every 24 hours while it runs, using a stable random
+install ID as the event `DistinctId`. The event includes
+`application=agentsview`, app version, commit, OS, and CPU architecture, with
+`$process_person_profile=false` and `$geoip_disable=true`. It does not include
+session, project, prompt, file path, account, or machine identity. Disable
+telemetry with `AGENTSVIEW_TELEMETRY_ENABLED=0` or `TELEMETRY_ENABLED=0`.
+Telemetry is also hard-disabled in Go test binaries, regardless of environment.
+
+All session data stays on your machine. The server binds to `127.0.0.1` by
+default. The update check is optional and can be disabled with
+`--no-update-check`.
 
 ## Documentation
 
@@ -387,27 +528,37 @@ Requires Go 1.26+ (CGO), Node.js 22+.
 
 ```bash
 make dev            # Go server (dev mode)
-make frontend-dev   # Vite dev server (run alongside make dev)
+make frontend-dev   # Vite+ dev server (run alongside make dev)
 make build          # build binary with embedded frontend
 make install        # install to ~/.local/bin
 ```
 
 ```bash
-make test           # Go tests (CGO_ENABLED=1 -tags fts5)
+make test           # Go tests (CGO_ENABLED=1 -tags "fts5")
+make bench-backends # compare SQLite, DuckDB, and PostgreSQL store reads
 make lint           # golangci-lint + NilAway
 make nilaway        # NilAway through custom golangci-lint
 make e2e            # Playwright E2E tests
 ```
 
-Pre-commit hooks via [prek](https://github.com/j178/prek): run `make lint-tools`
-and `make install-hooks` after cloning (requires `prek` and `uv`).
+`make bench-backends` requires Docker. It starts a PostgreSQL container with
+testcontainers, mirrors the same SQLite fixture into DuckDB and PostgreSQL, and
+benchmarks the shared `db.Store` read queries for relative comparison. The
+default fixture is 1,000 sessions and 64,000 messages; use
+`BENCH_BACKENDS_SESSIONS` and `BENCH_BACKENDS_MESSAGES_PER_SESSION` to scale it.
+When the Docker CLI uses a non-default socket, export `DOCKER_HOST` for that
+socket before running the benchmark.
+
+Pre-commit and pre-push hooks via [prek](https://github.com/j178/prek): run
+`make lint-tools` and `make install-hooks` after cloning (requires `prek` and
+`uv`).
 
 ### Project Layout
 
 ```
 cmd/agentsview/     CLI entrypoint
 internal/           Go packages (config, db, parser, server, sync, postgres)
-frontend/           Svelte 5 SPA (Vite, TypeScript)
+frontend/           Svelte 5 SPA (Vite+, TypeScript)
 desktop/            Tauri desktop wrapper
 ```
 

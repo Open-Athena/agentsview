@@ -12,9 +12,9 @@
   import { ui } from "../../stores/ui.svelte.js";
   import { formatRelativeTime, truncate } from "../../utils/format.js";
   import { renderMarkdown } from "../../utils/markdown.js";
+  import { highlightCodeFences } from "../../utils/highlight-fences.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
   import { normalizeMessagePreview } from "../../utils/messages.js";
-
   $effect(() => {
     pins.loadAll(sessions.filters.project || undefined);
   });
@@ -55,6 +55,7 @@
       ? {
           project: s.project,
           agent: s.agent,
+          // normalizeMessagePreview can return "" — use || not ?? to fall through.
           name:
             s.display_name
             ?? (normalizeMessagePreview(s.first_message) || s.project),
@@ -139,7 +140,10 @@
           {#if preview}
             <div class="pin-content-wrap">
               {#if isExpanded && pin.content}
-                <div class="pin-content-full markdown">
+                <div
+                  class="pin-content-full markdown"
+                  use:highlightCodeFences={{ content: pin.content }}
+                >
                   {@html renderMarkdown(pin.content)}
                 </div>
               {:else}

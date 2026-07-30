@@ -5,7 +5,7 @@ import {
   vi,
   beforeEach,
   afterEach,
-} from "vitest";
+} from "vite-plus/test";
 import { ui } from "../stores/ui.svelte.js";
 import { sessions } from "../stores/sessions.svelte.js";
 import { starred } from "../stores/starred.svelte.js";
@@ -34,7 +34,7 @@ describe("registerShortcuts", () => {
     sessions.activeSessionId = null;
     sessions.sessions = [];
     starred.filterOnly = false;
-    for (const id of [...starred.ids]) {
+    for (const id of starred.ids) {
       starred.unstar(id);
     }
     navigateMessage = vi.fn();

@@ -99,6 +99,7 @@ func (db *DB) Search(
 	if f.Limit <= 0 || f.Limit > MaxSearchLimit {
 		f.Limit = DefaultSearchLimit
 	}
+	f.Query = PrepareFTSQuery(f.Query)
 
 	// ORDER BY for the outer query. FTS5 ranks are negative (lower = better),
 	// so rank ASC places message matches (negative rank) before name-only rows
@@ -132,11 +133,11 @@ func (db *DB) Search(
 	}
 
 	innerWhereSQL := strings.Join(innerWhere, " AND ")
-	// Strip FTS phrase-matching quotes before substring operations.
-	// The HTTP handler wraps multi-word queries in double quotes for FTS
-	// (e.g. "fix bug" → `"fix bug"`). LIKE and instr() must use the
-	// plain text form so name/content substring searches work correctly.
-	plainQuery := stripFTSQuotes(f.Query)
+	// Strip FTS quoting before substring operations. PrepareFTSQuery wraps
+	// each term in double quotes for FTS (e.g. "fix bug" → `"fix" "bug"`).
+	// LIKE and instr() must use the plain text form so name/content substring
+	// searches work correctly.
+	plainQuery := StripFTSQuotes(f.Query)
 	if plainQuery == "" {
 		return SearchPage{}, nil
 	}
@@ -146,26 +147,26 @@ func (db *DB) Search(
 	// Position 0 (? AS best_query in the ROW_NUMBER SELECT) is
 	// prepended after this block — see args2 below.
 	//
-	//  pos | SQL clause                              | value
-	//  ----+-----------------------------------------+------------
-	//   0  | SELECT ? AS best_query (ROW_NUMBER)     | plainQuery  ← prepended in args2
-	//   1  | WHERE messages_fts MATCH ? (ROW_NUMBER) | ftsArgs[0] (f.Query)
-	//  [1+]| AND s2.project = ? (if project set)     | ftsArgs[1] (f.Project)
-	//   2  | WHERE messages_fts MATCH ? (outer JOIN) | f.Query
-	//   3  | WHEN s.display_name LIKE ? (CASE)       | likePattern
-	//   4  | WHEN s.first_message LIKE ? (CASE)      | likePattern
-	//   5  | WHERE s.display_name LIKE ? (name WHERE)| likePattern
-	//   6  | WHERE s.first_message LIKE ? (name WHERE)| likePattern
-	//  [7] | AND s.project = ? (name branch, optional)| f.Project
-	//   8  | WHERE messages_fts MATCH ? (NOT IN)     | ftsArgs[0]
-	//  [8+]| AND s2.project = ? (NOT IN, if set)     | ftsArgs[1]
-	//   9  | LIMIT ? OFFSET ?                        | f.Limit+1, f.Cursor
+	//  pos | SQL clause                                  | value
+	//  ----+---------------------------------------------+------------
+	//   0  | SELECT ? AS best_query (ROW_NUMBER)         | plainQuery  ← prepended in args2
+	//   1  | WHERE messages_fts MATCH ? (ROW_NUMBER)     | ftsArgs[0] (f.Query)
+	//  [1+]| AND s2.project = ? (if project set)         | ftsArgs[1] (f.Project)
+	//   2  | WHERE messages_fts MATCH ? (outer JOIN)     | f.Query
+	//   3  | WHEN COALESCE(display_name,session_name) LIKE ? (CASE) | likePattern
+	//   4  | WHEN s.first_message LIKE ? (CASE)          | likePattern
+	//   5  | WHERE COALESCE(display_name,session_name) LIKE ? (name WHERE) | likePattern
+	//   6  | WHERE s.first_message LIKE ? (name WHERE)   | likePattern
+	//  [7] | AND s.project = ? (name branch, optional)   | f.Project
+	//   8  | WHERE messages_fts MATCH ? (NOT IN)         | ftsArgs[0]
+	//  [8+]| AND s2.project = ? (NOT IN, if set)         | ftsArgs[1]
+	//   9  | LIMIT ? OFFSET ?                            | f.Limit+1, f.Cursor
 	args := make([]any, 0, len(ftsArgs)*2+6+len(nameProjectArgs))
 	args = append(args, ftsArgs...)          // (1) ROW_NUMBER WHERE
 	args = append(args, f.Query)             // (2) outer MATCH re-filter
-	args = append(args, likePattern)         // (3) CASE display_name LIKE
+	args = append(args, likePattern)         // (3) CASE COALESCE(display_name,session_name) LIKE
 	args = append(args, likePattern)         // (4) CASE first_message LIKE
-	args = append(args, likePattern)         // (5) name WHERE display_name LIKE
+	args = append(args, likePattern)         // (5) name WHERE COALESCE(display_name,session_name) LIKE
 	args = append(args, likePattern)         // (6) name WHERE first_message LIKE
 	args = append(args, nameProjectArgs...)  // (7) optional name branch project
 	args = append(args, ftsArgs...)          // (8) NOT IN WHERE
@@ -177,7 +178,7 @@ func (db *DB) Search(
 		FROM (
 			-- FTS branch: message content matches
 			SELECT m.session_id, s.project, s.agent,
-				COALESCE(s.display_name, s.first_message, '') AS name,
+				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
 				COALESCE(s.ended_at, s.started_at, '') AS session_ended_at,
 				best.best_ordinal AS ordinal,
 				snippet(messages_fts, 0, '<mark>', '</mark>',
@@ -212,22 +213,22 @@ func (db *DB) Search(
 
 			UNION ALL
 
-			-- Name branch: display_name / first_message matches not in FTS branch
+			-- Name branch: display_name / session_name / first_message matches not in FTS branch
 			SELECT s.id, s.project, s.agent,
-				COALESCE(s.display_name, s.first_message, '') AS name,
+				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
 				COALESCE(s.ended_at, s.started_at, '') AS session_ended_at,
 				-1 AS ordinal,
 				CASE
-					WHEN s.display_name LIKE ? ESCAPE '\'
-						THEN COALESCE(s.display_name, '')
+					WHEN COALESCE(s.display_name, s.session_name) LIKE ? ESCAPE '\'
+						THEN COALESCE(s.display_name, s.session_name, '')
 					WHEN s.first_message LIKE ? ESCAPE '\'
 						THEN COALESCE(s.first_message, '')
-					ELSE COALESCE(s.display_name, s.first_message, '')
+					ELSE COALESCE(s.display_name, s.session_name, s.first_message, '')
 				END AS snippet,
 				0.0 AS rank,
 				0 AS match_pos
 			FROM sessions s
-			WHERE (s.display_name LIKE ? ESCAPE '\'
+			WHERE (COALESCE(s.display_name, s.session_name) LIKE ? ESCAPE '\'
 				OR s.first_message LIKE ? ESCAPE '\')
 				AND s.deleted_at IS NULL
 				AND EXISTS (
@@ -344,12 +345,97 @@ func (db *DB) SearchSession(
 	return ordinals, rows.Err()
 }
 
-// stripFTSQuotes removes surrounding double quotes added by the HTTP
-// handler's prepareFTSQuery for FTS phrase matching, returning the plain
-// search term for substring operations (LIKE, instr).
-func stripFTSQuotes(v string) string {
-	if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
-		return v[1 : len(v)-1]
+// PrepareFTSQuery turns a user's raw search input into a well-formed SQLite
+// FTS5 MATCH expression. Each whitespace-separated term is wrapped in double
+// quotes (with any embedded quote doubled, per FTS5 escaping), which makes
+// punctuation literal inside the term and combines the terms under FTS5's
+// implicit AND. Quoting is what prevents a single token containing an FTS5
+// operator character (e.g. "error-401" or "status:500") from being parsed as
+// query syntax and raising a malformed-query error (an HTTP 500).
+//
+// An empty/whitespace-only input is returned unchanged. An input the caller
+// already opened with a double quote is treated as a deliberate FTS5 expression
+// (including an explicit "exact phrase") and is passed through untouched, so
+// exact-phrase matching remains opt-in via a leading quote.
+//
+// This is the single source of truth shared by the SQLite, PostgreSQL, and HTTP
+// search paths so the same user query behaves identically across backends.
+func PrepareFTSQuery(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.HasPrefix(raw, `"`) {
+		return raw
 	}
-	return v
+	var b strings.Builder
+	for i, term := range strings.Fields(raw) {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteByte('"')
+		b.WriteString(strings.ReplaceAll(term, `"`, `""`))
+		b.WriteByte('"')
+	}
+	return b.String()
+}
+
+// FTSTerms decomposes a PrepareFTSQuery output back into its individual terms,
+// un-doubling escaped quotes inside quoted terms and collecting bare tokens. A
+// multi-term AND query like `"error" "401"` yields ["error", "401"], a single
+// quoted operator token `"error-401"` yields ["error-401"], and an explicit
+// exact phrase `"fix bug"` yields a single ["fix bug"] term. This lets the
+// substring backends (SQLite name-branch LIKE/instr, PostgreSQL ILIKE)
+// reconstruct the same AND-of-terms vs. exact-phrase semantics the FTS engine
+// applies, keeping behavior identical across backends.
+func FTSTerms(v string) []string {
+	if !strings.Contains(v, `"`) {
+		if v = strings.TrimSpace(v); v == "" {
+			return nil
+		}
+		return strings.Fields(v)
+	}
+	var terms []string
+	var cur strings.Builder
+	inQuote := false
+	hasTerm := false
+	flush := func() {
+		if hasTerm {
+			terms = append(terms, cur.String())
+			cur.Reset()
+			hasTerm = false
+		}
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		switch {
+		case c == '"':
+			if inQuote && i+1 < len(v) && v[i+1] == '"' {
+				// Doubled quote inside a quoted term is a literal quote.
+				cur.WriteByte('"')
+				hasTerm = true
+				i++
+				continue
+			}
+			inQuote = !inQuote
+			hasTerm = true
+		case !inQuote && (c == ' ' || c == '\t' || c == '\n' || c == '\r'):
+			flush()
+		default:
+			cur.WriteByte(c)
+			hasTerm = true
+		}
+	}
+	flush()
+	return terms
+}
+
+// StripFTSQuotes reverses PrepareFTSQuery into a plain substring suitable for
+// LIKE and instr() operations (name-branch matching, snippet centering). It
+// rejoins the parsed FTS terms with single spaces. So `"unique" "phrase"`
+// becomes "unique phrase", a single quoted token like `"error-401"` becomes
+// "error-401", and an explicit phrase `"fix bug"` becomes "fix bug". Input with
+// no quotes is returned unchanged.
+func StripFTSQuotes(v string) string {
+	if !strings.Contains(v, `"`) {
+		return v
+	}
+	return strings.Join(FTSTerms(v), " ")
 }

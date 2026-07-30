@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy, tick, untrack } from "svelte";
+  import { onDestroy, onMount, tick, untrack } from "svelte";
   import {
     usage,
     buildUsageUrlParams,
@@ -12,24 +12,33 @@
     parseFiltersFromParams,
     splitExcludeProjectParam,
   } from "../../stores/sessions.svelte.js";
-  import { router } from "../../stores/router.svelte.js";
   import { events } from "../../stores/events.svelte.js";
+  import { router } from "../../stores/router.svelte.js";
+  import { sync } from "../../stores/sync.svelte.js";
+  import RangePicker from "../shared/RangePicker.svelte";
+  import {
+    resolveRange,
+    selectionFromWindow,
+    type RangeSelection,
+  } from "../shared/rangeSelection.js";
   import UsageSummaryCards from "./UsageSummaryCards.svelte";
   import CostTimeSeriesChart from "./CostTimeSeriesChart.svelte";
   import AttributionPanel from "./AttributionPanel.svelte";
   import TopSessionsTable from "./TopSessionsTable.svelte";
   import LongestPromptsPanel from "./LongestPromptsPanel.svelte";
   import CacheEfficiencyPanel from "./CacheEfficiencyPanel.svelte";
-  import DateRangeSelector from "../shared/DateRangeSelector.svelte";
   import SessionFilterControl from "../filters/SessionFilterControl.svelte";
   import SessionActiveFilters from "../filters/SessionActiveFilters.svelte";
   import FilterDropdown from "./FilterDropdown.svelte";
-  import { RefreshCwIcon } from "../../icons.js";
+  import RefreshControl from "../shared/RefreshControl.svelte";
+  import {
+    yokedDates,
+    panelDateState,
+    type PanelDateState,
+  } from "../../stores/yokedDates.svelte.js";
 
-  const REFRESH_MS = 5 * 60 * 1000;
-  let refreshTimer: ReturnType<typeof setInterval> | undefined;
-  let unsubEvents: (() => void) | undefined;
   let mounted = false;
+  let unsubEvents: (() => void) | undefined;
 
   const projectItems = $derived(
     sessions.projects.map((p) => ({
@@ -37,6 +46,34 @@
       count: p.session_count,
     })),
   );
+
+  const earliestSession = $derived(sync.stats?.earliest_session ?? null);
+
+  const rangeSelection = $derived(
+    selectionFromWindow({
+      isPinned: usage.isPinned,
+      windowDays: usage.windowDays,
+      from: usage.from,
+      to: usage.to,
+      earliestSession,
+    }),
+  );
+
+  function applyRange(sel: RangeSelection) {
+    if (sel.mode === "relative" && sel.days > 0) {
+      usage.setRollingWindow(sel.days);
+      updateYokeFromUsage(panelDateState(usage.from, usage.to, {
+        mode: "rolling",
+        windowDays: sel.days,
+      }));
+    } else {
+      const range = resolveRange(sel, earliestSession);
+      usage.setDateRange(range.from, range.to);
+      updateYokeFromUsage(panelDateState(range.from, range.to, {
+        mode: "fixed",
+      }));
+    }
+  }
 
   // Track every model we've seen in any summary response or
   // model filter — never remove one. This keeps the model
@@ -90,6 +127,30 @@
   const sessionFilterSignature = $derived(
     JSON.stringify(sessionUrlParams),
   );
+  function applyUsagePanelDate(state: PanelDateState): boolean {
+    const before = JSON.stringify({
+      from: usage.from,
+      to: usage.to,
+      isPinned: usage.isPinned,
+      windowDays: usage.windowDays,
+    });
+    if (state.mode === "rolling" && state.windowDays) {
+      usage.applyRollingWindow(state.windowDays);
+    } else {
+      usage.applyDateRange(state.from, state.to);
+    }
+    const after = JSON.stringify({
+      from: usage.from,
+      to: usage.to,
+      isPinned: usage.isPinned,
+      windowDays: usage.windowDays,
+    });
+    return before !== after;
+  }
+
+  function updateYokeFromUsage(state: PanelDateState | null): void {
+    if (state) yokedDates.updateFromPanel(state);
+  }
 
   // URL-init: seed store filters from URL params when landing
   // on /usage with a deep-link. A bare /usage preserves the
@@ -101,11 +162,23 @@
   ]);
   const SESSION_FILTER_KEYS = new Set([
     "project", "machine", "agent",
-    "date", "date_from", "date_to",
+    "termination",
     "active_since", "exclude_project",
     "min_messages", "max_messages", "min_user_messages",
     "include_one_shot", "include_automated",
   ]);
+  function usageSupportedSessionParams(
+    params: Record<string, string>,
+  ): Record<string, string> {
+    const supported: Record<string, string> = {};
+    for (const [key, value] of Object.entries(params)) {
+      if (SESSION_FILTER_KEYS.has(key)) {
+        supported[key] = value;
+      }
+    }
+    return supported;
+  }
+
   let urlInitRan = $state(false);
   let urlWritebackReady = $state(false);
   let initialFetchDone = $state(false);
@@ -116,14 +189,15 @@
       if (route !== "usage") return;
       const hasDateParam = !!params["from"] || !!params["to"];
       const parsedWindowDays = parseWindowDays(params["window_days"]);
-      const hasFilterKeys = Object.keys(params).some(
-        (k) =>
-          USAGE_FILTER_KEYS.has(k) ||
-          SESSION_FILTER_KEYS.has(k),
+      const supportedSessionParams =
+        usageSupportedSessionParams(params);
+      const hasSessionFilterKeys =
+        Object.keys(supportedSessionParams).length > 0;
+      const hasUsageFilterKeys = Object.keys(params).some(
+        (k) => USAGE_FILTER_KEYS.has(k),
       );
-      const hasSessionFilterKeys = Object.keys(params).some(
-        (k) => SESSION_FILTER_KEYS.has(k),
-      );
+      const hasFilterKeys =
+        hasUsageFilterKeys || hasSessionFilterKeys;
 
       let changed = false;
       let sessionChanged = false;
@@ -136,13 +210,40 @@
         changed = true;
       }
 
+      if (!hasDateParam && parsedWindowDays === null) {
+        const seed = yokedDates.seedForPanel();
+        const state = seed
+          ? panelDateState(seed.from, seed.to, {
+              mode: seed.mode,
+              windowDays: seed.windowDays,
+            })
+          : null;
+        if (state) {
+          changed = applyUsagePanelDate(state) || changed;
+        }
+      }
+
       // Apply rolling window from URL when present and the URL is
       // not pinning a specific date range.
       if (!hasDateParam && parsedWindowDays !== null) {
-        if (usage.windowDays !== parsedWindowDays) {
-          usage.windowDays = parsedWindowDays;
-          changed = true;
-        }
+        const stateBefore = JSON.stringify({
+          from: usage.from,
+          to: usage.to,
+          isPinned: usage.isPinned,
+          windowDays: usage.windowDays,
+        });
+        usage.applyRollingWindow(parsedWindowDays);
+        const stateAfter = JSON.stringify({
+          from: usage.from,
+          to: usage.to,
+          isPinned: usage.isPinned,
+          windowDays: usage.windowDays,
+        });
+        changed = stateBefore !== stateAfter || changed;
+        updateYokeFromUsage(panelDateState(usage.from, usage.to, {
+          mode: "rolling",
+          windowDays: parsedWindowDays,
+        }));
       }
 
       if (!hasFilterKeys) {
@@ -154,7 +255,7 @@
       }
       if (hasSessionFilterKeys) {
         const nextSessionParams = filtersToParams(
-          parseFiltersFromParams(params),
+          parseFiltersFromParams(supportedSessionParams),
         );
         const currentSessionParams = filtersToParams(
           sessions.filters,
@@ -163,17 +264,20 @@
           JSON.stringify(nextSessionParams) !==
           JSON.stringify(currentSessionParams)
         ) {
-          sessions.initFromParams(params);
+          sessions.initFromParams(supportedSessionParams);
           sessionChanged = true;
         }
       }
-      if (params["from"] && params["from"] !== usage.from) {
-        usage.from = params["from"];
-        changed = true;
-      }
-      if (params["to"] && params["to"] !== usage.to) {
-        usage.to = params["to"];
-        changed = true;
+      if (hasDateParam) {
+        const state = panelDateState(
+          params["from"] ?? usage.from,
+          params["to"] ?? usage.to,
+          { mode: "fixed" },
+        );
+        if (state) {
+          changed = applyUsagePanelDate(state) || changed;
+          updateYokeFromUsage(state);
+        }
       }
       const newExProject = splitExcludeProjectParam(
         params["exclude_project"],
@@ -239,22 +343,16 @@
 
   onMount(() => {
     mounted = true;
+    // SSE events only flag new data; RefreshControl owns the periodic refresh
+    // and the manual button. The initial and filter-change fetches run from the
+    // effects above once URL/filter state is hydrated.
+    unsubEvents = events.subscribe(() => usage.markNewData());
     tick().then(() => {
       urlWritebackReady = true;
     });
-    refreshTimer = setInterval(
-      () => usage.fetchAll(),
-      REFRESH_MS,
-    );
-    unsubEvents = events.subscribeDebounced(
-      () => usage.fetchAll(),
-    );
   });
 
   onDestroy(() => {
-    if (refreshTimer !== undefined) {
-      clearInterval(refreshTimer);
-    }
     unsubEvents?.();
   });
 </script>
@@ -275,11 +373,11 @@
         />
       </div>
 
-      <DateRangeSelector
-        from={usage.from}
-        to={usage.to}
-        onChange={(from, to) => usage.setDateRange(from, to)}
-        onPreset={(days) => usage.setRollingWindow(days)}
+      <RangePicker
+        selection={rangeSelection}
+        busy={usage.isQuerying}
+        {earliestSession}
+        onSelect={applyRange}
       />
 
       <FilterDropdown
@@ -303,14 +401,13 @@
           usage.deselectAllModels(modelItems.map((m) => m.name))}
       />
 
-      <button
-        class="refresh-btn"
-        onclick={() => usage.fetchAll()}
+      <RefreshControl
+        lastUpdatedAt={usage.lastUpdatedAt}
+        busy={usage.isQuerying}
+        onRefresh={() => usage.fetchAll()}
+        label="Refresh usage data"
         title="Refresh"
-        aria-label="Refresh usage data"
-      >
-        <RefreshCwIcon size="14" strokeWidth="2" aria-hidden="true" />
-      </button>
+      />
 
     </div>
   </div>
@@ -322,7 +419,15 @@
     onClearModels={() => usage.selectAllModels()}
   />
 
-  <div class="usage-content">
+  <div
+    class="usage-content"
+    class:querying={usage.isQuerying}
+    aria-busy={usage.isQuerying}
+  >
+    {#if usage.isQuerying}
+      <div class="query-progress" aria-hidden="true"></div>
+    {/if}
+
     <UsageSummaryCards />
 
     <div class="chart-panel wide">
@@ -380,22 +485,6 @@
     align-items: center;
   }
 
-  .refresh-btn {
-    width: 28px;
-    height: 28px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: var(--radius-sm);
-    color: var(--text-muted);
-    cursor: pointer;
-  }
-
-  .refresh-btn:hover {
-    background: var(--bg-surface-hover);
-    color: var(--text-primary);
-  }
-
   .usage-content {
     flex: 1;
     overflow-y: auto;
@@ -403,6 +492,37 @@
     display: flex;
     flex-direction: column;
     gap: 16px;
+    position: relative;
+    transition: opacity 0.12s;
+  }
+
+  .usage-content.querying {
+    opacity: 0.88;
+  }
+
+  .query-progress {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 4;
+    height: 2px;
+    overflow: hidden;
+    background: color-mix(
+      in srgb,
+      var(--accent-blue) 16%,
+      transparent
+    );
+  }
+
+  .query-progress::before {
+    content: "";
+    display: block;
+    width: 38%;
+    height: 100%;
+    background: var(--accent-blue);
+    border-radius: 999px;
+    animation: query-progress 1s ease-in-out infinite;
   }
 
   .chart-panel {
@@ -426,6 +546,15 @@
   @media (max-width: 800px) {
     .bottom-grid {
       grid-template-columns: 1fr;
+    }
+  }
+
+  @keyframes query-progress {
+    0% {
+      transform: translateX(-105%);
+    }
+    100% {
+      transform: translateX(265%);
     }
   }
 </style>

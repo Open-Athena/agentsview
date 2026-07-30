@@ -1,6 +1,10 @@
 package db
 
-import "context"
+import (
+	"context"
+
+	"go.kenn.io/agentsview/internal/activity"
+)
 
 // ErrReadOnly is returned by write methods on read-only store
 // implementations (e.g. the PostgreSQL reader).
@@ -11,12 +15,14 @@ type errReadOnly struct{}
 func (errReadOnly) Error() string { return "not available in remote mode" }
 
 // Store is the interface the HTTP server uses for all data access.
-// The concrete *DB (SQLite) satisfies it implicitly. The pgdb
-// package provides a read-only PostgreSQL implementation.
+// Any new server-visible query or mutation belongs here, not only on
+// the SQLite *DB type, so PostgreSQL and DuckDB fail compilation until
+// they implement the same capability surface. The backendcontract package
+// centralizes compile-time assertions for every concrete provider.
 type Store interface {
 	// Cursor pagination.
 	SetCursorSecret(secret []byte)
-	EncodeCursor(endedAt, id string, total ...int) string
+	EncodeCursor(c SessionCursor) string
 	DecodeCursor(s string) (SessionCursor, error)
 
 	// Sessions.
@@ -43,7 +49,7 @@ type Store interface {
 	SecretFindingSource(ctx context.Context, f SecretFinding) (string, bool, error)
 
 	// SSE change detection.
-	GetSessionVersion(id string) (count int, fileMtime int64, ok bool)
+	GetSessionVersion(id string) (count int, version int64, ok bool)
 
 	// Metadata.
 	GetStats(ctx context.Context, excludeOneShot, excludeAutomated bool) (Stats, error)
@@ -59,10 +65,13 @@ type Store interface {
 	GetAnalyticsHourOfWeek(ctx context.Context, f AnalyticsFilter) (HourOfWeekResponse, error)
 	GetAnalyticsSessionShape(ctx context.Context, f AnalyticsFilter) (SessionShapeResponse, error)
 	GetAnalyticsTools(ctx context.Context, f AnalyticsFilter) (ToolsAnalyticsResponse, error)
+	GetAnalyticsSkills(ctx context.Context, f AnalyticsFilter) (SkillsAnalyticsResponse, error)
 	GetAnalyticsVelocity(ctx context.Context, f AnalyticsFilter) (VelocityResponse, error)
 	GetAnalyticsTopSessions(ctx context.Context, f AnalyticsFilter, metric string) (TopSessionsResponse, error)
 	GetAnalyticsSignals(ctx context.Context, f AnalyticsFilter) (SignalsAnalyticsResponse, error)
+	GetAnalyticsSignalSessions(ctx context.Context, f AnalyticsFilter, signal string, limit int) (SignalSessionsResponse, error)
 	GetTrendsTerms(ctx context.Context, f AnalyticsFilter, terms []TrendTermInput, granularity string) (TrendsTermsResponse, error)
+	GetActivityReport(ctx context.Context, f AnalyticsFilter, q activity.Query) (activity.Report, error)
 
 	// Usage (token cost).
 	GetDailyUsage(ctx context.Context, f UsageFilter) (DailyUsageResult, error)
@@ -85,6 +94,7 @@ type Store interface {
 	// Insights (local-only; PG returns ErrReadOnly).
 	ListInsights(ctx context.Context, f InsightFilter) ([]Insight, error)
 	GetInsight(ctx context.Context, id int64) (*Insight, error)
+	GetCachedInsight(ctx context.Context, cacheKey string) (*Insight, error)
 	InsertInsight(s Insight) (int64, error)
 	DeleteInsight(id int64) error
 

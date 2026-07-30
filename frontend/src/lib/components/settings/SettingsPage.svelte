@@ -1,12 +1,15 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { settings } from "../../stores/settings.svelte.js";
+  import { sync } from "../../stores/sync.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
   import { setAuthToken, getAuthToken, setServerUrl, isRemoteConnection } from "../../api/runtime.js";
+  import { m } from "../../i18n/index.js";
   import AppearanceSettings from "./AppearanceSettings.svelte";
   import AgentDirSettings from "./AgentDirSettings.svelte";
   import TerminalSettings from "./TerminalSettings.svelte";
   import GithubSettings from "./GithubSettings.svelte";
+  import LanguageSettings from "./LanguageSettings.svelte";
   import RemoteSettings from "./RemoteSettings.svelte";
   import WorktreeMappingSettings from "./WorktreeMappingSettings.svelte";
 
@@ -27,11 +30,11 @@
 
 <div class="settings-page">
   <div class="settings-header">
-    <h2 class="settings-title">Settings</h2>
+    <h2 class="settings-title">{m.settings_title()}</h2>
   </div>
 
-  {#if settings.loading}
-    <div class="settings-loading">Loading settings...</div>
+  {#if settings.loading || !settings.loaded}
+    <div class="settings-loading">{m.settings_loading()}</div>
   {:else if settings.needsAuth}
     <div class="auth-prompt">
       <h3 class="auth-title">Authentication Required</h3>
@@ -85,22 +88,31 @@
     </div>
   {:else}
     <div class="settings-sections">
+      <LanguageSettings />
       <AppearanceSettings />
       <AgentDirSettings />
       <TerminalSettings />
-      <WorktreeMappingSettings />
+      <WorktreeMappingSettings readOnly={settings.readOnly} />
       <GithubSettings />
       <RemoteSettings />
 
       <div class="settings-actions">
         <button
           class="resync-btn"
-          onclick={() => (ui.activeModal = "resync")}
+          onclick={() => {
+            if (!sync.readOnly) ui.activeModal = "resync";
+          }}
+          disabled={sync.readOnly}
+          title={sync.readOnly
+            ? "Full resync unavailable in read-only mode"
+            : "Full resync"}
         >
           Full Resync
         </button>
         <span class="settings-actions-hint">
-          Re-scan all session files from scratch
+          {sync.readOnly
+            ? "Unavailable while connected to a read-only backend"
+            : "Re-scan all session files from scratch"}
         </span>
       </div>
     </div>
@@ -173,8 +185,13 @@
     transition: opacity 0.12s;
   }
 
-  .resync-btn:hover {
+  .resync-btn:hover:not(:disabled) {
     opacity: 0.8;
+  }
+
+  .resync-btn:disabled {
+    opacity: 0.55;
+    cursor: default;
   }
 
   .settings-actions-hint {

@@ -370,6 +370,86 @@ func TestWatcherAutoWatchesNewDirs_RespectsExcludes(t *testing.T) {
 	}
 }
 
+func TestWatcherShallowRootDoesNotAutoWatchNewDirs(t *testing.T) {
+	pathsCh := make(chan []string, 10)
+	w, err := NewWatcher(20*time.Millisecond, func(paths []string) {
+		pathsCh <- paths
+	}, nil)
+	require.NoError(t, err, "NewWatcher")
+	t.Cleanup(func() { w.Stop() })
+
+	root := t.TempDir()
+	require.True(t, w.WatchShallow(root), "WatchShallow")
+	w.Start()
+
+	localDir := filepath.Join(root, "local_session")
+	require.NoError(t, os.Mkdir(localDir, 0o755), "Mkdir(local)")
+
+	select {
+	case paths := <-pathsCh:
+		assert.Contains(t, paths, localDir,
+			"root-level create should still trigger onChange")
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("timed out waiting for shallow root create event")
+	}
+	assert.NotContains(t, w.watcher.WatchList(), localDir,
+		"shallow root descendant should not be auto-watched")
+}
+
+// A shallow parent root (e.g. Codex's .codex) must not shadow a recursive
+// child root (.codex/sessions) nested inside it: newly created directories
+// under the recursive child still need to be auto-watched so new sessions in
+// new date directories live-sync.
+func TestWatcherShallowParentDoesNotShadowRecursiveChild(t *testing.T) {
+	pathsCh := make(chan []string, 10)
+	w, err := NewWatcher(20*time.Millisecond, func(paths []string) {
+		pathsCh <- paths
+	}, nil)
+	require.NoError(t, err, "NewWatcher")
+	t.Cleanup(func() { w.Stop() })
+
+	parent := t.TempDir()
+	child := filepath.Join(parent, "sessions")
+	require.NoError(t, os.Mkdir(child, 0o755), "Mkdir(child)")
+
+	require.True(t, w.WatchShallow(parent), "WatchShallow(parent)")
+	_, _, err = w.WatchRecursive(child)
+	require.NoError(t, err, "WatchRecursive(child)")
+	w.Start()
+
+	// A sibling write directly under the shallow parent is still seen but its
+	// directory is not auto-watched.
+	logDir := filepath.Join(parent, "log")
+	require.NoError(t, os.Mkdir(logDir, 0o755), "Mkdir(log)")
+
+	// A new directory created under the recursive child must be auto-watched
+	// even though it also sits inside the shallow parent root.
+	dateDir := filepath.Join(child, "2026-06-16")
+	require.NoError(t, os.Mkdir(dateDir, 0o755), "Mkdir(dateDir)")
+	pollUntil(t, func() bool {
+		return slices.Contains(w.watcher.WatchList(), dateDir)
+	})
+
+	sessionFile := filepath.Join(dateDir, "rollout.jsonl")
+	require.NoError(t, os.WriteFile(sessionFile, []byte("x"), 0o644))
+
+	deadline := time.Now().Add(5 * time.Second)
+	found := false
+	for time.Now().Before(deadline) && !found {
+		select {
+		case paths := <-pathsCh:
+			if slices.Contains(paths, sessionFile) {
+				found = true
+			}
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	require.True(t, found,
+		"file in a new date dir under the recursive child must trigger onChange")
+	assert.NotContains(t, w.watcher.WatchList(), logDir,
+		"sibling dir under the shallow parent must not be auto-watched")
+}
+
 func TestWatchRecursive_RootUnderExcludedAncestorStillWatchesDescendants(t *testing.T) {
 	w, err := NewWatcher(time.Second, func(_ []string) {}, []string{"venv"})
 	require.NoError(t, err, "NewWatcher")

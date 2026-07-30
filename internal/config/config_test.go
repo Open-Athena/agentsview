@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -49,6 +50,152 @@ func setupTestEnv(t *testing.T) string {
 	return dir
 }
 
+type configFixture struct {
+	Dir string
+}
+
+func newConfigFixture(t *testing.T) configFixture {
+	t.Helper()
+	return configFixture{Dir: setupTestEnv(t)}
+}
+
+func (f configFixture) Path(name string) string {
+	return filepath.Join(f.Dir, name)
+}
+
+func (f configFixture) WriteTOML(t *testing.T, data any) {
+	t.Helper()
+	writeConfig(t, f.Dir, data)
+}
+
+func (f configFixture) WriteConfigText(t *testing.T, text string) {
+	t.Helper()
+	require.NoError(t, os.WriteFile(f.Path(configFileName), []byte(text), 0o600),
+		"write config")
+}
+
+func (f configFixture) WriteLegacyJSON(t *testing.T, text string) {
+	t.Helper()
+	require.NoError(t, os.WriteFile(f.Path("config.json"), []byte(text), 0o600),
+		"write legacy config")
+}
+
+func (f configFixture) LoadMinimal(t *testing.T) Config {
+	t.Helper()
+	cfg, err := LoadMinimal()
+	require.NoError(t, err)
+	return cfg
+}
+
+func (f configFixture) LoadMinimalErr(t *testing.T) error {
+	t.Helper()
+	_, err := LoadMinimal()
+	return err
+}
+
+func (f configFixture) LoadFile(t *testing.T) Config {
+	t.Helper()
+	cfg, err := Default()
+	require.NoError(t, err)
+	cfg.DataDir = f.Dir
+	require.NoError(t, cfg.loadFile(), "loadFile")
+	return cfg
+}
+
+func (f configFixture) ReadTOMLMap(t *testing.T) map[string]any {
+	t.Helper()
+	got, err := os.ReadFile(f.Path(configFileName))
+	require.NoError(t, err)
+	var result map[string]any
+	_, err = toml.Decode(string(got), &result)
+	require.NoError(t, err)
+	return result
+}
+
+func loadMinimalWithConfig(t *testing.T, data any) Config {
+	t.Helper()
+	f := newConfigFixture(t)
+	f.WriteTOML(t, data)
+	return f.LoadMinimal(t)
+}
+
+func loadMinimalErrWithConfig(t *testing.T, data any) error {
+	t.Helper()
+	f := newConfigFixture(t)
+	f.WriteTOML(t, data)
+	return f.LoadMinimalErr(t)
+}
+
+func loadPFlagsWithConfig(
+	t *testing.T,
+	data any,
+	args ...string,
+) Config {
+	t.Helper()
+	f := newConfigFixture(t)
+	f.WriteTOML(t, data)
+	cfg, err := loadConfigFromPFlags(t, args...)
+	require.NoError(t, err, "loading config")
+	return cfg
+}
+
+func runConcurrent(t *testing.T, workers int, fn func(i int) error) {
+	t.Helper()
+	start := make(chan struct{})
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := range workers {
+		go func() {
+			defer wg.Done()
+			<-start
+			if err := fn(i); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+}
+
+func requireAllSameNonEmpty[T comparable](t *testing.T, values []T) {
+	t.Helper()
+	require.NotEmpty(t, values)
+	for _, value := range values {
+		require.NotZero(t, value)
+		assert.Equal(t, values[0], value)
+	}
+}
+
+func requireErrorContains(t *testing.T, err error, substrs ...string) {
+	t.Helper()
+	require.Error(t, err)
+	for _, substr := range substrs {
+		assert.Contains(t, err.Error(), substr)
+	}
+}
+
+func captureLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+	return &buf
+}
+
+func assertLogContains(t *testing.T, buf *bytes.Buffer, substrs ...string) {
+	t.Helper()
+	logged := buf.String()
+	for _, substr := range substrs {
+		assert.Contains(t, logged, substr)
+	}
+}
+
 func loadConfigFromFlags(t *testing.T, args ...string) (Config, error) {
 	t.Helper()
 	if os.Getenv("AGENTSVIEW_DATA_DIR") == "" {
@@ -76,21 +223,38 @@ func loadConfigFromPFlags(t *testing.T, args ...string) (Config, error) {
 }
 
 func TestLoadMinimal_LoadsAgentBinaryConfig(t *testing.T) {
-	dir := setupTestEnv(t)
-	path := filepath.Join(dir, configFileName)
-	data := []byte(`[agent.claude]
+	f := newConfigFixture(t)
+	f.WriteConfigText(t, `[agent.claude]
 binary = "/opt/agents/claude"
 
 [agent.gemini]
 binary = "/usr/local/bin/gemini"
 `)
-	require.NoError(t, os.WriteFile(path, data, 0o600), "write config")
 
-	cfg, err := LoadMinimal()
-	require.NoError(t, err)
+	cfg := f.LoadMinimal(t)
 
 	assert.Equal(t, "/opt/agents/claude", cfg.Agent["claude"].Binary)
 	assert.Equal(t, "/usr/local/bin/gemini", cfg.Agent["gemini"].Binary)
+}
+
+func TestLoadReadOnlyReadsLegacyJSONWithoutMigrating(t *testing.T) {
+	f := newConfigFixture(t)
+	jsonPath := f.Path("config.json")
+	f.WriteLegacyJSON(t, `{
+		"codex_sessions_dirs": ["/legacy/codex"],
+		"result_content_blocked_categories": ["Read", "Search"]
+	}`)
+
+	cfg, err := LoadReadOnly()
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"/legacy/codex"},
+		cfg.ResolveDirs(parser.AgentCodex))
+	assert.Equal(t, []string{"Read", "Search"},
+		cfg.ResultContentBlockedCategories)
+	assert.FileExists(t, jsonPath)
+	assert.NoFileExists(t, f.Path(configFileName))
+	assert.NoFileExists(t, jsonPath+".bak")
 }
 
 func TestDefault_IncludesCodexArchivedSessionsDir(t *testing.T) {
@@ -163,48 +327,36 @@ func TestLoad_PublicOriginFlagOverridesConfigFile(t *testing.T) {
 }
 
 func TestLoad_PublicOriginsFromConfigFile(t *testing.T) {
-	tmp := setupTestEnv(t)
-	writeConfig(t, tmp, map[string]any{
+	cfg := loadMinimalWithConfig(t, map[string]any{
 		"public_origins": []string{
 			"https://Viewer.Example.Test:443/",
 			"http://viewer.example.test:8004",
 		},
 	})
 
-	cfg, err := LoadMinimal()
-	require.NoError(t, err)
-
 	got := strings.Join(cfg.PublicOrigins, ",")
 	assert.Equal(t, "https://viewer.example.test,http://viewer.example.test:8004", got)
 }
 
 func TestLoad_PublicOriginsRejectInvalid(t *testing.T) {
-	tmp := setupTestEnv(t)
-	writeConfig(t, tmp, map[string]any{
+	err := loadMinimalErrWithConfig(t, map[string]any{
 		"public_origins": []string{"ftp://viewer.example.test"},
 	})
 
-	_, err := LoadMinimal()
-	require.Error(t, err, "expected invalid public origin error")
-	assert.Contains(t, err.Error(), "invalid public origins")
+	requireErrorContains(t, err, "invalid public origins")
 }
 
 func TestLoad_PublicURLMergedIntoOrigins(t *testing.T) {
-	tmp := setupTestEnv(t)
-	writeConfig(t, tmp, map[string]any{
+	cfg := loadMinimalWithConfig(t, map[string]any{
 		"public_url": "https://viewer.example.test/",
 	})
-
-	cfg, err := LoadMinimal()
-	require.NoError(t, err)
 
 	assert.Equal(t, "https://viewer.example.test", cfg.PublicURL)
 	assert.Equal(t, "https://viewer.example.test", strings.Join(cfg.PublicOrigins, ","))
 }
 
 func TestLoad_ProxyConfigFromFile(t *testing.T) {
-	tmp := setupTestEnv(t)
-	writeConfig(t, tmp, map[string]any{
+	cfg := loadMinimalWithConfig(t, map[string]any{
 		"public_url": "https://viewer.example.test",
 		"proxy": map[string]any{
 			"mode":            "caddy",
@@ -215,9 +367,6 @@ func TestLoad_ProxyConfigFromFile(t *testing.T) {
 			"allowed_subnets": []string{"10.1.2.3/16", "192.168.1.0/24"},
 		},
 	})
-
-	cfg, err := LoadMinimal()
-	require.NoError(t, err)
 
 	assert.Equal(t, "caddy", cfg.Proxy.Mode)
 	assert.Equal(t, "caddy", cfg.Proxy.Bin)
@@ -268,8 +417,7 @@ func TestLoad_ManagedCaddyRejectsConflictingPublicPort(t *testing.T) {
 		"-proxy", "caddy",
 		"-public-port", "8443",
 	)
-	require.Error(t, err, "expected public port conflict error")
-	assert.Contains(t, err.Error(), "conflicts with configured public port")
+	requireErrorContains(t, err, "conflicts with configured public port")
 }
 
 func TestLoad_ManagedCaddyRejectsPublicURLPath(t *testing.T) {
@@ -278,8 +426,7 @@ func TestLoad_ManagedCaddyRejectsPublicURLPath(t *testing.T) {
 		"-public-url", "https://viewer.example.test/path",
 		"-proxy", "caddy",
 	)
-	require.Error(t, err, "expected public URL path error")
-	assert.Contains(t, err.Error(), "must not include a path")
+	requireErrorContains(t, err, "must not include a path")
 }
 
 func TestLoad_ManagedCaddyNormalizesExplicitDefaultPorts(t *testing.T) {
@@ -301,17 +448,14 @@ func TestLoad_ManagedCaddyNormalizesExplicitDefaultPorts(t *testing.T) {
 }
 
 func TestLoad_AllowedSubnetsRejectInvalid(t *testing.T) {
-	tmp := setupTestEnv(t)
-	writeConfig(t, tmp, map[string]any{
+	err := loadMinimalErrWithConfig(t, map[string]any{
 		"proxy": map[string]any{
 			"mode":            "caddy",
 			"allowed_subnets": []string{"10.0.0.0/not-a-mask"},
 		},
 	})
 
-	_, err := LoadMinimal()
-	require.Error(t, err, "expected invalid allowed subnets error")
-	assert.Contains(t, err.Error(), "invalid allowed subnets")
+	requireErrorContains(t, err, "invalid allowed subnets")
 }
 
 func TestSaveGithubToken_RejectsCorruptConfig(t *testing.T) {
@@ -329,45 +473,95 @@ func TestSaveGithubToken_RejectsCorruptConfig(t *testing.T) {
 func TestSaveGithubToken_ReturnsErrorOnReadFailure(t *testing.T) {
 	skipIfNotUnix(t)
 
-	tmp := setupTestEnv(t)
-	cfg := Config{DataDir: tmp}
+	f := newConfigFixture(t)
+	cfg := Config{DataDir: f.Dir}
 
 	// Create a config file that is not readable
-	path := filepath.Join(tmp, configFileName)
+	path := f.Path(configFileName)
 	require.NoError(t, os.WriteFile(path, []byte("k = \"v\"\n"), 0o000))
 
 	err := cfg.SaveGithubToken("tok")
-	require.Error(t, err, "expected error for unreadable config file")
-	assert.Contains(t, err.Error(), "reading config file")
+	requireErrorContains(t, err, "reading config file")
 }
 
 func TestSaveGithubToken_PreservesExistingKeys(t *testing.T) {
-	tmp := setupTestEnv(t)
-	cfg := Config{DataDir: tmp}
+	f := newConfigFixture(t)
+	cfg := Config{DataDir: f.Dir}
 
 	existing := map[string]any{"custom_key": "value"}
-	writeConfig(t, tmp, existing)
+	f.WriteTOML(t, existing)
 
 	require.NoError(t, cfg.SaveGithubToken("new-token"))
 
-	got, err := os.ReadFile(filepath.Join(tmp, configFileName))
-	require.NoError(t, err)
-	var result map[string]any
-	_, err = toml.Decode(string(got), &result)
-	require.NoError(t, err)
+	result := f.ReadTOMLMap(t)
 	assert.Equal(t, "value", result["custom_key"])
 	assert.Equal(t, "new-token", result["github_token"])
 }
 
+func TestEnsureAuthTokenConcurrentCallersSharePersistedToken(t *testing.T) {
+	f := newConfigFixture(t)
+	const workers = 8
+	tokens := make([]string, workers)
+
+	runConcurrent(t, workers, func(i int) error {
+		cfg := Config{DataDir: f.Dir}
+		if err := cfg.EnsureAuthToken(); err != nil {
+			return err
+		}
+		tokens[i] = cfg.AuthToken
+		return nil
+	})
+
+	requireAllSameNonEmpty(t, tokens)
+	result := f.ReadTOMLMap(t)
+	assert.Equal(t, tokens[0], result["auth_token"])
+}
+
+func TestEnsureCursorSecretConcurrentCallersSharePersistedSecret(t *testing.T) {
+	f := newConfigFixture(t)
+	const workers = 8
+	secrets := make([]string, workers)
+
+	runConcurrent(t, workers, func(i int) error {
+		cfg := Config{DataDir: f.Dir}
+		if err := cfg.ensureCursorSecret(); err != nil {
+			return err
+		}
+		secrets[i] = cfg.CursorSecret
+		return nil
+	})
+
+	requireAllSameNonEmpty(t, secrets)
+	result := f.ReadTOMLMap(t)
+	assert.Equal(t, secrets[0], result["cursor_secret"])
+}
+
+func TestMigrateJSONToTOMLConcurrentCallersMigrateOnce(t *testing.T) {
+	f := newConfigFixture(t)
+	jsonPath := f.Path("config.json")
+	f.WriteLegacyJSON(t, `{
+		"github_token": "legacy-token",
+		"require_auth": true
+	}`)
+
+	const workers = 4
+	runConcurrent(t, workers, func(int) error {
+		cfg := Config{DataDir: f.Dir}
+		return cfg.migrateJSONToTOML()
+	})
+
+	assert.NoFileExists(t, jsonPath)
+	assert.FileExists(t, jsonPath+".bak")
+	result := f.ReadTOMLMap(t)
+	assert.Equal(t, "legacy-token", result["github_token"])
+	assert.Equal(t, true, result["require_auth"])
+}
+
 func TestLoadFile_ReadsDirArrays(t *testing.T) {
-	dir := setupTestEnv(t)
-	writeConfig(t, dir, map[string]any{
+	cfg := loadMinimalWithConfig(t, map[string]any{
 		"claude_project_dirs": []string{"/path/one", "/path/two"},
 		"codex_sessions_dirs": []string{"/codex/a"},
 	})
-
-	cfg, err := LoadMinimal()
-	require.NoError(t, err)
 
 	claudeDirs := cfg.ResolveDirs(parser.AgentClaude)
 	require.Len(t, claudeDirs, 2)
@@ -480,41 +674,34 @@ func TestDataDir_LegacyEnvFallback(t *testing.T) {
 }
 
 func TestEnvOverridesConfigFile(t *testing.T) {
-	dir := setupTestEnv(t)
-	writeConfig(t, dir, map[string]any{
+	f := newConfigFixture(t)
+	f.WriteTOML(t, map[string]any{
 		"codex_sessions_dirs": []string{"/from/config"},
 	})
 	t.Setenv("CODEX_SESSIONS_DIR", "/from/env")
 
-	cfg, err := LoadMinimal()
-	require.NoError(t, err)
+	cfg := f.LoadMinimal(t)
 
 	dirs := cfg.ResolveDirs(parser.AgentCodex)
 	assert.Equal(t, []string{"/from/env"}, dirs)
 }
 
 func TestLoadFile_MalformedDirValueLogsWarning(t *testing.T) {
-	dir := setupTestEnv(t)
+	f := newConfigFixture(t)
 
 	// Write a config where claude_project_dirs is a string
 	// instead of a string array.
-	writeConfig(t, dir, map[string]any{
+	f.WriteTOML(t, map[string]any{
 		"claude_project_dirs": "/not/an/array",
 	})
 
 	// Capture log output during Load.
-	var buf bytes.Buffer
-	prev := log.Writer()
-	log.SetOutput(&buf)
-	t.Cleanup(func() { log.SetOutput(prev) })
+	buf := captureLog(t)
 
-	cfg, err := LoadMinimal()
-	require.NoError(t, err)
+	cfg := f.LoadMinimal(t)
 
 	// The malformed key should trigger a warning.
-	logged := buf.String()
-	assert.Contains(t, logged, "claude_project_dirs")
-	assert.Contains(t, logged, "expected string array")
+	assertLogContains(t, buf, "claude_project_dirs", "expected string array")
 
 	// ResolveDirs should return the default (malformed value
 	// was not applied).
@@ -567,11 +754,7 @@ func TestLoadFile_ResultContentBlockedCategories(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dir := setupTestEnv(t)
-			writeConfig(t, dir, tt.config)
-
-			cfg, err := LoadMinimal()
-			require.NoError(t, err)
+			cfg := loadMinimalWithConfig(t, tt.config)
 
 			assert.Equal(t, tt.want, cfg.ResultContentBlockedCategories)
 		})
@@ -607,11 +790,7 @@ func TestLoadFile_EventsCoalesceInterval(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dir := setupTestEnv(t)
-			writeConfig(t, dir, tt.config)
-
-			cfg, err := LoadMinimal()
-			require.NoError(t, err)
+			cfg := loadMinimalWithConfig(t, tt.config)
 			assert.Equal(t, tt.want, cfg.EventsCoalesceInterval)
 		})
 	}
@@ -674,14 +853,13 @@ func TestLoadFile_PGConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dir := setupTestEnv(t)
-			writeConfig(t, dir, tt.config)
+			f := newConfigFixture(t)
+			f.WriteTOML(t, tt.config)
 			if tt.envURL != "" {
 				t.Setenv("AGENTSVIEW_PG_URL", tt.envURL)
 			}
 
-			cfg, err := LoadMinimal()
-			require.NoError(t, err)
+			cfg := f.LoadMinimal(t)
 
 			assert.Equal(t, tt.want.URL, cfg.PG.URL)
 			assert.Equal(t, tt.want.MachineName, cfg.PG.MachineName)
@@ -690,18 +868,14 @@ func TestLoadFile_PGConfig(t *testing.T) {
 }
 
 func TestPGConfig_ProjectFilter(t *testing.T) {
-	dir := t.TempDir()
-	tomlPath := filepath.Join(dir, "config.toml")
-	os.WriteFile(tomlPath, []byte(`
+	f := newConfigFixture(t)
+	f.WriteConfigText(t, `
 [pg]
 url = "postgres://localhost/test"
 projects = ["alpha", "beta"]
-`), 0o644)
+`)
 
-	cfg, err := Default()
-	require.NoError(t, err)
-	cfg.DataDir = dir
-	require.NoError(t, cfg.loadFile(), "loadFile")
+	cfg := f.LoadFile(t)
 
 	require.Len(t, cfg.PG.Projects, 2)
 	assert.Equal(t, "alpha", cfg.PG.Projects[0])
@@ -709,21 +883,37 @@ projects = ["alpha", "beta"]
 }
 
 func TestPGConfig_ExcludeProjectFilter(t *testing.T) {
-	dir := t.TempDir()
-	tomlPath := filepath.Join(dir, "config.toml")
-	os.WriteFile(tomlPath, []byte(`
+	f := newConfigFixture(t)
+	f.WriteConfigText(t, `
 [pg]
 url = "postgres://localhost/test"
 exclude_projects = ["gamma"]
-`), 0o644)
+`)
 
-	cfg, err := Default()
-	require.NoError(t, err)
-	cfg.DataDir = dir
-	require.NoError(t, cfg.loadFile(), "loadFile")
+	cfg := f.LoadFile(t)
 
 	require.Len(t, cfg.PG.ExcludeProjects, 1)
 	assert.Equal(t, "gamma", cfg.PG.ExcludeProjects[0])
+}
+
+func TestEnsureAuthTokenAdoptsPersistedToken(t *testing.T) {
+	f := newConfigFixture(t)
+	f.WriteConfigText(t, `
+auth_token = "persisted-token"
+require_auth = true
+`)
+
+	cfg, err := Default()
+	require.NoError(t, err)
+	cfg.DataDir = f.Dir
+	cfg.RequireAuth = true
+
+	require.NoError(t, cfg.EnsureAuthToken())
+	assert.Equal(t, "persisted-token", cfg.AuthToken)
+
+	data, err := os.ReadFile(f.Path(configFileName))
+	require.NoError(t, err)
+	assert.Contains(t, string(data), `auth_token = "persisted-token"`)
 }
 
 func TestResolvePG_Defaults(t *testing.T) {
@@ -793,8 +983,7 @@ func TestResolvePG_ErrorsOnMissingEnvVar(t *testing.T) {
 	}
 
 	_, err := cfg.ResolvePG()
-	require.Error(t, err, "expected error for unset env var")
-	assert.Contains(t, err.Error(), "NONEXISTENT_PG_VAR")
+	requireErrorContains(t, err, "NONEXISTENT_PG_VAR")
 }
 
 func TestResolvePG_ErrorsOnMissingBareEnvVar(t *testing.T) {
@@ -805,8 +994,7 @@ func TestResolvePG_ErrorsOnMissingBareEnvVar(t *testing.T) {
 	}
 
 	_, err := cfg.ResolvePG()
-	require.Error(t, err, "expected error for unset bare env var")
-	assert.Contains(t, err.Error(), "NONEXISTENT_PG_BARE_VAR")
+	requireErrorContains(t, err, "NONEXISTENT_PG_BARE_VAR")
 }
 
 // TestIsEnvDependentURL locks the helper to the same expansion semantics
@@ -850,9 +1038,80 @@ func TestResolvePG_AllowsBothFilterLists(t *testing.T) {
 	require.NoError(t, err, "ResolvePG should not reject filter conflicts")
 }
 
+func TestDuckDBConfig_LoadsFileAndEnv(t *testing.T) {
+	f := newConfigFixture(t)
+	f.WriteTOML(t, map[string]any{
+		"duckdb": map[string]any{
+			"path":             "/from/config/sessions.duckdb",
+			"url":              "quack:config-host",
+			"token":            "config-token",
+			"machine_name":     "config-machine",
+			"allow_insecure":   true,
+			"projects":         []string{"alpha", "beta"},
+			"exclude_projects": []string{"gamma"},
+		},
+	})
+	t.Setenv("AGENTSVIEW_DUCKDB_PATH", "/from/env/sessions.duckdb")
+	t.Setenv("AGENTSVIEW_DUCKDB_URL", "quack:env-host")
+	t.Setenv("AGENTSVIEW_DUCKDB_TOKEN", "env-token")
+	t.Setenv("AGENTSVIEW_DUCKDB_MACHINE", "env-machine")
+
+	cfg := f.LoadMinimal(t)
+
+	assert.Equal(t, "/from/env/sessions.duckdb", cfg.DuckDB.Path)
+	assert.Equal(t, "quack:env-host", cfg.DuckDB.URL)
+	assert.Equal(t, "env-token", cfg.DuckDB.Token)
+	assert.Equal(t, "env-machine", cfg.DuckDB.MachineName)
+	assert.True(t, cfg.DuckDB.AllowInsecure)
+	assert.Equal(t, []string{"alpha", "beta"}, cfg.DuckDB.Projects)
+	assert.Equal(t, []string{"gamma"}, cfg.DuckDB.ExcludeProjects)
+}
+
+func TestResolveDuckDB_Defaults(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{DataDir: dir}
+
+	resolved, err := cfg.ResolveDuckDB()
+	require.NoError(t, err, "ResolveDuckDB")
+
+	assert.Equal(t, filepath.Join(dir, "sessions.duckdb"), resolved.Path)
+	assert.NotEmpty(t, resolved.MachineName, "MachineName should default to hostname")
+}
+
+func TestResolveDuckDB_ExpandsEnvVars(t *testing.T) {
+	t.Setenv("DUCKDB_URL", "quack:localhost")
+	t.Setenv("DUCKDB_TOKEN", "secret-token")
+	t.Setenv("DUCKDB_PATH", filepath.Join(t.TempDir(), "remote.duckdb"))
+
+	cfg := Config{
+		DuckDB: DuckDBConfig{
+			Path:  "$DUCKDB_PATH",
+			URL:   "${DUCKDB_URL}",
+			Token: "${DUCKDB_TOKEN}",
+		},
+	}
+
+	resolved, err := cfg.ResolveDuckDB()
+	require.NoError(t, err, "ResolveDuckDB")
+
+	assert.Equal(t, os.Getenv("DUCKDB_PATH"), resolved.Path)
+	assert.Equal(t, "quack:localhost", resolved.URL)
+	assert.Equal(t, "secret-token", resolved.Token)
+}
+
+func TestResolveDuckDB_ErrorsOnMissingEnvVar(t *testing.T) {
+	cfg := Config{
+		DuckDB: DuckDBConfig{
+			URL: "${MISSING_DUCKDB_URL}",
+		},
+	}
+
+	_, err := cfg.ResolveDuckDB()
+	requireErrorContains(t, err, "MISSING_DUCKDB_URL")
+}
+
 func TestAutomatedPrefixesRoundTrip(t *testing.T) {
-	dir := setupTestEnv(t)
-	writeConfig(t, dir, map[string]any{
+	cfg := loadPFlagsWithConfig(t, map[string]any{
 		"automated": map[string]any{
 			"prefixes": []string{
 				"You are analyzing an essay",
@@ -862,8 +1121,6 @@ func TestAutomatedPrefixesRoundTrip(t *testing.T) {
 			},
 		},
 	})
-	cfg, err := loadConfigFromPFlags(t)
-	require.NoError(t, err, "loading config")
 	want := []string{
 		"You are analyzing an essay",
 		"You are grading quotes",
@@ -874,12 +1131,9 @@ func TestAutomatedPrefixesRoundTrip(t *testing.T) {
 }
 
 func TestAutomatedPrefixesAbsentIsNil(t *testing.T) {
-	dir := setupTestEnv(t)
-	writeConfig(t, dir, map[string]any{
+	cfg := loadPFlagsWithConfig(t, map[string]any{
 		"public_url": "http://example.com",
 	})
-	cfg, err := loadConfigFromPFlags(t)
-	require.NoError(t, err, "loading config")
 	assert.Nil(t, cfg.Automated.Prefixes)
 }
 
@@ -922,11 +1176,7 @@ func TestLoadFile_CustomModelPricing(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dir := setupTestEnv(t)
-			writeConfig(t, dir, tt.data)
-
-			cfg, err := LoadMinimal()
-			require.NoError(t, err, "LoadMinimal")
+			cfg := loadMinimalWithConfig(t, tt.data)
 
 			if len(tt.want) == 0 {
 				assert.Empty(t, cfg.CustomModelPricing)
@@ -942,6 +1192,61 @@ func TestLoadFile_CustomModelPricing(t *testing.T) {
 				}
 				assert.Equal(t, wantRate, got, "model %q", model)
 			}
+		})
+	}
+}
+
+func TestLoadFile_RemoteHosts(t *testing.T) {
+	f := newConfigFixture(t)
+	f.WriteConfigText(t, `[[remote_hosts]]
+host = "devbox1"
+user = "jesse"
+port = 22
+
+[[remote_hosts]]
+host = "  laptop2  "
+`)
+
+	cfg := f.LoadMinimal(t)
+
+	require.Len(t, cfg.RemoteHosts, 2)
+	assert.Equal(t, RemoteHost{Host: "devbox1", User: "jesse", Port: 22}, cfg.RemoteHosts[0])
+	// host is trimmed at load so validation and SSH see the same value
+	assert.Equal(t, RemoteHost{Host: "laptop2"}, cfg.RemoteHosts[1])
+}
+
+func TestLoadFile_RemoteHostsAbsentIsNil(t *testing.T) {
+	cfg := loadMinimalWithConfig(t,
+		map[string]any{"public_url": "http://example.com"})
+
+	assert.Nil(t, cfg.RemoteHosts)
+}
+
+func TestValidateRemoteHosts(t *testing.T) {
+	tests := []struct {
+		name    string
+		hosts   []RemoteHost
+		wantErr []string // substrings expected in error; empty => no error
+	}{
+		{"valid", []RemoteHost{{Host: "a"}, {Host: "b", Port: 22}, {Host: "c", Port: 0}}, nil},
+		{"empty host", []RemoteHost{{Host: ""}}, []string{"host is required"}},
+		{"negative port", []RemoteHost{{Host: "a", Port: -1}}, []string{"invalid port"}},
+		{"port too large", []RemoteHost{{Host: "a", Port: 70000}}, []string{"invalid port"}},
+		{"aggregates both", []RemoteHost{{Host: ""}, {Host: "b", Port: 99999}}, []string{"host is required", "invalid port"}},
+		{"duplicate host", []RemoteHost{{Host: "a"}, {Host: "a"}}, []string{"duplicate host"}},
+		{"duplicate host different user or port", []RemoteHost{{Host: "box", User: "alice"}, {Host: "box", User: "bob", Port: 2222}}, []string{"duplicate host"}},
+		{"option shaped host", []RemoteHost{{Host: "-oProxyCommand=sh"}}, []string{"host must not begin with '-'"}},
+		{"option shaped user", []RemoteHost{{Host: "box", User: "-lroot"}}, []string{"user must not begin with '-'"}},
+		{"none configured", nil, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := Config{RemoteHosts: tt.hosts}.ValidateRemoteHosts()
+			if len(tt.wantErr) == 0 {
+				require.NoError(t, err)
+				return
+			}
+			requireErrorContains(t, err, tt.wantErr...)
 		})
 	}
 }

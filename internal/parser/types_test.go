@@ -138,12 +138,15 @@ func TestAgentByType(t *testing.T) {
 		{AgentCodex, true},
 		{AgentCopilot, true},
 		{AgentGemini, true},
+		{AgentMiMoCode, true},
 		{AgentOpenCode, true},
 		{AgentOpenHands, true},
 		{AgentCursor, true},
 		{AgentAmp, true},
 		{AgentVSCodeCopilot, true},
 		{AgentPi, true},
+		{AgentOMP, true},
+		{AgentDeepSeekTUI, true},
 		{"unknown", false},
 	}
 	for _, tt := range tests {
@@ -187,6 +190,12 @@ func TestAgentByPrefix(t *testing.T) {
 			true,
 		},
 		{
+			"mimocode prefix",
+			"mimocode:sess-id",
+			AgentMiMoCode,
+			true,
+		},
+		{
 			"opencode prefix",
 			"opencode:sess-id",
 			AgentOpenCode,
@@ -217,9 +226,54 @@ func TestAgentByPrefix(t *testing.T) {
 			true,
 		},
 		{
+			"visualstudio-copilot prefix",
+			"visualstudio-copilot:sess-id",
+			AgentVSCopilot,
+			true,
+		},
+		{
 			"pi prefix",
 			"pi:pi-session-uuid",
 			AgentPi,
+			true,
+		},
+		{
+			"omp prefix",
+			"omp:omp-session-uuid",
+			AgentOMP,
+			true,
+		},
+		{
+			"zed prefix",
+			"zed:sess-id",
+			AgentZed,
+			true,
+		},
+		{
+			"qwenpaw prefix",
+			"qwenpaw:default:sess-id",
+			AgentQwenPaw,
+			true,
+		},
+		{
+			// Lock in the disjoint prefix: "qwenpaw:" must NOT be
+			// swallowed by the "qwen:" rule (no shared stem), so
+			// QwenPaw IDs never route to the Qwen agent.
+			"qwen prefix does not capture qwenpaw",
+			"qwen:sess-id",
+			AgentQwen,
+			true,
+		},
+		{
+			"deepseek tui prefix",
+			"deepseek-tui:sess-id",
+			AgentDeepSeekTUI,
+			true,
+		},
+		{
+			"remote deepseek tui prefix",
+			"devbox~deepseek-tui:sess-id",
+			AgentDeepSeekTUI,
 			true,
 		},
 		{
@@ -248,17 +302,30 @@ func TestAgentByPrefix(t *testing.T) {
 }
 
 func TestRegistryCompleteness(t *testing.T) {
+	// allTypes is the canonical list of every supported agent. It must match
+	// Registry exactly in both directions: the assertions below fail if an
+	// agent is registered without being listed here (or vice versa), so a new
+	// AgentDef cannot silently bypass this check the way several agents
+	// previously did.
 	allTypes := []AgentType{
 		AgentClaude,
+		AgentCowork,
 		AgentCodex,
 		AgentCopilot,
 		AgentGemini,
+		AgentMiMoCode,
 		AgentOpenCode,
+		AgentKilo,
 		AgentOpenHands,
 		AgentCursor,
 		AgentAmp,
 		AgentVSCodeCopilot,
+		AgentVSCopilot,
 		AgentPi,
+		AgentOMP,
+		AgentQwen,
+		AgentCommandCode,
+		AgentDeepSeekTUI,
 		AgentOpenClaw,
 		AgentQClaw,
 		AgentKimi,
@@ -272,16 +339,42 @@ func TestRegistryCompleteness(t *testing.T) {
 		AgentPiebald,
 		AgentWarp,
 		AgentPositron,
+		AgentZed,
+		AgentAntigravity,
+		AgentAntigravityCLI,
+		AgentIflow,
+		AgentWorkBuddy,
+		AgentZencoder,
+		AgentGptme,
+		AgentQwenPaw,
+		AgentShelley,
+		AgentVibe,
+		AgentAider,
+		AgentReasonix,
 	}
 
-	registered := make(map[AgentType]bool)
+	expected := make(map[AgentType]bool, len(allTypes))
+	for _, at := range allTypes {
+		assert.Falsef(t, expected[at], "AgentType %q listed more than once in allTypes", at)
+		expected[at] = true
+	}
+
+	registered := make(map[AgentType]bool, len(Registry))
 	for _, def := range Registry {
+		assert.Falsef(t, registered[def.Type],
+			"AgentType %q registered more than once in Registry", def.Type)
 		registered[def.Type] = true
 	}
 
-	for _, at := range allTypes {
-		assert.Truef(t, registered[at],
-			"AgentType %q missing from Registry", at)
+	// Every listed agent must be registered.
+	for at := range expected {
+		assert.Truef(t, registered[at], "AgentType %q missing from Registry", at)
+	}
+	// Every registered agent must be listed, so additions to Registry cannot
+	// silently skip this completeness check.
+	for at := range registered {
+		assert.Truef(t, expected[at],
+			"AgentType %q registered but not listed in allTypes (add it to TestRegistryCompleteness)", at)
 	}
 }
 
@@ -385,6 +478,28 @@ func TestFileBasedAgentsHaveConfigKey(t *testing.T) {
 	}
 }
 
+func TestZedRegistryEntry(t *testing.T) {
+	def, ok := AgentByType(AgentZed)
+	if !ok {
+		t.Fatalf("AgentZed missing from Registry")
+	}
+	if !def.FileBased {
+		t.Fatalf("Zed FileBased = false, want true")
+	}
+	if def.EnvVar != "ZED_DIR" {
+		t.Fatalf("Zed EnvVar = %q", def.EnvVar)
+	}
+	if def.ConfigKey != "zed_dirs" {
+		t.Fatalf("Zed ConfigKey = %q", def.ConfigKey)
+	}
+	if def.IDPrefix != "zed:" {
+		t.Fatalf("Zed IDPrefix = %q", def.IDPrefix)
+	}
+	if def.DiscoverFunc == nil || def.FindSourceFunc == nil {
+		t.Fatalf("Zed discover/source funcs must be set")
+	}
+}
+
 func TestOpenCodeRegistryEntry(t *testing.T) {
 	def, ok := AgentByType(AgentOpenCode)
 	require.True(t, ok, "AgentOpenCode missing from Registry")
@@ -400,6 +515,68 @@ func TestOpenCodeRegistryEntry(t *testing.T) {
 		"OpenCode WatchSubdirs = %v, want %v", def.WatchSubdirs, want)
 }
 
+func TestCoworkRegistryEntry(t *testing.T) {
+	def, ok := AgentByType(AgentCowork)
+	require.True(t, ok, "AgentCowork missing from Registry")
+	require.True(t, def.FileBased, "Cowork FileBased")
+	require.NotNil(t, def.DiscoverFunc, "Cowork DiscoverFunc")
+	require.NotNil(t, def.FindSourceFunc, "Cowork FindSourceFunc")
+	assert.Equal(t, "COWORK_DIR", def.EnvVar)
+	assert.Equal(t, "cowork_dirs", def.ConfigKey)
+	assert.Equal(t, "cowork:", def.IDPrefix)
+	assert.Equal(t, coworkDefaultDirs(), def.DefaultDirs)
+	assert.True(t, def.ShallowWatch,
+		"Cowork root contains large local_* working trees that discovery skips")
+}
+
+func TestAgentByPrefixCowork(t *testing.T) {
+	def, ok := AgentByPrefix("cowork:c0000000-0000-4000-8000-000000000001")
+	require.True(t, ok, "cowork-prefixed ID should resolve")
+	assert.Equal(t, AgentCowork, def.Type)
+}
+
+func TestMiMoCodeRegistryEntry(t *testing.T) {
+	def, ok := AgentByType(AgentMiMoCode)
+	require.True(t, ok, "AgentMiMoCode missing from Registry")
+	require.True(t, def.FileBased, "MiMoCode FileBased")
+	require.NotNil(t, def.DiscoverFunc, "MiMoCode DiscoverFunc")
+	require.NotNil(t, def.FindSourceFunc, "MiMoCode FindSourceFunc")
+	assert.Equal(t, "MIMOCODE_DIR", def.EnvVar)
+	assert.Equal(t, "mimocode_dirs", def.ConfigKey)
+	assert.Equal(t, []string{".local/share/mimocode"}, def.DefaultDirs)
+	assert.Equal(t, "mimocode:", def.IDPrefix)
+	want := []string{
+		"storage/session_diff",
+		"storage/message",
+		"storage/part",
+	}
+	require.Truef(t, slices.Equal(def.WatchSubdirs, want),
+		"MiMoCode WatchSubdirs = %v, want %v", def.WatchSubdirs, want)
+}
+
+func TestCommandCodeRegistryEntry(t *testing.T) {
+	def, ok := AgentByType(AgentCommandCode)
+	require.True(t, ok, "AgentCommandCode missing from Registry")
+	require.True(t, def.FileBased, "Command Code FileBased")
+	require.NotNil(t, def.DiscoverFunc, "Command Code DiscoverFunc")
+	require.NotNil(t, def.FindSourceFunc, "Command Code FindSourceFunc")
+	assert.Equal(t, []string{".commandcode/projects"}, def.DefaultDirs)
+	assert.Equal(t, "commandcode:", def.IDPrefix)
+}
+
+func TestDeepSeekTUIRegistryEntry(t *testing.T) {
+	def, ok := AgentByType(AgentDeepSeekTUI)
+	require.True(t, ok, "AgentDeepSeekTUI missing from Registry")
+	require.True(t, def.FileBased, "DeepSeek TUI FileBased")
+	require.NotNil(t, def.DiscoverFunc, "DeepSeek TUI DiscoverFunc")
+	require.NotNil(t, def.FindSourceFunc, "DeepSeek TUI FindSourceFunc")
+	assert.Equal(t, "DeepSeek TUI", def.DisplayName)
+	assert.Equal(t, "DEEPSEEK_TUI_SESSIONS_DIR", def.EnvVar)
+	assert.Equal(t, "deepseek_tui_sessions_dirs", def.ConfigKey)
+	assert.Equal(t, []string{".codewhale/sessions", ".deepseek/sessions"}, def.DefaultDirs)
+	assert.Equal(t, "deepseek-tui:", def.IDPrefix)
+}
+
 func TestResolveOpenCodeSourcePrefersStorage(t *testing.T) {
 	root := t.TempDir()
 	sessionDir := filepath.Join(root, "storage", "session", "global")
@@ -410,6 +587,29 @@ func TestResolveOpenCodeSourcePrefersStorage(t *testing.T) {
 	got := ResolveOpenCodeSource(root)
 	require.Equal(t, OpenCodeSourceStorage, got.Mode, "Mode")
 	require.Equal(t, filepath.Join(root, "storage", "session"), got.SessionRoot, "SessionRoot")
+}
+
+func TestResolveMiMoCodeSourcePrefersStorage(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "storage", "session_diff", "global")
+	require.NoError(t, os.MkdirAll(dir, 0o755), "mkdir")
+	dbPath := filepath.Join(root, "mimocode.db")
+	require.NoError(t, os.WriteFile(dbPath, []byte("x"), 0o644), "write db marker")
+
+	src := ResolveMiMoCodeSource(root)
+	require.Equal(t, OpenCodeSourceStorage, src.Mode, "Mode")
+	require.Equal(t, filepath.Join(root, "storage", "session_diff"), src.SessionRoot)
+
+	path := filepath.Join(dir, "ses_test.json")
+	require.NoError(t, os.WriteFile(path,
+		[]byte(`{"id":"ses_test","directory":"/home/user/code/my-app"}`),
+		0o644))
+
+	discovered := DiscoverMiMoCodeSessions(root)
+	require.Len(t, discovered, 1)
+	require.Equal(t, AgentMiMoCode, discovered[0].Agent)
+
+	require.Equal(t, path, FindMiMoCodeSourceFile(root, "ses_test"))
 }
 
 func TestResolveOpenCodeSourceFallsBackToSQLiteOnBrokenStoragePath(
@@ -570,6 +770,59 @@ func TestOpenCodeStorageSessionIDsNilForNonStorageRoot(t *testing.T) {
 	), "write db marker")
 	got := OpenCodeStorageSessionIDs(root)
 	assert.Nil(t, got, "want nil for SQLite-only root")
+}
+
+func TestResolveCodexShallowWatchRoots(t *testing.T) {
+	tests := []struct {
+		name string
+		root string
+		want []string
+	}{
+		{
+			name: "sessions dir",
+			root: filepath.Join("home", ".codex", "sessions"),
+			want: []string{filepath.Join("home", ".codex")},
+		},
+		{
+			name: "archived sessions dir",
+			root: filepath.Join("home", ".codex", "archived_sessions"),
+			want: []string{filepath.Join("home", ".codex")},
+		},
+		{
+			name: "empty root",
+			root: "",
+			want: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ResolveCodexShallowWatchRoots(tt.root)
+			assert.Truef(t, slices.Equal(got, tt.want),
+				"ResolveCodexShallowWatchRoots(%q) = %v, want %v",
+				tt.root, got, tt.want)
+		})
+	}
+}
+
+func TestCodexDefShallowWatchesIndexParent(t *testing.T) {
+	var def AgentDef
+	found := false
+	for _, d := range Registry {
+		if d.Type == AgentCodex {
+			def = d
+			found = true
+			break
+		}
+	}
+	require.True(t, found, "Codex agent def must exist")
+	require.NotNil(t, def.ShallowWatchRootsFunc,
+		"Codex must watch its index parent shallowly")
+	got := def.ShallowWatchRootsFunc(
+		filepath.Join("home", ".codex", "sessions"),
+	)
+	want := []string{filepath.Join("home", ".codex")}
+	assert.Truef(t, slices.Equal(got, want),
+		"Codex ShallowWatchRootsFunc = %v, want %v", got, want)
 }
 
 func TestResolveOpenCodeWatchRootsStorage(t *testing.T) {
@@ -798,4 +1051,78 @@ func TestVSCodeCopilotDefaultDirs(t *testing.T) {
 		assert.Truef(t, slices.Contains(def.DefaultDirs, path),
 			"missing default dir: %s", path)
 	}
+}
+
+func TestApplyUsageEventTokenTotals(t *testing.T) {
+	// Verify that applyUsageEventTokenTotals computes PeakContextTokens
+	// correctly including cache-creation and cache-read tokens.
+	sess := &ParsedSession{}
+	events := []ParsedUsageEvent{
+		{
+			InputTokens:              1000,
+			OutputTokens:             200,
+			CacheReadInputTokens:     500,
+			CacheCreationInputTokens: 300,
+		},
+		{
+			InputTokens:              800,
+			OutputTokens:             150,
+			CacheReadInputTokens:     1200,
+			CacheCreationInputTokens: 100,
+		},
+	}
+
+	applyUsageEventTokenTotals(sess, events)
+
+	assert.True(t, sess.HasTotalOutputTokens)
+	assert.Equal(t, 350, sess.TotalOutputTokens)
+
+	assert.True(t, sess.HasPeakContextTokens)
+	// Peak context should be max of context window (InputTokens + CacheRead + CacheCreation)
+	// Event 1 context = 1000 + 500 + 300 = 1800
+	// Event 2 context = 800 + 1200 + 100 = 2100
+	assert.Equal(t, 2100, sess.PeakContextTokens)
+}
+
+func TestReasonixRegistryEntry(t *testing.T) {
+	// Find Reasonix in the registry
+	var reasonixDef *AgentDef
+	for _, def := range Registry {
+		if def.Type == AgentReasonix {
+			reasonixDef = &def
+			break
+		}
+	}
+	require.NotNil(t, reasonixDef, "AgentReasonix must be in Registry")
+
+	// Verify basic properties
+	assert.Equal(t, AgentReasonix, reasonixDef.Type)
+	assert.Equal(t, "Reasonix", reasonixDef.DisplayName)
+	assert.Equal(t, "REASONIX_DIR", reasonixDef.EnvVar)
+	assert.Equal(t, "reasonix_dirs", reasonixDef.ConfigKey)
+	assert.Equal(t, "reasonix:", reasonixDef.IDPrefix)
+	assert.True(t, reasonixDef.FileBased)
+
+	// Verify watch subdirs
+	assert.Contains(t, reasonixDef.WatchSubdirs, "sessions")
+	assert.Contains(t, reasonixDef.WatchSubdirs, "archive")
+
+	// Verify function pointers are set
+	assert.NotNil(t, reasonixDef.DiscoverFunc, "DiscoverFunc must be set")
+	assert.NotNil(t, reasonixDef.FindSourceFunc, "FindSourceFunc must be set")
+
+	// Verify default dirs contain .reasonix and Windows path
+	assert.True(t, len(reasonixDef.DefaultDirs) > 0)
+	hasUnix := false
+	hasWindows := false
+	for _, dir := range reasonixDef.DefaultDirs {
+		if dir == ".reasonix" {
+			hasUnix = true
+		}
+		if dir == "AppData/Roaming/reasonix" {
+			hasWindows = true
+		}
+	}
+	assert.True(t, hasUnix, "DefaultDirs should contain .reasonix")
+	assert.True(t, hasWindows, "DefaultDirs should contain AppData/Roaming/reasonix")
 }

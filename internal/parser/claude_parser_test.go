@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
@@ -24,6 +26,34 @@ func runClaudeParserTest(t *testing.T, fileName, content string) (ParsedSession,
 	require.NoError(t, err)
 	require.NotEmpty(t, results)
 	return results[0].Session, results[0].Messages
+}
+
+func callParseClaudeSessionFrom(
+	path string, offset int64, startOrdinal int, lastEntryUUID string,
+) ([]ParsedMessage, time.Time, int64, error) {
+	fn := reflect.ValueOf(ParseClaudeSessionFrom)
+	args := []reflect.Value{
+		reflect.ValueOf(path),
+		reflect.ValueOf(offset),
+		reflect.ValueOf(startOrdinal),
+	}
+	if fn.Type().NumIn() == 4 {
+		args = append(args, reflect.ValueOf(lastEntryUUID))
+	}
+	out := fn.Call(args)
+
+	var msgs []ParsedMessage
+	if !out[0].IsNil() {
+		msgs = out[0].Interface().([]ParsedMessage)
+	}
+	endedAt := out[1].Interface().(time.Time)
+	consumed := out[2].Interface().(int64)
+
+	var err error
+	if !out[3].IsNil() {
+		err = out[3].Interface().(error)
+	}
+	return msgs, endedAt, consumed, err
 }
 
 // TestParseClaudeSession_UsageProbe verifies that sessions whose only
@@ -512,8 +542,8 @@ func TestParseClaudeSessionFrom_Incremental(t *testing.T) {
 	require.NoError(t, f.Close())
 
 	// Incremental parse from offset.
-	newMsgs, endedAt, _, err := ParseClaudeSessionFrom(
-		path, offset, 2,
+	newMsgs, endedAt, _, err := callParseClaudeSessionFrom(
+		path, offset, 2, "",
 	)
 	require.NoError(t, err)
 	assert.Equal(t, 2, len(newMsgs))
@@ -556,7 +586,7 @@ func TestParseClaudeSessionFrom_QueuedCommand(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	newMsgs, _, _, err := ParseClaudeSessionFrom(path, offset, 2)
+	newMsgs, _, _, err := callParseClaudeSessionFrom(path, offset, 2, "")
 	require.NoError(t, err)
 	require.Len(t, newMsgs, 2)
 
@@ -568,6 +598,43 @@ func TestParseClaudeSessionFrom_QueuedCommand(t *testing.T) {
 
 	assert.Equal(t, RoleAssistant, newMsgs[1].Role)
 	assert.Equal(t, 3, newMsgs[1].Ordinal)
+}
+
+func TestParseClaudeSessionFrom_QueueOperationPreservesSubagentMapping(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	initial := testjsonl.JoinJSONL(
+		testjsonl.ClaudeUserJSON("hello", tsEarly),
+	)
+	path := createTestFile(t, "inc-subagent.jsonl", initial)
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	offset := info.Size()
+
+	appended := strings.Join([]string{
+		`{"type":"assistant","timestamp":"` + tsEarlyS1 + `","uuid":"a1","parentUuid":"u1","message":{"content":[{"type":"tool_use","id":"toolu_agent","name":"Agent","input":{"description":"inspect","subagent_type":"Explore","prompt":"inspect"}}]}}`,
+		`{"type":"queue-operation","operation":"enqueue","timestamp":"` + tsEarlyS5 + `","sessionId":"test-session","content":"{\"task_id\":\"child123\",\"tool_use_id\":\"toolu_agent\",\"description\":\"inspect\",\"task_type\":\"local_agent\"}"}`,
+	}, "\n") + "\n"
+	f, err := os.OpenFile(
+		path, os.O_APPEND|os.O_WRONLY, 0o644,
+	)
+	require.NoError(t, err)
+	_, err = f.WriteString(appended)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	newMsgs, _, _, err := callParseClaudeSessionFrom(path, offset, 1, "")
+	require.NoError(t, err)
+	require.Len(t, newMsgs, 1)
+	require.Len(t, newMsgs[0].ToolCalls, 1)
+	assert.Equal(
+		t,
+		"agent-child123",
+		newMsgs[0].ToolCalls[0].SubagentSessionID,
+	)
 }
 
 func TestParseClaudeSessionFrom_SkipsNonMessages(
@@ -600,8 +667,8 @@ func TestParseClaudeSessionFrom_SkipsNonMessages(
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	newMsgs, _, _, err := ParseClaudeSessionFrom(
-		path, offset, 1,
+	newMsgs, _, _, err := callParseClaudeSessionFrom(
+		path, offset, 1, "",
 	)
 	require.NoError(t, err)
 	assert.Equal(t, 1, len(newMsgs))
@@ -623,8 +690,8 @@ func TestParseClaudeSessionFrom_NoNewData(t *testing.T) {
 	require.NoError(t, err)
 
 	// Parse from EOF — should return empty.
-	newMsgs, endedAt, _, err := ParseClaudeSessionFrom(
-		path, info.Size(), 1,
+	newMsgs, endedAt, _, err := callParseClaudeSessionFrom(
+		path, info.Size(), 1, "",
 	)
 	require.NoError(t, err)
 	assert.Empty(t, newMsgs)
@@ -660,8 +727,8 @@ func TestParseClaudeSessionFrom_PartialLineAtEOF(
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	newMsgs, _, consumed, err := ParseClaudeSessionFrom(
-		path, offset, 1,
+	newMsgs, _, consumed, err := callParseClaudeSessionFrom(
+		path, offset, 1, "",
 	)
 	require.NoError(t, err)
 	assert.Equal(t, 1, len(newMsgs))
@@ -708,8 +775,42 @@ func TestParseClaudeSessionFrom_DAGDetected(
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	_, _, _, err = ParseClaudeSessionFrom(
-		path, offset, 1,
+	_, _, _, err = callParseClaudeSessionFrom(
+		path, offset, 1, "",
+	)
+	assert.ErrorIs(t, err, ErrDAGDetected)
+}
+
+func TestParseClaudeSessionFrom_DAGBoundaryAgainstStoredLastUUID(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	path := createTestFile(
+		t, "inc-dag-boundary.jsonl",
+		testjsonl.JoinJSONL(
+			testjsonl.ClaudeUserJSON("hello", tsEarly),
+		),
+	)
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	offset := info.Size()
+
+	appended := testjsonl.JoinJSONL(
+		`{"type":"assistant","uuid":"a1","parentUuid":"wrong-parent","timestamp":"` +
+			tsEarlyS5 + `","message":{"content":[{"type":"text","text":"branch"}]}}`,
+	)
+	f, err := os.OpenFile(
+		path, os.O_APPEND|os.O_WRONLY, 0o644,
+	)
+	require.NoError(t, err)
+	_, err = f.WriteString(appended + "\n")
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	_, _, _, err = callParseClaudeSessionFrom(
+		path, offset, 1, "stored-tip",
 	)
 	assert.ErrorIs(t, err, ErrDAGDetected)
 }
@@ -755,8 +856,8 @@ func TestParseClaudeSessionFrom_DAGAcrossNonUUID(
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	_, _, _, err = ParseClaudeSessionFrom(
-		path, offset, 1,
+	_, _, _, err = callParseClaudeSessionFrom(
+		path, offset, 1, "",
 	)
 	assert.ErrorIs(t, err, ErrDAGDetected)
 }
@@ -798,8 +899,8 @@ func TestParseClaudeSessionFrom_LinearUUID(
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	newMsgs, endedAt, _, err := ParseClaudeSessionFrom(
-		path, offset, 1,
+	newMsgs, endedAt, _, err := callParseClaudeSessionFrom(
+		path, offset, 1, "",
 	)
 	require.NoError(t, err)
 	assert.Equal(t, 2, len(newMsgs))
@@ -845,9 +946,93 @@ func TestParseClaudeSessionFrom_ToolUseResultAgentIDFallsBack(
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	_, _, _, err = ParseClaudeSessionFrom(path, offset, 1)
+	_, _, _, err = callParseClaudeSessionFrom(path, offset, 1, "")
 	assert.ErrorIs(t, err, ErrClaudeIncrementalNeedsFullParse)
 	assert.True(t, IsIncrementalFullParseFallback(err))
+}
+
+func TestParseClaudeSession_ResolvesPersistedToolResultOutput(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	sessionDir := filepath.Join(dir, "project", "parent-session")
+	resultPath := filepath.Join(sessionDir, "tool-results", "b123.txt")
+	require.NoError(t, os.MkdirAll(filepath.Dir(resultPath), 0o755))
+
+	fullOutput := "full output line 1\nfull output line 2\n"
+	require.NoError(t, os.WriteFile(resultPath, []byte(fullOutput), 0o644))
+
+	resultPathJSON := mustJSONString(t, resultPath)
+	persistedContentJSON := mustJSONString(t,
+		"<persisted-output>\n"+
+			"Output too large (32B). Full output saved to: "+resultPath+
+			"\n\nPreview (first 2KB):\npreview only\n</persisted-output>")
+
+	content := strings.Join([]string{
+		`{"type":"user","timestamp":"2024-01-01T00:00:00Z","uuid":"u1","message":{"content":"run it"},"cwd":"/tmp/project"}`,
+		`{"type":"assistant","timestamp":"2024-01-01T00:00:01Z","uuid":"a1","parentUuid":"u1","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"make logs"}}]}}`,
+		`{"type":"user","timestamp":"2024-01-01T00:00:02Z","uuid":"u2","parentUuid":"a1","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":` + persistedContentJSON + `,"is_error":false}]},"toolUseResult":{"persistedOutputPath":` + resultPathJSON + `,"persistedOutputSize":32}}`,
+	}, "\n")
+	sessionPath := filepath.Join(dir, "project", "parent-session.jsonl")
+	require.NoError(t, os.WriteFile(sessionPath, []byte(content), 0o644))
+
+	results, err := ParseClaudeSession(sessionPath, "project", "local")
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Len(t, results[0].Messages, 3)
+	require.Len(t, results[0].Messages[2].ToolResults, 1)
+
+	got := results[0].Messages[2].ToolResults[0]
+	assert.Equal(t, len(fullOutput), got.ContentLength)
+	assert.Equal(t, fullOutput, DecodeContent(got.ContentRaw))
+}
+
+func TestParseClaudeSession_PersistedToolResultDoesNotOverwriteSiblings(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	sessionDir := filepath.Join(dir, "project", "parent-session")
+	resultPath := filepath.Join(sessionDir, "tool-results", "b123.txt")
+	require.NoError(t, os.MkdirAll(filepath.Dir(resultPath), 0o755))
+
+	fullOutput := "full persisted output\n"
+	require.NoError(t, os.WriteFile(resultPath, []byte(fullOutput), 0o644))
+
+	resultPathJSON := mustJSONString(t, resultPath)
+	persistedContentJSON := mustJSONString(t,
+		"<persisted-output>\n"+
+			"Output too large. Full output saved to: "+resultPath+
+			"\n\nPreview (first 2KB):\npreview only\n</persisted-output>")
+
+	content := strings.Join([]string{
+		`{"type":"user","timestamp":"2024-01-01T00:00:00Z","uuid":"u1","message":{"content":"run it"},"cwd":"/tmp/project"}`,
+		`{"type":"assistant","timestamp":"2024-01-01T00:00:01Z","uuid":"a1","parentUuid":"u1","message":{"content":[{"type":"tool_use","id":"toolu_big","name":"Bash","input":{"command":"make logs"}},{"type":"tool_use","id":"toolu_small","name":"Read","input":{"file_path":"README.md"}}]}}`,
+		`{"type":"user","timestamp":"2024-01-01T00:00:02Z","uuid":"u2","parentUuid":"a1","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_big","content":` + persistedContentJSON + `,"is_error":false},{"type":"tool_result","tool_use_id":"toolu_small","content":"small inline result","is_error":false}]},"toolUseResult":{"persistedOutputPath":` + resultPathJSON + `,"persistedOutputSize":22}}`,
+	}, "\n")
+	sessionPath := filepath.Join(dir, "project", "parent-session.jsonl")
+	require.NoError(t, os.WriteFile(sessionPath, []byte(content), 0o644))
+
+	results, err := ParseClaudeSession(sessionPath, "project", "local")
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Len(t, results[0].Messages, 3)
+	require.Len(t, results[0].Messages[2].ToolResults, 2)
+
+	toolResults := results[0].Messages[2].ToolResults
+	assert.Equal(t, fullOutput, DecodeContent(toolResults[0].ContentRaw))
+	assert.Equal(t, "small inline result", DecodeContent(toolResults[1].ContentRaw))
+	assert.Equal(t, len("small inline result"), toolResults[1].ContentLength)
+}
+
+func mustJSONString(t *testing.T, value string) string {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	require.NoError(t, err)
+	return string(encoded)
 }
 
 // Two appended assistant entries with the same message.id form a
@@ -887,7 +1072,69 @@ func TestParseClaudeSessionFrom_SameMessageIDFallsBack(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	_, _, _, err = ParseClaudeSessionFrom(path, offset, 1)
+	_, _, _, err = callParseClaudeSessionFrom(path, offset, 1, "")
+	assert.ErrorIs(t, err, ErrClaudeIncrementalNeedsFullParse)
+	assert.True(t, IsIncrementalFullParseFallback(err))
+}
+
+func TestParseClaudeSessionFrom_QueueOperationOnlyFallsBack(t *testing.T) {
+	t.Parallel()
+
+	initial := testjsonl.JoinJSONL(
+		`{"type":"user","uuid":"u1","timestamp":"`+tsEarly+`","message":{"content":"go"}}`,
+		`{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"`+tsEarlyS5+`","message":{"id":"msg_queue","content":[{"type":"tool_use","id":"toolu_queue","name":"Agent","input":{"description":"inspect","subagent_type":"Explore","prompt":"inspect"}}]}}`,
+	)
+	path := createTestFile(
+		t, "inc-queue-only.jsonl", initial,
+	)
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	offset := info.Size()
+
+	appended := `{"type":"queue-operation","operation":"enqueue","timestamp":"` +
+		tsLate + `","sessionId":"queued-subagent","content":"{\"task_id\":\"childqueue\",\"tool_use_id\":\"toolu_queue\",\"description\":\"inspect\",\"task_type\":\"local_agent\"}"}` + "\n"
+
+	f, err := os.OpenFile(
+		path, os.O_APPEND|os.O_WRONLY, 0o644,
+	)
+	require.NoError(t, err)
+	_, err = f.WriteString(appended)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	_, _, _, err = callParseClaudeSessionFrom(path, offset, 2, "a1")
+	assert.ErrorIs(t, err, ErrClaudeIncrementalNeedsFullParse)
+	assert.True(t, IsIncrementalFullParseFallback(err))
+}
+
+func TestParseClaudeSessionFrom_ProgressOnlyFallsBack(t *testing.T) {
+	t.Parallel()
+
+	initial := testjsonl.JoinJSONL(
+		`{"type":"user","uuid":"u1","timestamp":"`+tsEarly+`","message":{"content":"go"}}`,
+		`{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"`+tsEarlyS5+`","message":{"id":"msg_progress","content":[{"type":"tool_use","id":"toolu_progress","name":"Agent","input":{"description":"inspect","subagent_type":"Explore","prompt":"inspect"}}]}}`,
+	)
+	path := createTestFile(
+		t, "inc-progress-only.jsonl", initial,
+	)
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	offset := info.Size()
+
+	appended := `{"type":"progress","timestamp":"` + tsLate +
+		`","parentToolUseID":"toolu_progress","data":{"type":"agent_progress","agentId":"childprogress"}}` + "\n"
+
+	f, err := os.OpenFile(
+		path, os.O_APPEND|os.O_WRONLY, 0o644,
+	)
+	require.NoError(t, err)
+	_, err = f.WriteString(appended)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	_, _, _, err = callParseClaudeSessionFrom(path, offset, 2, "a1")
 	assert.ErrorIs(t, err, ErrClaudeIncrementalNeedsFullParse)
 	assert.True(t, IsIncrementalFullParseFallback(err))
 }
@@ -926,7 +1173,7 @@ func TestParseClaudeSessionFrom_BenignAppendNoFallback(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	newMsgs, _, _, err := ParseClaudeSessionFrom(path, offset, 1)
+	newMsgs, _, _, err := callParseClaudeSessionFrom(path, offset, 1, "")
 	require.NoError(t, err)
 	assert.Len(t, newMsgs, 2)
 }
@@ -1468,8 +1715,8 @@ func TestParseClaudeSession_CompactBoundary(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, f.Close())
 
-		newMsgs, _, _, err := ParseClaudeSessionFrom(
-			path, offset, 1,
+		newMsgs, _, _, err := callParseClaudeSessionFrom(
+			path, offset, 1, "",
 		)
 		require.NoError(t, err)
 		require.Len(t, newMsgs, 2)

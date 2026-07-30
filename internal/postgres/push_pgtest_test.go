@@ -115,6 +115,215 @@ func TestPushSystemFingerprintCollisionRegression(t *testing.T) {
 	checkIsSystem(t, pg, sessID, secondSet, 7)
 }
 
+func TestPushMessageContentHashRewriteRegression(t *testing.T) {
+	pgURL := testPGURL(t)
+
+	const schema = "agentsview_push_contenthash_test"
+	pg, err := Open(pgURL, schema, true)
+	require.NoError(t, err, "Open")
+	defer pg.Close()
+
+	ctx := context.Background()
+	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+	require.NoError(t, err, "drop schema")
+	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
+
+	localDB, err := db.Open(filepath.Join(t.TempDir(), "local.db"))
+	require.NoError(t, err, "db.Open")
+	defer localDB.Close()
+
+	sync := &Sync{
+		pg:         pg,
+		local:      localDB,
+		machine:    "test-machine",
+		schema:     schema,
+		schemaDone: true,
+	}
+
+	const sessID = "content-hash-rewrite-001"
+	sess := db.Session{
+		ID:               sessID,
+		Project:          "test-proj",
+		Machine:          "test-machine",
+		Agent:            "shelley",
+		MessageCount:     2,
+		UserMessageCount: 1,
+		CreatedAt:        "2026-01-01T00:00:00Z",
+	}
+	require.NoError(t, localDB.UpsertSession(sess), "UpsertSession")
+	msgs := []db.Message{
+		{
+			SessionID:     sessID,
+			Ordinal:       1,
+			Role:          "user",
+			Content:       "question",
+			ContentLength: len("question"),
+		},
+		{
+			SessionID:     sessID,
+			Ordinal:       2,
+			Role:          "assistant",
+			Content:       "answer aaaa",
+			ContentLength: len("answer aaaa"),
+		},
+	}
+	require.NoError(t, localDB.InsertMessages(msgs),
+		"InsertMessages first content")
+
+	_, err = sync.Push(ctx, false, nil)
+	require.NoError(t, err, "Push first content")
+	assertPGMessageContent(t, pg, sessID, 2, "answer aaaa")
+
+	msgs[1].Content = "answer bbbb"
+	msgs[1].ContentLength = len("answer bbbb")
+	require.NoError(t, localDB.ReplaceSessionMessages(sessID, msgs),
+		"ReplaceSessionMessages rewritten content")
+	require.NoError(t, localDB.SetSyncState("last_push_at", ""),
+		"clearing last_push_at")
+	require.NoError(t, localDB.SetSyncState(lastPushBoundaryStateKey, ""),
+		"clearing boundary state")
+
+	_, err = sync.Push(ctx, false, nil)
+	require.NoError(t, err, "Push rewritten content")
+	assertPGMessageContent(t, pg, sessID, 2, "answer bbbb")
+}
+
+func TestPushMessageFlagsRewriteRegression(t *testing.T) {
+	pgURL := testPGURL(t)
+
+	const schema = "agentsview_push_msgflags_test"
+	pg, err := Open(pgURL, schema, true)
+	require.NoError(t, err, "Open")
+	defer pg.Close()
+
+	ctx := context.Background()
+	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+	require.NoError(t, err, "drop schema")
+	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
+
+	localDB, err := db.Open(filepath.Join(t.TempDir(), "local.db"))
+	require.NoError(t, err, "db.Open")
+	defer localDB.Close()
+
+	sync := &Sync{
+		pg:         pg,
+		local:      localDB,
+		machine:    "test-machine",
+		schema:     schema,
+		schemaDone: true,
+	}
+
+	const sessID = "message-flags-rewrite-001"
+	sess := db.Session{
+		ID:               sessID,
+		Project:          "test-proj",
+		Machine:          "test-machine",
+		Agent:            "shelley",
+		MessageCount:     2,
+		UserMessageCount: 1,
+		CreatedAt:        "2026-01-01T00:00:00Z",
+	}
+	require.NoError(t, localDB.UpsertSession(sess), "UpsertSession")
+	msgs := []db.Message{
+		{
+			SessionID:     sessID,
+			Ordinal:       1,
+			Role:          "user",
+			Content:       "question",
+			ContentLength: len("question"),
+		},
+		{
+			SessionID:     sessID,
+			Ordinal:       2,
+			Role:          "assistant",
+			Content:       "answer",
+			ContentLength: len("answer"),
+		},
+	}
+	require.NoError(t, localDB.InsertMessages(msgs),
+		"InsertMessages first metadata")
+
+	_, err = sync.Push(ctx, false, nil)
+	require.NoError(t, err, "Push first metadata")
+	assertPGMessageThinking(t, pg, sessID, 2, false, "")
+
+	msgs[1].ThinkingText = "private chain of thought"
+	msgs[1].HasThinking = true
+	require.NoError(t, localDB.ReplaceSessionMessages(sessID, msgs),
+		"ReplaceSessionMessages rewritten metadata")
+	require.NoError(t, localDB.SetSyncState("last_push_at", ""),
+		"clearing last_push_at")
+	require.NoError(t, localDB.SetSyncState(lastPushBoundaryStateKey, ""),
+		"clearing boundary state")
+
+	_, err = sync.Push(ctx, false, nil)
+	require.NoError(t, err, "Push rewritten metadata")
+	assertPGMessageThinking(t, pg, sessID, 2, true,
+		"private chain of thought")
+}
+
+func TestPushMessageNanosecondTimestampNoRewriteRegression(t *testing.T) {
+	pgURL := testPGURL(t)
+
+	const schema = "agentsview_push_msgtime_nanos_test"
+	pg, err := Open(pgURL, schema, true)
+	require.NoError(t, err, "Open")
+	defer pg.Close()
+
+	ctx := context.Background()
+	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+	require.NoError(t, err, "drop schema")
+	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
+
+	localDB, err := db.Open(filepath.Join(t.TempDir(), "local.db"))
+	require.NoError(t, err, "db.Open")
+	defer localDB.Close()
+
+	sync := &Sync{
+		pg:         pg,
+		local:      localDB,
+		machine:    "test-machine",
+		schema:     schema,
+		schemaDone: true,
+	}
+
+	const sessID = "message-nanotime-rewrite-001"
+	sess := db.Session{
+		ID:               sessID,
+		Project:          "test-proj",
+		Machine:          "test-machine",
+		Agent:            "shelley",
+		MessageCount:     1,
+		UserMessageCount: 1,
+		CreatedAt:        "2026-01-01T00:00:00Z",
+	}
+	require.NoError(t, localDB.UpsertSession(sess), "UpsertSession")
+	require.NoError(t, localDB.InsertMessages([]db.Message{{
+		SessionID:     sessID,
+		Ordinal:       1,
+		Role:          "user",
+		Content:       "question",
+		ContentLength: len("question"),
+		Timestamp:     "2026-01-01T00:00:00.123456789Z",
+	}}), "InsertMessages")
+
+	_, err = sync.Push(ctx, false, nil)
+	require.NoError(t, err, "Push first timestamp")
+	assertPGMessageTimestamp(t, pg, sessID, 1,
+		"2026-01-01T00:00:00.123456Z")
+
+	ctidBefore := pgMessageCTID(t, pg, sessID, 1)
+	require.NoError(t, localDB.SetSyncState("last_push_at", ""),
+		"clearing last_push_at")
+	require.NoError(t, localDB.SetSyncState(lastPushBoundaryStateKey, ""),
+		"clearing boundary state")
+
+	_, err = sync.Push(ctx, false, nil)
+	require.NoError(t, err, "Push same timestamp")
+	assert.Equal(t, ctidBefore, pgMessageCTID(t, pg, sessID, 1),
+		"microsecond-equivalent timestamps should hit the fast path")
+}
+
 // TestPushSessionTerminationStatus verifies that pushSession round-trips
 // the termination_status column to PG: a non-nil value writes the string,
 // and a subsequent push with nil clears the column back to NULL via the
@@ -143,6 +352,8 @@ func TestPushSessionTerminationStatus(t *testing.T) {
 		schema:     schema,
 		schemaDone: true,
 	}
+	markerID, err := sync.pushMarkerID()
+	require.NoError(t, err, "pushMarkerID")
 
 	pending := "tool_call_pending"
 	sess := db.Session{
@@ -162,7 +373,7 @@ func TestPushSessionTerminationStatus(t *testing.T) {
 		t.Helper()
 		tx, err := pg.BeginTx(ctx, nil)
 		require.NoError(t, err, "BeginTx")
-		if err := sync.pushSession(ctx, tx, s); err != nil {
+		if err := sync.pushSession(ctx, tx, s, markerID, nil); err != nil {
 			_ = tx.Rollback()
 			t.Fatalf("pushSession: %v", err)
 		}
@@ -188,6 +399,55 @@ func TestPushSessionTerminationStatus(t *testing.T) {
 		sess.ID,
 	).Scan(&got), "read back 2")
 	assert.Nil(t, got)
+}
+
+func TestPushSessionPreservesSourceMachine(t *testing.T) {
+	pgURL := testPGURL(t)
+
+	const schema = "agentsview_push_source_machine_test"
+	pg, err := Open(pgURL, schema, true)
+	require.NoError(t, err, "Open")
+	defer pg.Close()
+
+	ctx := context.Background()
+	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+	require.NoError(t, err, "drop schema")
+	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
+
+	localDB, err := db.Open(filepath.Join(t.TempDir(), "local.db"))
+	require.NoError(t, err, "db.Open")
+	defer localDB.Close()
+
+	sync := &Sync{
+		pg:         pg,
+		local:      localDB,
+		machine:    "push-host",
+		schema:     schema,
+		schemaDone: true,
+	}
+
+	remoteSession := db.Session{
+		ID:           "remote-source-machine-1",
+		Project:      "proj",
+		Machine:      "remote-host",
+		Agent:        "claude",
+		MessageCount: 1,
+		CreatedAt:    "2026-01-01T00:00:00Z",
+	}
+
+	tx, err := pg.BeginTx(ctx, nil)
+	require.NoError(t, err, "BeginTx")
+	markerID, err := sync.pushMarkerID()
+	require.NoError(t, err, "pushMarkerID")
+	require.NoError(t, sync.pushSession(ctx, tx, remoteSession, markerID, nil), "pushSession")
+	require.NoError(t, tx.Commit(), "Commit")
+
+	var got string
+	require.NoError(t, pg.QueryRow(
+		`SELECT machine FROM sessions WHERE id = $1`,
+		remoteSession.ID,
+	).Scan(&got), "read back machine")
+	assert.Equal(t, "remote-host", got)
 }
 
 // TestPushSyncsUsageEventsForZeroMessageSession verifies that a session
@@ -314,4 +574,709 @@ func checkIsSystem(
 	for i := range wantTotal {
 		assert.True(t, seen[i], "ordinal %d missing from PG messages", i)
 	}
+}
+
+func assertPGMessageContent(
+	t *testing.T,
+	pg *sql.DB,
+	sessionID string,
+	ordinal int,
+	want string,
+) {
+	t.Helper()
+	var got string
+	require.NoError(t, pg.QueryRow(
+		`SELECT content FROM messages
+		  WHERE session_id = $1 AND ordinal = $2`,
+		sessionID, ordinal,
+	).Scan(&got), "read pg message content")
+	assert.Equal(t, want, got)
+}
+
+func assertPGMessageThinking(
+	t *testing.T,
+	pg *sql.DB,
+	sessionID string,
+	ordinal int,
+	wantHasThinking bool,
+	wantThinkingText string,
+) {
+	t.Helper()
+	var gotHasThinking bool
+	var gotThinkingText string
+	require.NoError(t, pg.QueryRow(
+		`SELECT has_thinking, thinking_text FROM messages
+		  WHERE session_id = $1 AND ordinal = $2`,
+		sessionID, ordinal,
+	).Scan(&gotHasThinking, &gotThinkingText), "read pg message thinking")
+	assert.Equal(t, wantHasThinking, gotHasThinking)
+	assert.Equal(t, wantThinkingText, gotThinkingText)
+}
+
+func assertPGMessageTimestamp(
+	t *testing.T,
+	pg *sql.DB,
+	sessionID string,
+	ordinal int,
+	want string,
+) {
+	t.Helper()
+	var gotTime sql.NullTime
+	require.NoError(t, pg.QueryRow(
+		`SELECT timestamp FROM messages
+		  WHERE session_id = $1 AND ordinal = $2`,
+		sessionID, ordinal,
+	).Scan(&gotTime), "read pg message timestamp")
+	require.True(t, gotTime.Valid, "timestamp should be non-NULL")
+	assert.Equal(t, want, FormatISO8601(gotTime.Time))
+}
+
+func pgMessageCTID(
+	t *testing.T,
+	pg *sql.DB,
+	sessionID string,
+	ordinal int,
+) string {
+	t.Helper()
+	var ctid string
+	require.NoError(t, pg.QueryRow(
+		`SELECT ctid::text FROM messages
+		  WHERE session_id = $1 AND ordinal = $2`,
+		sessionID, ordinal,
+	).Scan(&ctid), "read pg message ctid")
+	return ctid
+}
+
+// TestPushMessagesSanitizesNULBytes verifies that a message whose
+// model and source fields carry NUL bytes (observed in production:
+// the Antigravity gen_metadata heuristic persisted a raw protobuf
+// fragment as the model name) pushes to PG without the whole-session
+// rollback caused by SQLSTATE 22021 (invalid byte sequence for
+// encoding "UTF8": 0x00). Model and source fields come from
+// third-party session files, so the push boundary must be defensive
+// regardless of any single parser fix.
+func TestPushMessagesSanitizesNULBytes(t *testing.T) {
+	pgURL := testPGURL(t)
+
+	const schema = "agentsview_push_nul_test"
+	pg, err := Open(pgURL, schema, true)
+	require.NoError(t, err, "Open")
+	defer pg.Close()
+
+	ctx := context.Background()
+	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+	require.NoError(t, err, "drop schema")
+	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
+
+	localDB, err := db.Open(
+		filepath.Join(t.TempDir(), "local.db"),
+	)
+	require.NoError(t, err, "db.Open")
+	defer localDB.Close()
+
+	sync := &Sync{
+		pg:         pg,
+		local:      localDB,
+		machine:    "test-machine",
+		schema:     schema,
+		schemaDone: true,
+	}
+
+	// The exact 10-byte protobuf fragment persisted as a model
+	// name by the pre-fix Antigravity parser (hex
+	// 080020022A0201024001, contains 0x00).
+	badModel := "\x08\x00\x20\x02\x2a\x02\x01\x02\x40\x01"
+
+	const sessID = "nul-bytes-001"
+	sess := db.Session{
+		ID:           sessID,
+		Project:      "test-proj",
+		Machine:      "test-machine",
+		Agent:        "antigravity",
+		MessageCount: 1,
+		CreatedAt:    "2026-01-01T00:00:00Z",
+		Cwd:          "/tmp/with\x00nul",
+		GitBranch:    "main\x00",
+	}
+	require.NoError(t, localDB.UpsertSession(sess), "UpsertSession")
+
+	msgs := []db.Message{{
+		SessionID:     sessID,
+		Ordinal:       0,
+		Role:          "assistant",
+		Content:       "thinking summary",
+		ContentLength: 16,
+		Model:         badModel,
+		SourceUUID:    "uuid\x00tail",
+	}}
+	require.NoError(t, localDB.InsertMessages(msgs), "InsertMessages")
+
+	res, err := sync.Push(ctx, false, nil)
+	require.NoError(t, err, "Push")
+	assert.Zero(t, res.Errors, "push should report no failed sessions")
+
+	var model, sourceUUID string
+	err = pg.QueryRow(
+		`SELECT model, source_uuid FROM messages
+		 WHERE session_id = $1 AND ordinal = 0`, sessID,
+	).Scan(&model, &sourceUUID)
+	require.NoError(t, err, "querying pushed message")
+	assert.Equal(t, sanitizePG(badModel), model, "model stripped of NUL")
+	assert.NotContains(t, model, "\x00")
+	assert.Equal(t, "uuidtail", sourceUUID, "source_uuid stripped of NUL")
+
+	// Second push with sync state cleared: the local token
+	// fingerprint (sanitized, see db.SanitizeUTF8) must match the
+	// PG-readback fingerprint despite the NUL bytes still stored
+	// locally, so the metadata fast path skips the rewrite. ctid
+	// changes on DELETE+reinsert, so an unchanged ctid proves the
+	// row was left alone.
+	var ctidBefore string
+	require.NoError(t, pg.QueryRow(
+		`SELECT ctid::text FROM messages
+		 WHERE session_id = $1 AND ordinal = 0`, sessID,
+	).Scan(&ctidBefore), "reading ctid before second push")
+
+	require.NoError(t, localDB.SetSyncState("last_push_at", ""),
+		"clearing last_push_at")
+	require.NoError(t,
+		localDB.SetSyncState(lastPushBoundaryStateKey, ""),
+		"clearing boundary state")
+
+	res, err = sync.Push(ctx, false, nil)
+	require.NoError(t, err, "Push (second)")
+	assert.Zero(t, res.Errors, "second push should report no failures")
+
+	var ctidAfter string
+	require.NoError(t, pg.QueryRow(
+		`SELECT ctid::text FROM messages
+		 WHERE session_id = $1 AND ordinal = 0`, sessID,
+	).Scan(&ctidAfter), "reading ctid after second push")
+	assert.Equal(t, ctidBefore, ctidAfter,
+		"fast path should skip rewriting a NUL-field session")
+}
+
+// TestPushIncrementalWithOnlyForeignMachineSessions verifies reset detection
+// does not misfire when every local session carries a machine value other than
+// s.machine (e.g. orphan-copied sessions kept from a previous machine name).
+// The push marker, not a per-machine row count, drives reset detection, so the
+// second incremental push is a no-op rather than a forced full re-push.
+func TestPushIncrementalWithOnlyForeignMachineSessions(t *testing.T) {
+	pgURL := testPGURL(t)
+
+	const schema = "agentsview_push_foreign_machine_test"
+	pg, err := Open(pgURL, schema, true)
+	require.NoError(t, err, "Open")
+	defer pg.Close()
+
+	ctx := context.Background()
+	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+	require.NoError(t, err, "drop schema")
+	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
+
+	localDB, err := db.Open(filepath.Join(t.TempDir(), "local.db"))
+	require.NoError(t, err, "db.Open")
+	defer localDB.Close()
+
+	sync := &Sync{
+		pg:         pg,
+		local:      localDB,
+		machine:    "new-host",
+		schema:     schema,
+		schemaDone: true,
+	}
+
+	const sessID = "foreign-machine-001"
+	sess := db.Session{
+		ID:           sessID,
+		Project:      "proj",
+		Machine:      "old-host",
+		Agent:        "claude",
+		MessageCount: 1,
+		CreatedAt:    "2026-01-01T00:00:00Z",
+	}
+	require.NoError(t, localDB.UpsertSession(sess), "UpsertSession")
+	require.NoError(t, localDB.InsertMessages([]db.Message{{
+		SessionID:     sessID,
+		Ordinal:       0,
+		Role:          "assistant",
+		Content:       "hello",
+		ContentLength: 5,
+	}}), "InsertMessages")
+
+	res, err := sync.Push(ctx, false, nil)
+	require.NoError(t, err, "first Push")
+	assert.Zero(t, res.Errors, "first push should report no failures")
+
+	var machine string
+	require.NoError(t, pg.QueryRow(
+		`SELECT machine FROM sessions WHERE id = $1`, sessID,
+	).Scan(&machine), "reading pushed machine")
+	require.Equal(t, "old-host", machine, "source machine preserved")
+
+	var ctidBefore string
+	require.NoError(t, pg.QueryRow(
+		`SELECT ctid::text FROM messages
+		 WHERE session_id = $1 AND ordinal = 0`, sessID,
+	).Scan(&ctidBefore), "reading ctid before second push")
+
+	// Second incremental push with sync state intact. Reset detection counts
+	// machine = "new-host" plus "old-host", finds the row, and the fingerprint
+	// fast path skips the session entirely; the unchanged ctid proves the
+	// message row was left alone instead of being rewritten by a forced full.
+	res, err = sync.Push(ctx, false, nil)
+	require.NoError(t, err, "second Push")
+	assert.Zero(t, res.Errors, "second push should report no failures")
+	assert.Zero(t, res.SessionsPushed,
+		"unchanged foreign-machine session should not be re-pushed")
+
+	var ctidAfter string
+	require.NoError(t, pg.QueryRow(
+		`SELECT ctid::text FROM messages
+		 WHERE session_id = $1 AND ordinal = 0`, sessID,
+	).Scan(&ctidAfter), "reading ctid after second push")
+	assert.Equal(t, ctidBefore, ctidAfter,
+		"second incremental push must not rewrite the session")
+}
+
+// TestPushDetectsResetWhenCompetingMachineRowsExist verifies that a PG reset is
+// detected even when another pusher has repopulated rows under a machine value
+// this host also writes. The local session carries Machine "remote-host" (as a
+// remote host's sessions synced in over SSH would); after the first push the PG
+// rows and this host's push marker are removed and a competing "remote-host"
+// row is inserted, simulating the remote host re-pushing first after a shared
+// PG reset. A machine-count check would see the competing row and skip the full
+// push, leaving this host's session missing; the push marker is per-pusher, so
+// the reset is detected and the session is re-pushed.
+func TestPushDetectsResetWhenCompetingMachineRowsExist(t *testing.T) {
+	pgURL := testPGURL(t)
+
+	const schema = "agentsview_push_reset_competing_test"
+	pg, err := Open(pgURL, schema, true)
+	require.NoError(t, err, "Open")
+	defer pg.Close()
+
+	ctx := context.Background()
+	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+	require.NoError(t, err, "drop schema")
+	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
+
+	localDB, err := db.Open(filepath.Join(t.TempDir(), "local.db"))
+	require.NoError(t, err, "db.Open")
+	defer localDB.Close()
+
+	sync := &Sync{
+		pg:         pg,
+		local:      localDB,
+		machine:    "this-host",
+		schema:     schema,
+		schemaDone: true,
+	}
+
+	const sessID = "remote-host~sess-1"
+	require.NoError(t, localDB.UpsertSession(db.Session{
+		ID:           sessID,
+		Project:      "proj",
+		Machine:      "remote-host",
+		Agent:        "claude",
+		MessageCount: 1,
+		CreatedAt:    "2026-01-01T00:00:00Z",
+	}), "UpsertSession")
+	require.NoError(t, localDB.InsertMessages([]db.Message{{
+		SessionID:     sessID,
+		Ordinal:       0,
+		Role:          "assistant",
+		Content:       "hello",
+		ContentLength: 5,
+	}}), "InsertMessages")
+
+	res, err := sync.Push(ctx, false, nil)
+	require.NoError(t, err, "first Push")
+	assert.Zero(t, res.Errors, "first push should report no failures")
+
+	// Simulate a PG reset where the real remote host re-pushed first: drop this
+	// host's rows and its push marker, then insert a competing "remote-host"
+	// row under a different id.
+	_, err = pg.Exec(`DELETE FROM sessions WHERE id = $1`, sessID)
+	require.NoError(t, err, "delete pushed session")
+	_, err = pg.Exec(
+		`DELETE FROM sync_metadata WHERE key LIKE 'push_marker:%'`,
+	)
+	require.NoError(t, err, "delete push marker")
+	_, err = pg.Exec(
+		`INSERT INTO sessions (id, machine, project, agent, created_at)
+		 VALUES ('remote-host-native-1', 'remote-host', 'proj', 'claude', NOW())`,
+	)
+	require.NoError(t, err, "insert competing remote-host row")
+
+	res, err = sync.Push(ctx, false, nil)
+	require.NoError(t, err, "second Push")
+	assert.Zero(t, res.Errors, "second push should report no failures")
+
+	var exists bool
+	require.NoError(t, pg.QueryRow(
+		`SELECT EXISTS (SELECT 1 FROM sessions WHERE id = $1)`, sessID,
+	).Scan(&exists), "checking re-pushed session")
+	assert.True(t, exists,
+		"reset must be detected and this host's session re-pushed")
+}
+
+// TestPushMarkerNotWrittenWhenResetRecoveryFails verifies the push marker is
+// written only after a push finalizes. When a reset is detected but the
+// recovery push fails before finalization, the marker must stay absent so the
+// next push re-detects the reset; otherwise the local watermark would remain at
+// the old value while PG holds a fresh marker, and reset-lost sessions would be
+// skipped indefinitely.
+func TestPushMarkerNotWrittenWhenResetRecoveryFails(t *testing.T) {
+	pgURL := testPGURL(t)
+
+	const schema = "agentsview_push_reset_recovery_fail_test"
+	pg, err := Open(pgURL, schema, true)
+	require.NoError(t, err, "Open")
+	defer pg.Close()
+
+	ctx := context.Background()
+	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+	require.NoError(t, err, "drop schema")
+	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
+
+	localDB, err := db.Open(filepath.Join(t.TempDir(), "local.db"))
+	require.NoError(t, err, "db.Open")
+	defer localDB.Close()
+
+	sync := &Sync{
+		pg:         pg,
+		local:      localDB,
+		machine:    "this-host",
+		schema:     schema,
+		schemaDone: true,
+	}
+
+	const sessID = "reset-recovery-1"
+	require.NoError(t, localDB.UpsertSession(db.Session{
+		ID:           sessID,
+		Project:      "proj",
+		Machine:      "this-host",
+		Agent:        "claude",
+		MessageCount: 1,
+		CreatedAt:    "2026-01-01T00:00:00Z",
+	}), "UpsertSession")
+	require.NoError(t, localDB.InsertMessages([]db.Message{{
+		SessionID:     sessID,
+		Ordinal:       0,
+		Role:          "assistant",
+		Content:       "hello",
+		ContentLength: 5,
+	}}), "InsertMessages")
+
+	res, err := sync.Push(ctx, false, nil)
+	require.NoError(t, err, "first Push")
+	assert.Zero(t, res.Errors, "first push should report no failures")
+
+	markerCount := func() int {
+		var n int
+		require.NoError(t, pg.QueryRow(
+			`SELECT COUNT(*) FROM sync_metadata
+			 WHERE key LIKE 'push_marker:%'`,
+		).Scan(&n), "counting push markers")
+		return n
+	}
+	require.Equal(t, 1, markerCount(), "marker present after first push")
+
+	// Simulate a PG reset: drop this host's row and marker, keeping the local
+	// watermark and boundary state so the session would otherwise be skipped.
+	_, err = pg.Exec(`DELETE FROM sessions WHERE id = $1`, sessID)
+	require.NoError(t, err, "delete pushed session")
+	_, err = pg.Exec(
+		`DELETE FROM sync_metadata WHERE key LIKE 'push_marker:%'`,
+	)
+	require.NoError(t, err, "delete push marker")
+	require.Equal(t, 0, markerCount(), "marker cleared for reset simulation")
+
+	// Sabotage the recovery push so it fails after reset detection but before
+	// finalization: drop a model_pricing column syncModelPricing reads. The
+	// reset branch re-runs EnsureSchema, but CREATE TABLE IF NOT EXISTS does
+	// not re-add a column to an existing table, so the failure persists.
+	_, err = pg.Exec(
+		`ALTER TABLE model_pricing DROP COLUMN cache_read_per_mtok`,
+	)
+	require.NoError(t, err, "drop model_pricing column")
+
+	_, err = sync.Push(ctx, false, nil)
+	require.Error(t, err, "recovery push should fail at model pricing sync")
+	assert.Equal(t, 0, markerCount(),
+		"marker must not be written when recovery push fails")
+
+	// Repair the column; the next push must re-detect the reset (marker still
+	// absent) and re-push the session.
+	_, err = pg.Exec(
+		`ALTER TABLE model_pricing
+		 ADD COLUMN cache_read_per_mtok DOUBLE PRECISION NOT NULL DEFAULT 0`,
+	)
+	require.NoError(t, err, "restore model_pricing column")
+
+	res, err = sync.Push(ctx, false, nil)
+	require.NoError(t, err, "recovery push after repair")
+	assert.Zero(t, res.Errors, "repaired push should report no failures")
+
+	var exists bool
+	require.NoError(t, pg.QueryRow(
+		`SELECT EXISTS (SELECT 1 FROM sessions WHERE id = $1)`, sessID,
+	).Scan(&exists), "checking re-pushed session")
+	assert.True(t, exists, "session must be re-pushed after reset recovery")
+	assert.Equal(t, 1, markerCount(), "marker restored after successful push")
+}
+
+// TestPushUpdatesSentinelMachineWhenSyncMachineChanges verifies that a session
+// stored with the "local" sentinel machine is re-pushed under the new fallback
+// when Sync.machine changes, rather than being skipped by a fingerprint that
+// ignored the resolved machine. The second push clears the local watermark so
+// the session is re-evaluated; without the resolved machine in the fingerprint
+// it would match and be skipped, leaving PG with the stale machine name.
+func TestPushUpdatesSentinelMachineWhenSyncMachineChanges(t *testing.T) {
+	pgURL := testPGURL(t)
+
+	const schema = "agentsview_push_sentinel_machine_test"
+	pg, err := Open(pgURL, schema, true)
+	require.NoError(t, err, "Open")
+	defer pg.Close()
+
+	ctx := context.Background()
+	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+	require.NoError(t, err, "drop schema")
+	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
+
+	localDB, err := db.Open(filepath.Join(t.TempDir(), "local.db"))
+	require.NoError(t, err, "db.Open")
+	defer localDB.Close()
+
+	sync := &Sync{
+		pg:         pg,
+		local:      localDB,
+		machine:    "host-a",
+		schema:     schema,
+		schemaDone: true,
+	}
+
+	const sessID = "sentinel-machine-1"
+	require.NoError(t, localDB.UpsertSession(db.Session{
+		ID:           sessID,
+		Project:      "proj",
+		Machine:      "local",
+		Agent:        "claude",
+		MessageCount: 1,
+		CreatedAt:    "2026-01-01T00:00:00Z",
+	}), "UpsertSession")
+	require.NoError(t, localDB.InsertMessages([]db.Message{{
+		SessionID:     sessID,
+		Ordinal:       0,
+		Role:          "assistant",
+		Content:       "hello",
+		ContentLength: 5,
+	}}), "InsertMessages")
+
+	res, err := sync.Push(ctx, false, nil)
+	require.NoError(t, err, "first Push")
+	assert.Zero(t, res.Errors, "first push should report no failures")
+
+	machine := func() string {
+		var m string
+		require.NoError(t, pg.QueryRow(
+			`SELECT machine FROM sessions WHERE id = $1`, sessID,
+		).Scan(&m), "reading machine")
+		return m
+	}
+	require.Equal(t, "host-a", machine(), "sentinel pushed under host-a")
+
+	// Rename: change the fallback machine and re-evaluate the session by
+	// clearing the watermark, mirroring any path that re-lists it.
+	sync.machine = "host-b"
+	require.NoError(t, localDB.SetSyncState("last_push_at", ""),
+		"clearing last_push_at")
+
+	res, err = sync.Push(ctx, false, nil)
+	require.NoError(t, err, "second Push")
+	assert.Zero(t, res.Errors, "second push should report no failures")
+	assert.Equal(t, "host-b", machine(),
+		"sentinel machine must follow the new fallback")
+}
+
+func TestPushAdoptsOwnerlessRowsFromPreviousMarkerMachine(t *testing.T) {
+	pgURL := testPGURL(t)
+
+	const schema = "agentsview_push_legacy_marker_machine_test"
+	pg, err := Open(pgURL, schema, true)
+	require.NoError(t, err, "Open")
+	defer pg.Close()
+
+	ctx := context.Background()
+	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+	require.NoError(t, err, "drop schema")
+	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
+
+	localDB, err := db.Open(filepath.Join(t.TempDir(), "local.db"))
+	require.NoError(t, err, "db.Open")
+	defer localDB.Close()
+
+	const markerID = "legacy-marker-1"
+	require.NoError(t, localDB.SetSyncState("pg_push_marker_id", markerID),
+		"seed local push marker")
+
+	sync := &Sync{
+		pg:         pg,
+		local:      localDB,
+		machine:    "host-b",
+		schema:     schema,
+		schemaDone: true,
+	}
+
+	const sessID = "legacy-previous-machine-1"
+	require.NoError(t, localDB.UpsertSession(db.Session{
+		ID:           sessID,
+		Project:      "proj",
+		Machine:      "host-b",
+		Agent:        "claude",
+		MessageCount: 1,
+		CreatedAt:    "2026-01-01T00:00:00Z",
+	}), "UpsertSession")
+	require.NoError(t, localDB.InsertMessages([]db.Message{{
+		SessionID:     sessID,
+		Ordinal:       0,
+		Role:          "assistant",
+		Content:       "hello",
+		ContentLength: 5,
+	}}), "InsertMessages")
+
+	_, err = pg.ExecContext(ctx, `
+		INSERT INTO sync_metadata (key, value)
+		VALUES ($1, $2)
+	`, pushMarkerKeyPrefix+markerID, "host-a")
+	require.NoError(t, err, "seed previous marker machine")
+	_, err = pg.ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, owner_marker, project, agent, created_at
+		) VALUES ($1, $2, $3, $4, $5, NOW())
+	`, sessID, "host-a", "", "proj", "claude")
+	require.NoError(t, err, "seed ownerless legacy session")
+
+	res, err := sync.Push(ctx, true, nil)
+	require.NoError(t, err, "Push")
+	assert.Zero(t, res.Errors, "push should report no failed sessions")
+	assert.Zero(t, res.SkippedConflicts,
+		"previous-marker-machine legacy row should be adopted")
+	assert.Equal(t, 1, res.SessionsPushed,
+		"legacy row should be counted as pushed")
+
+	var machine, ownerMarker string
+	require.NoError(t, pg.QueryRow(
+		`SELECT machine, owner_marker FROM sessions WHERE id = $1`, sessID,
+	).Scan(&machine, &ownerMarker), "reading adopted row")
+	assert.Equal(t, "host-b", machine)
+	assert.Equal(t, markerID, ownerMarker)
+
+	var markerMachine string
+	require.NoError(t, pg.QueryRow(
+		`SELECT value FROM sync_metadata WHERE key = $1`,
+		pushMarkerKeyPrefix+markerID,
+	).Scan(&markerMachine), "reading marker machine")
+	assert.Equal(t, "host-b", markerMachine)
+
+	var aliases string
+	require.NoError(t, pg.QueryRow(
+		`SELECT value FROM sync_metadata WHERE key = $1`,
+		pushMarkerMachineAliasesKeyPrefix+markerID,
+	).Scan(&aliases), "reading marker aliases")
+	assert.JSONEq(t, `["host-a"]`, aliases)
+
+	const laterSessID = "legacy-previous-machine-2"
+	require.NoError(t, localDB.UpsertSession(db.Session{
+		ID:           laterSessID,
+		Project:      "proj",
+		Machine:      "host-b",
+		Agent:        "claude",
+		MessageCount: 1,
+		CreatedAt:    "2026-01-01T00:00:00Z",
+	}), "UpsertSession later legacy row")
+	require.NoError(t, localDB.InsertMessages([]db.Message{{
+		SessionID:     laterSessID,
+		Ordinal:       0,
+		Role:          "assistant",
+		Content:       "later",
+		ContentLength: 5,
+	}}), "InsertMessages later legacy row")
+	_, err = pg.ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, owner_marker, project, agent, created_at
+		) VALUES ($1, $2, $3, $4, $5, NOW())
+	`, laterSessID, "host-a", "", "proj", "claude")
+	require.NoError(t, err, "seed later ownerless legacy session")
+
+	res, err = sync.Push(ctx, true, nil)
+	require.NoError(t, err, "second Push")
+	assert.Zero(t, res.Errors, "second push should report no failed sessions")
+	assert.Zero(t, res.SkippedConflicts,
+		"preserved marker alias should adopt later legacy row")
+
+	require.NoError(t, pg.QueryRow(
+		`SELECT machine, owner_marker FROM sessions WHERE id = $1`,
+		laterSessID,
+	).Scan(&machine, &ownerMarker), "reading later adopted row")
+	assert.Equal(t, "host-b", machine)
+	assert.Equal(t, markerID, ownerMarker)
+}
+
+func TestPushReportsSkippedConflicts(t *testing.T) {
+	pgURL := testPGURL(t)
+
+	const schema = "agentsview_push_skipped_conflicts_test"
+	pg, err := Open(pgURL, schema, true)
+	require.NoError(t, err, "Open")
+	defer pg.Close()
+
+	ctx := context.Background()
+	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+	require.NoError(t, err, "drop schema")
+	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
+
+	localDB, err := db.Open(filepath.Join(t.TempDir(), "local.db"))
+	require.NoError(t, err, "db.Open")
+	defer localDB.Close()
+
+	sync := &Sync{
+		pg:         pg,
+		local:      localDB,
+		machine:    "machine-b",
+		schema:     schema,
+		schemaDone: true,
+	}
+
+	const sessID = "conflict-001"
+	require.NoError(t, localDB.UpsertSession(db.Session{
+		ID:           sessID,
+		Project:      "proj",
+		Machine:      "machine-b",
+		Agent:        "claude",
+		MessageCount: 1,
+		CreatedAt:    "2026-01-01T00:00:00Z",
+	}), "UpsertSession")
+	require.NoError(t, localDB.InsertMessages([]db.Message{{
+		SessionID:     sessID,
+		Ordinal:       0,
+		Role:          "assistant",
+		Content:       "hello",
+		ContentLength: 5,
+	}}), "InsertMessages")
+
+	_, err = pg.ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, owner_marker, project, agent, created_at
+		) VALUES ($1, $2, $3, $4, $5, NOW())
+	`, sessID, "machine-a", "other-owner", "proj", "claude")
+	require.NoError(t, err, "insert conflicting owner")
+
+	res, err := sync.Push(ctx, false, nil)
+	require.NoError(t, err, "Push")
+	assert.Zero(t, res.Errors, "push should not report failed sessions")
+	assert.Zero(t, res.SessionsPushed, "conflicting session should not be counted as pushed")
+	assert.Equal(t, 1, res.SkippedConflicts, "skipped conflicts should be observable in PushResult")
 }

@@ -70,20 +70,46 @@ type OpenCodeSource struct {
 	DBPath      string
 }
 
-// ResolveOpenCodeSource detects whether an OpenCode root is using
-// file-backed storage or legacy SQLite storage.
-func ResolveOpenCodeSource(root string) OpenCodeSource {
+// openCodeFormat parameterizes the shared OpenCode storage format by
+// the per-agent SQLite filename, the storage/<sessionSubdir> that holds
+// session JSON, and the agent label stamped on discovered sessions.
+// Kilo is a fork of OpenCode with an identical on-disk layout; MiMoCode
+// is a fork that stores sessions under storage/session_diff and a
+// mimocode.db SQLite fallback. All share one implementation and differ
+// only in these values.
+type openCodeFormat struct {
+	agent         AgentType
+	dbName        string
+	sessionSubdir string
+}
+
+var (
+	openCodeFmt = openCodeFormat{
+		agent: AgentOpenCode, dbName: "opencode.db", sessionSubdir: "session",
+	}
+	kiloFmt = openCodeFormat{
+		agent: AgentKilo, dbName: "kilo.db", sessionSubdir: "session",
+	}
+	mimoFmt = openCodeFormat{
+		agent: AgentMiMoCode, dbName: "mimocode.db",
+		sessionSubdir: "session_diff",
+	}
+)
+
+func resolveOpenCodeFormatSource(
+	f openCodeFormat, root string,
+) OpenCodeSource {
 	if root == "" {
 		return OpenCodeSource{}
 	}
 
-	sessionRoot := filepath.Join(root, "storage", "session")
+	sessionRoot := filepath.Join(root, "storage", f.sessionSubdir)
 	if info, err := os.Stat(sessionRoot); err == nil && info.IsDir() {
 		return OpenCodeSource{
 			Mode:        OpenCodeSourceStorage,
 			Root:        root,
 			SessionRoot: sessionRoot,
-			DBPath:      filepath.Join(root, "opencode.db"),
+			DBPath:      filepath.Join(root, f.dbName),
 		}
 	} else if err != nil && !os.IsNotExist(err) {
 		storageRoot := filepath.Join(root, "storage")
@@ -92,12 +118,12 @@ func ResolveOpenCodeSource(root string) OpenCodeSource {
 				Mode:        OpenCodeSourceStorage,
 				Root:        root,
 				SessionRoot: sessionRoot,
-				DBPath:      filepath.Join(root, "opencode.db"),
+				DBPath:      filepath.Join(root, f.dbName),
 			}
 		}
 	}
 
-	dbPath := filepath.Join(root, "opencode.db")
+	dbPath := filepath.Join(root, f.dbName)
 	if info, err := os.Stat(dbPath); err == nil && !info.IsDir() {
 		return OpenCodeSource{
 			Mode:   OpenCodeSourceSQLite,
@@ -109,10 +135,10 @@ func ResolveOpenCodeSource(root string) OpenCodeSource {
 	return OpenCodeSource{Root: root}
 }
 
-// DiscoverOpenCodeSessions finds all file-backed OpenCode session
-// JSON files under storage/session.
-func DiscoverOpenCodeSessions(root string) []DiscoveredFile {
-	src := ResolveOpenCodeSource(root)
+func discoverOpenCodeFormatSessions(
+	f openCodeFormat, root string,
+) []DiscoveredFile {
+	src := resolveOpenCodeFormatSource(f, root)
 	if src.Mode != OpenCodeSourceStorage {
 		return nil
 	}
@@ -140,7 +166,7 @@ func DiscoverOpenCodeSessions(root string) []DiscoveredFile {
 			files = append(files, DiscoveredFile{
 				Path:    path,
 				Project: openCodeSessionProject(path),
-				Agent:   AgentOpenCode,
+				Agent:   f.agent,
 			})
 		}
 	}
@@ -151,18 +177,14 @@ func DiscoverOpenCodeSessions(root string) []DiscoveredFile {
 	return files
 }
 
-// FindOpenCodeSourceFile locates a single OpenCode session source
-// path or SQLite backing file by raw session ID. Returns "" when
-// the session is not present under this root so the caller
-// (Engine.FindSourceFile) can continue searching later configured
-// roots — important when an early hybrid root with an unrelated
-// opencode.db could otherwise shadow a session in a later root.
-func FindOpenCodeSourceFile(root, sessionID string) string {
+func findOpenCodeFormatSourceFile(
+	f openCodeFormat, root, sessionID string,
+) string {
 	if !IsValidSessionID(sessionID) {
 		return ""
 	}
 
-	src := ResolveOpenCodeSource(root)
+	src := resolveOpenCodeFormatSource(f, root)
 	switch src.Mode {
 	case OpenCodeSourceStorage:
 		if entries, err := os.ReadDir(src.SessionRoot); err == nil {
@@ -181,16 +203,12 @@ func FindOpenCodeSourceFile(root, sessionID string) string {
 			}
 		}
 		if OpenCodeSQLiteSessionExists(src.DBPath, sessionID) {
-			return OpenCodeSQLiteVirtualPath(
-				src.DBPath, sessionID,
-			)
+			return OpenCodeSQLiteVirtualPath(src.DBPath, sessionID)
 		}
 		return ""
 	case OpenCodeSourceSQLite:
 		if OpenCodeSQLiteSessionExists(src.DBPath, sessionID) {
-			return OpenCodeSQLiteVirtualPath(
-				src.DBPath, sessionID,
-			)
+			return OpenCodeSQLiteVirtualPath(src.DBPath, sessionID)
 		}
 		return ""
 	default:
@@ -198,13 +216,10 @@ func FindOpenCodeSourceFile(root, sessionID string) string {
 	}
 }
 
-// OpenCodeStorageSessionIDs returns the set of session IDs that
-// have a JSON file under storage/session/*/ in the given root.
-// Returns nil for non-storage roots. In hybrid roots (storage and
-// SQLite both present) the storage transcript is canonical, so
-// callers use this to skip duplicate SQLite metas during sync.
-func OpenCodeStorageSessionIDs(root string) map[string]struct{} {
-	src := ResolveOpenCodeSource(root)
+func openCodeFormatStorageSessionIDs(
+	f openCodeFormat, root string,
+) map[string]struct{} {
+	src := resolveOpenCodeFormatSource(f, root)
 	if src.Mode != OpenCodeSourceStorage {
 		return nil
 	}
@@ -238,20 +253,13 @@ func OpenCodeStorageSessionIDs(root string) map[string]struct{} {
 	return ids
 }
 
-// ResolveOpenCodeWatchRoots returns the directories that should be
-// watched for live OpenCode updates under a configured root. Pure
-// storage mode targets the storage/ subtree so fsnotify does not
-// recurse over unrelated opencode state (binaries, logs, caches),
-// while still covering the session/message/part subdirs — including
-// ones that OpenCode creates lazily after the watcher starts, since
-// the watcher auto-adds new subdirectories on Create events. Hybrid
-// storage+SQLite roots and pure SQLite mode watch the root so DB/WAL
-// updates are observed too.
-func ResolveOpenCodeWatchRoots(root string) []string {
+func resolveOpenCodeFormatWatchRoots(
+	f openCodeFormat, root string,
+) []string {
 	if root == "" {
 		return nil
 	}
-	src := ResolveOpenCodeSource(root)
+	src := resolveOpenCodeFormatSource(f, root)
 	switch src.Mode {
 	case OpenCodeSourceStorage:
 		if info, err := os.Stat(src.DBPath); err == nil &&
@@ -268,6 +276,65 @@ func ResolveOpenCodeWatchRoots(root string) []string {
 	return nil
 }
 
+func parseOpenCodeFormatVirtualPath(
+	dbName, sourcePath string,
+) (dbPath, sessionID string, ok bool) {
+	idx := strings.LastIndex(sourcePath, "#")
+	if idx <= 0 || idx >= len(sourcePath)-1 {
+		return "", "", false
+	}
+	dbPath = sourcePath[:idx]
+	sessionID = sourcePath[idx+1:]
+	if filepath.Base(dbPath) != dbName {
+		return "", "", false
+	}
+	return dbPath, sessionID, true
+}
+
+// ResolveOpenCodeSource detects whether an OpenCode root is using
+// file-backed storage or legacy SQLite storage.
+func ResolveOpenCodeSource(root string) OpenCodeSource {
+	return resolveOpenCodeFormatSource(openCodeFmt, root)
+}
+
+// DiscoverOpenCodeSessions finds all file-backed OpenCode session
+// JSON files under storage/session.
+func DiscoverOpenCodeSessions(root string) []DiscoveredFile {
+	return discoverOpenCodeFormatSessions(openCodeFmt, root)
+}
+
+// FindOpenCodeSourceFile locates a single OpenCode session source
+// path or SQLite backing file by raw session ID. Returns "" when
+// the session is not present under this root so the caller
+// (Engine.FindSourceFile) can continue searching later configured
+// roots — important when an early hybrid root with an unrelated
+// opencode.db could otherwise shadow a session in a later root.
+func FindOpenCodeSourceFile(root, sessionID string) string {
+	return findOpenCodeFormatSourceFile(openCodeFmt, root, sessionID)
+}
+
+// OpenCodeStorageSessionIDs returns the set of session IDs that
+// have a JSON file under storage/session/*/ in the given root.
+// Returns nil for non-storage roots. In hybrid roots (storage and
+// SQLite both present) the storage transcript is canonical, so
+// callers use this to skip duplicate SQLite metas during sync.
+func OpenCodeStorageSessionIDs(root string) map[string]struct{} {
+	return openCodeFormatStorageSessionIDs(openCodeFmt, root)
+}
+
+// ResolveOpenCodeWatchRoots returns the directories that should be
+// watched for live OpenCode updates under a configured root. Pure
+// storage mode targets the storage/ subtree so fsnotify does not
+// recurse over unrelated opencode state (binaries, logs, caches),
+// while still covering the session/message/part subdirs — including
+// ones that OpenCode creates lazily after the watcher starts, since
+// the watcher auto-adds new subdirectories on Create events. Hybrid
+// storage+SQLite roots and pure SQLite mode watch the root so DB/WAL
+// updates are observed too.
+func ResolveOpenCodeWatchRoots(root string) []string {
+	return resolveOpenCodeFormatWatchRoots(openCodeFmt, root)
+}
+
 func OpenCodeSQLiteVirtualPath(
 	dbPath, sessionID string,
 ) string {
@@ -277,16 +344,7 @@ func OpenCodeSQLiteVirtualPath(
 func ParseOpenCodeSQLiteVirtualPath(
 	sourcePath string,
 ) (dbPath, sessionID string, ok bool) {
-	idx := strings.LastIndex(sourcePath, "#")
-	if idx <= 0 || idx >= len(sourcePath)-1 {
-		return "", "", false
-	}
-	dbPath = sourcePath[:idx]
-	sessionID = sourcePath[idx+1:]
-	if filepath.Base(dbPath) != "opencode.db" {
-		return "", "", false
-	}
-	return dbPath, sessionID, true
+	return parseOpenCodeFormatVirtualPath(openCodeFmt.dbName, sourcePath)
 }
 
 func openCodeSessionProject(path string) string {
@@ -303,6 +361,85 @@ func openCodeSessionProject(path string) string {
 		return project
 	}
 	return "unknown"
+}
+
+// ResolveKiloSource detects whether a Kilo root is using file-backed
+// storage or legacy SQLite storage.
+func ResolveKiloSource(root string) OpenCodeSource {
+	return resolveOpenCodeFormatSource(kiloFmt, root)
+}
+
+func DiscoverKiloSessions(root string) []DiscoveredFile {
+	return discoverOpenCodeFormatSessions(kiloFmt, root)
+}
+
+func FindKiloSourceFile(root, sessionID string) string {
+	return findOpenCodeFormatSourceFile(kiloFmt, root, sessionID)
+}
+
+func KiloStorageSessionIDs(root string) map[string]struct{} {
+	return openCodeFormatStorageSessionIDs(kiloFmt, root)
+}
+
+func ResolveKiloWatchRoots(root string) []string {
+	return resolveOpenCodeFormatWatchRoots(kiloFmt, root)
+}
+
+func KiloSQLiteVirtualPath(dbPath, sessionID string) string {
+	return OpenCodeSQLiteVirtualPath(dbPath, sessionID)
+}
+
+func ParseKiloSQLiteVirtualPath(
+	sourcePath string,
+) (dbPath, sessionID string, ok bool) {
+	return parseOpenCodeFormatVirtualPath(kiloFmt.dbName, sourcePath)
+}
+
+// ResolveMiMoCodeSource detects whether a MiMoCode root is using
+// file-backed storage (storage/session_diff) or SQLite storage.
+func ResolveMiMoCodeSource(root string) OpenCodeSource {
+	return resolveOpenCodeFormatSource(mimoFmt, root)
+}
+
+func DiscoverMiMoCodeSessions(root string) []DiscoveredFile {
+	return discoverOpenCodeFormatSessions(mimoFmt, root)
+}
+
+func FindMiMoCodeSourceFile(root, sessionID string) string {
+	return findOpenCodeFormatSourceFile(mimoFmt, root, sessionID)
+}
+
+func MiMoCodeStorageSessionIDs(root string) map[string]struct{} {
+	return openCodeFormatStorageSessionIDs(mimoFmt, root)
+}
+
+func ResolveMiMoCodeWatchRoots(root string) []string {
+	return resolveOpenCodeFormatWatchRoots(mimoFmt, root)
+}
+
+func MiMoCodeSQLiteVirtualPath(dbPath, sessionID string) string {
+	return OpenCodeSQLiteVirtualPath(dbPath, sessionID)
+}
+
+func ParseMiMoCodeSQLiteVirtualPath(
+	sourcePath string,
+) (dbPath, sessionID string, ok bool) {
+	return parseOpenCodeFormatVirtualPath(mimoFmt.dbName, sourcePath)
+}
+
+// ResolveCodexShallowWatchRoots returns directories that should be watched
+// shallowly (root only) for live Codex updates, in addition to the recursive
+// watch on the configured sessions root. Codex writes title renames to
+// session_index.jsonl in the parent of sessions/ and archived_sessions/, so
+// that parent must be watched for renames to surface without waiting for the
+// periodic sync. A shallow watch avoids recursing over unrelated Codex state
+// such as logs.
+func ResolveCodexShallowWatchRoots(root string) []string {
+	parent := filepath.Dir(root)
+	if parent == "" || parent == "." || parent == root {
+		return nil
+	}
+	return []string{parent}
 }
 
 // DiscoverClaudeProjects finds all project directories under the
@@ -344,7 +481,11 @@ func DiscoverClaudeProjects(projectsDir string) []DiscoveredFile {
 			})
 		}
 
-		// Scan session directories for subagent files
+		// Scan session directories for subagent files. Claude workflow
+		// tools group subagents under nested paths such as
+		// subagents/workflows/<workflow-id>/agent-<id>.jsonl, so walk the
+		// whole subagents tree instead of assuming transcripts are direct
+		// children of subagents/.
 		for _, sf := range sessionFiles {
 			if !sf.IsDir() {
 				continue
@@ -352,27 +493,25 @@ func DiscoverClaudeProjects(projectsDir string) []DiscoveredFile {
 			subagentsDir := filepath.Join(
 				projDir, sf.Name(), "subagents",
 			)
-			subFiles, err := os.ReadDir(subagentsDir)
-			if err != nil {
-				continue
-			}
-			for _, sub := range subFiles {
-				if sub.IsDir() {
-					continue
-				}
-				name := sub.Name()
-				if !strings.HasPrefix(name, "agent-") ||
-					!strings.HasSuffix(name, ".jsonl") {
-					continue
-				}
-				files = append(files, DiscoveredFile{
-					Path: filepath.Join(
-						subagentsDir, name,
-					),
-					Project: entry.Name(),
-					Agent:   AgentClaude,
-				})
-			}
+			_ = filepath.WalkDir(
+				subagentsDir,
+				func(path string, sub os.DirEntry, err error) error {
+					if err != nil || sub.IsDir() {
+						return nil
+					}
+					name := sub.Name()
+					if !strings.HasPrefix(name, "agent-") ||
+						!strings.HasSuffix(name, ".jsonl") {
+						return nil
+					}
+					files = append(files, DiscoveredFile{
+						Path:    path,
+						Project: entry.Name(),
+						Agent:   AgentClaude,
+					})
+					return nil
+				},
+			)
 		}
 	}
 
@@ -458,7 +597,7 @@ func FindClaudeSourceFile(
 	}
 
 	// Subagent files live under session directories:
-	// <project>/<session>/subagents/agent-<id>.jsonl
+	// <project>/<session>/subagents/**/agent-<id>.jsonl
 	if strings.HasPrefix(sessionID, "agent-") {
 		for _, entry := range entries {
 			if !entry.IsDir() {
@@ -475,12 +614,22 @@ func FindClaudeSourceFile(
 				if !sd.IsDir() {
 					continue
 				}
-				candidate := filepath.Join(
-					projDir, sd.Name(),
-					"subagents", target,
+				var found string
+				subagentsDir := filepath.Join(
+					projDir, sd.Name(), "subagents",
 				)
-				if _, err := os.Stat(candidate); err == nil {
-					return candidate
+				_ = filepath.WalkDir(
+					subagentsDir,
+					func(path string, d os.DirEntry, err error) error {
+						if err != nil || d.IsDir() || d.Name() != target {
+							return nil
+						}
+						found = path
+						return filepath.SkipAll
+					},
+				)
+				if found != "" {
+					return found
 				}
 			}
 		}
@@ -1328,6 +1477,17 @@ func IsPiSessionFile(path string) bool {
 // the directory name. Project is left empty so ParsePiSession
 // can derive it from the header cwd field.
 func DiscoverPiSessions(piDir string) []DiscoveredFile {
+	return discoverPiLikeSessions(piDir, AgentPi)
+}
+
+// DiscoverOMPSessions finds JSONL files under an OhMyPi session root.
+// OMP uses the same layout and file format as Pi, rooted by default at
+// ~/.omp/agent/sessions.
+func DiscoverOMPSessions(ompDir string) []DiscoveredFile {
+	return discoverPiLikeSessions(ompDir, AgentOMP)
+}
+
+func discoverPiLikeSessions(piDir string, agent AgentType) []DiscoveredFile {
 	if piDir == "" {
 		return nil
 	}
@@ -1358,7 +1518,7 @@ func DiscoverPiSessions(piDir string) []DiscoveredFile {
 			}
 			files = append(files, DiscoveredFile{
 				Path:  path,
-				Agent: AgentPi,
+				Agent: agent,
 				// Project intentionally empty; ParsePiSession
 				// derives project from the header cwd field.
 			})
@@ -1374,6 +1534,15 @@ func DiscoverPiSessions(piDir string) []DiscoveredFile {
 // session ID by searching all encoded-cwd subdirectories
 // under piDir for a file named <sessionID>.jsonl.
 func FindPiSourceFile(piDir, sessionID string) string {
+	return findPiLikeSourceFile(piDir, sessionID)
+}
+
+// FindOMPSourceFile finds the original JSONL file for an OMP session ID.
+func FindOMPSourceFile(ompDir, sessionID string) string {
+	return findPiLikeSourceFile(ompDir, sessionID)
+}
+
+func findPiLikeSourceFile(piDir, sessionID string) string {
 	if piDir == "" || !IsValidSessionID(sessionID) {
 		return ""
 	}
@@ -1591,6 +1760,142 @@ func FindVSCodeCopilotSourceFile(
 	}
 
 	return ""
+}
+
+// DiscoverVisualStudioCopilotSessions finds Visual Studio Copilot
+// trace files under the configured traces directory.
+func DiscoverVisualStudioCopilotSessions(vsRoot string) []DiscoveredFile {
+	if vsRoot == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(vsRoot)
+	if err != nil {
+		return nil
+	}
+	files := discoverVisualStudioCopilotSessionFiles(vsRoot, entries)
+	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+	return files
+}
+
+// discoverVisualStudioCopilotSessionFiles emits one work item per conversation
+// found across the trace files in a directory. A single physical trace file
+// can hold spans for several conversations, and one conversation can be split
+// across rotating trace files, so each conversation is keyed independently and
+// represented by the latest trace file that contains it. The work item path is
+// a <traceFile>#<conversationID> virtual path so the parser can re-gather that
+// conversation's spans from all sibling files.
+func discoverVisualStudioCopilotSessionFiles(
+	dir string, entries []os.DirEntry,
+) []DiscoveredFile {
+	type candidate struct {
+		path  string
+		mtime time.Time
+	}
+	bestByConversation := map[string]candidate{}
+	var unreadable []DiscoveredFile
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".jsonl") ||
+			!strings.Contains(name, "_VSGitHubCopilot_traces") {
+			continue
+		}
+		path := filepath.Join(dir, name)
+		mtime := time.Time{}
+		if info, err := entry.Info(); err == nil {
+			mtime = info.ModTime()
+		}
+		ids, err := VisualStudioCopilotFileConversationIDs(path)
+		if err != nil {
+			// Enqueue the physical file so the sync worker surfaces the
+			// read failure instead of silently dropping every
+			// conversation it might contain.
+			unreadable = append(unreadable, DiscoveredFile{
+				Path:    path,
+				Project: "visualstudio",
+				Agent:   AgentVSCopilot,
+			})
+			continue
+		}
+		for _, id := range ids {
+			current, ok := bestByConversation[id]
+			if !ok || mtime.After(current.mtime) ||
+				(mtime.Equal(current.mtime) && path > current.path) {
+				bestByConversation[id] = candidate{path: path, mtime: mtime}
+			}
+		}
+	}
+	files := make([]DiscoveredFile, 0, len(bestByConversation)+len(unreadable))
+	for id, c := range bestByConversation {
+		files = append(files, DiscoveredFile{
+			Path:    VisualStudioCopilotVirtualPath(c.path, id),
+			Project: "visualstudio",
+			Agent:   AgentVSCopilot,
+		})
+	}
+	files = append(files, unreadable...)
+	return files
+}
+
+// FindVisualStudioCopilotSourceFile locates a Visual Studio Copilot
+// trace file by conversation UUID.
+func FindVisualStudioCopilotSourceFile(vsRoot, rawID string) string {
+	if vsRoot == "" || !IsValidSessionID(rawID) {
+		return ""
+	}
+	return findVisualStudioCopilotTraceSourceFile(vsRoot, rawID)
+}
+
+func findVisualStudioCopilotTraceSourceFile(
+	dir, rawID string,
+) string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	needle := `"gen_ai.conversation.id"`
+	valueNeedle := `"stringValue":"` + rawID + `"`
+	var matches []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".jsonl") ||
+			!strings.Contains(name, "_VSGitHubCopilot_traces") {
+			continue
+		}
+		path := filepath.Join(dir, name)
+		if visualStudioCopilotTraceContains(path, needle, valueNeedle) {
+			matches = append(matches, path)
+		}
+	}
+	if len(matches) == 0 {
+		return ""
+	}
+	sort.Strings(matches)
+	// Return a conversation-scoped virtual path. The stored file_path is a
+	// <traceFile>#<conversationID> key, and returning the bare trace file would
+	// let a single-session resync enumerate and rewrite every conversation in
+	// that trace rather than only the requested one.
+	return VisualStudioCopilotVirtualPath(matches[len(matches)-1], rawID)
+}
+
+func visualStudioCopilotTraceContains(
+	path, keyNeedle, valueNeedle string,
+) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 256*1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.Contains(line, keyNeedle) &&
+			strings.Contains(line, valueNeedle) {
+			return true
+		}
+	}
+	return false
 }
 
 // DiscoverOpenClawSessions finds all JSONL session files under the
@@ -2102,4 +2407,82 @@ func FindIflowSourceFile(
 	}
 
 	return ""
+}
+
+// DiscoverVibeSessions finds all Vibe session files under the given root directory.
+// Vibe stores sessions in: ~/.vibe/logs/session/session_YYYYMMDD_HHMMSS_uuid/
+// Each session directory contains messages.jsonl
+func DiscoverVibeSessions(root string) []DiscoveredFile {
+	var results []DiscoveredFile
+
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return results
+	}
+
+	for _, entry := range entries {
+		if !isDirOrSymlink(entry, root) {
+			continue
+		}
+
+		// Vibe session directories match pattern: session_YYYYMMDD_HHMMSS_uuid
+		// The uuid part can contain hyphens
+		if !strings.HasPrefix(entry.Name(), "session_") || !strings.Contains(entry.Name(), "_") {
+			continue
+		}
+
+		sessionDir := filepath.Join(root, entry.Name())
+		messagesPath := filepath.Join(sessionDir, "messages.jsonl")
+
+		if info, err := os.Stat(messagesPath); err == nil && !info.IsDir() {
+			results = append(results, DiscoveredFile{
+				Path:    messagesPath,
+				Agent:   AgentVibe,
+				Project: entry.Name(),
+			})
+		}
+	}
+
+	return results
+}
+
+// FindVibeSourceFile locates a specific Vibe session file by ID. The ID is the
+// session_id recorded in meta.json (a uuid), which usually differs from the
+// session directory name. Sessions without meta.json fall back to the directory
+// name, so a direct path is tried first before scanning meta.json files.
+func FindVibeSourceFile(root, sessionID string) string {
+	// Fast path: sessionID is the directory name (no-meta fallback).
+	if messagesPath := filepath.Join(root, sessionID, "messages.jsonl"); isVibeMessagesFile(messagesPath) {
+		return messagesPath
+	}
+
+	// Otherwise sessionID is a meta.json session_id; scan session
+	// directories and match on their recorded session_id.
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return ""
+	}
+	for _, entry := range entries {
+		if !isDirOrSymlink(entry, root) || !strings.HasPrefix(entry.Name(), "session_") {
+			continue
+		}
+		messagesPath := filepath.Join(root, entry.Name(), "messages.jsonl")
+		if !isVibeMessagesFile(messagesPath) {
+			continue
+		}
+		metaPath := filepath.Join(root, entry.Name(), "meta.json")
+		if meta, err := parseVibeMetadata(metaPath); err == nil && meta.SessionID == sessionID {
+			return messagesPath
+		}
+	}
+	return ""
+}
+
+// isVibeMessagesFile reports whether path is an existing regular file.
+func isVibeMessagesFile(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || info == nil {
+		return false
+	}
+	return !info.IsDir()
 }

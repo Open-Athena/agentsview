@@ -2,7 +2,22 @@
   import { onMount } from "svelte";
   import { trends } from "../../stores/trends.svelte.js";
   import { getBasePath } from "../../stores/router.svelte.js";
+  import { sync } from "../../stores/sync.svelte.js";
+  import {
+    yokedDates,
+    panelDateState,
+    rangeToPanelDate,
+    type PanelDateState,
+  } from "../../stores/yokedDates.svelte.js";
+  import { rollingRange } from "../../utils/dates.js";
   import type { TrendsGranularity } from "../../api/types.js";
+  import { ChartColumnIcon, ChevronDownIcon } from "../../icons.js";
+  import RangePicker from "../shared/RangePicker.svelte";
+  import {
+    resolveRange,
+    selectionFromRange,
+    type RangeSelection,
+  } from "../shared/rangeSelection.js";
   import TermTable from "./TermTable.svelte";
   import TrendsLineChart from "./TrendsLineChart.svelte";
 
@@ -20,8 +35,30 @@
     "var(--trend-indigo)",
     "var(--trend-black)",
   ] as const;
+  const TREND_WINDOW_PARAM = "window_days";
 
   let activeTerm: string | null = $state(null);
+  let trendsWindowDays: number | null = $state(null);
+  const trendsPanelDate = $derived(currentTrendsPanelDate());
+
+  const GRANULARITIES: TrendsGranularity[] = ["day", "week", "month"];
+  let groupByOpen = $state(false);
+  let groupByEl: HTMLDivElement | undefined = $state();
+
+  function pickGranularity(g: TrendsGranularity) {
+    groupByOpen = false;
+    if (g !== trends.granularity) void setGranularity(g);
+  }
+
+  function onGroupByDocClick(e: MouseEvent) {
+    if (groupByEl && !groupByEl.contains(e.target as Node)) {
+      groupByOpen = false;
+    }
+  }
+
+  function onGroupByKey(e: KeyboardEvent) {
+    if (e.key === "Escape") groupByOpen = false;
+  }
 
   function colorFor(_term: string, index: number): string {
     return TREND_PALETTE[index % TREND_PALETTE.length]!;
@@ -31,18 +68,37 @@
     return value === "day" || value === "week" || value === "month";
   }
 
-  function applyQueryParams() {
+  function parseTrendWindowDays(raw: string | null): number | null {
+    if (!raw) return null;
+    const n = Number.parseInt(raw, 10);
+    if (!Number.isInteger(n) || n <= 0 || String(n) !== raw) {
+      return null;
+    }
+    return n;
+  }
+
+  function applyQueryParams(): boolean {
     const q = new URLSearchParams(window.location.search);
     const from = q.get("from");
     const to = q.get("to");
+    const windowDays = parseTrendWindowDays(q.get(TREND_WINDOW_PARAM));
     const granularity = q.get("granularity");
     const normalized = q.get("normalized");
     const terms = q.getAll("term").map((s) => s.trim()).filter(Boolean);
-    if (from) trends.from = from;
-    if (to) trends.to = to;
+    if (windowDays !== null) {
+      const range = rollingRange(windowDays);
+      trends.from = range.from;
+      trends.to = range.to;
+      trendsWindowDays = windowDays;
+    } else {
+      if (from) trends.from = from;
+      if (to) trends.to = to;
+      trendsWindowDays = null;
+    }
     if (isGranularity(granularity)) trends.granularity = granularity;
     trends.normalized = normalized === "true";
     if (terms.length > 0) trends.termText = terms.join("\n");
+    return windowDays !== null || q.has("from") || q.has("to");
   }
 
   function writeUrl() {
@@ -53,6 +109,9 @@
     }
     q.set("from", trends.from);
     q.set("to", trends.to);
+    if (trendsWindowDays !== null) {
+      q.set(TREND_WINDOW_PARAM, String(trendsWindowDays));
+    }
     q.set("granularity", trends.granularity);
     if (trends.normalized) {
       q.set("normalized", "true");
@@ -66,19 +125,56 @@
     window.history.replaceState(null, "", url);
   }
 
+  function materializeRollingWindow(): void {
+    if (trendsWindowDays === null) return;
+    const range = rollingRange(trendsWindowDays);
+    if (trends.from === range.from && trends.to === range.to) return;
+    trends.from = range.from;
+    trends.to = range.to;
+    updateYokeFromTrends(panelDateState(range.from, range.to, {
+      mode: "rolling",
+      windowDays: trendsWindowDays,
+    }));
+  }
+
   async function refresh() {
+    materializeRollingWindow();
     writeUrl();
     await trends.fetchTerms();
   }
 
-  async function setFromDate(event: Event) {
-    trends.from = (event.currentTarget as HTMLInputElement).value;
+  const earliestSession = $derived(sync.stats?.earliest_session ?? null);
+
+  const rangeSelection = $derived.by((): RangeSelection => {
+    if (trendsWindowDays !== null) {
+      return { mode: "relative", days: trendsWindowDays };
+    }
+    return selectionFromRange(trends.from, trends.to, earliestSession);
+  });
+
+  async function applyRange(sel: RangeSelection) {
+    const range = resolveRange(sel, earliestSession);
+    trends.from = range.from;
+    trends.to = range.to;
+    const yokeState = yokeStateForSelection(sel, range);
+    trendsWindowDays = yokeState?.mode === "rolling"
+      ? yokeState.windowDays ?? null
+      : null;
+    updateYokeFromTrends(yokeState);
     await refresh();
   }
 
-  async function setToDate(event: Event) {
-    trends.to = (event.currentTarget as HTMLInputElement).value;
-    await refresh();
+  function yokeStateForSelection(
+    sel: RangeSelection,
+    range: { from: string; to: string },
+  ): PanelDateState | null {
+    if (sel.mode === "relative" && sel.days > 0) {
+      return panelDateState(range.from, range.to, {
+        mode: "rolling",
+        windowDays: sel.days,
+      });
+    }
+    return panelDateState(range.from, range.to, { mode: "fixed" });
   }
 
   function setNormalized(event: Event) {
@@ -87,6 +183,8 @@
   }
 
   async function resetTerms() {
+    materializeRollingWindow();
+    writeUrl();
     await trends.resetTerms();
     writeUrl();
   }
@@ -96,10 +194,48 @@
     await refresh();
   }
 
+  function currentTrendsPanelDate(): PanelDateState | null {
+    if (trendsWindowDays !== null) {
+      return panelDateState(trends.from, trends.to, {
+        mode: "rolling",
+        windowDays: trendsWindowDays,
+      });
+    }
+    return panelDateState(trends.from, trends.to, { mode: "fixed" });
+  }
+
+  function updateYokeFromTrends(
+    state: PanelDateState | null = trendsPanelDate,
+  ): void {
+    if (state) yokedDates.updateFromPanel(state);
+  }
+
+  function seedTrendsYoke(): void {
+    const seed = yokedDates.seedForPanel();
+    const state = seed ? rangeToPanelDate(seed) : null;
+    if (!state) return;
+    trends.from = state.from;
+    trends.to = state.to;
+    trendsWindowDays = state.mode === "rolling"
+      ? state.windowDays ?? null
+      : null;
+  }
+
   onMount(() => {
-    applyQueryParams();
+    const hasDateParams = applyQueryParams();
+    if (hasDateParams) {
+      updateYokeFromTrends();
+    } else {
+      seedTrendsYoke();
+    }
     writeUrl();
     trends.fetchTerms();
+    document.addEventListener("click", onGroupByDocClick);
+    document.addEventListener("keydown", onGroupByKey);
+    return () => {
+      document.removeEventListener("click", onGroupByDocClick);
+      document.removeEventListener("keydown", onGroupByKey);
+    };
   });
 </script>
 
@@ -118,32 +254,12 @@
   </div>
 
   <div class="toolbar">
-    <label>
-      <span>From</span>
-      <input type="date" bind:value={trends.from} onchange={setFromDate} />
-    </label>
-    <label>
-      <span>To</span>
-      <input type="date" bind:value={trends.to} onchange={setToDate} />
-    </label>
-    <div class="granularity" aria-label="Granularity">
-      {#each ["day", "week", "month"] as value}
-        <button
-          class:active={trends.granularity === value}
-          onclick={() => setGranularity(value as TrendsGranularity)}
-        >
-          {value}
-        </button>
-      {/each}
-    </div>
-    <label class="normalize-toggle">
-      <input
-        type="checkbox"
-        bind:checked={trends.normalized}
-        onchange={setNormalized}
-      />
-      <span>Normalize by number of messages</span>
-    </label>
+    <RangePicker
+      selection={rangeSelection}
+      busy={trends.loading.terms}
+      {earliestSession}
+      onSelect={applyRange}
+    />
   </div>
 
   <div class="content-grid">
@@ -164,6 +280,48 @@
     </div>
 
     <div class="chart-panel" aria-busy={trends.loading.terms}>
+      <div class="chart-options">
+        <div class="group-by" bind:this={groupByEl}>
+          <button
+            class="group-trigger"
+            onclick={() => (groupByOpen = !groupByOpen)}
+            aria-haspopup="menu"
+            aria-expanded={groupByOpen}
+          >
+            <ChartColumnIcon size="13" strokeWidth="2" aria-hidden="true" />
+            Group by <span class="gval">{trends.granularity}</span>
+            <ChevronDownIcon
+              class={groupByOpen ? "g-chev open" : "g-chev"}
+              size="11"
+              strokeWidth="2.2"
+              aria-hidden="true"
+            />
+          </button>
+          {#if groupByOpen}
+            <div class="group-menu" role="menu">
+              {#each GRANULARITIES as g (g)}
+                <button
+                  class="group-item"
+                  class:active={trends.granularity === g}
+                  role="menuitemradio"
+                  aria-checked={trends.granularity === g}
+                  onclick={() => pickGranularity(g)}
+                >
+                  {g}
+                </button>
+              {/each}
+            </div>
+          {/if}
+        </div>
+        <label class="normalize-toggle">
+          <input
+            type="checkbox"
+            bind:checked={trends.normalized}
+            onchange={setNormalized}
+          />
+          <span>Normalize by number of messages</span>
+        </label>
+      </div>
       <TrendsLineChart
         buckets={trends.response?.buckets ?? []}
         series={trends.response?.series ?? []}
@@ -251,8 +409,7 @@
   }
 
   .head-actions,
-  .toolbar,
-  .granularity {
+  .toolbar {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -328,40 +485,96 @@
     font-size: 12px;
   }
 
-  .granularity {
-    align-self: end;
-    height: 32px;
-    padding: 2px;
-    border: 1px solid var(--border-default);
-    border-radius: 7px;
-    background: var(--bg-surface);
+  .chart-options {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 14px;
+    padding: 2px 2px 10px;
   }
 
-  .granularity button {
+  .group-by {
+    position: relative;
+  }
+
+  .group-trigger {
     height: 26px;
-    min-width: 54px;
-    padding: 0 10px;
+    padding: 0 8px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
     border: 0;
+    border-radius: 6px;
     background: transparent;
     color: var(--text-muted);
-    text-transform: capitalize;
     font-size: 12px;
   }
 
-  .granularity button.active {
-    background: var(--bg-hover);
-    color: var(--text-primary);
+  .group-trigger:hover:not(:disabled) {
+    background: var(--bg-surface-hover);
+    color: var(--text-secondary);
+  }
+
+  .group-trigger .gval {
+    color: var(--text-secondary);
+    font-weight: 500;
+    text-transform: capitalize;
+  }
+
+  :global(.g-chev) {
+    color: var(--text-muted);
+    transition: transform 0.15s;
+  }
+
+  :global(.g-chev.open) {
+    transform: rotate(180deg);
+  }
+
+  .group-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    z-index: 20;
+    min-width: 124px;
+    padding: 4px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-muted);
+    border-radius: 7px;
+    box-shadow: var(--shadow-md);
+  }
+
+  .group-item {
+    width: 100%;
+    height: 28px;
+    padding: 0 9px;
+    display: flex;
+    align-items: center;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 12px;
+    text-align: left;
+    text-transform: capitalize;
+  }
+
+  .group-item:hover:not(:disabled) {
+    background: var(--bg-surface-hover);
+  }
+
+  .group-item.active {
+    color: var(--accent-blue);
+    font-weight: 500;
   }
 
   .normalize-toggle {
-    align-self: end;
-    height: 32px;
     display: flex;
     align-items: center;
-    gap: 7px;
-    color: var(--text-primary);
+    gap: 6px;
+    color: var(--text-muted);
     font-size: 12px;
     font-weight: 500;
+    cursor: pointer;
   }
 
   .normalize-toggle input {

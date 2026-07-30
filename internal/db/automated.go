@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"slices"
 	"strings"
 	"sync"
@@ -37,6 +38,7 @@ var automatedPrefixes = []string{
 // longer prompts.
 var automatedSubstrings = []string{
 	"invoked by roborev to perform this review",
+	"You are a security code reviewer with an exploitability burden of proof. Review the code changes for concrete vulnerabilities",
 	"You are a conversation title generator",
 }
 
@@ -131,4 +133,51 @@ func IsAutomatedSession(firstMessage string) bool {
 	}
 	trimmed := strings.TrimSpace(firstMessage)
 	return slices.Contains(automatedExactMatches, trimmed)
+}
+
+// IsAutomatedTranscript classifies automation from the actual
+// transcript and the stored first_message. The first_message
+// candidate preserves legacy/imported rows whose messages are
+// unavailable or less specific than the parser-owned preview.
+func IsAutomatedTranscript(
+	userMessageCount int,
+	msgs []Message,
+	firstMessage *string,
+) bool {
+	if userMessageCount > 1 {
+		return false
+	}
+	if firstUser, ok := firstUserMessageContent(msgs); ok &&
+		IsAutomatedSession(firstUser) {
+		return true
+	}
+	return firstMessage != nil && IsAutomatedSession(*firstMessage)
+}
+
+func firstUserMessageContent(msgs []Message) (string, bool) {
+	for _, m := range msgs {
+		if m.Role != "user" || m.IsSystem {
+			continue
+		}
+		if strings.TrimSpace(m.Content) == "" {
+			continue
+		}
+		return m.Content, true
+	}
+	return "", false
+}
+
+func isAutomatedFromTextCandidates(
+	userMessageCount int,
+	firstUserMessage, firstMessage sql.NullString,
+) bool {
+	if userMessageCount > 1 {
+		return false
+	}
+	if firstUserMessage.Valid &&
+		strings.TrimSpace(firstUserMessage.String) != "" &&
+		IsAutomatedSession(firstUserMessage.String) {
+		return true
+	}
+	return firstMessage.Valid && IsAutomatedSession(firstMessage.String)
 }

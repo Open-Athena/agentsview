@@ -20,6 +20,7 @@ type seedStats struct {
 	TotalMessages          int
 	ActiveProjects         int
 	TotalToolCalls         int
+	TotalSkillCalls        int
 	Agents                 int
 	ActiveDays             int
 	TotalOutputTokens      int
@@ -70,6 +71,9 @@ func seedAnalyticsEnv(t *testing.T, te *testEnv) seedStats {
 		)
 		te.seedMessages(t, s.id, s.msgs,
 			func(i int, m *db.Message) {
+				// Skill analytics now buckets and filters by message
+				// timestamp, so align messages with the session window.
+				m.Timestamp = started
 				// Add tool calls on every other assistant msg
 				if m.Role == "assistant" && i%4 == 1 {
 					m.HasToolUse = true
@@ -78,9 +82,11 @@ func seedAnalyticsEnv(t *testing.T, te *testEnv) seedStats {
 							SessionID: s.id,
 							ToolName:  "Read",
 							Category:  "Read",
+							SkillName: "review-code",
 						},
 					}
 					stats.TotalToolCalls++
+					stats.TotalSkillCalls++
 				}
 			},
 		)
@@ -278,6 +284,15 @@ func TestAnalyticsErrorRedaction(t *testing.T) {
 			assert.NotContains(t, body, "database", "response exposes internal error")
 		})
 	}
+}
+
+func TestAnalyticsSignalSessionsRejectsUnsupportedSignal(t *testing.T) {
+	te := setup(t)
+	seedAnalyticsEnv(t, te)
+
+	w := te.get(t, buildURLWithRange("signal-sessions",
+		map[string]string{"signal": "not_a_signal"}))
+	assertStatus(t, w, http.StatusBadRequest)
 }
 
 func TestAnalyticsEndpoints_DefaultParams(t *testing.T) {
@@ -741,6 +756,35 @@ func TestAnalyticsTools(t *testing.T) {
 
 	t.Run("InvalidTimezone", func(t *testing.T) {
 		w := te.get(t, buildURL("tools", map[string]string{"timezone": "Fake/Zone"}))
+		assertStatus(t, w, http.StatusBadRequest)
+	})
+}
+
+func TestAnalyticsSkills(t *testing.T) {
+	te := setup(t)
+	stats := seedAnalyticsEnv(t, te)
+
+	t.Run("OK", func(t *testing.T) {
+		w := te.get(t, buildURLWithRange("skills", map[string]string{"timezone": "UTC"}))
+		assertStatus(t, w, http.StatusOK)
+
+		resp := decode[db.SkillsAnalyticsResponse](t, w)
+		assert.Equal(t, stats.TotalSkillCalls, resp.TotalSkillCalls)
+		assert.Equal(t, 1, resp.DistinctSkills)
+		require.NotEmpty(t, resp.BySkill)
+		assert.Equal(t, "review-code", resp.BySkill[0].SkillName)
+	})
+
+	t.Run("WithProjectFilter", func(t *testing.T) {
+		w := te.get(t, buildURLWithRange("skills", map[string]string{"project": "alpha", "timezone": "UTC"}))
+		assertStatus(t, w, http.StatusOK)
+
+		resp := decode[db.SkillsAnalyticsResponse](t, w)
+		assert.NotZero(t, resp.TotalSkillCalls, "TotalSkillCalls for alpha")
+	})
+
+	t.Run("InvalidTimezone", func(t *testing.T) {
+		w := te.get(t, buildURL("skills", map[string]string{"timezone": "Fake/Zone"}))
 		assertStatus(t, w, http.StatusBadRequest)
 	})
 }

@@ -42,6 +42,9 @@ func (db *DB) WriteSessionBatch(
 	writes []SessionBatchWrite,
 ) (SessionBatchResult, error) {
 	var result SessionBatchResult
+	if err := db.requireWritable(); err != nil {
+		return result, err
+	}
 	if len(writes) == 0 {
 		return result, nil
 	}
@@ -107,6 +110,9 @@ func (db *DB) WriteSessionBatchAtomic(
 	beforeCommit ...func() error,
 ) (SessionBatchResult, error) {
 	var result SessionBatchResult
+	if err := db.requireWritable(); err != nil {
+		return result, err
+	}
 	if len(writes) == 0 {
 		return result, nil
 	}
@@ -189,18 +195,19 @@ func writeOneSessionBatchTx(
 	if excluded == 1 {
 		return 0, ErrSessionExcluded
 	}
-	var trashed int
+	var deletedAt sql.NullString
 	err = tx.QueryRow(
-		"SELECT 1 FROM sessions WHERE id = ? AND deleted_at IS NOT NULL",
+		"SELECT deleted_at FROM sessions WHERE id = ?",
 		write.Session.ID,
-	).Scan(&trashed)
+	).Scan(&deletedAt)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, fmt.Errorf(
 			"checking trash for %s: %w",
 			write.Session.ID, err,
 		)
 	}
-	if trashed == 1 {
+	sessionExists := err == nil
+	if deletedAt.Valid {
 		return 0, ErrSessionTrashed
 	}
 
@@ -221,7 +228,7 @@ func writeOneSessionBatchTx(
 
 	msgs := write.Messages
 	var pins []savedPin
-	if write.ReplaceMessages {
+	if write.ReplaceMessages && sessionExists {
 		pins, err = savePinsTx(tx, write.Session.ID)
 		if err != nil {
 			return 0, err
@@ -256,6 +263,11 @@ func writeOneSessionBatchTx(
 			return 0, err
 		}
 	}
+	if err := updateSessionAutomationFromMessagesTx(
+		tx, write.Session.ID,
+	); err != nil {
+		return 0, err
+	}
 
 	if write.DataVersion > 0 {
 		if _, err := tx.Exec(
@@ -281,30 +293,6 @@ func writeOneSessionBatchTx(
 	}
 
 	return len(msgs), nil
-}
-
-func deleteSessionMessagesTx(tx *sql.Tx, sessionID string) error {
-	if _, err := tx.Exec(
-		"DELETE FROM tool_calls WHERE session_id = ?",
-		sessionID,
-	); err != nil {
-		return fmt.Errorf("deleting old tool_calls: %w", err)
-	}
-	if _, err := tx.Exec(
-		"DELETE FROM tool_result_events WHERE session_id = ?",
-		sessionID,
-	); err != nil {
-		return fmt.Errorf(
-			"deleting old tool_result_events: %w", err,
-		)
-	}
-	if _, err := tx.Exec(
-		"DELETE FROM messages WHERE session_id = ?",
-		sessionID,
-	); err != nil {
-		return fmt.Errorf("deleting old messages: %w", err)
-	}
-	return nil
 }
 
 func maxOrdinalTx(tx *sql.Tx, sessionID string) (int, error) {

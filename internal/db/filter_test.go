@@ -560,6 +560,123 @@ func TestIncludeChildrenExcludesOrphanSubagents(t *testing.T) {
 	requireSessions(t, d, f, []string{"root", "root-sub"})
 }
 
+// TestIncludeOrphansPromotesToRoot verifies that canonical orphan rows
+// surface as synthetic roots when IncludeOrphans is enabled, and remain
+// hidden when IncludeOrphans is false.
+func TestIncludeOrphansPromotesToRoot(t *testing.T) {
+	d := testDB(t)
+
+	// Control: legitimate root with a subagent child.
+	insertSession(t, d, "root", "proj", func(s *Session) {
+		s.MessageCount = 10
+		s.UserMessageCount = 5
+	})
+	insertSession(t, d, "root-sub", "proj", func(s *Session) {
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.ParentSessionID = new("root")
+		s.RelationshipType = "subagent"
+	})
+
+	// Orphan subagent: parent doesn't exist in DB.
+	insertSession(t, d, "orphan-sub", "proj", func(s *Session) {
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.ParentSessionID = new("missing-parent")
+		s.RelationshipType = "subagent"
+	})
+
+	// Orphan fork: parent doesn't exist in DB.
+	insertSession(t, d, "orphan-fork", "proj", func(s *Session) {
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.ParentSessionID = new("also-missing")
+		s.RelationshipType = "fork"
+	})
+
+	insertSession(t, d, "orphan-grandchild", "proj", func(s *Session) {
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.ParentSessionID = new("orphan-sub")
+		s.RelationshipType = "fork"
+	})
+
+	insertSession(t, d, "continuation-orphan", "proj", func(s *Session) {
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.ParentSessionID = new("missing-continuation-parent")
+		s.RelationshipType = "continuation"
+	})
+
+	tests := []struct {
+		name           string
+		includeOrphans bool
+		want           []string
+	}{
+		{
+			name:           "WithIncludeOrphans",
+			includeOrphans: true,
+			want: []string{
+				"root", "root-sub", "orphan-sub", "orphan-fork", "orphan-grandchild", "continuation-orphan",
+			},
+		},
+		{
+			name:           "WithoutIncludeOrphans",
+			includeOrphans: false,
+			want:           []string{"root", "root-sub"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := SessionFilter{
+				IncludeChildren: true,
+				IncludeOrphans:  tt.includeOrphans,
+			}
+			requireSessions(t, d, f, tt.want)
+		})
+	}
+}
+
+// TestIncludeOrphansWithExcludeAutomated verifies that when both
+// IncludeOrphans and ExcludeAutomated are set, automated orphans
+// are still excluded while non-automated orphans are promoted to roots.
+func TestIncludeOrphansWithExcludeAutomated(t *testing.T) {
+	d := testDB(t)
+
+	// Non-automated root.
+	insertSession(t, d, "root", "proj", func(s *Session) {
+		s.MessageCount = 10
+		s.UserMessageCount = 5
+	})
+
+	// Non-automated orphan subagent — should be included.
+	insertSession(t, d, "orphan-sub", "proj", func(s *Session) {
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.ParentSessionID = new("missing-parent")
+		s.RelationshipType = "subagent"
+	})
+
+	// Automated orphan fork — should be excluded.
+	fm := "You are a code reviewer. Review the code."
+	insertSession(t, d, "orphan-auto-fork", "proj", func(s *Session) {
+		s.FirstMessage = &fm
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.ParentSessionID = new("also-missing")
+		s.RelationshipType = "fork"
+	})
+
+	f := SessionFilter{
+		IncludeChildren:  true,
+		IncludeOrphans:   true,
+		ExcludeAutomated: true,
+	}
+	// Expected: root + non-automated orphan-sub, automated orphan-auto-fork excluded.
+	requireSessions(t, d, f, []string{"root", "orphan-sub"})
+}
+
 // TestIncludeChildrenKeepsNestedDescendants guards against a
 // regression where a fork spawned inside a subagent thread
 // (root → subagent → fork) was dropped. The direct-match side
@@ -1097,12 +1214,138 @@ func TestSidebarSessionIndexIncludesChildrenForMatchingRoot(t *testing.T) {
 	requireSidebarIndexIDs(t, index.Sessions, []string{"root", "sub", "fork"})
 }
 
+func TestSidebarSessionIndexStarredIncludesStarredDescendantRoot(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "unstarred-newer", "proj", func(s *Session) {
+		s.EndedAt = new("2024-01-20T00:00:00Z")
+		s.MessageCount = 5
+		s.UserMessageCount = 2
+	})
+	rootID := "root"
+	insertSession(t, d, rootID, "proj", func(s *Session) {
+		s.EndedAt = new("2024-01-01T00:00:00Z")
+		s.MessageCount = 5
+		s.UserMessageCount = 2
+	})
+	insertSession(t, d, "starred-child", "proj", func(s *Session) {
+		s.EndedAt = new("2024-01-10T00:00:00Z")
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.ParentSessionID = &rootID
+		s.RelationshipType = "subagent"
+	})
+	ok, err := d.StarSession("starred-child")
+	require.NoError(t, err, "StarSession")
+	require.True(t, ok, "starred-child should exist")
+
+	index, err := d.GetSidebarSessionIndex(context.Background(), SessionFilter{
+		Starred: true,
+		Limit:   1,
+	})
+	requireNoError(t, err, "GetSidebarSessionIndex")
+	require.Empty(t, index.NextCursor)
+	require.Equal(t, 1, index.Total, "total starred root groups")
+	requireSidebarIndexIDs(t, index.Sessions, []string{"root", "starred-child"})
+}
+
+func TestSidebarSessionIndexPagedPromotesNestedOrphans(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "root", "proj", func(s *Session) {
+		s.EndedAt = new("2024-01-20T00:00:00Z")
+		s.MessageCount = 5
+		s.UserMessageCount = 2
+	})
+	insertSession(t, d, "orphan-sub", "proj", func(s *Session) {
+		s.EndedAt = new("2024-01-19T00:00:00Z")
+		s.MessageCount = 3
+		s.UserMessageCount = 1
+		s.ParentSessionID = new("missing-parent")
+		s.RelationshipType = "subagent"
+	})
+	insertSession(t, d, "orphan-fork", "proj", func(s *Session) {
+		s.EndedAt = new("2024-01-18T00:00:00Z")
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.ParentSessionID = new("orphan-sub")
+		s.RelationshipType = "fork"
+	})
+	insertSession(t, d, "continuation-orphan", "proj", func(s *Session) {
+		s.EndedAt = new("2024-01-17T00:00:00Z")
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.ParentSessionID = new("missing-continuation-parent")
+		s.RelationshipType = "continuation"
+	})
+
+	index, err := d.GetSidebarSessionIndex(ctx, SessionFilter{Limit: 2})
+	requireNoError(t, err, "GetSidebarSessionIndex")
+	require.Equal(t, 3, index.Total, "total paged root groups")
+	require.NotEmpty(t, index.NextCursor, "paged sidebar should expose a next cursor when more root groups remain")
+	requireSidebarIndexIDs(t, index.Sessions, []string{"root", "orphan-sub", "orphan-fork"})
+}
+
+func TestSidebarSessionIndexPagedExcludesContinuationWithSoftDeletedParent(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "root", "proj", func(s *Session) {
+		s.EndedAt = new("2024-01-20T00:00:00Z")
+		s.MessageCount = 5
+		s.UserMessageCount = 2
+	})
+	insertSession(t, d, "deleted-parent", "proj", func(s *Session) {
+		s.EndedAt = new("2024-01-19T00:00:00Z")
+		s.MessageCount = 5
+		s.UserMessageCount = 2
+	})
+	require.NoError(t, d.SoftDeleteSession("deleted-parent"), "SoftDeleteSession")
+	insertSession(t, d, "continuation-child", "proj", func(s *Session) {
+		s.EndedAt = new("2024-01-18T00:00:00Z")
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.ParentSessionID = new("deleted-parent")
+		s.RelationshipType = "continuation"
+	})
+
+	index, err := d.GetSidebarSessionIndex(ctx, SessionFilter{Limit: 10})
+	requireNoError(t, err, "GetSidebarSessionIndex")
+	require.Equal(t, 1, index.Total, "soft-deleted parent should not promote continuation root")
+	requireSidebarIndexIDs(t, index.Sessions, []string{"root"})
+}
+
+func TestSidebarSessionIndexPagedKeepsContinuationUnderLiveParent(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "root", "proj", func(s *Session) {
+		s.EndedAt = new("2024-01-20T00:00:00Z")
+		s.MessageCount = 5
+		s.UserMessageCount = 2
+	})
+	insertSession(t, d, "continuation-child", "proj", func(s *Session) {
+		s.EndedAt = new("2024-01-19T00:00:00Z")
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.ParentSessionID = new("root")
+		s.RelationshipType = "continuation"
+	})
+
+	index, err := d.GetSidebarSessionIndex(ctx, SessionFilter{Limit: 1})
+	requireNoError(t, err, "GetSidebarSessionIndex")
+	require.Equal(t, 1, index.Total, "live continuation should stay nested")
+	require.Empty(t, index.NextCursor, "only one root group exists")
+	requireSidebarIndexIDs(t, index.Sessions, []string{"root", "continuation-child"})
+}
+
 func TestSidebarSessionIndexReturnsDisplayName(t *testing.T) {
 	d := testDB(t)
 
-	displayName := "Named session"
+	sessionName := "Named session"
 	insertSession(t, d, "named", "proj", func(s *Session) {
-		s.DisplayName = &displayName
+		s.SessionName = &sessionName
 		s.MessageCount = 3
 		s.UserMessageCount = 2
 	})
@@ -1110,8 +1353,34 @@ func TestSidebarSessionIndexReturnsDisplayName(t *testing.T) {
 	index, err := d.GetSidebarSessionIndex(context.Background(), SessionFilter{})
 	require.NoError(t, err, "GetSidebarSessionIndex")
 	require.Len(t, index.Sessions, 1)
-	require.NotNil(t, index.Sessions[0].DisplayName, "display_name")
-	assert.Equal(t, displayName, *index.Sessions[0].DisplayName, "display_name")
+	require.NotNil(t, index.Sessions[0].DisplayName, "display_name via COALESCE")
+	assert.Equal(t, sessionName, *index.Sessions[0].DisplayName, "display_name via COALESCE")
+}
+
+func TestSidebarIndexDisplayNameResolvesViaCoalesce(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	// Session has an agent-provided name but no user rename.
+	insertSession(t, d, "s1", "p", func(s *Session) {
+		name := "Agent Name"
+		s.SessionName = &name
+	})
+
+	index, err := d.GetSidebarSessionIndex(ctx, SessionFilter{})
+	requireNoError(t, err, "sidebar index")
+	require.Len(t, index.Sessions, 1)
+	// display_name is resolved via COALESCE(display_name, session_name).
+	require.NotNil(t, index.Sessions[0].DisplayName, "display_name must be present via COALESCE")
+	assert.Equal(t, "Agent Name", *index.Sessions[0].DisplayName, "COALESCE returns session_name")
+
+	// User renames override session_name.
+	requireNoError(t, d.RenameSession("s1", Ptr("My Name")), "rename")
+	index, err = d.GetSidebarSessionIndex(ctx, SessionFilter{})
+	requireNoError(t, err, "sidebar index after rename")
+	require.Len(t, index.Sessions, 1)
+	require.NotNil(t, index.Sessions[0].DisplayName, "display_name must be present after rename")
+	assert.Equal(t, "My Name", *index.Sessions[0].DisplayName, "display_name wins over session_name")
 }
 
 func TestSidebarSessionIndexComputesIsTeammate(t *testing.T) {
@@ -1277,8 +1546,21 @@ func TestIncrementalUpdateClearsAutomated(t *testing.T) {
 	require.True(t, s.IsAutomated, "should start as automated")
 
 	// Simulate a second user turn via incremental update.
-	err = d.UpdateSessionIncremental(
-		"s1", nil, 6, 2, 100, 12345, 0, 0, false, false,
+	err = callUpdateSessionIncrementalCompat(
+		t,
+		d,
+		"s1",
+		nil,
+		6,
+		2,
+		100,
+		12345,
+		0,
+		"",
+		0,
+		0,
+		false,
+		false,
 	)
 	require.NoError(t, err, "incremental update")
 

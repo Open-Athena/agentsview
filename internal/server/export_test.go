@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"html/template"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -710,6 +712,61 @@ func TestGenerateExportMarkdown_SerializesCodeSkillAndCDATAFallback(t *testing.T
 	})
 }
 
+func TestGenerateExportMarkdown_RendersCursorApplyPatch(t *testing.T) {
+	t.Parallel()
+	session := testSession()
+	msgs := []db.Message{{
+		SessionID:  "test-id",
+		Ordinal:    0,
+		Role:       "assistant",
+		Content:    "[Patch: src/app.ts]\n@@ -1,1 +1,1 @@\n-old\n+new",
+		HasToolUse: true,
+		ToolCalls: []db.ToolCall{{
+			ToolName:  "ApplyPatch",
+			Category:  "Edit",
+			ToolUseID: "toolu_patch",
+			InputJSON: `{"path":"src/app.ts","patch":"@@ -1,1 +1,1 @@\n-old\n+new"}`,
+		}},
+	}}
+
+	out := generateExportMarkdown(session, msgs, exportMarkdownOptions{})
+	assertContainsAll(t, out, []string{
+		`<tool_call id="toolu_patch" name="ApplyPatch" category="Edit">`,
+		`<tool_body><![CDATA[` + "\n@@ -1,1 +1,1 @@\n-old\n+new\n" + `]]></tool_body>`,
+	})
+	assertContainsNone(t, out, []string{
+		`[Patch: src/app.ts]`,
+		`patch: @@ -1,1 +1,1 @@`,
+	})
+}
+
+func TestGenerateExportMarkdown_RendersCursorApplyPatchFromInputJSON(t *testing.T) {
+	t.Parallel()
+	session := testSession()
+	msgs := []db.Message{{
+		SessionID:  "test-id",
+		Ordinal:    0,
+		Role:       "assistant",
+		Content:    "[Patch: src/app.ts]",
+		HasToolUse: true,
+		ToolCalls: []db.ToolCall{{
+			ToolName:  "ApplyPatch",
+			Category:  "Edit",
+			ToolUseID: "toolu_patch",
+			InputJSON: `{"path":"src/app.ts","patch":"@@ -1,1 +1,1 @@\n-old\n+new"}`,
+		}},
+	}}
+
+	out := generateExportMarkdown(session, msgs, exportMarkdownOptions{})
+	assertContainsAll(t, out, []string{
+		`<tool_call id="toolu_patch" name="ApplyPatch" category="Edit">`,
+		`<tool_body><![CDATA[` + "\n@@ -1,1 +1,1 @@\n-old\n+new\n" + `]]></tool_body>`,
+	})
+	assertContainsNone(t, out, []string{
+		`[Patch: src/app.ts]`,
+	})
+}
+
 func TestGenerateExportMarkdown_OmitsEmptyOptionalAttributes(t *testing.T) {
 	t.Parallel()
 	session := testSession(func(s *db.Session) {
@@ -1114,7 +1171,7 @@ func TestCreateGist(t *testing.T) {
 			}
 
 			got, err := createGistWithURL(
-				ctx, ts.URL, "tok", "f.html", "desc", "content",
+				ctx, ts.URL, "tok", "f.html", "desc", "content", true,
 			)
 
 			if tt.cancelCtx {
@@ -1131,6 +1188,45 @@ func TestCreateGist(t *testing.T) {
 			assert.Equal(t, tt.wantID, got.ID)
 			assert.Equal(t, tt.wantURL, got.HTMLURL)
 			assert.Equal(t, tt.wantLogin, got.Owner.Login)
+		})
+	}
+}
+
+func TestCreateGistVisibility(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		public bool
+	}{
+		{name: "Public", public: true},
+		{name: "Secret", public: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var payload struct {
+				Public bool `json:"public"`
+			}
+			ts := httptest.NewServer(http.HandlerFunc(
+				func(w http.ResponseWriter, r *http.Request) {
+					assert.NoError(t,
+						json.NewDecoder(r.Body).Decode(&payload))
+					w.WriteHeader(http.StatusCreated)
+					w.Write([]byte(`{"id":"abc123",` +
+						`"html_url":"https://gist.github.com/abc123",` +
+						`"owner":{"login":"testuser"}}`))
+				},
+			))
+			defer ts.Close()
+
+			_, err := createGistWithURL(
+				context.Background(), ts.URL,
+				"tok", "f.html", "desc", "content", tt.public,
+			)
+			require.NoError(t, err)
+			assert.Equal(t, tt.public, payload.Public)
 		})
 	}
 }
@@ -1209,4 +1305,11 @@ func TestValidateGithubToken(t *testing.T) {
 			assert.Equal(t, tt.wantLogin, login)
 		})
 	}
+}
+
+func TestGithubHTTPClientUsesIsolatedTransport(t *testing.T) {
+	client := githubHTTPClient(10 * time.Second)
+	require.NotNil(t, client.Transport)
+	assert.NotSame(t, http.DefaultTransport, client.Transport,
+		"github API clients must not share the package default transport")
 }

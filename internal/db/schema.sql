@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     agent       TEXT NOT NULL DEFAULT 'claude',
     first_message TEXT,
     display_name TEXT,
+    session_name TEXT,
     started_at  TEXT,
     ended_at    TEXT,
     message_count INTEGER NOT NULL DEFAULT 0,
@@ -13,6 +14,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     file_path   TEXT,
     file_size   INTEGER,
     file_mtime  INTEGER,
+    next_ordinal INTEGER NOT NULL DEFAULT 0,
+    last_entry_uuid TEXT,
     file_inode  INTEGER,
     file_device INTEGER,
     file_hash   TEXT,
@@ -40,6 +43,14 @@ CREATE TABLE IF NOT EXISTS sessions (
     health_grade TEXT,
     has_tool_calls INTEGER NOT NULL DEFAULT 0,
     has_context_data INTEGER NOT NULL DEFAULT 0,
+    quality_signal_version INTEGER NOT NULL DEFAULT 0,
+    short_prompt_count INTEGER NOT NULL DEFAULT 0,
+    unstructured_start INTEGER NOT NULL DEFAULT 0,
+    missing_success_criteria_count INTEGER NOT NULL DEFAULT 0,
+    missing_verification_count INTEGER NOT NULL DEFAULT 0,
+    duplicate_prompt_count INTEGER NOT NULL DEFAULT 0,
+    no_code_context_count INTEGER NOT NULL DEFAULT 0,
+    runaway_tool_loop_count INTEGER NOT NULL DEFAULT 0,
     data_version INTEGER NOT NULL DEFAULT 0,
     cwd TEXT NOT NULL DEFAULT '',
     git_branch TEXT NOT NULL DEFAULT '',
@@ -120,6 +131,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_machine
     ON sessions(machine);
 CREATE INDEX IF NOT EXISTS idx_messages_session_ordinal
     ON messages(session_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_messages_velocity
+    ON messages(session_id, ordinal, role, timestamp, content_length);
 CREATE INDEX IF NOT EXISTS idx_messages_session_role
     ON messages(session_id, role);
 
@@ -189,6 +202,8 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 
 CREATE INDEX IF NOT EXISTS idx_tool_calls_session
     ON tool_calls(session_id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_session_category
+    ON tool_calls(session_id, category);
 -- idx_tool_calls_message backs the ON DELETE CASCADE from
 -- messages(id). Without it SQLite full-scans tool_calls per
 -- deleted message row, which makes ReplaceSessionMessages
@@ -244,12 +259,21 @@ CREATE TABLE IF NOT EXISTS insights (
     model       TEXT,
     prompt      TEXT,
     content     TEXT NOT NULL,
+    kind        TEXT NOT NULL DEFAULT '',
+    schema_version TEXT NOT NULL DEFAULT '',
+    template_id TEXT NOT NULL DEFAULT '',
+    template_version TEXT NOT NULL DEFAULT '',
+    aggregate_hash TEXT NOT NULL DEFAULT '',
+    cache_key   TEXT NOT NULL DEFAULT '',
+    cache_status TEXT NOT NULL DEFAULT '',
+    provenance_json TEXT NOT NULL DEFAULT '',
+    structured_json TEXT NOT NULL DEFAULT '',
     created_at  TEXT NOT NULL
         DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_insights_lookup
-    ON insights(type, date_from, project);
+    ON insights(type, date_from, date_to, project);
 
 CREATE INDEX IF NOT EXISTS idx_insights_created
     ON insights(created_at DESC);

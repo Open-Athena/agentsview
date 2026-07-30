@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { m } from "../../i18n/index.js";
   import {
     sessions,
     type SessionGroupInput,
@@ -18,6 +19,7 @@
     UsersRoundIcon,
   } from "../../icons.js";
   import StatusDot from "../common/StatusDot.svelte";
+  import { router } from "../../stores/router.svelte.js";
 
   interface Props {
     session: SessionGroupInput;
@@ -101,11 +103,9 @@
    * repetitive "You are a teammate on..." boilerplate.
    */
   let displayLabel = $derived.by((): { text: string; isShell: boolean } => {
-    if (session.display_name) {
-      return {
-        text: truncate(session.display_name, 50),
-        isShell: false,
-      };
+    const name = session.display_name ?? null;
+    if (name) {
+      return { text: name, isShell: false };
     }
     let msg = session.first_message ?? "";
     if (msg.includes("<teammate-message")) {
@@ -116,18 +116,18 @@
       // Extract "Task #N: description" from the boilerplate.
       const taskMatch = msg.match(/Task\s*#?\d+[:\s]+(.+?)(?:\s+\d+\.|$)/s);
       if (taskMatch) {
-        return { text: truncate(taskMatch[1]!.trim(), 50), isShell: false };
+        return { text: taskMatch[1]!.trim(), isShell: false };
       }
       // Fallback: skip the "You are a teammate on ..." boilerplate.
       const afterTeam = msg.match(/team[."]\s*[^.]*?[.]\s+(.+)/s)
         ?? msg.match(/You are a teammate[^.]*\.\s+(.+)/s);
       if (afterTeam) {
-        return { text: truncate(afterTeam[1]!.trim(), 50), isShell: false };
+        return { text: afterTeam[1]!.trim(), isShell: false };
       }
     }
     const p = previewMessage(msg);
-    if (p.text) return { text: truncate(p.text, 50), isShell: p.isShell };
-    return { text: truncate(session.project, 30), isShell: false };
+    if (p.text) return { text: p.text, isShell: p.isShell };
+    return { text: session.project, isShell: false };
   });
 
   let timeStr = $derived(
@@ -141,6 +141,10 @@
   );
 
   let hasChildren = $derived(childCount > 0 && !!onToggleExpand);
+
+  const sessionHref = $derived.by(() =>
+    router.buildSessionHref(session.id),
+  );
 
   /** Whether this is an orphaned teammate showing at root level. */
   let isOrphanedTeammate = $derived(
@@ -186,7 +190,8 @@
   function startRename() {
     renameValue =
       session.display_name
-      ?? normalizeMessagePreview(session.first_message);
+      ?? normalizeMessagePreview(session.first_message)
+      ?? "";
     renaming = true;
     closeContextMenu();
     requestAnimationFrame(() => renameInput?.select());
@@ -215,6 +220,40 @@
   function handleDblClick(e: MouseEvent) {
     e.preventDefault();
     startRename();
+  }
+
+  function handleSessionClick(e: MouseEvent) {
+    if (
+      e.metaKey ||
+      e.ctrlKey ||
+      e.shiftKey ||
+      e.altKey ||
+      e.button !== 0
+    ) {
+      return;
+    }
+    e.preventDefault();
+    sessions.selectSession(session.id);
+  }
+
+  function handleRowClick(e: MouseEvent) {
+    if (
+      e.metaKey ||
+      e.ctrlKey ||
+      e.shiftKey ||
+      e.altKey ||
+      e.button !== 0
+    ) {
+      return;
+    }
+    const target = e.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    if (target.closest("a, button, input")) {
+      return;
+    }
+    sessions.selectSession(session.id);
   }
 
   $effect(() => {
@@ -247,6 +286,7 @@
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
+<!-- svelte-ignore a11y_click_events_have_key_events -->
 <div
   class="session-item"
   class:active={isActive}
@@ -256,10 +296,19 @@
   class:orphaned-teammate={isOrphanedTeammate}
   data-session-id={session.id}
   role="button"
+  aria-current={isActive ? "page" : undefined}
   tabindex="0"
   style:padding-left="{8 + depth * 16}px"
-  onclick={() => sessions.selectSession(session.id)}
-  onkeydown={(e) => { if (e.target !== e.currentTarget) return; if (e.key === "Enter" || e.key === " ") { e.preventDefault(); sessions.selectSession(session.id); } }}
+  onclick={handleRowClick}
+  onkeydown={(e) => {
+    if (e.target !== e.currentTarget) {
+      return;
+    }
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      sessions.selectSession(session.id);
+    }
+  }}
   oncontextmenu={handleContextMenu}
 >
   <!-- Tree expand/collapse or connector -->
@@ -269,7 +318,7 @@
       class="tree-toggle"
       onclick={handleToggle}
       tabindex="-1"
-      aria-label={expanded ? "Collapse" : "Expand"}
+      aria-label={expanded ? m.sidebar_row_collapse() : m.sidebar_row_expand()}
     >
       {#if expanded}
         <ChevronDownIcon class="tree-arrow" size="10" strokeWidth="2.5" aria-hidden="true" />
@@ -308,35 +357,40 @@
         }}
       />
     {:else}
-      <!-- svelte-ignore a11y_no_static_element_interactions -->
-      <div
-        class="session-name"
-        class:shell={displayLabel.isShell}
-        ondblclick={handleDblClick}
+      <a
+        class="session-info-link"
+        href={sessionHref}
+        onclick={handleSessionClick}
       >
-        {#if displayLabel.isShell}
-          <code>{displayLabel.text}</code>
-        {:else}
-          {displayLabel.text}
-        {/if}
-      </div>
+        <div
+          class="session-name"
+          class:shell={displayLabel.isShell}
+          ondblclick={handleDblClick}
+        >
+          {#if displayLabel.isShell}
+            <code>{displayLabel.text}</code>
+          {:else}
+            {displayLabel.text}
+          {/if}
+        </div>
+        <div class="session-meta">
+          {#if !hideProject}
+            <span class="session-project">{session.project}</span>
+          {/if}
+          <span class="session-time">{timeStr}</span>
+          <span class="session-count">{session.user_message_count}</span>
+          {#if hasSubagents}
+            <UserRoundIcon class="group-hint-icon" size="9" strokeWidth="2" aria-hidden="true" />
+          {/if}
+          {#if hasTeammates}
+            <UsersRoundIcon class="group-hint-icon" size="11" strokeWidth="2" aria-hidden="true" />
+          {/if}
+          {#if childCount > 0 && !onToggleExpand}
+            <span class="continuation-badge">x{continuationCount}</span>
+          {/if}
+        </div>
+      </a>
     {/if}
-    <div class="session-meta">
-      {#if !hideProject}
-        <span class="session-project">{session.project}</span>
-      {/if}
-      <span class="session-time">{timeStr}</span>
-      <span class="session-count">{session.user_message_count}</span>
-      {#if hasSubagents}
-        <UserRoundIcon class="group-hint-icon" size="9" strokeWidth="2" aria-hidden="true" />
-      {/if}
-      {#if hasTeammates}
-        <UsersRoundIcon class="group-hint-icon" size="11" strokeWidth="2" aria-hidden="true" />
-      {/if}
-      {#if childCount > 0 && !onToggleExpand}
-        <span class="continuation-badge">x{continuationCount}</span>
-      {/if}
-    </div>
   </div>
 
   {#if !compact}
@@ -344,8 +398,8 @@
       class="star-btn"
       class:starred={isStarred}
       onclick={handleStar}
-      title={isStarred ? "Unstar session" : "Star session"}
-      aria-label={isStarred ? "Unstar session" : "Star session"}
+      title={isStarred ? m.sidebar_row_unstar_session() : m.sidebar_row_star_session()}
+      aria-label={isStarred ? m.sidebar_row_unstar_session() : m.sidebar_row_star_session()}
     >
       {#if isStarred}
         <StarIcon size="12" fill="currentColor" strokeWidth="0" aria-hidden="true" />
@@ -375,10 +429,19 @@
     style="left: {contextMenu.x}px; top: {contextMenu.y}px;"
   >
     <button class="context-menu-item" onclick={startRename}>
-      Rename
+      {m.sidebar_row_rename()}
+    </button>
+    <button
+      class="context-menu-item"
+      onclick={() => {
+        window.open(sessionHref, "_blank", "noopener");
+        closeContextMenu();
+      }}
+    >
+      {m.sidebar_row_open_in_new_tab()}
     </button>
     <button class="context-menu-item danger" onclick={handleDelete}>
-      Delete
+      {m.sidebar_row_delete()}
     </button>
   </div>
 {/if}
@@ -393,7 +456,7 @@
     padding: 0 10px;
     padding-right: 10px;
     text-align: left;
-    transition: background 0.1s;
+    transition: background 0.1s, box-shadow 0.1s;
     user-select: none;
     -webkit-user-select: none;
     cursor: pointer;
@@ -415,7 +478,28 @@
   }
 
   .session-item.active {
-    background: var(--bg-surface-hover);
+    background: color-mix(in srgb, var(--accent-blue) 11%, var(--bg-surface-hover));
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-blue) 28%, transparent);
+  }
+
+  .session-item.active::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 5px;
+    bottom: 5px;
+    width: 3px;
+    border-radius: 0 2px 2px 0;
+    background: var(--accent-blue);
+  }
+
+  .session-item.active .session-name {
+    color: var(--text-primary);
+    font-weight: 600;
+  }
+
+  .session-item.active .session-meta {
+    color: var(--text-secondary);
   }
 
   /* Orphaned teammate at root level — dim it slightly */
@@ -423,7 +507,7 @@
     opacity: 0.6;
   }
 
-  /* Tree toggle (▶/▼) */
+  /* Tree toggle */
   .tree-toggle {
     all: unset;
     display: flex;
@@ -495,6 +579,13 @@
   .session-info {
     min-width: 0;
     flex: 1;
+  }
+
+  .session-info-link {
+    display: block;
+    color: inherit;
+    text-decoration: none;
+    min-width: 0;
   }
 
   .session-name {

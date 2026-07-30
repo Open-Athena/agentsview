@@ -146,19 +146,7 @@ func (s *Store) HasFTS() bool { return true }
 // escapeLike escapes SQL LIKE metacharacters so the bind
 // parameter is treated as a literal substring.
 func escapeLike(v string) string {
-	r := strings.NewReplacer(
-		`\`, `\\`, `%`, `\%`, `_`, `\_`,
-	)
-	return r.Replace(v)
-}
-
-// stripFTSQuotes removes surrounding double quotes that
-// prepareFTSQuery adds for SQLite FTS phrase matching.
-func stripFTSQuotes(v string) string {
-	if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
-		return v[1 : len(v)-1]
-	}
-	return v
+	return db.EscapeLikePattern(v)
 }
 
 // Search performs ILIKE-based full-text search across messages,
@@ -171,10 +159,21 @@ func (s *Store) Search(
 		f.Limit = db.DefaultSearchLimit
 	}
 
-	searchTerm := stripFTSQuotes(f.Query)
-	if searchTerm == "" {
+	// plainTerm is the de-quoted query joined back into one string. It feeds
+	// the name-branch ILIKE (matching the typed text against the short session
+	// name) and centers the message snippet, mirroring SQLite's plainQuery.
+	// terms is the per-term decomposition: every term must appear in the
+	// message content (AND), matching SQLite FTS5's implicit AND so the same
+	// user query behaves identically across backends. An explicit exact phrase
+	// (user-supplied leading quote) collapses to a single term, preserving the
+	// exact-phrase opt-in.
+	plainTerm := db.StripFTSQuotes(f.Query)
+	terms := db.FTSTerms(f.Query)
+	if plainTerm == "" || len(terms) == 0 {
 		return db.SearchPage{}, nil
 	}
+	// firstTerm anchors POSITION-based ordering and snippet centering.
+	firstTerm := terms[0]
 
 	// Validate Sort before interpolating into ORDER BY.
 	// session_id ASC is a deterministic tie-breaker for both modes,
@@ -194,10 +193,22 @@ func (s *Store) Search(
 		outerOrderBy = "session_ended_at DESC NULLS LAST, session_id ASC"
 	}
 
-	// $1 = escaped ILIKE pattern (for WHERE clause)
-	// $2 = raw search term (for POSITION — case folded in expression)
-	args := []any{escapeLike(searchTerm), searchTerm}
+	// $1 = escaped ILIKE pattern for the name branch (full plain term)
+	// $2 = raw first term (for POSITION — case folded in expression)
+	args := []any{escapeLike(plainTerm), firstTerm}
 	argIdx := 3
+
+	// Message branch matches every term (AND). Each term gets its own escaped
+	// ILIKE placeholder so a multi-word query requires all terms to be present
+	// without demanding they be contiguous, exactly like SQLite FTS5.
+	termClauses := make([]string, len(terms))
+	for i, t := range terms {
+		termClauses[i] = fmt.Sprintf(
+			"m.content ILIKE '%%' || $%d || '%%' ESCAPE E'\\\\'", argIdx)
+		args = append(args, escapeLike(t))
+		argIdx++
+	}
+	msgTermPredicate := strings.Join(termClauses, "\n\t\t\t\t\tAND ")
 
 	msgProjectClause := ""
 	nameProjectClause := ""
@@ -214,7 +225,7 @@ func (s *Store) Search(
 				m.session_id,
 				s.project,
 				s.agent,
-				COALESCE(s.display_name, s.first_message, '') AS name,
+				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
 				COALESCE(s.ended_at, s.started_at) AS session_ended_at,
 				m.ordinal,
 				POSITION(LOWER($2) IN LOWER(m.content)) AS match_pos,
@@ -230,7 +241,7 @@ func (s *Store) Search(
 				END AS snippet
 			FROM messages m
 			JOIN sessions s ON m.session_id = s.id
-			WHERE m.content ILIKE '%%' || $1 || '%%' ESCAPE E'\\'
+			WHERE %s
 				AND s.deleted_at IS NULL
 				AND m.is_system = FALSE
 				AND `+db.SystemPrefixSQL("m.content", "m.role")+`
@@ -244,19 +255,19 @@ func (s *Store) Search(
 				s.id AS session_id,
 				s.project,
 				s.agent,
-				COALESCE(s.display_name, s.first_message, '') AS name,
+				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
 				COALESCE(s.ended_at, s.started_at) AS session_ended_at,
 				-1 AS ordinal,
 				0 AS match_pos,
 				CASE
-					WHEN s.display_name ILIKE '%%' || $1 || '%%' ESCAPE E'\\'
-						THEN COALESCE(s.display_name, '')
+					WHEN COALESCE(s.display_name, s.session_name) ILIKE '%%' || $1 || '%%' ESCAPE E'\\'
+						THEN COALESCE(s.display_name, s.session_name, '')
 					WHEN s.first_message ILIKE '%%' || $1 || '%%' ESCAPE E'\\'
 						THEN COALESCE(s.first_message, '')
-					ELSE COALESCE(s.display_name, s.first_message, '')
+					ELSE COALESCE(s.display_name, s.session_name, s.first_message, '')
 				END AS snippet
 			FROM sessions s
-			WHERE (s.display_name ILIKE '%%' || $1 || '%%' ESCAPE E'\\'
+			WHERE (COALESCE(s.display_name, s.session_name) ILIKE '%%' || $1 || '%%' ESCAPE E'\\'
 				OR s.first_message ILIKE '%%' || $1 || '%%' ESCAPE E'\\')
 				AND s.deleted_at IS NULL
 				AND EXISTS (
@@ -281,6 +292,7 @@ func (s *Store) Search(
 		) combined
 		ORDER BY %s
 		LIMIT $%d OFFSET $%d`,
+		msgTermPredicate,
 		msgProjectClause,
 		nameProjectClause,
 		outerOrderBy,

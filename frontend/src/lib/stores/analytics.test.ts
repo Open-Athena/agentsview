@@ -5,9 +5,10 @@ import {
   vi,
   beforeEach,
   afterEach,
-} from "vitest";
+} from "vite-plus/test";
 import { analytics } from "./analytics.svelte.js";
 import { AnalyticsService } from "../api/generated/index";
+import { callGenerated } from "../api/runtime.js";
 import type {
   AnalyticsSummary,
   ActivityResponse,
@@ -17,12 +18,14 @@ import type {
   SessionShapeResponse,
   VelocityResponse,
   ToolsAnalyticsResponse,
+  SkillsAnalyticsResponse,
   TopSessionsResponse,
 } from "../api/types.js";
 
 vi.mock("../api/runtime.js", () => ({
   configureGeneratedClient: vi.fn(),
   callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
+  isAbortError: vi.fn(() => false),
 }));
 
 vi.mock("../api/generated/index", () => ({
@@ -35,6 +38,7 @@ vi.mock("../api/generated/index", () => ({
     getApiV1AnalyticsSessions: vi.fn(),
     getApiV1AnalyticsVelocity: vi.fn(),
     getApiV1AnalyticsTools: vi.fn(),
+    getApiV1AnalyticsSkills: vi.fn(),
     getApiV1AnalyticsTopSessions: vi.fn(),
     getApiV1AnalyticsSignals: vi.fn(),
   },
@@ -51,6 +55,7 @@ const analyticsService = AnalyticsService as unknown as {
   getApiV1AnalyticsSessions: MockFn;
   getApiV1AnalyticsVelocity: MockFn;
   getApiV1AnalyticsTools: MockFn;
+  getApiV1AnalyticsSkills: MockFn;
   getApiV1AnalyticsTopSessions: MockFn;
   getApiV1AnalyticsSignals: MockFn;
 };
@@ -125,6 +130,15 @@ function makeTools(): ToolsAnalyticsResponse {
   };
 }
 
+function makeSkills(): SkillsAnalyticsResponse {
+  return {
+    total_skill_calls: 0,
+    distinct_skills: 0,
+    by_skill: [],
+    trend: [],
+  };
+}
+
 function makeTopSessions(): TopSessionsResponse {
   return { metric: "messages", sessions: [] };
 }
@@ -154,6 +168,9 @@ function mockAllAPIs() {
   vi.mocked(analyticsService.getApiV1AnalyticsTools).mockResolvedValue(
     makeTools(),
   );
+  vi.mocked(analyticsService.getApiV1AnalyticsSkills).mockResolvedValue(
+    makeSkills(),
+  );
   vi.mocked(analyticsService.getApiV1AnalyticsTopSessions).mockResolvedValue(
     makeTopSessions(),
   );
@@ -180,9 +197,33 @@ function mockAllAPIs() {
       avg_context_pressure: null,
       high_pressure_sessions: 0,
     },
+    quality_health: {
+      computed_sessions: 0,
+      totals: {
+        short_prompt_count: 0,
+        unstructured_start: 0,
+        missing_success_criteria_count: 0,
+        missing_verification_count: 0,
+        duplicate_prompt_count: 0,
+        no_code_context_count: 0,
+        runaway_tool_loop_count: 0,
+        frustration_marker_count: 0,
+      },
+      sessions_with_signal: {
+        short_prompt_count: 0,
+        unstructured_start: 0,
+        missing_success_criteria_count: 0,
+        missing_verification_count: 0,
+        duplicate_prompt_count: 0,
+        no_code_context_count: 0,
+        runaway_tool_loop_count: 0,
+        frustration_marker_count: 0,
+      },
+    },
     trend: [],
     by_agent: [],
     by_project: [],
+    calibration: {},
   });
 }
 
@@ -195,8 +236,13 @@ async function loadAnalyticsStore() {
 
 function resetStore() {
   analytics.selectedDate = null;
+  analytics.selectedDow = null;
+  analytics.selectedHour = null;
   analytics.project = "";
   analytics.machine = "";
+  analytics.agent = "";
+  analytics.includeAutomated = false;
+  analytics.automatedScope = "human";
   analytics.from = "2024-01-01";
   analytics.to = "2024-01-31";
   analytics.isPinned = false;
@@ -214,8 +260,24 @@ function resetStore() {
   analytics.sessionShape = null;
   analytics.velocity = null;
   analytics.tools = null;
+  analytics.skills = null;
   analytics.topSessions = null;
   analytics.signals = null;
+  analytics.lastUpdatedAt = null;
+  analytics.hasNewData = false;
+  analytics.querying = {
+    summary: false,
+    activity: false,
+    heatmap: false,
+    projects: false,
+    hourOfWeek: false,
+    sessionShape: false,
+    velocity: false,
+    tools: false,
+    skills: false,
+    topSessions: false,
+    signals: false,
+  };
 }
 
 // Note: selectDate and setDateRange invoke API mocks
@@ -255,6 +317,7 @@ describe("AnalyticsStore.selectDate", () => {
     expect(analyticsService.getApiV1AnalyticsSessions).toHaveBeenCalledTimes(1);
     expect(analyticsService.getApiV1AnalyticsVelocity).toHaveBeenCalledTimes(1);
     expect(analyticsService.getApiV1AnalyticsTools).toHaveBeenCalledTimes(1);
+    expect(analyticsService.getApiV1AnalyticsSkills).toHaveBeenCalledTimes(1);
     expect(analyticsService.getApiV1AnalyticsActivity).not.toHaveBeenCalled();
     expect(analyticsService.getApiV1AnalyticsHeatmap).not.toHaveBeenCalled();
     expect(analyticsService.getApiV1AnalyticsHourOfWeek).not.toHaveBeenCalled();
@@ -307,6 +370,7 @@ describe("AnalyticsStore.setDateRange", () => {
     expect(analyticsService.getApiV1AnalyticsSessions).toHaveBeenCalledTimes(1);
     expect(analyticsService.getApiV1AnalyticsVelocity).toHaveBeenCalledTimes(1);
     expect(analyticsService.getApiV1AnalyticsTools).toHaveBeenCalledTimes(1);
+    expect(analyticsService.getApiV1AnalyticsSkills).toHaveBeenCalledTimes(1);
 
     const expected = expect.objectContaining({
       from: "2024-02-01", to: "2024-02-28",
@@ -319,6 +383,58 @@ describe("AnalyticsStore.setDateRange", () => {
     expect(analyticsService.getApiV1AnalyticsSessions).toHaveBeenLastCalledWith(expected);
     expect(analyticsService.getApiV1AnalyticsVelocity).toHaveBeenLastCalledWith(expected);
     expect(analyticsService.getApiV1AnalyticsTools).toHaveBeenLastCalledWith(expected);
+    expect(analyticsService.getApiV1AnalyticsSkills).toHaveBeenLastCalledWith(expected);
+  });
+});
+
+describe("AnalyticsStore freshness state", () => {
+  it("records full refresh time and clears new-data hints", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-06-15T15:00:00Z"));
+
+      await analytics.fetchAll();
+
+      expect(analytics.lastUpdatedAt).toBe(
+        new Date("2026-06-15T15:00:00Z").getTime(),
+      );
+
+      analytics.markNewData();
+      expect(analytics.hasNewData).toBe(true);
+
+      vi.setSystemTime(new Date("2026-06-15T15:05:00Z"));
+      await analytics.fetchAll();
+
+      expect(analytics.lastUpdatedAt).toBe(
+        new Date("2026-06-15T15:05:00Z").getTime(),
+      );
+      expect(analytics.hasNewData).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not mark cached partial refresh failures as current", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      vi.setSystemTime(new Date("2026-06-15T15:00:00Z"));
+      await analytics.fetchAll();
+      const previousUpdatedAt = analytics.lastUpdatedAt;
+
+      analytics.markNewData();
+      vi.mocked(analyticsService.getApiV1AnalyticsVelocity)
+        .mockRejectedValueOnce(new Error("velocity failed"));
+
+      vi.setSystemTime(new Date("2026-06-15T15:05:00Z"));
+      await analytics.fetchAll();
+
+      expect(analytics.lastUpdatedAt).toBe(previousUpdatedAt);
+      expect(analytics.hasNewData).toBe(true);
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -379,6 +495,7 @@ describe("AnalyticsStore.clearDate", () => {
     expect(analyticsService.getApiV1AnalyticsSessions).toHaveBeenCalledTimes(1);
     expect(analyticsService.getApiV1AnalyticsVelocity).toHaveBeenCalledTimes(1);
     expect(analyticsService.getApiV1AnalyticsTools).toHaveBeenCalledTimes(1);
+    expect(analyticsService.getApiV1AnalyticsSkills).toHaveBeenCalledTimes(1);
     expect(analyticsService.getApiV1AnalyticsTopSessions).toHaveBeenCalledTimes(1);
     expect(analyticsService.getApiV1AnalyticsActivity).not.toHaveBeenCalled();
     expect(analyticsService.getApiV1AnalyticsHeatmap).not.toHaveBeenCalled();
@@ -422,6 +539,7 @@ describe("AnalyticsStore.setProject", () => {
     { name: "sessionShape", fn: () => analyticsService.getApiV1AnalyticsSessions },
     { name: "velocity", fn: () => analyticsService.getApiV1AnalyticsVelocity },
     { name: "tools", fn: () => analyticsService.getApiV1AnalyticsTools },
+    { name: "skills", fn: () => analyticsService.getApiV1AnalyticsSkills },
     { name: "topSessions", fn: () => analyticsService.getApiV1AnalyticsTopSessions },
   ])(
     "should include project in $name params",
@@ -470,6 +588,7 @@ describe("AnalyticsStore.setProject", () => {
     { name: "sessionShape", fn: () => analyticsService.getApiV1AnalyticsSessions },
     { name: "velocity", fn: () => analyticsService.getApiV1AnalyticsVelocity },
     { name: "tools", fn: () => analyticsService.getApiV1AnalyticsTools },
+    { name: "skills", fn: () => analyticsService.getApiV1AnalyticsSkills },
     { name: "topSessions", fn: () => analyticsService.getApiV1AnalyticsTopSessions },
     { name: "heatmap", fn: () => analyticsService.getApiV1AnalyticsHeatmap },
     { name: "hourOfWeek", fn: () => analyticsService.getApiV1AnalyticsHourOfWeek },
@@ -499,6 +618,7 @@ describe("AnalyticsStore machine filter", () => {
     { name: "sessionShape", fn: () => analyticsService.getApiV1AnalyticsSessions },
     { name: "velocity", fn: () => analyticsService.getApiV1AnalyticsVelocity },
     { name: "tools", fn: () => analyticsService.getApiV1AnalyticsTools },
+    { name: "skills", fn: () => analyticsService.getApiV1AnalyticsSkills },
     { name: "topSessions", fn: () => analyticsService.getApiV1AnalyticsTopSessions },
     { name: "signals", fn: () => analyticsService.getApiV1AnalyticsSignals },
   ])("should include machine in $name params", ({ fn }) => {
@@ -510,6 +630,28 @@ describe("AnalyticsStore machine filter", () => {
     expect(mock).toHaveBeenCalled();
     const params = mock.mock.lastCall?.[0];
     expect(params?.machine).toBe("host-a,host-b");
+  });
+});
+
+describe("AnalyticsStore automated scope params", () => {
+  it("derives all scope from legacy includeAutomated updates", () => {
+    analytics.includeAutomated = true;
+
+    analytics.fetchSummary();
+
+    expect(analyticsService.getApiV1AnalyticsSummary).toHaveBeenLastCalledWith(
+      expect.objectContaining({ automatedScope: "all" }),
+    );
+  });
+
+  it("keeps automated-only scope when selected explicitly", () => {
+    analytics.setAutomatedScope("automated");
+
+    analytics.fetchSummary();
+
+    expect(analyticsService.getApiV1AnalyticsSummary).toHaveBeenLastCalledWith(
+      expect.objectContaining({ automatedScope: "automated" }),
+    );
   });
 });
 
@@ -526,6 +668,26 @@ describe("executeFetch concurrency and error handling", () => {
     resolve(makeSummary());
     await p;
     expect(analytics.loading.summary).toBe(false);
+  });
+
+  it("should expose query progress during cached refetches", async () => {
+    analytics.summary = makeSummary();
+    let resolve!: (v: AnalyticsSummary) => void;
+    vi.mocked(analyticsService.getApiV1AnalyticsSummary).mockReturnValue(
+      new Promise((r) => { resolve = r; }),
+    );
+
+    const p = analytics.fetchSummary();
+
+    expect(analytics.loading.summary).toBe(false);
+    expect(analytics.querying.summary).toBe(true);
+    expect(analytics.isQuerying).toBe(true);
+
+    resolve(makeSummary());
+    await p;
+
+    expect(analytics.querying.summary).toBe(false);
+    expect(analytics.isQuerying).toBe(false);
   });
 
   it("should clear error on new request", async () => {
@@ -638,6 +800,27 @@ describe("executeFetch concurrency and error handling", () => {
     await secondFetch;
     expect(analytics.loading.summary).toBe(false);
   });
+
+  it("aborts stale panel requests when a newer fetch starts", async () => {
+    const signals: (AbortSignal | undefined)[] = [];
+    vi.mocked(callGenerated).mockImplementation(
+      (request: () => Promise<unknown>, signal?: AbortSignal) => {
+        signals.push(signal);
+        return request();
+      },
+    );
+    vi.mocked(analyticsService.getApiV1AnalyticsSummary)
+      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockResolvedValueOnce(makeSummary());
+
+    void analytics.fetchSummary();
+    await Promise.resolve();
+    void analytics.fetchSummary();
+    await Promise.resolve();
+
+    expect(signals[0]).toBeDefined();
+    expect(signals[0]?.aborted).toBe(true);
+  });
 });
 
 describe("AnalyticsStore rolling default date range", () => {
@@ -722,5 +905,51 @@ describe("AnalyticsStore rolling default date range", () => {
     expect(analytics.selectedDate).toBeNull();
     expect(analytics.selectedDow).toBeNull();
     expect(analytics.selectedHour).toBeNull();
+  });
+
+  it("fetchSignalsForInsights clears hidden drill-down filters", async () => {
+    const { analytics } = await loadAnalyticsStore();
+    analytics.from = "2026-04-01";
+    analytics.to = "2026-04-30";
+    analytics.isPinned = true;
+    analytics.selectedDate = "2026-04-12";
+    analytics.selectedDow = 2;
+    analytics.selectedHour = 16;
+
+    await analytics.fetchSignalsForInsights();
+
+    expect(analytics.selectedDate).toBeNull();
+    expect(analytics.selectedDow).toBeNull();
+    expect(analytics.selectedHour).toBeNull();
+    expect(analyticsService.getApiV1AnalyticsSignals).toHaveBeenCalledWith(
+      expect.objectContaining({
+        from: "2026-04-01",
+        to: "2026-04-30",
+      }),
+    );
+    expect(analyticsService.getApiV1AnalyticsSignals).toHaveBeenCalledWith(
+      expect.not.objectContaining({
+        dow: expect.anything(),
+        hour: expect.anything(),
+      }),
+    );
+  });
+
+  it("fetchSignalsForInsights re-derives rolling dates before fetching", async () => {
+    const { analytics } = await loadAnalyticsStore();
+    analytics.setRollingWindow(7);
+    vi.clearAllMocks();
+
+    vi.setSystemTime(new Date("2026-04-26T12:00:00"));
+    await analytics.fetchSignalsForInsights();
+
+    expect(analytics.from).toBe("2026-04-19");
+    expect(analytics.to).toBe("2026-04-26");
+    expect(analyticsService.getApiV1AnalyticsSignals).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        from: "2026-04-19",
+        to: "2026-04-26",
+      }),
+    );
   });
 });

@@ -4,7 +4,7 @@ import {
   expect,
   vi,
   beforeEach,
-} from "vitest";
+} from "vite-plus/test";
 import { tick } from "svelte";
 import {
   SIDEBAR_WIDTH_DEFAULT,
@@ -638,6 +638,9 @@ describe("UIStore", () => {
 
       ui.cycleLayout();
       expect(ui.messageLayout).toBe("stream");
+
+      ui.cycleLayout();
+      expect(ui.messageLayout).toBe("skim");
 
       ui.cycleLayout();
       expect(ui.messageLayout).toBe("default");

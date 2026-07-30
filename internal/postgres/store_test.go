@@ -224,17 +224,17 @@ func insertSidebarIndexSession(
 			id, machine, project, agent, first_message,
 			display_name, started_at, ended_at, message_count,
 			user_message_count, parent_session_id,
-			relationship_type, is_automated
+			relationship_type, is_automated, deleted_at
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7::timestamptz, $8::timestamptz, $9,
-			$10, $11, $12, $13
+			$10, $11, $12, $13, $14::timestamptz
 		)
 	`, row.id, row.machine, row.project, row.agent,
 		row.firstMessage, row.displayName, row.startedAt,
 		row.endedAt, row.messageCount, row.userMessageCount,
 		row.parentSessionID, row.relationshipType,
-		row.isAutomated)
+		row.isAutomated, row.deletedAt)
 	require.NoError(t, err, "inserting sidebar index session %s", id)
 }
 
@@ -252,6 +252,7 @@ type sidebarIndexSessionSeed struct {
 	parentSessionID  *string
 	relationshipType string
 	isAutomated      bool
+	deletedAt        *string
 }
 
 func sidebarIndexRowsByID(
@@ -276,6 +277,16 @@ func requireSidebarIndexIDs(
 		_, ok := rows[id]
 		require.True(t, ok, "session %q missing from rows=%v", id, rows)
 	}
+}
+
+func sidebarIndexIDs(
+	sessions []db.SidebarSessionIndexRow,
+) []string {
+	ids := make([]string, 0, len(sessions))
+	for _, s := range sessions {
+		ids = append(ids, s.ID)
+	}
+	return ids
 }
 
 func TestStoreGetSidebarSessionIndexComputesIsTeammate(
@@ -438,6 +449,224 @@ func TestStoreGetSidebarSessionIndexIncludesChildrenForMatchingRoot(
 	require.NoError(t, err, "GetSidebarSessionIndex")
 	requireSidebarIndexIDs(
 		t, index.Sessions, []string{"root", "sub", "fork"},
+	)
+}
+
+func TestStoreGetSidebarSessionIndexPaginatesContinuationsAsDescendants(
+	t *testing.T,
+) {
+	pgURL := testPGURL(t)
+	store := ensureSidebarIndexStoreSchema(t, pgURL)
+	defer store.Close()
+
+	rootEnd := "2024-01-01T00:00:00Z"
+	continuationEnd := "2024-01-10T00:00:00Z"
+	otherEnd := "2024-01-05T00:00:00Z"
+	rootID := "root"
+	insertSidebarIndexSession(t, store, rootID, func(
+		s *sidebarIndexSessionSeed,
+	) {
+		s.endedAt = rootEnd
+	})
+	insertSidebarIndexSession(t, store, "continuation", func(
+		s *sidebarIndexSessionSeed,
+	) {
+		s.parentSessionID = &rootID
+		s.relationshipType = "continuation"
+		s.endedAt = continuationEnd
+	})
+	insertSidebarIndexSession(t, store, "other", func(
+		s *sidebarIndexSessionSeed,
+	) {
+		s.endedAt = otherEnd
+	})
+
+	ctx := context.Background()
+	first, err := store.GetSidebarSessionIndex(
+		ctx, db.SessionFilter{Limit: 1},
+	)
+	require.NoError(t, err, "first page")
+	assert.Equal(t, 2, first.Total)
+	assert.NotEmpty(t, first.NextCursor)
+	assert.ElementsMatch(t,
+		[]string{"root", "continuation"},
+		sidebarIndexIDs(first.Sessions),
+	)
+
+	second, err := store.GetSidebarSessionIndex(
+		ctx, db.SessionFilter{Limit: 1, Cursor: first.NextCursor},
+	)
+	require.NoError(t, err, "second page")
+	assert.Equal(t, 2, second.Total)
+	assert.Empty(t, second.NextCursor)
+	assert.Equal(t, []string{"other"}, sidebarIndexIDs(second.Sessions))
+}
+
+func TestStoreGetSidebarSessionIndexPaginatesByDescendantFreshness(
+	t *testing.T,
+) {
+	pgURL := testPGURL(t)
+	store := ensureSidebarIndexStoreSchema(t, pgURL)
+	defer store.Close()
+
+	rootEnd := "2024-01-01T00:00:00Z"
+	childEnd := "2024-01-10T00:00:00Z"
+	otherEnd := "2024-01-05T00:00:00Z"
+	rootID := "root"
+	insertSidebarIndexSession(t, store, rootID, func(
+		s *sidebarIndexSessionSeed,
+	) {
+		s.endedAt = rootEnd
+	})
+	insertSidebarIndexSession(t, store, "child", func(
+		s *sidebarIndexSessionSeed,
+	) {
+		s.parentSessionID = &rootID
+		s.relationshipType = "subagent"
+		s.endedAt = childEnd
+	})
+	insertSidebarIndexSession(t, store, "other", func(
+		s *sidebarIndexSessionSeed,
+	) {
+		s.endedAt = otherEnd
+	})
+
+	ctx := context.Background()
+	first, err := store.GetSidebarSessionIndex(
+		ctx, db.SessionFilter{Limit: 1},
+	)
+	require.NoError(t, err, "first page")
+	assert.Equal(t, 2, first.Total)
+	assert.NotEmpty(t, first.NextCursor)
+	assert.ElementsMatch(t,
+		[]string{"root", "child"},
+		sidebarIndexIDs(first.Sessions),
+	)
+
+	second, err := store.GetSidebarSessionIndex(
+		ctx, db.SessionFilter{Limit: 1, Cursor: first.NextCursor},
+	)
+	require.NoError(t, err, "second page")
+	assert.Equal(t, 2, second.Total)
+	assert.Empty(t, second.NextCursor)
+	assert.Equal(t, []string{"other"}, sidebarIndexIDs(second.Sessions))
+}
+
+func TestStoreGetSidebarSessionIndexStarredIncludesStarredDescendantRoot(
+	t *testing.T,
+) {
+	pgURL := testPGURL(t)
+	store := ensureSidebarIndexStoreSchema(t, pgURL)
+	defer store.Close()
+
+	insertSidebarIndexSession(t, store, "unstarred-newer", func(
+		s *sidebarIndexSessionSeed,
+	) {
+		s.endedAt = "2024-01-20T00:00:00Z"
+	})
+	rootID := "root"
+	insertSidebarIndexSession(t, store, rootID, func(
+		s *sidebarIndexSessionSeed,
+	) {
+		s.endedAt = "2024-01-01T00:00:00Z"
+	})
+	insertSidebarIndexSession(t, store, "starred-child", func(
+		s *sidebarIndexSessionSeed,
+	) {
+		s.parentSessionID = &rootID
+		s.relationshipType = "subagent"
+		s.endedAt = "2024-01-10T00:00:00Z"
+	})
+	ok, err := store.StarSession("starred-child")
+	require.NoError(t, err, "StarSession")
+	require.True(t, ok, "starred-child should exist")
+
+	index, err := store.GetSidebarSessionIndex(
+		context.Background(), db.SessionFilter{
+			Starred: true,
+			Limit:   1,
+		},
+	)
+	require.NoError(t, err, "GetSidebarSessionIndex")
+	assert.Empty(t, index.NextCursor)
+	assert.Equal(t, 1, index.Total)
+	assert.ElementsMatch(t,
+		[]string{"root", "starred-child"},
+		sidebarIndexIDs(index.Sessions),
+	)
+}
+
+func TestStoreGetSidebarSessionIndexPaginatesOrphanRoots(t *testing.T) {
+	pgURL := testPGURL(t)
+	store := ensureSidebarIndexStoreSchema(t, pgURL)
+	defer store.Close()
+
+	insertSidebarIndexSession(t, store, "root", func(s *sidebarIndexSessionSeed) {
+		s.endedAt = "2024-01-20T00:00:00Z"
+		s.userMessageCount = 2
+	})
+	insertSidebarIndexSession(t, store, "orphan-sub", func(s *sidebarIndexSessionSeed) {
+		s.endedAt = "2024-01-19T00:00:00Z"
+		s.parentSessionID = strPtr("missing-parent")
+		s.relationshipType = "subagent"
+	})
+	insertSidebarIndexSession(t, store, "orphan-fork", func(s *sidebarIndexSessionSeed) {
+		s.endedAt = "2024-01-18T00:00:00Z"
+		s.parentSessionID = strPtr("orphan-sub")
+		s.relationshipType = "fork"
+	})
+	insertSidebarIndexSession(t, store, "continuation-orphan", func(s *sidebarIndexSessionSeed) {
+		s.endedAt = "2024-01-17T00:00:00Z"
+		s.parentSessionID = strPtr("missing-continuation-parent")
+		s.relationshipType = "continuation"
+	})
+
+	first, err := store.GetSidebarSessionIndex(
+		context.Background(), db.SessionFilter{Limit: 2},
+	)
+	require.NoError(t, err, "first page")
+	assert.Equal(t, 3, first.Total)
+	assert.NotEmpty(t, first.NextCursor)
+	assert.ElementsMatch(t,
+		[]string{"root", "orphan-sub", "orphan-fork"},
+		sidebarIndexIDs(first.Sessions),
+	)
+
+	second, err := store.GetSidebarSessionIndex(
+		context.Background(), db.SessionFilter{Limit: 2, Cursor: first.NextCursor},
+	)
+	require.NoError(t, err, "second page")
+	assert.Equal(t, 3, second.Total)
+	assert.Empty(t, second.NextCursor)
+	assert.Equal(t, []string{"continuation-orphan"}, sidebarIndexIDs(second.Sessions))
+}
+
+func TestStoreGetSidebarSessionIndexDoesNotPromoteSoftDeletedParentChildren(t *testing.T) {
+	pgURL := testPGURL(t)
+	store := ensureSidebarIndexStoreSchema(t, pgURL)
+	defer store.Close()
+
+	rootID := "soft-deleted-root"
+	insertSidebarIndexSession(t, store, rootID, func(s *sidebarIndexSessionSeed) {
+		s.endedAt = "2024-01-20T00:00:00Z"
+		s.deletedAt = strPtr("2024-01-21T00:00:00Z")
+	})
+	insertSidebarIndexSession(t, store, "child-of-deleted-parent", func(s *sidebarIndexSessionSeed) {
+		s.endedAt = "2024-01-19T00:00:00Z"
+		s.parentSessionID = &rootID
+		s.relationshipType = "subagent"
+	})
+	insertSidebarIndexSession(t, store, "other", func(s *sidebarIndexSessionSeed) {
+		s.endedAt = "2024-01-18T00:00:00Z"
+	})
+
+	index, err := store.GetSidebarSessionIndex(
+		context.Background(), db.SessionFilter{Limit: 10},
+	)
+	require.NoError(t, err, "GetSidebarSessionIndex")
+	assert.ElementsMatch(t,
+		[]string{"other"},
+		sidebarIndexIDs(index.Sessions),
 	)
 }
 
@@ -863,6 +1092,64 @@ func TestStoreAnalyticsTopSessionsOutputTokens(
 		assert.NotEqual(t, "pg-token-missing", session.ID,
 			"session without token coverage was included: %+v", session)
 	}
+}
+
+func TestStoreAnalyticsTopSessionsDisplayName(t *testing.T) {
+	pgURL := testPGURL(t)
+	ensureStoreSchema(t, pgURL)
+
+	store, err := NewStore(pgURL, testSchema, true)
+	require.NoError(t, err, "NewStore")
+	defer store.Close()
+
+	_, err = store.DB().Exec(`
+		INSERT INTO sessions (
+			id, machine, project, agent, first_message,
+			display_name, session_name,
+			started_at, ended_at, message_count,
+			user_message_count
+		) VALUES
+			('pg-session-name', 'test-machine', 'test-project',
+			 'claude', 'raw first user message', NULL,
+			 'Agent generated title',
+			 '2026-03-12T11:00:00Z'::timestamptz,
+			 '2026-03-12T11:30:00Z'::timestamptz,
+			 10, 2),
+			('pg-custom-name', 'test-machine', 'test-project',
+			 'claude', 'raw first user message',
+			 'User renamed title', 'Generated title hidden by rename',
+			 '2026-03-12T12:00:00Z'::timestamptz,
+			 '2026-03-12T12:30:00Z'::timestamptz,
+			 9, 2)
+	`)
+	require.NoError(t, err, "inserting top session names")
+
+	top, err := store.GetAnalyticsTopSessions(
+		context.Background(),
+		db.AnalyticsFilter{
+			From: "2026-03-12",
+			To:   "2026-03-12",
+		},
+		"messages",
+	)
+	require.NoError(t, err, "GetAnalyticsTopSessions")
+
+	byID := map[string]db.TopSession{}
+	for _, session := range top.Sessions {
+		byID[session.ID] = session
+	}
+
+	named, ok := byID["pg-session-name"]
+	require.True(t, ok, "pg-session-name missing from top sessions")
+	require.NotNil(t, named.DisplayName,
+		"session_name should be exposed as display_name")
+	assert.Equal(t, "Agent generated title", *named.DisplayName)
+
+	custom, ok := byID["pg-custom-name"]
+	require.True(t, ok, "pg-custom-name missing from top sessions")
+	require.NotNil(t, custom.DisplayName,
+		"custom display_name should be exposed")
+	assert.Equal(t, "User renamed title", *custom.DisplayName)
 }
 
 func TestStoreWriteMethodsReturnReadOnly(t *testing.T) {

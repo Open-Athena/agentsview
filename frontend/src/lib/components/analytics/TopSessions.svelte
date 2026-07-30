@@ -14,6 +14,18 @@
     return text.slice(0, max - 1) + "\u2026";
   }
 
+  function sessionLabel(session: {
+    id: string;
+    first_message: string | null;
+    display_name?: string | null;
+  }): string {
+    return (
+      session.display_name ||
+      normalizeMessagePreview(session.first_message) ||
+      session.id.slice(0, 12)
+    );
+  }
+
   function formatDuration(mins: number): string {
     const total = Math.round(mins);
     if (total < 60) return `${total}m`;
@@ -24,16 +36,32 @@
 
   function handleSessionClick(id: string) {
     let needInvalidate = false;
+    const params: Record<string, string> = {};
+    const clearParams: string[] = [];
     if (analytics.includeOneShot && !sessions.filters.includeOneShot) {
       sessions.filters.includeOneShot = true;
+      clearParams.push("include_one_shot");
       needInvalidate = true;
     }
-    if (analytics.includeAutomated && !sessions.filters.includeAutomated) {
+    if (
+      analytics.automatedScope !== "human" &&
+      !sessions.filters.includeAutomated
+    ) {
       sessions.filters.includeAutomated = true;
+      params.include_automated = "true";
+      clearParams.push("include_automated");
       needInvalidate = true;
     }
     if (needInvalidate) {
       sessions.invalidateFilterCaches();
+    }
+    if (clearParams.length > 0 || Object.keys(params).length > 0) {
+      router.navigateToSession(
+        id,
+        Object.keys(params).length > 0 ? params : undefined,
+        clearParams,
+      );
+      return;
     }
     router.navigateToSession(id);
   }
@@ -104,7 +132,7 @@
   {:else if analytics.topSessions && analytics.topSessions.sessions.length > 0}
     <div class="session-list">
       {#each analytics.topSessions.sessions as session, i}
-        {@const preview = normalizeMessagePreview(session.first_message)}
+        {@const label = sessionLabel(session)}
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
@@ -117,9 +145,7 @@
           </span>
           <div class="session-info">
             <span class="session-label">
-              {preview
-                ? truncate(preview, 50)
-                : session.id.slice(0, 12)}
+              {truncate(label, 50)}
             </span>
             <span class="session-project">{session.project}</span>
           </div>

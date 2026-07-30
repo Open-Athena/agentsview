@@ -1,9 +1,12 @@
 package parser
 
 import (
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -44,8 +47,98 @@ func TestParseCodexSession_Basic(t *testing.T) {
 
 	require.NotNil(t, sess)
 	assert.Equal(t, "codex:abc-123", sess.ID)
+	assert.Equal(t, "/Users/alice/code/my-api", sess.Cwd)
 	assert.Equal(t, 2, len(msgs))
 	assertSessionMeta(t, sess, "codex:abc-123", "my_api", AgentCodex)
+}
+
+func TestParseCodexSession_UsesThreadNameFromSessionIndex(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "sessions", "2026", "06", "11")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+
+	sessionPath := filepath.Join(sessionDir, "rollout-2026-06-11T12-44-06-019eb791-cf7d-75c1-8439-9ed74c1229e1.jsonl")
+	content := loadFixture(t, "codex/standard_session.jsonl")
+	require.NoError(t, os.WriteFile(sessionPath, []byte(content), 0o644))
+
+	indexPath := filepath.Join(root, "session_index.jsonl")
+	index := `{"id":"abc-123","thread_name":"Renamed from Codex","updated_at":"2026-06-11T17:34:20.3755243Z"}` + "\n"
+	require.NoError(t, os.WriteFile(indexPath, []byte(index), 0o644))
+
+	sess, msgs, err := ParseCodexSession(sessionPath, "local", false)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	assert.Equal(t, "Renamed from Codex", sess.SessionName)
+	assert.Equal(t, "Add rate limiting", sess.FirstMessage)
+	assert.Len(t, msgs, 2)
+}
+
+func TestParseCodexSession_LeavesSessionNameEmptyWithoutThreadName(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "sessions", "2026", "06", "11")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+
+	sessionPath := filepath.Join(sessionDir, "rollout-2026-06-11T12-44-06-019eb791-cf7d-75c1-8439-9ed74c1229e1.jsonl")
+	content := loadFixture(t, "codex/standard_session.jsonl")
+	require.NoError(t, os.WriteFile(sessionPath, []byte(content), 0o644))
+
+	indexPath := filepath.Join(root, "session_index.jsonl")
+	index := `{"id":"abc-123","updated_at":"2026-06-11T17:34:20.3755243Z"}` + "\n"
+	require.NoError(t, os.WriteFile(indexPath, []byte(index), 0o644))
+
+	sess, _, err := ParseCodexSession(sessionPath, "local", false)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	assert.Empty(t, sess.SessionName)
+	assert.Equal(t, "Add rate limiting", sess.FirstMessage)
+}
+
+func TestParseCodexSession_UsesThreadNameFromArchivedSessions(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "archived_sessions")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+
+	sessionPath := filepath.Join(sessionDir, "rollout-2026-06-11T12-44-06-019eb791-cf7d-75c1-8439-9ed74c1229e1.jsonl")
+	content := loadFixture(t, "codex/standard_session.jsonl")
+	require.NoError(t, os.WriteFile(sessionPath, []byte(content), 0o644))
+
+	indexPath := filepath.Join(root, "session_index.jsonl")
+	index := `{"id":"abc-123","thread_name":"Archived title","updated_at":"2026-06-11T17:34:20.3755243Z"}` + "\n"
+	require.NoError(t, os.WriteFile(indexPath, []byte(index), 0o644))
+
+	sess, _, err := ParseCodexSession(sessionPath, "local", false)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	assert.Equal(t, "Archived title", sess.SessionName)
+}
+
+func TestParseCodexSession_MtimeIncludesSessionIndex(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "sessions", "2026", "06", "11")
+	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
+
+	sessionPath := filepath.Join(sessionDir, "rollout-2026-06-11T12-44-06-019eb791-cf7d-75c1-8439-9ed74c1229e1.jsonl")
+	content := loadFixture(t, "codex/standard_session.jsonl")
+	require.NoError(t, os.WriteFile(sessionPath, []byte(content), 0o644))
+
+	indexPath := filepath.Join(root, "session_index.jsonl")
+	index := `{"id":"abc-123","thread_name":"Original","updated_at":"2026-06-11T17:34:20Z"}` + "\n"
+	require.NoError(t, os.WriteFile(indexPath, []byte(index), 0o644))
+
+	sess1, _, err := ParseCodexSession(sessionPath, "local", false)
+	require.NoError(t, err)
+	mtime1 := sess1.File.Mtime
+
+	// Simulate a rename by rewriting the index after a delay.
+	future := time.Now().Add(2 * time.Second)
+	renamed := `{"id":"abc-123","thread_name":"Renamed","updated_at":"2026-06-11T18:00:00Z"}` + "\n"
+	require.NoError(t, os.WriteFile(indexPath, []byte(renamed), 0o644))
+	require.NoError(t, os.Chtimes(indexPath, future, future))
+
+	sess2, _, err := ParseCodexSession(sessionPath, "local", false)
+	require.NoError(t, err)
+	assert.Greater(t, sess2.File.Mtime, mtime1, "mtime must advance when session_index.jsonl is updated")
+	assert.Equal(t, "Renamed", sess2.SessionName)
 }
 
 func TestParseCodexSession_PreservesAssistantBlockquotes(t *testing.T) {
@@ -1083,6 +1176,192 @@ func TestParseCodexSession_TokenUsage(t *testing.T) {
 	})
 }
 
+// testUUIDv7 builds a syntactically valid UUIDv7 whose embedded
+// timestamp is the given unix-millisecond value.
+func testUUIDv7(ms int64, seq byte) string {
+	h := fmt.Sprintf("%012x", ms)
+	return fmt.Sprintf(
+		"%s-%s-7000-8000-0000000000%02x", h[:8], h[8:12], seq,
+	)
+}
+
+func TestParseCodexSession_ForkedSessionSkipsReplayedHistory(t *testing.T) {
+	// `codex fork` replays the parent's history — its session_meta,
+	// turns, messages and token_count events — into the top of the new
+	// rollout with re-stamped envelope timestamps, so the same usage
+	// lives in two files and was counted twice (#643). Turn ids are
+	// UUIDv7 values minted when the turn originally ran, which is what
+	// locates the replay/genuine boundary.
+	forkCreatedMs := time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC).UnixMilli() // == tsEarly
+	forkID := testUUIDv7(forkCreatedMs, 1)
+	parentTurnID := testUUIDv7(forkCreatedMs-3600_000, 2) // minted an hour earlier
+	genuineTurnID := testUUIDv7(forkCreatedMs+1000, 3)
+
+	t.Run("replayed history is dropped, genuine turns kept", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexForkedSessionMetaJSON(forkID, "parent-1", "/tmp", "user", tsEarly),
+			// Replayed parent history (all re-stamped at fork creation):
+			testjsonl.CodexSessionMetaJSON("parent-1", "/other-project", "user", tsEarly),
+			testjsonl.CodexTurnContextWithIDJSON("gpt-5.4", parentTurnID, tsEarly),
+			testjsonl.CodexMsgJSON("user", "replayed question", tsEarly),
+			testjsonl.CodexMsgJSON("assistant", "replayed answer", tsEarly),
+			testjsonl.CodexTokenCountJSON(tsEarly, 50_000, 9_000, 0),
+			// A replayed turn from before Codex stamped turn ids:
+			testjsonl.CodexTurnContextJSON("gpt-5.3", tsEarly),
+			testjsonl.CodexMsgJSON("assistant", "older replayed answer", tsEarly),
+			// The fork's own first turn:
+			testjsonl.CodexTurnContextWithIDJSON("gpt-5.5", genuineTurnID, tsEarlyS1),
+			testjsonl.CodexMsgJSON("user", "genuine question", tsEarlyS1),
+			testjsonl.CodexMsgJSON("assistant", "genuine answer", tsEarlyS5),
+			testjsonl.CodexTokenCountJSON(tsEarlyS5, 10_000, 500, 6_000),
+		)
+		sess, msgs := runCodexParserTest(t, "fork.jsonl", content, false)
+		require.NotNil(t, sess)
+
+		// The fork keeps its own identity — the replayed parent
+		// session_meta must not overwrite the id.
+		assert.Equal(t, "codex:"+forkID, sess.ID)
+
+		require.Len(t, msgs, 2)
+		assert.Equal(t, "genuine question", msgs[0].Content)
+		assert.Equal(t, "genuine answer", msgs[1].Content)
+		assert.Equal(t, "gpt-5.5", msgs[1].Model)
+
+		// Usage comes only from the genuine turn: 9,000 replayed
+		// output tokens must not be re-billed to the fork.
+		assert.Equal(t, 500, sess.TotalOutputTokens)
+		assert.Equal(t, 10_000, sess.PeakContextTokens)
+	})
+
+	t.Run("fork with no genuine turns yields no messages", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexForkedSessionMetaJSON(forkID, "parent-1", "/tmp", "user", tsEarly),
+			testjsonl.CodexSessionMetaJSON("parent-1", "/tmp", "user", tsEarly),
+			testjsonl.CodexTurnContextWithIDJSON("gpt-5.4", parentTurnID, tsEarly),
+			testjsonl.CodexMsgJSON("user", "replayed question", tsEarly),
+			testjsonl.CodexMsgJSON("assistant", "replayed answer", tsEarly),
+			testjsonl.CodexTokenCountJSON(tsEarly, 50_000, 9_000, 0),
+		)
+		sess, msgs := runCodexParserTest(t, "fork.jsonl", content, false)
+		require.NotNil(t, sess)
+		assert.Equal(t, "codex:"+forkID, sess.ID)
+		assert.Empty(t, msgs)
+		assert.Equal(t, 0, sess.TotalOutputTokens)
+	})
+
+	t.Run("non-v7 fork id anchors the boundary from the envelope timestamp", func(t *testing.T) {
+		// Neither the fork id nor the payload carries a usable
+		// timestamp here — the gate must fall back to the JSONL
+		// envelope timestamp and still suppress the replay.
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexForkedSessionMetaJSON("fork-plain-1", "parent-1", "/tmp", "user", tsEarly),
+			testjsonl.CodexSessionMetaJSON("parent-1", "/tmp", "user", tsEarly),
+			testjsonl.CodexTurnContextWithIDJSON("gpt-5.4", parentTurnID, tsEarly),
+			testjsonl.CodexMsgJSON("user", "replayed question", tsEarly),
+			testjsonl.CodexMsgJSON("assistant", "replayed answer", tsEarly),
+			testjsonl.CodexTokenCountJSON(tsEarly, 50_000, 9_000, 0),
+			testjsonl.CodexTurnContextWithIDJSON("gpt-5.5", genuineTurnID, tsEarlyS1),
+			testjsonl.CodexMsgJSON("user", "genuine question", tsEarlyS1),
+			testjsonl.CodexMsgJSON("assistant", "genuine answer", tsEarlyS5),
+			testjsonl.CodexTokenCountJSON(tsEarlyS5, 10_000, 500, 6_000),
+		)
+		sess, msgs := runCodexParserTest(t, "fork.jsonl", content, false)
+		require.NotNil(t, sess)
+		assert.Equal(t, "codex:fork-plain-1", sess.ID)
+		require.Len(t, msgs, 2)
+		assert.Equal(t, "genuine question", msgs[0].Content)
+		assert.Equal(t, 500, sess.TotalOutputTokens)
+	})
+
+	t.Run("unparseable turn_id fails open instead of dropping live data", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexForkedSessionMetaJSON(forkID, "parent-1", "/tmp", "user", tsEarly),
+			testjsonl.CodexTurnContextWithIDJSON("gpt-5.5", "not-a-uuid", tsEarlyS1),
+			testjsonl.CodexMsgJSON("user", "kept question", tsEarlyS1),
+			testjsonl.CodexMsgJSON("assistant", "kept answer", tsEarlyS5),
+		)
+		_, msgs := runCodexParserTest(t, "fork.jsonl", content, false)
+		require.Len(t, msgs, 2)
+		assert.Equal(t, "kept question", msgs[0].Content)
+	})
+
+	t.Run("non-forked sessions are untouched", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON("plain-1", "/tmp", "user", tsEarly),
+			testjsonl.CodexTurnContextJSON("gpt-5.4", tsEarlyS1),
+			testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+			testjsonl.CodexMsgJSON("assistant", "hi", tsEarlyS5),
+			testjsonl.CodexTokenCountJSON(tsEarlyS5, 10_000, 500, 6_000),
+		)
+		sess, msgs := runCodexParserTest(t, "plain.jsonl", content, false)
+		require.NotNil(t, sess)
+		assert.Equal(t, "codex:plain-1", sess.ID)
+		require.Len(t, msgs, 2)
+		assert.Equal(t, 500, sess.TotalOutputTokens)
+	})
+}
+
+// TestParseCodexSessionFrom_ForkReplaySpansOffset covers the
+// incremental case of the fork replay gate (#643): a sync boundary
+// lands inside the replayed parent history, so the rest of the replay
+// arrives via ParseCodexSessionFrom. The incremental parser must
+// restore the still-active gate from the prefix and keep suppressing
+// the replay until the fork's first genuine turn.
+func TestParseCodexSessionFrom_ForkReplaySpansOffset(t *testing.T) {
+	t.Parallel()
+
+	forkCreatedMs := time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC).UnixMilli() // == tsEarly
+	forkID := testUUIDv7(forkCreatedMs, 1)
+	parentTurnID := testUUIDv7(forkCreatedMs-3600_000, 2)
+	genuineTurnID := testUUIDv7(forkCreatedMs+1000, 3)
+
+	// The initial sync sees only part of the replayed parent history.
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexForkedSessionMetaJSON(forkID, "parent-1", "/tmp", "user", tsEarly),
+		testjsonl.CodexSessionMetaJSON("parent-1", "/tmp", "user", tsEarly),
+		testjsonl.CodexTurnContextWithIDJSON("gpt-5.4", parentTurnID, tsEarly),
+		testjsonl.CodexMsgJSON("user", "replayed question", tsEarly),
+	)
+	path := createTestFile(t, "fork-incremental.jsonl", initial)
+
+	sess, msgs, err := ParseCodexSession(path, "local", false)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	assert.Equal(t, "codex:"+forkID, sess.ID)
+	require.Empty(t, msgs, "replayed prefix must not produce messages")
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	offset := info.Size()
+
+	// The rest of the replay plus the fork's first genuine turn
+	// arrive after the sync boundary.
+	appended := testjsonl.JoinJSONL(
+		testjsonl.CodexMsgJSON("assistant", "replayed answer", tsEarly),
+		testjsonl.CodexTokenCountJSON(tsEarly, 50_000, 9_000, 0),
+		testjsonl.CodexTurnContextWithIDJSON("gpt-5.5", genuineTurnID, tsEarlyS1),
+		testjsonl.CodexMsgJSON("user", "genuine question", tsEarlyS1),
+		testjsonl.CodexMsgJSON("assistant", "genuine answer", tsEarlyS5),
+		testjsonl.CodexTokenCountJSON(tsEarlyS5, 10_000, 500, 6_000),
+	)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString(appended)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	newMsgs, _, _, err := ParseCodexSessionFrom(path, offset, 0, false)
+	require.NoError(t, err)
+
+	// Only the genuine turn survives; the replayed assistant answer
+	// and its 9,000 output tokens stay suppressed.
+	require.Len(t, newMsgs, 2)
+	assert.Equal(t, "genuine question", newMsgs[0].Content)
+	assert.Equal(t, "genuine answer", newMsgs[1].Content)
+	assert.Equal(t, "gpt-5.5", newMsgs[1].Model)
+	assert.Equal(t, 500, newMsgs[1].OutputTokens)
+}
+
 func TestParseCodexSession_EdgeCases(t *testing.T) {
 	t.Run("skips system messages", func(t *testing.T) {
 		content := testjsonl.JoinJSONL(
@@ -1388,6 +1667,80 @@ func TestParseCodexSessionFrom_Incremental(t *testing.T) {
 
 	// endedAt reflects the latest timestamp.
 	assert.False(t, endedAt.IsZero())
+}
+
+func TestParseCodexSessionFrom_LateTokenCountRequiresFullParse(t *testing.T) {
+	t.Parallel()
+
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			"inc-late-usage", "/projects/api",
+			"codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexTurnContextJSON("gpt-5.5", tsEarlyS1),
+		testjsonl.CodexMsgJSON("user", "run command", tsEarlyS1),
+		testjsonl.CodexFunctionCallWithCallIDJSON(
+			"exec_command", "call_cmd",
+			map[string]any{"cmd": "sleep 1"}, tsEarlyS5,
+		),
+	)
+	path := createTestFile(t, "late-token-count.jsonl", initial)
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	offset := info.Size()
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString(testjsonl.JoinJSONL(
+		testjsonl.CodexFunctionCallOutputJSON(
+			"call_cmd", "done", tsLate,
+		),
+		testjsonl.CodexTokenCountJSON(
+			tsLate, 100_000, 250, 64_000,
+		),
+	))
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	_, _, _, err = ParseCodexSessionFrom(path, offset, 2, false)
+	require.Error(t, err)
+	assert.True(t, IsIncrementalFullParseFallback(err))
+}
+
+func TestParseCodexSessionFrom_FunctionCallOutputRequiresFullParse(t *testing.T) {
+	t.Parallel()
+
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			"inc-function-output", "/projects/api",
+			"codex_exec", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "run command", tsEarlyS1),
+		testjsonl.CodexFunctionCallWithCallIDJSON(
+			"exec_command", "call_cmd",
+			map[string]any{"cmd": "sleep 1"}, tsEarlyS5,
+		),
+	)
+	path := createTestFile(t, "function-call-output.jsonl", initial)
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	offset := info.Size()
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString(testjsonl.JoinJSONL(
+		testjsonl.CodexFunctionCallOutputJSON(
+			"call_cmd", "done", tsLate,
+		),
+	))
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	_, _, _, err = ParseCodexSessionFrom(path, offset, 2, false)
+	require.Error(t, err)
+	assert.True(t, IsIncrementalFullParseFallback(err))
 }
 
 // TestParseCodexSessionFrom_DedupsReemittedPrompt covers the
@@ -1751,7 +2104,7 @@ func TestParseCodexSessionFrom_RunningNotificationRequiresFullParse(t *testing.T
 	assert.Contains(t, err.Error(), "full parse")
 }
 
-func TestParseCodexSessionFrom_NonSubagentFunctionOutputDoesNotRequireFullParse(t *testing.T) {
+func TestParseCodexSessionFrom_NonSubagentFunctionOutputRequiresFullParse(t *testing.T) {
 	t.Parallel()
 
 	initial := testjsonl.JoinJSONL(
@@ -1772,10 +2125,9 @@ func TestParseCodexSessionFrom_NonSubagentFunctionOutputDoesNotRequireFullParse(
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	newMsgs, endedAt, _, err := ParseCodexSessionFrom(path, offset, 1, false)
-	require.NoError(t, err)
-	assert.Equal(t, 0, len(newMsgs))
-	assert.False(t, endedAt.IsZero())
+	_, _, _, err = ParseCodexSessionFrom(path, offset, 1, false)
+	require.Error(t, err)
+	assert.True(t, IsIncrementalFullParseFallback(err))
 }
 
 func TestParseCodexSessionFrom_SeedsModelFromTurnContext(
@@ -1919,7 +2271,7 @@ func TestParseCodexSessionFrom_EmptyModelReset(
 		"empty-model turn_context should reset model")
 }
 
-func TestReadCodexModelAtOffset_SkipsInvalidJSON(
+func TestSeedCodexIncrementalState_SkipsInvalidJSON(
 	t *testing.T,
 ) {
 	t.Parallel()
@@ -1943,12 +2295,12 @@ func TestReadCodexModelAtOffset_SkipsInvalidJSON(
 
 	info, err := os.Stat(path)
 	require.NoError(t, err)
-	got := readCodexModelAtOffset(path, info.Size())
+	got := seedCodexIncrementalState(path, info.Size()).model
 	assert.Equal(t, "gpt-5.4", got,
 		"truncated turn_context should be skipped")
 }
 
-func TestReadCodexModelAtOffset(t *testing.T) {
+func TestSeedCodexIncrementalState_Model(t *testing.T) {
 	t.Parallel()
 
 	content := testjsonl.JoinJSONL(
@@ -1972,17 +2324,17 @@ func TestReadCodexModelAtOffset(t *testing.T) {
 	t.Run("full file returns last model", func(t *testing.T) {
 		info, err := os.Stat(path)
 		require.NoError(t, err)
-		got := readCodexModelAtOffset(path, info.Size())
+		got := seedCodexIncrementalState(path, info.Size()).model
 		assert.Equal(t, "gpt-5.4", got)
 	})
 
 	t.Run("zero offset returns empty", func(t *testing.T) {
-		got := readCodexModelAtOffset(path, 0)
+		got := seedCodexIncrementalState(path, 0).model
 		assert.Equal(t, "", got)
 	})
 
 	t.Run("nonexistent file returns empty", func(t *testing.T) {
-		got := readCodexModelAtOffset("/no/such/file", 100)
+		got := seedCodexIncrementalState("/no/such/file", 100).model
 		assert.Equal(t, "", got)
 	})
 }

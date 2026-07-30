@@ -141,12 +141,31 @@ func (d *DB) CopyOrphanedDataFromExcluding(
 	// Snapshot orphaned session IDs before any inserts
 	// change main.sessions. Exclude permanently deleted sessions
 	// so they are not resurrected as orphans.
+	//
+	// Also exclude stale Codex rows whose file was reparsed into
+	// the new DB under a different session id: before dataVersion
+	// 40 a forked rollout's replayed parent session_meta overwrote
+	// the fork's id (#643), so the fork file's row was stored under
+	// the parent's identity with double-counted totals. That row is
+	// a stale duplicate of a live file, not an archive of a lost
+	// one. Scoped to Codex because it is strictly one session per
+	// file; SQLite-backed agents share a file_path across many
+	// sessions, where an id missing from the fresh parse can be a
+	// genuinely evicted chat that must survive as an orphan.
 	if _, err := conn.ExecContext(ctx, `
 		CREATE TEMP TABLE _orphaned_ids AS
 		SELECT id FROM old_db.sessions
 		WHERE id NOT IN (SELECT id FROM main.sessions)
 		  AND id NOT IN (SELECT id FROM main.excluded_sessions)
-		  AND id NOT IN (SELECT id FROM _extra_excluded_orphan_ids)`,
+		  AND id NOT IN (SELECT id FROM _extra_excluded_orphan_ids)
+		  AND id NOT IN (
+			SELECT old_s.id
+			FROM old_db.sessions old_s
+			JOIN main.sessions new_s
+				ON new_s.file_path = old_s.file_path
+			WHERE old_s.agent = 'codex'
+			  AND new_s.agent = 'codex'
+		  )`,
 	); err != nil {
 		return 0, fmt.Errorf(
 			"identifying orphaned sessions: %w", err,
@@ -280,6 +299,54 @@ func (d *DB) CopyTrashedDataFrom(sourcePath string) (int, error) {
 	return count, nil
 }
 
+// CopySyncStateFrom copies pg_sync_state rows from the source database into the
+// current database. ResyncAll uses this to preserve durable local sync metadata
+// such as the PG push owner marker across the temp-DB swap.
+func (d *DB) CopySyncStateFrom(sourcePath string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	ctx := context.Background()
+	conn, err := d.getWriter().Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquiring connection: %w", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(
+		ctx, "ATTACH DATABASE ? AS old_db", sourcePath,
+	); err != nil {
+		return fmt.Errorf("attaching source db: %w", err)
+	}
+	defer func() {
+		_, _ = execWithoutCancel(ctx, conn, "DETACH DATABASE old_db")
+	}()
+
+	// Older databases may have no pg_sync_state table.
+	var tableExists int
+	err = conn.QueryRowContext(
+		ctx, "SELECT 1 FROM old_db.sqlite_master WHERE type='table' AND name='pg_sync_state'",
+	).Scan(&tableExists)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("probing pg_sync_state table: %w", err)
+	}
+	if tableExists != 1 {
+		return nil
+	}
+
+	_, err = conn.ExecContext(ctx, `
+		INSERT OR REPLACE INTO main.pg_sync_state (key, value)
+		SELECT key, value FROM old_db.pg_sync_state
+		WHERE key = 'pg_push_marker_id'`)
+	if err != nil {
+		return fmt.Errorf("copying sync state: %w", err)
+	}
+	return nil
+}
+
 // CopyExcludedSessionsFrom copies the excluded_sessions table
 // from the source DB so permanently deleted sessions survive
 // full DB rebuilds. The source must not have active connections.
@@ -367,40 +434,44 @@ func (d *DB) CopySessionMetadataFrom(
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// Copy display_name and deleted_at from the quiesced old DB.
-	// These columns may be NULL (user cleared a rename or
-	// restored a trashed session), so we copy the value as-is
-	// rather than using COALESCE — a NULL in old_db is an
-	// intentional clear that must be preserved.
-	// Probe columns first so older source DBs that lack these
-	// columns don't abort the migration.
+	// Copy user-managed metadata from the quiesced old DB. deleted_at
+	// is copied for all rows. display_name is overlaid ONLY for
+	// user-owned rows: the fresh DB already holds re-parsed session_name
+	// values, so agent-owned and cleared rows must keep the fresh value.
+	// Probe columns first so older source DBs don't abort.
 	hasDisplayName := oldDBHasColumn(ctx, tx, "sessions", "display_name")
 	hasDeletedAt := oldDBHasColumn(ctx, tx, "sessions", "deleted_at")
 
-	if hasDisplayName && hasDeletedAt {
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE main.sessions
-			SET display_name = old_s.display_name,
-			    deleted_at   = old_s.deleted_at
-			FROM old_db.sessions old_s
-			WHERE main.sessions.id = old_s.id`); err != nil {
-			return fmt.Errorf("copying session metadata: %w", err)
-		}
-	} else if hasDisplayName {
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE main.sessions
-			SET display_name = old_s.display_name
-			FROM old_db.sessions old_s
-			WHERE main.sessions.id = old_s.id`); err != nil {
-			return fmt.Errorf("copying display_name: %w", err)
-		}
-	} else if hasDeletedAt {
+	if hasDeletedAt {
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE main.sessions
 			SET deleted_at = old_s.deleted_at
 			FROM old_db.sessions old_s
 			WHERE main.sessions.id = old_s.id`); err != nil {
 			return fmt.Errorf("copying deleted_at: %w", err)
+		}
+	}
+
+	// Copy user-set display_name (renames via RenameSession) from the old DB.
+	// In the two-field design display_name is always user-owned, so any
+	// non-NULL value is a user rename worth preserving.
+	// session_name is repopulated by re-parse and does not need copying.
+	//
+	// Note: the name_source discriminator column (which would have distinguished
+	// user renames from parser-owned titles) was introduced and removed in the
+	// same PR as the two-field split and was never present in any released build.
+	// Any non-NULL display_name in an upgrading database therefore came from
+	// RenameSession (user action) or a pre-feature import — the latter being
+	// acceptable to treat as a user rename since there is no lossless heuristic
+	// to separate them without name_source.
+	if hasDisplayName {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE main.sessions
+			SET display_name = old_s.display_name
+			FROM old_db.sessions old_s
+			WHERE main.sessions.id = old_s.id
+			  AND old_s.display_name IS NOT NULL`); err != nil {
+			return fmt.Errorf("copying user display_name: %w", err)
 		}
 	}
 
@@ -499,6 +570,10 @@ func orphanSessionCols(ctx context.Context, tx *sql.Tx) string {
 	if oldDBHasColumn(ctx, tx, "sessions", "display_name") {
 		cols = append(cols, "display_name")
 	}
+	if oldDBHasColumn(ctx, tx, "sessions", "session_name") {
+		cols = append(cols, "session_name")
+	}
+	// name_source was removed from the schema; do not copy it.
 	cols = append(cols,
 		"started_at", "ended_at", "message_count",
 		"user_message_count", "file_path", "file_size",
@@ -522,6 +597,12 @@ func orphanSessionCols(ctx context.Context, tx *sql.Tx) string {
 		"context_pressure_max", "health_score",
 		"health_grade", "has_tool_calls",
 		"has_context_data", "data_version",
+		"quality_signal_version", "short_prompt_count",
+		"unstructured_start",
+		"missing_success_criteria_count",
+		"missing_verification_count",
+		"duplicate_prompt_count", "no_code_context_count",
+		"runaway_tool_loop_count",
 		"cwd", "git_branch", "source_session_id",
 		"source_version", "parser_malformed_lines",
 		"is_truncated",

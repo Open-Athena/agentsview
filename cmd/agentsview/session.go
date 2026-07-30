@@ -5,6 +5,8 @@ package main
 import (
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/agentsview/internal/config"
@@ -26,9 +28,21 @@ func newSessionCommand() *cobra.Command {
 		"format", "human",
 		"Output format: human or json",
 	)
+	cmd.PersistentFlags().Bool(
+		"json", false,
+		"Emit JSON output (alias for --format json)",
+	)
 	cmd.PersistentFlags().String(
 		"server", "",
-		"Remote daemon URL (not yet implemented)",
+		"Remote daemon URL",
+	)
+	cmd.PersistentFlags().String(
+		"server-token-file", "",
+		"File containing bearer token for explicit --server requests",
+	)
+	cmd.PersistentFlags().Bool(
+		"pg", false,
+		"Read session data from configured PostgreSQL",
 	)
 
 	cmd.AddCommand(newSessionGetCommand())
@@ -51,9 +65,17 @@ func resolveService(
 ) (service.SessionService, func(), error) {
 	remote, _ := cmd.Flags().GetString("server")
 	if remote != "" {
-		return nil, nil, errors.New(
-			"--server not yet implemented",
-		)
+		if pgReadRequested(cmd) {
+			return nil, nil, errors.New(
+				"--server and --pg are mutually exclusive",
+			)
+		}
+		token, err := explicitServerToken(cmd)
+		if err != nil {
+			return nil, nil, err
+		}
+		return service.NewHTTPBackend(remote, token, false),
+			func() {}, nil
 	}
 	cfg, err := config.LoadPFlags(cmd.Flags())
 	if err != nil {
@@ -61,7 +83,14 @@ func resolveService(
 			"loading config: %w", err,
 		)
 	}
-	tr, err := detectTransport(cfg.DataDir, cfg.AuthToken, 0)
+	pgCfg, usePG, err := resolvePGReadConfig(cmd, cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	if usePG {
+		return newPGReadService(cfg, pgCfg)
+	}
+	tr, err := ensureTransport(&cfg, transportIntentRead, 0)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -76,14 +105,46 @@ func resolveService(
 func resolveWritableService(
 	cmd *cobra.Command,
 ) (service.SessionService, func(), error) {
+	return resolveWritableServiceWithIntent(cmd, false)
+}
+
+func resolveFreshWritableService(
+	cmd *cobra.Command,
+) (service.SessionService, func(), error) {
+	return resolveWritableServiceWithIntent(cmd, true)
+}
+
+func resolveWritableServiceWithIntent(
+	cmd *cobra.Command, fresh bool,
+) (service.SessionService, func(), error) {
 	if remote, _ := cmd.Flags().GetString("server"); remote != "" {
-		return nil, nil, errors.New("--server not yet implemented")
+		if pgReadRequested(cmd) {
+			return nil, nil, errors.New(
+				"--server and --pg are mutually exclusive",
+			)
+		}
+		token, err := explicitServerToken(cmd)
+		if err != nil {
+			return nil, nil, err
+		}
+		return service.NewHTTPBackend(remote, token, false),
+			func() {}, nil
+	}
+	if pgReadRequested(cmd) {
+		return nil, nil, errors.New(
+			"--pg is read-only and cannot be used with write commands",
+		)
 	}
 	cfg, err := config.LoadPFlags(cmd.Flags())
 	if err != nil {
 		return nil, nil, fmt.Errorf("loading config: %w", err)
 	}
-	tr, err := detectTransport(cfg.DataDir, cfg.AuthToken, 0)
+	var tr transport
+	if fresh {
+		tr, err = ensureTransport(&cfg, transportIntentArchiveWrite, 0)
+	} else {
+		tr, err = detectTransport(cfg.DataDir, cfg.AuthToken, 0)
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -95,18 +156,67 @@ func resolveWritableService(
 		)
 	}
 	if tr.Mode == transportDirect && tr.DirectReadOnly {
+		reason := tr.DirectReason
+		if reason == "" {
+			reason = "local daemon owns the SQLite archive but is not responding"
+		}
 		return nil, nil, errors.New(
-			"local daemon owns the SQLite archive but is not responding; " +
-				"refusing to write directly. Retry once the daemon is " +
-				"reachable, or stop it to write locally",
+			reason + "; refusing to write directly. Retry once the daemon " +
+				"is reachable and compatible, or stop it to write locally",
 		)
 	}
 	return syncService(cfg, tr)
 }
 
+func resolvePGReadConfig(
+	cmd *cobra.Command, cfg config.Config,
+) (config.PGConfig, bool, error) {
+	if !pgReadRequested(cmd) {
+		return config.PGConfig{}, false, nil
+	}
+	pgCfg, err := cfg.ResolvePG()
+	if err != nil {
+		return config.PGConfig{}, false,
+			fmt.Errorf("resolving pg config: %w", err)
+	}
+	if pgCfg.URL == "" {
+		return config.PGConfig{}, false, errors.New(
+			"pg url not configured; set AGENTSVIEW_PG_URL or [pg].url",
+		)
+	}
+	return pgCfg, true, nil
+}
+
+func pgReadRequested(cmd *cobra.Command) bool {
+	if cmd == nil {
+		return false
+	}
+	v, err := cmd.Flags().GetBool("pg")
+	return err == nil && v
+}
+
+func explicitServerToken(cmd *cobra.Command) (string, error) {
+	if cmd == nil {
+		return "", nil
+	}
+	path, err := cmd.Flags().GetString("server-token-file")
+	if err == nil && strings.TrimSpace(path) != "" {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("reading --server-token-file: %w", err)
+		}
+		return strings.TrimSpace(string(b)), nil
+	}
+	return strings.TrimSpace(os.Getenv("AGENTSVIEW_SERVER_TOKEN")), nil
+}
+
 // outputFormat returns the requested --format flag value
 // ("human" or "json"). Defaults to "human".
 func outputFormat(cmd *cobra.Command) string {
+	jsonOutput, _ := cmd.Flags().GetBool("json")
+	if jsonOutput {
+		return "json"
+	}
 	v, _ := cmd.Flags().GetString("format")
 	if v == "" {
 		return "human"

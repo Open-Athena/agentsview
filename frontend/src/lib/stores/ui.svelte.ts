@@ -6,7 +6,7 @@ import {
 import { SNAPSHOT } from "../utils/snapshot.js";
 
 type Theme = "light" | "dark";
-export type MessageLayout = "default" | "compact" | "stream";
+export type MessageLayout = "default" | "compact" | "stream" | "skim";
 export type TranscriptMode = "normal" | "focused";
 type ModalType =
   | "about"
@@ -94,6 +94,7 @@ const VALID_LAYOUTS: MessageLayout[] = [
   "default",
   "compact",
   "stream",
+  "skim",
 ];
 function readStoredTheme(): Theme | null {
   if (
@@ -167,6 +168,8 @@ class UIStore {
   );
   sidebarWidth: number = $state(readStoredSidebarWidth());
   activeModal: ModalType = $state(null);
+  /** Whether the next gist publish should be secret instead of public. */
+  publishSecret: boolean = $state(false);
   selectedOrdinal: number | null = $state(null);
   pendingScrollOrdinal: number | null = $state(null);
   pendingScrollSession: string | null = $state(null);
