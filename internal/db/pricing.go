@@ -234,6 +234,12 @@ func (db *DB) SetPricingMeta(key, value string) error {
 // Called during a resync so the rebuilt DB keeps pricing across the
 // swap; without it every usage cost reads as zero until the next
 // daemon startup re-seeds the table.
+//
+// The fork-local cache_creation_1h_microdollars_per_mtok column is
+// deliberately NOT copied: a source DB written by upstream (or an
+// intermediate binary) may lack it, and selecting it would fail the whole
+// copy. It re-seeds on startup (derived 8/5 of the 5m rate), and until then
+// loadPricingMap's defensive fallback prices 1h at the 5m rate.
 func (db *DB) CopyModelPricingFrom(sourcePath string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -260,14 +266,10 @@ func (db *DB) CopyModelPricingFrom(sourcePath string) error {
 	if _, err := conn.ExecContext(ctx, `
 		INSERT OR REPLACE INTO model_pricing
 			(model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
-			 cache_creation_microdollars_per_mtok,
-			 cache_creation_1h_microdollars_per_mtok,
-			 cache_read_microdollars_per_mtok,
+			 cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok,
 			 updated_at)
 		SELECT model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
-			cache_creation_microdollars_per_mtok,
-			cache_creation_1h_microdollars_per_mtok,
-			cache_read_microdollars_per_mtok,
+			cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok,
 			updated_at
 		FROM old_db.model_pricing`,
 	); err != nil {
