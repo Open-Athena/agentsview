@@ -167,13 +167,31 @@ git commit                              # merge commit banks the resolution
     by the automatic `dataVersion=74` full resync on normal serve; `--no-sync`
     against an old DB 500s on the usage routes until that resync runs.
 
+- **Waypoint E — DONE** (`b335c130`, merges `u/main` @ `b0b0553e`, 14 commits).
+  Final cleanup pass: artifact-ledger reliability follow-ups, duckdb push-watch
+  fix, settings-page host layout, a kit-ui bump (97be355e). Kept the fork's
+  redacted-transcript CSS alongside upstream's new `.settings-page-host`;
+  regenerated package-lock. **The branch is now fully current with `u/main`**
+  (`git merge-base --is-ancestor u/main HEAD` = yes; 0 behind). CIC-verified:
+  usage total $7543.14 (still cost-neutral) rendering as dollars under the newest
+  kit-ui.
+
+## Status: COMPLETE
+
+All five waypoints merged. `merge-upstream` is fully current with
+`kenn-io/agentsview` `u/main` and carries all fork features (snapshot publish +
+views, 1h cache-write pricing in microdollars, subagent rollup, private
+sessions, longest-prompts, org color-coding). Next: review the merge, then
+fast-forward `cache-1h-and-projects` onto `merge-upstream`.
+
 ## Acceptance
 
 - [x] Waypoint A merged with `make build && make test` green
 - [x] Waypoint B merged (green except the `origin`-remote snapshot test)
 - [x] Waypoint C merged (same green status)
 - [x] Waypoint D merged (money->microdollars; same green status + 2 flaky/env)
-- [ ] Waypoint E merged with `make build && make test` green
+- [x] Waypoint E merged; branch fully current with u/main
+- [ ] `merge-upstream` reviewed, then fast-forward `cache-1h-and-projects` onto it
 - [ ] Private-view toggle works post-Huma (PATCH route re-homed, e2e passes)
 - [ ] Snapshot export still produces a working hosted dashboard (browser-verified)
 - [ ] Snapshot usage/cost reconciled onto microdollars (no float pricing left in
