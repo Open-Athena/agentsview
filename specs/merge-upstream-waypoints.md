@@ -108,10 +108,32 @@ git commit                              # merge commit banks the resolution
   `localStorage` shadows jsdom). All green: go build/vet/test, svelte-check,
   1171 vitest tests, `make build`.
 
+- **Waypoint B — DONE** (`1d881faa`, merges `84af6fbf`, 155 commits). LiteLLM
+  offline-pricing snapshot + daemon-first CLI + DuckDB backend + i18n +
+  vite-plus. Re-threaded the fork's **1h cache-write pricing** (additive column
+  through upstream's batched builders; 1h derived via shared
+  `catalog.Fill1hCacheRate` in the live parser, snapshot overlay, and at
+  bundled-snapshot load in `fallback.go`; `parseUsageTokenCounters` extended for
+  the 5m/1h split, applied in both cost sites) and the **subagent rollup**
+  (`rollupProjectExpr` injected into all four of upstream's new daily-usage SQL
+  templates). Adopted upstream's usage-handler rework (comparison as its own
+  Huma endpoint). Ported `usage projects` onto `resolveArchiveQueryBackend` and
+  `usage longest-prompts` onto a read-only open. DuckDB: implemented
+  `GetLongestUserPrompts`, stubbed `SetSessionPrivate`. Frontend: re-ported the
+  longestPrompts panel onto the reworked usage store. All green (svelte-check,
+  1631 vitest, go build/vet/test, make build) except one snapshot test needing
+  a git `origin` remote.
+  - **Deferred follow-ups (Waypoint B):** 1h-cache parity for the PostgreSQL and
+    DuckDB *cost* paths (their `modelRates` still single-rate — optional
+    backends the fork never supported); the offline bundled snapshot derives 1h
+    at load rather than shipping it in the SHA-pinned artifact; no DuckDB unit
+    test yet for `GetLongestUserPrompts`.
+
 ## Acceptance
 
 - [x] Waypoint A merged with `make build && make test` green
-- [ ] Waypoints B-E each merged with `make build && make test` green
+- [x] Waypoint B merged (green except the `origin`-remote snapshot test)
+- [ ] Waypoints C-E each merged with `make build && make test` green
 - [ ] Private-view toggle works post-Huma (PATCH route re-homed, e2e passes)
 - [ ] Snapshot export still produces a working hosted dashboard (browser-verified)
 - [ ] Snapshot usage/cost reconciled onto microdollars (no float pricing left in
