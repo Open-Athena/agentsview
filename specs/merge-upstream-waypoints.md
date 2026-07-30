@@ -129,11 +129,30 @@ git commit                              # merge commit banks the resolution
     at load rather than shipping it in the SHA-pinned artifact; no DuckDB unit
     test yet for `GetLongestUserPrompts`.
 
+- **Waypoint C — DONE** (`128abb43`, merges `725a3d0c`, 126 commits). Export v1
+  (`internal/export`), the `export.PricingResolver` cost model, a `service`
+  layer for usage summaries, kit-ui (TopBar/theme), i18n, pairwise usage
+  comparison, Activity/RecentEdits nav. Threaded the fork's 1h cache-write rate
+  through `export.ModelRates` as an **internal, non-serialized**
+  `CacheWrite1hPerMTok` (verified contract-preserving: no canonical-JSON key, no
+  `EffectiveModelRate` field — digest/wire byte-identical), populated in
+  `loadPricingMap`/`modelPricingRates`; restored the 5m/1h split in
+  `dailyUsageAmounts`+`sessionRowCost` via a new `parseEphemeralCacheSplit`
+  (upstream's rewritten parser skips the nested `cache_creation` object). Dropped
+  the orphaned `db.modelRates`. Re-homed `BuildUsageSummary` onto
+  `service.BuildUsageSummaryResult`. Frontend: kit-ui TopBar with snapshot-mode
+  `tabs` filtering, kit-ui theme, kept the fork's golden-angle/org projectColor,
+  longestPrompts coexists with the new pairwise panel. CLI adopted the
+  `--format`/`--json` pairing. CIC-verified: usage total **$7543 matches
+  waypoint A** (1h threading is cost-neutral/correct); pairwise + longest-prompts
+  both render.
+
 ## Acceptance
 
 - [x] Waypoint A merged with `make build && make test` green
 - [x] Waypoint B merged (green except the `origin`-remote snapshot test)
-- [ ] Waypoints C-E each merged with `make build && make test` green
+- [x] Waypoint C merged (same green status)
+- [ ] Waypoints D-E each merged with `make build && make test` green
 - [ ] Private-view toggle works post-Huma (PATCH route re-homed, e2e passes)
 - [ ] Snapshot export still produces a working hosted dashboard (browser-verified)
 - [ ] Snapshot usage/cost reconciled onto microdollars (no float pricing left in
