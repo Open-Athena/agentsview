@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
+  import { EmptyState } from "@kenn-io/kit-ui";
+  // kit-ui-check-ignore: MessageList uses the local TanStack wrapper for pinned-message scroll reconciliation and per-session measurement cache resets; kit-ui VirtualList does not expose those controls yet.
   import type { Virtualizer } from "@tanstack/virtual-core";
   import { messages } from "../../stores/messages.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
@@ -29,6 +31,7 @@
     getLatestDisplayIndex,
     type ScrollAlign,
   } from "./message-scroll.js";
+  import { m } from "../../i18n/index.js";
 
   let containerRef: HTMLDivElement | undefined = $state(undefined);
   let scrollRaf: number | null = null;
@@ -527,16 +530,13 @@
 </script>
 
 {#if !sessions.activeSessionId}
-  <div class="empty-state">
-    <div class="empty-icon">
+  <EmptyState title={m.message_list_empty()}>
+    {#snippet icon()}
       <MessageSquareIcon size="36" strokeWidth="1.5" aria-hidden="true" />
-    </div>
-    <p class="empty-text">Select a session to view messages</p>
-  </div>
+    {/snippet}
+  </EmptyState>
 {:else if messages.loading && messages.messages.length === 0}
-  <div class="empty-state">
-    <p class="empty-text">Loading messages...</p>
-  </div>
+  <EmptyState title={m.message_list_loading()} />
 {:else}
   <SessionFindBar />
   <div
@@ -616,25 +616,6 @@
     outline: 2px solid var(--accent-blue);
     outline-offset: -2px;
     border-radius: var(--radius-md, 6px);
-  }
-
-  .empty-state {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    color: var(--text-muted);
-    gap: 12px;
-  }
-
-  .empty-icon {
-    opacity: 0.25;
-  }
-
-  .empty-text {
-    font-size: 14px;
-    font-weight: 500;
   }
 
   /* ── Compact layout ── */

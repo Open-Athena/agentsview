@@ -13,9 +13,10 @@
   import { liveTick } from "../../stores/liveTick.svelte.js";
   import ToolBlock from "./ToolBlock.svelte";
   import ParallelGroup from "./ParallelGroup.svelte";
-  import CopyButton from "../shared/CopyButton.svelte";
+  import { CopyButton } from "@kenn-io/kit-ui";
   import { displayToolName } from "../../utils/toolDisplay.js";
   import { SettingsIcon } from "../../icons.js";
+  import { m } from "../../i18n/index.js";
 
   interface Props {
     messages: Message[];
@@ -50,9 +51,7 @@
     messages.reduce((n, m) => n + messageToolCount(m), 0),
   );
 
-  let label = $derived(
-    totalCalls === 1 ? "1 tool call" : `${totalCalls} tool calls`,
-  );
+  let label = $derived(m.tool_call_group_call_count({ count: totalCalls }));
 
   /** Index turn timings by message id for O(1) lookup. */
   let turnByMessage = $derived.by(() => {
@@ -94,7 +93,9 @@
       const elapsed = Number.isNaN(startMs)
         ? 0
         : Math.max(0, liveTick.now - startMs);
-      return `running ${formatDuration(elapsed)}+`;
+      return m.tool_call_group_running_duration({
+        duration: formatDuration(elapsed),
+      });
     }
     return undefined;
   }
@@ -127,11 +128,12 @@
     </span>
     <span class="group-label">{label}</span>
     <CopyButton
+      revealOnHover
       {copied}
-      ariaLabel="Copy tool calls"
-      copiedAriaLabel="Copied tool calls"
-      title="Copy tool calls"
-      copiedTitle="Copied!"
+      ariaLabel={m.tool_call_group_copy_tool_calls()}
+      copiedAriaLabel={m.tool_call_group_copied_tool_calls()}
+      title={m.tool_call_group_copy_tool_calls()}
+      copiedTitle={m.tool_call_group_copied()}
       onclick={handleCopy}
     />
     <span class="group-timestamp">
@@ -219,7 +221,7 @@
     margin-left: auto;
   }
 
-  .tool-group:hover :global(.copy-btn) {
+  .tool-group:hover :global(.kit-copy-btn) {
     opacity: 1;
   }
 

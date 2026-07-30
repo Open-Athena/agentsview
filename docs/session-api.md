@@ -80,8 +80,8 @@ for a writable local archive owner.
   second writer. Read commands may still fall back to direct
   read-only SQLite.
 - `session export` always runs locally regardless of daemon
-  state, and rejects `--server`, `--pg`, and `--format` because it
-  streams raw source bytes.
+  state, and rejects `--server`, `--pg`, and `--format`/`--json`
+  because it streams raw source bytes.
 
 When a discovered local daemon requires auth (`require_auth: true`),
 the CLI attaches `Authorization: Bearer <token>` using the
@@ -108,6 +108,39 @@ use local SQLite unless `--pg` is supplied.
 | `--server-token-file <path>` | Bearer token file for an explicit `--server` URL. |
 | `--pg`                       | Read from configured PostgreSQL instead of SQLite. |
 
+## Shared metadata endpoints
+
+The web UI and generated API clients use shared metadata endpoints
+for filter options:
+
+```http
+GET /api/v1/projects
+GET /api/v1/machines
+GET /api/v1/branches
+GET /api/v1/agents
+```
+
+`GET /api/v1/branches` returns distinct `(project, branch)` pairs
+plus an opaque `token` field:
+
+```json
+{
+  "branches": [
+    {
+      "project": "myapp",
+      "branch": "main",
+      "token": "..."
+    }
+  ]
+}
+```
+
+Pass the returned token back as the `git_branch` query parameter on
+branch-aware endpoints. Treat it as opaque and URL-encode it in
+manual HTTP calls. The token is scoped by both project and branch,
+so `app-a/main` and `app-b/main` remain distinct, and an empty
+branch remains distinct from a literal `unknown` branch.
+
 ## Commands
 
 ### `agentsview session get`
@@ -127,6 +160,7 @@ agentsview session get <id> [--format json]
   "agent": "claude",
   "first_message": "...",
   "display_name": "...",
+  "git_branch": "main",
   "started_at": "2026-04-18T12:00:00Z",
   "ended_at": "2026-04-18T13:00:00Z",
   "message_count": 42,
@@ -136,12 +170,22 @@ agentsview session get <id> [--format json]
   "outcome": "completed",
   "health_score_basis": ["..."],
   "health_penalties": {"tool_retries": 5},
+  "parser_malformed_lines": 3,
   "secret_leak_count": 0
 }
 ```
 
 `health_score_basis` and `health_penalties` are populated when
 `health_score` is non-null. Both HTTP and CLI surfaces return them.
+
+`git_branch` is the branch captured at sync time when the parser or
+source metadata exposes it; sessions with no recorded branch omit
+the field. `parser_malformed_lines` counts the malformed source
+lines a parser skipped while still recovering the session and is
+omitted when zero. Antigravity detail responses may also include
+`decode_confidence`; the value `low` means the session came from an
+unrecognized Antigravity schema fingerprint and was decoded
+heuristically.
 
 `secret_leak_count` (added in 0.30.0) counts definite-tier
 findings from [secret scanning](#secret-scanning) and is stamped
@@ -176,6 +220,7 @@ One-shot and automated sessions are excluded by default. Use the
 | `--project`           | `project`           | string                            |
 | `--exclude-project`   | `exclude_project`   | string                            |
 | `--machine`           | `machine`           | string                            |
+| —                     | `git_branch`        | opaque token from `GET /api/v1/branches` |
 | `--agent`             | `agent`             | string                            |
 | `--date`              | `date`              | `YYYY-MM-DD`                      |
 | `--date-from`         | `date_from`         | `YYYY-MM-DD`                      |
@@ -299,14 +344,65 @@ be a plain string (e.g. `"echo hello world"` from Codex).
 
 ---
 
+### `POST /api/v1/sessions/{id}/resume`
+
+Resume a local session in its native agent, or return the command
+that would be launched. This is an HTTP-only surface used by the
+web UI's resume menu.
+
+```http
+POST /api/v1/sessions/{id}/resume
+```
+
+Request body:
+
+```json
+{
+  "skip_permissions": false,
+  "fork_session": false,
+  "from_ordinal": 17,
+  "command_only": false,
+  "opener_id": ""
+}
+```
+
+Response:
+
+```json
+{
+  "launched": true,
+  "terminal": "Terminal",
+  "command": "cd /repo && claude --resume abc-123",
+  "cwd": "/repo"
+}
+```
+
+`command_only: true` returns the command without launching a
+terminal. When a launch is attempted but fails, the response still
+includes the command with `launched: false` and an `error` code of
+`no_terminal_found` or `launch_failed`. Read-only local mode can
+still return commands, but remote sessions and read-only remote
+serving cannot launch local programs.
+
+For Claude Code sessions, setting `fork_session: true` without
+`from_ordinal` appends Claude's native `--fork-session` flag to the
+normal resume command. Setting both `fork_session: true` and
+`from_ordinal` creates a message-point fork: AgentsView renders the
+transcript through that message ordinal into a temporary prompt and
+runs `claude < prompt` from the resolved session working directory.
+Message-point forks are Claude-only, require `fork_session`, reject
+`opener_id`, and return `404` when the ordinal is not present.
+
+---
+
 ### `agentsview session export`
 
 Stream the raw session source file to stdout. This is a
 **local-only** filesystem helper: the source file path is resolved
 from the local SQLite archive, never from any daemon. Both
-`--server` and `--format` are rejected with an error — the command
-also rejects `--pg`. It streams raw bytes, so structured-output
-and remote-store flags don't apply.
+`--server` and `--format`/`--json` are rejected with an error — the
+command also rejects `--pg`. It streams raw bytes, so
+structured-output and remote-store flags don't apply.
 
 ```bash
 agentsview session export <id>
@@ -394,7 +490,8 @@ agentsview session watch <id>
 Recognized `event` values today: `session_updated`, `heartbeat`.
 New events may be added; consumers should ignore unknown events.
 The command runs until interrupted (Ctrl+C) or the context is
-cancelled.
+cancelled. Like `session export`, it streams a fixed format and
+rejects `--format`/`--json`.
 
 Watch validates the session id before opening the stream. An
 unknown id fails fast with a `watch: session not found: <id>`
@@ -444,6 +541,7 @@ default; opt back in with `--include-one-shot`,
 | `--project`           | `project`           | string                                                 |
 | `--exclude-project`   | `exclude_project`   | string                                                 |
 | `--machine`           | `machine`           | string                                                 |
+| —                     | `git_branch`        | opaque token from `GET /api/v1/branches`               |
 | `--agent`             | `agent`             | string                                                 |
 | `--date`              | `date`              | `YYYY-MM-DD`                                           |
 | `--date-from`         | `date_from`         | `YYYY-MM-DD`                                           |
@@ -589,6 +687,9 @@ Activity includes one-shot sessions by default. Automated sessions
 are also included by default and can be filtered with the
 `automation` query parameter.
 
+The JSON response shares the same `schema_version`, `pricing`, and `projects`
+metadata contract as `agentsview activity report --json`.
+
 | Query param | Notes |
 |-------------|-------|
 | `preset` | `day`, `week`, `month`, or `custom` |
@@ -598,6 +699,7 @@ are also included by default and can be filtered with the
 | `timezone` | IANA timezone name; default `UTC` |
 | `bucket` | Optional bucket override: `5m`, `15m`, `1h`, `1d`, or `1w` |
 | `project` | Filter by project |
+| `git_branch` | Filter by opaque branch token from `GET /api/v1/branches` |
 | `agent` | Filter by agent |
 | `machine` | Filter by machine |
 | `automation` | `all`, `interactive`, or `automated`; default `all` |
@@ -606,10 +708,44 @@ Response excerpt:
 
 ```json
 {
+  "schema_version": 1,
+  "pricing": {
+    "source": "fetched",
+    "table_version": "litellm-398a0b15378c",
+    "latest_row_updated_at": "2026-06-20T18:40:00Z",
+    "custom_override_count": 0,
+    "effective_row_count": 2428,
+    "digest": "sha256:8d815a1737bce68fa1a19ba977bf33c8c8efcc74deb954fcf62ce80e46e75f2c",
+    "cost_source": "mixed",
+    "fallback": {
+      "used": false,
+      "models": []
+    },
+    "models": {
+      "gpt-5.4": {
+        "matched_pattern": "gpt-5.4",
+        "input_cost_per_mtok": 2,
+        "output_cost_per_mtok": 8,
+        "cache_write_cost_per_mtok": 3,
+        "cache_read_cost_per_mtok": 0.5,
+        "cost_source": "computed"
+      }
+    }
+  },
+  "projects": {
+    "agentsview": {
+      "resolution": "resolved",
+      "identity": {
+        "key": "sha256:97879729c8ab311e9d4b28941e3a04830b28c527f00af53f2270212eccdbbd39",
+        "key_source": "git_remote",
+        "normalized_remote": "github.com/acme/agentsview"
+      }
+    }
+  },
   "timezone": "America/Chicago",
   "range_start": "2026-06-20T05:00:00Z",
   "range_end": "2026-06-21T05:00:00Z",
-  "bucket_unit": "1h",
+  "bucket_unit": "hour",
   "bucket_seconds": 3600,
   "partial": true,
   "as_of": "2026-06-20T18:40:00Z",

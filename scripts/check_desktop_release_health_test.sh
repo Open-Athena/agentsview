@@ -44,7 +44,27 @@ assert_failure_contains() {
 write_fixture() {
     local dir="$1" manifest_version="$2"
     cat >"$dir/latest.json" <<EOF
-{"version":"${manifest_version}"}
+{
+  "version": "${manifest_version}",
+  "platforms": {
+    "darwin-aarch64": {
+      "url": "https://github.com/kenn-io/agentsview/releases/download/updater/AgentsView_aarch64.app.tar.gz",
+      "signature": "YWJjCg=="
+    },
+    "darwin-x86_64": {
+      "url": "https://github.com/kenn-io/agentsview/releases/download/updater/AgentsView_x86_64.app.tar.gz",
+      "signature": "YWJjCg=="
+    },
+    "windows-x86_64": {
+      "url": "https://github.com/kenn-io/agentsview/releases/download/updater/AgentsView_0.34.5_x64-setup.nsis.zip",
+      "signature": "YWJjCg=="
+    },
+    "linux-x86_64": {
+      "url": "https://github.com/kenn-io/agentsview/releases/download/updater/AgentsView_0.34.5_amd64.AppImage.tar.gz",
+      "signature": "YWJjCg=="
+    }
+  }
+}
 EOF
 }
 
@@ -77,6 +97,158 @@ write_fixture "$tmp" "0.34.4"
 assert_failure_contains \
     "stale updater manifest fails" \
     "updater manifest version 0.34.4 does not match expected 0.34.5" \
+    run_checker "$tmp" "v0.34.5"
+
+cat >"$tmp/latest.json" <<'EOF'
+{"version":"0.34.5"}
+EOF
+assert_failure_contains \
+    "manifest without updater platforms fails" \
+    "updater manifest platforms must be an object with signatures for darwin-aarch64, darwin-x86_64, windows-x86_64, linux-x86_64" \
+    run_checker "$tmp" "v0.34.5"
+
+cat >"$tmp/latest.json" <<'EOF'
+{"version":"0.34.5","platforms":{}}
+EOF
+assert_failure_contains \
+    "manifest with empty updater platforms fails" \
+    "updater manifest missing platform darwin-aarch64" \
+    run_checker "$tmp" "v0.34.5"
+
+cat >"$tmp/latest.json" <<'EOF'
+{"version":"0.34.5","platforms":[]}
+EOF
+assert_failure_contains \
+    "manifest with non-object updater platforms fails" \
+    "updater manifest platforms must be an object with signatures for darwin-aarch64, darwin-x86_64, windows-x86_64, linux-x86_64" \
+    run_checker "$tmp" "v0.34.5"
+
+cat >"$tmp/latest.json" <<'EOF'
+{
+  "version": "0.34.5",
+  "platforms": {
+    "darwin-aarch64": {
+      "url": "https://github.com/kenn-io/agentsview/releases/download/updater/AgentsView_aarch64.app.tar.gz"
+    },
+    "darwin-x86_64": {
+      "url": "https://github.com/kenn-io/agentsview/releases/download/updater/AgentsView_x86_64.app.tar.gz",
+      "signature": "YWJjCg=="
+    },
+    "windows-x86_64": {
+      "url": "https://github.com/kenn-io/agentsview/releases/download/updater/AgentsView_0.34.5_x64-setup.nsis.zip",
+      "signature": "YWJjCg=="
+    },
+    "linux-x86_64": {
+      "url": "https://github.com/kenn-io/agentsview/releases/download/updater/AgentsView_0.34.5_amd64.AppImage.tar.gz",
+      "signature": "YWJjCg=="
+    }
+  }
+}
+EOF
+assert_failure_contains \
+    "manifest with missing updater signature fails" \
+    "updater manifest missing signature for darwin-aarch64" \
+    run_checker "$tmp" "v0.34.5"
+
+cat >"$tmp/latest.json" <<'EOF'
+{
+  "version": "0.34.5",
+  "platforms": {
+    "darwin-aarch64": {
+      "signature": "YWJjCg=="
+    },
+    "darwin-x86_64": {
+      "url": "https://github.com/kenn-io/agentsview/releases/download/updater/AgentsView_x86_64.app.tar.gz",
+      "signature": "YWJjCg=="
+    },
+    "windows-x86_64": {
+      "url": "https://github.com/kenn-io/agentsview/releases/download/updater/AgentsView_0.34.5_x64-setup.nsis.zip",
+      "signature": "YWJjCg=="
+    },
+    "linux-x86_64": {
+      "url": "https://github.com/kenn-io/agentsview/releases/download/updater/AgentsView_0.34.5_amd64.AppImage.tar.gz",
+      "signature": "YWJjCg=="
+    }
+  }
+}
+EOF
+assert_failure_contains \
+    "manifest with missing updater URL fails" \
+    "updater manifest missing url for darwin-aarch64" \
+    run_checker "$tmp" "v0.34.5"
+
+cat >"$tmp/latest.json" <<'EOF'
+{
+  "version": "0.34.5",
+  "platforms": {
+    "darwin-aarch64": {
+      "url": "",
+      "signature": "YWJjCg=="
+    },
+    "darwin-x86_64": {
+      "url": "https://github.com/kenn-io/agentsview/releases/download/updater/AgentsView_x86_64.app.tar.gz",
+      "signature": "YWJjCg=="
+    },
+    "windows-x86_64": {
+      "url": "https://github.com/kenn-io/agentsview/releases/download/updater/AgentsView_0.34.5_x64-setup.nsis.zip",
+      "signature": "YWJjCg=="
+    },
+    "linux-x86_64": {
+      "url": "https://github.com/kenn-io/agentsview/releases/download/updater/AgentsView_0.34.5_amd64.AppImage.tar.gz",
+      "signature": "YWJjCg=="
+    }
+  }
+}
+EOF
+assert_failure_contains \
+    "manifest with empty updater URL fails" \
+    "updater manifest missing url for darwin-aarch64" \
+    run_checker "$tmp" "v0.34.5"
+
+cat >"$tmp/latest.json" <<'EOF'
+{
+  "version": "0.34.5",
+  "platforms": {
+    "linux-x86_64": {
+      "url": "https://github.com/kenn-io/agentsview/releases/download/updater/AgentsView_0.34.5_amd64.AppImage.tar.gz",
+      "signature": "
+Public signature:
+YWJjCg=="
+    }
+  }
+}
+EOF
+assert_failure_contains \
+    "invalid updater manifest JSON fails" \
+    "updater manifest is not valid JSON" \
+    run_checker "$tmp" "v0.34.5"
+
+cat >"$tmp/latest.json" <<'EOF'
+{
+  "version": "0.34.5",
+  "platforms": {
+    "darwin-aarch64": {
+      "url": "https://github.com/kenn-io/agentsview/releases/download/updater/AgentsView_aarch64.app.tar.gz",
+      "signature": "YWJjCg=="
+    },
+    "darwin-x86_64": {
+      "url": "https://github.com/kenn-io/agentsview/releases/download/updater/AgentsView_x86_64.app.tar.gz",
+      "signature": "YWJjCg=="
+    },
+    "windows-x86_64": {
+      "url": "https://github.com/kenn-io/agentsview/releases/download/updater/AgentsView_0.34.5_x64-setup.nsis.zip",
+      "signature": "YWJjCg=="
+    },
+    "linux-x86_64": {
+      "url": "https://github.com/kenn-io/agentsview/releases/download/updater/AgentsView_0.34.5_amd64.AppImage.tar.gz",
+      "signature": "Public signature: YWJjCg=="
+    }
+  }
+}
+EOF
+assert_failure_contains \
+    "non-base64 updater signature fails" \
+    "updater manifest signature for linux-x86_64 is not a base64 payload" \
     run_checker "$tmp" "v0.34.5"
 
 echo

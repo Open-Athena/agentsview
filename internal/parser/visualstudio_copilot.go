@@ -16,60 +16,37 @@ import (
 	"time"
 )
 
-// ParseVisualStudioCopilotSession parses a single Visual Studio Copilot
-// conversation from an OpenTelemetry trace JSONL file. The path may be a real
-// trace file or a <traceFile>#<conversationID> virtual path emitted by
-// discovery. A real trace file resolves to the conversation it contains; when
-// a file carries spans for more than one conversation, discovery emits one
-// virtual-path work item per conversation, so production does not rely on this
-// entry point to choose among several.
-func ParseVisualStudioCopilotSession(
-	path, project, machine string,
-) (*ParsedSession, []ParsedMessage, error) {
-	if tracePath, conversationID, ok :=
-		ParseVisualStudioCopilotVirtualPath(path); ok {
-		return ParseVisualStudioCopilotConversation(
-			tracePath, conversationID, project, machine,
-		)
-	}
-	if !IsVisualStudioCopilotTraceFile(path) {
-		return nil, nil, nil
-	}
-	ids, err := VisualStudioCopilotFileConversationIDs(path)
-	if err != nil {
-		return nil, nil, err
-	}
-	if len(ids) == 0 {
-		return nil, nil, nil
-	}
-	return ParseVisualStudioCopilotConversation(
-		path, ids[0], project, machine,
-	)
-}
-
 // VisualStudioCopilotVirtualPath pairs a trace file with one conversation ID.
 // A single physical trace file can hold spans for multiple conversations, so
 // each conversation is tracked as its own work item under this virtual path.
 func VisualStudioCopilotVirtualPath(tracePath, conversationID string) string {
-	return tracePath + "#" + conversationID
+	conversationID = canonicalVisualStudioCopilotConversationID(conversationID)
+	return VirtualSourcePath(tracePath, conversationID)
 }
 
-// ParseVisualStudioCopilotVirtualPath splits a <traceFile>#<conversationID>
-// virtual path. It returns ok=false for a plain trace-file path.
-func ParseVisualStudioCopilotVirtualPath(
+func canonicalVisualStudioCopilotConversationID(id string) string {
+	if isVisualStudioCopilotVS2026SessionID(id) {
+		return strings.ToLower(id)
+	}
+	return id
+}
+
+func sameVisualStudioCopilotConversationID(a, b string) bool {
+	return canonicalVisualStudioCopilotConversationID(a) ==
+		canonicalVisualStudioCopilotConversationID(b)
+}
+
+// SplitVisualStudioCopilotVirtualPath splits a <traceFile>#<conversationID>
+// virtual source path into its physical trace file and conversation ID. It
+// builds on the provider-neutral ParseVirtualSourcePath splitter and adds the
+// Visual Studio Copilot validation that the container names a trace file and
+// the source ID is a valid conversation ID. It returns ok=false for a plain
+// trace-file path. Callers outside the parser package use it to detect and
+// resolve the virtual paths Visual Studio Copilot stores for its sessions.
+func SplitVisualStudioCopilotVirtualPath(
 	sourcePath string,
 ) (tracePath, conversationID string, ok bool) {
-	idx := strings.LastIndex(sourcePath, "#")
-	if idx <= 0 || idx >= len(sourcePath)-1 {
-		return "", "", false
-	}
-	tracePath = sourcePath[:idx]
-	conversationID = sourcePath[idx+1:]
-	if !IsVisualStudioCopilotTraceFile(tracePath) ||
-		!IsValidSessionID(conversationID) {
-		return "", "", false
-	}
-	return tracePath, conversationID, true
+	return splitVisualStudioCopilotVirtualPath(sourcePath)
 }
 
 // IsVisualStudioCopilotTraceFile reports whether path names a Visual Studio
@@ -82,6 +59,59 @@ func IsVisualStudioCopilotTraceFile(path string) bool {
 		strings.Contains(base, "_VSGitHubCopilot_traces")
 }
 
+func isVisualStudioCopilotConversationPath(path string) bool {
+	return IsVisualStudioCopilotTraceFile(path) ||
+		isVisualStudioCopilotVS2026SessionPath(path)
+}
+
+// IsVisualStudioCopilotVS2026SessionPath reports whether path names a Visual
+// Studio 2026 Copilot one-file conversation source.
+func IsVisualStudioCopilotVS2026SessionPath(path string) bool {
+	return isVisualStudioCopilotVS2026SessionPath(path)
+}
+
+func isVisualStudioCopilotVS2026SessionPath(path string) bool {
+	if !isVisualStudioCopilotVS2026SessionFileName(filepath.Base(path)) {
+		return false
+	}
+
+	parts := strings.Split(filepath.ToSlash(filepath.Dir(path)), "/")
+	if len(parts) < 4 {
+		return false
+	}
+	return strings.EqualFold(parts[len(parts)-1], "sessions") &&
+		strings.EqualFold(parts[len(parts)-3], "copilot-chat")
+}
+
+func isVisualStudioCopilotVS2026SessionFileName(name string) bool {
+	return isVisualStudioCopilotVS2026SessionID(name)
+}
+
+func isVisualStudioCopilotVS2026SessionID(id string) bool {
+	if len(id) != 36 {
+		return false
+	}
+	for i, c := range id {
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if !isVisualStudioCopilotVS2026Hex(c) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isVisualStudioCopilotVS2026Hex(c rune) bool {
+	return (c >= '0' && c <= '9') ||
+		(c >= 'a' && c <= 'f') ||
+		(c >= 'A' && c <= 'F')
+}
+
 // ResolveSourceFilePath maps a stored session source path to a path that can
 // be opened on disk. Visual Studio Copilot stores a
 // <traceFile>#<conversationID> virtual path whose conversations share one
@@ -89,7 +119,7 @@ func IsVisualStudioCopilotTraceFile(path string) bool {
 // path whose runs share one physical history file; both resolve to the
 // physical file. Every other agent stores a real path, returned unchanged.
 func ResolveSourceFilePath(storedPath string) string {
-	if tracePath, _, ok := ParseVisualStudioCopilotVirtualPath(storedPath); ok {
+	if tracePath, _, ok := splitVisualStudioCopilotVirtualPath(storedPath); ok {
 		return tracePath
 	}
 	if historyPath, _, ok := ParseAiderVirtualPath(storedPath); ok {
@@ -133,13 +163,14 @@ type vsCopilotTraceValue struct {
 	BoolValue   bool   `json:"boolValue"`
 }
 
-// ParseVisualStudioCopilotConversation parses one conversation, gathering its
-// spans from the given trace file and every sibling trace file in the same
-// directory. File metadata is recorded against the conversation's virtual path
-// so that each conversation in a shared trace file is tracked independently.
-func ParseVisualStudioCopilotConversation(
+// parseConversation parses one conversation, gathering its spans from the given
+// trace file and every sibling trace file in the same directory. File metadata
+// is recorded against the conversation's virtual path so that each conversation
+// in a shared trace file is tracked independently.
+func parseVisualStudioCopilotConversation(
 	tracePath, conversationID, project, machine string,
 ) (*ParsedSession, []ParsedMessage, error) {
+	conversationID = canonicalVisualStudioCopilotConversationID(conversationID)
 	if conversationID == "" {
 		return nil, nil, nil
 	}
@@ -220,7 +251,9 @@ func visualStudioCopilotConversationSpans(
 	}
 	var spans []vsCopilotSpan
 	for _, span := range own {
-		if span.attrMap["gen_ai.conversation.id"] == conversationID {
+		if sameVisualStudioCopilotConversationID(
+			span.attrMap["gen_ai.conversation.id"], conversationID,
+		) {
 			spans = append(spans, span)
 		}
 	}
@@ -246,7 +279,9 @@ func VisualStudioCopilotFileConversationIDs(path string) ([]string, error) {
 	seen := map[string]struct{}{}
 	var ids []string
 	for _, span := range spans {
-		id := span.attrMap["gen_ai.conversation.id"]
+		id := canonicalVisualStudioCopilotConversationID(
+			span.attrMap["gen_ai.conversation.id"],
+		)
 		if id == "" {
 			continue
 		}
@@ -262,19 +297,36 @@ func VisualStudioCopilotFileConversationIDs(path string) ([]string, error) {
 // WriteVisualStudioCopilotConversationJSONL streams the trace data for one
 // conversation across every sibling trace file in the representative trace's
 // directory, since a conversation's spans can be split across rotated trace
-// files. From each file it emits only the spans whose gen_ai.conversation.id
-// matches the requested conversation: a line is written verbatim when all of its
-// spans already belong to that conversation, otherwise it is re-encoded with
-// only the matching spans so a batched OTLP line cannot disclose another
-// conversation's or an id-less span's prompts, tool arguments, command output,
-// or secrets. A sibling that vanished between listing and open is skipped; any
-// other read error is returned. When no trace file in the directory contains the
-// conversation (e.g. the representative trace was rotated away and no sibling
-// holds it), it returns an os.ErrNotExist-wrapped error rather than succeeding
-// with empty output, so callers can report a clear not-found error.
+// files. VS 2026 session-file paths already point at one conversation file, so
+// they are filtered and exported directly. From each file it emits only the
+// spans whose gen_ai.conversation.id matches the requested conversation: a line
+// is written verbatim when all of its spans already belong to that
+// conversation, otherwise it is re-encoded with only the matching spans so a
+// batched OTLP line cannot disclose another conversation's or an id-less span's
+// prompts, tool arguments, command output, or secrets. A sibling that vanished
+// between listing and open is skipped; any other read error is returned. When
+// no trace file in the directory contains the conversation (e.g. the
+// representative trace was rotated away and no sibling holds it), it returns an
+// os.ErrNotExist-wrapped error rather than succeeding with empty output, so
+// callers can report a clear not-found error.
 func WriteVisualStudioCopilotConversationJSONL(
 	w io.Writer, tracePath, conversationID string,
 ) error {
+	if isVisualStudioCopilotVS2026SessionPath(tracePath) {
+		written, err := writeVisualStudioCopilotConversationFile(
+			w, tracePath, conversationID,
+		)
+		if err != nil {
+			return err
+		}
+		if written == 0 {
+			return fmt.Errorf(
+				"conversation %s not found in %s: %w",
+				conversationID, tracePath, os.ErrNotExist,
+			)
+		}
+		return nil
+	}
 	files, err := visualStudioCopilotSiblingTraceFiles(tracePath)
 	if err != nil {
 		return err
@@ -343,6 +395,7 @@ func writeVisualStudioCopilotConversationFile(
 func visualStudioCopilotConversationLine(
 	line []byte, conversationID string,
 ) ([]byte, bool) {
+	conversationID = canonicalVisualStudioCopilotConversationID(conversationID)
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(line, &top); err != nil {
 		return nil, false
@@ -453,7 +506,9 @@ func visualStudioCopilotFilterScopeSpan(
 	kept := make([]json.RawMessage, 0, len(spans))
 	modified := false
 	for _, sp := range spans {
-		if visualStudioCopilotSpanConversationID(sp) == conversationID {
+		if sameVisualStudioCopilotConversationID(
+			visualStudioCopilotSpanConversationID(sp), conversationID,
+		) {
 			kept = append(kept, sp)
 		} else {
 			modified = true
@@ -489,7 +544,9 @@ func visualStudioCopilotSpanConversationID(span json.RawMessage) string {
 	}
 	for _, attr := range s.Attributes {
 		if attr.Key == "gen_ai.conversation.id" {
-			return attr.Value.StringValue
+			return canonicalVisualStudioCopilotConversationID(
+				attr.Value.StringValue,
+			)
 		}
 	}
 	return ""
@@ -566,7 +623,9 @@ func visualStudioCopilotSiblingTraceSpans(
 			return nil, err
 		}
 		for _, span := range candidateSpans {
-			if span.attrMap["gen_ai.conversation.id"] == conversationID {
+			if sameVisualStudioCopilotConversationID(
+				span.attrMap["gen_ai.conversation.id"], conversationID,
+			) {
 				spans = append(spans, span)
 			}
 		}
@@ -607,6 +666,12 @@ func visualStudioCopilotSiblingTraceFiles(path string) ([]string, error) {
 func VisualStudioCopilotTraceFingerprint(
 	tracePath string,
 ) (size, mtime int64) {
+	if isVisualStudioCopilotVS2026SessionPath(tracePath) {
+		if info, err := os.Stat(tracePath); err == nil {
+			return info.Size(), info.ModTime().UnixNano()
+		}
+		return 0, 0
+	}
 	size, mtime, err := visualStudioCopilotTraceFingerprint(tracePath, false)
 	if err != nil {
 		if info, statErr := os.Stat(tracePath); statErr == nil {
@@ -629,6 +694,13 @@ func VisualStudioCopilotTraceFingerprint(
 func VisualStudioCopilotTraceFingerprintStrict(
 	tracePath string,
 ) (size, mtime int64, err error) {
+	if isVisualStudioCopilotVS2026SessionPath(tracePath) {
+		info, err := os.Stat(tracePath)
+		if err != nil {
+			return 0, 0, err
+		}
+		return info.Size(), info.ModTime().UnixNano(), nil
+	}
 	return visualStudioCopilotTraceFingerprint(tracePath, true)
 }
 

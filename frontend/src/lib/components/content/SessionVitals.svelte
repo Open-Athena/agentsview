@@ -7,6 +7,8 @@
   import { categoryToken } from "../../utils/categoryToken.js";
   import { displayToolName } from "../../utils/toolDisplay.js";
   import { ui } from "../../stores/ui.svelte.js";
+  import { m } from "../../i18n/index.js";
+  import { formatNumber } from "../../utils/format.js";
   import type {
     CallTiming,
     SessionTiming,
@@ -216,7 +218,7 @@
     const dur =
       turn.duration_ms != null
         ? formatDuration(turn.duration_ms)
-        : "running";
+        : m.session_vitals_running();
     return `${turn.primary_category} · ${dur}`;
   }
 
@@ -228,14 +230,14 @@
 <div class="vital">
   <header class="vital-titlebar">
     <div>
-      <div class="vital-title">Analysis</div>
-      <div class="vital-subtitle">Session vital signs</div>
+      <div class="vital-title">{m.session_vitals_title()}</div>
+      <div class="vital-subtitle">{m.session_vitals_subtitle()}</div>
     </div>
     <button
       type="button"
       class="vital-close"
-      title="Close session analysis"
-      aria-label="Close session analysis"
+      title={m.session_vitals_close()}
+      aria-label={m.session_vitals_close()}
       onclick={() => ui.closeVitals()}
     >
       <XIcon size="12" strokeWidth="2.4" aria-hidden="true" />
@@ -245,10 +247,10 @@
   {#if timing}
     <section class="v-section">
       <header class="v-h">
-        <span>Session</span>
+        <span>{m.session_vitals_session()}</span>
         <span class="v-meta" class:live={timing.running}>
           {#if timing.running}
-            running {formatDuration(timing.total_duration_ms)}+
+            {m.session_vitals_running_duration({ duration: formatDuration(timing.total_duration_ms) })}
           {:else}
             {formatDuration(timing.total_duration_ms)}
           {/if}
@@ -256,23 +258,23 @@
       </header>
       <div class="stat-grid">
         <div>
-          <div class="lbl">tool calls</div>
+          <div class="lbl">{m.session_vitals_tool_calls()}</div>
           <div class="val">{timing.tool_call_count}</div>
         </div>
         <div>
-          <div class="lbl">tool time</div>
+          <div class="lbl">{m.session_vitals_tool_time()}</div>
           <div class="val" class:live={timing.running}>
             {formatDuration(timing.tool_duration_ms)}{timing.running ? "+" : ""}
           </div>
         </div>
         <div>
-          <div class="lbl">slowest call</div>
+          <div class="lbl">{m.session_vitals_slowest_call()}</div>
           {#if timing.slowest_call}
             {@const slowest = timing.slowest_call}
             <button
               type="button"
               class="val slow val-link"
-              title="Jump to call"
+              title={m.session_vitals_jump_to_call()}
               onclick={() => scrollToCall(slowest)}
             >
               {displayToolName(slowest)} · {formatDuration(slowest.duration_ms ?? 0)}
@@ -282,11 +284,11 @@
           {/if}
         </div>
         <div>
-          <div class="lbl">turns</div>
+          <div class="lbl">{m.session_vitals_turns()}</div>
           <div class="val">{timing.turn_count}</div>
         </div>
         <div>
-          <div class="lbl">sub-agents</div>
+          <div class="lbl">{m.session_vitals_subagents()}</div>
           <div class="val">{timing.subagent_count}</div>
         </div>
       </div>
@@ -295,20 +297,20 @@
     {#if timing.by_category.length > 0}
       <section class="v-section">
         <header class="v-h">
-          <span>Time spent</span>
+          <span>{m.session_vitals_time_spent()}</span>
           {#if categoryFilter}
             <button
               class="filter-chip"
               style="color: {categoryToken(categoryFilter)}; border-color: {categoryToken(categoryFilter)};"
               onclick={() => (categoryFilter = null)}
-              aria-label="clear category filter"
+              aria-label={m.session_vitals_clear_category_filter()}
             >
               {categoryFilter}<span class="x">
                 <XIcon size="10" strokeWidth="2.4" aria-hidden="true" />
               </span>
             </button>
           {:else}
-            <span class="v-meta">completed turns · click to highlight</span>
+            <span class="v-meta">{m.session_vitals_completed_turns_hint()}</span>
           {/if}
         </header>
         {#each timing.by_category as cat (cat.category)}
@@ -338,12 +340,12 @@
     {#if timing.turns.length > 0}
       <section class="v-section">
         <header class="v-h">
-          <span>Timeline</span>
-          <span class="v-meta">click marks to scroll</span>
+          <span>{m.session_vitals_timeline()}</span>
+          <span class="v-meta">{m.session_vitals_click_marks_to_scroll()}</span>
         </header>
 
         <div class="lane-row">
-          <span class="lane-label">turns</span>
+          <span class="lane-label">{m.session_vitals_turns()}</span>
           <span class="lane-track">
             {#each timing.turns as t (t.message_id)}
               {@const isLive = t.duration_ms == null}
@@ -357,7 +359,10 @@
                 title={turnTitle(t)}
                 onclick={() => scrollToTurn(t)}
                 type="button"
-                aria-label="Jump to {t.primary_category} turn at {t.started_at}"
+                aria-label={m.session_vitals_jump_to_turn({
+                  category: t.primary_category,
+                  time: t.started_at,
+                })}
               ></button>
             {/each}
           </span>
@@ -383,7 +388,10 @@
                   title={turnTitle(t)}
                   onclick={() => scrollToTurn(t)}
                   type="button"
-                  aria-label="Jump to {cat.category} turn at {t.started_at}"
+                  aria-label={m.session_vitals_jump_to_turn({
+                    category: cat.category,
+                    time: t.started_at,
+                  })}
                 ></button>
               {/each}
             </span>
@@ -411,11 +419,13 @@
     {#if timing.turns.length > 0}
       <section class="v-section">
         <header class="v-h">
-          <span>Calls</span>
+          <span>{m.session_vitals_calls()}</span>
           <span class="v-meta">
-            {timing.tool_call_count} call{timing.tool_call_count === 1
-              ? ""
-              : "s"}{timing.running ? " · 1 running" : ""}
+            {m.session_vitals_calls_summary({
+              count: timing.tool_call_count,
+              countLabel: formatNumber(timing.tool_call_count),
+              runningCount: timing.running ? 1 : 0,
+            })}
           </span>
         </header>
         <div class="scale-axis">
@@ -429,7 +439,7 @@
           >
           <span class:now={timing.running}
             >{timing.running
-              ? "now"
+              ? m.session_vitals_now()
               : formatDuration(timing.total_duration_ms)}</span
           >
         </div>
@@ -600,7 +610,7 @@
   .stat-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 10px;
+    gap: var(--space-4);
     font-family: var(--font-mono);
     font-size: 11px;
   }
@@ -660,7 +670,7 @@
     transition: background 0.12s, opacity 0.18s, border-color 0.12s;
   }
   .agg-row:hover {
-    background: rgba(255, 255, 255, 0.03);
+    background: color-mix(in srgb, var(--text-primary) 3%, transparent);
   }
   .agg-row.active {
     background: color-mix(in srgb, var(--ring, transparent) 10%, transparent);
@@ -698,8 +708,8 @@
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    background: rgba(255, 255, 255, 0.04);
-    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: color-mix(in srgb, var(--text-primary) 4%, transparent);
+    border: 1px solid color-mix(in srgb, var(--text-primary) 12%, transparent);
     padding: 2px 6px;
     border-radius: var(--radius-sm);
     font-family: var(--font-mono);
@@ -708,7 +718,7 @@
     color: var(--text-primary);
   }
   .filter-chip:hover {
-    background: rgba(255, 255, 255, 0.08);
+    background: color-mix(in srgb, var(--text-primary) 8%, transparent);
   }
   .filter-chip .x {
     display: inline-flex;
@@ -789,21 +799,20 @@
   }
 
   /* Calls section --------------------------------------------------- */
-  /* Copied verbatim from
-     docs/superpowers/specs/2026-04-26-session-duration-ux-mockup.html
-     (.scale-axis and .calls rules, lines 498–516). */
+  /* Adapted from the session-duration UX mockup, with the raw colors mapped to
+     theme tokens. */
   .scale-axis {
     display: flex;
     justify-content: space-between;
     font-family: ui-monospace, monospace;
     font-size: 9px;
-    color: #666;
+    color: var(--text-muted);
     padding: 0 4px 5px;
-    border-bottom: 1px solid #232323;
+    border-bottom: 1px solid var(--border-muted);
     margin-bottom: 8px;
   }
   .scale-axis .now {
-    color: #6ad0a8;
+    color: var(--running-fg);
     font-weight: 500;
   }
   .calls {

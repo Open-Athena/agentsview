@@ -15,7 +15,7 @@ import sessionItemSource from "./SessionItem.svelte?raw";
 import { sessions } from "../../stores/sessions.svelte.js";
 import type { Session } from "../../api/types.js";
 import { starred } from "../../stores/starred.svelte.js";
-import { setLocale } from "../../i18n/index.js";
+import { m, setLocale } from "../../i18n/index.js";
 import {
   ITEM_HEIGHT,
   OVERSCAN,
@@ -81,6 +81,8 @@ describe("SessionList filter dropdown", () => {
     sessions.activeSessionId = null;
     sessions.nextCursor = null;
     sessions.loading = false;
+    sessions.selectedIds = new Set();
+    sessions.selectMode = false;
     sessions.sidebarIndexVersion++;
     sessions.hydratedSessionsByVersion = new Map([
       [sessions.sidebarIndexVersion, new Map()],
@@ -196,6 +198,17 @@ describe("SessionList filter dropdown", () => {
     expect(document.body.textContent).toContain("重命名");
     expect(document.body.textContent).toContain("在新标签页打开");
     expect(document.body.textContent).toContain("删除");
+
+    sessions.selectMode = true;
+    sessions.selectedIds = new Set(["translated-session"]);
+    await tick();
+
+    expect(document.body.textContent).toContain("已选择 1 个");
+    const batchSelectButton = document.querySelector<HTMLButtonElement>(
+      ".batch-select-all-btn",
+    );
+    expect(batchSelectButton?.textContent?.trim()).toBe("清除");
+    expect(document.body.textContent).toContain("取消");
   });
 });
 
@@ -225,6 +238,8 @@ describe("SessionList visible hydration", () => {
     sessions.activeSessionId = null;
     sessions.nextCursor = null;
     sessions.loading = false;
+    sessions.selectedIds = new Set();
+    sessions.selectMode = false;
     sessions.sidebarIndexVersion++;
     sessions.hydratedSessionsByVersion = new Map([
       [sessions.sidebarIndexVersion, new Map()],
@@ -534,6 +549,46 @@ describe("SessionList visible hydration", () => {
     expect(selectSession).toHaveBeenCalledWith("keyboard-session");
   });
 
+  it("toggles selection from the session link in select mode", async () => {
+    const selectSession = vi
+      .spyOn(sessions, "selectSession")
+      .mockImplementation(() => {});
+    sessions.sessions = [
+      makeSession({
+        id: "link-select-session",
+        display_name: "Link selection target",
+        is_index_only: false,
+      }),
+    ];
+    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(
+      undefined,
+    );
+
+    component = mount(SessionList, { target: document.body });
+    await tick();
+
+    const selectModeButton = document.querySelector<HTMLButtonElement>(
+      ".select-toggle-btn",
+    );
+    expect(selectModeButton).not.toBeNull();
+    selectModeButton!.click();
+    await tick();
+
+    const link = document.querySelector<HTMLAnchorElement>(
+      ".session-info-link",
+    );
+    expect(link).not.toBeNull();
+    const click = new MouseEvent("click", {
+      bubbles: true,
+      cancelable: true,
+    });
+    link!.dispatchEvent(click);
+
+    expect(click.defaultPrevented).toBe(true);
+    expect(selectSession).not.toHaveBeenCalled();
+    expect([...sessions.selectedIds]).toEqual(["link-select-session"]);
+  });
+
   it("keeps the non-link parts of the row selectable", async () => {
     const selectSession = vi
       .spyOn(sessions, "selectSession")
@@ -645,6 +700,107 @@ describe("SessionList visible hydration", () => {
     await tick();
 
     expect(document.querySelectorAll(".group-hint-icon")).toHaveLength(1);
+  });
+
+  it("selects only rendered session rows when selecting all visible", async () => {
+    sessions.sessions = [
+      makeSession({
+        id: "parent",
+        display_name: "Parent session",
+        started_at: "2024-01-01T00:00:00Z",
+        ended_at: "2024-01-01T00:01:00Z",
+        is_index_only: false,
+      }),
+      makeSession({
+        id: "child",
+        parent_session_id: "parent",
+        display_name: "Visible continuation",
+        started_at: "2024-01-01T00:02:00Z",
+        ended_at: "2024-01-01T00:03:00Z",
+        is_index_only: false,
+      }),
+    ];
+    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
+
+    component = mount(SessionList, { target: document.body });
+    await tick();
+
+    expect(
+      document.querySelector<HTMLElement>('[data-session-id="child"]'),
+    ).not.toBeNull();
+    expect(
+      document.querySelector<HTMLElement>('[data-session-id="parent"]'),
+    ).toBeNull();
+
+    const selectModeButton = document.querySelector<HTMLButtonElement>(
+      ".select-toggle-btn",
+    );
+    expect(selectModeButton).not.toBeNull();
+    selectModeButton!.click();
+    await tick();
+
+    const selectAllButton = document.querySelector<HTMLButtonElement>(
+      ".batch-select-all-btn",
+    );
+    expect(selectAllButton).not.toBeNull();
+    selectAllButton!.click();
+    await tick();
+
+    expect([...sessions.selectedIds]).toEqual(["child"]);
+  });
+
+  it("deletes only selected rows that are still rendered", async () => {
+    sessions.sessions = [
+      makeSession({
+        id: "visible",
+        display_name: "Visible session",
+        is_index_only: false,
+      }),
+      makeSession({
+        id: "hidden",
+        display_name: "Hidden session",
+        is_index_only: false,
+      }),
+    ];
+    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
+    const batchDelete = vi
+      .spyOn(sessions, "batchDeleteSessions")
+      .mockResolvedValue(undefined);
+
+    component = mount(SessionList, { target: document.body });
+    await tick();
+
+    const selectModeButton = document.querySelector<HTMLButtonElement>(
+      ".select-toggle-btn",
+    );
+    expect(selectModeButton).not.toBeNull();
+    selectModeButton!.click();
+    await tick();
+
+    const selectAllButton = document.querySelector<HTMLButtonElement>(
+      ".batch-select-all-btn",
+    );
+    expect(selectAllButton).not.toBeNull();
+    selectAllButton!.click();
+    await tick();
+    expect([...sessions.selectedIds]).toEqual(["visible", "hidden"]);
+
+    sessions.sessions = sessions.sessions.filter((s) => s.id !== "hidden");
+    await tick();
+
+    expect(document.querySelector('[data-session-id="hidden"]')).toBeNull();
+    expect(document.body.textContent).toContain(m.sidebar_selected_count({
+      countLabel: "1",
+    }));
+
+    const deleteButton = document.querySelector<HTMLButtonElement>(
+      ".batch-delete-btn",
+    );
+    expect(deleteButton).not.toBeNull();
+    deleteButton!.click();
+    await tick();
+
+    expect(batchDelete).toHaveBeenCalledWith(["visible"]);
   });
 
   it("does not auto-page when saved grouping starts collapsed", async () => {

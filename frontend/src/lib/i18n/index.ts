@@ -1,10 +1,17 @@
-import { setLocale as setParaglideLocale } from "../paraglide/runtime.js";
+import {
+  getLocale,
+  setLocale as setParaglideLocale,
+} from "../paraglide/runtime.js";
 
 export { m } from "../paraglide/messages.js";
+// Current BCP 47 tag (en / zh-CN / zh-TW) for kit-ui components that take a
+// `locale` prop, so their date/tooltip formatting follows the app language
+// setting instead of the browser locale.
+export { getLocale };
 
 export const DEFAULT_LOCALE = "en";
 export const LOCALE_STORAGE_KEY = "agentsview-locale";
-export const SUPPORTED_LOCALES = ["en", "zh-CN"] as const;
+export const SUPPORTED_LOCALES = ["en", "zh-CN", "zh-TW"] as const;
 
 export type SupportedLocale = typeof SUPPORTED_LOCALES[number];
 
@@ -18,6 +25,13 @@ function matchingLocale(value: string | null | undefined): SupportedLocale | nul
   if (normalized === "en" || normalized.startsWith("en-")) return "en";
   if (normalized === "zh-cn" || normalized.startsWith("zh-hans")) {
     return "zh-CN";
+  }
+  if (
+    normalized === "zh-tw" ||
+    normalized.startsWith("zh-tw-") ||
+    normalized.startsWith("zh-hant")
+  ) {
+    return "zh-TW";
   }
   return null;
 }
@@ -58,6 +72,13 @@ export function setLocale(value: SupportedLocale) {
   } catch {
     // Ignore storage failures; the active in-memory locale still changes.
   }
+}
+
+export function formatDateTime(
+  value: Date | number | string,
+  options: Intl.DateTimeFormatOptions = {},
+): string {
+  return new Intl.DateTimeFormat(getLocale(), options).format(new Date(value));
 }
 
 export function initI18n() {

@@ -8,6 +8,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/sync"
 )
 
@@ -16,82 +17,85 @@ type piebaldTestDB struct {
 	db   *sql.DB
 }
 
+const piebaldTestSchema = `
+	CREATE TABLE projects (
+		id INTEGER PRIMARY KEY,
+		directory TEXT NOT NULL,
+		name TEXT NOT NULL
+	);
+	CREATE TABLE chats (
+		id INTEGER PRIMARY KEY,
+		title TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		is_deleted BOOLEAN NOT NULL DEFAULT 0,
+		message_count INTEGER NOT NULL DEFAULT 0,
+		current_directory TEXT,
+		worktree_path TEXT,
+		branch_name TEXT,
+		project_id INTEGER
+	);
+	CREATE TABLE messages (
+		id INTEGER PRIMARY KEY,
+		parent_chat_id INTEGER NOT NULL,
+		parent_message_id INTEGER,
+		role TEXT NOT NULL,
+		model TEXT,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		input_tokens BIGINT,
+		output_tokens BIGINT,
+		reasoning_tokens BIGINT,
+		cache_read_tokens BIGINT,
+		cache_write_tokens BIGINT,
+		status TEXT NOT NULL,
+		finish_reason TEXT,
+		error TEXT,
+		enabled INTEGER NOT NULL DEFAULT 1
+	);
+	CREATE TABLE message_parts (
+		id INTEGER PRIMARY KEY,
+		parent_chat_message_id INTEGER NOT NULL,
+		part_index INTEGER NOT NULL,
+		part_type TEXT NOT NULL
+	);
+	CREATE TABLE message_part_text (
+		message_part_id INTEGER PRIMARY KEY,
+		is_thinking BOOLEAN NOT NULL DEFAULT FALSE
+	);
+	CREATE TABLE message_content_nodes (
+		id INTEGER PRIMARY KEY,
+		parent_text_part_id INTEGER NOT NULL,
+		node_index INTEGER NOT NULL,
+		node_type TEXT NOT NULL
+	);
+	CREATE TABLE message_node_text (
+		node_id INTEGER PRIMARY KEY,
+		content TEXT NOT NULL
+	);
+	CREATE TABLE message_part_tool_call (
+		message_part_id INTEGER PRIMARY KEY,
+		provider_tool_use_id TEXT NOT NULL,
+		tool_name TEXT NOT NULL,
+		tool_input TEXT NOT NULL,
+		tool_result TEXT,
+		tool_error TEXT,
+		tool_state TEXT NOT NULL DEFAULT 'pending',
+		sub_agent_chat_id INTEGER
+	);
+`
+
 func createPiebaldDB(t *testing.T, dir string) *piebaldTestDB {
 	t.Helper()
 	path := filepath.Join(dir, "app.db")
+	copySQLiteSchemaTemplate(
+		t, path, "piebald", &piebaldSchemaOnce,
+		&piebaldSchemaBytes, &piebaldSchemaErr,
+		piebaldTestSchema,
+	)
 	d, err := sql.Open("sqlite3", path)
 	require.NoError(t, err, "opening piebald test db")
 	t.Cleanup(func() { d.Close() })
-
-	schema := `
-		CREATE TABLE projects (
-			id INTEGER PRIMARY KEY,
-			directory TEXT NOT NULL,
-			name TEXT NOT NULL
-		);
-		CREATE TABLE chats (
-			id INTEGER PRIMARY KEY,
-			title TEXT NOT NULL,
-			created_at TEXT NOT NULL,
-			updated_at TEXT NOT NULL,
-			is_deleted BOOLEAN NOT NULL DEFAULT 0,
-			message_count INTEGER NOT NULL DEFAULT 0,
-			current_directory TEXT,
-			worktree_path TEXT,
-			branch_name TEXT,
-			project_id INTEGER
-		);
-		CREATE TABLE messages (
-			id INTEGER PRIMARY KEY,
-			parent_chat_id INTEGER NOT NULL,
-			parent_message_id INTEGER,
-			role TEXT NOT NULL,
-			model TEXT,
-			created_at TEXT NOT NULL,
-			updated_at TEXT NOT NULL,
-			input_tokens BIGINT,
-			output_tokens BIGINT,
-			reasoning_tokens BIGINT,
-			cache_read_tokens BIGINT,
-			cache_write_tokens BIGINT,
-			status TEXT NOT NULL,
-			finish_reason TEXT,
-			error TEXT,
-			enabled INTEGER NOT NULL DEFAULT 1
-		);
-		CREATE TABLE message_parts (
-			id INTEGER PRIMARY KEY,
-			parent_chat_message_id INTEGER NOT NULL,
-			part_index INTEGER NOT NULL,
-			part_type TEXT NOT NULL
-		);
-		CREATE TABLE message_part_text (
-			message_part_id INTEGER PRIMARY KEY,
-			is_thinking BOOLEAN NOT NULL DEFAULT FALSE
-		);
-		CREATE TABLE message_content_nodes (
-			id INTEGER PRIMARY KEY,
-			parent_text_part_id INTEGER NOT NULL,
-			node_index INTEGER NOT NULL,
-			node_type TEXT NOT NULL
-		);
-		CREATE TABLE message_node_text (
-			node_id INTEGER PRIMARY KEY,
-			content TEXT NOT NULL
-		);
-		CREATE TABLE message_part_tool_call (
-			message_part_id INTEGER PRIMARY KEY,
-			provider_tool_use_id TEXT NOT NULL,
-			tool_name TEXT NOT NULL,
-			tool_input TEXT NOT NULL,
-			tool_result TEXT,
-			tool_error TEXT,
-			tool_state TEXT NOT NULL DEFAULT 'pending',
-			sub_agent_chat_id INTEGER
-		);
-	`
-	_, err = d.Exec(schema)
-	require.NoError(t, err, "creating piebald schema")
 	return &piebaldTestDB{path: path, db: d}
 }
 
@@ -185,88 +189,78 @@ func (p *piebaldTestDB) addChatWithFork(t *testing.T, chatID int64) {
 	p.addTextPart(t, 1201, 201, 0, "Fork answer", false)
 }
 
-func TestSyncSingleSessionPiebaldFork(t *testing.T) {
-	env := setupTestEnv(t)
+func TestSyncPiebaldSingleBulkAndIncremental(t *testing.T) {
+
+	env := setupSingleAgentTestEnv(t, parser.AgentPiebald)
 	piebald := createPiebaldDB(t, env.piebaldDir)
 	piebald.addChatWithFork(t, 42)
-
-	require.NoError(t, env.engine.SyncSingleSession("piebald:42-200"), "SyncSingleSession(fork)")
-	assertSessionMessageCount(t, env.db, "piebald:42-200", 2)
-	assertSessionMessageCount(t, env.db, "piebald:42", 4)
-
-	src := env.engine.FindSourceFile("piebald:42-200")
-	wantSrc := filepath.Join(env.piebaldDir, "app.db")
-	assert.Equal(t, wantSrc, src)
-
-	mtime := env.engine.SourceMtime("piebald:42-200")
-	assert.NotZero(t, mtime, "SourceMtime(fork) returned zero")
-}
-
-func TestSyncSingleSessionPiebaldUnknownFork(t *testing.T) {
-	env := setupTestEnv(t)
-	piebald := createPiebaldDB(t, env.piebaldDir)
-	piebald.addChatWithFork(t, 42)
-
-	err := env.engine.SyncSingleSession("piebald:42-999")
-	require.Error(t, err, "SyncSingleSession(piebald:42-999) returned nil; want not-found error")
-	src := env.engine.FindSourceFile("piebald:42-999")
-	assert.Empty(t, src, "FindSourceFile(piebald:42-999)")
-	mtime := env.engine.SourceMtime("piebald:42-999")
-	assert.Zero(t, mtime, "SourceMtime(piebald:42-999)")
-}
-
-func TestSyncEnginePiebaldBulkSync(t *testing.T) {
-	env := setupTestEnv(t)
-	piebald := createPiebaldDB(t, env.piebaldDir)
-	piebald.addChat(t, 42, "Piebald Bulk Sync", "Please add Piebald support.", "Added Piebald support.", "2026-05-01T10:05:00Z")
-
-	runSyncAndAssert(t, env.engine, sync.SyncStats{TotalSessions: 1, Synced: 1, Skipped: 0})
-	assertSessionProject(t, env.db, "piebald:42", "app")
-	assertSessionMessageCount(t, env.db, "piebald:42", 2)
-	assertMessageRoles(t, env.db, "piebald:42", "user", "assistant")
-	assertToolCallCount(t, env.db, "piebald:42", 1)
-	assertMessageContent(t, env.db, "piebald:42", "Please add Piebald support.", "Added Piebald support.")
-
-	runSyncAndAssert(t, env.engine, sync.SyncStats{TotalSessions: 0, Synced: 0, Skipped: 0})
-}
-
-func TestSyncSingleSessionPiebald(t *testing.T) {
-	env := setupTestEnv(t)
-	piebald := createPiebaldDB(t, env.piebaldDir)
 	piebald.addChat(t, 7, "Single Piebald", "One chat.", "One answer.", "2026-05-01T10:05:00Z")
+	piebald.addChat(t, 100, "Piebald Bulk Sync", "Please add Piebald support.", "Added Piebald support.", "2026-05-01T10:06:00Z")
+	piebald.addChat(t, 301, "Chat A", "Prompt A.", "Answer A.", "2026-05-01T10:01:00Z")
+	piebald.addChat(t, 302, "Chat B", "Prompt B.", "Answer B.", "2026-05-01T10:02:00Z")
 
-	require.NoError(t, env.engine.SyncSingleSession("piebald:7"), "SyncSingleSession")
-	assertSessionProject(t, env.db, "piebald:7", "app")
-	assertSessionMessageCount(t, env.db, "piebald:7", 2)
+	t.Run("fork", func(t *testing.T) {
+		require.NoError(t, env.engine.SyncSingleSession("piebald:42-200"), "SyncSingleSession(fork)")
+		assertSessionMessageCount(t, env.db, "piebald:42-200", 2)
+		assertSessionMessageCount(t, env.db, "piebald:42", 4)
 
-	src := env.engine.FindSourceFile("piebald:7")
-	wantSrc := filepath.Join(env.piebaldDir, "app.db")
-	assert.Equal(t, wantSrc, src)
+		src := env.engine.FindSourceFile("piebald:42-200")
+		// Piebald is a provider-authoritative DB-backed provider. A fork session
+		// resolves to its base chat virtual <db>#<chatID> path, matching the
+		// stored session file_path the provider re-parses.
+		wantSrc := filepath.Join(env.piebaldDir, "app.db") + "#42"
+		assert.Equal(t, wantSrc, src)
 
-	mtime := env.engine.SourceMtime("piebald:7")
-	require.NotZero(t, mtime, "SourceMtime returned zero")
+		mtime := env.engine.SourceMtime("piebald:42-200")
+		assert.NotZero(t, mtime, "SourceMtime(fork) returned zero")
+	})
 
-	_, storedMtime, ok := env.db.GetSessionFileInfo("piebald:7")
-	require.True(t, ok, "session file info not found")
-	assert.Equal(t, mtime, storedMtime)
-}
+	t.Run("unknown fork", func(t *testing.T) {
+		err := env.engine.SyncSingleSession("piebald:42-999")
+		require.Error(t, err, "SyncSingleSession(piebald:42-999) returned nil; want not-found error")
+		src := env.engine.FindSourceFile("piebald:42-999")
+		assert.Empty(t, src, "FindSourceFile(piebald:42-999)")
+		mtime := env.engine.SourceMtime("piebald:42-999")
+		assert.Zero(t, mtime, "SourceMtime(piebald:42-999)")
+	})
 
-func TestSyncPiebaldMultiChatIncremental(t *testing.T) {
-	env := setupTestEnv(t)
-	piebald := createPiebaldDB(t, env.piebaldDir)
-	piebald.addChat(t, 1, "Chat A", "Prompt A.", "Answer A.", "2026-05-01T10:01:00Z")
-	piebald.addChat(t, 2, "Chat B", "Prompt B.", "Answer B.", "2026-05-01T10:02:00Z")
+	t.Run("chat", func(t *testing.T) {
+		require.NoError(t, env.engine.SyncSingleSession("piebald:7"), "SyncSingleSession")
+		assertSessionProject(t, env.db, "piebald:7", "app")
+		assertSessionMessageCount(t, env.db, "piebald:7", 2)
 
-	runSyncAndAssert(t, env.engine, sync.SyncStats{TotalSessions: 2, Synced: 2, Skipped: 0})
-	_, storedMtimeA, okA := env.db.GetSessionFileInfo("piebald:1")
+		src := env.engine.FindSourceFile("piebald:7")
+		// Piebald resolves the per-session virtual <db>#<chatID> path the provider
+		// parses, matching the stored session file_path.
+		wantSrc := filepath.Join(env.piebaldDir, "app.db") + "#7"
+		assert.Equal(t, wantSrc, src)
+
+		mtime := env.engine.SourceMtime("piebald:7")
+		require.NotZero(t, mtime, "SourceMtime returned zero")
+
+		_, storedMtime, ok := env.db.GetSessionFileInfo("piebald:7")
+		require.True(t, ok, "session file info not found")
+		assert.Equal(t, mtime, storedMtime)
+	})
+
+	runSyncAndAssert(t, env.engine, sync.SyncStats{TotalSessions: 3, Synced: 3, Skipped: 0})
+	assertSessionProject(t, env.db, "piebald:100", "app")
+	assertSessionMessageCount(t, env.db, "piebald:100", 2)
+	assertMessageRoles(t, env.db, "piebald:100", "user", "assistant")
+	assertToolCallCount(t, env.db, "piebald:100", 1)
+	assertMessageContent(t, env.db, "piebald:100", "Please add Piebald support.", "Added Piebald support.")
+
+	_, storedMtimeA, okA := env.db.GetSessionFileInfo("piebald:301")
 	require.True(t, okA, "session A file info not found after initial sync")
 
+	runSyncAndAssert(t, env.engine, sync.SyncStats{TotalSessions: 0, Synced: 0, Skipped: 0})
+
 	piebald.mustExec(t, "update B updated_at",
-		`UPDATE chats SET updated_at = '2026-05-01T10:03:00Z' WHERE id = 2`,
+		`UPDATE chats SET updated_at = '2026-05-01T10:03:00Z' WHERE id = 302`,
 	)
 
 	runSyncAndAssert(t, env.engine, sync.SyncStats{TotalSessions: 1, Synced: 1, Skipped: 0})
-	_, storedMtimeA2, okA2 := env.db.GetSessionFileInfo("piebald:1")
+	_, storedMtimeA2, okA2 := env.db.GetSessionFileInfo("piebald:301")
 	require.True(t, okA2, "session A file info not found after partial sync")
 	assert.Equal(t, storedMtimeA, storedMtimeA2, "A's stored mtime changed")
 }

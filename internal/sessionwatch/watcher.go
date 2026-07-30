@@ -7,6 +7,7 @@ import (
 	"context"
 	"log"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"go.kenn.io/agentsview/internal/db"
@@ -27,6 +28,38 @@ const (
 	// through the normal SyncPaths pipeline.
 	SyncFallbackDelay = 5 * time.Second
 )
+
+var (
+	pollIntervalNanos      int64 = int64(PollInterval)
+	syncFallbackDelayNanos int64 = int64(SyncFallbackDelay)
+)
+
+func pollInterval() time.Duration {
+	return time.Duration(atomic.LoadInt64(&pollIntervalNanos))
+}
+
+func syncFallbackDelay() time.Duration {
+	return time.Duration(atomic.LoadInt64(&syncFallbackDelayNanos))
+}
+
+// SetTimingsForTest overrides watcher timing knobs and returns a restore
+// function. It is intended for tests that exercise polling behavior without
+// paying production-scale intervals.
+func SetTimingsForTest(
+	pollIntervalOverride time.Duration,
+	syncFallbackDelayOverride time.Duration,
+) func() {
+	oldPoll := atomic.SwapInt64(
+		&pollIntervalNanos, int64(pollIntervalOverride),
+	)
+	oldFallback := atomic.SwapInt64(
+		&syncFallbackDelayNanos, int64(syncFallbackDelayOverride),
+	)
+	return func() {
+		atomic.StoreInt64(&pollIntervalNanos, oldPoll)
+		atomic.StoreInt64(&syncFallbackDelayNanos, oldFallback)
+	}
+}
 
 // Watcher emits a tick on Events() each time the session's DB state
 // changes, with an optional file-mtime-triggered direct sync when the
@@ -56,13 +89,11 @@ func (w *Watcher) Events(
 	ctx context.Context, sessionID string,
 ) <-chan struct{} {
 	ch := make(chan struct{})
+	lastCount, lastDBVersion, _ := w.db.GetSessionVersion(
+		sessionID,
+	)
 	go func() {
 		defer close(ch)
-
-		// Seed initial state from the database.
-		lastCount, lastDBVersion, _ := w.db.GetSessionVersion(
-			sessionID,
-		)
 
 		if w.engine == nil {
 			// PG read mode: poll GetSessionVersion only,
@@ -80,7 +111,7 @@ func (w *Watcher) Events(
 			lastFileMtime = w.engine.SourceMtime(sessionID)
 		}
 
-		ticker := time.NewTicker(PollInterval)
+		ticker := time.NewTicker(pollInterval())
 		defer ticker.Stop()
 
 		for {
@@ -116,7 +147,7 @@ func (w *Watcher) pollDBOnly(
 	ctx context.Context, ch chan<- struct{},
 	sessionID string, lastCount int, lastDBVersion int64,
 ) {
-	ticker := time.NewTicker(PollInterval)
+	ticker := time.NewTicker(pollInterval())
 	defer ticker.Stop()
 
 	for {
@@ -171,7 +202,7 @@ func (w *Watcher) checkDBForChanges(
 		*lastFileMtime = w.engine.SourceMtime(sessionID)
 		// Source file (re-)resolved — trigger fallback sync
 		// immediately since content likely differs from DB.
-		past := time.Now().Add(-SyncFallbackDelay)
+		past := time.Now().Add(-syncFallbackDelay())
 		*fileMtimeChangedAt = past
 	}
 
@@ -196,7 +227,7 @@ func (w *Watcher) checkDBForChanges(
 	// updated within SyncFallbackDelay, trigger a direct
 	// sync.
 	if !fileMtimeChangedAt.IsZero() &&
-		time.Since(*fileMtimeChangedAt) >= SyncFallbackDelay {
+		time.Since(*fileMtimeChangedAt) >= syncFallbackDelay() {
 		*fileMtimeChangedAt = time.Time{}
 		if err := w.engine.SyncSingleSession(
 			sessionID,

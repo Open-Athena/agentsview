@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { m } from "../../i18n/index.js";
   import { onMount, onDestroy, untrack } from "svelte";
   import { analytics } from "../../stores/analytics.svelte.js";
   import { insights } from "../../stores/insights.svelte.js";
@@ -7,6 +8,7 @@
   import { sessions } from "../../stores/sessions.svelte.js";
   import { sync } from "../../stores/sync.svelte.js";
   import { events } from "../../stores/events.svelte.js";
+  import { downloadInsightExport } from "../../api/client.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
   import {
     yokedDates,
@@ -30,8 +32,7 @@
     SignalCalibration,
     SignalSessionExample,
   } from "../../api/types.js";
-  import CopyButton from "../shared/CopyButton.svelte";
-  import OptionTypeahead from "../layout/OptionTypeahead.svelte";
+  import { CopyButton, IconButton, Typeahead } from "@kenn-io/kit-ui";
   import ProjectTypeahead from "../layout/ProjectTypeahead.svelte";
   import RangePicker from "../shared/RangePicker.svelte";
   import {
@@ -79,11 +80,12 @@
   );
   const loading = $derived(analytics.loading.signals);
   const error = $derived(analytics.errors.signals);
-  const readOnly = $derived(
-    sync.serverVersion?.read_only === true,
+  const insightGenerationAvailable = $derived(
+    sync.serverVersion?.insight_generation_available === true ||
+      sync.serverVersion?.read_only !== true,
   );
   const generationUnavailable = $derived(
-    sync.serverVersion === null || readOnly,
+    sync.serverVersion === null || !insightGenerationAvailable,
   );
   const earliestSession = $derived(sync.stats?.earliest_session ?? null);
   const rangeSelection = $derived(
@@ -123,8 +125,8 @@
     return [
       {
         name: "",
-        label: "All Agents",
-        displayLabel: "All Agents",
+        label: m.insights_page_all_agents(),
+        displayLabel: m.insights_page_all_agents(),
         count: 0,
       },
       ...opts,
@@ -135,22 +137,22 @@
     label: agentLabel(name),
     displayLabel: agentLabel(name),
   }));
-  const templateOptions = [
-    { name: "prompt_maturity_review", label: "Prompt Maturity" },
-    { name: "context_setup_review", label: "Context Setup" },
-    { name: "workflow_hygiene_review", label: "Workflow Hygiene" },
-    { name: "tool_reliability_review", label: "Tool Reliability" },
-    { name: "model_cost_review", label: "Model and Cost" },
+  const templateOptions = $derived([
+    { name: "prompt_maturity_review", label: m.insights_page_template_prompt_maturity() },
+    { name: "context_setup_review", label: m.insights_page_template_context_setup() },
+    { name: "workflow_hygiene_review", label: m.insights_page_template_workflow_hygiene() },
+    { name: "tool_reliability_review", label: m.insights_page_template_tool_reliability() },
+    { name: "model_cost_review", label: m.insights_page_template_model_cost() },
     {
       name: "instruction_opportunity_review",
-      label: "Instruction Opportunities",
+      label: m.insights_page_template_instruction_opportunities(),
     },
-  ];
-  const scopeOptions = [
-    { name: "human", label: "No automated" },
-    { name: "all", label: "Both" },
-    { name: "automated", label: "Only automated" },
-  ];
+  ]);
+  const scopeOptions = $derived([
+    { name: "human", label: m.insights_page_scope_no_automated() },
+    { name: "all", label: m.insights_page_scope_both() },
+    { name: "automated", label: m.insights_page_scope_only_automated() },
+  ]);
 
   function applyRange(sel: RangeSelection) {
     let state: PanelDateState | null = null;
@@ -400,7 +402,7 @@
       ) {
         signalExamples = [];
         signalExamplesError =
-          err instanceof Error ? err.message : "Could not load examples";
+          err instanceof Error ? err.message : m.insights_page_could_not_load_examples();
       }
     } finally {
       if (
@@ -492,7 +494,7 @@
 
   function formatDateRange(from: string, to: string): string {
     if (from === to) return formatDate(from);
-    return `${formatDate(from)} to ${formatDate(to)}`;
+    return m.insights_page_date_range({ from: formatDate(from), to: formatDate(to) });
   }
 
   function formatDate(date: string): string {
@@ -514,21 +516,21 @@
   function severityLabel(severity: QualityPatternSeverity): string {
     switch (severity) {
       case "critical":
-        return "Critical";
+        return m.insights_page_severity_critical();
       case "warning":
-        return "Warning";
+        return m.insights_page_severity_warning();
       case "watch":
-        return "Watch";
+        return m.insights_page_severity_watch();
       case "clear":
-        return "Clear";
+        return m.insights_page_severity_clear();
       case "unavailable":
-        return "No data";
+        return m.insights_page_severity_unavailable();
     }
   }
 
   function affectedLabel(pattern: QualityPatternView): string {
-    if (pattern.totalSessions === 0) return "No computed sessions";
-    return `${pattern.affectedSessions} of ${pattern.totalSessions} sessions`;
+    if (pattern.totalSessions === 0) return m.insights_page_no_computed_sessions();
+    return m.insights_page_affected_sessions({ affected: pattern.affectedSessions, total: pattern.totalSessions });
   }
 
   function pct(count: number, total: number): number {
@@ -546,23 +548,23 @@
 
   function calibrationLabel(signal: string): string {
     if (signal.startsWith("outcome_")) {
-      return "Outcome cohort";
+      return m.insights_page_calibration_outcome_cohort();
     }
     const calibration = calibrationFor(signal);
     if (!calibration) {
-      return "Examples only";
+      return m.insights_page_calibration_examples_only();
     }
     if (calibration.affected_sessions === 0) {
-      return "No affected sessions";
+      return m.insights_page_calibration_no_affected();
     }
     if (calibration.incomplete_lift == null) {
-      return `${calibration.affected_incomplete_rate}% incomplete`;
+      return m.insights_page_calibration_incomplete_rate({ rate: calibration.affected_incomplete_rate });
     }
-    return `${calibration.incomplete_lift.toFixed(1)}x incomplete`;
+    return m.insights_page_calibration_incomplete_lift({ lift: calibration.incomplete_lift.toFixed(1) });
   }
 
   function selectedSignalLabel(): string {
-    if (!selectedSignalId) return "Signal examples";
+    if (!selectedSignalId) return m.insights_page_signal_examples();
     for (const pattern of patterns) {
       const found = pattern.drivers.find(
         (driver) => driver.id === selectedSignalId,
@@ -573,9 +575,9 @@
   }
 
   function qualityBadge(example: SignalSessionExample): string {
-    if (example.health_grade) return `Grade ${example.health_grade}`;
+    if (example.health_grade) return m.insights_page_grade_badge({ grade: example.health_grade });
     if (example.health_score != null) return String(example.health_score);
-    return "Unscored";
+    return m.insights_page_unscored();
   }
 
   function cannedKindLabel(
@@ -583,19 +585,19 @@
   ): string {
     switch (kind) {
       case "prompt_maturity_review":
-        return "Prompt Maturity";
+        return m.insights_page_template_prompt_maturity();
       case "context_setup_review":
-        return "Context Setup";
+        return m.insights_page_template_context_setup();
       case "workflow_hygiene_review":
-        return "Workflow Hygiene";
+        return m.insights_page_template_workflow_hygiene();
       case "tool_reliability_review":
-        return "Tool Reliability";
+        return m.insights_page_template_tool_reliability();
       case "model_cost_review":
-        return "Model and Cost";
+        return m.insights_page_template_model_cost();
       case "instruction_opportunity_review":
-        return "Instruction Opportunities";
+        return m.insights_page_template_instruction_opportunities();
       default:
-        return "Generated Recommendation";
+        return m.insights_page_generated_recommendation();
     }
   }
 
@@ -604,14 +606,33 @@
     kind: CannedInsightKind | "" | undefined,
   ): string {
     if (type === "llm_canned") return cannedKindLabel(kind);
-    if (type === "agent_analysis") return "Agent Analysis";
-    return "Activity";
+    if (type === "agent_analysis") return m.insights_page_agent_analysis();
+    return m.insights_page_activity();
   }
 
   function cacheStatusLabel(status: string | undefined): string {
-    if (status === "hit") return "cache hit";
-    if (status === "fresh") return "fresh";
+    if (status === "hit") return m.insights_page_cache_hit();
+    if (status === "fresh") return m.insights_page_fresh();
     return "";
+  }
+
+  async function handleInsightExport() {
+    if (!insights.selectedItem) return;
+    try {
+      await downloadInsightExport(insights.selectedItem.id);
+    } catch (error) {
+      console.error("Insight export failed:", error);
+    }
+  }
+
+  function openInsightPublish(secret: boolean) {
+    if (!insights.selectedItem) return;
+    ui.publishSecret = secret;
+    ui.setPublishTarget({
+      kind: "insight",
+      id: insights.selectedItem.id,
+    });
+    ui.activeModal = "publish";
   }
 
   onMount(() => {
@@ -717,41 +738,41 @@
         value={analytics.project}
         onselect={handleProjectChange}
       />
-      <OptionTypeahead
+      <Typeahead
         options={agentOptions}
         value={analytics.agent}
         fallbackLabel={analytics.agent
           ? agentLabel(analytics.agent)
-          : "All Agents"}
-        placeholder="Filter agents..."
-        title="Filter insights by agent"
-        emptyLabel="No matching agents"
+          : m.insights_page_all_agents()}
+        placeholder={m.insights_page_filter_agents()}
+        title={m.insights_page_filter_by_agent()}
+        emptyLabel={m.insights_page_no_matching_agents()}
         onselect={handleAgentChange}
       />
       <label class="toolbar-scope">
-        <span>Session scope</span>
-        <OptionTypeahead
+        <span>{m.insights_page_session_scope()}</span>
+        <Typeahead
           options={scopeOptions}
           value={analytics.automatedScope}
-          fallbackLabel="No automated"
-          placeholder="Filter scopes..."
-          title="Filter insights by session scope"
-          emptyLabel="No matching scopes"
+          fallbackLabel={m.insights_page_scope_no_automated()}
+          placeholder={m.insights_page_filter_scopes()}
+          title={m.insights_page_filter_by_scope()}
+          emptyLabel={m.insights_page_no_matching_scopes()}
           onselect={handleAutomatedScopeChange}
         />
       </label>
     </div>
 
-    <button
-      class="icon-btn"
+    <IconButton
+      class="toolbar-refresh"
       onclick={handleRefresh}
-      title="Refresh insights"
-      aria-label="Refresh insights"
+      title={m.insights_page_refresh()}
+      ariaLabel={m.insights_page_refresh()}
     >
       <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
         <path d="M8 3a5 5 0 00-4.546 2.914.5.5 0 01-.908-.418A6 6 0 0114 8a.5.5 0 01-1 0 5 5 0 00-5-5zm4.546 7.086a.5.5 0 01.908.418A6 6 0 012 8a.5.5 0 011 0 5 5 0 005 5 5 5 0 004.546-2.914z"/>
       </svg>
-    </button>
+    </IconButton>
   </header>
 
   <main class="content">
@@ -759,25 +780,36 @@
       <div class="section-heading compact">
         <div>
           <div class="eyebrow">
-            <span class="badge rule">Rule-based</span>
-            <span>Next actions</span>
+            <span class="badge rule">{m.insights_page_rule_based()}</span>
+            <span>{m.insights_page_next_actions()}</span>
           </div>
-          <h2 id="actions-title">Deterministic Recommendations</h2>
+          <h2 id="actions-title">{m.insights_page_deterministic_recommendations()}</h2>
         </div>
+        <p class="insights-help">
+          {m.insights_page_insights_help_intro()}
+          <a
+            href="https://www.agentsview.io/insights/"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="insights-help-link"
+          >
+            {m.insights_page_insights_help_docs()}
+          </a>
+        </p>
       </div>
 
       {#if recommendations.length === 0}
         <div class="state-panel compact-state">
-          <strong>No rule-based actions are firing.</strong>
+          <strong>{m.insights_page_no_rule_actions()}</strong>
           <span>
-            Patterns are clear or unavailable for the current filters.
+            {m.insights_page_patterns_clear()}
           </span>
         </div>
       {:else}
         <div class="recommendation-list">
           {#each recommendations as rec}
             <article class="recommendation">
-              <span class="badge rule">Rule-based</span>
+              <span class="badge rule">{m.insights_page_rule_based()}</span>
               <strong>{rec.label}</strong>
               <p>{rec.rationale}</p>
             </article>
@@ -790,14 +822,13 @@
       <div class="section-heading">
         <div>
           <div class="eyebrow">
-            <span class="badge rule">Rule-based</span>
-            <span>Scored facts</span>
+            <span class="badge rule">{m.insights_page_rule_based()}</span>
+            <span>{m.insights_page_scored_facts()}</span>
           </div>
-          <h2 id="facts-title">Quality Patterns</h2>
+          <h2 id="facts-title">{m.insights_page_quality_patterns()}</h2>
         </div>
         <p>
-          Deterministic counts from persisted session signals for
-          {formatDateRange(analytics.from, analytics.to)}.
+          {m.insights_page_deterministic_counts({ range: formatDateRange(analytics.from, analytics.to) })}
         </p>
       </div>
 
@@ -814,31 +845,29 @@
         </div>
       {:else if error && !signals}
         <div class="state-panel error" role="alert">
-          <strong>Could not load deterministic insights.</strong>
+          <strong>{m.insights_page_could_not_load()}</strong>
           <span>{error}</span>
           <button onclick={fetchInsightSignals}>
-            Retry
+            {m.insights_page_retry()}
           </button>
         </div>
       {:else if !hasData}
         <div class="state-panel">
-          <strong>No scored quality data for this range.</strong>
+          <strong>{m.insights_page_no_scored_data()}</strong>
           <span>
-            Sync or backfill sessions with Phase 3 quality signals to
-            populate prompt, context, workflow, and tool patterns.
+            {m.insights_page_no_scored_data_hint()}
           </span>
         </div>
       {:else}
         {#if error}
           <div class="inline-warning" role="status">
-            Showing cached deterministic data. Latest refresh failed:
-            {error}
+            {m.insights_page_cached_warning({ error })}
           </div>
         {/if}
 
         <div class="summary-grid">
           <article class="summary-card">
-            <span class="label">Average score</span>
+            <span class="label">{m.insights_page_average_score()}</span>
             <strong>
               {summary.avgHealthScore == null
                 ? "--"
@@ -846,28 +875,28 @@
             </strong>
             <span>
               {summary.avgHealthScore == null
-                ? "No scored sessions"
-                : `Grade ${scoreToGrade(summary.avgHealthScore)}`}
+                ? m.insights_page_no_scored_sessions()
+                : m.insights_page_grade_badge({ grade: scoreToGrade(summary.avgHealthScore) })}
             </span>
           </article>
           <article class="summary-card">
-            <span class="label">Scored sessions</span>
+            <span class="label">{m.insights_page_scored_sessions()}</span>
             <strong>{summary.scoredSessions}</strong>
-            <span>{summary.unscoredSessions} unscored</span>
+            <span>{m.insights_page_unscored_count({ count: summary.unscoredSessions })}</span>
           </article>
           <article class="summary-card">
-            <span class="label">Low quality</span>
+            <span class="label">{m.insights_page_low_quality()}</span>
             <strong>{summary.lowQualitySessions}</strong>
-            <span>D/F graded sessions</span>
+            <span>{m.insights_page_df_graded()}</span>
           </article>
           <article class="summary-card">
-            <span class="label">Prompt signals</span>
+            <span class="label">{m.insights_page_prompt_signals()}</span>
             <strong>{summary.computedQualitySessions}</strong>
-            <span>sessions computed</span>
+            <span>{m.insights_page_sessions_computed()}</span>
           </article>
         </div>
 
-        <div class="distribution-row" aria-label="Score distribution">
+        <div class="distribution-row" aria-label={m.insights_page_score_distribution()}>
           {#each summary.scoreDistribution as bucket}
             <div class="grade-bar">
               <span>{bucket.grade}</span>
@@ -903,8 +932,7 @@
               <div class="affected">
                 <strong>{affectedLabel(pattern)}</strong>
                 <span>
-                  {pct(pattern.affectedSessions, pattern.totalSessions)}%
-                  affected
+                  {m.insights_page_pct_affected({ pct: pct(pattern.affectedSessions, pattern.totalSessions) })}
                 </span>
               </div>
 
@@ -920,7 +948,10 @@
                     <strong>
                       {driver.total}{driver.unit ?? ""}
                     </strong>
-                    <em>{driver.sessions} sessions</em>
+                    <em>{m.insights_page_driver_sessions({
+                      count: driver.sessions,
+                      countLabel: driver.sessions.toLocaleString(),
+                    })}</em>
                     <small>{calibrationLabel(String(driver.id))}</small>
                   </button>
                 {/each}
@@ -959,7 +990,7 @@
           <section class="evidence-panel" aria-live="polite">
             <div class="evidence-head">
               <div>
-                <span class="examples-label">Session evidence</span>
+                <span class="examples-label">{m.insights_page_session_evidence()}</span>
                 <h3>{selectedSignalLabel()}</h3>
               </div>
               <button
@@ -972,16 +1003,16 @@
                   signalExamplesFilterKey = null;
                 }}
               >
-                Close
+                {m.insights_page_close()}
               </button>
             </div>
             {#if signalExamplesLoading}
-              <p class="evidence-state">Loading examples...</p>
+              <p class="evidence-state">{m.insights_page_loading_examples()}</p>
             {:else if signalExamplesError}
               <p class="evidence-state error">{signalExamplesError}</p>
             {:else if signalExamples.length === 0}
               <p class="evidence-state">
-                No sessions currently trigger this signal in the selected filters.
+                {m.insights_page_no_triggering_sessions()}
               </p>
             {:else}
               <div class="evidence-list">
@@ -996,14 +1027,14 @@
                       openEvidenceSession(example, event)}
                   >
                     <span class="evidence-main">
-                      <strong>{example.project || "Unassigned project"}</strong>
-                      <em>{example.excerpt || "No prompt excerpt available"}</em>
+                      <strong>{example.project || m.insights_page_unassigned_project()}</strong>
+                      <em>{example.excerpt || m.insights_page_no_excerpt()}</em>
                     </span>
                     <span class="evidence-meta">
                       <span>{agentLabel(example.agent)}</span>
-                      <span>{example.outcome || "unknown"}</span>
+                      <span>{example.outcome || m.insights_page_unknown()}</span>
                       <span>{qualityBadge(example)}</span>
-                      <span>{example.failure_signals} failures</span>
+                      <span>{m.insights_page_failures({ count: example.failure_signals })}</span>
                     </span>
                   </a>
                 {/each}
@@ -1021,53 +1052,51 @@
       <div class="section-heading">
         <div>
           <div class="eyebrow">
-            <span class="badge generated">Generated</span>
-            <span>Separate from scored facts</span>
+            <span class="badge generated">{m.insights_page_generated()}</span>
+            <span>{m.insights_page_separate_from_facts()}</span>
           </div>
-          <h2 id="generated-title">Generated Insights Archive</h2>
+          <h2 id="generated-title">{m.insights_page_generated_archive()}</h2>
         </div>
         <p>
-          Saved generated text is shown separately and does not affect
-          deterministic quality scores. Creation remains out of scope
-          for this deterministic phase.
+          {m.insights_page_generated_archive_hint()}
         </p>
       </div>
 
       <div class="generated-controls">
         <label class="generated-control">
-          <span>Template</span>
-          <OptionTypeahead
+          <span>{m.insights_page_template_label()}</span>
+          <Typeahead
             options={templateOptions}
             value={insights.cannedKind}
             fallbackLabel={cannedKindLabel(insights.cannedKind)}
-            placeholder="Filter templates..."
-            title="Select template"
-            emptyLabel="No matching templates"
+            placeholder={m.insights_page_filter_templates()}
+            title={m.insights_page_select_template()}
+            emptyLabel={m.insights_page_no_matching_templates()}
             onselect={handleCannedKindChange}
           />
         </label>
 
         <label class="generated-control">
-          <span>Generator</span>
-          <OptionTypeahead
+          <span>{m.insights_page_generator_label()}</span>
+          <Typeahead
             options={generationAgentOptions}
             value={insights.agent}
             fallbackLabel={agentLabel(insights.agent)}
-            placeholder="Filter generators..."
-            title="Select generator"
-            emptyLabel="No matching generators"
+            placeholder={m.insights_page_filter_generators()}
+            title={m.insights_page_select_generator()}
+            emptyLabel={m.insights_page_no_matching_generators()}
             onselect={handleInsightAgentChange}
           />
         </label>
 
         <label class="generated-control focus-control">
-          <span>Optional focus</span>
+          <span>{m.insights_page_optional_focus()}</span>
           <textarea
             class="generated-focus"
             value={insights.promptText}
             maxlength="1200"
             rows="2"
-            placeholder="Narrow the recommendation without changing scored facts"
+            placeholder={m.insights_page_focus_placeholder()}
             oninput={handlePromptChange}
           ></textarea>
         </label>
@@ -1075,24 +1104,22 @@
         <button
           class="generate-action"
           disabled={generationUnavailable}
-          title={readOnly
-            ? "Generation is disabled in read-only mode"
-            : "Generate quality recommendation"}
+          title={sync.serverVersion !== null && !insightGenerationAvailable
+            ? m.insights_page_generate_disabled()
+            : m.insights_page_generate_title()}
           onclick={handleGenerateCanned}
         >
-          Generate
+          {m.insights_page_generate()}
         </button>
       </div>
 
       {#if insights.loading}
-        <div class="state-panel compact-state">Loading archive...</div>
+        <div class="state-panel compact-state">{m.insights_page_loading_archive()}</div>
       {:else if insights.items.length === 0 && insights.tasks.length === 0}
         <div class="state-panel compact-state">
-          <strong>No generated insights saved.</strong>
+          <strong>{m.insights_page_no_generated_saved()}</strong>
           <span>
-            The deterministic dashboard above works without LLM
-            configuration. Generated insight creation is reserved for
-            the generated-insights phase.
+            {m.insights_page_no_generated_hint()}
           </span>
         </div>
       {:else}
@@ -1104,8 +1131,8 @@
                 class:error-task={task.status === "error"}
                 onclick={() => selectGeneratedTask(task.clientId)}
               >
-                <span>{task.status === "error" ? "Error" : "Running"}</span>
-                <strong>{task.project || "global"}</strong>
+                <span>{task.status === "error" ? m.insights_page_error() : m.insights_page_running()}</span>
+                <strong>{task.project || m.insights_page_global()}</strong>
                 <em>
                   {task.kind ? cannedKindLabel(task.kind) : task.phase}
                 </em>
@@ -1119,7 +1146,7 @@
                 <span>
                   {insightTypeLabel(item.type, item.kind)}
                 </span>
-                <strong>{item.project || "global"}</strong>
+                <strong>{item.project || m.insights_page_global()}</strong>
                 <em>
                   {formatDateRange(item.date_from, item.date_to)}
                   · {formatTime(item.created_at)}
@@ -1133,8 +1160,8 @@
               <div class="generated-detail-head">
                 <span class="badge generated">
                   {insights.selectedTask.status === "error"
-                    ? "Generation error"
-                    : "Generating"}
+                    ? m.insights_page_generation_error()
+                    : m.insights_page_generating()}
                 </span>
                 {#if insights.selectedTask.status === "error"}
                   <div class="generated-actions">
@@ -1146,7 +1173,7 @@
                           insights.selectedTask!.clientId,
                         )}
                     >
-                      Retry
+                      {m.insights_page_retry()}
                     </button>
                     <button
                       class="icon-action danger"
@@ -1155,8 +1182,8 @@
                         insights.dismissTask(
                           insights.selectedTask!.clientId,
                         )}
-                      title="Dismiss failed generation"
-                      aria-label="Dismiss failed generation"
+                      title={m.insights_page_dismiss_failed()}
+                      aria-label={m.insights_page_dismiss_failed()}
                     >
                       <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
                         <path d="M5.5 5.5A.5.5 0 016 6v6a.5.5 0 01-1 0V6a.5.5 0 01.5-.5zm2.5 0a.5.5 0 01.5.5v6a.5.5 0 01-1 0V6a.5.5 0 01.5-.5zm3 .5a.5.5 0 00-1 0v6a.5.5 0 001 0V6z"/>
@@ -1188,24 +1215,45 @@
                     {/if}
                     {#if insights.selectedItem.template_version}
                       <span class="detail-chip muted">
-                        template {insights.selectedItem.template_version}
+                        {m.insights_page_template_version({ version: insights.selectedItem.template_version })}
                       </span>
                     {/if}
                     {#if insights.selectedItem.aggregate_hash}
                       <span class="detail-chip muted">
-                        aggregate {insights.selectedItem.aggregate_hash.slice(0, 12)}
+                        {m.insights_page_aggregate_hash({ hash: insights.selectedItem.aggregate_hash.slice(0, 12) })}
                       </span>
                     {/if}
                   {/if}
                 </div>
                 <div class="generated-actions">
+                  <button
+                    class="header-action"
+                    type="button"
+                    onclick={handleInsightExport}
+                  >
+                    Export
+                  </button>
+                  <button
+                    class="header-action"
+                    type="button"
+                    onclick={() => openInsightPublish(false)}
+                  >
+                    Publish
+                  </button>
+                  <button
+                    class="header-action subtle"
+                    type="button"
+                    onclick={() => openInsightPublish(true)}
+                  >
+                    Secret
+                  </button>
                   <CopyButton
                     class="insight-link-copy"
                     copied={copiedInsightLinkId === insights.selectedItem.id}
-                    ariaLabel="Copy generated insight link"
-                    copiedAriaLabel="Copied generated insight link"
-                    title="Copy link to generated insight"
-                    copiedTitle="Copied link"
+                    ariaLabel={m.insights_page_copy_link()}
+                    copiedAriaLabel={m.insights_page_copied_link()}
+                    title={m.insights_page_copy_link_title()}
+                    copiedTitle={m.insights_page_copied_link_short()}
                     onclick={() =>
                       handleCopyInsightLink(insights.selectedItem!.id)}
                   />
@@ -1220,8 +1268,8 @@
                         router.replaceParams(params);
                       }
                     }}
-                    title="Delete generated insight"
-                    aria-label="Delete generated insight"
+                    title={m.insights_page_delete_insight()}
+                    aria-label={m.insights_page_delete_insight()}
                   >
                     <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
                       <path d="M5.5 5.5A.5.5 0 016 6v6a.5.5 0 01-1 0V6a.5.5 0 01.5-.5zm2.5 0a.5.5 0 01.5.5v6a.5.5 0 01-1 0V6a.5.5 0 01.5-.5zm3 .5a.5.5 0 00-1 0v6a.5.5 0 001 0V6z"/>
@@ -1234,7 +1282,7 @@
                 {@html renderMarkdown(insights.selectedItem.content)}
               </div>
             {:else}
-              <p>Select a generated insight to read it.</p>
+              <p>{m.insights_page_select_to_read()}</p>
             {/if}
           </article>
         </div>
@@ -1274,17 +1322,6 @@
     max-width: 720px;
   }
 
-  .agent-select {
-    height: 28px;
-    min-width: 112px;
-    border: 1px solid var(--border-muted);
-    background: var(--bg-inset);
-    border-radius: var(--radius-sm);
-    color: var(--text-secondary);
-    padding: 0 6px;
-    font-size: 12px;
-  }
-
   .toolbar-scope {
     display: flex;
     align-items: center;
@@ -1302,44 +1339,33 @@
     white-space: nowrap;
   }
 
-  .filter-group :global(.typeahead),
-  .toolbar-scope :global(.typeahead),
-  .generated-control :global(.typeahead) {
+  .filter-group :global(.kit-typeahead),
+  .toolbar-scope :global(.kit-typeahead),
+  .generated-control :global(.kit-typeahead) {
     min-width: 0;
     max-width: none;
     width: 100%;
   }
 
-  .filter-group > :global(.typeahead:first-child) {
-    --typeahead-list-min-width: min(360px, calc(100vw - 32px));
+  /* The kit-ui Typeahead list pins to the trigger width, so size the
+     trigger itself (the old --typeahead-list-min-width knob is retired). */
+  .filter-group > :global(.kit-typeahead:first-child) {
     flex: 0 1 220px;
     min-width: 180px;
     max-width: 260px;
   }
 
-  .filter-group > :global(.typeahead:nth-child(2)) {
+  .filter-group > :global(.kit-typeahead:nth-child(2)) {
     flex: 0 0 120px;
   }
 
-  .toolbar-scope :global(.typeahead) {
+  .toolbar-scope :global(.kit-typeahead) {
     flex: 0 0 128px;
     width: 128px;
   }
 
-  .icon-btn {
-    width: 28px;
-    height: 28px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: var(--radius-sm);
-    color: var(--text-muted);
+  :global(.toolbar-refresh.kit-icon-button) {
     margin-left: auto;
-  }
-
-  .icon-btn:hover {
-    background: var(--bg-surface-hover);
-    color: var(--text-primary);
   }
 
   .content {
@@ -1349,7 +1375,7 @@
     padding: 18px;
     display: flex;
     flex-direction: column;
-    gap: 18px;
+    gap: var(--space-6);
   }
 
   .section-block {
@@ -1367,6 +1393,26 @@
 
   .section-heading.compact {
     align-items: center;
+  }
+
+  .section-heading p.insights-help {
+    max-width: 58ch;
+    margin: 0;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 4px;
+    text-align: right;
+    line-height: 1.35;
+  }
+
+  .insights-help-link {
+    color: var(--accent-blue);
+  }
+
+  .insights-help-link:hover {
+    color: color-mix(in srgb, var(--accent-blue) 70%, var(--text-primary));
+    text-underline-offset: 2px;
   }
 
   .section-heading h2 {
@@ -1439,7 +1485,7 @@
   .summary-grid {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 10px;
+    gap: var(--space-5);
   }
 
   .summary-card,
@@ -1596,7 +1642,7 @@
     display: flex;
     align-items: baseline;
     justify-content: space-between;
-    gap: 10px;
+    gap: var(--space-4);
     padding: 10px;
     border-radius: var(--radius-sm);
     background: var(--bg-inset);
@@ -1621,7 +1667,7 @@
   .driver-row {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto auto auto;
-    gap: 10px;
+    gap: var(--space-4);
     align-items: baseline;
     width: 100%;
     min-height: 24px;
@@ -1666,7 +1712,7 @@
     height: 42px;
     display: flex;
     align-items: end;
-    gap: 3px;
+    gap: var(--space-1);
     padding: 6px 0 2px;
     border-top: 1px solid var(--border-muted);
     position: relative;
@@ -1724,7 +1770,7 @@
   .example-row {
     display: grid;
     grid-template-columns: minmax(90px, 0.35fr) 1fr;
-    gap: 10px;
+    gap: var(--space-4);
     font-size: 12px;
   }
 
@@ -1745,7 +1791,7 @@
 
   .evidence-panel {
     display: grid;
-    gap: 10px;
+    gap: var(--space-5);
     padding: 12px;
     background: var(--bg-surface);
     border: 1px solid var(--border-muted);
@@ -1829,13 +1875,13 @@
   .recommendation-list {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 10px;
+    gap: var(--space-5);
   }
 
   .recommendation {
     padding: 12px;
     display: grid;
-    gap: 7px;
+    gap: var(--space-3);
   }
 
   .recommendation strong {
@@ -1854,12 +1900,22 @@
     padding-top: 18px;
   }
 
+  /* The generated-archive grids have hard minimum column widths (controls:
+     180+130+240px; layout: a 240px list rail), so they collapse on available
+     CONTENT width via a container query (declared after both base grid rules
+     — same specificity, so it must win on source order) rather than the
+     viewport-width media gate below — with the sidebar open, a ~950px
+     viewport leaves far less room than a viewport breakpoint assumes. */
+  .generated-block {
+    container-type: inline-size;
+  }
+
   .generated-controls {
     display: grid;
     grid-template-columns:
       minmax(180px, 220px) minmax(130px, 160px)
       minmax(240px, 1fr) auto;
-    gap: 10px;
+    gap: var(--space-5);
     align-items: end;
     padding: 12px;
     background: var(--bg-surface);
@@ -1869,7 +1925,7 @@
 
   .generated-control {
     display: grid;
-    gap: 5px;
+    gap: var(--space-2);
     min-width: 0;
   }
 
@@ -1881,18 +1937,42 @@
     text-transform: uppercase;
   }
 
-  .generated-focus {
-    width: 100%;
-    border: 1px solid var(--border-muted);
-    background: var(--bg-inset);
+  .badge-blue {
+    background: var(--accent-blue);
+  }
+
+  .badge-purple {
+    background: var(--accent-purple);
+  }
+
+  .badge-red {
+    background: var(--accent-red);
+  }
+
+  .header-date {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-primary);
+    letter-spacing: -0.01em;
+  }
+
+  .delete-btn {
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
     border-radius: var(--radius-sm);
     color: var(--text-primary);
     font-size: 12px;
   }
 
   .generated-focus {
+    width: 100%;
     min-height: 30px;
     max-height: 76px;
+    border: 1px solid var(--border-muted);
+    background: var(--bg-inset);
     padding: 7px 8px;
     resize: vertical;
     line-height: 1.35;
@@ -1902,7 +1982,7 @@
     height: 30px;
     padding: 0 12px;
     background: var(--accent-purple);
-    color: white;
+    color: var(--accent-purple-foreground);
     border-radius: var(--radius-sm);
     font-size: 12px;
     font-weight: 700;
@@ -1918,6 +1998,13 @@
     grid-template-columns: minmax(240px, 320px) 1fr;
     gap: 12px;
     align-items: start;
+  }
+
+  @container (max-width: 760px) {
+    .generated-controls,
+    .generated-layout {
+      grid-template-columns: 1fr;
+    }
   }
 
   .generated-list {
@@ -1965,6 +2052,44 @@
     color: var(--accent-red);
   }
 
+  .header-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .header-action {
+    height: 28px;
+    padding: 0 10px;
+    border-radius: var(--radius-sm);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    background: var(--bg-inset);
+    border: 1px solid var(--border-muted);
+    transition: background 0.12s, color 0.12s,
+      border-color 0.12s;
+  }
+
+  .header-action:hover {
+    background: var(--bg-surface-hover);
+    color: var(--text-primary);
+    border-color: var(--border-default);
+  }
+
+  .header-action.subtle {
+    color: var(--text-muted);
+  }
+
+  .delete-btn:hover {
+    background: color-mix(
+      in srgb,
+      var(--accent-red) 10%,
+      transparent
+    );
+    color: var(--accent-red);
+  }
+
   .generated-detail {
     min-height: 220px;
     padding: 14px;
@@ -1993,13 +2118,12 @@
     flex-shrink: 0;
   }
 
-  .generated-actions :global(.insight-link-copy.copy-btn) {
-    opacity: 1;
+  .generated-actions :global(.insight-link-copy.kit-copy-btn) {
     border: 1px solid var(--border-muted);
     background: var(--bg-inset);
   }
 
-  .generated-actions :global(.insight-link-copy.copy-btn:hover) {
+  .generated-actions :global(.insight-link-copy.kit-copy-btn:hover) {
     border-color: var(--border-default);
   }
 
@@ -2109,7 +2233,7 @@
     height: 26px;
     padding: 0 10px;
     background: var(--accent-blue);
-    color: white;
+    color: var(--accent-blue-foreground);
     border-radius: var(--radius-sm);
     font-size: 12px;
     font-weight: 700;
@@ -2175,14 +2299,14 @@
     }
   }
 
-  @media (max-width: 980px) {
+  @media (max-width: 900px) {
     .toolbar,
     .section-heading {
       align-items: stretch;
       flex-direction: column;
     }
 
-    .icon-btn {
+    :global(.toolbar-refresh.kit-icon-button) {
       margin-left: 0;
     }
 
@@ -2196,11 +2320,14 @@
       text-align: left;
     }
 
+    .section-heading p.insights-help {
+      justify-content: flex-start;
+      text-align: left;
+    }
+
     .summary-grid,
     .pattern-grid,
-    .recommendation-list,
-    .generated-controls,
-    .generated-layout {
+    .recommendation-list {
       grid-template-columns: 1fr;
     }
 

@@ -25,24 +25,31 @@ Then start the server on a non-loopback interface:
 agentsview serve --host 0.0.0.0
 ```
 
+To make the bind persistent — so restarts, auto-started daemons, and reboots
+keep the server reachable — set `host` in `config.toml` instead of passing
+the flag each time:
+
+```toml
+host = "0.0.0.0"
+```
+
+A non-loopback `host` in `config.toml` requires `require_auth = true`; the
+server refuses to start rather than persistently exposing an unauthenticated
+API. The `--host` flag remains available for one-off unauthenticated binds.
+
 When this command runs inside WSL, AgentsView advertises the WSL `eth0` address
 instead of `127.0.0.1` so the printed URL is usable from the Windows host and
 nearby LAN clients. An explicit `--public-url` still takes precedence.
 
-When auth is enabled, AgentsView generates a token if needed and prints it on
-startup:
-
-```
-Auth enabled. Token: <token>
-```
-
-Open `http://<your-ip>:8080` from another device and configure the token in the
-frontend, or send it in an `Authorization` header.
+When auth is enabled, AgentsView generates a token if needed and stores it in
+`~/.agentsview/config.toml`. Open `http://<your-ip>:8080` from another device
+and enter the configured token in the frontend, or send it in an
+`Authorization` header.
 
 !!! note
 
-    Older configs may still use `remote_access = true`. AgentsView still reads that
-    legacy key, but new setups should use `require_auth = true`.
+    Older configs may still use `remote_access = true`. AgentsView still reads
+    that legacy key, but new setups should use `require_auth = true`.
 
 ## Authentication
 
@@ -54,13 +61,63 @@ Authorization: Bearer <token>
 
 The token is stored in `config.toml` as `auth_token`. It is generated
 automatically the first time auth is enabled, so you do not need to mint one
-manually.
+manually. For supervised services or temporary overrides, set
+`AGENTSVIEW_AUTH_TOKEN`; it takes precedence over the config file.
 
 Auth is enforced on API routes, not on static assets. That means a browser can
 load the HTML shell, but API requests fail with `401` until the correct token is
 supplied.
 
 When `require_auth` is disabled, normal local loopback use remains ungated.
+
+## HTTP Remote Sync
+
+Configured `[[remote_hosts]]` entries can use `transport = "http"` when the
+remote machine is already running an AgentsView daemon:
+
+```toml
+[[remote_hosts]]
+host = "devbox1"
+transport = "http"
+url = "http://devbox1.tailnet.ts.net:8080"
+token = "remote-token"
+```
+
+The daemon on the remote machine must bind a non-loopback interface (set
+`host = "0.0.0.0"` with `require_auth = true` in its config.toml) or every
+sync fails with a connection-refused error. See
+[Remote Hosts](/configuration/#remote-hosts) for the full remote-side setup,
+including keeping detached daemons alive.
+
+Use `require_auth = true` on remote nodes when practical, or at minimum keep
+their generated `auth_token` configured. The remote archive endpoints always
+require `Authorization: Bearer <token>`, even when the rest of the daemon API is
+unauthenticated. The `token` in the collector's `remote_hosts` entry must match
+the remote daemon's `auth_token` and is required for HTTP remote sync. Do not
+reuse the collector daemon's own `auth_token` for untrusted remote endpoints.
+
+The HTTP transport is intended for private networking such as Tailscale or an
+equivalent restricted overlay. Do not expose raw archive endpoints directly to
+the public internet.
+
+HTTP remote sync failures are summarized without echoing remote-controlled URLs
+or response bodies. Common summaries point at the specific fix: a rejected token
+means the collector's per-host `token` does not match the remote daemon's
+`auth_token`; a missing endpoint means the remote host needs a newer
+AgentsView; connection refusal usually means the daemon is not running, is still
+bound to loopback, or the URL port is wrong; DNS and timeout messages point back
+to the configured `url`.
+
+For always-available fleet nodes launched with `agentsview serve --background`,
+set:
+
+```toml
+daemon_idle_timeout = "0s"
+```
+
+That setting controls detached background daemons only. Supervised daemons run
+under systemd, launchd, Docker, or a foreground shell never create the idle
+tracker and already stay alive until their supervisor stops them.
 
 ## SSE Endpoints
 
@@ -166,8 +223,8 @@ handles the public socket.
 !!! warning "Enable auth first"
 
     Managed Caddy exposes a public endpoint. Set `require_auth = true` in
-    `~/.agentsview/config.toml` before starting the server, or the proxy will front
-    an unauthenticated API. See [Quick Setup](#quick-setup).
+    `~/.agentsview/config.toml` before starting the server, or the proxy will
+    front an unauthenticated API. See [Quick Setup](#quick-setup).
 
 ```bash
 agentsview serve \
@@ -255,19 +312,19 @@ tls_key = "/path/to/key.pem"
 allowed_subnets = ["192.168.1.0/24"]
 ```
 
-| Field                   | Description                                        |
-| ----------------------- | -------------------------------------------------- |
-| `require_auth`          | Require bearer-token authentication for API access |
-| `auth_token`            | Auto-generated 256-bit bearer token                |
-| `public_url`            | Public URL for host/origin validation              |
-| `public_origins`        | Additional trusted CORS origins                    |
-| `proxy.mode`            | Managed proxy mode (`caddy`)                       |
-| `proxy.bin`             | Path to proxy binary                               |
-| `proxy.bind_host`       | Interface for proxy to bind                        |
-| `proxy.public_port`     | External port for proxy                            |
-| `proxy.tls_cert`        | TLS certificate path                               |
-| `proxy.tls_key`         | TLS key path                                       |
-| `proxy.allowed_subnets` | CIDR allowlist for proxy connections               |
+| Field                   | Description                                                                |
+| ----------------------- | -------------------------------------------------------------------------- |
+| `require_auth`          | Require bearer-token authentication for API access                         |
+| `auth_token`            | Auto-generated 256-bit bearer token; overridden by `AGENTSVIEW_AUTH_TOKEN` |
+| `public_url`            | Public URL for host/origin validation                                      |
+| `public_origins`        | Additional trusted CORS origins                                            |
+| `proxy.mode`            | Managed proxy mode (`caddy`)                                               |
+| `proxy.bin`             | Path to proxy binary                                                       |
+| `proxy.bind_host`       | Interface for proxy to bind                                                |
+| `proxy.public_port`     | External port for proxy                                                    |
+| `proxy.tls_cert`        | TLS certificate path                                                       |
+| `proxy.tls_key`         | TLS key path                                                               |
+| `proxy.allowed_subnets` | CIDR allowlist for proxy connections                                       |
 
 For LAN access you still need a non-loopback bind such as
 `agentsview serve --host 0.0.0.0`. `require_auth` controls API auth; it does not

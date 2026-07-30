@@ -35,6 +35,7 @@ vi.mock("../../api/timing.js", () => ({
 
 import { ui } from "../../stores/ui.svelte.js";
 import { sessionTiming } from "../../stores/sessionTiming.svelte.js";
+import { m } from "../../i18n/index.js";
 // @ts-ignore
 import SessionVitals from "./SessionVitals.svelte";
 
@@ -65,11 +66,11 @@ describe("SessionVitals", () => {
     await tick();
 
     const closeButton = document.querySelector<HTMLButtonElement>(
-      'button[aria-label="Close session analysis"]',
+      `button[aria-label="${m.session_vitals_close()}"]`,
     );
 
     expect(closeButton).not.toBeNull();
-    expect(closeButton?.title).toBe("Close session analysis");
+    expect(closeButton?.title).toBe(m.session_vitals_close());
 
     closeButton!.click();
     await tick();

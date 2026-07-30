@@ -2,11 +2,12 @@ package server
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"time"
 
 	"go.kenn.io/agentsview/internal/db"
-	"go.kenn.io/agentsview/internal/timeutil"
+	"go.kenn.io/agentsview/internal/service"
 )
 
 func (s *Server) registerUsageRoutes() {
@@ -14,6 +15,10 @@ func (s *Server) registerUsageRoutes() {
 
 	get(s, group, "/summary", "Get usage summary", s.humaUsageSummary)
 	get(s, group, "/comparison", "Get usage comparison", s.humaUsageComparison)
+	get(
+		s, group, "/pairwise-comparison",
+		"Get usage pairwise comparison", s.humaUsagePairwiseComparison,
+	)
 	get(s, group, "/top-sessions", "Get top usage sessions", s.humaUsageTopSessions)
 }
 
@@ -24,6 +29,7 @@ type UsageFilterInput struct {
 	Agent            string `query:"agent" doc:"Filter by agent"`
 	Project          string `query:"project" doc:"Filter by project"`
 	Machine          string `query:"machine" doc:"Filter by machine"`
+	GitBranch        string `query:"git_branch" doc:"Filter by git branch; opaque (project, branch) tokens from the /branches endpoint"`
 	ExcludeProject   string `query:"exclude_project" doc:"Exclude a project"`
 	ExcludeAgent     string `query:"exclude_agent" doc:"Exclude an agent"`
 	ExcludeModel     string `query:"exclude_model" doc:"Exclude a model"`
@@ -48,62 +54,87 @@ type usageComparisonInput struct {
 	CurrentCost float64 `query:"current_cost" required:"true" doc:"Current period total cost"`
 }
 
-func usageFilterFromInput(in UsageFilterInput) (db.UsageFilter, error) {
-	tz := in.Timezone
-	if tz == "" {
-		tz = "UTC"
+type usagePairwiseComparisonInput struct {
+	UsageFilterInput
+	LeftDimension  string `query:"left_dimension" required:"true" doc:"Left-side comparison dimension"`
+	LeftValue      string `query:"left_value" required:"true" doc:"Left-side comparison value"`
+	RightDimension string `query:"right_dimension" required:"true" doc:"Right-side comparison dimension"`
+	RightValue     string `query:"right_value" required:"true" doc:"Right-side comparison value"`
+}
+
+// usageRequestFromInput maps the HTTP query-param struct to the
+// transport-neutral service.UsageRequest.
+func usageRequestFromInput(in UsageFilterInput) service.UsageRequest {
+	return service.UsageRequest{
+		From:             in.From,
+		To:               in.To,
+		Timezone:         in.Timezone,
+		Agent:            in.Agent,
+		Project:          in.Project,
+		Machine:          in.Machine,
+		GitBranch:        in.GitBranch,
+		ExcludeProject:   in.ExcludeProject,
+		ExcludeAgent:     in.ExcludeAgent,
+		ExcludeModel:     in.ExcludeModel,
+		Model:            in.Model,
+		MinUserMessages:  in.MinUserMessages,
+		ActiveSince:      in.ActiveSince,
+		Termination:      in.Termination,
+		IncludeOneShot:   in.IncludeOneShot,
+		IncludeAutomated: in.IncludeAutomated,
+		NoDefaultRange:   in.NoDefaultRange,
+		Breakdowns:       &in.Breakdowns,
+		SessionCounts:    &in.SessionCounts,
 	}
-	if _, err := time.LoadLocation(tz); err != nil {
-		return db.UsageFilter{}, apiError(http.StatusBadRequest, "invalid timezone: "+tz)
+}
+
+func usagePairwiseRequestFromInput(
+	in usagePairwiseComparisonInput,
+) (service.UsagePairwiseComparisonRequest, error) {
+	if in.LeftDimension == "" || in.LeftValue == "" {
+		return service.UsagePairwiseComparisonRequest{}, &service.UsageInputError{
+			Msg: "left side requires left_dimension and left_value",
+		}
 	}
-	from, to := in.From, in.To
-	if !in.NoDefaultRange {
-		from, to = defaultDateRange(in.From, in.To)
+	if in.RightDimension == "" || in.RightValue == "" {
+		return service.UsagePairwiseComparisonRequest{}, &service.UsageInputError{
+			Msg: "right side requires right_dimension and right_value",
+		}
 	}
-	if (from != "" && !timeutil.IsValidDate(from)) ||
-		(to != "" && !timeutil.IsValidDate(to)) {
-		return db.UsageFilter{}, apiError(
-			http.StatusBadRequest,
-			"invalid date format: use YYYY-MM-DD",
-		)
-	}
-	if from != "" && to != "" && from > to {
-		return db.UsageFilter{}, apiError(http.StatusBadRequest, "from must not be after to")
-	}
-	if in.ActiveSince != "" && !timeutil.IsValidTimestamp(in.ActiveSince) {
-		return db.UsageFilter{}, apiError(http.StatusBadRequest, "invalid active_since: use RFC3339 timestamp")
-	}
-	return db.UsageFilter{
-		From:              from,
-		To:                to,
-		Agent:             in.Agent,
-		Project:           in.Project,
-		Machine:           in.Machine,
-		ExcludeProject:    in.ExcludeProject,
-		ExcludeAgent:      in.ExcludeAgent,
-		ExcludeModel:      in.ExcludeModel,
-		Model:             in.Model,
-		Timezone:          tz,
-		MinUserMessages:   in.MinUserMessages,
-		ExcludeOneShot:    !in.IncludeOneShot,
-		ExcludeAutomated:  !in.IncludeAutomated,
-		ActiveSince:       in.ActiveSince,
-		Termination:       in.Termination,
-		Breakdowns:        in.Breakdowns,
-		SkipSessionCounts: !in.SessionCounts,
+	return service.UsagePairwiseComparisonRequest{
+		UsageRequest:   usageRequestFromInput(in.UsageFilterInput),
+		LeftDimension:  in.LeftDimension,
+		LeftValue:      in.LeftValue,
+		RightDimension: in.RightDimension,
+		RightValue:     in.RightValue,
 	}, nil
+}
+
+// usageFilterFromInput validates and builds a db.UsageFilter via the
+// shared service validator (the single source of truth, also used by the
+// usage-summary seam method), mapping a validation failure to HTTP 400.
+func usageFilterFromInput(in UsageFilterInput) (db.UsageFilter, error) {
+	f, err := service.BuildUsageFilter(usageRequestFromInput(in))
+	if err != nil {
+		var ue *service.UsageInputError
+		if errors.As(err, &ue) {
+			return db.UsageFilter{}, apiError(http.StatusBadRequest, ue.Msg)
+		}
+		return db.UsageFilter{}, err
+	}
+	return f, nil
 }
 
 func (s *Server) humaUsageSummary(
 	ctx context.Context,
 	in *UsageFilterInput,
 ) (*jsonOutput[UsageSummaryResponse], error) {
-	f, err := usageFilterFromInput(*in)
+	res, err := s.sessions.UsageSummary(ctx, usageRequestFromInput(*in))
 	if err != nil {
-		return nil, err
-	}
-	result, err := s.db.GetDailyUsage(ctx, f)
-	if err != nil {
+		var ue *service.UsageInputError
+		if errors.As(err, &ue) {
+			return nil, apiError(http.StatusBadRequest, ue.Msg)
+		}
 		if handled := handleHumaContextError(err); handled != nil {
 			return nil, handled
 		}
@@ -112,24 +143,9 @@ func (s *Server) humaUsageSummary(
 		}
 		return nil, internalError("usage summary error", err)
 	}
-	resp := UsageSummaryResponse{
-		From:          f.From,
-		To:            f.To,
-		Totals:        result.Totals,
-		Daily:         result.Daily,
-		SessionCounts: result.SessionCounts,
-		CacheStats:    computeCacheStats(result.Totals),
-	}
-	if f.Breakdowns {
-		resp.ProjectTotals = foldProjectTotals(result.Daily)
-		resp.ModelTotals = foldModelTotals(result.Daily)
-		resp.AgentTotals = foldAgentTotals(result.Daily)
-	} else {
-		resp.ProjectTotals = []ProjectTotal{}
-		resp.ModelTotals = []ModelTotal{}
-		resp.AgentTotals = []AgentTotal{}
-	}
-	return &jsonOutput[UsageSummaryResponse]{Body: resp}, nil
+	return &jsonOutput[UsageSummaryResponse]{
+		Body: usageSummaryResponseFromService(res),
+	}, nil
 }
 
 func (s *Server) humaUsageComparison(
@@ -159,6 +175,37 @@ func (s *Server) humaUsageComparison(
 	return &jsonOutput[Comparison]{Body: *comparison}, nil
 }
 
+func (s *Server) humaUsagePairwiseComparison(
+	ctx context.Context,
+	in *usagePairwiseComparisonInput,
+) (*jsonOutput[service.UsagePairwiseComparisonResponse], error) {
+	req, err := usagePairwiseRequestFromInput(*in)
+	if err != nil {
+		var ue *service.UsageInputError
+		if errors.As(err, &ue) {
+			return nil, apiError(http.StatusBadRequest, ue.Msg)
+		}
+		return nil, err
+	}
+	comparison, err := s.sessions.UsagePairwiseComparison(ctx, req)
+	if err != nil {
+		var ue *service.UsageInputError
+		if errors.As(err, &ue) {
+			return nil, apiError(http.StatusBadRequest, ue.Msg)
+		}
+		if handled := handleHumaContextError(err); handled != nil {
+			return nil, handled
+		}
+		if handled := handleHumaReadOnly(err); handled != nil {
+			return nil, handled
+		}
+		return nil, internalError("usage pairwise comparison error", err)
+	}
+	return &jsonOutput[service.UsagePairwiseComparisonResponse]{
+		Body: *comparison,
+	}, nil
+}
+
 func (s *Server) computeUsageComparison(
 	ctx context.Context,
 	f db.UsageFilter,
@@ -181,6 +228,7 @@ func (s *Server) computeUsageComparison(
 		Agent:            f.Agent,
 		Project:          f.Project,
 		Machine:          f.Machine,
+		GitBranch:        f.GitBranch,
 		Model:            f.Model,
 		ExcludeProject:   f.ExcludeProject,
 		ExcludeAgent:     f.ExcludeAgent,

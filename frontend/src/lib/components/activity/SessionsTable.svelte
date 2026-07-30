@@ -1,12 +1,10 @@
 <script lang="ts">
+  import { formatDateTime, m } from "../../i18n/index.js";
   import type { Report } from "../../api/types.js";
   import type { ActivitySessionRow } from "../../api/generated/index";
   import { router } from "../../stores/router.svelte.js";
-  import {
-    ArrowDownIcon,
-    ArrowUpIcon,
-    XIcon,
-  } from "../../icons.js";
+  import { XIcon } from "../../icons.js";
+  import { TableHeaderCell } from "@kenn-io/kit-ui";
 
   let {
     report,
@@ -134,7 +132,7 @@
 
   function rowModel(row: ActivitySessionRow): string {
     const models = (row.models ?? []) as string[];
-    if (models.length > 1) return "mixed";
+    if (models.length > 1) return m.activity_mixed();
     return row.primary_model || "—";
   }
 
@@ -144,7 +142,7 @@
     if (!ts) return "";
     const d = new Date(ts);
     if (Number.isNaN(d.getTime())) return "";
-    return d.toLocaleTimeString([], {
+    return formatDateTime(d, {
       hour: "2-digit",
       minute: "2-digit",
       hourCycle: "h23",
@@ -166,39 +164,35 @@
     label: string;
   }
 
-  const sortColumns: Column[] = [
-    { key: "project", label: "Project" },
-    { key: "agent", label: "Agent" },
-    { key: "agent_minutes", label: "Agent-min" },
-    { key: "cost", label: "Cost" },
-    { key: "first_active", label: "Window" },
-  ];
+  const sortColumns: Column[] = $derived([
+    { key: "project", label: m.activity_project() },
+    { key: "agent", label: m.activity_agent() },
+    { key: "agent_minutes", label: m.activity_agent_min() },
+    { key: "cost", label: m.activity_cost() },
+    { key: "first_active", label: m.activity_window() },
+  ]);
 
-  function ariaSort(key: SortKey): "ascending" | "descending" | "none" {
-    if (sortKey !== key) return "none";
-    return sortDir === "asc" ? "ascending" : "descending";
-  }
 </script>
 
 <div class="sessions-table">
   <div class="sessions-header">
-    <h3 class="chart-title">Sessions</h3>
+    <h3 class="chart-title">{m.activity_sessions()}</h3>
     <div class="header-meta">
       {#if filterSet}
         <button
           type="button"
           class="filter-badge"
           onclick={() => onClearFilter?.()}
-          title="Clear time filter"
+          title={m.activity_clear_time_filter()}
         >
-          <span>Active: {filterLabel}</span>
+          <span>{m.activity_active_filter({ label: filterLabel })}</span>
           <span class="filter-badge-x">
             <XIcon size="11" strokeWidth="2.4" aria-hidden="true" />
           </span>
         </button>
       {/if}
       {#if rows.length > 0}
-        <span class="count">{rows.length} total</span>
+        <span class="count">{m.activity_total_count({ count: rows.length })}</span>
       {/if}
     </div>
   </div>
@@ -208,34 +202,17 @@
       <table class="table">
         <thead>
           <tr>
-            <th class="col-session" scope="col">Session</th>
-            <th class="col-model" scope="col">Model</th>
+            <TableHeaderCell label={m.activity_session()} />
+            <TableHeaderCell label={m.activity_model()} />
             {#each sortColumns as col}
-              <th
-                class="col-sortable"
-                class:col-num={col.key === "agent_minutes" ||
-                  col.key === "cost"}
-                scope="col"
-                aria-sort={ariaSort(col.key)}
-              >
-                <button
-                  class="sort-btn"
-                  type="button"
-                  data-sort-key={col.key}
-                  onclick={() => setSort(col.key)}
-                >
-                  {col.label}
-                  {#if sortKey === col.key}
-                    <span class="sort-arrow">
-                      {#if sortDir === "asc"}
-                        <ArrowUpIcon size="10" strokeWidth="2.2" aria-hidden="true" />
-                      {:else}
-                        <ArrowDownIcon size="10" strokeWidth="2.2" aria-hidden="true" />
-                      {/if}
-                    </span>
-                  {/if}
-                </button>
-              </th>
+              <TableHeaderCell
+                class="sort-{col.key}"
+                label={col.label}
+                sortable
+                numeric={col.key === "agent_minutes" || col.key === "cost"}
+                sortDirection={sortKey === col.key ? sortDir : null}
+                onsort={() => setSort(col.key)}
+              />
             {/each}
           </tr>
         </thead>
@@ -264,7 +241,7 @@
                     {row.title || row.session_id}
                   </a>
                   {#if row.is_automated}
-                    <span class="auto-badge" title="Automated session">Auto</span>
+                    <span class="auto-badge" title={m.activity_automated_session()}>{m.activity_auto()}</span>
                   {/if}
                 </div>
               </td>
@@ -288,8 +265,8 @@
   {:else}
     <div class="empty">
       {filterSet
-        ? "No sessions active in the selected slot."
-        : "No sessions in range."}
+        ? m.activity_no_sessions_selected_slot()
+        : m.shared_no_sessions_in_range()}
     </div>
   {/if}
 </div>
@@ -328,7 +305,7 @@
   .filter-badge {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
+    gap: var(--space-2);
     height: 20px;
     padding: 0 6px 0 8px;
     border: 1px solid var(--accent-blue);
@@ -364,53 +341,17 @@
     font-size: 11px;
   }
 
-  thead th {
+  /* The header cells come from kit-ui TableHeaderCell; the local table
+     shell keeps them pinned while the body scrolls. */
+  .table :global(thead th) {
     position: sticky;
     top: 0;
     z-index: 1;
-    background: var(--bg-inset);
-    text-align: left;
-    font-weight: 600;
-    color: var(--text-muted);
-    padding: 6px 8px;
-    border-bottom: 1px solid var(--border-muted);
-    white-space: nowrap;
-  }
-
-  th.col-num {
-    text-align: right;
   }
 
   .col-num {
     text-align: right;
     font-family: var(--font-mono);
-  }
-
-  .sort-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 3px;
-    background: none;
-    border: none;
-    padding: 0;
-    font: inherit;
-    font-weight: 600;
-    color: inherit;
-    cursor: pointer;
-  }
-
-  .sort-btn:hover {
-    color: var(--text-primary);
-  }
-
-  .sort-arrow {
-    display: inline-flex;
-    align-items: center;
-    color: var(--accent-blue);
-  }
-
-  .col-num .sort-btn {
-    flex-direction: row-reverse;
   }
 
   tbody td {

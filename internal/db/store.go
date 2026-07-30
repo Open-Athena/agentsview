@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"go.kenn.io/agentsview/internal/activity"
+	"go.kenn.io/agentsview/internal/export"
 )
 
 // ErrReadOnly is returned by write methods on read-only store
@@ -30,6 +31,8 @@ type Store interface {
 	GetSidebarSessionIndex(ctx context.Context, f SessionFilter) (SidebarSessionIndex, error)
 	GetSession(ctx context.Context, id string) (*Session, error)
 	GetSessionFull(ctx context.Context, id string) (*Session, error)
+	// FindSessionIDsByPartial uses literal, case-sensitive substring matching.
+	FindSessionIDsByPartial(ctx context.Context, partial string, limit int) ([]string, error)
 	GetChildSessions(ctx context.Context, parentID string) ([]Session, error)
 
 	// Messages.
@@ -56,6 +59,9 @@ type Store interface {
 	GetProjects(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]ProjectInfo, error)
 	GetAgents(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]AgentInfo, error)
 	GetMachines(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]string, error)
+	GetBranches(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]BranchInfo, error)
+	ListProjectIdentityObservations(ctx context.Context, labels []string) ([]export.ProjectIdentityObservation, error)
+	BuildProjectIdentityMap(ctx context.Context, labels []string) (map[string]export.ProjectMapEntry, error)
 
 	// Analytics.
 	GetAnalyticsSummary(ctx context.Context, f AnalyticsFilter) (AnalyticsSummary, error)
@@ -72,11 +78,13 @@ type Store interface {
 	GetAnalyticsSignalSessions(ctx context.Context, f AnalyticsFilter, signal string, limit int) (SignalSessionsResponse, error)
 	GetTrendsTerms(ctx context.Context, f AnalyticsFilter, terms []TrendTermInput, granularity string) (TrendsTermsResponse, error)
 	GetActivityReport(ctx context.Context, f AnalyticsFilter, q activity.Query) (activity.Report, error)
+	RecentEdits(ctx context.Context, p RecentEditsParams) (RecentEditsResult, error)
 
 	// Usage (token cost).
 	GetDailyUsage(ctx context.Context, f UsageFilter) (DailyUsageResult, error)
 	GetTopSessionsByCost(ctx context.Context, f UsageFilter, limit int) ([]TopSessionEntry, error)
 	GetUsageSessionCounts(ctx context.Context, f UsageFilter) (UsageSessionCounts, error)
+	GetUsageMatchingSessionCount(ctx context.Context, f UsageFilter) (int, error)
 	GetSessionUsage(ctx context.Context, sessionID string) (*SessionUsage, error)
 	GetLongestUserPrompts(ctx context.Context, limit int, project string) ([]LongestUserPrompt, error)
 
@@ -91,17 +99,18 @@ type Store interface {
 	UnpinMessage(sessionID string, messageID int64) error
 	ListPinnedMessages(ctx context.Context, sessionID string, project string) ([]PinnedMessage, error)
 
-	// Insights (local-only; PG returns ErrReadOnly).
+	// Insights.
 	ListInsights(ctx context.Context, f InsightFilter) ([]Insight, error)
 	GetInsight(ctx context.Context, id int64) (*Insight, error)
 	GetCachedInsight(ctx context.Context, cacheKey string) (*Insight, error)
 	InsertInsight(s Insight) (int64, error)
 	DeleteInsight(id int64) error
 
-	// Session management (local-only; PG returns ErrReadOnly).
+	// Session management.
 	RenameSession(id string, displayName *string) error
 	SetSessionPrivate(id string, private bool) error
 	SoftDeleteSession(id string) error
+	SoftDeleteSessions(ids []string) (int, error)
 	RestoreSession(id string) (int64, error)
 	DeleteSessionIfTrashed(id string) (int64, error)
 	ListTrashedSessions(ctx context.Context) ([]Session, error)

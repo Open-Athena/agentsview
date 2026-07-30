@@ -1,11 +1,14 @@
 package activity
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/export"
 )
 
 func mustLoad(t *testing.T, name string) *time.Location {
@@ -43,6 +46,23 @@ func paramsFromQuery(q Query) Params {
 		GapCapSeconds: q.GapCapSeconds,
 		Bucket:        q.Bucket,
 	}
+}
+
+func TestReportOmitsUnsetPricingMetadata(t *testing.T) {
+	b, err := json.Marshal(Report{})
+	require.NoError(t, err)
+
+	assert.NotContains(t, string(b), `"pricing"`)
+}
+
+func TestReportEmitsEmptyProjectsMap(t *testing.T) {
+	b, err := json.Marshal(Report{
+		SchemaVersion: export.ActivityReportSchemaVersion,
+		Projects:      map[string]export.ProjectMapEntry{},
+	})
+	require.NoError(t, err)
+
+	assert.Contains(t, string(b), `"projects":{}`)
 }
 
 func TestAggregate_DayWindowUTC(t *testing.T) {

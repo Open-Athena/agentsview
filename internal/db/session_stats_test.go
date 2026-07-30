@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -95,7 +96,7 @@ func Test_loadSessionsInWindow_isAutomated(t *testing.T) {
 	ctx := t.Context()
 	from := time.Now().Add(-24 * time.Hour)
 	to := time.Now().Add(1 * time.Hour)
-	rows, err := d.loadSessionsInWindow(ctx, StatsFilter{}, from, to)
+	rows, err := d.loadSessionsInWindow(ctx, StatsFilter{}, from, to, false)
 	require.NoError(t, err, "loadSessionsInWindow")
 	byID := map[string]bool{}
 	for _, r := range rows {
@@ -368,12 +369,18 @@ func TestGetSessionStats_TotalsAndArchetypes(t *testing.T) {
 	assert.Equal(t, 2, stats.Totals.SessionsAutomation,
 		"sessions_automation")
 	assert.Equal(t, 3, stats.Totals.SessionsHuman, "sessions_human")
-	// Invariant: human + automation must equal all.
+	// Invariant: human + automation + subagent must equal all. This
+	// fixture has no subagents, so subagent is 0 and the partition still
+	// reduces to human + automation.
+	assert.Equal(t, 0, stats.Totals.SessionsSubagent,
+		"sessions_subagent (no subagents seeded)")
 	assert.Equal(t, stats.Totals.SessionsAll,
-		stats.Totals.SessionsHuman+stats.Totals.SessionsAutomation,
-		"invariant: human (%d) + automation (%d) != all (%d)",
+		stats.Totals.SessionsHuman+stats.Totals.SessionsAutomation+
+			stats.Totals.SessionsSubagent,
+		"invariant: human (%d) + automation (%d) + subagent (%d) != all (%d)",
 		stats.Totals.SessionsHuman,
 		stats.Totals.SessionsAutomation,
+		stats.Totals.SessionsSubagent,
 		stats.Totals.SessionsAll)
 	assert.Equal(t, 161, stats.Totals.UserMessagesTotal,
 		"user_messages_total")
@@ -412,6 +419,98 @@ func TestGetSessionStats_TotalsAndArchetypes(t *testing.T) {
 		"filters.projects_excluded must be non-nil slice")
 
 	assert.NotEmpty(t, stats.GeneratedAt, "generated_at")
+}
+
+// TestGetSessionStats_SubagentTotals verifies the two-bucket split in
+// the stats pipeline: subagent sessions (e.g. workflow subagents) count
+// toward the additive token/session totals, but stay out of the
+// distribution and human-vs-automation breakdowns so their short,
+// signal-less shape does not skew those. The subagent here is one-shot
+// (userMsgs 1) and short, like a real workflow subagent.
+func TestGetSessionStats_SubagentTotals(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	// One multi-turn root session (10 user msgs, 20 messages, ~100 min,
+	// 1000 output tokens) and one one-shot subagent (1 user msg, 5
+	// messages, ~8 min, 400 output tokens). Both agent "claude" so the
+	// agent-portfolio assertions reconcile against the totals.
+	insertSessionFixture(t, d, sessionFixture{
+		id: "root", agent: "claude", userMsgs: 10, messageCount: 20,
+		startedAt: hoursAgo(5), durationMin: 100,
+		totalOutputTok: 1000, hasTotalOutputToks: true,
+	})
+	insertSessionFixture(t, d, sessionFixture{
+		id: "agent-x", agent: "claude", userMsgs: 1, messageCount: 5,
+		startedAt: hoursAgo(5), durationMin: 8,
+		totalOutputTok: 400, hasTotalOutputToks: true,
+		relationshipType: "subagent",
+	})
+
+	stats, err := d.GetSessionStats(ctx, StatsFilter{Since: "28d"})
+	require.NoError(t, err, "GetSessionStats")
+
+	// Additive totals include the subagent.
+	assert.Equal(t, 2, stats.Totals.SessionsAll, "sessions_all")
+	assert.Equal(t, 25, stats.Totals.MessagesTotal, "messages_total")
+	assert.Equal(t, 11, stats.Totals.UserMessagesTotal,
+		"user_messages_total")
+
+	// SessionsHuman stays root-only: a subagent is not a human session.
+	assert.Equal(t, 1, stats.Totals.SessionsHuman, "sessions_human")
+	assert.Equal(t, 0, stats.Totals.SessionsAutomation,
+		"sessions_automation")
+	// The subagent lands in its own bucket so the partition holds.
+	assert.Equal(t, 1, stats.Totals.SessionsSubagent, "sessions_subagent")
+	assert.Equal(t, stats.Totals.SessionsAll,
+		stats.Totals.SessionsHuman+stats.Totals.SessionsAutomation+
+			stats.Totals.SessionsSubagent,
+		"invariant: all == human + automation + subagent")
+
+	// Distributions stay root-only: only the root session is in the
+	// user-messages histogram, so its bucket counts sum to 1, not 2.
+	gotN := 0
+	for _, b := range stats.Distributions.UserMessages.ScopeAll.Buckets {
+		gotN += b.Count
+	}
+	assert.Equal(t, 1, gotN,
+		"user-messages distribution must exclude the subagent")
+
+	// Duration distribution likewise root-only (subagent's 8 min absent).
+	durN := 0
+	for _, b := range stats.Distributions.DurationMinutes.ScopeAll.Buckets {
+		durN += b.Count
+	}
+	assert.Equal(t, 1, durN,
+		"duration distribution must exclude the subagent")
+
+	// Agent portfolio all-session maps count the subagent so they
+	// reconcile with the inclusive totals; the _human maps stay
+	// root-only (a subagent is not human).
+	ap := stats.AgentPortfolio
+	assert.Equal(t, 2, ap.BySessions["claude"], "by_sessions counts subagent")
+	assert.Equal(t, 25, ap.ByMessages["claude"], "by_messages counts subagent")
+	assert.Equal(t, int64(1400), ap.ByTokens["claude"],
+		"by_tokens counts subagent spend (1000 + 400)")
+	assert.Equal(t, 1, ap.BySessionsHuman["claude"],
+		"by_sessions_human stays root-only")
+	assert.Equal(t, int64(1000), ap.ByTokensHuman["claude"],
+		"by_tokens_human excludes the subagent")
+
+	// Reconciliation: the all-session agent-portfolio sums must equal
+	// the (subagent-inclusive) totals. These would have caught the
+	// per-panel undercount.
+	sumSessions, sumMessages := 0, 0
+	for _, v := range ap.BySessions {
+		sumSessions += v
+	}
+	for _, v := range ap.ByMessages {
+		sumMessages += v
+	}
+	assert.Equal(t, stats.Totals.SessionsAll, sumSessions,
+		"sum(by_sessions) must equal sessions_all")
+	assert.Equal(t, stats.Totals.MessagesTotal, sumMessages,
+		"sum(by_messages) must equal messages_total")
 }
 
 func Test_computeTotalsAndArchetypes_flagAuthority(t *testing.T) {
@@ -557,13 +656,48 @@ func TestWindowBounds(t *testing.T) {
 	})
 }
 
+func TestParseWindowPoint(t *testing.T) {
+	now := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name             string
+		in               string
+		want             time.Time
+		wantErrSubstring string
+	}{
+		{name: "Nd duration anchors at now", in: "7d",
+			want: time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)},
+		{name: "Nh duration", in: "48h",
+			want: time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)},
+		{name: "bare date is start of UTC day", in: "2026-04-01",
+			want: time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)},
+		{name: "garbage is a hard error", in: "7x",
+			wantErrSubstring: "Nd, Nh, or YYYY-MM-DD"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ParseWindowPoint(tc.in, now)
+			if tc.wantErrSubstring != "" {
+				require.Error(t, err, "expected an error")
+				assert.Contains(t, err.Error(), tc.wantErrSubstring)
+				return
+			}
+			require.NoError(t, err)
+			assert.True(t, got.Equal(tc.want), "got %v want %v", got, tc.want)
+		})
+	}
+}
+
 func TestGetSessionStats_Distributions(t *testing.T) {
 	d := testDB(t)
 	ctx := context.Background()
 
-	// Five sessions chosen to place one row in each interesting bucket
+	// Seven sessions chosen to place rows in each interesting bucket
 	// for duration and peak_context. is_automated drives the scope_human
-	// filter: a,b → automation (isAutomated=true); c,d,e → human.
+	// filter: a,b,g → automation (isAutomated=true); c,d,e,f → human.
+	// f is intentionally a short non-automated session: duration scope_human
+	// includes it, while user_messages scope_human filters values below 2.
+	// g is intentionally multi-turn automation so scope_human excludes it.
 	fixtures := []struct {
 		id             string
 		userMsgs       int
@@ -578,6 +712,8 @@ func TestGetSessionStats_Distributions(t *testing.T) {
 		{"c", 3, 25_000, 10.0, 6, 3, false},
 		{"d", 10, 60_000, 25.0, 15, 10, false},
 		{"e", 30, 150_000, 120.0, 30, 30, false},
+		{"f", 1, 12_000, 3.0, 0, 0, false},
+		{"g", 4, 75_000, 30.0, 0, 0, true},
 	}
 	for _, f := range fixtures {
 		insertSessionFixture(t, d, sessionFixture{
@@ -597,19 +733,20 @@ func TestGetSessionStats_Distributions(t *testing.T) {
 	stats, err := d.GetSessionStats(ctx, StatsFilter{Since: "28d"})
 	require.NoError(t, err, "GetSessionStats")
 
-	// duration scope_all: 0.5→bucket0, 0.9→bucket0, 10→bucket2,
-	// 25→bucket3, 120→bucket5 (top).
+	// duration scope_all: 0.5→bucket0, 0.9→bucket0, 3→bucket1,
+	// 10→bucket2, 25/30→bucket3, 120→bucket5 (top).
 	gotAll := stats.Distributions.DurationMinutes.ScopeAll.Buckets
-	wantCountsAll := []int{2, 0, 1, 1, 0, 1}
+	wantCountsAll := []int{2, 1, 1, 2, 0, 1}
 	require.Len(t, gotAll, len(wantCountsAll),
 		"duration scope_all buckets")
 	for i, w := range wantCountsAll {
 		assert.Equal(t, w, gotAll[i].Count,
 			"duration scope_all bucket %d", i)
 	}
-	// duration scope_human (c,d,e): bucket2=1, bucket3=1, bucket5=1.
+	// duration scope_human (c,d,e,f): bucket1=1, bucket2=1,
+	// bucket3=1, bucket5=1.
 	gotHuman := stats.Distributions.DurationMinutes.ScopeHuman.Buckets
-	wantCountsHuman := []int{0, 0, 1, 1, 0, 1}
+	wantCountsHuman := []int{0, 1, 1, 1, 0, 1}
 	require.Len(t, gotHuman, len(wantCountsHuman),
 		"duration scope_human buckets")
 	for i, w := range wantCountsHuman {
@@ -618,20 +755,20 @@ func TestGetSessionStats_Distributions(t *testing.T) {
 	}
 
 	// Means (arithmetic over included sessions).
-	wantAllMean := (0.5 + 0.9 + 10 + 25 + 120) / 5.0
+	wantAllMean := (0.5 + 0.9 + 10 + 25 + 120 + 3 + 30) / 7.0
 	gotAllMean := stats.Distributions.DurationMinutes.ScopeAll.Mean
 	assert.InDelta(t, wantAllMean, gotAllMean, 0.01,
 		"duration scope_all mean")
-	wantHumanMean := (10.0 + 25.0 + 120.0) / 3.0
+	wantHumanMean := (10.0 + 25.0 + 120.0 + 3.0) / 4.0
 	gotHumanMean := stats.Distributions.DurationMinutes.ScopeHuman.Mean
 	assert.InDelta(t, wantHumanMean, gotHumanMean, 0.01,
 		"duration scope_human mean")
 
 	// user_messages scope_all uses userMessagesEdgesAll
 	// ([0,2),[2,6),[6,16),[16,31),[31,51),[51,inf)):
-	// 0→0, 1→0, 3→1, 10→2, 30→3.
+	// 0→0, 1→0, 3→1, 10→2, 30→3, 1→0, 4→1.
 	gotUM := stats.Distributions.UserMessages.ScopeAll.Buckets
-	wantUM := []int{2, 1, 1, 1, 0, 0}
+	wantUM := []int{3, 2, 1, 1, 0, 0}
 	require.Len(t, gotUM, len(wantUM),
 		"user_messages scope_all buckets")
 	for i, w := range wantUM {
@@ -639,7 +776,9 @@ func TestGetSessionStats_Distributions(t *testing.T) {
 			"user_messages scope_all bucket %d", i)
 	}
 	// user_messages scope_human uses userMessagesEdgesHuman (5 buckets,
-	// dropping the automation band): 3→0, 10→1, 30→2.
+	// dropping the automation band): 3→0, 10→1, 30→2. The short
+	// non-automated session with userMsgs=1 is filtered out before
+	// mean and bucket accumulation.
 	gotUMH := stats.Distributions.UserMessages.ScopeHuman.Buckets
 	wantUMH := []int{1, 1, 1, 0, 0}
 	require.Len(t, gotUMH, len(wantUMH),
@@ -648,17 +787,22 @@ func TestGetSessionStats_Distributions(t *testing.T) {
 		assert.Equal(t, w, gotUMH[i].Count,
 			"user_messages scope_human bucket %d", i)
 	}
+	assert.InDelta(t, (3.0+10.0+30.0)/3.0,
+		stats.Distributions.UserMessages.ScopeHuman.Mean, 0.01,
+		"user_messages scope_human mean filters values below 2")
 
-	// peak_context scope_all: 2k→0, 8k→0, 25k→1, 60k→2, 150k→4.
+	// peak_context scope_all: 2k/8k→0, 12k/25k→1,
+	// 60k/75k→2, 150k→4.
 	gotPCAll := stats.Distributions.PeakContextTokens.ScopeAll.Buckets
-	wantPCAll := []int{2, 1, 1, 0, 1, 0}
+	wantPCAll := []int{2, 2, 2, 0, 1, 0}
 	for i, w := range wantPCAll {
 		assert.Equal(t, w, gotPCAll[i].Count,
 			"peak_context scope_all bucket %d", i)
 	}
-	// peak_context scope_human (c,d,e): 25k→1, 60k→2, 150k→4.
+	// peak_context scope_human (c,d,e,f): 12k/25k→1,
+	// 60k→2, 150k→4.
 	gotPC := stats.Distributions.PeakContextTokens.ScopeHuman.Buckets
-	assert.Equal(t, 1, gotPC[1].Count,
+	assert.Equal(t, 2, gotPC[1].Count,
 		"peak_context scope_human: %+v", gotPC)
 	assert.Equal(t, 1, gotPC[2].Count,
 		"peak_context scope_human: %+v", gotPC)
@@ -681,40 +825,6 @@ func TestGetSessionStats_Distributions(t *testing.T) {
 		assert.Equal(t, w, gotTPT[i].Count,
 			"tools_per_turn scope_all bucket %d", i)
 	}
-}
-
-func Test_computeDistributions_scopeHuman_flag(t *testing.T) {
-	d := testDB(t)
-	// Short non-automated: must count in scope_human.
-	insertSessionFixture(t, d, sessionFixture{
-		id: "short-human", userMsgs: 1, durationMin: 3,
-		startedAt: hoursAgo(1), isAutomated: false,
-	})
-	// Multi-turn automated: must be excluded from scope_human.
-	insertSessionFixture(t, d, sessionFixture{
-		id: "auto-long", userMsgs: 4, durationMin: 30,
-		startedAt: hoursAgo(1), isAutomated: true,
-	})
-
-	got, err := d.GetSessionStats(t.Context(), StatsFilter{Since: "1d"})
-	require.NoError(t, err, "GetSessionStats")
-	// scope_all has both rows — mean ~= 16.5.
-	allMean := got.Distributions.DurationMinutes.ScopeAll.Mean
-	require.InDelta(t, 16.5, allMean, 1.5,
-		"scope_all duration mean")
-	// scope_human has only the non-automated short session — mean ~= 3.
-	humanMean := got.Distributions.DurationMinutes.ScopeHuman.Mean
-	require.InDelta(t, 3.0, humanMean, 1.0,
-		"scope_human duration mean (short-human only)")
-
-	humanUserMessages := got.Distributions.UserMessages.ScopeHuman
-	require.Equal(t, 0.0, humanUserMessages.Mean,
-		"scope_human user_messages mean want 0 (<2 filtered)")
-	bucketedHumanMessages := 0
-	for _, bucket := range humanUserMessages.Buckets {
-		bucketedHumanMessages += bucket.Count
-	}
-	require.Equal(t, 0, bucketedHumanMessages, "scope_human user_messages bucket total")
 }
 
 func TestGetSessionStats_Distributions_NullPeakContext(t *testing.T) {
@@ -1520,6 +1630,49 @@ func TestGetSessionStats_CacheEconomics(t *testing.T) {
 		"DollarsSavedVsUncached")
 }
 
+func TestGetSessionStats_CacheEconomicsClampsRawTokenUsage(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	const maxTokens = MaxPlausibleTokens
+
+	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
+		ModelPattern:         "claude-sonnet-4-6",
+		InputPerMTok:         1.0,
+		OutputPerMTok:        2.0,
+		CacheCreationPerMTok: 3.0,
+		CacheReadPerMTok:     4.0,
+	}}), "UpsertModelPricing")
+
+	insertSessionFixture(t, d, sessionFixture{
+		id: "ce-clamp", agent: "claude", userMsgs: 3,
+		startedAt: hoursAgo(2),
+	})
+	seedCacheEconomicsMessage(t, d, "ce-clamp", 1, "claude-sonnet-4-6",
+		cacheTokenBreakdown{
+			input:         9_999_999_999,
+			output:        9_999_999_999,
+			cacheCreation: 9_999_999_999,
+			cacheRead:     9_999_999_999,
+		})
+
+	stats, err := d.GetSessionStats(ctx, StatsFilter{Since: "28d"})
+	require.NoError(t, err, "GetSessionStats")
+	ce := stats.CacheEconomics
+	require.NotNil(t, ce, "CacheEconomics: want populated")
+
+	assert.InDelta(t, 1.0/3.0, ce.CacheHitRatio.Overall, 1e-9,
+		"CacheHitRatio.Overall")
+	assert.Equal(t, 1, ce.CacheHitRatio.Buckets[1].Count,
+		"clamped ratio 1/3 should land in bucket [0.25,0.5)")
+	wantSpent := float64(maxTokens) * (1.0 + 2.0 + 3.0 + 4.0) / 1_000_000
+	assert.InDelta(t, wantSpent, ce.DollarsSpent, 1e-9, "DollarsSpent")
+	wantWithoutCache := float64(maxTokens) * (1.0 + 2.0 + 1.0 + 1.0) / 1_000_000
+	assert.InDelta(t, wantWithoutCache, ce.DollarsSavedVsUncached+ce.DollarsSpent,
+		1e-9, "DollarsWithoutCache")
+	assert.InDelta(t, wantWithoutCache-wantSpent, ce.DollarsSavedVsUncached,
+		1e-9, "DollarsSavedVsUncached")
+}
+
 // TestGetSessionStats_CacheEconomics_NoClaude verifies that the
 // pointer remains nil when the window contains zero Claude sessions.
 // A zero-valued *StatsCacheEconomics would emit "claude_only":false,
@@ -1860,10 +2013,13 @@ func TestGetSessionStats_Temporal_EmptyWindowEmptySlice(t *testing.T) {
 	assert.NotNil(t, stats.Temporal.HourlyUTC,
 		"hourly_utc must be a non-nil empty slice, got nil")
 	assert.Len(t, stats.Temporal.HourlyUTC, 0, "hourly_utc: got len")
-	// Reporter timezone should still be populated (claim in the spec).
-	assert.NotEmpty(t, stats.Temporal.ReporterTimezone,
-		"reporter_timezone must be populated even when "+
-			"hourly_utc is empty")
+	// Reporter timezone may now be empty when the host only exposes the
+	// Local sentinel; otherwise it must still be a loadable IANA name.
+	if stats.Temporal.ReporterTimezone != "" {
+		_, tzErr := time.LoadLocation(stats.Temporal.ReporterTimezone)
+		assert.NoError(t, tzErr,
+			"reporter_timezone must stay loadable when populated")
+	}
 	// JSON encoding must emit [] not null.
 	raw, err := json.Marshal(stats.Temporal.HourlyUTC)
 	require.NoError(t, err, "json.Marshal")
@@ -1892,6 +2048,8 @@ func TestReporterTimezone_Precedence(t *testing.T) {
 			_ = os.Unsetenv("TZ")
 		}
 	})
+	oldLocal := time.Local
+	t.Cleanup(func() { time.Local = oldLocal })
 
 	// Filter wins over env.
 	err := os.Setenv("TZ", "Europe/Berlin")
@@ -1904,12 +2062,18 @@ func TestReporterTimezone_Precedence(t *testing.T) {
 	assert.Equal(t, "Europe/Berlin",
 		reporterTimezone(StatsFilter{}), "env wins")
 
-	// No filter, no env → time.Local fallback.
+	// No filter, no env, valid local name → local wins.
 	err = os.Unsetenv("TZ")
 	require.NoError(t, err, "unset TZ")
-	got := reporterTimezone(StatsFilter{})
-	assert.NotEmpty(t, got, "time.Local fallback: got empty string")
-	assert.Equal(t, time.Local.String(), got, "time.Local fallback")
+	time.Local = time.FixedZone("America/New_York", -5*60*60)
+	assert.Equal(t, "America/New_York",
+		reporterTimezone(StatsFilter{}),
+		"valid local name should pass through")
+
+	// No filter, no env, Local sentinel → emit empty fallback.
+	time.Local = time.FixedZone("Local", 0)
+	assert.Equal(t, "", reporterTimezone(StatsFilter{}),
+		"Local sentinel should not be published")
 }
 
 func TestGetSessionStats_Temporal_FilterByAgentFlowsThrough(t *testing.T) {
@@ -2325,18 +2489,13 @@ func statsRunGit(t *testing.T, repo string, env []string, args ...string) {
 		strings.Join(args, " "), out)
 }
 
-// statsInitRepo creates a fresh git repo under t.TempDir() with a
-// deterministic author identity (test@example.com). Signing is disabled
-// so the tests don't hang on a GPG prompt when the host has commit
-// signing enabled globally.
-func statsInitRepo(t *testing.T) string {
+func statsInitRepoAt(t *testing.T, repo string) {
 	t.Helper()
-	repo := t.TempDir()
+	require.NoError(t, os.MkdirAll(repo, 0o755), "mkdir repo")
 	statsRunGit(t, repo, nil, "init", "-q", "-b", "main")
 	statsRunGit(t, repo, nil, "config", "user.email", "test@example.com")
 	statsRunGit(t, repo, nil, "config", "user.name", "Test User")
 	statsRunGit(t, repo, nil, "config", "commit.gpgsign", "false")
-	return repo
 }
 
 // statsCommitFile writes content into repo/relpath, stages it, and
@@ -2361,29 +2520,42 @@ func statsCommitFile(
 	statsRunGit(t, repo, env, "commit", "-q", "-m", message)
 }
 
-// TestGetSessionStats_OutcomeStats_DefaultDisabled verifies that plain
-// stats runs do not touch git-derived outcome aggregation, even when
-// sessions carry cwd values inside a real repository.
-func TestGetSessionStats_OutcomeStats_DefaultDisabled(t *testing.T) {
-	skipIfNoGit(t)
-	d := testDB(t)
-	ctx := context.Background()
+var (
+	statsOutcomeRepoOnce sync.Once
+	statsOutcomeRepoDir  string
+	statsOutcomeRepoPath string
+)
 
-	repo := statsInitRepo(t)
-	statsCommitFile(t, repo, "a.txt", "a1\n", "c1")
-	insertSessionFixture(t, d, sessionFixture{
-		id: "os-default", agent: "claude", userMsgs: 5,
-		startedAt: hoursAgo(5), cwd: repo,
+func statsOutcomeRepo(t *testing.T) string {
+	t.Helper()
+	statsOutcomeRepoOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "agentsview-stats-outcome-*")
+		require.NoError(t, err, "create stats outcome repo dir")
+		statsOutcomeRepoDir = dir
+		statsOutcomeRepoPath = filepath.Join(dir, "repo")
+		statsInitRepoAt(t, statsOutcomeRepoPath)
+		// Three commits by test@example.com with known LOC counts.
+		//   c1 a.txt:      +3 -0 (new file, 3 lines)
+		//   c2 a.txt:      +2 -0 (append 2 lines)
+		//   c3 b.txt:      +4 -0 (new file, 4 lines)
+		statsCommitFile(t, statsOutcomeRepoPath,
+			"a.txt", "a1\na2\na3\n", "c1")
+		statsCommitFile(t, statsOutcomeRepoPath,
+			"a.txt", "a1\na2\na3\na4\na5\n", "c2")
+		statsCommitFile(t, statsOutcomeRepoPath,
+			"b.txt", "b1\nb2\nb3\nb4\n", "c3")
+		require.NoError(t, os.MkdirAll(
+			filepath.Join(statsOutcomeRepoPath, "subdir"), 0o755,
+		), "mkdir stats outcome subdir")
 	})
 
-	stats, err := d.GetSessionStats(ctx, StatsFilter{Since: "28d"})
-	require.NoError(t, err, "GetSessionStats")
-	require.Nil(t, stats.OutcomeStats, "OutcomeStats")
+	return statsOutcomeRepoPath
 }
 
 // TestGetSessionStats_OutcomeStats_Happy seeds sessions whose cwd
-// points inside a real fixture repo and asserts that the outcome_stats
-// section surfaces the author-filtered commit totals. PRsOpened /
+// points inside a real fixture repo, verifies outcome_stats is off by
+// default, and asserts that enabling it surfaces the author-filtered
+// commit totals. PRsOpened /
 // PRsMerged must stay nil because no GHToken is supplied — the JSON
 // contract distinguishes "gh not configured" (nil) from "gh configured,
 // zero PRs" (pointer to 0).
@@ -2392,21 +2564,12 @@ func TestGetSessionStats_OutcomeStats_Happy(t *testing.T) {
 	d := testDB(t)
 	ctx := context.Background()
 
-	repo := statsInitRepo(t)
-	// Three commits by test@example.com with known LOC counts.
-	//   c1 a.txt:      +3 -0 (new file, 3 lines)
-	//   c2 a.txt:      +2 -0 (append 2 lines)
-	//   c3 b.txt:      +4 -0 (new file, 4 lines)
-	statsCommitFile(t, repo, "a.txt", "a1\na2\na3\n", "c1")
-	statsCommitFile(t, repo, "a.txt", "a1\na2\na3\na4\na5\n", "c2")
-	statsCommitFile(t, repo, "b.txt", "b1\nb2\nb3\nb4\n", "c3")
+	repo := statsOutcomeRepo(t)
 
 	// Two Claude sessions with cwds inside the repo — one at the root,
 	// one in a subdirectory. Both should collapse to the same repo and
 	// counted once in ReposActive.
 	sub := filepath.Join(repo, "subdir")
-	err := os.MkdirAll(sub, 0o755)
-	require.NoError(t, err, "mkdir sub")
 	insertSessionFixture(t, d, sessionFixture{
 		id: "os1", agent: "claude", userMsgs: 5,
 		startedAt: hoursAgo(5), cwd: repo,
@@ -2416,7 +2579,11 @@ func TestGetSessionStats_OutcomeStats_Happy(t *testing.T) {
 		startedAt: hoursAgo(4), cwd: sub,
 	})
 
-	stats, err := d.GetSessionStats(ctx, StatsFilter{
+	stats, err := d.GetSessionStats(ctx, StatsFilter{Since: "28d"})
+	require.NoError(t, err, "GetSessionStats without git outcomes")
+	require.Nil(t, stats.OutcomeStats, "OutcomeStats")
+
+	stats, err = d.GetSessionStats(ctx, StatsFilter{
 		Since: "28d", IncludeGitOutcomes: true,
 	})
 	require.NoError(t, err, "GetSessionStats")

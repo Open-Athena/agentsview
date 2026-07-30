@@ -15,6 +15,7 @@ import (
 	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/export"
 )
 
 // ActivityReportConfig holds the flags for `agentsview activity report`.
@@ -32,6 +33,8 @@ type ActivityReportConfig struct {
 	NoSync   bool
 	Offline  bool
 }
+
+var activityReportNow = time.Now
 
 // runActivityReport syncs, resolves the range, runs the report, and prints it.
 func runActivityReport(cfg ActivityReportConfig) {
@@ -115,6 +118,9 @@ func fetchHTTPActivityReport(
 	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
 		return activity.Report{}, err
 	}
+	if r.Projects == nil {
+		r.Projects = map[string]export.ProjectMapEntry{}
+	}
 	return r, nil
 }
 
@@ -154,7 +160,7 @@ func resolveActivityReport(
 		Timezone:       tz,
 		BucketOverride: cfg.Bucket,
 	}
-	q, err := activity.ResolveQuery(input, time.Now())
+	q, err := activity.ResolveQuery(input, activityReportNow())
 	if err != nil {
 		return activity.Report{}, err
 	}
@@ -177,7 +183,7 @@ func todayIn(tz string) string {
 	if err != nil {
 		loc = time.Local
 	}
-	return time.Now().In(loc).Format("2006-01-02")
+	return activityReportNow().In(loc).Format("2006-01-02")
 }
 
 // printActivityReport renders the human-readable report: a header, totals,

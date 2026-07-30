@@ -83,7 +83,7 @@ func guardClassifierRebuild(tr transport) error {
 	if tr.Mode == transportHTTP {
 		return errors.New(
 			"local daemon is serving on " + tr.URL +
-				"; stop 'agentsview serve' (or 'pg serve') " +
+				"; stop 'agentsview serve' or the read-only mirror serve " +
 				"before running 'classifier rebuild'",
 		)
 	}
@@ -137,7 +137,7 @@ func runClassifierRebuild(
 		}
 		if pgCfg.URL == "" {
 			return errors.New(
-				"pg url not configured; set AGENTSVIEW_PG_URL or [pg].url",
+				"pg url not configured; set AGENTSVIEW_PG_URL, use a legacy [pg].url, or configure default_pg with named [pg.NAME] targets",
 			)
 		}
 		if err := clearPGClassifierHash(ctx, cfg, pgCfg); err != nil {

@@ -23,7 +23,11 @@
   } from "../../api/generated/index";
   import { configureGeneratedClient } from "../../api/runtime.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
-  import { agentColor, agentLabel } from "../../utils/agents.js";
+  import {
+    agentColor,
+    agentForeground,
+    agentLabel,
+  } from "../../utils/agents.js";
   import { formatCost, formatTokenUsage } from "../../utils/format.js";
   import { normalizeMessagePreview } from "../../utils/messages.js";
   import { getGradeStyle, getGradeLabel } from "../../utils/grade.js";
@@ -40,6 +44,7 @@
   import { messages as messagesStore } from "../../stores/messages.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
   import { SNAPSHOT } from "../../utils/snapshot.js";
+  import { m } from "../../i18n/index.js";
 
   interface Props {
     session: Session | undefined;
@@ -312,14 +317,18 @@
           } satisfies ResumeRequest,
         }) as ResumeResponse;
       if (resp.launched) {
-        showFeedback(`Resumed in ${resp.terminal ?? opener.name}`);
+        showFeedback(m.session_breadcrumb_resumed_in({
+          target: resp.terminal ?? opener.name,
+        }));
         return;
       }
       // Launch failed — fall back to clipboard copy.
       if (resp.command) {
         const cmd = formatResumeResponseCommand(session.agent, resp);
         const ok = cmd ? await copyToClipboard(cmd) : false;
-        showFeedback(ok ? "Command copied!" : "Failed");
+        showFeedback(ok
+          ? m.session_breadcrumb_command_copied()
+          : m.session_breadcrumb_failed());
         return;
       }
     } catch {
@@ -328,9 +337,11 @@
     const cmd = buildResumeCommand(session.agent, session.id);
     if (cmd) {
       const ok = await copyToClipboard(cmd);
-      showFeedback(ok ? "Command copied!" : "Failed");
+      showFeedback(ok
+        ? m.session_breadcrumb_command_copied()
+        : m.session_breadcrumb_failed());
     } else {
-      showFeedback("Not supported");
+      showFeedback(m.session_breadcrumb_not_supported());
     }
   }
 
@@ -347,7 +358,9 @@
       if (resp.command) {
         const cmd = formatResumeResponseCommand(session.agent, resp);
         const ok = cmd ? await copyToClipboard(cmd) : false;
-        showFeedback(ok ? "Command copied!" : "Failed");
+        showFeedback(ok
+          ? m.session_breadcrumb_command_copied()
+          : m.session_breadcrumb_failed());
         return;
       }
     } catch {
@@ -356,20 +369,24 @@
     const cmd = buildResumeCommand(session.agent, session.id);
     if (cmd) {
       const ok = await copyToClipboard(cmd);
-      showFeedback(ok ? "Command copied!" : "Failed");
+      showFeedback(ok
+        ? m.session_breadcrumb_command_copied()
+        : m.session_breadcrumb_failed());
     } else {
-      showFeedback("Not supported");
+      showFeedback(m.session_breadcrumb_not_supported());
     }
   }
 
   async function handleCopyFilePath() {
     showOpenMenu = false;
     if (!sessionDir) {
-      showFeedback("No path available");
+      showFeedback(m.session_breadcrumb_no_path_available());
       return;
     }
     const ok = await copyToClipboard(sessionDir);
-    showFeedback(ok ? "Path copied!" : "Failed");
+    showFeedback(ok
+      ? m.session_breadcrumb_path_copied()
+      : m.session_breadcrumb_failed());
   }
 
   async function handleOpenIn(opener: Opener) {
@@ -381,9 +398,11 @@
         id: session.id,
         requestBody: { opener_id: opener.id },
       });
-      showFeedback(`Opened in ${opener.name}`);
+      showFeedback(m.session_breadcrumb_opened_in({
+        target: opener.name,
+      }));
     } catch {
-      showFeedback("Failed to open");
+      showFeedback(m.session_breadcrumb_failed_to_open());
     }
   }
 
@@ -399,14 +418,18 @@
         }) as ResumeResponse;
       if (resp.launched) {
         showFeedback(
-          `Resumed in ${resp.terminal ?? "terminal"}`,
+          m.session_breadcrumb_resumed_in({
+            target: resp.terminal ?? "terminal",
+          }),
         );
         return;
       }
       if (resp.command) {
         const cmd = formatResumeResponseCommand(session.agent, resp);
         const ok = cmd ? await copyToClipboard(cmd) : false;
-        showFeedback(ok ? "Command copied!" : "Failed");
+        showFeedback(ok
+          ? m.session_breadcrumb_command_copied()
+          : m.session_breadcrumb_failed());
         return;
       }
     } catch {
@@ -415,9 +438,11 @@
     const cmd = buildResumeCommand(session.agent, session.id);
     if (cmd) {
       const ok = await copyToClipboard(cmd);
-      showFeedback(ok ? "Command copied!" : "Failed");
+      showFeedback(ok
+        ? m.session_breadcrumb_command_copied()
+        : m.session_breadcrumb_failed());
     } else {
-      showFeedback("Not supported");
+      showFeedback(m.session_breadcrumb_not_supported());
     }
   }
 
@@ -512,9 +537,9 @@
   <button
     class="breadcrumb-link"
     onclick={onBack}
-    title="Back to sessions"
+    title={m.session_breadcrumb_back_to_sessions()}
   >
-    Sessions
+    {m.session_breadcrumb_sessions()}
   </button>
   <span class="breadcrumb-sep">/</span>
   {#if renaming}
@@ -539,7 +564,33 @@
       <span
         class="agent-badge"
         style:background={agentColor(session.agent)}
+        style:color={agentForeground(session.agent)}
       >{agentLabel(session.agent)}</span>
+      {#if session.agent === "antigravity-cli" && session.transcript_fidelity === "summary"}
+        <a
+          class="summary-badge"
+          href="https://github.com/kenn-io/agentsview#antigravity-cli-high-resolution-transcripts"
+          target="_blank"
+          rel="noopener noreferrer"
+          title={m.session_breadcrumb_summary_mode_tooltip()}
+        >{m.session_breadcrumb_summary_mode()}</a>
+      {/if}
+      {#if session.parser_malformed_lines}
+        <span
+          class="malformed-badge"
+          title={m.session_breadcrumb_malformed_lines_tooltip({
+            count: session.parser_malformed_lines,
+          })}
+        >{m.session_breadcrumb_malformed_lines({
+          count: session.parser_malformed_lines,
+        })}</span>
+      {/if}
+      {#if (session.agent === "antigravity" || session.agent === "antigravity-cli") && session.decode_confidence === "low"}
+        <span
+          class="decode-badge"
+          title={m.session_breadcrumb_antigravity_decode_confidence_low_tooltip()}
+        >{m.session_breadcrumb_antigravity_decode_confidence_low()}</span>
+      {/if}
       {#if session.started_at}
         <span class="session-time">
           {new Date(session.started_at).toLocaleDateString(
@@ -558,7 +609,7 @@
         style:color={gradeStyle.text}
         style:border-color={gradeStyle.border}
         onclick={() => ui.toggleSignalPanel()}
-        title="Session health"
+        title={m.session_breadcrumb_session_health()}
       >
         {getGradeLabel(session.health_grade)}
       </button>
@@ -568,14 +619,20 @@
             class="resume-btn"
             class:has-feedback={openFeedback !== ""}
             onclick={(e) => { e.stopPropagation(); showOpenMenu = !showOpenMenu; }}
-            title={canResume ? "Resume session in terminal" : "Session actions"}
-            aria-label={canResume ? "Resume session" : "Session actions"}
+            title={canResume
+              ? m.session_breadcrumb_resume_session_in_terminal()
+              : m.session_breadcrumb_session_actions()}
+            aria-label={canResume
+              ? m.session_breadcrumb_resume_session()
+              : m.session_breadcrumb_session_actions()}
           >
             {#if openFeedback}
               <CheckIcon size="11" strokeWidth="2.4" aria-hidden="true" />
               {openFeedback}
             {:else}
-              {canResume ? "Resume" : "Open"}
+              {canResume
+                ? m.session_breadcrumb_resume()
+                : m.session_breadcrumb_open()}
               <ChevronDownIcon size="8" strokeWidth="2.6" aria-hidden="true" />
             {/if}
           </button>
@@ -595,14 +652,14 @@
                   <span class="open-menu-num">
                     <SquareTerminalIcon size="10" strokeWidth="2" aria-hidden="true" />
                   </span>
-                  <span class="open-menu-name">Default terminal</span>
+                  <span class="open-menu-name">{m.session_breadcrumb_default_terminal()}</span>
                 </button>
                 <div class="open-menu-divider"></div>
                 <button class="open-menu-item" onclick={handleCopyResumeCommand}>
                   <span class="open-menu-num">
                     <CopyIcon size="10" strokeWidth="2" aria-hidden="true" />
                   </span>
-                  <span class="open-menu-name">Copy command</span>
+                  <span class="open-menu-name">{m.session_breadcrumb_copy_command()}</span>
                 </button>
               {/if}
               {#if isLocal}
@@ -610,11 +667,11 @@
                 <span class="open-menu-num">
                   <FileTextIcon size="10" strokeWidth="2" aria-hidden="true" />
                 </span>
-                <span class="open-menu-name">Copy directory path</span>
+                <span class="open-menu-name">{m.session_breadcrumb_copy_directory_path()}</span>
               </button>
               {#if editorOpeners.length > 0 || fileOpeners.length > 0}
                 <div class="open-menu-divider"></div>
-                <div class="open-menu-section">Open in</div>
+                <div class="open-menu-section">{m.session_breadcrumb_open_in()}</div>
                 {#each editorOpeners as opener (opener.id)}
                   <button
                     class="open-menu-item"
@@ -659,12 +716,12 @@
         {@const rawId = sessionDisplayId(session.id)}
         <button
           class="session-id"
-          title="Copy session ID: {rawId}"
+          title={m.session_breadcrumb_copy_session_id_value({ id: rawId })}
           onclick={() => copySessionId(rawId, session.id)}
-          aria-label="Copy session ID"
+          aria-label={m.session_breadcrumb_copy_session_id()}
         >
           {copiedSessionId === session.id
-            ? "Copied!"
+            ? m.session_breadcrumb_copied()
             : rawId.slice(0, 8)}
         </button>
       {/if}
@@ -680,7 +737,7 @@
         </span>
       {/if}
       {#if sessionCostLabel}
-        <span class="cost-badge" title="Estimated session cost">
+        <span class="cost-badge" title={m.session_breadcrumb_estimated_session_cost()}>
           {sessionCostLabel}
         </span>
       {/if}
@@ -691,9 +748,9 @@
         <button
           class="link-btn"
           class:link-btn--copied={copiedLinkId === session?.id}
-          title="Copy link to session"
+          title={m.session_breadcrumb_copy_link_to_session()}
           onclick={copySessionLink}
-          aria-label="Copy link to session"
+          aria-label={m.session_breadcrumb_copy_link_to_session()}
         >
           {#if copiedLinkId === session?.id}
             <CheckIcon size="13" strokeWidth="2.4" aria-hidden="true" />
@@ -705,28 +762,28 @@
           class="minimap-btn"
           class:minimap-btn--active={ui.vitalsOpen}
           title={ui.vitalsOpen
-            ? "Hide session analysis"
-            : "Show session analysis"}
+            ? m.session_breadcrumb_hide_session_analysis()
+            : m.session_breadcrumb_show_session_analysis()}
           onclick={() => ui.toggleVitals()}
           aria-label={ui.vitalsOpen
-            ? "Hide session analysis"
-            : "Show session analysis"}
+            ? m.session_breadcrumb_hide_session_analysis()
+            : m.session_breadcrumb_show_session_analysis()}
         >
           <ChartColumnIcon size="13" strokeWidth="2" aria-hidden="true" />
         </button>
         <button
           class="find-btn"
           class:find-btn--active={inSessionSearch.isOpen}
-          title="Find in session (/)"
+          title={m.session_breadcrumb_find_in_session_shortcut()}
           onclick={() => inSessionSearch.toggle()}
-          aria-label="Find in session"
+          aria-label={m.session_breadcrumb_find_in_session()}
         >
           <SearchIcon size="13" strokeWidth="2" aria-hidden="true" />
         </button>
         <button
           class="actions-btn"
-          title="Session actions"
-          aria-label="Session actions"
+          title={m.session_breadcrumb_session_actions()}
+          aria-label={m.session_breadcrumb_session_actions()}
           bind:this={menuBtnEl}
           onclick={toggleMenu}
         >
@@ -738,7 +795,7 @@
               class="actions-menu-item"
               onclick={startRename}
             >
-              Rename
+              {m.session_breadcrumb_rename()}
             </button>
             {#if !SNAPSHOT}
               <button
@@ -752,7 +809,7 @@
               class="actions-menu-item danger"
               onclick={handleDelete}
             >
-              Delete
+              {m.session_breadcrumb_delete()}
             </button>
           </div>
         {/if}
@@ -839,6 +896,56 @@
     background: var(--text-muted);
   }
 
+  .summary-badge {
+    font-size: 9px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    flex-shrink: 0;
+    color: var(--accent-amber, #e0a458);
+    background: color-mix(in srgb, var(--accent-amber, #e0a458) 18%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent-amber, #e0a458) 40%, transparent);
+    text-decoration: none;
+    white-space: nowrap;
+  }
+
+  .summary-badge:hover {
+    text-decoration: underline;
+  }
+
+  .malformed-badge {
+    display: inline-flex;
+    align-items: center;
+    font-size: 9px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 8px;
+    letter-spacing: 0.02em;
+    flex-shrink: 0;
+    color: var(--accent-amber, #e0a458);
+    background: color-mix(in srgb, var(--accent-amber, #e0a458) 18%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent-amber, #e0a458) 40%, transparent);
+    white-space: nowrap;
+    cursor: default;
+  }
+
+  .decode-badge {
+    font-size: 9px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    flex-shrink: 0;
+    color: var(--accent-red, #e55);
+    background: color-mix(in srgb, var(--accent-red, #e55) 16%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent-red, #e55) 45%, transparent);
+    white-space: nowrap;
+    cursor: help;
+  }
+
   .session-time {
     font-size: 10px;
     color: var(--text-muted);
@@ -905,14 +1012,14 @@
     border-radius: 8px;
     padding: 4px;
     min-width: 200px;
-    z-index: 100;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+    z-index: var(--z-popover);
+    box-shadow: var(--shadow-lg);
   }
 
   .open-menu-item {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: var(--space-4);
     width: 100%;
     padding: 6px 10px;
     font-size: 13px;
@@ -1122,12 +1229,12 @@
     position: absolute;
     top: 100%;
     right: 0;
-    z-index: 9999;
+    z-index: var(--z-popover);
     margin-top: 4px;
     background: var(--bg-surface);
     border: 1px solid var(--border-default);
     border-radius: 6px;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+    box-shadow: var(--shadow-lg);
     padding: 4px 0;
     min-width: 120px;
   }
@@ -1161,7 +1268,7 @@
     );
   }
 
-  @media (max-width: 767px) {
+  @media (max-width: 760px) {
     .breadcrumb-meta {
       gap: 4px;
     }

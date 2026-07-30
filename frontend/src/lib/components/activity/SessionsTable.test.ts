@@ -2,6 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mount, tick, unmount } from "svelte";
 import SessionsTable from "./SessionsTable.svelte";
+import { m } from "../../i18n/index.js";
 import { router } from "../../stores/router.svelte.js";
 import type { Report } from "../../api/types.js";
 import type { ActivitySessionRow } from "../../api/generated/index";
@@ -144,7 +145,7 @@ describe("SessionsTable", () => {
     await tick();
 
     const costHeader = document.querySelector(
-      '[data-sort-key="cost"]',
+      "th.sort-cost button",
     ) as HTMLElement | null;
     expect(costHeader).toBeTruthy();
     costHeader!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -243,7 +244,7 @@ describe("SessionsTable", () => {
 
     expect(document.querySelectorAll(".session-row").length).toBe(0);
     expect(document.querySelector(".empty")?.textContent).toContain(
-      "No sessions active in the selected slot",
+      m.activity_no_sessions_selected_slot(),
     );
     expect(document.querySelector(".filter-badge")).toBeTruthy();
 

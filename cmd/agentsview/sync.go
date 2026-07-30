@@ -19,6 +19,7 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/remotesync"
 	"go.kenn.io/agentsview/internal/ssh"
 	"go.kenn.io/agentsview/internal/sync"
 )
@@ -90,10 +91,13 @@ func doSync(cfg SyncConfig) (hadRemoteFailures bool) {
 		if tr.Mode == transportHTTP {
 			useDaemon := useDaemonForSync(tr)
 			if useDaemon && len(remoteHosts) > 0 {
+				fmt.Println("Running sync with remotes via daemon...")
+				progress := newRemoteProgressPrinter(os.Stdout, time.Now)
 				failures, err := runDaemonRemoteSync(
 					context.Background(), tr, appCfg.AuthToken,
-					remoteHosts, cfg.Full, includeLocal,
+					remoteHosts, cfg.Full, includeLocal, progress.Print,
 				)
+				progress.Finish()
 				if err != nil {
 					fatal("daemon remote sync: %v", err)
 				}
@@ -102,9 +106,23 @@ func doSync(cfg SyncConfig) (hadRemoteFailures bool) {
 			}
 			if useDaemon {
 				start := time.Now()
+				var onProgress sync.ProgressFunc
+				var progress *resyncProgressPrinter
+				if cfg.Full {
+					fmt.Println("Running full resync via daemon...")
+					progress = newResyncProgressPrinter(os.Stdout, time.Now)
+					onProgress = progress.Print
+				} else {
+					fmt.Println("Running sync via daemon...")
+					onProgress = printSyncProgress
+				}
 				stats, err := runDaemonSync(
 					context.Background(), tr, appCfg.AuthToken, cfg.Full,
+					onProgress,
 				)
+				if progress != nil {
+					progress.Finish()
+				}
 				if err != nil {
 					fatal("daemon sync: %v", err)
 				}
@@ -160,6 +178,107 @@ func useDaemonForSync(tr transport) bool {
 	return true
 }
 
+type remoteProgressPrinter struct {
+	w        io.Writer
+	now      func() time.Time
+	label    string
+	started  time.Time
+	inPlace  bool
+	finished bool
+}
+
+const remoteLocalSyncProgressLabel = "Syncing local sessions"
+
+func newRemoteProgressPrinter(
+	w io.Writer, now func() time.Time,
+) *remoteProgressPrinter {
+	return &remoteProgressPrinter{w: w, now: now}
+}
+
+func (p *remoteProgressPrinter) Print(progress sync.Progress) {
+	if p.finished {
+		return
+	}
+	label := strings.TrimSpace(progress.Detail)
+	if progress.Phase == sync.PhaseDone {
+		p.printFinalInPlaceProgress(progress)
+		p.finishCurrent()
+		return
+	}
+	if label == "" && progress.SessionsTotal > 0 &&
+		progress.Phase == sync.PhaseSyncing {
+		label = remoteLocalSyncProgressLabel
+		progress.Detail = label
+	}
+	if label == "" {
+		return
+	}
+	if strings.HasPrefix(label, "Synced ") {
+		p.finishCurrent()
+		fmt.Fprintf(p.w, "  %s\n", label)
+		return
+	}
+	if progress.BytesDone > 0 || progress.BytesTotal > 0 {
+		if p.label != label {
+			p.finishCurrent()
+			p.label = label
+			p.started = p.now()
+		}
+		p.inPlace = true
+		fmt.Fprintf(p.w, "\r  %s\x1b[K", formatSyncProgress(progress))
+		return
+	}
+	if progress.Phase == sync.PhaseSyncing && progress.SessionsTotal > 0 {
+		if p.label != label {
+			p.finishCurrent()
+			p.label = label
+			p.started = p.now()
+		}
+		p.inPlace = true
+		fmt.Fprintf(p.w, "\r  %s\x1b[K", formatSyncProgress(progress))
+		return
+	}
+	if p.label == label {
+		return
+	}
+	p.finishCurrent()
+	p.label = label
+	p.started = p.now()
+	p.inPlace = false
+	fmt.Fprintf(p.w, "  %s...\n", strings.TrimSuffix(label, "."))
+}
+
+func (p *remoteProgressPrinter) printFinalInPlaceProgress(
+	progress sync.Progress,
+) {
+	if !p.inPlace || p.label == "" || progress.SessionsTotal == 0 {
+		return
+	}
+	if progress.Detail == "" {
+		progress.Detail = p.label
+	}
+	fmt.Fprintf(p.w, "\r  %s\x1b[K", formatSyncProgress(progress))
+}
+
+func (p *remoteProgressPrinter) Finish() {
+	p.finished = true
+	p.finishCurrent()
+}
+
+func (p *remoteProgressPrinter) finishCurrent() {
+	if p.label == "" {
+		return
+	}
+	if p.inPlace {
+		fmt.Fprint(p.w, "\n")
+	}
+	elapsed := p.now().Sub(p.started).Round(time.Millisecond)
+	fmt.Fprintf(p.w, "  %s completed in %s\n", p.label, elapsed)
+	p.label = ""
+	p.started = time.Time{}
+	p.inPlace = false
+}
+
 // syncLocalAndRemotes runs the local sync, then the configured
 // remote hosts. A local resync (forced via --full or an automatic
 // data-version resync) forces every remote sync full as well, so
@@ -198,6 +317,38 @@ func runRemoteSyncOnce(
 	appCfg config.Config, database *db.DB,
 	rh config.RemoteHost, full bool,
 ) error {
+	_, err := runRemoteSyncTransport(
+		context.Background(), appCfg, database, rh, full,
+	)
+	return err
+}
+
+func runRemoteSyncTransport(
+	ctx context.Context,
+	appCfg config.Config,
+	database *db.DB,
+	rh config.RemoteHost,
+	full bool,
+) (remotesync.SyncStats, error) {
+	switch rh.Transport {
+	case "", config.RemoteTransportSSH:
+		return runSSHRemoteSync(ctx, appCfg, database, rh, full)
+	case config.RemoteTransportHTTP:
+		return runHTTPRemoteSync(ctx, appCfg, database, rh, full)
+	default:
+		return remotesync.SyncStats{}, fmt.Errorf(
+			"invalid remote transport %q", rh.Transport,
+		)
+	}
+}
+
+var runSSHRemoteSync = func(
+	ctx context.Context,
+	appCfg config.Config,
+	database *db.DB,
+	rh config.RemoteHost,
+	full bool,
+) (remotesync.SyncStats, error) {
 	rs := &ssh.RemoteSync{
 		Host:                    rh.Host,
 		User:                    rh.User,
@@ -206,8 +357,31 @@ func runRemoteSyncOnce(
 		DB:                      database,
 		BlockedResultCategories: appCfg.ResultContentBlockedCategories,
 	}
-	_, err := rs.Run(context.Background())
-	return err
+	return rs.Run(ctx)
+}
+
+var runHTTPRemoteSync = func(
+	ctx context.Context,
+	appCfg config.Config,
+	database *db.DB,
+	rh config.RemoteHost,
+	full bool,
+) (remotesync.SyncStats, error) {
+	token := rh.Token
+	if token == "" {
+		return remotesync.SyncStats{}, fmt.Errorf(
+			"http remote sync token is required for host %q",
+			rh.Host,
+		)
+	}
+	return remotesync.HTTPSync{
+		Host:                    rh.Host,
+		URL:                     rh.URL,
+		Token:                   token,
+		Full:                    full,
+		DB:                      database,
+		BlockedResultCategories: appCfg.ResultContentBlockedCategories,
+	}.Run(ctx)
 }
 
 // remoteHostFailure records a configured remote host that failed
@@ -240,7 +414,8 @@ func runRemoteHosts(
 
 // reportRemoteFailures writes per-host failures to the debug log
 // and a summary to stderr, so unattended (cron) runs surface them
-// even though setupLogFile redirects log output to a file.
+// even though setupLogFile redirects log output to a file. The log
+// keeps the raw error; stderr gets the sanitized display form.
 func reportRemoteFailures(failures []remoteHostFailure) {
 	if len(failures) == 0 {
 		return
@@ -251,8 +426,21 @@ func reportRemoteFailures(failures []remoteHostFailure) {
 	fmt.Fprintf(os.Stderr,
 		"sync: %d remote host(s) failed:\n", len(failures))
 	for _, f := range failures {
-		fmt.Fprintf(os.Stderr, "  %s: %v\n", f.Host.Host, f.Err)
+		fmt.Fprintf(os.Stderr, "  %s: %s\n",
+			f.Host.Host, remoteFailureDisplay(f))
 	}
+}
+
+// remoteFailureDisplay renders a remote failure for user-facing
+// output. HTTP failures go through the sanitized summary because
+// their raw errors can embed the remote URL, response bodies, or
+// echoed tokens from a misbehaving endpoint; SSH errors are local
+// tool output and stay verbatim.
+func remoteFailureDisplay(f remoteHostFailure) string {
+	if f.Host.Transport == config.RemoteTransportHTTP {
+		return remotesync.FailureSummary(f.Err)
+	}
+	return f.Err.Error()
 }
 
 // runLocalSync runs a local sync (incremental or full resync).
@@ -279,12 +467,16 @@ func runLocalSync(
 		Machine:                 "local",
 		BlockedResultCategories: appCfg.ResultContentBlockedCategories,
 	})
+	defer engine.Close()
 
 	didResync := full || database.NeedsResync()
+	// No startup state writer: this is a one-shot CLI sync, not a
+	// daemon startup, so there is no start lock for status to read
+	// under.
 	if didResync {
-		runInitialResync(ctx, engine)
+		runInitialResync(ctx, engine, nil)
 	} else {
-		runInitialSync(ctx, engine)
+		runInitialSync(ctx, engine, nil)
 	}
 	engine.PhaseStats().Log("sync")
 
@@ -306,6 +498,7 @@ func runDaemonSync(
 	tr transport,
 	authToken string,
 	full bool,
+	onProgress sync.ProgressFunc,
 ) (sync.SyncStats, error) {
 	endpoint := "/api/v1/sync"
 	if full {
@@ -342,7 +535,7 @@ func runDaemonSync(
 		}
 		return stats, nil
 	}
-	return parseDaemonSyncSSE(resp.Body)
+	return parseDaemonSyncSSE(resp.Body, onProgress)
 }
 
 func runDaemonRemoteSync(
@@ -352,6 +545,7 @@ func runDaemonRemoteSync(
 	hosts []config.RemoteHost,
 	full bool,
 	includeLocal bool,
+	onProgress sync.ProgressFunc,
 ) ([]remoteHostFailure, error) {
 	body, err := json.Marshal(struct {
 		Full         bool                `json:"full"`
@@ -375,6 +569,7 @@ func runDaemonRemoteSync(
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Origin", baseURL)
 	if authToken != "" {
 		req.Header.Set("Authorization", "Bearer "+authToken)
@@ -390,15 +585,26 @@ func runDaemonRemoteSync(
 			"HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)),
 		)
 	}
-	var out struct {
-		Failures []struct {
-			Host config.RemoteHost `json:"host"`
-			Err  string            `json:"error"`
-		} `json:"failures"`
+	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
+		return parseDaemonRemoteSyncSSE(resp.Body, onProgress)
 	}
+	var out daemonRemoteSyncResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, err
 	}
+	return remoteFailuresFromResponse(out), nil
+}
+
+type daemonRemoteSyncResponse struct {
+	Failures []struct {
+		Host config.RemoteHost `json:"host"`
+		Err  string            `json:"error"`
+	} `json:"failures"`
+}
+
+func remoteFailuresFromResponse(
+	out daemonRemoteSyncResponse,
+) []remoteHostFailure {
 	failures := make([]remoteHostFailure, 0, len(out.Failures))
 	for _, f := range out.Failures {
 		failures = append(failures, remoteHostFailure{
@@ -406,10 +612,12 @@ func runDaemonRemoteSync(
 			Err:  errors.New(f.Err),
 		})
 	}
-	return failures, nil
+	return failures
 }
 
-func parseDaemonSyncSSE(r io.Reader) (sync.SyncStats, error) {
+func parseDaemonRemoteSyncSSE(
+	r io.Reader, onProgress sync.ProgressFunc,
+) ([]remoteHostFailure, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 	var event string
@@ -418,7 +626,82 @@ func parseDaemonSyncSSE(r io.Reader) (sync.SyncStats, error) {
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
-			if event == "done" {
+			switch event {
+			case "done":
+				var out daemonRemoteSyncResponse
+				if err := json.Unmarshal([]byte(data.String()), &out); err != nil {
+					return nil, err
+				}
+				return remoteFailuresFromResponse(out), nil
+			case "progress":
+				if data.Len() > 0 {
+					if err := reportDaemonSyncProgress(data.String(), onProgress); err != nil {
+						return nil, err
+					}
+				}
+			default:
+				if data.Len() > 0 {
+					lastNonDoneData = data.String()
+				}
+			}
+			if event == "error" && data.Len() > 0 {
+				lastNonDoneData = data.String()
+			}
+			event = ""
+			data.Reset()
+			continue
+		}
+		if value, ok := strings.CutPrefix(line, "event: "); ok {
+			event = value
+			continue
+		}
+		if value, ok := strings.CutPrefix(line, "data: "); ok {
+			if data.Len() > 0 {
+				data.WriteByte('\n')
+			}
+			data.WriteString(value)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	if event == "progress" && data.Len() > 0 {
+		if err := reportDaemonSyncProgress(data.String(), onProgress); err != nil {
+			return nil, err
+		}
+	} else if event != "done" && data.Len() > 0 {
+		lastNonDoneData = data.String()
+	}
+	if event == "done" && data.Len() > 0 {
+		var out daemonRemoteSyncResponse
+		if err := json.Unmarshal([]byte(data.String()), &out); err != nil {
+			return nil, err
+		}
+		return remoteFailuresFromResponse(out), nil
+	}
+	if lastNonDoneData != "" {
+		return nil, fmt.Errorf("daemon remote sync error: %s", lastNonDoneData)
+	}
+	return nil, fmt.Errorf("daemon remote sync response missing done event")
+}
+
+func parseDaemonSyncSSE(
+	r io.Reader, progressFns ...sync.ProgressFunc,
+) (sync.SyncStats, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+	var event string
+	var data strings.Builder
+	var lastNonDoneData string
+	var onProgress sync.ProgressFunc
+	if len(progressFns) > 0 {
+		onProgress = progressFns[0]
+	}
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			switch event {
+			case "done":
 				var stats sync.SyncStats
 				if err := json.Unmarshal(
 					[]byte(data.String()), &stats,
@@ -426,8 +709,20 @@ func parseDaemonSyncSSE(r io.Reader) (sync.SyncStats, error) {
 					return sync.SyncStats{}, err
 				}
 				return stats, nil
+			case "progress":
+				if data.Len() > 0 {
+					if err := reportDaemonSyncProgress(
+						data.String(), onProgress,
+					); err != nil {
+						return sync.SyncStats{}, err
+					}
+				}
+			default:
+				if data.Len() > 0 {
+					lastNonDoneData = data.String()
+				}
 			}
-			if data.Len() > 0 {
+			if event == "error" && data.Len() > 0 {
 				lastNonDoneData = data.String()
 			}
 			event = ""
@@ -448,7 +743,11 @@ func parseDaemonSyncSSE(r io.Reader) (sync.SyncStats, error) {
 	if err := scanner.Err(); err != nil {
 		return sync.SyncStats{}, err
 	}
-	if event != "done" && data.Len() > 0 {
+	if event == "progress" && data.Len() > 0 {
+		if err := reportDaemonSyncProgress(data.String(), onProgress); err != nil {
+			return sync.SyncStats{}, err
+		}
+	} else if event != "done" && data.Len() > 0 {
 		lastNonDoneData = data.String()
 	}
 	if event == "done" && data.Len() > 0 {
@@ -464,6 +763,18 @@ func parseDaemonSyncSSE(r io.Reader) (sync.SyncStats, error) {
 		)
 	}
 	return sync.SyncStats{}, fmt.Errorf("daemon sync response missing done event")
+}
+
+func reportDaemonSyncProgress(raw string, onProgress sync.ProgressFunc) error {
+	if onProgress == nil {
+		return nil
+	}
+	var progress sync.Progress
+	if err := json.Unmarshal([]byte(raw), &progress); err != nil {
+		return fmt.Errorf("decoding daemon sync progress: %w", err)
+	}
+	onProgress(progress)
+	return nil
 }
 
 func valueOrNever(s string) string {

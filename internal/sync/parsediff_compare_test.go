@@ -3,6 +3,9 @@ package sync
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
@@ -363,6 +367,33 @@ func TestCompareSessionFields(t *testing.T) {
 				stored: "1.0.0",
 				parsed: "1.1.0",
 			}},
+		},
+		{
+			name: "transcript_fidelity drift is a real diff",
+			stored: func(s *db.Session) {
+				s.Agent = "gemini"
+				s.TranscriptFidelity = "summary"
+			},
+			prepared: func(s *db.Session) {
+				s.Agent = "gemini"
+				s.TranscriptFidelity = "full"
+			},
+			want: []want{{
+				field:  FieldTranscriptFidelity,
+				stored: "summary",
+				parsed: "full",
+			}},
+		},
+		{
+			name: "transcript_fidelity equal values produce no diff",
+			stored: func(s *db.Session) {
+				s.Agent = "gemini"
+				s.TranscriptFidelity = "full"
+			},
+			prepared: func(s *db.Session) {
+				s.Agent = "gemini"
+				s.TranscriptFidelity = "full"
+			},
 		},
 		{
 			name: "parent_session_id nil stored vs empty parsed is no diff",
@@ -1140,7 +1171,7 @@ func TestCompareStoredSessionRoundTrip(t *testing.T) {
 
 	prepared, msgs, ok := e.prepareSessionWrite(pw, nil)
 	require.True(t, ok)
-	events := toDBUsageEvents(prepared.ID, pw.usageEvents)
+	events, _ := toDBUsageEvents(prepared.ID, pw.usageEvents)
 
 	stored := pdFetchStored(t, d, prepared.ID)
 	diffs, err := e.compareStoredSession(
@@ -1378,6 +1409,19 @@ func TestToolCallAndFlagsFingerprintTwinsMatchDB(t *testing.T) {
 		"tool-call twin must match db.ToolCallParseDiffFingerprint exactly")
 }
 
+func TestToolCallDiffDetectsFilePath(t *testing.T) {
+	base := db.ToolCall{
+		ToolName: "Edit", Category: "Edit", ToolUseID: "t1",
+		InputJSON: `{"x":1}`, FilePath: "a.go",
+	}
+	assert.Empty(t, toolCallDiff(base, base), "identical calls do not diff")
+	moved := base
+	moved.FilePath = "b.go"
+	// A file_path-only parser change must be detected so the resync rewrites
+	// the row and the mirrors pick up the corrected path.
+	assert.Contains(t, toolCallDiff(base, moved), "file_path")
+}
+
 // TestCompareStoredSessionRoundTripToolCalls is the false-diff acid test
 // for the new fields: a session with tool calls, a thinking block, and a
 // system message must compare identical against itself.
@@ -1451,20 +1495,23 @@ func pdFetchStored(t *testing.T, d *db.DB, id string) *db.Session {
 
 func TestParseDiffClassifyPrecedence(t *testing.T) {
 	tests := []struct {
-		name          string
-		needsRetry    bool
-		prepared      bool
-		hasStored     bool
-		storedTrashed bool
-		pendingResync bool
-		realDiffs     int
-		wantClass     DiffClass
-		wantReason    string
+		name            string
+		needsRetry      bool
+		prepared        bool
+		hasStored       bool
+		storedTrashed   bool
+		pendingResync   bool
+		realDiffs       int
+		raced           bool
+		incrementalSkew bool
+		wantClass       DiffClass
+		wantReason      string
 	}{
 		{
 			name:       "needs retry wins over everything",
 			needsRetry: true, prepared: false, hasStored: true,
 			storedTrashed: true, pendingResync: true, realDiffs: 3,
+			raced: true, incrementalSkew: true,
 			wantClass:  DiffNeedsRetry,
 			wantReason: "transient low-fidelity parse; differences expected",
 		},
@@ -1493,9 +1540,53 @@ func TestParseDiffClassifyPrecedence(t *testing.T) {
 			wantClass: DiffPendingResync,
 		},
 		{
+			name:     "pending resync wins over raced",
+			prepared: true, hasStored: true, pendingResync: true,
+			realDiffs: 2, raced: true,
+			wantClass: DiffPendingResync,
+		},
+		{
+			name:     "pending resync wins over incremental skew",
+			prepared: true, hasStored: true, pendingResync: true,
+			realDiffs: 2, incrementalSkew: true,
+			wantClass: DiffPendingResync,
+		},
+		{
+			name:     "raced wins over changed when source moved",
+			prepared: true, hasStored: true, realDiffs: 1, raced: true,
+			wantClass:  DiffRaced,
+			wantReason: "source file changed after snapshot (live-write skew)",
+		},
+		{
+			name:     "raced wins over incremental skew when both apply",
+			prepared: true, hasStored: true, realDiffs: 1,
+			raced: true, incrementalSkew: true,
+			wantClass:  DiffRaced,
+			wantReason: "source file changed after snapshot (live-write skew)",
+		},
+		{
+			name:     "incremental skew wins over changed",
+			prepared: true, hasStored: true, realDiffs: 1,
+			incrementalSkew: true,
+			wantClass:       DiffIncrementalSkew,
+			wantReason: "stored row last written incrementally " +
+				"(incremental-append skew)",
+		},
+		{
 			name:     "real diffs mean changed",
 			prepared: true, hasStored: true, realDiffs: 1,
 			wantClass: DiffChanged,
+		},
+		{
+			name:     "raced flag is inert without a real diff",
+			prepared: true, hasStored: true, realDiffs: 0, raced: true,
+			wantClass: DiffIdentical,
+		},
+		{
+			name:     "incremental skew flag is inert without a real diff",
+			prepared: true, hasStored: true, realDiffs: 0,
+			incrementalSkew: true,
+			wantClass:       DiffIdentical,
 		},
 		{
 			name:     "no real diffs mean identical",
@@ -1508,11 +1599,632 @@ func TestParseDiffClassifyPrecedence(t *testing.T) {
 			class, reason := classifyParseDiffSession(
 				tt.needsRetry, tt.prepared, tt.hasStored,
 				tt.storedTrashed, tt.pendingResync, tt.realDiffs,
+				tt.raced, tt.incrementalSkew,
 			)
 			assert.Equal(t, tt.wantClass, class)
 			assert.Equal(t, tt.wantReason, reason)
 		})
 	}
+}
+
+func TestDiffsConfinedToIncrementalArtifacts(t *testing.T) {
+	tests := []struct {
+		name   string
+		fields []FieldDiff
+		want   bool
+	}{
+		{
+			name: "message_metadata alone is an incremental artifact",
+			fields: []FieldDiff{
+				{Field: FieldMessageMetadata},
+			},
+			want: true,
+		},
+		{
+			name: "informational session fields are ignored",
+			fields: []FieldDiff{
+				{Field: FieldTerminationStatus, Informational: true},
+				{Field: FieldSessionName, Informational: true},
+				{Field: FieldMessageMetadata},
+			},
+			want: true,
+		},
+		{
+			name:   "no diffs are vacuously confined",
+			fields: nil,
+			want:   true,
+		},
+		{
+			name: "first_message drift is not an artifact",
+			fields: []FieldDiff{
+				{Field: FieldFirstMessage},
+			},
+			want: false,
+		},
+		{
+			name: "message_content drift is not an artifact",
+			fields: []FieldDiff{
+				{Field: FieldMessageContent},
+			},
+			want: false,
+		},
+		{
+			name: "usage totals drift is not an artifact",
+			fields: []FieldDiff{
+				{Field: FieldTotalOutputTokens},
+			},
+			want: false,
+		},
+		{
+			name: "an artifact mixed with a non-artifact is not confined",
+			fields: []FieldDiff{
+				{Field: FieldMessageMetadata},
+				{Field: FieldFirstMessage},
+			},
+			want: false,
+		},
+		{
+			name: "tool_calls drift is not an artifact",
+			fields: []FieldDiff{
+				{Field: FieldToolCalls},
+			},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want,
+				diffsConfinedToIncrementalArtifacts(tt.fields))
+		})
+	}
+}
+
+// TestParseDiffSourceRaced pins the conservative mtime-skew verdict: a
+// source that moved past the snapshot mtime (or whose mtime cannot be
+// resolved) is raced; one that is demonstrably at or before the snapshot
+// is not, so a genuine change there is never masked.
+func TestParseDiffSourceRaced(t *testing.T) {
+	mtime := func(v int64) *int64 { return &v }
+	tests := []struct {
+		name        string
+		storedMtime *int64
+		liveMtime   int64
+		liveOK      bool
+		want        bool
+	}{
+		{
+			name:        "live mtime advanced past snapshot is raced",
+			storedMtime: mtime(1000), liveMtime: 2000, liveOK: true,
+			want: true,
+		},
+		{
+			name:        "live mtime equal to snapshot is not raced",
+			storedMtime: mtime(1000), liveMtime: 1000, liveOK: true,
+			want: false,
+		},
+		{
+			name:        "live mtime before snapshot is not raced",
+			storedMtime: mtime(2000), liveMtime: 1000, liveOK: true,
+			want: false,
+		},
+		{
+			name:        "one nanosecond advance is raced (no truncation)",
+			storedMtime: mtime(1000), liveMtime: 1001, liveOK: true,
+			want: true,
+		},
+		{
+			name:        "unreadable source is conservatively raced",
+			storedMtime: mtime(1000), liveMtime: 0, liveOK: false,
+			want: true,
+		},
+		{
+			name:        "missing stored mtime is conservatively raced",
+			storedMtime: nil, liveMtime: 1000, liveOK: true,
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseDiffSourceRaced(
+				tt.storedMtime, tt.liveMtime, tt.liveOK,
+			)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestParseDiffLiveMtimeIgnoresCodexIndex pins that Codex's raced guard uses
+// the transcript mtime, not the global session_index.jsonl mtime. The index is
+// shared by every Codex session, so an unrelated title/index write is not a
+// per-session signal that transcript-derived diffs raced with live content.
+func TestParseDiffLiveMtimeIgnoresCodexIndex(t *testing.T) {
+	root := t.TempDir()
+	sessionsDir := filepath.Join(root, "sessions", "2024", "01", "01")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+	rollout := filepath.Join(sessionsDir, "rollout-x.jsonl")
+	require.NoError(t, os.WriteFile(rollout, []byte("{}\n"), 0o644))
+	indexPath := filepath.Join(root, "session_index.jsonl")
+	require.NoError(t, os.WriteFile(indexPath, []byte("{}\n"), 0o644))
+
+	// Index not newer than the rollout: raced mtime is the rollout's.
+	base := time.Now().Add(-2 * time.Hour)
+	require.NoError(t, os.Chtimes(rollout, base, base), "chtimes rollout")
+	require.NoError(t, os.Chtimes(indexPath, base, base), "chtimes index")
+
+	m1, err := parseDiffLiveMtime(parser.AgentCodex, rollout)
+	require.NoError(t, err)
+	rollInfo, err := os.Stat(rollout)
+	require.NoError(t, err)
+	assert.Equal(t, rollInfo.ModTime().UnixNano(), m1,
+		"codex raced mtime is the rollout's when the index is not newer")
+
+	// A sibling write advances the global index past the rollout AFTER the
+	// first resolution; the Codex raced resolver must keep reporting the
+	// transcript mtime.
+	future := time.Now().Add(time.Hour)
+	require.NoError(t, os.Chtimes(indexPath, future, future), "advance index")
+	m2, err := parseDiffLiveMtime(parser.AgentCodex, rollout)
+	require.NoError(t, err)
+	assert.Equal(t, rollInfo.ModTime().UnixNano(), m2,
+		"codex raced mtime ignores the advanced session_index.jsonl")
+	assert.Equal(t, m1, m2, "the global index write is not observed")
+}
+
+func TestParseDiffCodexTranscriptChangedRecomputesConsumedSize(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout-x.jsonl")
+	initial := "{}\n"
+	require.NoError(t, os.WriteFile(path, []byte(initial), 0o644))
+	storedSize := int64(len(initial))
+	stored := &db.Session{FileSize: &storedSize}
+	parsed := parser.ParsedSession{
+		Agent: parser.AgentCodex,
+		File: parser.FileInfo{
+			Path: path,
+			Size: storedSize,
+		},
+	}
+
+	require.NoError(t, os.WriteFile(
+		path, []byte(initial+`{"appended":true}`+"\n"), 0o644,
+	))
+
+	assert.True(t,
+		parseDiffCodexTranscriptChangedSinceStored(stored, parsed),
+		"collect-time Codex race check must not trust the parser's stale size")
+}
+
+// TestParseDiffSourceReliableForRaced pins the reliability gate that decides
+// whether the live-write skew (raced) reclassification may run for a session.
+// Only plain file-based agents reading a literal on-disk file have a live
+// mtime that is basis-matching with the stored file_mtime; every virtual-path
+// or DB-backed source must be treated as unreliable so the raced guard is
+// skipped and genuine parser drift is never masked.
+func TestParseDiffSourceReliableForRaced(t *testing.T) {
+	// Each virtual-path constructor is paired with a basename its parser
+	// accepts; stripVirtualSourceSuffix only recognizes the real shapes.
+	kiroPath := parser.KiroSQLiteVirtualPath(
+		"/data/data.sqlite3", "kiro_sess",
+	)
+	zedPath := parser.ZedSQLiteVirtualPath("/data/threads.db", "zed_thread")
+	shelleyPath := parser.ShelleyVirtualPath(
+		"/data/shelley.db", "shelley_conv",
+	)
+	vsCopilotPath := parser.VisualStudioCopilotVirtualPath(
+		"/traces/20260612T194439_abc_VSGitHubCopilot_traces.jsonl",
+		"conv_1",
+	)
+	tests := []struct {
+		name  string
+		agent parser.AgentType
+		path  string
+		want  bool
+	}{
+		{
+			name:  "plain file-based literal path is reliable",
+			agent: parser.AgentClaude,
+			path:  "/projects/proj/session.jsonl",
+			want:  true,
+		},
+		{
+			name:  "another plain file-based literal path is reliable",
+			agent: parser.AgentCodex,
+			path:  "/sessions/2026/06/rollout.jsonl",
+			want:  true,
+		},
+		{
+			name:  "aider virtual run-index path is unreliable",
+			agent: parser.AgentAider,
+			path:  parser.AiderVirtualPath("/repo/.aider.chat.history.md", 3),
+			want:  false,
+		},
+		{
+			name:  "kiro shared-db virtual path is unreliable",
+			agent: parser.AgentKiro,
+			path:  kiroPath,
+			want:  false,
+		},
+		{
+			name:  "zed shared-db virtual path is unreliable",
+			agent: parser.AgentZed,
+			path:  zedPath,
+			want:  false,
+		},
+		{
+			name:  "shelley shared-db virtual path is unreliable",
+			agent: parser.AgentShelley,
+			path:  shelleyPath,
+			want:  false,
+		},
+		{
+			name:  "visual studio copilot virtual path is unreliable",
+			agent: parser.AgentVSCopilot,
+			path:  vsCopilotPath,
+			want:  false,
+		},
+		{
+			name:  "db-backed agent on a literal path is unreliable",
+			agent: parser.AgentForge,
+			path:  "/forge/store.db",
+			want:  false,
+		},
+		{
+			name:  "unknown agent is unreliable",
+			agent: parser.AgentType("does-not-exist"),
+			path:  "/anywhere/file.jsonl",
+			want:  false,
+		},
+	}
+	engine := NewDiffEngine(dbtest.OpenTestDB(t), EngineConfig{})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := engine.parseDiffSourceReliableForRaced(tt.agent, tt.path)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestParseDiffPresenceSweepKeepsMixedProviderRetryCoverage(t *testing.T) {
+	sourcePath := "/tmp/provider-source.jsonl"
+	filePath := sourcePath
+	current := &db.Session{
+		ID:          "provider-current",
+		Agent:       string(parser.AgentClaude),
+		Machine:     "devbox",
+		Project:     "provider-project",
+		FilePath:    &filePath,
+		DataVersion: db.CurrentDataVersion(),
+	}
+	retry := &db.Session{
+		ID:          "provider-retry",
+		Agent:       string(parser.AgentClaude),
+		Machine:     "devbox",
+		Project:     "provider-project",
+		FilePath:    &filePath,
+		DataVersion: db.CurrentDataVersion(),
+	}
+	missing := &db.Session{
+		ID:          "provider-missing",
+		Agent:       string(parser.AgentClaude),
+		Machine:     "devbox",
+		Project:     "provider-project",
+		FilePath:    &filePath,
+		DataVersion: db.CurrentDataVersion(),
+	}
+	storedByID := map[string]*db.Session{
+		current.ID: current,
+		retry.ID:   retry,
+		missing.ID: missing,
+	}
+	storedByPath := map[string][]*db.Session{
+		sourcePath: {current, retry, missing},
+	}
+	job := syncJob{
+		path: sourcePath,
+		processResult: processResult{
+			results: []parser.ParseResult{
+				{Session: parser.ParsedSession{
+					ID:      current.ID,
+					Agent:   parser.AgentClaude,
+					Machine: "devbox",
+					Project: "provider-project",
+					File: parser.FileInfo{
+						Path: sourcePath,
+					},
+				}},
+				{Session: parser.ParsedSession{
+					ID:      retry.ID,
+					Agent:   parser.AgentClaude,
+					Machine: "devbox",
+					Project: "provider-project",
+					File: parser.FileInfo{
+						Path: sourcePath,
+					},
+				}},
+			},
+			retrySessionIDs: map[string]bool{
+				retry.ID: true,
+			},
+		},
+	}
+	engine := &Engine{db: dbtest.OpenTestDB(t)}
+	report := &ParseDiffReport{FieldCounts: map[string]int{}}
+	visited := map[string]bool{}
+	var presencePaths []string
+
+	err := engine.parseDiffCollectFile(
+		context.Background(),
+		report,
+		job,
+		map[string]parser.AgentType{sourcePath: parser.AgentClaude},
+		storedByID,
+		storedByPath,
+		visited,
+		engine.loadWorktreeProjectResolver(),
+		&presencePaths,
+	)
+	require.NoError(t, err)
+	engine.parseDiffPresenceSweep(
+		report,
+		presencePaths,
+		storedByPath,
+		visited,
+	)
+
+	assert.Equal(t, 1, report.Totals.NeedsRetry)
+	assert.Equal(t, 1, report.Totals.Changed)
+	byID := map[string]SessionDiff{}
+	for _, session := range report.Sessions {
+		byID[session.SessionID] = session
+	}
+	assert.Equal(t, DiffNeedsRetry, byID[retry.ID].Class)
+	assert.Equal(t, DiffChanged, byID[missing.ID].Class)
+	require.NotEmpty(t, byID[missing.ID].Fields)
+	assert.Equal(t, FieldPresence, byID[missing.ID].Fields[0].Field)
+}
+
+func TestParseDiffPresenceSweepSkipsIncompleteProviderResults(t *testing.T) {
+	sourcePath := "/tmp/incomplete-provider-source.jsonl"
+	filePath := sourcePath
+	missing := &db.Session{
+		ID:          "provider-missing",
+		Agent:       string(parser.AgentClaude),
+		Machine:     "devbox",
+		Project:     "provider-project",
+		FilePath:    &filePath,
+		DataVersion: db.CurrentDataVersion(),
+	}
+	storedByPath := map[string][]*db.Session{
+		sourcePath: {missing},
+	}
+	job := syncJob{
+		path: sourcePath,
+		processResult: processResult{
+			suppressPresenceSweep: true,
+		},
+	}
+	engine := &Engine{db: dbtest.OpenTestDB(t)}
+	report := &ParseDiffReport{FieldCounts: map[string]int{}}
+	visited := map[string]bool{}
+	var presencePaths []string
+
+	err := engine.parseDiffCollectFile(
+		context.Background(),
+		report,
+		job,
+		map[string]parser.AgentType{sourcePath: parser.AgentClaude},
+		map[string]*db.Session{missing.ID: missing},
+		storedByPath,
+		visited,
+		engine.loadWorktreeProjectResolver(),
+		&presencePaths,
+	)
+	require.NoError(t, err)
+	engine.parseDiffPresenceSweep(
+		report,
+		presencePaths,
+		storedByPath,
+		visited,
+	)
+
+	assert.Equal(t, 0, report.Totals.Changed)
+	assert.Empty(t, report.Sessions)
+}
+
+func TestParseDiffProviderVirtualSQLiteErrorUsesExactSource(t *testing.T) {
+	dbPath := "/tmp/opencode.db"
+	firstPath := parser.OpenCodeSQLiteVirtualPath(dbPath, "ses_one")
+	secondPath := parser.OpenCodeSQLiteVirtualPath(dbPath, "ses_two")
+	first := &db.Session{
+		ID:          "opencode:ses_one",
+		Agent:       string(parser.AgentOpenCode),
+		Machine:     "devbox",
+		Project:     "project",
+		FilePath:    &firstPath,
+		DataVersion: db.CurrentDataVersion(),
+	}
+	second := &db.Session{
+		ID:          "opencode:ses_two",
+		Agent:       string(parser.AgentOpenCode),
+		Machine:     "devbox",
+		Project:     "project",
+		FilePath:    &secondPath,
+		DataVersion: db.CurrentDataVersion(),
+	}
+	storedByPath := map[string][]*db.Session{
+		parseDiffSourceKey(firstPath):  {first},
+		parseDiffSourceKey(secondPath): {second},
+	}
+	job := syncJob{
+		path: firstPath,
+		processResult: processResult{
+			err: errors.New("bad virtual session"),
+		},
+	}
+	engine := &Engine{db: dbtest.OpenTestDB(t)}
+	report := &ParseDiffReport{FieldCounts: map[string]int{}}
+	visited := map[string]bool{}
+	var presencePaths []string
+
+	err := engine.parseDiffCollectFile(
+		context.Background(),
+		report,
+		job,
+		map[string]parser.AgentType{firstPath: parser.AgentOpenCode},
+		map[string]*db.Session{
+			first.ID:  first,
+			second.ID: second,
+		},
+		storedByPath,
+		visited,
+		engine.loadWorktreeProjectResolver(),
+		&presencePaths,
+	)
+	require.NoError(t, err)
+
+	require.Len(t, report.Sessions, 1)
+	assert.Equal(t, first.ID, report.Sessions[0].SessionID)
+	assert.Equal(t, DiffParseError, report.Sessions[0].Class)
+	assert.True(t, visited[first.ID])
+	assert.False(t, visited[second.ID])
+	assert.Empty(t, presencePaths)
+	assert.Equal(t, ParseDiffTotals{ParseErrors: 1}, report.Totals)
+}
+
+func TestParseDiffProviderVirtualSQLitePresenceUsesExactSource(t *testing.T) {
+	dbPath := "/tmp/opencode.db"
+	firstPath := parser.OpenCodeSQLiteVirtualPath(dbPath, "ses_one")
+	secondPath := parser.OpenCodeSQLiteVirtualPath(dbPath, "ses_two")
+	first := &db.Session{
+		ID:          "opencode:ses_one",
+		Agent:       string(parser.AgentOpenCode),
+		Machine:     "devbox",
+		Project:     "project",
+		FilePath:    &firstPath,
+		DataVersion: db.CurrentDataVersion(),
+	}
+	second := &db.Session{
+		ID:          "opencode:ses_two",
+		Agent:       string(parser.AgentOpenCode),
+		Machine:     "devbox",
+		Project:     "project",
+		FilePath:    &secondPath,
+		DataVersion: db.CurrentDataVersion(),
+	}
+	storedByPath := map[string][]*db.Session{
+		parseDiffSourceKey(firstPath):  {first},
+		parseDiffSourceKey(secondPath): {second},
+	}
+	job := syncJob{path: firstPath}
+	engine := &Engine{db: dbtest.OpenTestDB(t)}
+	report := &ParseDiffReport{FieldCounts: map[string]int{}}
+	visited := map[string]bool{}
+	var presencePaths []string
+
+	err := engine.parseDiffCollectFile(
+		context.Background(),
+		report,
+		job,
+		map[string]parser.AgentType{firstPath: parser.AgentOpenCode},
+		map[string]*db.Session{
+			first.ID:  first,
+			second.ID: second,
+		},
+		storedByPath,
+		visited,
+		engine.loadWorktreeProjectResolver(),
+		&presencePaths,
+	)
+	require.NoError(t, err)
+	engine.parseDiffPresenceSweep(
+		report,
+		presencePaths,
+		storedByPath,
+		visited,
+	)
+
+	require.Len(t, report.Sessions, 1)
+	assert.Equal(t, first.ID, report.Sessions[0].SessionID)
+	assert.Equal(t, DiffChanged, report.Sessions[0].Class)
+	assert.True(t, visited[first.ID])
+	assert.False(t, visited[second.ID])
+	assert.Equal(t, ParseDiffTotals{Changed: 1}, report.Totals)
+}
+
+func TestParseDiffProviderVirtualSQLiteLimitUsesExactSource(t *testing.T) {
+	dbPath := "/tmp/opencode.db"
+	firstPath := parser.OpenCodeSQLiteVirtualPath(dbPath, "ses_one")
+	secondPath := parser.OpenCodeSQLiteVirtualPath(dbPath, "ses_two")
+	_, cutPaths, limited := sortAndLimitParseDiffFiles(
+		[]parser.DiscoveredFile{
+			{Path: firstPath, Agent: parser.AgentOpenCode},
+			{Path: secondPath, Agent: parser.AgentOpenCode},
+		},
+		1,
+	)
+
+	require.True(t, limited)
+	assert.Len(t, cutPaths, 1)
+	assert.False(t, cutPaths[dbPath])
+	for path := range cutPaths {
+		assert.True(t,
+			path == firstPath || path == secondPath,
+			"cut path %q must be one exact virtual source", path,
+		)
+	}
+}
+
+func TestParseDiffDevinVirtualSQLiteLimitUsesExactSource(t *testing.T) {
+	dbPath := filepath.Join("/tmp", "devin", "cli", "sessions.db")
+	firstPath := parser.VirtualSourcePath(dbPath, "ses_one")
+	secondPath := parser.VirtualSourcePath(dbPath, "ses_two")
+	_, cutPaths, limited := sortAndLimitParseDiffFiles(
+		[]parser.DiscoveredFile{
+			{Path: firstPath, Agent: parser.AgentDevin},
+			{Path: secondPath, Agent: parser.AgentDevin},
+		},
+		1,
+	)
+
+	require.True(t, limited)
+	assert.Len(t, cutPaths, 1)
+	assert.False(t, cutPaths[dbPath])
+	for path := range cutPaths {
+		assert.True(t,
+			path == firstPath || path == secondPath,
+			"cut path %q must be one exact Devin virtual source", path,
+		)
+	}
+}
+
+// TestParseDiffDBBackedLimitOrdersByDiscoveryMtime pins the ordering fix at the
+// sorter boundary: two DB-backed virtual sources whose paths sort in the
+// opposite order to their per-session mtimes. Before the fix both stat to 0 and
+// --limit keeps the lexicographically-earlier (older) path, cutting the newer
+// session; the sorter must instead honor SourceRef.DiscoveryMTimeNS and keep the
+// newer one.
+func TestParseDiffDBBackedLimitOrdersByDiscoveryMtime(t *testing.T) {
+	dbPath := "/tmp/.forge.db"
+	// "a-older" sorts before "z-newer" as a path but carries the older mtime.
+	olderPath := dbPath + "#a-older"
+	newerPath := dbPath + "#z-newer"
+	older := parser.SourceRef{Provider: parser.AgentForge, DiscoveryMTimeNS: 100}
+	newer := parser.SourceRef{Provider: parser.AgentForge, DiscoveryMTimeNS: 200}
+
+	kept, cutPaths, limited := sortAndLimitParseDiffFiles(
+		[]parser.DiscoveredFile{
+			{Path: olderPath, Agent: parser.AgentForge, ProviderSource: &older},
+			{Path: newerPath, Agent: parser.AgentForge, ProviderSource: &newer},
+		},
+		1,
+	)
+
+	require.True(t, limited)
+	require.Len(t, kept, 1)
+	assert.Equal(t, newerPath, kept[0].Path,
+		"newer per-session mtime must be sampled even though its path sorts later")
+	assert.Len(t, cutPaths, 1)
+	assert.True(t, cutPaths[olderPath],
+		"the older session must be the one cut by --limit")
 }
 
 func TestParseDiffReportHasFailures(t *testing.T) {
@@ -1548,6 +2260,26 @@ func TestParseDiffReportHasFailures(t *testing.T) {
 				NeedsRetry: 2, NewOnDisk: 3,
 				ExcludedByParser: 1, InformationalOnly: 5,
 			},
+		},
+		{
+			name:   "raced sessions alone do not fail",
+			totals: ParseDiffTotals{Examined: 3, Identical: 2, Raced: 1},
+		},
+		{
+			name: "incremental-skew sessions alone do not fail",
+			totals: ParseDiffTotals{
+				Examined: 3, Identical: 2, IncrementalSkew: 1,
+			},
+		},
+		{
+			name:   "a real change still fails alongside raced sessions",
+			totals: ParseDiffTotals{Changed: 1, Raced: 2},
+			want:   true,
+		},
+		{
+			name:   "a real change still fails alongside incremental-skew",
+			totals: ParseDiffTotals{Changed: 1, IncrementalSkew: 2},
+			want:   true,
 		},
 	}
 	for _, tt := range tests {

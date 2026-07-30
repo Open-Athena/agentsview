@@ -73,6 +73,20 @@ On first run, agentsview discovers sessions from every supported agent on your
 machine, syncs them into a local SQLite database, and serves a web UI at
 `http://127.0.0.1:8080`.
 
+For Devin CLI, point `DEVIN_DIR` or `devin_dirs` at the local root that contains
+`cli/` — for example `~/Library/Application Support/devin` on macOS,
+`~/.local/share/devin` on Linux, or a redacted path like
+`.../Application Support/devin`. AgentsView reads session data under
+`<root>/cli/...` and intentionally ignores copied config or OAuth paths. Do not
+paste tokens, OAuth files, or other secrets into bug reports.
+
+Claude and Codex sources can also be configured as `s3://` roots, so a central
+AgentsView instance can read sessions that other machines push to S3-compatible
+object storage. Add those roots to `claude_project_dirs` or
+`codex_sessions_dirs`; AgentsView lists object metadata and only downloads
+changed sessions during sync. S3 change detection uses size, modified time, and
+available object fingerprints such as ETag, version ID, or checksums.
+
 The desktop app and freshness-sensitive CLI commands share a detached local
 daemon. Read-only CLI commands attach to it when it is already running, but fall
 back to direct read-only SQLite on a cold archive so one-off scripts stay fast.
@@ -292,6 +306,9 @@ agentsview stats --include-git-outcomes
   breakdowns, daily spend charts, all in the web UI
 - **Analytics dashboard** -- activity heatmaps, tool usage, velocity metrics,
   project breakdowns
+- **Recent Edits feed** -- the files your agents changed most recently across
+  every session, grouped by project and path, each linking to the message that
+  made the change
 - **Live updates** via SSE as active sessions receive new messages
 - **Keyboard-first** navigation (`j`/`k`/`[`/`]`, `Cmd+K` search, `?` for all
   shortcuts)
@@ -299,18 +316,24 @@ agentsview stats --include-git-outcomes
 
 ## Supported Agents
 
-agentsview auto-discovers sessions from all of these:
+agentsview discovers sessions from all of these. Aider is opt-in because it has
+no central session directory; set `AIDER_DIR` or `aider_dirs` to enable it. Amp
+support is deprecated because current Amp releases may store threads server-side
+and leave only local stubs; agentsview can still parse historical local Amp
+thread JSON files.
 
 | Agent                 | Session Directory                                                                                                                                                       |
 | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Aider                 | `<repo>/.aider.chat.history.md` (per repo; bounded scan of `~`, set `AIDER_DIR` to scope)                                                                               |
-| Amp                   | `~/.local/share/amp/threads/`                                                                                                                                           |
+| Aider                 | `<repo>/.aider.chat.history.md` (per repo; opt in with `AIDER_DIR` or `aider_dirs`)                                                                                     |
+| Amp (deprecated)      | `~/.local/share/amp/threads/` (historical local thread JSON only)                                                                                                       |
 | Antigravity           | `~/.gemini/antigravity/`                                                                                                                                                |
 | Antigravity CLI       | `~/.gemini/antigravity-cli/` (see note below)                                                                                                                           |
 | Claude Code           | `~/.claude/projects/`                                                                                                                                                   |
+| OpenClaude            | `~/.openclaude/projects/`                                                                                                                                               |
 | Claude Cowork         | `~/Library/Application Support/Claude/local-agent-mode-sessions/` (macOS)                                                                                               |
 | Codex                 | `~/.codex/sessions/`                                                                                                                                                    |
 | Copilot CLI           | `~/.copilot/`                                                                                                                                                           |
+| Devin CLI             | `~/.local/share/devin/` (Linux), `~/Library/Application Support/devin/` (macOS); point `DEVIN_DIR` / `devin_dirs` at the root that contains `cli/`                      |
 | Cortex Code           | `~/.snowflake/cortex/conversations/`                                                                                                                                    |
 | Cursor                | `~/.cursor/projects/`                                                                                                                                                   |
 | DeepSeek TUI          | `~/.codewhale/sessions/`, `~/.deepseek/sessions/`                                                                                                                       |
@@ -344,7 +367,11 @@ agentsview auto-discovers sessions from all of these:
 | Zencoder              | `~/.zencoder/sessions/`                                                                                                                                                 |
 
 Each directory can be overridden with an environment variable. See the
-[configuration docs](https://agentsview.io/configuration/) for details.
+[configuration docs](https://agentsview.io/configuration/) for details. Cursor
+attribution stats are a live, machine-local read from
+`~/.cursor/ai-tracking/ai-code-tracking.db` by default and can be redirected
+with `AGENTSVIEW_CURSOR_ATTRIBUTION_DB`; they are not synced or aggregated
+through PostgreSQL.
 
 ### Aider: per-repo Markdown logs
 
@@ -353,35 +380,65 @@ Markdown log per repository, and one log accumulates many runs (one per `aider`
 launch, delimited by `# aider chat started at ...` headers). agentsview indexes
 **each run as its own session**.
 
-Discovery is a bounded, symlink-safe walk of your home directory: it descends at
-most four levels below `~`, skips vendor/build/VCS directories by name
-(`node_modules`, `target`, `.git`, `Library`, `go`, `.cargo`, and similar), and
-stops after a two-second wall-clock budget so a large home tree cannot stall the
-scan. **A repository whose `.aider.chat.history.md` sits more than four levels
-under `~`, or outside your home directory, will not be found by the default
-scan.** Point `AIDER_DIR` (or the `aider_dirs` config key) at that code root to
-index it and to scope and speed up the walk. The live file watcher only watches
-the home root shallowly (registering it recursively would inotify the entire
-home tree); new repos are picked up by the periodic sync, which runs every 15
-minutes.
+AgentsView does not scan for Aider logs by default. Earlier builds attempted an
+always-on bounded scan of the home directory, but that was not trustworthy:
+desktop launches and background usage refreshes could still trigger macOS
+privacy prompts for protected folders. To enable Aider, point `AIDER_DIR` (or
+the `aider_dirs` config key) at a code root you explicitly want scanned. The
+scan descends at most four levels below each configured root, skips
+vendor/build/VCS directories by name (`node_modules`, `target`, `.git`,
+`Library`, `go`, `.cargo`, and similar), and stops after a two-second wall-clock
+budget. On macOS, broad home roots still skip protected top-level folders unless
+one of those folders is configured directly. The live file watcher only watches
+configured Aider roots shallowly; new repos are picked up by the periodic sync,
+which runs every 15 minutes.
 
 Because the format is Markdown-derived, roles are reconstructed from line
 prefixes and there are no per-message timestamps; a run's start time comes from
 its `# aider chat started at ...` header (written in local time, assumed UTC).
 
+### JetBrains Copilot via exporter
+
+JetBrains IDEs store Copilot chat in a Nitrite database that agentsview does not
+read directly. The supported path today is to export those sessions to Copilot
+JSONL with
+[copilot-jetbrains-exporter](https://github.com/MCBoarder289/copilot-jetbrains-exporter),
+then point agentsview at that output directory.
+
+```bash
+# Export JetBrains Copilot sessions to JSONL
+copilot-jetbrains-exporter --output ~/.copilot/jetbrains-sessions
+
+# Tell agentsview to index the exported sessions
+export COPILOT_DIR=~/.copilot/jetbrains-sessions
+```
+
+Or in `~/.agentsview/config.toml`:
+
+```toml
+copilot_dirs = ["~/.copilot/jetbrains-sessions"]
+```
+
+Re-run the exporter after new JetBrains Copilot sessions if you want agentsview
+to pick up fresh conversations from that source.
+
 ### Antigravity CLI: high-resolution transcripts
 
-Antigravity CLI sessions now appear in two on-disk formats. Newer releases store
-conversation trajectories as SQLite `.db` files, which agentsview indexes
-directly. Older releases stored assistant turns and tool calls in
-AES-GCM-encrypted `.pb` files; for those sessions, agentsview falls back to
-**summary mode** using your prompts from `history.jsonl` plus any plain-text
-artifacts under `brain/` (plans, walkthroughs, checkpoints).
+Antigravity CLI sessions appear in two on-disk formats: newer releases store
+conversation trajectories as SQLite `.db` files, older releases used
+AES-GCM-encrypted `.pb` files. For either format, the full transcript --
+structured tool calls, results, reasoning, and diffs -- comes from a
+`<uuid>.trajectory.json` sidecar. Without a covering sidecar, agentsview falls
+back to **summary mode**: a heuristic decode of the raw `.db` steps (prompts and
+tool-call names only), or for `.pb` sessions your prompts from `history.jsonl`
+plus any plain-text artifacts under `brain/` (plans, walkthroughs, checkpoints).
+Summary-mode sessions show a "Summary mode" badge in the detail header that
+links here.
 
-To unlock full transcripts for older `.pb` sessions, run
+To unlock full transcripts for `.db` and `.pb` sessions alike, run
 [agy-reader](https://github.com/mjacobs/agy-reader) alongside agentsview.
 agy-reader talks to the local Antigravity daemon, decrypts each conversation,
-and writes a `<uuid>.trajectory.json` sidecar next to the encrypted `.pb` file.
+and writes a `<uuid>.trajectory.json` sidecar next to the source file.
 agentsview's file watcher detects the sidecar automatically and parses it in
 place of summary mode -- no agentsview restart needed.
 
@@ -409,9 +466,39 @@ or read them, and treats sidecars as untrusted structured input -- see
 Push session data to a shared PostgreSQL instance for team dashboards:
 
 ```bash
-agentsview pg push       # push local data to PG
-agentsview pg serve      # serve web UI from PG (read-only)
+agentsview pg push             # push local data to the default PG target
+agentsview pg push archive     # push to one named PG target
+agentsview pg push --all       # push every configured PG target sequentially
+agentsview pg status           # show status for the default PG target
+agentsview pg status archive   # show status for one named PG target
+agentsview pg status --all     # show status for every configured PG target
+agentsview pg serve            # serve web UI from the default PG target (read-only)
 ```
+
+Single-target configs still use the legacy `[pg]` block. To manage more than one
+PostgreSQL destination, define named `[pg.NAME]` blocks and set `default_pg`
+when more than one target exists:
+
+```toml
+default_pg = "work"
+
+[pg.work]
+url = "postgres://user:pass@work-db/agentsview"
+machine_name = "laptop"
+
+[pg.archive]
+url = "postgres://user:pass@archive-db/agentsview"
+machine_name = "laptop-archive"
+exclude_projects = ["scratch"]
+```
+
+Named target names are normalized case-insensitively. `all`, `local`, and the
+legacy `[pg]` field names `url`, `schema`, `machine_name`, `allow_insecure`,
+`projects`, and `exclude_projects` cannot be used for `[pg.NAME]`.
+
+`AGENTSVIEW_PG_URL`, `AGENTSVIEW_PG_SCHEMA`, and `AGENTSVIEW_PG_MACHINE` still
+work, but in named-target mode they apply only to the effective default target.
+They do not rewrite every named `[pg.NAME]` entry.
 
 ### Automatic push (background service)
 
@@ -421,9 +508,14 @@ after new sessions are recorded, with a periodic floor as a safety net:
 
 ```bash
 agentsview pg push --watch                 # foreground, Ctrl-C to stop
+agentsview pg push archive --watch         # watch one named PG target
 agentsview pg push --watch --debounce 1m   # custom coalesce window
 agentsview pg push --watch --interval 5m   # custom floor interval
 ```
+
+`--watch` follows the default PG target unless you pass one target name.
+`--all --watch` is rejected; multi-target background watch remains out of scope
+for now.
 
 The daemon reads the same `[pg]` config as `pg push`, so the PostgreSQL DSN must
 be set in your config file (or an environment variable it expands). Protect the
@@ -442,6 +534,10 @@ agentsview pg service status      # show manager status
 agentsview pg service logs -f     # follow the service log
 agentsview pg service uninstall   # stop and remove
 ```
+
+`pg serve` and `pg service` always use the effective default PG target. In
+named-target mode, set `default_pg` to choose which target those long-running
+commands use.
 
 **Linux headless machines:** systemd `--user` services stop at logout and do not
 start at boot unless lingering is enabled for your user. `install` detects this

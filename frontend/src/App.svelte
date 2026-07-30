@@ -24,6 +24,7 @@
   import InsightsPage from "./lib/components/insights/InsightsPage.svelte";
   import PinnedPage from "./lib/components/pinned/PinnedPage.svelte";
   import TrashPage from "./lib/components/trash/TrashPage.svelte";
+  import RecentEditsPage from "./lib/components/recentedits/RecentEditsPage.svelte";
   import SettingsPage from "./lib/components/settings/SettingsPage.svelte";
   import { sessions, filtersToParams } from "./lib/stores/sessions.svelte.js";
   import { messages } from "./lib/stores/messages.svelte.js";
@@ -507,6 +508,10 @@
   <div class="page-scroll">
     <TrashPage />
   </div>
+{:else if router.route === "recent-edits"}
+  <div class="page-scroll">
+    <RecentEditsPage />
+  </div>
 {:else if router.route === "settings"}
   <div class="page-scroll">
     <SettingsPage />
@@ -583,6 +588,7 @@
 {/if}
 
 {#if sessions.recentlyDeleted.length > 0}
+  <!-- kit-ui-check-ignore: undo toast carries an inline restore action; kit-ui FlashBanner only supports text+dismiss today, so replacing this would change the delete/undo workflow. -->
   <div class="undo-toast">
     <span>{m.app_undo_session_deleted()}</span>
     <button
@@ -594,7 +600,7 @@
         if (!last) return;
         btn.disabled = true;
         try {
-          await sessions.restoreSession(last.id);
+          await sessions.restoreRecentlyDeleted(last);
         } catch {
           // restore failed — toast will remain
         } finally {
@@ -635,6 +641,7 @@
     color: var(--text-muted);
   }
 
+  /* kit-ui-check-ignore: undo toast carries an inline restore action; kit-ui FlashBanner only supports text+dismiss today, so replacing this would change the delete/undo workflow. */
   .undo-toast {
     position: fixed;
     bottom: 40px;
@@ -647,8 +654,8 @@
     border: 1px solid var(--border-default);
     border-radius: 8px;
     padding: 10px 18px;
-    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.3);
-    z-index: 10000;
+    box-shadow: 0 6px 24px var(--overlay-bg);
+    z-index: var(--z-overlay);
     font-size: 13px;
     color: var(--text-primary);
     animation: slide-up 0.2s ease-out;
@@ -739,7 +746,7 @@
     border-radius: 6px;
     font-size: 13px;
     font-weight: 500;
-    color: white;
+    color: var(--accent-blue-foreground);
     background: var(--accent-blue);
     border: none;
     cursor: pointer;

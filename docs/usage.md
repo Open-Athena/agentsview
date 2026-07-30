@@ -80,6 +80,49 @@ navigating to explicit range URLs also pins the range while the
 bare page URL returns to rolling mode. The `All` preset always
 pins to `(earliest_session, today)`.
 
+### Model Filter
+
+The dashboard toolbar includes a **Model** dropdown that scopes
+every panel to one or more AI models. By default the button reads
+**Model: All** and nothing is filtered.
+
+![Dashboard model filter](/assets/generated/screenshots/analytics-model-filter.png)
+
+Open the dropdown for a searchable list of the models found in
+your sessions, then click models to include them. The button then
+shows the chosen model — for example **Model: gpt-4o** — or
+**Model: 3 selected** once several are active. Click the
+**All models** row at the top of the list to clear the filter and
+return to every model. Selected models also appear as removable
+chips beneath the toolbar.
+
+While a model filter is active, every dashboard panel reflects
+only the selected model(s): the summary cards, activity chart,
+heatmap, hour-of-week grid, projects, session shape, velocity,
+tools, skills, top sessions, and the Session Health rollup.
+
+Model filtering is **message-grain**, unlike the session-grain
+project and agent filters, because a single session can switch
+models across turns. A session is included when it has at least
+one message from a selected model, and most panels count only the
+matching messages. The user turn paired with a matching assistant
+turn is kept alongside it — even though a user message carries no
+model of its own — so prompts and their responses stay aligned in
+the counts and in the top-session evidence.
+
+**Session Health** is the exception. It is scoped to whole
+sessions that used the selected model, but its health scores,
+outcomes, tool-failure rates, and compaction counts stay
+whole-session aggregates — they are not recomputed from only that
+model's messages.
+
+!!! note "Dashboard-only scope"
+    The model filter applies only to the analytics dashboard. The
+    [Session Insights](/insights/) page and the session list are
+    not scoped by it, so a model selected here does not silently
+    narrow those views. The [Usage](/token-usage/) page keeps its
+    own separate model filter.
+
 ### Activity Heatmap
 
 A GitHub-style contribution graph showing daily activity. Toggle
@@ -517,16 +560,26 @@ health grade badge, and a copyable **Session ID**. Click the ID to
 copy it to the clipboard for sharing or lookup. Click the grade
 badge to toggle the signal panel.
 
+If a parser skipped malformed source lines while still recovering
+the session, the header shows a malformed-lines badge with the
+persisted count (for example "3 malformed lines"). For Antigravity IDE and
+CLI sessions decoded from an unrecognized SQLite schema fingerprint,
+the header also shows **Unverified schema**. That badge means the
+session was decoded heuristically from a newer schema and may be
+incomplete.
+
 ### Message Layouts
 
-Three layouts control how messages are rendered. Cycle between
-them with the `l` key or the layout button in the header:
+Four layouts control how messages are rendered. Cycle between
+them with the `l` key or the layout button in the header, or pick
+one directly in Settings > Appearance:
 
 | Layout | Description |
 |--------|-------------|
 | Default | Full card layout with colored borders and spacing |
 | Compact | Condensed view with minimal spacing |
 | Stream | Continuous flow optimized for reading |
+| Skim | Collapses tool calls to summary headers for fast skimming |
 
 ### Focused Transcript Mode
 
@@ -553,6 +606,15 @@ The header shows the role label, timestamp, and a **copy
 button** that appears on hover. Click it to copy the full
 message content to the clipboard — a checkmark confirms the
 copy for 1.5 seconds.
+
+Claude Code sessions also show a fork action on each message header
+when the local server can launch or return a command. Clicking it
+starts a new Claude run from the selected point by rendering the
+transcript through that message ordinal into a temporary prompt,
+starting `claude` in the session working directory, and removing the
+temporary prompt after launch. In read-only local mode the action
+copies the command instead of launching it; remote sessions cannot be
+forked from the browser.
 
 ### Thinking Blocks
 
@@ -884,6 +946,16 @@ trashed sessions. From the trash page you can restore
 individual sessions or permanently delete them. Use **Empty
 trash** to permanently delete all trashed sessions at once.
 
+### Batch Selection
+
+Click the **Multi-select** toggle in the sidebar header to enter
+selection mode. A checkbox appears on each session; click
+sessions to check them, or use **All** to select every visible
+session and **Clear** to deselect. The batch toolbar shows how
+many are selected and a **Delete** action that moves the whole
+selection to the trash at once. Toggle multi-select off to return
+to normal browsing.
+
 ### Pinned Messages
 
 Click the pin icon on any message header to pin it. Pinned
@@ -985,9 +1057,21 @@ Gist**. The `p` shortcut publishes publicly.
 
 ![Publish modal](/assets/generated/screenshots/publish-modal.png)
 
-On first use, you'll be prompted to enter a GitHub personal
-access token with the `gist` scope. The token is saved to your
-config file and reused for future publishes.
+AgentsView prefers your existing GitHub CLI login for local
+publishing. If no token is saved in AgentsView and
+`AGENTSVIEW_GITHUB_TOKEN` is not set, it runs `gh auth token` and
+uses that token to create the gist. Run `gh auth login` once if
+the GitHub CLI is not authenticated yet.
+
+For remote or proxied AgentsView access, save a GitHub token in
+AgentsView before publishing. Remote requests do not use the server
+process environment or GitHub CLI credential as a fallback.
+
+If neither a saved token, `AGENTSVIEW_GITHUB_TOKEN`, nor
+`gh auth token` is available for local publishing, the publish
+modal prompts for a GitHub personal access token with the `gist`
+scope. That token is saved to your config file and reused for
+future publishes.
 
 !!! warning
     Secret gists are unlisted, not access-controlled: they don't
@@ -1047,16 +1131,18 @@ always works.
 ## Settings
 
 Click the gear icon in the header to open the Settings page.
-Settings are organized into tabs:
+Settings are organized into sections:
 
 ![Settings page](/assets/generated/screenshots/settings.png)
 
 | Section | What You Can Configure |
 |---------|----------------------|
-| Appearance | Theme (light/dark), block visibility, desktop zoom level |
+| Language | Interface language (English or Simplified Chinese) |
+| Appearance | Theme (light/dark), high-contrast mode, message layout, text size, block visibility, desktop zoom level |
+| Agent Directories | Custom paths for each agent's session files. For Devin CLI, point at the local root that contains `cli/` (for example a redacted `.../Application Support/devin` path), not copied config or OAuth files. |
 | Terminal | Default terminal emulator for session resume |
+| Worktree Mappings | Map worktree paths back to their main project (see [Worktree Project Mappings](/configuration/#worktree-project-mappings)) |
 | GitHub | Personal access token for Gist publishing |
-| Agent Directories | Custom paths for each agent's session files |
 | Remote Access | Remote connections toggle, auth token, connect to remote server |
 
 ![Settings remote access section](/assets/generated/screenshots/settings-remote.png)
@@ -1096,6 +1182,11 @@ preference is saved and persists across sessions.
 ![Light theme](/assets/generated/screenshots/theme-light.png)
 
 ![Dark theme](/assets/generated/screenshots/theme-dark.png)
+
+Settings > Appearance also offers a **high-contrast** mode for
+greater legibility and a **text size** control (90–130%) that
+scales message and interface text. Both preferences are saved
+and persist across sessions.
 
 ### Iframe Embedding
 

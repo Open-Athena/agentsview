@@ -3,65 +3,58 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/tidwall/gjson"
-
+	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/parser"
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
 )
 
-func IsCopilotAgent(agent string) bool {
-	return agent == "copilot" || agent == "vscode-copilot" || agent == "visualstudio-copilot"
-}
+// aiCreditUSD is the USD value of one AI credit for agents whose cost
+// is denominated in AI credits (the AICreditsDenominated capability).
+const aiCreditUSD = 0.01
 
-func lookupModelRates(
-	pricing map[string]modelRates, model string,
-) (modelRates, bool) {
-	return pricingpkg.Resolve(pricing, model)
-}
-
-type modelRateResolution struct {
-	rates modelRates
-	ok    bool
-}
-
-type modelRateResolver struct {
-	pricing map[string]modelRates
-	cache   map[string]modelRateResolution
-}
-
-func newModelRateResolver(
-	pricing map[string]modelRates,
-) *modelRateResolver {
-	return &modelRateResolver{
-		pricing: pricing,
-		cache:   make(map[string]modelRateResolution),
+// AICreditsFromCost converts a USD cost into AI credits when the
+// agent's cost is denominated in AI credits, and returns 0 otherwise.
+// It is the single home of the credit conversion shared by the SQLite,
+// PostgreSQL, and DuckDB usage paths; a per-agent credit rate would
+// slot in here rather than at each accumulation site.
+func AICreditsFromCost(agent string, costUSD float64) float64 {
+	if costUSD == 0 || !parser.AgentNameUsesAICredits(agent) {
+		return 0
 	}
+	return costUSD / aiCreditUSD
 }
 
-func (r *modelRateResolver) lookup(model string) (modelRates, bool) {
-	if r == nil {
-		return modelRates{}, false
-	}
-	if cached, ok := r.cache[model]; ok {
-		return cached.rates, cached.ok
-	}
-	rates, ok := lookupModelRates(r.pricing, model)
-	r.cache[model] = modelRateResolution{rates: rates, ok: ok}
-	return rates, ok
+// NoTokenData reports whether a daily-usage total carries neither token
+// data nor cost: every token counter, the cost total, and any Copilot AI
+// credits are zero. It distinguishes a window whose sessions simply do not
+// record token usage from one that genuinely has no sessions.
+func NoTokenData(t UsageTotals) bool {
+	return t.InputTokens == 0 &&
+		t.OutputTokens == 0 &&
+		t.CacheCreationTokens == 0 &&
+		t.CacheReadTokens == 0 &&
+		t.TotalCost == 0 &&
+		t.CopilotAICredits == 0
 }
 
 // UsageFilter controls the date range, agent, and timezone
 // for daily usage aggregation queries.
 type UsageFilter struct {
-	From              string // YYYY-MM-DD, inclusive
-	To                string // YYYY-MM-DD, inclusive
-	Agent             string // "" for all; supports comma-separated
-	Project           string // "" for all; supports comma-separated
-	Machine           string // "" for all; supports comma-separated
+	From    string // YYYY-MM-DD, inclusive
+	To      string // YYYY-MM-DD, inclusive
+	Agent   string // "" for all; supports comma-separated
+	Project string // "" for all; supports comma-separated
+	Machine string // "" for all; supports comma-separated
+	// GitBranch is a branchListSep-joined list of opaque (project, branch) tokens (EncodeBranchFilterToken).
+	GitBranch         string
 	Model             string // "" for all; supports comma-separated
 	ExcludeProject    string // comma-separated projects to exclude
 	ExcludeAgent      string // comma-separated agents to exclude
@@ -159,6 +152,11 @@ func (f UsageFilter) appendUsageSessionFilterClauses(
 	where, args = appendCSV(where, args, "s.agent", f.Agent, true)
 	where, args = appendCSV(where, args, "s.project", f.Project, true)
 	where, args = appendCSV(where, args, "s.machine", f.Machine, true)
+	if f.GitBranch != "" {
+		var clause string
+		clause, args = BranchPairClauseArgs("s.project", "s.git_branch", f.GitBranch, args)
+		where += "\n\tAND " + clause
+	}
 	where, args = appendCSV(where, args, "s.project", f.ExcludeProject, false)
 	where, args = appendCSV(where, args, "s.agent", f.ExcludeAgent, false)
 
@@ -186,6 +184,47 @@ func (f UsageFilter) appendUsageSessionFilterClauses(
 		args = append(args, pargs...)
 	}
 
+	return where, args
+}
+
+// appendUsageMatchingActivityClauses requires the session to have at
+// least one row that GetUsageMatchingSessionCount's bounded branch would
+// count: an assistant, non-synthetic message (model optional — some
+// Copilot assistant messages parse before a model name is known) or a
+// usage_events row with a model. Model/ExcludeModel narrow those same
+// rows. Seeding the EXISTS subqueries with the matching eligibility
+// predicates keeps the unbounded branch's semantics aligned with the
+// bounded branch's per-row predicates, so the same filter matches the
+// same sessions whether or not a date range is set.
+func (f UsageFilter) appendUsageMatchingActivityClauses(
+	where string, args []any,
+) (string, []any) {
+	var messageArgs []any
+	messageWhere, messageArgs := f.appendUsageSourceFilterClauses(
+		usageMatchingMessageSourceEligibility, messageArgs, "m.model",
+	)
+	var eventArgs []any
+	eventWhere, eventArgs := f.appendUsageSourceFilterClauses(
+		usageEventSourceEligibility, eventArgs, "ue.model",
+	)
+
+	where += `
+	AND (
+		EXISTS (
+			SELECT 1
+			FROM messages m
+			WHERE m.session_id = s.id
+				AND ` + messageWhere + `
+		)
+		OR EXISTS (
+			SELECT 1
+			FROM usage_events ue
+			WHERE ue.session_id = s.id
+				AND ` + eventWhere + `
+		)
+	)`
+	args = append(args, messageArgs...)
+	args = append(args, eventArgs...)
 	return where, args
 }
 
@@ -281,6 +320,25 @@ const usageMessageSourceEligibility = `
     AND m.model != ''
     AND m.model != '<synthetic>'`
 
+// usageMatchingMessageEligibility is usageMessageEligibility with the
+// token-presence requirement removed and the model-presence requirement
+// relaxed to a role check. GetUsageMatchingSessionCount counts sessions
+// that have usage-shaped activity even when the agent (e.g. Copilot)
+// never records per-message tokens or, for some assistant messages, a
+// model name, so it must not gate on m.token_usage or m.model != ” the
+// way every token/cost query does; Model/ExcludeModel filters are applied
+// separately and still narrow the match when set. Do not reuse this for
+// usageRowQuery or its callers — see the usageMessageEligibility doc
+// comment above.
+const usageMatchingMessageEligibility = `
+    m.role = 'assistant'
+    AND m.model != '<synthetic>'
+    AND s.deleted_at IS NULL`
+
+const usageMatchingMessageSourceEligibility = `
+    m.role = 'assistant'
+    AND m.model != '<synthetic>'`
+
 const usageEventEligibility = `
     ue.model != ''
     AND s.deleted_at IS NULL`
@@ -295,14 +353,17 @@ SELECT
 	m.session_id,
 	m.ordinal AS message_ordinal,
 	'message' AS usage_source,
-	COALESCE(m.timestamp, s.started_at) AS ts,
+	COALESCE(NULLIF(m.timestamp, ''), s.started_at, '') AS ts,
 	m.model,
 	m.token_usage,
 	0 AS input_tokens,
 	0 AS output_tokens,
 	0 AS cache_creation_input_tokens,
 	0 AS cache_read_input_tokens,
-	0 AS reasoning_tokens,
+	CASE
+		WHEN json_valid(m.token_usage) THEN COALESCE(CAST(json_extract(m.token_usage, '$.reasoning_tokens') AS INTEGER), 0)
+		ELSE 0
+	END AS reasoning_tokens,
 	NULL AS cost_usd,
 	'' AS cost_status,
 	'' AS cost_source,
@@ -329,7 +390,7 @@ SELECT
 	ue.session_id,
 	ue.message_ordinal,
 	ue.source AS usage_source,
-	COALESCE(ue.occurred_at, s.started_at) AS ts,
+	COALESCE(ue.occurred_at, s.started_at, '') AS ts,
 	ue.model,
 	'' AS token_usage,
 	ue.input_tokens,
@@ -375,13 +436,17 @@ SELECT
 	m.session_id,
 	m.ordinal AS message_ordinal,
 	'message' AS usage_source,
-	COALESCE(m.timestamp, s.started_at) AS ts,
+	COALESCE(NULLIF(m.timestamp, ''), s.started_at, '') AS ts,
 	m.model,
 	m.token_usage,
 	0 AS input_tokens,
 	0 AS output_tokens,
 	0 AS cache_creation_input_tokens,
 	0 AS cache_read_input_tokens,
+	CASE
+		WHEN json_valid(m.token_usage) THEN COALESCE(CAST(json_extract(m.token_usage, '$.reasoning_tokens') AS INTEGER), 0)
+		ELSE 0
+	END AS reasoning_tokens,
 	NULL AS cost_usd,
 	m.claude_message_id,
 	m.claude_request_id,
@@ -399,13 +464,14 @@ SELECT
 	ue.session_id,
 	ue.message_ordinal,
 	ue.source AS usage_source,
-	COALESCE(ue.occurred_at, s.started_at) AS ts,
+	COALESCE(ue.occurred_at, s.started_at, '') AS ts,
 	ue.model,
 	'' AS token_usage,
 	ue.input_tokens,
 	ue.output_tokens,
 	ue.cache_creation_input_tokens,
 	ue.cache_read_input_tokens,
+	ue.reasoning_tokens,
 	ue.cost_usd,
 	'' AS claude_message_id,
 	'' AS claude_request_id,
@@ -425,13 +491,17 @@ SELECT
 	m.session_id,
 	m.ordinal AS message_ordinal,
 	'message' AS usage_source,
-	COALESCE(m.timestamp, s.started_at) AS ts,
+	COALESCE(NULLIF(m.timestamp, ''), s.started_at, '') AS ts,
 	m.model,
 	m.token_usage,
 	0 AS input_tokens,
 	0 AS output_tokens,
 	0 AS cache_creation_input_tokens,
 	0 AS cache_read_input_tokens,
+	CASE
+		WHEN json_valid(m.token_usage) THEN COALESCE(CAST(json_extract(m.token_usage, '$.reasoning_tokens') AS INTEGER), 0)
+		ELSE 0
+	END AS reasoning_tokens,
 	NULL AS cost_usd,
 	m.claude_message_id,
 	m.claude_request_id,
@@ -448,13 +518,14 @@ SELECT
 	ue.session_id,
 	ue.message_ordinal,
 	ue.source AS usage_source,
-	COALESCE(ue.occurred_at, s.started_at) AS ts,
+	COALESCE(ue.occurred_at, s.started_at, '') AS ts,
 	ue.model,
 	'' AS token_usage,
 	ue.input_tokens,
 	ue.output_tokens,
 	ue.cache_creation_input_tokens,
 	ue.cache_read_input_tokens,
+	ue.reasoning_tokens,
 	ue.cost_usd,
 	'' AS claude_message_id,
 	'' AS claude_request_id,
@@ -490,7 +561,7 @@ message_timestamp_rows AS MATERIALIZED (
 	SELECT
 		m.session_id,
 		m.ordinal,
-		m.timestamp,
+		NULLIF(m.timestamp, '') AS timestamp,
 		m.model,
 		m.token_usage,
 		m.claude_message_id,
@@ -508,10 +579,11 @@ usage_event_timestamp_rows AS MATERIALIZED (
 		ue.occurred_at,
 		ue.model,
 		ue.input_tokens,
-		ue.output_tokens,
-		ue.cache_creation_input_tokens,
-		ue.cache_read_input_tokens,
-		ue.cost_usd,
+			ue.output_tokens,
+			ue.cache_creation_input_tokens,
+			ue.cache_read_input_tokens,
+			ue.reasoning_tokens,
+			ue.cost_usd,
 		ue.dedup_key
 	FROM usage_events ue
 	WHERE ` + eventTimestampWhere + `
@@ -588,6 +660,7 @@ type dailyUsageScanRow struct {
 	outputTokens             int
 	cacheCreationInputTokens int
 	cacheReadInputTokens     int
+	reasoningTokens          int
 	costUSD                  sql.NullFloat64
 	claudeMessageID          string
 	claudeRequestID          string
@@ -655,10 +728,11 @@ SELECT
 	u.model,
 	u.token_usage,
 	u.input_tokens,
-	u.output_tokens,
-	u.cache_creation_input_tokens,
-	u.cache_read_input_tokens,
-	u.cost_usd,
+		u.output_tokens,
+		u.cache_creation_input_tokens,
+		u.cache_read_input_tokens,
+		u.reasoning_tokens,
+		u.cost_usd,
 	u.claude_message_id,
 	u.claude_request_id,
 	u.source_uuid,
@@ -703,7 +777,7 @@ func appendUsageColumnBounds(
 	return where, args
 }
 
-func dailyUsageRowsSQLForBounds(
+func usageRowsSQLForBounds(
 	f UsageFilter, b usageBounds,
 ) (string, []any) {
 	if !b.bounded() {
@@ -720,8 +794,21 @@ func dailyUsageRowsSQLForBounds(
 		return rowsSQL, args
 	}
 
-	messageTimestampSourceWhere := usageMessageSourceEligibility +
-		"\n\tAND m.timestamp IS NOT NULL"
+	return usageBoundedRowsSQL(
+		f, b, usageMessageSourceEligibility, usageMessageEligibility)
+}
+
+// usageBoundedRowsSQL builds the bounded-branch CTE row source shared by
+// usageRowsSQLForBounds (token-eligible rows) and
+// usageMatchingSessionRowsSQLForBounds (relaxed matching rows). The two
+// callers differ only in the message eligibility predicates.
+func usageBoundedRowsSQL(
+	f UsageFilter, b usageBounds,
+	messageSourceEligibility, messageEligibility string,
+) (string, []any) {
+	messageTimestampSourceWhere := messageSourceEligibility +
+		"\n\tAND m.timestamp IS NOT NULL" +
+		"\n\tAND m.timestamp != ''"
 	var messageTimestampArgs []any
 	messageTimestampSourceWhere, messageTimestampArgs =
 		f.appendUsageSourceFilterClauses(
@@ -746,8 +833,8 @@ func dailyUsageRowsSQLForBounds(
 		f.appendUsageSessionFilterClauses(
 			usageSessionEligibility, eventTimestampJoinArgs)
 
-	messageFallbackWhere := usageMessageEligibility +
-		"\n\tAND m.timestamp IS NULL"
+	messageFallbackWhere := messageEligibility +
+		"\n\tAND NULLIF(m.timestamp, '') IS NULL"
 	var messageFallbackArgs []any
 	messageFallbackWhere, messageFallbackArgs =
 		f.appendUsageBranchFilterClauses(
@@ -787,14 +874,114 @@ func dailyUsageRowsSQLForBounds(
 	return rowsSQL, args
 }
 
+// usageMatchingSessionRowsSQLForBounds is usageRowsSQLForBounds's bounded
+// branch built from the relaxed usageMatchingMessageEligibility predicates,
+// so GetUsageMatchingSessionCount only relaxes the token-usage and
+// model-presence requirements and keeps the same per-row
+// Model/ExcludeModel filtering as the normal bounded path.
+func usageMatchingSessionRowsSQLForBounds(
+	f UsageFilter, b usageBounds,
+) (string, []any) {
+	return usageBoundedRowsSQL(
+		f, b,
+		usageMatchingMessageSourceEligibility, usageMatchingMessageEligibility)
+}
+
 func usageRowQuery(f UsageFilter) (string, []any) {
-	rowsSQL, args := dailyUsageRowsSQLForBounds(f, usageBoundsForFilter(f))
+	rowsSQL, args := usageRowsSQLForBounds(f, usageBoundsForFilter(f))
 	query := dailyUsageRowSelectFromRows(rowsSQL)
 	return query, args
 }
 
 func topSessionsUsageRowQuery(f UsageFilter) (string, []any) {
 	return usageRowQuery(f)
+}
+
+const dailyCursorUsageRowsSQLTemplate = `
+SELECT
+	'' AS session_id,
+	NULL AS message_ordinal,
+	'cursor' AS usage_source,
+	cu.occurred_at AS ts,
+	cu.model,
+	'' AS token_usage,
+	cu.input_tokens,
+	cu.output_tokens,
+	cu.cache_write_tokens AS cache_creation_input_tokens,
+	cu.cache_read_tokens AS cache_read_input_tokens,
+	0 AS reasoning_tokens,
+	cu.charged_cents / 100.0 AS cost_usd,
+	'' AS claude_message_id,
+	'' AS claude_request_id,
+	'' AS source_uuid,
+	cu.dedup_key AS usage_dedup_key,
+	'' AS project,
+	'cursor' AS agent
+FROM cursor_usage_events cu
+WHERE %s`
+
+func cursorUsageRowsSQLForBounds(
+	f UsageFilter, b usageBounds,
+) (string, []any, bool) {
+	termPred, _ := buildUsageTerminationPredSQLite(f.Termination)
+	// Cursor usage rows carry no project or git branch and bypass the session
+	// filter, so any filter they cannot satisfy (project, machine, branch)
+	// must exclude them entirely rather than let them leak into totals.
+	if f.Project != "" || f.ExcludeProject != "" ||
+		f.Machine != "" || f.GitBranch != "" || f.MinUserMessages > 0 ||
+		f.ExcludeOneShot || termPred != "" ||
+		f.ActiveSince != "" {
+		return "", nil, false
+	}
+	if f.Agent != "" {
+		vals := strings.Split(f.Agent, ",")
+		for i := range vals {
+			vals[i] = strings.TrimSpace(vals[i])
+		}
+		if !slices.Contains(vals, "cursor") {
+			return "", nil, false
+		}
+	}
+	if f.ExcludeAgent != "" {
+		vals := strings.Split(f.ExcludeAgent, ",")
+		for i := range vals {
+			vals[i] = strings.TrimSpace(vals[i])
+		}
+		if slices.Contains(vals, "cursor") {
+			return "", nil, false
+		}
+	}
+
+	where := "cu.model != ''"
+	var args []any
+	scope := normalizeAutomatedScope(f.AutomatedScope, f.ExcludeAutomated)
+	if pred := automatedScopePredicate(scope, "cu.is_headless"); pred != "" {
+		where += "\n\tAND " + pred
+	}
+	where, args = f.appendUsageSourceFilterClauses(
+		where, args, "cu.model",
+	)
+	where, args = appendUsageColumnBounds(where, "cu.occurred_at", b, args)
+	rowsSQL := fmt.Sprintf(dailyCursorUsageRowsSQLTemplate, where)
+	return rowsSQL, args, true
+}
+
+func dailyUsageRowsSQLForBounds(
+	f UsageFilter, b usageBounds, hasCursorTable bool,
+) (string, []any) {
+	sessionRowsSQL, sessionArgs := usageRowsSQLForBounds(f, b)
+	if !hasCursorTable {
+		return sessionRowsSQL, sessionArgs
+	}
+	cursorRowsSQL, cursorArgs, ok := cursorUsageRowsSQLForBounds(f, b)
+	if !ok {
+		return sessionRowsSQL, sessionArgs
+	}
+	rowsSQL := sessionRowsSQL + "\n\nUNION ALL\n\n" + cursorRowsSQL
+	args := make([]any, 0, len(sessionArgs)+len(cursorArgs))
+	args = append(args, sessionArgs...)
+	args = append(args, cursorArgs...)
+	return rowsSQL, args
 }
 
 func scanUsageRow(rows *sql.Rows) (usageScanRow, error) {
@@ -844,6 +1031,7 @@ func scanDailyUsageRow(rows *sql.Rows) (dailyUsageScanRow, error) {
 		&r.outputTokens,
 		&r.cacheCreationInputTokens,
 		&r.cacheReadInputTokens,
+		&r.reasoningTokens,
 		&r.costUSD,
 		&r.claudeMessageID,
 		&r.claudeRequestID,
@@ -864,129 +1052,416 @@ func scanDailyUsageRow(rows *sql.Rows) (dailyUsageScanRow, error) {
 // rate.
 func parseUsageTokenCounters(
 	tokenJSON string,
-) (inputTok, outputTok, cacheCrTok, cacheRdTok, cacheCr5m, cacheCr1h int) {
-	for i := 0; i < len(tokenJSON); {
-		keyStartRel := strings.IndexByte(tokenJSON[i:], '"')
-		if keyStartRel < 0 {
+) (inputTok, outputTok, cacheCrTok, cacheRdTok int) {
+	inputTok, outputTok, cacheCrTok, cacheRdTok, _ =
+		parseUsageTokenCountersWithReasoning(tokenJSON)
+	return
+}
+
+func parseUsageTokenCountersWithReasoning(
+	tokenJSON string,
+) (inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok int) {
+	i := skipJSONSpace(tokenJSON, 0)
+	if i >= len(tokenJSON) || tokenJSON[i] != '{' {
+		return
+	}
+	i++
+	for i < len(tokenJSON) {
+		i = skipJSONSpace(tokenJSON, i)
+		if i >= len(tokenJSON) || tokenJSON[i] == '}' {
 			break
 		}
-		keyStart := i + keyStartRel + 1
-		keyEndRel := strings.IndexByte(tokenJSON[keyStart:], '"')
-		if keyEndRel < 0 {
-			break
-		}
-		keyEnd := keyStart + keyEndRel
-		key := tokenJSON[keyStart:keyEnd]
-		valueStart, ok := usageTokenValueStart(tokenJSON, keyEnd+1)
-		if !ok {
-			i = keyEnd + 1
+		if tokenJSON[i] == ',' {
+			i++
 			continue
 		}
-		value, next := parseUsageTokenInt(tokenJSON, valueStart)
-		switch key {
-		case "input_tokens":
-			inputTok = value
-		case "output_tokens":
-			outputTok = value
-		case "cache_creation_input_tokens":
-			cacheCrTok = value
-		case "cache_read_input_tokens":
-			cacheRdTok = value
-		case "ephemeral_5m_input_tokens":
-			cacheCr5m = value
-		case "ephemeral_1h_input_tokens":
-			cacheCr1h = value
+		if tokenJSON[i] != '"' {
+			next, ok := skipJSONValue(tokenJSON, i)
+			if !ok || next <= i {
+				i++
+			} else {
+				i = next
+			}
+			continue
 		}
-		i = next
+		key, next, ok := parseJSONString(tokenJSON, i)
+		if !ok {
+			break
+		}
+		i = skipJSONSpace(tokenJSON, next)
+		if i >= len(tokenJSON) || tokenJSON[i] != ':' {
+			continue
+		}
+		i = skipJSONSpace(tokenJSON, i+1)
+		if isUsageTokenCounterKey(key) {
+			value, valueNext, ok := parseUsageTokenInt(tokenJSON, i)
+			if ok {
+				switch key {
+				case "input_tokens":
+					inputTok = value
+				case "output_tokens":
+					outputTok = value
+				case "cache_creation_input_tokens":
+					cacheCrTok = value
+				case "cache_read_input_tokens":
+					cacheRdTok = value
+				case "reasoning_tokens":
+					reasoningTok = value
+				}
+			}
+			if valueNext <= i {
+				i++
+			} else {
+				i = valueNext
+			}
+			continue
+		}
+		valueNext, ok := skipJSONValue(tokenJSON, i)
+		if !ok {
+			break
+		}
+		i = valueNext
 	}
 	return
 }
 
-func usageTokenValueStart(tokenJSON string, i int) (int, bool) {
-	for i < len(tokenJSON) && isJSONSpace(tokenJSON[i]) {
-		i++
+func isUsageTokenCounterKey(key string) bool {
+	switch key {
+	case "input_tokens", "output_tokens",
+		"cache_creation_input_tokens", "cache_read_input_tokens",
+		"reasoning_tokens":
+		return true
+	default:
+		return false
 	}
-	if i >= len(tokenJSON) || tokenJSON[i] != ':' {
-		return 0, false
-	}
-	i++
-	for i < len(tokenJSON) && isJSONSpace(tokenJSON[i]) {
-		i++
-	}
-	return i, i < len(tokenJSON)
 }
 
-func parseUsageTokenInt(tokenJSON string, i int) (int, int) {
-	if i < len(tokenJSON) && tokenJSON[i] == '"' {
+// parseEphemeralCacheSplit extracts the ephemeral 5m/1h cache-creation token
+// counts. They are nested under the cache_creation object, which
+// parseUsageTokenCountersWithReasoning skips as a non-counter value, so this
+// scans for the two keys directly. Both are zero when the blob predates the
+// TTL split; callers then bill the aggregate at the 5m rate.
+func parseEphemeralCacheSplit(tokenJSON string) (cr5m, cr1h int) {
+	return scanNestedTokenInt(tokenJSON, "ephemeral_5m_input_tokens"),
+		scanNestedTokenInt(tokenJSON, "ephemeral_1h_input_tokens")
+}
+
+func scanNestedTokenInt(tokenJSON, key string) int {
+	needle := `"` + key + `"`
+	idx := strings.Index(tokenJSON, needle)
+	if idx < 0 {
+		return 0
+	}
+	i := skipJSONSpace(tokenJSON, idx+len(needle))
+	if i >= len(tokenJSON) || tokenJSON[i] != ':' {
+		return 0
+	}
+	i = skipJSONSpace(tokenJSON, i+1)
+	value, _, ok := parseUsageTokenInt(tokenJSON, i)
+	if !ok {
+		return 0
+	}
+	return value
+}
+
+func skipJSONSpace(tokenJSON string, i int) int {
+	for i < len(tokenJSON) && isJSONSpace(tokenJSON[i]) {
 		i++
 	}
-	sign := 1
-	if i < len(tokenJSON) && tokenJSON[i] == '-' {
-		sign = -1
-		i++
+	return i
+}
+
+func parseJSONString(tokenJSON string, i int) (string, int, bool) {
+	if i >= len(tokenJSON) || tokenJSON[i] != '"' {
+		return "", i, false
+	}
+	for j := i + 1; j < len(tokenJSON); j++ {
+		switch tokenJSON[j] {
+		case '\\':
+			if j+1 >= len(tokenJSON) {
+				return "", len(tokenJSON), false
+			}
+			j++
+		case '"':
+			raw := tokenJSON[i : j+1]
+			var value string
+			err := json.Unmarshal([]byte(raw), &value)
+			if err != nil {
+				return "", j + 1, false
+			}
+			return value, j + 1, true
+		}
+	}
+	return "", len(tokenJSON), false
+}
+
+func parseUsageTokenInt(tokenJSON string, i int) (int, int, bool) {
+	if i >= len(tokenJSON) {
+		return 0, i, false
+	}
+	if tokenJSON[i] == '"' {
+		value, next, ok := parseJSONString(tokenJSON, i)
+		if !ok {
+			return 0, next, false
+		}
+		parsed, ok := parseUsageTokenIntLiteral(strings.TrimSpace(value))
+		return parsed, next, ok
 	}
 	start := i
-	var value int
-	for i < len(tokenJSON) && tokenJSON[i] >= '0' && tokenJSON[i] <= '9' {
-		value = value*10 + int(tokenJSON[i]-'0')
+	if tokenJSON[i] == '-' {
 		i++
 	}
-	if i == start {
-		return 0, i
+	digitStart := i
+	for i < len(tokenJSON) && tokenJSON[i] >= '0' && tokenJSON[i] <= '9' {
+		i++
 	}
-	return sign * value, i
+	if i == digitStart {
+		next, ok := skipJSONValue(tokenJSON, start)
+		if ok {
+			return 0, next, false
+		}
+		return 0, start, false
+	}
+	parsed, ok := parseUsageTokenIntLiteral(tokenJSON[start:i])
+	return parsed, i, ok
+}
+
+func parseUsageTokenIntLiteral(value string) (int, bool) {
+	parsed, err := strconv.ParseInt(value, 10, 0)
+	if err == nil {
+		return int(parsed), true
+	}
+	if numErr, ok := err.(*strconv.NumError); ok && numErr.Err == strconv.ErrRange {
+		if strings.HasPrefix(value, "-") {
+			return -int(^uint(0)>>1) - 1, true
+		}
+		return int(^uint(0) >> 1), true
+	}
+	return 0, false
+}
+
+func skipJSONValue(tokenJSON string, i int) (int, bool) {
+	i = skipJSONSpace(tokenJSON, i)
+	if i >= len(tokenJSON) {
+		return i, false
+	}
+	switch tokenJSON[i] {
+	case '"':
+		_, next, ok := parseJSONString(tokenJSON, i)
+		return next, ok
+	case '{', '[':
+		return skipJSONComposite(tokenJSON, i)
+	case 't':
+		if strings.HasPrefix(tokenJSON[i:], "true") {
+			return i + len("true"), true
+		}
+	case 'f':
+		if strings.HasPrefix(tokenJSON[i:], "false") {
+			return i + len("false"), true
+		}
+	case 'n':
+		if strings.HasPrefix(tokenJSON[i:], "null") {
+			return i + len("null"), true
+		}
+	default:
+		return skipJSONNumber(tokenJSON, i)
+	}
+	return i, false
+}
+
+func skipJSONComposite(tokenJSON string, i int) (int, bool) {
+	var stack []byte
+	switch tokenJSON[i] {
+	case '{':
+		stack = append(stack, '}')
+	case '[':
+		stack = append(stack, ']')
+	default:
+		return i, false
+	}
+	i++
+	for i < len(tokenJSON) {
+		switch tokenJSON[i] {
+		case '"':
+			_, next, ok := parseJSONString(tokenJSON, i)
+			if !ok {
+				return next, false
+			}
+			i = next
+		case '{':
+			stack = append(stack, '}')
+			i++
+		case '[':
+			stack = append(stack, ']')
+			i++
+		case '}', ']':
+			if len(stack) == 0 || tokenJSON[i] != stack[len(stack)-1] {
+				return i + 1, false
+			}
+			stack = stack[:len(stack)-1]
+			i++
+			if len(stack) == 0 {
+				return i, true
+			}
+		default:
+			i++
+		}
+	}
+	return len(tokenJSON), false
+}
+
+func skipJSONNumber(tokenJSON string, i int) (int, bool) {
+	start := i
+	if tokenJSON[i] == '-' {
+		i++
+	}
+	digitStart := i
+	for i < len(tokenJSON) && tokenJSON[i] >= '0' && tokenJSON[i] <= '9' {
+		i++
+	}
+	if i == digitStart {
+		return start, false
+	}
+	if i < len(tokenJSON) && tokenJSON[i] == '.' {
+		i++
+		fracStart := i
+		for i < len(tokenJSON) && tokenJSON[i] >= '0' && tokenJSON[i] <= '9' {
+			i++
+		}
+		if i == fracStart {
+			return start, false
+		}
+	}
+	if i < len(tokenJSON) && (tokenJSON[i] == 'e' || tokenJSON[i] == 'E') {
+		i++
+		if i < len(tokenJSON) && (tokenJSON[i] == '+' || tokenJSON[i] == '-') {
+			i++
+		}
+		expStart := i
+		for i < len(tokenJSON) && tokenJSON[i] >= '0' && tokenJSON[i] <= '9' {
+			i++
+		}
+		if i == expStart {
+			return start, false
+		}
+	}
+	return i, true
 }
 
 func isJSONSpace(b byte) bool {
 	return b == ' ' || b == '\n' || b == '\r' || b == '\t'
 }
 
-func dailyUsageAmounts(
-	r dailyUsageScanRow, pricing *modelRateResolver,
-) (inputTok, outputTok, cacheCrTok, cacheRdTok int, cost, savings float64) {
-	// cacheCr5m and cacheCr1h split the cache_creation total so
-	// the two ephemeral TTLs can be priced at their separate
-	// rates. For sources with no breakdown, everything stays in
-	// the 5m bucket so the bill falls back to the legacy rate.
-	var cacheCr5m, cacheCr1h int
+func clampedUsageRowTokens(
+	inputTokens, outputTokens, cacheCreationInputTokens,
+	cacheReadInputTokens int,
+) (inputTok, outputTok, cacheCrTok, cacheRdTok int) {
+	return ClampPlausibleTokens(int64(inputTokens)),
+		ClampPlausibleTokens(int64(outputTokens)),
+		ClampPlausibleTokens(int64(cacheCreationInputTokens)),
+		ClampPlausibleTokens(int64(cacheReadInputTokens))
+}
 
+func usageEventRowTokens(
+	source string,
+	inputTokens, outputTokens, cacheCreationInputTokens,
+	cacheReadInputTokens int,
+) (inputTok, outputTok, cacheCrTok, cacheRdTok int) {
+	if source == "session" {
+		return floorNegativeTokens(inputTokens),
+			floorNegativeTokens(outputTokens),
+			floorNegativeTokens(cacheCreationInputTokens),
+			floorNegativeTokens(cacheReadInputTokens)
+	}
+	return clampedUsageRowTokens(
+		inputTokens, outputTokens,
+		cacheCreationInputTokens, cacheReadInputTokens)
+}
+
+func floorNegativeTokens(v int) int {
+	if v < 0 {
+		return 0
+	}
+	return v
+}
+
+func clampedUsageTokenCounters(
+	tokenJSON string,
+) (inputTok, outputTok, cacheCrTok, cacheRdTok int) {
+	inputTok, outputTok, cacheCrTok, cacheRdTok, _ =
+		parseUsageTokenCountersWithReasoning(tokenJSON)
+	return ClampPlausibleTokens(int64(inputTok)),
+		ClampPlausibleTokens(int64(outputTok)),
+		ClampPlausibleTokens(int64(cacheCrTok)),
+		ClampPlausibleTokens(int64(cacheRdTok))
+}
+
+func clampedUsageTokenCountersWithReasoning(
+	tokenJSON string,
+) (inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok int) {
+	inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok =
+		parseUsageTokenCountersWithReasoning(tokenJSON)
+	return ClampPlausibleTokens(int64(inputTok)),
+		ClampPlausibleTokens(int64(outputTok)),
+		ClampPlausibleTokens(int64(cacheCrTok)),
+		ClampPlausibleTokens(int64(cacheRdTok)),
+		ClampPlausibleTokens(int64(reasoningTok))
+}
+
+func dailyUsageAmounts(
+	r dailyUsageScanRow, pricing *export.PricingResolver,
+) (inputTok, outputTok, cacheCrTok, cacheRdTok int, cost, savings float64) {
+	reasoningTok := r.reasoningTokens
+	// cacheCr5m/cacheCr1h split the cache-creation total so the two
+	// ephemeral TTLs are priced at their separate rates. Sources with no
+	// breakdown keep everything in the 5m bucket (the legacy rate).
+	var cacheCr5m, cacheCr1h int
 	if r.usageSource == "message" {
-		inputTok, outputTok, cacheCrTok, cacheRdTok, cacheCr5m, cacheCr1h =
-			parseUsageTokenCounters(r.tokenJSON)
-		// Older session logs (pre-1h-cache rollout) report only
-		// the aggregate field; treat those entirely as 5m so the
-		// bill matches the rate that was actually charged.
+		inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok =
+			clampedUsageTokenCountersWithReasoning(r.tokenJSON)
+		cacheCr5m, cacheCr1h = parseEphemeralCacheSplit(r.tokenJSON)
+		// Older session logs (pre-1h-cache rollout) report only the
+		// aggregate; bill those entirely at the 5m rate.
 		if cacheCr5m+cacheCr1h == 0 {
 			cacheCr5m = cacheCrTok
 		}
 	} else {
-		inputTok = r.inputTokens
-		outputTok = r.outputTokens
-		cacheCrTok = r.cacheCreationInputTokens
-		cacheRdTok = r.cacheReadInputTokens
-		// usage_events sources (Codex, etc.) lack the TTL split;
-		// bill the whole bucket at the 5m rate, matching the
-		// pre-split behavior.
+		inputTok, outputTok, cacheCrTok, cacheRdTok =
+			usageEventRowTokens(
+				r.usageSource,
+				r.inputTokens, r.outputTokens,
+				r.cacheCreationInputTokens, r.cacheReadInputTokens)
+		// usage_events sources (Codex, etc.) lack the TTL split.
 		cacheCr5m = cacheCrTok
 	}
 
-	rates, _ := pricing.lookup(r.model)
+	lookup := pricing.Lookup(r.model)
+	rates := lookup.Rates
 	if r.costUSD.Valid {
 		cost = r.costUSD.Float64
+		pricing.RecordReported(r.model, lookup)
 	} else {
-		cost = (float64(inputTok)*rates.input +
-			float64(outputTok)*rates.output +
-			float64(cacheCr5m)*rates.cacheCreation +
-			float64(cacheCr1h)*rates.cacheCreation1h +
-			float64(cacheRdTok)*rates.cacheRead) / 1_000_000
+		// Inline cost (not CostForTokens) so the 5m and 1h cache-write
+		// buckets are billed at their separate rates. Mirrors
+		// CostForTokens' reasoning-as-output fallback.
+		billableOutput := outputTok
+		if billableOutput == 0 {
+			billableOutput = reasoningTok
+		}
+		cost = (float64(inputTok)*rates.InputPerMTok +
+			float64(billableOutput)*rates.OutputPerMTok +
+			float64(cacheCr5m)*rates.CacheWritePerMTok +
+			float64(cacheCr1h)*rates.CacheWrite1hPerMTok +
+			float64(cacheRdTok)*rates.CacheReadPerMTok) / 1_000_000
+		pricing.RecordComputed(r.model, lookup)
 	}
 
 	readDelta := float64(cacheRdTok) *
-		(rates.input - rates.cacheRead) / 1_000_000
+		(rates.InputPerMTok - rates.CacheReadPerMTok) / 1_000_000
 	cr5mDelta := float64(cacheCr5m) *
-		(rates.input - rates.cacheCreation) / 1_000_000
+		(rates.InputPerMTok - rates.CacheWritePerMTok) / 1_000_000
 	cr1hDelta := float64(cacheCr1h) *
-		(rates.input - rates.cacheCreation1h) / 1_000_000
+		(rates.InputPerMTok - rates.CacheWrite1hPerMTok) / 1_000_000
 	savings = readDelta + cr5mDelta + cr1hDelta
 	return
 }
@@ -1079,9 +1554,27 @@ type DailyUsageEntry struct {
 	CacheReadTokens     int                `json:"cacheReadTokens"`
 	TotalCost           float64            `json:"totalCost"`
 	ModelsUsed          []string           `json:"modelsUsed"`
-	ModelBreakdowns     []ModelBreakdown   `json:"modelBreakdowns,omitempty"`
-	ProjectBreakdowns   []ProjectBreakdown `json:"projectBreakdowns,omitempty"`
-	AgentBreakdowns     []AgentBreakdown   `json:"agentBreakdowns,omitempty"`
+	ModelBreakdowns     []ModelBreakdown   `json:"modelBreakdowns"`
+	ProjectBreakdowns   []ProjectBreakdown `json:"projectBreakdowns"`
+	AgentBreakdowns     []AgentBreakdown   `json:"agentBreakdowns"`
+}
+
+func (e DailyUsageEntry) MarshalJSON() ([]byte, error) {
+	type alias DailyUsageEntry
+	out := alias(e)
+	if out.ModelsUsed == nil {
+		out.ModelsUsed = []string{}
+	}
+	if out.ModelBreakdowns == nil {
+		out.ModelBreakdowns = []ModelBreakdown{}
+	}
+	if out.ProjectBreakdowns == nil {
+		out.ProjectBreakdowns = []ProjectBreakdown{}
+	}
+	if out.AgentBreakdowns == nil {
+		out.AgentBreakdowns = []AgentBreakdown{}
+	}
+	return json.Marshal(out)
 }
 
 // ModelBreakdown holds per-model token and cost breakdown.
@@ -1134,38 +1627,28 @@ type UsageTotals struct {
 
 // DailyUsageResult wraps the daily entries and totals.
 type DailyUsageResult struct {
-	Daily         []DailyUsageEntry  `json:"daily"`
-	Totals        UsageTotals        `json:"totals"`
-	SessionCounts UsageSessionCounts `json:"sessionCounts,omitempty"`
-}
-
-// modelRates holds per-model pricing in rate-per-token form.
-// cacheCreation is the 5m ephemeral cache write rate; cacheCreation1h
-// is the 1h ephemeral cache write rate. Per-message usage rows
-// (Claude assistant messages) carry the 5m/1h split inside the
-// token_usage JSON blob and are priced separately; aggregate-only
-// sources (usage_events) fall back to the 5m rate.
-type modelRates struct {
-	input           float64
-	output          float64
-	cacheCreation   float64
-	cacheCreation1h float64
-	cacheRead       float64
+	SchemaVersion int                               `json:"schema_version,omitempty"`
+	Pricing       *export.PricingBlock              `json:"pricing,omitempty"`
+	Projects      map[string]export.ProjectMapEntry `json:"projects"`
+	Daily         []DailyUsageEntry                 `json:"daily"`
+	Totals        UsageTotals                       `json:"totals"`
+	SessionCounts UsageSessionCounts                `json:"sessionCounts,omitempty"`
 }
 
 // loadPricingMap reads the model_pricing table into a map for
 // in-memory joins. This is much faster than a SQL LEFT JOIN
 // on every row of the daily usage scan, since the pricing
-// table is tiny (a few dozen rows) and lookups are O(1).
+// table is tiny and repeated resolver lookups are cached.
 func (db *DB) loadPricingMap(
 	ctx context.Context,
-) (map[string]modelRates, error) {
+) ([]export.EffectivePricingRow, error) {
 	rows, err := db.getReader().QueryContext(ctx,
 		`SELECT model_pattern,
 			input_per_mtok, output_per_mtok,
 			cache_creation_per_mtok,
 			cache_creation_1h_per_mtok,
-			cache_read_per_mtok
+			cache_read_per_mtok,
+			updated_at
 		 FROM model_pricing
 		 WHERE model_pattern NOT LIKE '\_%' ESCAPE '\'`)
 	if err != nil {
@@ -1173,46 +1656,123 @@ func (db *DB) loadPricingMap(
 	}
 	defer rows.Close()
 
-	out := make(map[string]modelRates)
+	fallback := fallbackRateMap()
+	out := make(map[string]export.ModelRates)
 	for rows.Next() {
-		var (
-			pattern string
-			rates   modelRates
-		)
+		var p ModelPricing
 		if err := rows.Scan(
-			&pattern,
-			&rates.input, &rates.output,
-			&rates.cacheCreation,
-			&rates.cacheCreation1h,
-			&rates.cacheRead,
+			&p.ModelPattern,
+			&p.InputPerMTok, &p.OutputPerMTok,
+			&p.CacheCreationPerMTok,
+			&p.CacheCreation1hPerMTok,
+			&p.CacheReadPerMTok,
+			&p.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
-		// Defensive: if the 1h column is unpopulated (older
-		// LiteLLM rows from before the column was added, or
-		// rows pushed by an older PG sync client), fall back
-		// to the 5m rate so we still bill cache creation
-		// rather than dropping it to zero.
-		if rates.cacheCreation1h == 0 && rates.cacheCreation > 0 {
-			rates.cacheCreation1h = rates.cacheCreation
-		}
-		out[pattern] = rates
+		rates := modelPricingRates(p)
+		rates.Source = modelPricingSource(p, fallback)
+		out[p.ModelPattern] = rates
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
 	for model, cp := range db.customPricing {
-		out[model] = modelRates{
-			input:           cp.Input,
-			output:          cp.Output,
-			cacheCreation:   cp.CacheCreation,
-			cacheCreation1h: cp.CacheCreation,
-			cacheRead:       cp.CacheRead,
+		rates := export.ModelRates{
+			InputPerMTok:      cp.Input,
+			OutputPerMTok:     cp.Output,
+			CacheWritePerMTok: cp.CacheCreation,
+			// Custom rates carry no separate 1h value; bill 1h at the
+			// same (5m) cache-write rate the user configured.
+			CacheWrite1hPerMTok: cp.CacheCreation,
+			CacheReadPerMTok:    cp.CacheRead,
 		}
+		rates.Source = customPricingSource()
+		if source, ok := db.customPricingSources[model]; ok {
+			rates.Source = source
+		}
+		out[model] = rates
 	}
 
-	return out, nil
+	return pricingMapRows(out), nil
+}
+
+func customPricingSource() export.PricingRowSource {
+	return export.PricingRowSourceCustom
+}
+
+func fallbackRateMap() map[string]export.ModelRates {
+	fallback := pricingpkg.FallbackPricing()
+	out := make(map[string]export.ModelRates, len(fallback))
+	for _, p := range fallback {
+		cacheWrite1h := p.CacheCreation1hPerMTok
+		if cacheWrite1h == 0 && p.CacheCreationPerMTok > 0 {
+			cacheWrite1h = p.CacheCreationPerMTok
+		}
+		rates := export.ModelRates{
+			InputPerMTok:        p.InputPerMTok,
+			OutputPerMTok:       p.OutputPerMTok,
+			CacheWritePerMTok:   p.CacheCreationPerMTok,
+			CacheWrite1hPerMTok: cacheWrite1h,
+			CacheReadPerMTok:    p.CacheReadPerMTok,
+			Source:              export.PricingRowSourceEmbedded,
+		}
+		out[p.ModelPattern] = rates
+	}
+	return out
+}
+
+func modelPricingRates(p ModelPricing) export.ModelRates {
+	var updatedAt *time.Time
+	if p.UpdatedAt != "" {
+		if parsed, err := time.Parse(time.RFC3339Nano, p.UpdatedAt); err == nil {
+			t := parsed.UTC()
+			updatedAt = &t
+		}
+	}
+	cacheWrite1h := p.CacheCreation1hPerMTok
+	// Defensive: if the 1h column is unpopulated (older LiteLLM rows from
+	// before the column existed, or rows pushed by an older PG sync client),
+	// fall back to the 5m rate so 1h cache writes are still billed rather
+	// than dropped to zero.
+	if cacheWrite1h == 0 && p.CacheCreationPerMTok > 0 {
+		cacheWrite1h = p.CacheCreationPerMTok
+	}
+	return export.ModelRates{
+		InputPerMTok:        p.InputPerMTok,
+		OutputPerMTok:       p.OutputPerMTok,
+		CacheWritePerMTok:   p.CacheCreationPerMTok,
+		CacheWrite1hPerMTok: cacheWrite1h,
+		CacheReadPerMTok:    p.CacheReadPerMTok,
+		UpdatedAt:           updatedAt,
+	}
+}
+
+func modelPricingSource(
+	p ModelPricing, fallback map[string]export.ModelRates,
+) export.PricingRowSource {
+	if rates, ok := fallback[p.ModelPattern]; ok &&
+		rates.InputPerMTok == p.InputPerMTok &&
+		rates.OutputPerMTok == p.OutputPerMTok &&
+		rates.CacheWritePerMTok == p.CacheCreationPerMTok &&
+		rates.CacheReadPerMTok == p.CacheReadPerMTok {
+		return export.PricingRowSourceEmbedded
+	}
+	return export.PricingRowSourceFetched
+}
+
+func pricingMapRows(
+	in map[string]export.ModelRates,
+) []export.EffectivePricingRow {
+	out := make([]export.EffectivePricingRow, 0, len(in))
+	for pattern, rates := range in {
+		out = append(out, export.EffectivePricingRow{
+			ModelPattern: pattern,
+			Rates:        rates,
+		})
+	}
+	return out
 }
 
 // paddedUTCBound pads a UTC timestamp by hours to cover timezone
@@ -1240,13 +1800,14 @@ func (db *DB) GetDailyUsage(
 		return DailyUsageResult{},
 			fmt.Errorf("loading pricing: %w", err)
 	}
-	rateResolver := newModelRateResolver(pricing)
+	rateResolver := export.NewPricingResolver(pricing)
 
 	// Filter on usage timestamp (not only session started_at) so
 	// long-lived sessions that span date boundaries are included.
 	// Pad by +/-14h to cover all timezone offsets; the actual
 	// date filtering happens post-query via localDate.
-	query, args := usageRowQuery(f)
+	query, args := dailyUsageRowsSQLForBounds(f, usageBoundsForFilter(f), db.hasCursorUsageTable())
+	query = dailyUsageRowSelectFromRows(query)
 	query += ` ORDER BY u.ts ASC, u.session_id ASC,
 		COALESCE(u.message_ordinal, -1) ASC`
 
@@ -1279,6 +1840,7 @@ func (db *DB) GetDailyUsage(
 	if !f.SkipSessionCounts {
 		seenSessions = make(map[string]UsageSessionInfo)
 	}
+	projectLabels := make(map[string]struct{})
 
 	// totalSavings is the running sum of per-message cache
 	// savings using each row's actual per-model rates. We sum
@@ -1315,13 +1877,16 @@ func (db *DB) GetDailyUsage(
 			seen[key] = struct{}{}
 		}
 
-		if seenSessions != nil {
+		if seenSessions != nil && r.usageSource != "cursor" {
 			if _, ok := seenSessions[r.sessionID]; !ok {
 				seenSessions[r.sessionID] = UsageSessionInfo{
 					Project: r.project,
 					Agent:   r.agent,
 				}
 			}
+		}
+		if r.project != "" {
+			projectLabels[r.project] = struct{}{}
 		}
 
 		inputTok, outputTok, cacheCrTok, cacheRdTok, cost, savings :=
@@ -1468,20 +2033,31 @@ func (db *DB) GetDailyUsage(
 		}
 		totals.CacheSavings = totalSavings
 
-		var copilotCost float64
+		var aiCredits float64
 		for key, b := range accum {
-			if IsCopilotAgent(key.agent) {
-				copilotCost += b.cost
-			}
+			aiCredits += AICreditsFromCost(key.agent, b.cost)
 		}
-		if copilotCost > 0 {
-			totals.CopilotAICredits = copilotCost / 0.01
+		if aiCredits > 0 {
+			totals.CopilotAICredits = aiCredits
 		}
 		var sessionCounts UsageSessionCounts
 		if seenSessions != nil {
 			sessionCounts = NewUsageSessionCounts(seenSessions)
 		}
+		projects, err := db.BuildProjectIdentityMap(ctx,
+			sortedSetKeys(projectLabels))
+		if err != nil {
+			return DailyUsageResult{}, err
+		}
+		pricingBlock, err := rateResolver.BuildBlock()
+		if err != nil {
+			return DailyUsageResult{}, fmt.Errorf(
+				"building pricing block: %w", err)
+		}
 		return DailyUsageResult{
+			SchemaVersion: export.UsageDailySchemaVersion,
+			Pricing:       &pricingBlock,
+			Projects:      projects,
 			Daily:         daily,
 			Totals:        totals,
 			SessionCounts: sessionCounts,
@@ -1643,23 +2219,33 @@ func (db *DB) GetDailyUsage(
 
 	totals.CacheSavings = totalSavings
 
-	var copilotCost float64
+	var aiCredits float64
 	for _, d := range daily {
 		for _, ab := range d.AgentBreakdowns {
-			if IsCopilotAgent(ab.Agent) {
-				copilotCost += ab.Cost
-			}
+			aiCredits += AICreditsFromCost(ab.Agent, ab.Cost)
 		}
 	}
-	if copilotCost > 0 {
-		totals.CopilotAICredits = copilotCost / 0.01
+	if aiCredits > 0 {
+		totals.CopilotAICredits = aiCredits
 	}
 
 	var sessionCounts UsageSessionCounts
 	if seenSessions != nil {
 		sessionCounts = NewUsageSessionCounts(seenSessions)
 	}
+	projects, err := db.BuildProjectIdentityMap(ctx, sortedSetKeys(projectLabels))
+	if err != nil {
+		return DailyUsageResult{}, err
+	}
+	pricingBlock, err := rateResolver.BuildBlock()
+	if err != nil {
+		return DailyUsageResult{}, fmt.Errorf(
+			"building pricing block: %w", err)
+	}
 	return DailyUsageResult{
+		SchemaVersion: export.UsageDailySchemaVersion,
+		Pricing:       &pricingBlock,
+		Projects:      projects,
 		Daily:         daily,
 		Totals:        totals,
 		SessionCounts: sessionCounts,
@@ -1694,7 +2280,7 @@ func (db *DB) GetTopSessionsByCost(
 		return nil,
 			fmt.Errorf("loading pricing: %w", err)
 	}
-	rateResolver := newModelRateResolver(pricing)
+	rateResolver := export.NewPricingResolver(pricing)
 
 	query, args := topSessionsUsageRowQuery(f)
 	// Deterministic order so the dedup "winner" (the session
@@ -1844,49 +2430,53 @@ type SessionUsage struct {
 // an explicit map lookup so callers can distinguish "unpriced" from
 // "$0".
 func sessionRowCost(
-	r usageScanRow, pricing map[string]modelRates,
+	r usageScanRow, pricing *export.PricingResolver,
 ) (cost float64, priced, contributes bool) {
 	var inTok, outTok, crTok, rdTok int
-	// cr5m/cr1h split the cache-creation total by ephemeral TTL so the
-	// two are priced at their separate rates, matching dailyUsageAmounts.
+	// cr5m/cr1h split the cache-creation total by ephemeral TTL so the two
+	// are priced at their separate rates, matching dailyUsageAmounts.
 	var cr5m, cr1h int
+	reasoningTok := r.reasoningTokens
 	if r.usageSource == "message" {
-		usage := gjson.Parse(r.tokenJSON)
-		inTok = int(usage.Get("input_tokens").Int())
-		outTok = int(usage.Get("output_tokens").Int())
-		crTok = int(usage.Get("cache_creation_input_tokens").Int())
-		rdTok = int(usage.Get("cache_read_input_tokens").Int())
-		cr5m = int(usage.Get(
-			"cache_creation.ephemeral_5m_input_tokens").Int())
-		cr1h = int(usage.Get(
-			"cache_creation.ephemeral_1h_input_tokens").Int())
+		inTok, outTok, crTok, rdTok, reasoningTok =
+			clampedUsageTokenCountersWithReasoning(r.tokenJSON)
+		cr5m, cr1h = parseEphemeralCacheSplit(r.tokenJSON)
 		// Pre-TTL-split logs report only the aggregate; bill it at 5m.
 		if cr5m+cr1h == 0 {
 			cr5m = crTok
 		}
 	} else {
-		inTok = r.inputTokens
-		outTok = r.outputTokens
-		crTok = r.cacheCreationInputTokens
-		rdTok = r.cacheReadInputTokens
+		inTok, outTok, crTok, rdTok = usageEventRowTokens(
+			r.usageSource,
+			r.inputTokens, r.outputTokens,
+			r.cacheCreationInputTokens, r.cacheReadInputTokens)
 		cr5m = crTok
 	}
 
 	if r.costUSD.Valid {
+		pricing.RecordReported(r.model, pricing.Lookup(r.model))
 		return r.costUSD.Float64, true, true
 	}
-	if inTok == 0 && outTok == 0 && crTok == 0 && rdTok == 0 {
+	if inTok == 0 && outTok == 0 && reasoningTok == 0 &&
+		crTok == 0 && rdTok == 0 {
 		return 0, true, false
 	}
-	rates, ok := lookupModelRates(pricing, r.model)
-	if !ok {
+	lookup := pricing.Lookup(r.model)
+	if !lookup.OK {
+		pricing.RecordComputed(r.model, lookup)
 		return 0, false, true
 	}
-	cost = (float64(inTok)*rates.input +
-		float64(outTok)*rates.output +
-		float64(cr5m)*rates.cacheCreation +
-		float64(cr1h)*rates.cacheCreation1h +
-		float64(rdTok)*rates.cacheRead) / 1_000_000
+	rates := lookup.Rates
+	billableOutput := outTok
+	if billableOutput == 0 {
+		billableOutput = reasoningTok
+	}
+	cost = (float64(inTok)*rates.InputPerMTok +
+		float64(billableOutput)*rates.OutputPerMTok +
+		float64(cr5m)*rates.CacheWritePerMTok +
+		float64(cr1h)*rates.CacheWrite1hPerMTok +
+		float64(rdTok)*rates.CacheReadPerMTok) / 1_000_000
+	pricing.RecordComputed(r.model, lookup)
 	return cost, true, true
 }
 
@@ -1913,6 +2503,7 @@ func (db *DB) GetSessionUsage(
 	if err != nil {
 		return nil, fmt.Errorf("loading pricing: %w", err)
 	}
+	rateResolver := export.NewPricingResolver(pricing)
 
 	query := usageRowSelect() + ` AND u.session_id = ?
 		ORDER BY u.ts ASC, u.session_id ASC,
@@ -1946,7 +2537,7 @@ func (db *DB) GetSessionUsage(
 			seen[key] = struct{}{}
 		}
 
-		c, priced, contributes := sessionRowCost(r, pricing)
+		c, priced, contributes := sessionRowCost(r, rateResolver)
 		if !contributes {
 			continue
 		}
@@ -1975,9 +2566,7 @@ func (db *DB) GetSessionUsage(
 	}
 	if out.HasCost {
 		out.CostUSD = cost
-	}
-	if IsCopilotAgent(sess.Agent) && out.HasCost {
-		out.AICredits = cost / 0.01
+		out.AICredits = AICreditsFromCost(sess.Agent, cost)
 	}
 	if len(unpricedSet) > 0 {
 		out.UnpricedModels = sortedSetKeys(unpricedSet)
@@ -2119,4 +2708,63 @@ func (db *DB) GetUsageSessionCounts(
 	}
 
 	return out, nil
+}
+
+// GetUsageMatchingSessionCount counts sessions that match the usage filter
+// even when they have no token-bearing usage rows. Bounded ranges are
+// resolved against the timestamps of the sessions' messages/usage_events
+// rows (falling back to s.started_at for rows with no timestamp of their
+// own), the same shape usageRowsSQLForBounds uses, so a session whose
+// started_at/ended_at fall outside the window but whose message activity
+// falls inside it is still counted.
+func (db *DB) GetUsageMatchingSessionCount(
+	ctx context.Context, f UsageFilter,
+) (int, error) {
+	bounds := usageBoundsForFilter(f)
+
+	if !bounds.bounded() {
+		where, args := f.appendUsageSessionFilterClauses(usageSessionEligibility, nil)
+		where, args = f.appendUsageMatchingActivityClauses(where, args)
+
+		var count int
+		err := db.getReader().QueryRowContext(ctx, `
+			SELECT COUNT(*)
+			FROM sessions s WHERE `+where, args...).Scan(&count)
+		if err != nil {
+			return 0, fmt.Errorf("querying matching usage sessions: %w", err)
+		}
+		return count, nil
+	}
+
+	rowsSQL, args := usageMatchingSessionRowsSQLForBounds(f, bounds)
+	rows, err := db.getReader().QueryContext(
+		ctx, dailyUsageRowSelectFromRows(rowsSQL), args...)
+	if err != nil {
+		return 0, fmt.Errorf("querying matching usage sessions: %w", err)
+	}
+	defer rows.Close()
+
+	loc := f.location()
+	seen := make(map[string]struct{})
+	for rows.Next() {
+		r, err := scanDailyUsageRow(rows)
+		if err != nil {
+			return 0, fmt.Errorf("scanning matching usage session: %w", err)
+		}
+		date := localDate(r.ts, loc)
+		if date == "" {
+			continue
+		}
+		if f.From != "" && date < f.From {
+			continue
+		}
+		if f.To != "" && date > f.To {
+			continue
+		}
+		seen[r.sessionID] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterating matching usage sessions: %w", err)
+	}
+	return len(seen), nil
 }

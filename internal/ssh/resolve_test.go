@@ -18,26 +18,57 @@ func TestBuildResolveScript(t *testing.T) {
 
 	// Claude has CLAUDE_PROJECTS_DIR env var — must be referenced.
 	assert.Contains(t, script, "CLAUDE_PROJECTS_DIR")
+	assert.Contains(t, script, "CLAUDE_CONFIG_DIR")
 
-	// Non-file-based agents must not appear.
+	// Only file-backed provider-authoritative agents belong in the resolver.
 	for _, def := range parser.Registry {
-		if def.FileBased || def.DiscoverFunc != nil {
+		marker := "\"" + string(def.Type) + ":"
+		want := def.FileBased &&
+			parser.ProviderMigrationModes()[def.Type] ==
+				parser.ProviderMigrationProviderAuthoritative
+		if want {
+			assert.Contains(t, script, marker,
+				"file-backed provider-authoritative agent %s missing from script", def.Type)
 			continue
 		}
-		marker := "\"" + string(def.Type) + ":"
 		assert.NotContains(t, script, marker,
-			"non-file-based agent %s in script", def.Type)
+			"unsupported agent %s must stay out of the SSH resolver", def.Type)
 	}
+}
 
-	// Every file-based agent with DiscoverFunc must appear.
-	for _, def := range parser.Registry {
-		if !def.FileBased || def.DiscoverFunc == nil {
-			continue
-		}
-		marker := "\"" + string(def.Type) + ":"
-		assert.Contains(t, script, marker,
-			"file-based agent %s missing from script", def.Type)
+func TestResolveScriptExcludesDevinProviderRoot(t *testing.T) {
+	home := t.TempDir()
+	devinRoot := filepath.Join(home, ".local", "share", "devin")
+	require.NoError(t, os.MkdirAll(devinRoot, 0o755))
+
+	script := buildResolveScript()
+	cmd := exec.Command("sh", "-c", script)
+	cmd.Env = []string{"HOME=" + home, "DEVIN_DIR=" + devinRoot}
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "resolve script failed: output: %s", out)
+
+	dirs, _ := parseResolvedDirs(string(out))
+	assert.NotContains(t, dirs, parser.AgentDevin)
+}
+
+func TestResolveScriptHonorsClaudeConfigDirRoot(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".claude-personal")
+	projectsDir := filepath.Join(root, "projects")
+	require.NoError(t, os.MkdirAll(projectsDir, 0o755), "mkdir projects")
+
+	script := buildResolveScript()
+	cmd := exec.Command("sh", "-c", script)
+	cmd.Env = []string{
+		"HOME=" + home,
+		"CLAUDE_CONFIG_DIR=" + root,
 	}
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "resolve script failed: output: %s", out)
+
+	dirs, _ := parseResolvedDirs(string(out))
+	assert.Contains(t, dirs[parser.AgentClaude], root+"/projects")
+	assert.NotContains(t, dirs[parser.AgentClaude], home+"/.claude/projects")
 }
 
 func TestResolveScriptExitsZero(t *testing.T) {
@@ -112,11 +143,9 @@ func TestResolveScriptSkipsMissingCodexIndex(t *testing.T) {
 }
 
 // TestResolveScriptSkipsAiderHomeDefault verifies the resolve script does
-// NOT emit aider's bare-$HOME default. Aider's only default dir is "" (the
-// home directory); the remote resolver tars every emitted dir wholesale, so
-// emitting it would archive the entire remote $HOME. With AIDER_DIR unset,
-// the script must produce no aider dir even when a history file exists at
-// home root. Runs the real script through sh against a temp HOME.
+// NOT infer a bare-$HOME Aider root. The remote resolver tars every emitted
+// target, so Aider must stay opt-in even when a history file exists at home
+// root. Runs the real script through sh against a temp HOME.
 func TestResolveScriptSkipsAiderHomeDefault(t *testing.T) {
 	home := t.TempDir()
 	require.NoError(t, os.WriteFile(

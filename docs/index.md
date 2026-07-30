@@ -38,6 +38,7 @@ A local-first desktop and web app for browsing, searching, and analyzing your pa
 
 <div class="agent-grid">
   <a class="agent-chip" data-agent="claude-code" href="https://www.anthropic.com/claude-code" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-claude"/></svg></span><span class="agent-chip__name">Claude Code</span></a>
+  <a class="agent-chip" data-agent="openclaude" href="/configuration/#session-discovery"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-claude"/></svg></span><span class="agent-chip__name">OpenClaude</span></a>
   <a class="agent-chip" data-agent="codex" href="https://openai.com/codex/" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-openai"/></svg></span><span class="agent-chip__name">Codex</span></a>
   <a class="agent-chip" data-agent="gemini" href="https://github.com/google-gemini/gemini-cli" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-gemini"/></svg></span><span class="agent-chip__name">Gemini</span></a>
   <a class="agent-chip" data-agent="copilot" href="https://github.com/features/copilot" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-copilot"/></svg></span><span class="agent-chip__name">Copilot</span></a>
@@ -49,7 +50,7 @@ A local-first desktop and web app for browsing, searching, and analyzing your pa
   <a class="agent-chip" data-agent="vibe" href="https://mistral.ai" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-mistral"/></svg></span><span class="agent-chip__name">Mistral Vibe</span></a>
   <a class="agent-chip" data-agent="zed" href="https://zed.dev" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-zed"/></svg></span><span class="agent-chip__name">Zed</span></a>
   <a class="agent-chip" data-agent="warp" href="https://www.warp.dev" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-warp"/></svg></span><span class="agent-chip__name">Warp</span></a>
-  <a class="agent-chip" data-agent="amp" href="https://ampcode.com" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-sourcegraph"/></svg></span><span class="agent-chip__name">Amp</span></a>
+  <a class="agent-chip" data-agent="amp" href="https://ampcode.com" target="_blank" rel="noopener" title="Deprecated: historical local Amp thread JSON only"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-sourcegraph"/></svg></span><span class="agent-chip__name">Amp (historical)</span></a>
   <a class="agent-chip" data-agent="opencode" href="https://opencode.ai" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-opencode"/></svg></span><span class="agent-chip__name">OpenCode</span></a>
   <a class="agent-chip" data-agent="positron" href="https://positron.posit.co" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-posit"/></svg></span><span class="agent-chip__name">Positron</span></a>
   <a class="agent-chip" data-agent="cowork" href="https://www.anthropic.com" target="_blank" rel="noopener"><span class="agent-chip__glyph"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-claude"/></svg></span><span class="agent-chip__name">Claude Cowork</span></a>
@@ -202,6 +203,13 @@ to a shared database for team or multi-machine setups.
     one conversation where you discussed a specific function,
     error message, or design decision — even months later.
 
+-   **Recent Edits**
+
+    A cross-session feed of the files your agents changed most
+    recently, grouped by project and path. Expand any file to see
+    its edits and jump straight to the message that made each
+    change, on the [Recent Edits](/recent-edits/) page.
+
 -   **Analyze Your Usage**
 
     Activity heatmaps, tool usage breakdowns, velocity
@@ -235,8 +243,8 @@ to a shared database for team or multi-machine setups.
 -   **Multi-Agent Support**
 
     Works with [dozens of AI coding session sources](/configuration/#session-discovery)
-    including Claude Code, Codex, Copilot, Cursor, Gemini,
-    OpenHands, Aider, Claude Cowork, DeepSeek TUI, gptme,
+    including Claude Code, OpenClaude, Codex, Copilot, Cursor,
+    Gemini, OpenHands, Aider, Claude Cowork, DeepSeek TUI, gptme,
     Kilo, MiMoCode, Mistral Vibe, OhMyPi, QwenPaw, Reasonix,
     Shelley, and Visual Studio Copilot. Auto-discovers session
     directories so there's nothing to configure.

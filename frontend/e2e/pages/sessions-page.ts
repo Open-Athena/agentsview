@@ -14,6 +14,7 @@ export class SessionsPage {
   readonly sortButton: Locator;
   readonly projectTypeahead: Locator;
   readonly sessionListHeader: Locator;
+  readonly sessionCount: Locator;
 
   readonly analyticsPage: Locator;
   readonly analyticsToolbar: Locator;
@@ -25,8 +26,9 @@ export class SessionsPage {
     this.messageRows = page.locator(".virtual-row");
     this.scroller = page.locator(".message-list-scroll");
     this.sortButton = page.getByLabel("Toggle sort order");
-    this.projectTypeahead = page.locator(".typeahead");
+    this.projectTypeahead = page.locator(".kit-typeahead");
     this.sessionListHeader = page.locator(".session-list-header");
+    this.sessionCount = this.sessionListHeader.locator(".session-count");
     this.analyticsPage = page.locator(".analytics-page");
     this.analyticsToolbar = page.locator(".analytics-toolbar");
     this.exportBtn = page.locator(".export-btn");
@@ -64,8 +66,8 @@ export class SessionsPage {
   }
 
   async filterByProject(project: string) {
-    const trigger = this.projectTypeahead.locator(".typeahead-trigger");
-    const input = this.projectTypeahead.locator(".typeahead-input");
+    const trigger = this.projectTypeahead.locator(".kit-typeahead__trigger");
+    const input = this.projectTypeahead.locator(".kit-typeahead__input");
     // The typeahead may close immediately if a reactive update
     // steals focus right after opening. Retry until stable.
     await expect(async () => {
@@ -79,16 +81,16 @@ export class SessionsPage {
     await input.fill(project);
     const escaped = project.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     await this.projectTypeahead
-      .locator(".typeahead-option", {
+      .locator(".kit-typeahead__option", {
         hasText: new RegExp(`^${escaped} \\(`),
       })
       .click();
   }
 
   async clearProjectFilter() {
-    await this.projectTypeahead.locator(".typeahead-trigger").click();
+    await this.projectTypeahead.locator(".kit-typeahead__trigger").click();
     await this.projectTypeahead
-      .locator(".typeahead-option", { hasText: "All Projects" })
+      .locator(".kit-typeahead__option", { hasText: "All Projects" })
       .click();
   }
 

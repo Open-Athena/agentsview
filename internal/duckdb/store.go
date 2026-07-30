@@ -26,10 +26,12 @@ var _ db.Store = (*Store)(nil)
 
 // Store wraps a DuckDB connection for read-mostly serve mode.
 type Store struct {
-	duck          *sql.DB
-	cursorMu      sync.RWMutex
-	cursorSecret  []byte
-	customPricing map[string]config.CustomModelRate
+	duck           *sql.DB
+	quack          *quackClient
+	connectionKind duckDBConnectionKind
+	cursorMu       sync.RWMutex
+	cursorSecret   []byte
+	customPricing  map[string]config.CustomModelRate
 }
 
 // NewStore opens a local DuckDB mirror file as a db.Store.
@@ -47,6 +49,82 @@ func NewStoreFromDB(conn *sql.DB) *Store { return &Store{duck: conn} }
 func (s *Store) DB() *sql.DB { return s.duck }
 
 func (s *Store) Close() error { return s.duck.Close() }
+
+func (s *Store) queryContext(
+	ctx context.Context, query string, args ...any,
+) (*sql.Rows, error) {
+	return queryDuckDBContext(ctx, s.duck, s.connectionKind, s.quack, query, args...)
+}
+
+func (s *Store) queryRowContext(
+	ctx context.Context, query string, args ...any,
+) interface{ Scan(...any) error } {
+	return queryDuckDBRowContext(
+		ctx, s.duck, s.connectionKind, s.quack, query, args...,
+	)
+}
+
+func queryDuckDBContext(
+	ctx context.Context,
+	duck *sql.DB,
+	connectionKind duckDBConnectionKind,
+	quack *quackClient,
+	query string,
+	args ...any,
+) (*sql.Rows, error) {
+	if connectionKind != duckDBQuackClientConnection {
+		return duck.QueryContext(ctx, query, args...)
+	}
+	sqlText, err := duckSQLWithArgs(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	if quack != nil {
+		return quack.queryRemote(ctx, sqlText, true)
+	}
+	return duck.QueryContext(
+		ctx,
+		"SELECT * FROM "+quackAttachmentName+".query(?)",
+		sqlText,
+	)
+}
+
+func queryDuckDBRowContext(
+	ctx context.Context,
+	duck *sql.DB,
+	connectionKind duckDBConnectionKind,
+	quack *quackClient,
+	query string,
+	args ...any,
+) interface{ Scan(...any) error } {
+	if connectionKind != duckDBQuackClientConnection {
+		return duck.QueryRowContext(ctx, query, args...)
+	}
+	rows, err := queryDuckDBContext(ctx, duck, connectionKind, quack, query, args...)
+	return duckSingleRow{rows: rows, err: err}
+}
+
+type duckSingleRow struct {
+	rows *sql.Rows
+	err  error
+}
+
+func (r duckSingleRow) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	defer r.rows.Close()
+	if !r.rows.Next() {
+		if err := r.rows.Err(); err != nil {
+			return err
+		}
+		return sql.ErrNoRows
+	}
+	if err := r.rows.Scan(dest...); err != nil {
+		return err
+	}
+	return r.rows.Err()
+}
 
 func (s *Store) SetCustomPricing(p map[string]config.CustomModelRate) {
 	s.customPricing = p
@@ -80,7 +158,7 @@ const duckSessionCols = `id, project, machine, agent,
 	missing_success_criteria_count, missing_verification_count,
 	duplicate_prompt_count, no_code_context_count, runaway_tool_loop_count,
 	data_version,
-	cwd, git_branch, source_session_id, source_version,
+	cwd, git_branch, source_session_id, source_version, transcript_fidelity,
 	parser_malformed_lines, is_truncated,
 	secret_leak_count, secrets_rules_version,
 	deleted_at, termination_status`
@@ -113,7 +191,7 @@ func scanSession(rs interface{ Scan(...any) error }) (db.Session, error) {
 		&s.NoCodeContextCount, &s.RunawayToolLoopCount,
 		&s.DataVersion,
 		&s.Cwd, &s.GitBranch,
-		&s.SourceSessionID, &s.SourceVersion,
+		&s.SourceSessionID, &s.SourceVersion, &s.TranscriptFidelity,
 		&s.ParserMalformedLines, &s.IsTruncated,
 		&s.SecretLeakCount, &s.SecretsRulesVersion,
 		&deletedAt, &s.TerminationStatus,
@@ -144,6 +222,40 @@ func scanSessionRows(rows *sql.Rows) ([]db.Session, error) {
 		sessions = append(sessions, s)
 	}
 	return sessions, rows.Err()
+}
+
+func (s *Store) FindSessionIDsByPartial(
+	ctx context.Context, partial string, limit int,
+) ([]string, error) {
+	if partial == "" {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 5
+	}
+	rows, err := s.queryContext(ctx,
+		`SELECT id FROM sessions
+		 WHERE strpos(id, ?) > 0 AND deleted_at IS NULL
+		 ORDER BY COALESCE(ended_at, started_at, created_at) DESC
+		 LIMIT ?`,
+		partial, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"finding sessions by partial id %q: %w",
+			partial, err,
+		)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 func formatDBTime(v any) string {
@@ -230,7 +342,7 @@ func (s *Store) ListSessions(ctx context.Context, f db.SessionFilter) (db.Sessio
 		total = cur.Total
 	}
 	if total <= 0 {
-		if err := s.duck.QueryRowContext(ctx,
+		if err := s.queryRowContext(ctx,
 			"SELECT COUNT(*) FROM sessions WHERE "+where,
 			args...,
 		).Scan(&total); err != nil {
@@ -252,7 +364,7 @@ func (s *Store) ListSessions(ctx context.Context, f db.SessionFilter) (db.Sessio
 		pageBuilder.OrderByClause(rs, f) + " " +
 		pageBuilder.Limit(f.Limit+1)
 	cursorArgs = append(cursorArgs, pageBuilder.Args()...)
-	rows, err := s.duck.QueryContext(ctx, query, cursorArgs...)
+	rows, err := s.queryContext(ctx, query, cursorArgs...)
 	if err != nil {
 		return db.SessionPage{}, fmt.Errorf("querying duckdb sessions: %w", err)
 	}
@@ -300,7 +412,7 @@ func (s *Store) GetSidebarSessionIndex(ctx context.Context, f db.SessionFilter) 
 			ended_at, started_at, created_at
 		) DESC, id DESC`
 
-	rows, err := s.duck.QueryContext(ctx, query, args...)
+	rows, err := s.queryContext(ctx, query, args...)
 	if err != nil {
 		return db.SidebarSessionIndex{},
 			fmt.Errorf("querying duckdb sidebar session index: %w", err)
@@ -355,7 +467,7 @@ func (s *Store) GetSidebarSessionIndex(ctx context.Context, f db.SessionFilter) 
 }
 
 func (s *Store) GetSession(ctx context.Context, id string) (*db.Session, error) {
-	row := s.duck.QueryRowContext(ctx,
+	row := s.queryRowContext(ctx,
 		"SELECT "+duckSessionCols+" FROM sessions WHERE id = ? AND deleted_at IS NULL",
 		id,
 	)
@@ -370,7 +482,7 @@ func (s *Store) GetSession(ctx context.Context, id string) (*db.Session, error) 
 }
 
 func (s *Store) GetSessionFull(ctx context.Context, id string) (*db.Session, error) {
-	row := s.duck.QueryRowContext(ctx,
+	row := s.queryRowContext(ctx,
 		"SELECT "+duckSessionCols+" FROM sessions WHERE id = ?",
 		id,
 	)
@@ -385,7 +497,7 @@ func (s *Store) GetSessionFull(ctx context.Context, id string) (*db.Session, err
 }
 
 func (s *Store) GetChildSessions(ctx context.Context, parentID string) ([]db.Session, error) {
-	rows, err := s.duck.QueryContext(ctx,
+	rows, err := s.queryContext(ctx,
 		"SELECT "+duckSessionCols+` FROM sessions
 		 WHERE parent_session_id = ? AND deleted_at IS NULL
 		 ORDER BY COALESCE(started_at, created_at) ASC`,
@@ -403,7 +515,7 @@ func (s *Store) GetSessionVersion(id string) (int, int64, bool) {
 	var fileMtime sql.NullInt64
 	var fileHash sql.NullString
 	var updated any
-	err := s.duck.QueryRow(
+	err := s.queryRowContext(context.Background(),
 		`SELECT message_count, file_mtime, file_hash,
 		        COALESCE(local_modified_at, ended_at, started_at, created_at)
 		 FROM sessions WHERE id = ?`,
@@ -431,15 +543,17 @@ func (s *Store) GetStats(ctx context.Context, excludeOneShot, excludeAutomated b
 	filter := rootSessionWhere(excludeOneShot, excludeAutomated)
 	query := fmt.Sprintf(`
 		SELECT
-			(SELECT COUNT(*) FROM sessions WHERE %s),
-			(SELECT COALESCE(SUM(message_count), 0) FROM sessions WHERE %s),
-			(SELECT COUNT(DISTINCT project) FROM sessions WHERE %s),
-			(SELECT COUNT(DISTINCT machine) FROM sessions WHERE %s),
-			(SELECT MIN(COALESCE(started_at, created_at)) FROM sessions WHERE %s)`,
-		filter, filter, filter, filter, filter)
+			COUNT(*),
+			COALESCE(SUM(message_count), 0),
+			COUNT(DISTINCT project),
+			COUNT(DISTINCT machine),
+			MIN(COALESCE(started_at, created_at))
+		FROM sessions
+		WHERE %s`,
+		filter)
 	var stats db.Stats
 	var earliest any
-	if err := s.duck.QueryRowContext(ctx, query).Scan(
+	if err := s.queryRowContext(ctx, query).Scan(
 		&stats.SessionCount, &stats.MessageCount,
 		&stats.ProjectCount, &stats.MachineCount, &earliest,
 	); err != nil {
@@ -452,7 +566,7 @@ func (s *Store) GetStats(ctx context.Context, excludeOneShot, excludeAutomated b
 }
 
 func (s *Store) GetProjects(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]db.ProjectInfo, error) {
-	rows, err := s.duck.QueryContext(ctx,
+	rows, err := s.queryContext(ctx,
 		`SELECT project, COUNT(*) FROM sessions WHERE `+
 			rootSessionWhere(excludeOneShot, excludeAutomated)+
 			` GROUP BY project ORDER BY project`,
@@ -473,7 +587,7 @@ func (s *Store) GetProjects(ctx context.Context, excludeOneShot, excludeAutomate
 }
 
 func (s *Store) GetAgents(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]db.AgentInfo, error) {
-	rows, err := s.duck.QueryContext(ctx,
+	rows, err := s.queryContext(ctx,
 		`SELECT agent, COUNT(*) FROM sessions WHERE agent <> '' AND `+
 			rootSessionWhere(excludeOneShot, excludeAutomated)+
 			` GROUP BY agent ORDER BY agent`,
@@ -494,7 +608,7 @@ func (s *Store) GetAgents(ctx context.Context, excludeOneShot, excludeAutomated 
 }
 
 func (s *Store) GetMachines(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]string, error) {
-	rows, err := s.duck.QueryContext(ctx,
+	rows, err := s.queryContext(ctx,
 		`SELECT DISTINCT machine FROM sessions WHERE `+
 			rootSessionWhere(excludeOneShot, excludeAutomated)+
 			` ORDER BY machine`,
@@ -510,6 +624,28 @@ func (s *Store) GetMachines(ctx context.Context, excludeOneShot, excludeAutomate
 			return nil, err
 		}
 		out = append(out, machine)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetBranches(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]db.BranchInfo, error) {
+	rows, err := s.duck.QueryContext(ctx,
+		`SELECT DISTINCT project, git_branch FROM sessions WHERE `+
+			rootSessionWhere(excludeOneShot, excludeAutomated)+
+			` ORDER BY project, git_branch`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("querying duckdb branches: %w", err)
+	}
+	defer rows.Close()
+	out := []db.BranchInfo{}
+	for rows.Next() {
+		var bi db.BranchInfo
+		if err := rows.Scan(&bi.Project, &bi.Branch); err != nil {
+			return nil, fmt.Errorf("scanning duckdb branch: %w", err)
+		}
+		bi.Token = db.EncodeBranchFilterToken(bi.Project, bi.Branch)
+		out = append(out, bi)
 	}
 	return out, rows.Err()
 }
@@ -584,7 +720,7 @@ func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, e
 		orderBy = "session_ended_at DESC, session_id ASC"
 	}
 	args = append(args, f.Limit+1, f.Cursor)
-	rows, err := s.duck.QueryContext(ctx, `
+	rows, err := s.queryContext(ctx, `
 		WITH msg_ranked AS (
 			SELECT m.session_id, s.project, s.agent,
 				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
@@ -602,7 +738,7 @@ func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, e
 			WHERE `+msgTermPredicate+`
 				AND s.deleted_at IS NULL
 				AND m.is_system = FALSE
-				AND `+db.SystemPrefixSQL("m.content", "m.role")+`
+				AND `+db.DuckDBSystemPrefixSQL("m.content", "m.role")+`
 				`+project+`
 		),
 		msg_matches AS (
@@ -632,7 +768,7 @@ func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, e
 					SELECT 1 FROM messages mx
 					WHERE mx.session_id = s.id
 						AND mx.is_system = FALSE
-						AND `+db.SystemPrefixSQL("mx.content", "mx.role")+`
+						AND `+db.DuckDBSystemPrefixSQL("mx.content", "mx.role")+`
 				)
 				AND s.id NOT IN (SELECT session_id FROM msg_matches)
 				`+nameProject+`
@@ -678,7 +814,7 @@ func (s *Store) SearchSession(ctx context.Context, sessionID, query string) ([]i
 	if query == "" {
 		return nil, nil
 	}
-	rows, err := s.duck.QueryContext(ctx, `
+	rows, err := s.queryContext(ctx, `
 		SELECT DISTINCT m.ordinal
 		FROM messages m
 		LEFT JOIN tool_calls tc
@@ -690,7 +826,7 @@ func (s *Store) SearchSession(ctx context.Context, sessionID, query string) ([]i
 			AND tre.call_index = tc.call_index
 		WHERE m.session_id = ?
 			AND m.is_system = FALSE
-			AND `+db.SystemPrefixSQL("m.content", "m.role")+`
+			AND `+db.DuckDBSystemPrefixSQL("m.content", "m.role")+`
 			AND (m.content ILIKE ? ESCAPE '\'
 				OR tc.result_content ILIKE ? ESCAPE '\'
 				OR tre.content ILIKE ? ESCAPE '\')
@@ -811,7 +947,7 @@ func (s *Store) collectContentSubstringMatches(
 		case "messages":
 			sysPred := "TRUE"
 			if f.ExcludeSystem {
-				sysPred = "m.is_system = FALSE AND " + db.SystemPrefixSQL("m.content", "m.role")
+				sysPred = "m.is_system = FALSE AND " + db.DuckDBSystemPrefixSQL("m.content", "m.role")
 			}
 			contentPred := addSearchArgs("m.content")
 			branches = append(branches, `
@@ -1018,7 +1154,7 @@ func contentCandidateMatches(candidates []duckContentCandidate) []db.ContentMatc
 func contentSessionFilter(f db.ContentSearchFilter) db.SessionFilter {
 	return db.SessionFilter{
 		Project: f.Project, ExcludeProject: f.ExcludeProject,
-		Machine: f.Machine, Agent: f.Agent,
+		Machine: f.Machine, GitBranch: f.GitBranch, Agent: f.Agent,
 		Date: f.Date, DateFrom: f.DateFrom, DateTo: f.DateTo,
 		ActiveSince:      f.ActiveSince,
 		ExcludeOneShot:   !f.IncludeOneShot,
@@ -1049,7 +1185,7 @@ func (s *Store) collectContentSource(
 			args = append(args, pattern)
 		}
 		if f.ExcludeSystem {
-			query += " AND m.is_system = FALSE AND " + db.SystemPrefixSQL("m.content", "m.role")
+			query += " AND m.is_system = FALSE AND " + db.DuckDBSystemPrefixSQL("m.content", "m.role")
 		}
 		orderBy = "m.session_id, m.ordinal, COALESCE(m.id, 0)"
 	case "tool_input":
@@ -1124,7 +1260,7 @@ func (s *Store) collectContentSource(
 		return nil, &db.SearchInputError{Msg: fmt.Sprintf("search: unknown source %q", source)}
 	}
 	query += ` ORDER BY ` + orderBy
-	rows, err := s.duck.QueryContext(ctx, query, args...)
+	rows, err := s.queryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("duckdb content search: %w", err)
 	}
@@ -1134,7 +1270,7 @@ func (s *Store) collectContentSource(
 func (s *Store) scanContentMatches(
 	ctx context.Context, query string, args []any, makeSnippet func(string) string,
 ) ([]db.ContentMatch, error) {
-	rows, err := s.duck.QueryContext(ctx, query, args...)
+	rows, err := s.queryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("duckdb content search: %w", err)
 	}

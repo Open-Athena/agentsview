@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { m } from "../../i18n/index.js";
   import { onMount } from "svelte";
   import { trends } from "../../stores/trends.svelte.js";
   import { getBasePath } from "../../stores/router.svelte.js";
@@ -12,6 +13,7 @@
   import { rollingRange } from "../../utils/dates.js";
   import type { TrendsGranularity } from "../../api/types.js";
   import { ChartColumnIcon, ChevronDownIcon } from "../../icons.js";
+  import { Spinner } from "@kenn-io/kit-ui";
   import RangePicker from "../shared/RangePicker.svelte";
   import {
     resolveRange,
@@ -36,9 +38,10 @@
     "var(--trend-black)",
   ] as const;
   const TREND_WINDOW_PARAM = "window_days";
+  const DEFAULT_TREND_WINDOW_DAYS = 365;
 
   let activeTerm: string | null = $state(null);
-  let trendsWindowDays: number | null = $state(null);
+  let trendsWindowDays: number | null = $state(DEFAULT_TREND_WINDOW_DAYS);
   const trendsPanelDate = $derived(currentTrendsPanelDate());
 
   const GRANULARITIES: TrendsGranularity[] = ["day", "week", "month"];
@@ -90,7 +93,7 @@
       trends.from = range.from;
       trends.to = range.to;
       trendsWindowDays = windowDays;
-    } else {
+    } else if (from || to) {
       if (from) trends.from = from;
       if (to) trends.to = to;
       trendsWindowDays = null;
@@ -228,6 +231,7 @@
     } else {
       seedTrendsYoke();
     }
+    materializeRollingWindow();
     writeUrl();
     trends.fetchTerms();
     document.addEventListener("click", onGroupByDocClick);
@@ -242,13 +246,13 @@
 <section class="trends-page">
   <div class="page-head">
     <div>
-      <h1>Trends</h1>
-      <p>{trends.response?.from ?? trends.from} to {trends.response?.to ?? trends.to}</p>
+      <h1>{m.trends_title()}</h1>
+      <p>{m.trends_date_range({ from: trends.response?.from ?? trends.from, to: trends.response?.to ?? trends.to })}</p>
     </div>
     <div class="head-actions">
-      <button class="secondary" onclick={resetTerms}>Reset</button>
+      <button class="secondary" onclick={resetTerms}>{m.trends_reset()}</button>
       <button class="primary" onclick={refresh} disabled={trends.loading.terms}>
-        {trends.loading.terms ? "Refreshing" : "Refresh"}
+        {trends.loading.terms ? m.trends_refreshing() : m.trends_refresh()}
       </button>
     </div>
   </div>
@@ -265,8 +269,8 @@
   <div class="content-grid">
     <div class="query-panel">
       <label class="terms-label" for="trend-terms">
-        <span>Terms</span>
-        <span class="terms-hint">one per line</span>
+        <span>{m.trends_terms()}</span>
+        <span class="terms-hint">{m.trends_one_per_line()}</span>
       </label>
       <textarea
         id="trend-terms"
@@ -289,7 +293,7 @@
             aria-expanded={groupByOpen}
           >
             <ChartColumnIcon size="13" strokeWidth="2" aria-hidden="true" />
-            Group by <span class="gval">{trends.granularity}</span>
+            {m.trends_group_by()} <span class="gval">{trends.granularity}</span>
             <ChevronDownIcon
               class={groupByOpen ? "g-chev open" : "g-chev"}
               size="11"
@@ -319,7 +323,7 @@
             bind:checked={trends.normalized}
             onchange={setNormalized}
           />
-          <span>Normalize by number of messages</span>
+          <span>{m.trends_normalize()}</span>
         </label>
       </div>
       <TrendsLineChart
@@ -332,8 +336,8 @@
       />
       {#if trends.loading.terms}
         <div class="loading-overlay" role="status" aria-live="polite">
-          <span class="loading-spinner" aria-hidden="true"></span>
-          <span>Computing trends...</span>
+          <span aria-hidden="true"><Spinner size={18} /></span>
+          <span>{m.trends_computing()}</span>
         </div>
       {/if}
     </div>
@@ -353,18 +357,19 @@
 
 <style>
   .trends-page {
-    --trend-blue: #2563eb;
-    --trend-gold: #d97706;
-    --trend-purple: #7c3aed;
-    --trend-green: #059669;
-    --trend-magenta: #db2777;
-    --trend-slate: #475569;
-    --trend-red: #dc2626;
-    --trend-cyan: #0891b2;
+    --trend-blue: var(--accent-blue);
+    --trend-gold: var(--accent-amber);
+    --trend-purple: var(--accent-purple);
+    --trend-green: var(--accent-green);
+    --trend-magenta: var(--accent-pink);
+    --trend-slate: var(--text-secondary);
+    --trend-red: var(--accent-red);
+    --trend-cyan: var(--accent-cyan);
+    /* kit-ui-check-ignore: brown slot of the 12-hue categorical series palette; nearest token --accent-orange would collide with the amber slot */
     --trend-brown: #92400e;
-    --trend-lime: #65a30d;
-    --trend-indigo: #4338ca;
-    --trend-black: #111827;
+    --trend-lime: var(--accent-lime);
+    --trend-indigo: var(--accent-indigo);
+    --trend-black: var(--text-primary);
     max-width: 1180px;
     margin: 0 auto;
     padding: 22px;
@@ -372,18 +377,8 @@
   }
 
   :global(:root.dark) .trends-page {
-    --trend-blue: #60a5fa;
-    --trend-gold: #fbbf24;
-    --trend-purple: #c084fc;
-    --trend-green: #4ade80;
-    --trend-magenta: #f472b6;
-    --trend-slate: #cbd5e1;
-    --trend-red: #f87171;
-    --trend-cyan: #22d3ee;
+    /* kit-ui-check-ignore: dark-mode counterpart of the suppressed brown palette slot above */
     --trend-brown: #fb923c;
-    --trend-lime: #a3e635;
-    --trend-indigo: #818cf8;
-    --trend-black: #f8fafc;
   }
 
   .page-head {
@@ -449,7 +444,7 @@
   .primary {
     background: var(--accent-blue);
     border-color: var(--accent-blue);
-    color: white;
+    color: var(--accent-blue-foreground);
   }
 
   .primary:hover:not(:disabled) {
@@ -465,7 +460,7 @@
 
   label {
     display: grid;
-    gap: 5px;
+    gap: var(--space-2);
     color: var(--text-muted);
     font-size: 11px;
     font-weight: 600;
@@ -489,7 +484,7 @@
     display: flex;
     align-items: center;
     justify-content: flex-end;
-    gap: 14px;
+    gap: var(--space-5);
     padding: 2px 2px 10px;
   }
 
@@ -589,7 +584,7 @@
     grid-template-areas:
       "query chart"
       "table chart";
-    gap: 14px;
+    gap: var(--space-6);
     align-items: start;
   }
 
@@ -656,22 +651,7 @@
     pointer-events: none;
   }
 
-  .loading-spinner {
-    width: 18px;
-    height: 18px;
-    border: 2px solid var(--border-default);
-    border-top-color: var(--accent-blue);
-    border-radius: 999px;
-    animation: trends-spin 800ms linear infinite;
-  }
-
-  @keyframes trends-spin {
-    to {
-      transform: rotate(360deg);
-    }
-  }
-
-  @media (max-width: 820px) {
+  @media (max-width: 900px) {
     .trends-page {
       padding: 16px;
     }

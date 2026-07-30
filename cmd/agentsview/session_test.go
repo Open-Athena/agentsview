@@ -22,7 +22,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/server"
+	agentsync "go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/kit/daemon"
 )
 
@@ -258,11 +261,16 @@ func seedSession(t *testing.T, dataDir, id, project string) {
 	seedSessionWithOpts(t, dataDir, id, project, nil)
 }
 
+type sessionSeed struct {
+	id      string
+	project string
+	mut     func(*db.Session)
+}
+
 func seedEmptyArchive(t *testing.T, dataDir string) {
 	t.Helper()
-	d, err := db.Open(filepath.Join(dataDir, "sessions.db"))
-	require.NoError(t, err)
-	require.NoError(t, d.Close())
+	dbtest.EnsureTestDBAt(t, sessionsDBPath(dataDir))
+	registerSQLiteDaemonRuntime(t, dataDir)
 }
 
 // seedSessionWithOpts is like seedSession but allows mutation of
@@ -275,144 +283,309 @@ func seedSessionWithOpts(
 	mut func(*db.Session),
 ) {
 	t.Helper()
-	d, err := db.Open(filepath.Join(dataDir, "sessions.db"))
+	seedSessionsWithOpts(t, dataDir, sessionSeed{
+		id:      id,
+		project: project,
+		mut:     mut,
+	})
+}
+
+func seedSessionsWithOpts(t *testing.T, dataDir string, seeds ...sessionSeed) {
+	t.Helper()
+	seedSessionArchiveRows(t, dataDir, seeds...)
+	registerSQLiteDaemonRuntime(t, dataDir)
+}
+
+func seedSessionArchiveRows(t *testing.T, dataDir string, seeds ...sessionSeed) {
+	t.Helper()
+	dbPath := sessionsDBPath(dataDir)
+	dbtest.EnsureTestDBAt(t, dbPath)
+	d, err := db.Open(dbPath)
 	require.NoError(t, err)
-	t.Cleanup(func() { d.Close() })
-	// UserMessageCount >= 2 so seeded sessions pass the default
-	// ExcludeOneShot filter in `session list` (one-shot means
-	// user_message_count <= 1). See internal/db/analytics.go.
-	s := db.Session{
-		ID:               id,
-		Project:          project,
-		Machine:          "m",
-		Agent:            "claude",
-		MessageCount:     4,
-		UserMessageCount: 2,
+	closed := false
+	t.Cleanup(func() {
+		if !closed {
+			_ = d.Close()
+		}
+	})
+	for _, seed := range seeds {
+		// UserMessageCount >= 2 so seeded sessions pass the default
+		// ExcludeOneShot filter in `session list` (one-shot means
+		// user_message_count <= 1). See internal/db/analytics.go.
+		s := db.Session{
+			ID:               seed.id,
+			Project:          seed.project,
+			Machine:          "m",
+			Agent:            "claude",
+			MessageCount:     4,
+			UserMessageCount: 2,
+		}
+		if seed.mut != nil {
+			seed.mut(&s)
+		}
+		require.NoError(t, d.UpsertSession(s))
 	}
-	if mut != nil {
-		mut(&s)
+	err = d.Close()
+	closed = true
+	require.NoError(t, err)
+}
+
+func registerSQLiteDaemonRuntime(t *testing.T, dataDir string) {
+	t.Helper()
+	registerSQLiteDaemonRuntimeWithEngine(t, dataDir, false)
+}
+
+func registerSQLiteWritableDaemonRuntime(t *testing.T, dataDir string) {
+	t.Helper()
+	registerSQLiteDaemonRuntimeWithEngine(t, dataDir, true)
+}
+
+func registerSQLiteDaemonRuntimeWithEngine(
+	t *testing.T, dataDir string, writable bool,
+) {
+	t.Helper()
+	cfg, err := config.LoadMinimal()
+	require.NoError(t, err)
+	if cfg.DataDir != dataDir {
+		cfg.DataDir = dataDir
+		cfg.DBPath = sessionsDBPath(dataDir)
 	}
-	require.NoError(t, d.UpsertSession(s))
-	require.NoError(t, d.Close())
-}
-
-func TestSessionGet_JSON(t *testing.T) {
-	dataDir := newAgentDataDir(t)
-	seedSession(t, dataDir, "s-1", "proj")
-
-	out, err := executeCommand(newRootCommand(),
-		"session", "get", "s-1", "--format", "json")
+	database, err := openDB(cfg)
 	require.NoError(t, err)
-
-	got := decodeCLIJSON[map[string]any](t, out)
-	assert.Equal(t, "s-1", got["id"])
-	assert.Equal(t, "proj", got["project"])
-}
-
-func TestSessionGet_JSONAlias(t *testing.T) {
-	dataDir := newAgentDataDir(t)
-	seedSession(t, dataDir, "s-json", "proj")
-
-	out, err := executeCommand(newRootCommand(),
-		"session", "get", "s-json", "--json")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-
-	got := decodeCLIJSON[map[string]any](t, out)
-	assert.Equal(t, "s-json", got["id"])
-	assert.Equal(t, "proj", got["project"])
+	port := ln.Addr().(*net.TCPAddr).Port
+	cfg.Host = "127.0.0.1"
+	cfg.Port = port
+	cfg.WriteTimeout = 30 * time.Second
+	var engine *agentsync.Engine
+	if writable {
+		engine = agentsync.NewEngine(database, agentsync.EngineConfig{
+			Ephemeral: true,
+		})
+	}
+	srv := server.New(cfg, database, engine)
+	ts := httptest.NewUnstartedServer(srv.Handler())
+	ts.Listener = ln
+	ts.Start()
+	t.Cleanup(func() {
+		ts.Close()
+		database.Close()
+		RemoveDaemonRuntime(dataDir)
+	})
+	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
 }
 
-func TestSessionGet_NotFound(t *testing.T) {
-	dataDir := newAgentDataDir(t)
-	seedEmptyArchive(t, dataDir)
-
-	_, err := executeCommand(newRootCommand(),
-		"session", "get", "missing", "--format", "json")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "missing")
-	assert.Contains(t, err.Error(), "not found")
-}
-
-func TestSessionGet_Human(t *testing.T) {
-	dataDir := newAgentDataDir(t)
-	seedSession(t, dataDir, "s-2", "proj")
-
-	out, err := executeCommand(newRootCommand(),
-		"session", "get", "s-2")
-	require.NoError(t, err)
-	assert.True(t, strings.Contains(out, "s-2"),
-		"human output should contain session id, got: %q", out)
-	assert.True(t, strings.Contains(out, "proj"),
-		"human output should contain project, got: %q", out)
-}
-
-// TestSessionGet_BareIDFindsPrefixed covers the case where a user
-// passes a bare UUID (e.g. copied from a Codex session file name)
-// for a session whose stored ID carries an agent prefix. The CLI
-// retries the lookup with each registered IDPrefix.
-func TestSessionGet_BareIDFindsPrefixed(t *testing.T) {
+func TestSessionGetVariants(t *testing.T) {
 	dataDir := newAgentDataDir(t)
 	bareID := "019da6a6-8c67-7c23-b102-ef48502852d0"
-	seedSessionWithOpts(t, dataDir, "codex:"+bareID, "proj",
-		func(s *db.Session) { s.Agent = "codex" })
+	seedSessionsWithOpts(t, dataDir,
+		sessionSeed{id: "s-1", project: "proj"},
+		sessionSeed{id: "s-json", project: "proj"},
+		sessionSeed{id: "s-2", project: "proj"},
+		sessionSeed{
+			id:      "codex:" + bareID,
+			project: "proj",
+			mut:     func(s *db.Session) { s.Agent = "codex" },
+		},
+	)
 
-	out, err := executeCommand(newRootCommand(),
-		"session", "get", bareID, "--format", "json")
-	require.NoError(t, err)
+	t.Run("json format", func(t *testing.T) {
+		out, err := executeCommand(newRootCommand(),
+			"session", "get", "s-1", "--format", "json")
+		require.NoError(t, err)
 
-	got := decodeCLIJSON[map[string]any](t, out)
-	assert.Equal(t, "codex:"+bareID, got["id"])
+		got := decodeCLIJSON[map[string]any](t, out)
+		assert.Equal(t, "s-1", got["id"])
+		assert.Equal(t, "proj", got["project"])
+	})
+
+	t.Run("json alias", func(t *testing.T) {
+		out, err := executeCommand(newRootCommand(),
+			"session", "get", "s-json", "--json")
+		require.NoError(t, err)
+
+		got := decodeCLIJSON[map[string]any](t, out)
+		assert.Equal(t, "s-json", got["id"])
+		assert.Equal(t, "proj", got["project"])
+	})
+
+	t.Run("missing", func(t *testing.T) {
+		_, err := executeCommand(newRootCommand(),
+			"session", "get", "missing", "--format", "json")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "missing")
+		assert.Contains(t, err.Error(), "not found")
+	})
+
+	t.Run("human", func(t *testing.T) {
+		out, err := executeCommand(newRootCommand(),
+			"session", "get", "s-2")
+		require.NoError(t, err)
+		assert.True(t, strings.Contains(out, "s-2"),
+			"human output should contain session id, got: %q", out)
+		assert.True(t, strings.Contains(out, "proj"),
+			"human output should contain project, got: %q", out)
+	})
+
+	// Covers the case where a user passes a bare UUID (e.g. copied from a
+	// Codex session file name) for a session whose stored ID carries an
+	// agent prefix. The CLI retries the lookup with each registered IDPrefix.
+	t.Run("bare id finds prefixed", func(t *testing.T) {
+		out, err := executeCommand(newRootCommand(),
+			"session", "get", bareID, "--format", "json")
+		require.NoError(t, err)
+
+		got := decodeCLIJSON[map[string]any](t, out)
+		assert.Equal(t, "codex:"+bareID, got["id"])
+	})
 }
 
-func TestSessionList_JSONShape(t *testing.T) {
+func TestSessionList_ReadOnlyFixture(t *testing.T) {
 	dataDir := newAgentDataDir(t)
-	seedSession(t, dataDir, "s-a", "proj")
-	seedSession(t, dataDir, "s-b", "proj")
+	seedSessionsWithOpts(t, dataDir,
+		sessionSeed{id: "s-a", project: "shape"},
+		sessionSeed{id: "s-b", project: "shape"},
+		sessionSeed{id: "s-c", project: "shape"},
+		sessionSeed{id: "p1-only", project: "p1"},
+		sessionSeed{id: "lo", project: "sort-count", mut: func(s *db.Session) {
+			s.MessageCount = 2
+		}},
+		sessionSeed{id: "mid", project: "sort-count", mut: func(s *db.Session) {
+			s.MessageCount = 5
+		}},
+		sessionSeed{id: "hi", project: "sort-count", mut: func(s *db.Session) {
+			s.MessageCount = 9
+		}},
+		sessionSeed{id: "a", project: "sort-multi", mut: func(s *db.Session) {
+			s.MessageCount = 1
+			s.StartedAt = new("2024-03-01T00:00:00Z")
+		}},
+		sessionSeed{id: "b", project: "sort-multi", mut: func(s *db.Session) {
+			s.MessageCount = 1
+			s.StartedAt = new("2024-01-01T00:00:00Z")
+		}},
+		sessionSeed{id: "c", project: "sort-multi", mut: func(s *db.Session) {
+			s.MessageCount = 2
+			s.StartedAt = new("2024-02-01T00:00:00Z")
+		}},
+		sessionSeed{id: "old", project: "sort-empty", mut: func(s *db.Session) {
+			s.EndedAt = new("2024-01-01T00:00:00Z")
+		}},
+		sessionSeed{id: "new", project: "sort-empty", mut: func(s *db.Session) {
+			s.EndedAt = new("2024-03-01T00:00:00Z")
+		}},
+	)
 
-	out, err := executeCommand(newRootCommand(),
-		"session", "list", "--format", "json")
-	require.NoError(t, err)
+	t.Run("json shape", func(t *testing.T) {
+		out, err := executeCommand(newRootCommand(),
+			"session", "list", "--project", "shape", "--format", "json")
+		require.NoError(t, err)
 
-	got := decodeCLIJSON[cliSessionList](t, out)
-	assert.Equal(t, 2, got.Total)
-	assert.Len(t, got.Sessions, 2)
-}
+		got := decodeCLIJSON[cliSessionList](t, out)
+		assert.Equal(t, 3, got.Total)
+		assert.Len(t, got.Sessions, 3)
+	})
 
-func TestSessionListColdReadOnlyCursorRoundTrip(t *testing.T) {
-	dataDir := newAgentDataDir(t)
-	t.Setenv("AGENTSVIEW_NO_DAEMON", "1")
-	seedSession(t, dataDir, "s-a", "proj")
-	seedSession(t, dataDir, "s-b", "proj")
-	seedSession(t, dataDir, "s-c", "proj")
+	t.Run("cold read-only cursor round trip", func(t *testing.T) {
+		t.Setenv("AGENTSVIEW_NO_DAEMON", "1")
 
-	out, err := executeCommand(newRootCommand(),
-		"session", "list", "--format", "json", "--limit", "1")
-	require.NoError(t, err)
+		out, err := executeCommand(newRootCommand(),
+			"session", "list", "--project", "shape",
+			"--format", "json", "--limit", "1")
+		require.NoError(t, err)
 
-	first := decodeCLIJSON[cliSessionList](t, out)
-	require.NotEmpty(t, first.NextCursor)
+		first := decodeCLIJSON[cliSessionList](t, out)
+		require.NotEmpty(t, first.NextCursor)
 
-	out, err = executeCommand(newRootCommand(),
-		"session", "list", "--format", "json",
-		"--limit", "1", "--cursor", first.NextCursor)
-	require.NoError(t, err)
+		out, err = executeCommand(newRootCommand(),
+			"session", "list", "--project", "shape", "--format", "json",
+			"--limit", "1", "--cursor", first.NextCursor)
+		require.NoError(t, err)
 
-	second := decodeCLIJSON[cliSessionList](t, out)
-	assert.Len(t, second.Sessions, 1)
-}
+		second := decodeCLIJSON[cliSessionList](t, out)
+		assert.Len(t, second.Sessions, 1)
+	})
 
-func TestSessionList_FilterByProject(t *testing.T) {
-	dataDir := newAgentDataDir(t)
-	seedSession(t, dataDir, "s-a", "p1")
-	seedSession(t, dataDir, "s-b", "p2")
+	t.Run("filter by project", func(t *testing.T) {
+		out, err := executeCommand(newRootCommand(),
+			"session", "list", "--project", "p1", "--format", "json")
+		require.NoError(t, err)
 
-	out, err := executeCommand(newRootCommand(),
-		"session", "list", "--project", "p1", "--format", "json")
-	require.NoError(t, err)
+		got := decodeCLIJSON[cliSessionList](t, out)
+		require.Len(t, got.Sessions, 1)
+		assert.Equal(t, "p1-only", got.Sessions[0]["id"])
+	})
 
-	got := decodeCLIJSON[cliSessionList](t, out)
-	require.Len(t, got.Sessions, 1)
-	assert.Equal(t, "s-a", got.Sessions[0]["id"])
+	t.Run("sort and reverse", func(t *testing.T) {
+		// --sort messages defaults to ascending.
+		out, err := executeCommand(newRootCommand(),
+			"session", "list", "--project", "sort-count",
+			"--sort", "messages", "--format", "json")
+		require.NoError(t, err)
+		assert.Equal(t, []string{"lo", "mid", "hi"},
+			sessionListIDs(t, out))
+
+		// --reverse flips it to descending.
+		out, err = executeCommand(newRootCommand(),
+			"session", "list", "--project", "sort-count",
+			"--sort", "messages", "--reverse", "--format", "json")
+		require.NoError(t, err)
+		assert.Equal(t, []string{"hi", "mid", "lo"},
+			sessionListIDs(t, out))
+
+		// -r is the shorthand for --reverse.
+		out, err = executeCommand(newRootCommand(),
+			"session", "list", "--project", "sort-count",
+			"--sort", "messages", "-r", "--format", "json")
+		require.NoError(t, err)
+		assert.Equal(t, []string{"hi", "mid", "lo"},
+			sessionListIDs(t, out))
+	})
+
+	t.Run("multi-key sort", func(t *testing.T) {
+		// Per-key directions: messages asc, then started desc.
+		out, err := executeCommand(newRootCommand(),
+			"session", "list", "--project", "sort-multi",
+			"--sort", "messages:asc,started:desc", "--format", "json")
+		require.NoError(t, err)
+		assert.Equal(t, []string{"a", "b", "c"},
+			sessionListIDs(t, out))
+
+		// --reverse flips only the unsuffixed key (messages -> desc); the
+		// explicit started:asc is left untouched.
+		out, err = executeCommand(newRootCommand(),
+			"session", "list", "--project", "sort-multi",
+			"--sort", "messages,started:asc", "-r", "--format", "json")
+		require.NoError(t, err)
+		assert.Equal(t, []string{"c", "b", "a"},
+			sessionListIDs(t, out))
+	})
+
+	t.Run("empty sort reverse", func(t *testing.T) {
+		// Default recent is newest-first.
+		out, err := executeCommand(newRootCommand(),
+			"session", "list", "--project", "sort-empty",
+			"--sort", "", "--format", "json")
+		require.NoError(t, err)
+		assert.Equal(t, []string{"new", "old"}, sessionListIDs(t, out))
+
+		// --reverse on the empty (default) sort flips recent to
+		// oldest-first.
+		out, err = executeCommand(newRootCommand(),
+			"session", "list", "--project", "sort-empty",
+			"--sort", "", "--reverse", "--format", "json")
+		require.NoError(t, err)
+		assert.Equal(t, []string{"old", "new"}, sessionListIDs(t, out))
+	})
+
+	t.Run("invalid sort", func(t *testing.T) {
+		_, err := executeCommand(newRootCommand(),
+			"session", "list", "--project", "sort-count",
+			"--sort", "bogus", "--format", "json")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid sort")
+	})
 }
 
 func TestSessionList_ServerFlagUsesHTTP(t *testing.T) {
@@ -506,12 +679,12 @@ func TestSessionList_PGFlagUsesPGReadStore(t *testing.T) {
 	t.Setenv("AGENTSVIEW_PG_URL", "postgres://example.test/agentsview")
 	t.Setenv("AGENTSVIEW_PG_SCHEMA", "custom_schema")
 
-	seedSession(t, localDir, "local-session", "local")
-	seedSession(t, remoteDir, "pg-session", "remote")
+	seedSessionArchiveRows(t, localDir,
+		sessionSeed{id: "local-session", project: "local"})
+	seedSessionArchiveRows(t, remoteDir,
+		sessionSeed{id: "pg-session", project: "remote"})
 
-	remoteDB, err := db.Open(filepath.Join(remoteDir, "sessions.db"))
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = remoteDB.Close() })
+	remoteDB := dbtest.OpenTestDBAt(t, sessionsDBPath(remoteDir))
 	stub := stubPGReadStore(t, remoteDB)
 
 	out, err := executeCommand(newRootCommand(),
@@ -529,16 +702,11 @@ func TestSessionList_PGFlagUsesPGReadStore(t *testing.T) {
 
 func TestSessionList_ConfiguredPGWithoutFlagUsesSQLite(t *testing.T) {
 	localDir := newAgentDataDir(t)
-	remoteDir := t.TempDir()
 	t.Setenv("AGENTSVIEW_PG_URL", "postgres://example.test/from-env")
 
 	seedSession(t, localDir, "local-session", "local")
-	seedSession(t, remoteDir, "pg-session", "remote")
 
-	remoteDB, err := db.Open(filepath.Join(remoteDir, "sessions.db"))
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = remoteDB.Close() })
-	stub := stubPGReadStore(t, remoteDB)
+	forbidPGReadStore(t)
 
 	out, err := executeCommand(newRootCommand(),
 		"session", "list", "--format", "json")
@@ -548,7 +716,6 @@ func TestSessionList_ConfiguredPGWithoutFlagUsesSQLite(t *testing.T) {
 	assert.Equal(t, 1, got.Total)
 	require.Len(t, got.Sessions, 1)
 	assert.Equal(t, "local-session", got.Sessions[0]["id"])
-	assert.Empty(t, stub.PG.URL, "configured PG sync URL must not select PG reads")
 }
 
 func TestSessionList_PGFlagRequiresURL(t *testing.T) {
@@ -651,54 +818,49 @@ func seedMessages(t *testing.T, dataDir, sessionID string, n int) {
 	require.NoError(t, d.Close())
 }
 
-func TestSessionMessages_JSONShape(t *testing.T) {
-	dataDir := newAgentDataDir(t)
-	seedSession(t, dataDir, "s-msgs", "proj")
-	seedMessages(t, dataDir, "s-msgs", 3)
-
-	out, err := executeCommand(newRootCommand(),
-		"session", "messages", "s-msgs", "--format", "json")
-	require.NoError(t, err)
-
-	got := decodeCLIJSON[cliMessageList](t, out)
-	assert.Equal(t, 3, got.Count)
-	require.Len(t, got.Messages, 3)
-	assert.Equal(t, float64(1), got.Messages[0]["ordinal"])
-}
-
-func TestSessionMessages_FromLimit(t *testing.T) {
+func TestSessionMessagesVariants(t *testing.T) {
 	dataDir := newAgentDataDir(t)
 	seedSession(t, dataDir, "s-msgs", "proj")
 	seedMessages(t, dataDir, "s-msgs", 5)
 
-	out, err := executeCommand(newRootCommand(),
-		"session", "messages", "s-msgs",
-		"--from", "3", "--limit", "2", "--format", "json")
-	require.NoError(t, err)
+	t.Run("json shape", func(t *testing.T) {
+		out, err := executeCommand(newRootCommand(),
+			"session", "messages", "s-msgs", "--format", "json")
+		require.NoError(t, err)
 
-	got := decodeCLIJSON[cliMessageList](t, out)
-	assert.Equal(t, 2, got.Count)
-	require.Len(t, got.Messages, 2)
-	assert.Equal(t, float64(3), got.Messages[0]["ordinal"])
-}
+		got := decodeCLIJSON[cliMessageList](t, out)
+		assert.Equal(t, 5, got.Count)
+		require.Len(t, got.Messages, 5)
+		assert.Equal(t, float64(1), got.Messages[0]["ordinal"])
+	})
 
-func TestSessionMessages_DirectionDesc(t *testing.T) {
-	dataDir := newAgentDataDir(t)
-	seedSession(t, dataDir, "s-msgs", "proj")
-	seedMessages(t, dataDir, "s-msgs", 4)
+	t.Run("from and limit", func(t *testing.T) {
+		out, err := executeCommand(newRootCommand(),
+			"session", "messages", "s-msgs",
+			"--from", "3", "--limit", "2", "--format", "json")
+		require.NoError(t, err)
 
-	out, err := executeCommand(newRootCommand(),
-		"session", "messages", "s-msgs",
-		"--direction", "desc", "--format", "json")
-	require.NoError(t, err)
+		got := decodeCLIJSON[cliMessageList](t, out)
+		assert.Equal(t, 2, got.Count)
+		require.Len(t, got.Messages, 2)
+		assert.Equal(t, float64(3), got.Messages[0]["ordinal"])
+	})
 
-	got := decodeCLIJSON[cliMessageList](t, out)
-	assert.Equal(t, 4, got.Count)
-	require.Len(t, got.Messages, 4)
-	assert.Equal(t, float64(4), got.Messages[0]["ordinal"])
-	assert.Equal(t, float64(3), got.Messages[1]["ordinal"])
-	assert.Equal(t, float64(2), got.Messages[2]["ordinal"])
-	assert.Equal(t, float64(1), got.Messages[3]["ordinal"])
+	t.Run("direction desc", func(t *testing.T) {
+		out, err := executeCommand(newRootCommand(),
+			"session", "messages", "s-msgs",
+			"--direction", "desc", "--format", "json")
+		require.NoError(t, err)
+
+		got := decodeCLIJSON[cliMessageList](t, out)
+		assert.Equal(t, 5, got.Count)
+		require.Len(t, got.Messages, 5)
+		assert.Equal(t, float64(5), got.Messages[0]["ordinal"])
+		assert.Equal(t, float64(4), got.Messages[1]["ordinal"])
+		assert.Equal(t, float64(3), got.Messages[2]["ordinal"])
+		assert.Equal(t, float64(2), got.Messages[3]["ordinal"])
+		assert.Equal(t, float64(1), got.Messages[4]["ordinal"])
+	})
 }
 
 // seedMessagesWithToolCalls inserts one assistant message for sessionID
@@ -736,38 +898,36 @@ func seedMessagesWithToolCalls(
 	require.NoError(t, d.Close())
 }
 
-func TestSessionToolCalls_JSONShape(t *testing.T) {
+func TestSessionToolCallsVariants(t *testing.T) {
 	dataDir := newAgentDataDir(t)
 	seedSession(t, dataDir, "s-tc", "proj")
 	seedMessagesWithToolCalls(t, dataDir, "s-tc", 2)
 
-	out, err := executeCommand(newRootCommand(),
-		"session", "tool-calls", "s-tc", "--format", "json")
-	require.NoError(t, err)
+	t.Run("json shape", func(t *testing.T) {
+		out, err := executeCommand(newRootCommand(),
+			"session", "tool-calls", "s-tc", "--format", "json")
+		require.NoError(t, err)
 
-	got := decodeCLIJSON[cliToolCallList](t, out)
-	assert.Equal(t, 2, got.Count)
-	require.Len(t, got.ToolCalls, 2)
-	assert.NotEmpty(t, got.ToolCalls[0]["tool_name"])
-	assert.NotEmpty(t, got.ToolCalls[0]["timestamp"])
-}
+		got := decodeCLIJSON[cliToolCallList](t, out)
+		assert.Equal(t, 2, got.Count)
+		require.Len(t, got.ToolCalls, 2)
+		assert.NotEmpty(t, got.ToolCalls[0]["tool_name"])
+		assert.NotEmpty(t, got.ToolCalls[0]["timestamp"])
+	})
 
-func TestSessionToolCalls_HumanTable(t *testing.T) {
-	dataDir := newAgentDataDir(t)
-	seedSession(t, dataDir, "s-tc2", "proj")
-	seedMessagesWithToolCalls(t, dataDir, "s-tc2", 2)
+	t.Run("human table", func(t *testing.T) {
+		out, err := executeCommand(newRootCommand(),
+			"session", "tool-calls", "s-tc")
+		require.NoError(t, err)
 
-	out, err := executeCommand(newRootCommand(),
-		"session", "tool-calls", "s-tc2")
-	require.NoError(t, err)
-
-	for _, token := range []string{
-		"ORDINAL", "TIMESTAMP", "TOOL", "CATEGORY",
-		"Bash1", "Bash2",
-	} {
-		assert.Contains(t, out, token,
-			"human output should contain %q, got: %q", token, out)
-	}
+		for _, token := range []string{
+			"ORDINAL", "TIMESTAMP", "TOOL", "CATEGORY",
+			"Bash1", "Bash2",
+		} {
+			assert.Contains(t, out, token,
+				"human output should contain %q, got: %q", token, out)
+		}
+	})
 }
 
 func TestSessionExport_StreamsFromDisk(t *testing.T) {
@@ -878,17 +1038,20 @@ func TestSessionExport_FailsWhenNotInLocalArchive(t *testing.T) {
 	assert.Contains(t, err.Error(), "unknown-id")
 }
 
-// TestSessionExport_RejectsFormatFlag verifies that export refuses
-// --format because it streams raw bytes. Previously --format was a
-// silently-accepted inherited flag, which was a contract footgun
-// for scripts that expected JSON output.
+// Export inherits --format/--json from the session group but streams raw
+// bytes, so it must reject both rather than silently ignore them.
 func TestSessionExport_RejectsFormatFlag(t *testing.T) {
-	newAgentDataDir(t)
+	for _, flag := range [][]string{{"--format", "json"}, {"--json"}} {
+		t.Run(strings.Join(flag, " "), func(t *testing.T) {
+			newAgentDataDir(t)
 
-	_, err := executeCommand(newRootCommand(),
-		"session", "export", "some-id", "--format", "json")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "--format not supported")
+			args := append([]string{"session", "export", "some-id"}, flag...)
+			_, err := executeCommand(newRootCommand(), args...)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(),
+				"--format/--json not supported")
+		})
+	}
 }
 
 func TestSessionExport_RejectsPGFlag(t *testing.T) {
@@ -1215,24 +1378,16 @@ func TestSessionUsage_ConfiguredPGWithoutFlagUsesSQLite(t *testing.T) {
 	t.Setenv("AGENTSVIEW_PG_URL", "postgres://example.test/agentsview")
 	t.Setenv("AGENTSVIEW_NO_DAEMON", "1")
 
-	localDB, err := db.Open(sessionsDBPath(dataDir))
-	require.NoError(t, err)
-	t.Cleanup(func() { localDB.Close() })
+	localDB := dbtest.OpenTestDBAt(t, sessionsDBPath(dataDir))
 	seedUsageSession(t, localDB, "local-session", "local-project", "codex", 24)
 
-	pgDB, err := db.Open(filepath.Join(dataDir, "pg.db"))
-	require.NoError(t, err)
-	t.Cleanup(func() { pgDB.Close() })
-	seedUsageSession(t, pgDB, "pg-session", "pg-project", "codex", 42)
-
-	stub := stubPGReadStore(t, pgDB)
+	forbidPGReadStore(t)
 
 	cmd := sessionUsageCommand(t, "session", "usage", "local-session")
 
 	out, code, err := sessionUsageDataForCommand(cmd, "local-session")
 	require.NoError(t, err)
 	require.NotNil(t, out)
-	assert.False(t, stub.Opened, "configured PG sync URL must not select PG reads")
 	assert.Equal(t, tokenUseExitOK, code)
 	assert.Equal(t, "local-session", out.SessionID)
 	assert.Equal(t, "local-project", out.Project)
@@ -1244,9 +1399,7 @@ func TestSessionUsage_PGFlagUsesPGStore(t *testing.T) {
 	dataDir := newAgentDataDir(t)
 	t.Setenv("AGENTSVIEW_PG_URL", "postgres://example.test/agentsview")
 
-	pgDB, err := db.Open(filepath.Join(dataDir, "pg.db"))
-	require.NoError(t, err)
-	t.Cleanup(func() { pgDB.Close() })
+	pgDB := dbtest.OpenTestDBAt(t, filepath.Join(dataDir, "pg.db"))
 	seedUsageSession(t, pgDB, "pg-session", "pg-project", "codex", 42)
 
 	stub := stubPGReadStore(t, pgDB)
@@ -1271,9 +1424,7 @@ func TestSessionUsage_PGFlagResolvesBareSessionID(t *testing.T) {
 
 	bareID := "019da6a6-8c67-7c23-b102-ef48502852d0"
 	storedID := "codex:" + bareID
-	pgDB, err := db.Open(filepath.Join(dataDir, "pg.db"))
-	require.NoError(t, err)
-	t.Cleanup(func() { pgDB.Close() })
+	pgDB := dbtest.OpenTestDBAt(t, filepath.Join(dataDir, "pg.db"))
 	seedUsageSession(t, pgDB, storedID, "pg-project", "codex", 42)
 
 	stubPGReadStore(t, pgDB)
@@ -1295,9 +1446,7 @@ func TestSessionUsage_PGFlagResolvesColonBearingRawSessionID(t *testing.T) {
 
 	rawID := "project-hash:session-uuid"
 	storedID := "kimi:" + rawID
-	pgDB, err := db.Open(filepath.Join(dataDir, "pg.db"))
-	require.NoError(t, err)
-	t.Cleanup(func() { pgDB.Close() })
+	pgDB := dbtest.OpenTestDBAt(t, filepath.Join(dataDir, "pg.db"))
 	seedUsageSession(t, pgDB, storedID, "pg-project", "kimi", 84)
 
 	stubPGReadStore(t, pgDB)
@@ -1475,7 +1624,7 @@ func daemonRuntimeFromTestURL(t *testing.T, rawURL string) *DaemonRuntime {
 // and the shutdown path.
 //
 // To distinguish a real Watch call from an early-return stub, we
-// also assert the command runs for at least ~150ms: any stub that
+// also assert the command runs past a short delay: any stub that
 // returns synchronously would complete in single-digit ms.
 func TestSessionWatch_ExitsOnCancel(t *testing.T) {
 	dataDir := newAgentDataDir(t)
@@ -1490,7 +1639,7 @@ func TestSessionWatch_ExitsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 		cancel()
 	}()
 
@@ -1515,9 +1664,9 @@ func TestSessionWatch_ExitsOnCancel(t *testing.T) {
 	}
 
 	// A stub that returns immediately would complete far faster
-	// than the 200ms cancel delay. Require the command to actually
+	// than the cancel delay. Require the command to actually
 	// wait on the Watch channel.
-	assert.GreaterOrEqual(t, elapsed, 150*time.Millisecond,
+	assert.GreaterOrEqual(t, elapsed, 30*time.Millisecond,
 		"session watch returned too quickly (%v) — "+
 			"likely a stub, not a real Watch", elapsed)
 
@@ -1548,6 +1697,23 @@ func TestSessionWatch_UnknownID_FailsFast(t *testing.T) {
 		"expected 'session not found' error; got: %v", err)
 	assert.Contains(t, err.Error(), "unknown-id",
 		"error should name the missing session id")
+}
+
+// Watch streams a fixed NDJSON format, so it rejects --format/--json
+// inherited from the session group. The guard fires before any service
+// resolution, so no archive setup is needed.
+func TestSessionWatch_RejectsFormatFlag(t *testing.T) {
+	for _, flag := range [][]string{{"--format", "json"}, {"--json"}} {
+		t.Run(strings.Join(flag, " "), func(t *testing.T) {
+			newAgentDataDir(t)
+
+			args := append([]string{"session", "watch", "some-id"}, flag...)
+			_, err := executeCommand(newRootCommand(), args...)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(),
+				"--format/--json not supported")
+		})
+	}
 }
 
 // TestLooksLikePath covers both POSIX and Windows-style separators

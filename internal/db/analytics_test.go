@@ -32,16 +32,17 @@ func seedAnalyticsData(t *testing.T, d *DB) seedStats {
 		end     string
 		msgs    int
 		agent   string
+		model   string
 	}
 
 	sessions := []sessionData{
 		// Project A: 3 sessions across 2 days, mixed agents
-		{"a1", "project-alpha", "2024-06-01T09:00:00Z", tsMidYear, 10, "claude"},
-		{"a2", "project-alpha", "2024-06-01T14:00:00Z", "2024-06-01T15:00:00Z", 20, "codex"},
-		{"a3", "project-alpha", "2024-06-03T09:00:00Z", "2024-06-03T10:00:00Z", 5, "claude"},
+		{"a1", "project-alpha", "2024-06-01T09:00:00Z", tsMidYear, 10, "claude", "claude-3-5-sonnet"},
+		{"a2", "project-alpha", "2024-06-01T14:00:00Z", "2024-06-01T15:00:00Z", 20, "codex", "gpt-4o"},
+		{"a3", "project-alpha", "2024-06-03T09:00:00Z", "2024-06-03T10:00:00Z", 5, "claude", "claude-3-5-sonnet"},
 		// Project B: 2 sessions on 1 day
-		{"b1", "project-beta", "2024-06-02T10:00:00Z", "2024-06-02T11:00:00Z", 30, "claude"},
-		{"b2", "project-beta", "2024-06-02T15:00:00Z", "2024-06-02T16:00:00Z", 15, "claude"},
+		{"b1", "project-beta", "2024-06-02T10:00:00Z", "2024-06-02T11:00:00Z", 30, "claude", "gpt-4o-mini"},
+		{"b2", "project-beta", "2024-06-02T15:00:00Z", "2024-06-02T16:00:00Z", 15, "claude", "gpt-4o"},
 	}
 
 	stats := seedStats{}
@@ -84,6 +85,7 @@ func seedAnalyticsData(t *testing.T, d *DB) seedStats {
 				Content:       fmt.Sprintf("msg %d", i),
 				ContentLength: 5,
 				Timestamp:     tsMidYear,
+				Model:         sess.model,
 			}
 		}
 		insertMessages(t, d, msgs...)
@@ -175,6 +177,15 @@ func TestGetAnalyticsSummary(t *testing.T) {
 		assert.Equal(t, 15, s.MedianMessages, "MedianMessages")
 		// P90 index = int(5*0.9) = 4 → value 30
 		assert.Equal(t, 30, s.P90Messages, "P90Messages")
+		assert.Equal(t,
+			[]string{
+				"claude-3-5-sonnet",
+				"gpt-4o",
+				"gpt-4o-mini",
+			},
+			s.Models,
+			"Models",
+		)
 
 		require.NotNil(t, s.Agents["claude"], "expected claude agent entry")
 		assert.Equal(t, 4, s.Agents["claude"].Sessions, "claude sessions")
@@ -202,7 +213,392 @@ func TestGetAnalyticsSummary(t *testing.T) {
 	t.Run("EmptyDateRange", func(t *testing.T) {
 		s := mustSummary(t, d, ctx, emptyFilter())
 		assert.Equal(t, 0, s.TotalSessions, "TotalSessions")
+		assert.Empty(t, s.Models, "Models")
 	})
+}
+
+// TestRelationshipExclusionSQL covers the shared predicate helper that
+// the analytics builders and the stats pipeline both use, including the
+// column qualifier the DuckDB builder relies on.
+func TestRelationshipExclusionSQL(t *testing.T) {
+	cases := []struct {
+		includeSubagents bool
+		colPrefix        string
+		want             string
+	}{
+		{false, "", "relationship_type NOT IN ('subagent', 'fork')"},
+		{true, "", "relationship_type NOT IN ('fork')"},
+		{false, "s.", "s.relationship_type NOT IN ('subagent', 'fork')"},
+		{true, "s.", "s.relationship_type NOT IN ('fork')"},
+	}
+	for _, c := range cases {
+		got := RelationshipExclusionSQL(c.includeSubagents, c.colPrefix)
+		assert.Equal(t, c.want, got,
+			"includeSubagents=%v colPrefix=%q", c.includeSubagents, c.colPrefix)
+	}
+	// The method form delegates to the unqualified helper.
+	assert.Equal(t,
+		RelationshipExclusionSQL(true, ""),
+		AnalyticsFilter{IncludeSubagents: true}.RelationshipExclusionSQL(),
+		"method must match the free function")
+}
+
+// TestAnalyticsSubagentScope verifies the two-bucket rule for subagent
+// sessions (e.g. workflow subagents):
+//   - Sum/count surfaces (summary) COUNT subagents: their output tokens
+//     and messages are real, independent spend in separate transcripts.
+//   - Distribution surfaces (session-shape) stay ROOT-ONLY so the many
+//     short subagent sessions do not skew length/duration distributions.
+//
+// Fork rows stay excluded on both surfaces because their tokens overlap
+// their root session and would double-count.
+func TestAnalyticsSubagentScope(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	withTokens := func(rel string, msgs, userMsgs, tokens int) func(*Session) {
+		return func(s *Session) {
+			s.StartedAt = new("2024-06-02T10:00:00Z")
+			s.EndedAt = new("2024-06-02T11:00:00Z")
+			s.MessageCount = msgs
+			s.UserMessageCount = userMsgs
+			s.RelationshipType = rel
+			s.TotalOutputTokens = tokens
+			s.HasTotalOutputTokens = true
+		}
+	}
+
+	// Root session: 10 msgs, multi-turn, 1000 output tokens.
+	insertSession(t, d, "root", "project-alpha", withTokens("", 10, 3, 1000))
+	// Subagent: ONE-SHOT (1 user msg), 400 tokens. Workflow subagents
+	// are always one-shot; it must still be counted in aggregates.
+	insertSession(t, d, "agent-x", "project-alpha",
+		withTokens("subagent", 4, 1, 400))
+	// Fork: shares the root conversation — excluded everywhere.
+	insertSession(t, d, "root-fork", "project-alpha",
+		withTokens("fork", 6, 1, 600))
+
+	// Default filter excludes one-shot sessions, matching the summary
+	// endpoint default. The one-shot subagent must survive this.
+	f := baseFilter()
+	f.ExcludeOneShot = true
+	s := mustSummary(t, d, ctx, f)
+
+	// Summary counts the one-shot subagent; fork stays excluded.
+	assert.Equal(t, 1400, s.TotalOutputTokens, "TotalOutputTokens")
+	assert.Equal(t, 2, s.TotalSessions, "TotalSessions")
+	assert.Equal(t, 14, s.TotalMessages, "TotalMessages")
+
+	// Session-shape is a distribution surface: root only. The subagent
+	// is excluded, so the count is 1 (just the root; fork also excluded).
+	shape, err := d.GetAnalyticsSessionShape(ctx, f)
+	require.NoError(t, err, "GetAnalyticsSessionShape")
+	assert.Equal(t, 1, shape.Count, "session-shape stays root-only")
+}
+
+func TestAnalyticsModelFilter(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "model-a", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T10:00:00Z")
+		s.MessageCount = 2
+		s.Agent = "claude"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "model-a", Ordinal: 0, Role: "user",
+			Content: "q", ContentLength: 1,
+			Timestamp: "2024-06-01T09:05:00Z",
+			Model:     "claude-3-5-sonnet",
+		},
+		Message{
+			SessionID: "model-a", Ordinal: 1, Role: "assistant",
+			Content: "a", ContentLength: 1,
+			Timestamp: "2024-06-01T09:06:00Z",
+			Model:     "claude-3-5-sonnet",
+		},
+	)
+
+	insertSession(t, d, "model-b", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T11:00:00Z")
+		s.EndedAt = new("2024-06-01T12:00:00Z")
+		s.MessageCount = 3
+		s.Agent = "codex"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "model-b", Ordinal: 0, Role: "user",
+			Content: "q", ContentLength: 1,
+			Timestamp: "2024-06-01T11:05:00Z",
+			Model:     "gpt-4o",
+		},
+		Message{
+			SessionID: "model-b", Ordinal: 1, Role: "assistant",
+			Content: "a", ContentLength: 1,
+			Timestamp: "2024-06-01T11:06:00Z",
+			Model:     "gpt-4o",
+		},
+		Message{
+			SessionID: "model-b", Ordinal: 2, Role: "user",
+			Content: "follow-up", ContentLength: 9,
+			Timestamp: "2024-06-01T11:07:00Z",
+			Model:     "gpt-4o",
+		},
+	)
+
+	f := AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+	}
+
+	t.Run("SingleModel", func(t *testing.T) {
+		ff := f
+		ff.Model = "gpt-4o"
+		s := mustSummary(t, d, ctx, ff)
+		assert.Equal(t, 1, s.TotalSessions, "TotalSessions")
+		assert.Equal(t, 3, s.TotalMessages, "TotalMessages")
+		assert.Equal(t, []string{"gpt-4o"}, s.Models, "Models")
+	})
+
+	t.Run("MultiModel", func(t *testing.T) {
+		ff := f
+		ff.Model = "gpt-4o, claude-3-5-sonnet"
+		s := mustSummary(t, d, ctx, ff)
+		assert.Equal(t, 2, s.TotalSessions, "TotalSessions")
+		assert.Equal(t,
+			[]string{"claude-3-5-sonnet", "gpt-4o"},
+			s.Models,
+			"Models",
+		)
+	})
+}
+
+func TestAnalyticsModelFilterGoTimePath(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "dst-claude", "proj", func(s *Session) {
+		s.StartedAt = new("2026-03-10T14:00:00Z")
+		s.EndedAt = new("2026-03-10T14:30:00Z")
+		s.MessageCount = 2
+		s.Agent = "claude"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "dst-claude", Ordinal: 0, Role: "user",
+			Content: "q", ContentLength: 1,
+			Timestamp: "2026-03-10T14:05:00Z",
+			Model:     "claude-3-5-sonnet",
+		},
+		Message{
+			SessionID: "dst-claude", Ordinal: 1, Role: "assistant",
+			Content: "a", ContentLength: 1,
+			Timestamp: "2026-03-10T14:06:00Z",
+			Model:     "claude-3-5-sonnet",
+		},
+	)
+
+	insertSession(t, d, "dst-gpt", "proj", func(s *Session) {
+		s.StartedAt = new("2026-03-05T15:00:00Z")
+		s.EndedAt = new("2026-03-05T15:30:00Z")
+		s.MessageCount = 2
+		s.Agent = "codex"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "dst-gpt", Ordinal: 0, Role: "user",
+			Content: "q", ContentLength: 1,
+			Timestamp: "2026-03-05T15:05:00Z",
+			Model:     "gpt-4o",
+		},
+		Message{
+			SessionID: "dst-gpt", Ordinal: 1, Role: "assistant",
+			Content: "a", ContentLength: 1,
+			Timestamp: "2026-03-05T15:06:00Z",
+			Model:     "gpt-4o",
+		},
+	)
+
+	hour := 10
+	s, err := d.GetAnalyticsSummary(ctx, AnalyticsFilter{
+		From:     "2026-03-01",
+		To:       "2026-03-31",
+		Timezone: "America/New_York",
+		Model:    "gpt-4o",
+		Hour:     &hour,
+	})
+	require.NoError(t, err, "GetAnalyticsSummary")
+	assert.Equal(t, 1, s.TotalSessions, "TotalSessions")
+	assert.Equal(t, []string{"gpt-4o"}, s.Models, "Models")
+}
+
+func TestAnalyticsSummaryModelFilterCountsOnlyMatchingMessages(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "summary-mixed", "alpha", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T10:00:00Z")
+		s.MessageCount = 2
+		s.Agent = "mixed"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "summary-mixed", Ordinal: 0, Role: "assistant",
+			Content: "gpt", ContentLength: 3,
+			Timestamp: "2024-06-01T09:05:00Z",
+			Model:     "gpt-4o",
+		},
+		Message{
+			SessionID: "summary-mixed", Ordinal: 1, Role: "assistant",
+			Content: "claude", ContentLength: 6,
+			Timestamp: "2024-06-01T09:06:00Z",
+			Model:     "claude-3-5-sonnet",
+		},
+	)
+
+	resp := mustSummary(t, d, ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o",
+	})
+	assert.Equal(t, 1, resp.TotalSessions, "TotalSessions")
+	assert.Equal(t, 1, resp.TotalMessages, "TotalMessages")
+	assert.Equal(t, []string{"gpt-4o"}, resp.Models, "Models")
+	assert.Equal(t, 1.0, resp.AvgMessages, "AvgMessages")
+	assert.Equal(t, 1, resp.MedianMessages, "MedianMessages")
+	assert.Equal(t, 1, resp.P90Messages, "P90Messages")
+	require.Contains(t, resp.Agents, "mixed")
+	assert.Equal(t, 1, resp.Agents["mixed"].Messages, "AgentMessages")
+}
+
+func TestAnalyticsSummaryModelsRespectHourFilterSQLiteSQL(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "hour-a", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T09:30:00Z")
+		s.MessageCount = 1
+		s.Agent = "claude"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "hour-a", Ordinal: 0, Role: "user",
+			Content: "q", ContentLength: 1,
+			Timestamp: "2024-06-01T09:05:00Z",
+			Model:     "claude-3-5-sonnet",
+		},
+	)
+
+	insertSession(t, d, "hour-b", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T10:00:00Z")
+		s.EndedAt = new("2024-06-01T10:30:00Z")
+		s.MessageCount = 1
+		s.Agent = "codex"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "hour-b", Ordinal: 0, Role: "user",
+			Content: "q", ContentLength: 1,
+			Timestamp: "2024-06-01T10:05:00Z",
+			Model:     "gpt-4o",
+		},
+	)
+
+	hour := 9
+	s := mustSummary(t, d, ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Hour: &hour,
+	})
+	assert.Equal(t, 1, s.TotalSessions, "TotalSessions")
+	assert.Equal(t,
+		[]string{"claude-3-5-sonnet"},
+		s.Models,
+		"Models",
+	)
+}
+
+func TestAnalyticsSummaryModelsRespectHourFilterGoPath(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "ktm-a", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T04:15:00Z")
+		s.EndedAt = new("2024-06-01T04:45:00Z")
+		s.MessageCount = 1
+		s.Agent = "claude"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "ktm-a", Ordinal: 0, Role: "user",
+			Content: "q", ContentLength: 1,
+			Timestamp: "2024-06-01T04:15:00Z",
+			Model:     "claude-3-5-sonnet",
+		},
+	)
+
+	insertSession(t, d, "ktm-b", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T05:15:00Z")
+		s.EndedAt = new("2024-06-01T05:45:00Z")
+		s.MessageCount = 1
+		s.Agent = "codex"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "ktm-b", Ordinal: 0, Role: "user",
+			Content: "q", ContentLength: 1,
+			Timestamp: "2024-06-01T05:15:00Z",
+			Model:     "gpt-4o",
+		},
+	)
+
+	hour := 10
+	s := mustSummary(t, d, ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01",
+		Timezone: "Asia/Kathmandu",
+		Hour:     &hour,
+	})
+	assert.Equal(t, 1, s.TotalSessions, "TotalSessions")
+	assert.Equal(t,
+		[]string{"claude-3-5-sonnet"},
+		s.Models,
+		"Models",
+	)
+}
+
+func TestAnalyticsSummaryModelsUseMatchingHourRowsOnly(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "summary-hour-mixed", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T10:30:00Z")
+		s.MessageCount = 2
+		s.Agent = "mixed"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "summary-hour-mixed", Ordinal: 0, Role: "assistant",
+			Content: "gpt", ContentLength: 3,
+			Timestamp: "2024-06-01T09:05:00Z",
+			Model:     "gpt-4o",
+		},
+		Message{
+			SessionID: "summary-hour-mixed", Ordinal: 1, Role: "assistant",
+			Content: "claude", ContentLength: 6,
+			Timestamp: "2024-06-01T10:05:00Z",
+			Model:     "claude-3-5-sonnet",
+		},
+	)
+
+	hour := 9
+	resp := mustSummary(t, d, ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Hour: &hour,
+	})
+	assert.Equal(t, 1, resp.TotalSessions, "TotalSessions")
+	assert.Equal(t, []string{"gpt-4o"}, resp.Models, "Models")
 }
 
 func TestAnalyticsFilterMachineMultiSelect(t *testing.T) {
@@ -302,6 +698,341 @@ func TestGetAnalyticsActivity(t *testing.T) {
 	})
 }
 
+func TestGetAnalyticsActivityModelFilter(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "activity-a", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T09:30:00Z")
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.Agent = "claude"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "activity-a", Ordinal: 0, Role: "user",
+			Content: "q", ContentLength: 1,
+			Timestamp: "2024-06-01T09:00:00Z",
+			Model:     "claude-3-5-sonnet",
+		},
+		Message{
+			SessionID: "activity-a", Ordinal: 1, Role: "assistant",
+			Content: "a", ContentLength: 1,
+			Timestamp: "2024-06-01T09:01:00Z",
+			Model:     "claude-3-5-sonnet",
+		},
+	)
+
+	insertSession(t, d, "activity-b", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T10:00:00Z")
+		s.EndedAt = new("2024-06-01T10:30:00Z")
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.Agent = "codex"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "activity-b", Ordinal: 0, Role: "user",
+			Content: "q", ContentLength: 1,
+			Timestamp: "2024-06-01T10:00:00Z",
+			Model:     "gpt-4o",
+		},
+		Message{
+			SessionID: "activity-b", Ordinal: 1, Role: "assistant",
+			Content: "a", ContentLength: 1,
+			Timestamp: "2024-06-01T10:01:00Z",
+			Model:     "gpt-4o",
+		},
+	)
+
+	resp := mustActivity(t, d, ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o",
+	}, "day")
+	require.Len(t, resp.Series, 1, "len(Series)")
+	assert.Equal(t, 1, resp.Series[0].Sessions, "Sessions")
+	assert.Equal(t, 2, resp.Series[0].Messages, "Messages")
+}
+
+func TestGetAnalyticsActivityModelFilterCountsOnlyMatchingMessages(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "activity-mixed", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T09:30:00Z")
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.Agent = "claude"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "activity-mixed", Ordinal: 0, Role: "user",
+			Content: "q", ContentLength: 1,
+			Timestamp: "2024-06-01T09:00:00Z",
+			Model:     "gpt-4o",
+		},
+		Message{
+			SessionID: "activity-mixed", Ordinal: 1, Role: "assistant",
+			Content: "a", ContentLength: 1,
+			Timestamp: "2024-06-01T09:05:00Z",
+			Model:     "claude-3-5-sonnet",
+		},
+	)
+
+	resp := mustActivity(t, d, ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o",
+	}, "day")
+	require.Len(t, resp.Series, 1, "len(Series)")
+	assert.Equal(t, 1, resp.Series[0].Sessions, "Sessions")
+	assert.Equal(t, 1, resp.Series[0].Messages, "Messages")
+	assert.Equal(t, 1, resp.Series[0].UserMessages, "UserMessages")
+	assert.Equal(t, 0, resp.Series[0].AssistantMessages,
+		"AssistantMessages")
+}
+
+func TestGetAnalyticsActivityModelFilterKeepsNullTimestampSessionsWithoutTimeFilter(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "activity-null-ts", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T09:30:00Z")
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.Agent = "gpt"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "activity-null-ts", Ordinal: 0, Role: "user",
+			Content: "q", ContentLength: 1,
+			Timestamp: "2024-06-01T09:00:00Z",
+			Model:     "",
+		},
+		Message{
+			SessionID: "activity-null-ts", Ordinal: 1, Role: "assistant",
+			Content: "a", ContentLength: 1,
+			Model: "gpt-4o",
+		},
+	)
+
+	resp := mustActivity(t, d, ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o",
+	}, "day")
+	require.Len(t, resp.Series, 1, "len(Series)")
+	assert.Equal(t, 1, resp.Series[0].Sessions, "Sessions")
+	assert.Equal(t, 2, resp.Series[0].Messages, "Messages")
+	assert.Equal(t, 1, resp.Series[0].UserMessages, "UserMessages")
+	assert.Equal(t, 1, resp.Series[0].AssistantMessages,
+		"AssistantMessages")
+}
+
+func TestGetAnalyticsActivityModelAndHourFilterUseSameMessage(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "activity-time", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T10:30:00Z")
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.Agent = "claude"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "activity-time", Ordinal: 0, Role: "user",
+			Content: "q", ContentLength: 1,
+			Timestamp: "2024-06-01T09:00:00Z",
+			Model:     "gpt-4o",
+		},
+		Message{
+			SessionID: "activity-time", Ordinal: 1, Role: "assistant",
+			Content: "a", ContentLength: 1,
+			Timestamp: "2024-06-01T10:00:00Z",
+			Model:     "claude-3-5-sonnet",
+		},
+	)
+
+	hour := 10
+	resp := mustActivity(t, d, ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o", Hour: &hour,
+	}, "day")
+	assert.Empty(t, resp.Series, "Series")
+}
+
+func TestGetAnalyticsActivityModelAndHourFilterKeepsPairedUserTurn(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "activity-paired-hour", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T10:30:00Z")
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.Agent = "claude"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "activity-paired-hour", Ordinal: 0, Role: "user",
+			Content: "q", ContentLength: 1,
+			Timestamp: "2024-06-01T09:00:00Z",
+			// Empty model: paired with the gpt-4o assistant at 10:00. Filtering
+			// by hour 9 must keep the session via this paired user turn, even
+			// though the model-bearing assistant sits in hour 10.
+		},
+		Message{
+			SessionID: "activity-paired-hour", Ordinal: 1, Role: "assistant",
+			Content: "a", ContentLength: 1,
+			Timestamp: "2024-06-01T10:00:00Z",
+			Model:     "gpt-4o",
+		},
+	)
+
+	hour := 9
+	resp := mustActivity(t, d, ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o", Hour: &hour,
+	}, "day")
+	require.Len(t, resp.Series, 1, "len(Series)")
+	assert.Equal(t, 1, resp.Series[0].Sessions, "Sessions")
+	assert.Equal(t, 1, resp.Series[0].Messages, "Messages")
+	assert.Equal(t, 1, resp.Series[0].UserMessages, "UserMessages")
+	assert.Equal(t, 0, resp.Series[0].AssistantMessages,
+		"AssistantMessages")
+}
+
+func TestGetAnalyticsHeatmapSessionsModelAndHourFilterKeepsPairedUserTurn(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "heatmap-sessions-paired", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T10:30:00Z")
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "heatmap-sessions-paired", Ordinal: 0, Role: "user",
+			Content: "q", ContentLength: 1,
+			Timestamp: "2024-06-01T09:00:00Z",
+		},
+		Message{
+			SessionID: "heatmap-sessions-paired", Ordinal: 1,
+			Role: "assistant", Content: "a", ContentLength: 1,
+			Timestamp: "2024-06-01T10:00:00Z",
+			Model:     "gpt-4o",
+		},
+	)
+
+	// Empty-model user turn at hour 9 paired with a gpt-4o assistant at hour
+	// 10. The sessions heatmap must keep the session via the paired user turn.
+	hour := 9
+	resp := mustHeatmap(t, d, ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o", Hour: &hour,
+	}, "sessions")
+	require.Len(t, resp.Entries, 1, "len(Entries)")
+	assert.Equal(t, 1, resp.Entries[0].Value, "Value")
+}
+
+func TestGetAnalyticsTopSessionsDurationModelAndHourFilterKeepsPairedUserTurn(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "top-duration-paired", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T10:00:00Z")
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "top-duration-paired", Ordinal: 0, Role: "user",
+			Content: "q", ContentLength: 1,
+			Timestamp: "2024-06-01T09:00:00Z",
+		},
+		Message{
+			SessionID: "top-duration-paired", Ordinal: 1, Role: "assistant",
+			Content: "a", ContentLength: 1,
+			Timestamp: "2024-06-01T10:00:00Z",
+			Model:     "gpt-4o",
+		},
+	)
+
+	// Empty-model user turn at hour 9 paired with a gpt-4o assistant at hour
+	// 10. Ranking by duration under the gpt-4o + hour-9 filter must keep the
+	// session via the paired user turn.
+	hour := 9
+	resp, err := d.GetAnalyticsTopSessions(ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o", Hour: &hour,
+	}, "duration")
+	require.NoError(t, err, "GetAnalyticsTopSessions")
+	require.Len(t, resp.Sessions, 1, "len(Sessions)")
+	assert.Equal(t, "top-duration-paired", resp.Sessions[0].ID, "ID")
+}
+
+func TestGetAnalyticsActivityModelAndHourFilterCountsOnlyMatchingHourRows(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "activity-hour-gpt", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T10:30:00Z")
+		s.MessageCount = 2
+		s.UserMessageCount = 0
+		s.Agent = "claude"
+	})
+
+	m1 := asstMsgAt("activity-hour-gpt", 0, "[Read: a.go]", "2024-06-01T09:00:00Z")
+	m1.Model = "gpt-4o"
+	m1.HasToolUse = true
+	m1.ToolCalls = []ToolCall{
+		{SessionID: "activity-hour-gpt", ToolName: "Read", Category: "Read"},
+		{SessionID: "activity-hour-gpt", ToolName: "Bash", Category: "Bash"},
+	}
+
+	m2 := asstMsgAt("activity-hour-gpt", 1, "[Grep: b.go]", "2024-06-01T10:00:00Z")
+	m2.Model = "gpt-4o"
+	m2.HasToolUse = true
+	m2.ToolCalls = []ToolCall{
+		{SessionID: "activity-hour-gpt", ToolName: "Grep", Category: "Grep"},
+	}
+
+	insertMessages(t, d, m1, m2)
+
+	hour := 10
+	resp := mustActivity(t, d, ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o", Hour: &hour,
+	}, "day")
+	require.Len(t, resp.Series, 1, "len(Series)")
+	assert.Equal(t, 1, resp.Series[0].Sessions, "Sessions")
+	assert.Equal(t, 1, resp.Series[0].Messages, "Messages")
+	assert.Equal(t, 1, resp.Series[0].AssistantMessages,
+		"AssistantMessages")
+	assert.Equal(t, 1, resp.Series[0].ToolCalls, "ToolCalls")
+}
+
 func TestGetAnalyticsHeatmap(t *testing.T) {
 	d := testDB(t)
 	ctx := context.Background()
@@ -374,6 +1105,141 @@ func TestGetAnalyticsHeatmap(t *testing.T) {
 	})
 }
 
+func TestGetAnalyticsSummaryModelFilterUsesFilteredOutputTokens(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "summary-output-mixed", "alpha", func(s *Session) {
+		s.StartedAt = new("2024-06-01T10:00:00Z")
+		s.EndedAt = new("2024-06-01T10:30:00Z")
+		s.MessageCount = 2
+		s.Agent = "mixed"
+		s.TotalOutputTokens = 111
+		s.HasTotalOutputTokens = true
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "summary-output-mixed", Ordinal: 0, Role: "assistant",
+			Content: "gpt", ContentLength: 3,
+			Timestamp: "2024-06-01T10:00:00Z",
+			Model:     "gpt-4o", OutputTokens: 11, HasOutputTokens: true,
+		},
+		Message{
+			SessionID: "summary-output-mixed", Ordinal: 1, Role: "assistant",
+			Content: "claude", ContentLength: 6,
+			Timestamp:    "2024-06-01T10:05:00Z",
+			Model:        "claude-3-5-sonnet",
+			OutputTokens: 100, HasOutputTokens: true,
+		},
+	)
+
+	insertSession(t, d, "summary-output-uncovered", "alpha", func(s *Session) {
+		s.StartedAt = new("2024-06-01T10:40:00Z")
+		s.EndedAt = new("2024-06-01T11:00:00Z")
+		s.MessageCount = 2
+		s.Agent = "mixed"
+		s.TotalOutputTokens = 90
+		s.HasTotalOutputTokens = true
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "summary-output-uncovered", Ordinal: 0,
+			Role:    "assistant",
+			Content: "gpt", ContentLength: 3,
+			Timestamp: "2024-06-01T10:40:00Z",
+			Model:     "gpt-4o",
+		},
+		Message{
+			SessionID: "summary-output-uncovered", Ordinal: 1,
+			Role:    "assistant",
+			Content: "claude", ContentLength: 6,
+			Timestamp:    "2024-06-01T10:45:00Z",
+			Model:        "claude-3-5-sonnet",
+			OutputTokens: 90, HasOutputTokens: true,
+		},
+	)
+
+	hour := 10
+	resp := mustSummary(t, d, ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o", Hour: &hour,
+	})
+	assert.Equal(t, 2, resp.TotalSessions, "TotalSessions")
+	assert.Equal(t, 2, resp.TotalMessages, "TotalMessages")
+	assert.Equal(t, []string{"gpt-4o"}, resp.Models, "Models")
+	assert.Equal(t, 11, resp.TotalOutputTokens, "TotalOutputTokens")
+	assert.Equal(t, 1, resp.TokenReportingSessions, "TokenReportingSessions")
+}
+
+func TestGetAnalyticsHeatmapModelFilterUsesFilteredOutputTokens(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "heatmap-output-mixed", "alpha", func(s *Session) {
+		s.StartedAt = new("2024-06-01T10:00:00Z")
+		s.EndedAt = new("2024-06-01T10:30:00Z")
+		s.MessageCount = 2
+		s.Agent = "mixed"
+		s.TotalOutputTokens = 111
+		s.HasTotalOutputTokens = true
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "heatmap-output-mixed", Ordinal: 0,
+			Role:    "assistant",
+			Content: "gpt", ContentLength: 3,
+			Timestamp: "2024-06-01T10:00:00Z",
+			Model:     "gpt-4o", OutputTokens: 11, HasOutputTokens: true,
+		},
+		Message{
+			SessionID: "heatmap-output-mixed", Ordinal: 1,
+			Role:    "assistant",
+			Content: "claude", ContentLength: 6,
+			Timestamp:    "2024-06-01T10:05:00Z",
+			Model:        "claude-3-5-sonnet",
+			OutputTokens: 100, HasOutputTokens: true,
+		},
+	)
+
+	insertSession(t, d, "heatmap-output-uncovered", "alpha", func(s *Session) {
+		s.StartedAt = new("2024-06-01T10:40:00Z")
+		s.EndedAt = new("2024-06-01T11:00:00Z")
+		s.MessageCount = 2
+		s.Agent = "mixed"
+		s.TotalOutputTokens = 90
+		s.HasTotalOutputTokens = true
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "heatmap-output-uncovered", Ordinal: 0,
+			Role:    "assistant",
+			Content: "gpt", ContentLength: 3,
+			Timestamp: "2024-06-01T10:40:00Z",
+			Model:     "gpt-4o",
+		},
+		Message{
+			SessionID: "heatmap-output-uncovered", Ordinal: 1,
+			Role:    "assistant",
+			Content: "claude", ContentLength: 6,
+			Timestamp:    "2024-06-01T10:45:00Z",
+			Model:        "claude-3-5-sonnet",
+			OutputTokens: 90, HasOutputTokens: true,
+		},
+	)
+
+	hour := 10
+	resp := mustHeatmap(t, d, ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o", Hour: &hour,
+	}, "output_tokens")
+	require.Len(t, resp.Entries, 1, "len(Entries)")
+	assert.Equal(t, 11, resp.Entries[0].Value, "Value")
+}
+
 func TestGetAnalyticsProjects(t *testing.T) {
 	d := testDB(t)
 	ctx := context.Background()
@@ -414,6 +1280,80 @@ func TestGetAnalyticsProjects(t *testing.T) {
 		resp := mustProjects(t, d, ctx, emptyFilter())
 		assert.Equal(t, 0, len(resp.Projects), "len(Projects)")
 	})
+}
+
+func TestGetAnalyticsProjectsModelFilterCountsOnlyMatchingMessages(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "projects-mixed", "alpha", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T10:00:00Z")
+		s.MessageCount = 2
+		s.Agent = "mixed"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "projects-mixed", Ordinal: 0, Role: "assistant",
+			Content: "gpt", ContentLength: 3,
+			Timestamp: "2024-06-01T09:05:00Z",
+			Model:     "gpt-4o",
+		},
+		Message{
+			SessionID: "projects-mixed", Ordinal: 1, Role: "assistant",
+			Content: "claude", ContentLength: 6,
+			Timestamp: "2024-06-01T09:06:00Z",
+			Model:     "claude-3-5-sonnet",
+		},
+	)
+
+	resp, err := d.GetAnalyticsProjects(ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o",
+	})
+	require.NoError(t, err, "GetAnalyticsProjects")
+	require.Len(t, resp.Projects, 1, "len(Projects)")
+	assert.Equal(t, 1, resp.Projects[0].Messages, "Messages")
+	assert.Equal(t, 1.0, resp.Projects[0].AvgMessages, "AvgMessages")
+	assert.Equal(t, 1, resp.Projects[0].MedianMessages, "MedianMessages")
+	assert.Equal(t, 1.0, resp.Projects[0].DailyTrend, "DailyTrend")
+}
+
+func TestGetAnalyticsHeatmapModelFilterCountsOnlyMatchingMessages(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "heatmap-mixed", "alpha", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T10:00:00Z")
+		s.MessageCount = 2
+		s.Agent = "mixed"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "heatmap-mixed", Ordinal: 0, Role: "assistant",
+			Content: "gpt", ContentLength: 3,
+			Timestamp: "2024-06-01T09:05:00Z",
+			Model:     "gpt-4o",
+		},
+		Message{
+			SessionID: "heatmap-mixed", Ordinal: 1, Role: "assistant",
+			Content: "claude", ContentLength: 6,
+			Timestamp: "2024-06-01T09:06:00Z",
+			Model:     "claude-3-5-sonnet",
+		},
+	)
+
+	resp := mustHeatmap(t, d, ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o",
+	}, "messages")
+	require.Len(t, resp.Entries, 1, "len(Entries)")
+	assert.Equal(t, 1, resp.Entries[0].Value, "Value")
 }
 
 func TestMedianInt(t *testing.T) {
@@ -762,6 +1702,125 @@ func TestGetAnalyticsHourOfWeek(t *testing.T) {
 	})
 }
 
+func TestGetAnalyticsHourOfWeekModelFilter(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "how-a", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T09:30:00Z")
+		s.MessageCount = 1
+		s.UserMessageCount = 1
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "how-a", Ordinal: 0, Role: "user",
+			Content: "q", ContentLength: 1,
+			Timestamp: "2024-06-01T09:00:00Z",
+			Model:     "claude-3-5-sonnet",
+		},
+	)
+
+	insertSession(t, d, "how-b", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T10:00:00Z")
+		s.EndedAt = new("2024-06-01T10:30:00Z")
+		s.MessageCount = 1
+		s.UserMessageCount = 1
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "how-b", Ordinal: 0, Role: "user",
+			Content: "q", ContentLength: 1,
+			Timestamp: "2024-06-01T10:00:00Z",
+			Model:     "gpt-4o",
+		},
+	)
+
+	resp, err := d.GetAnalyticsHourOfWeek(ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o",
+	})
+	require.NoError(t, err, "GetAnalyticsHourOfWeek")
+	assert.Equal(t, 0, findHOWCell(resp.Cells, 5, 9), "Sat 09:00")
+	assert.Equal(t, 1, findHOWCell(resp.Cells, 5, 10), "Sat 10:00")
+}
+
+func TestGetAnalyticsHourOfWeekModelFilterCountsOnlyMatchingMessages(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "how-mixed", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T10:30:00Z")
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "how-mixed", Ordinal: 0, Role: "user",
+			Content: "q", ContentLength: 1,
+			Timestamp: "2024-06-01T09:00:00Z",
+			Model:     "gpt-4o",
+		},
+		Message{
+			SessionID: "how-mixed", Ordinal: 1, Role: "assistant",
+			Content: "a", ContentLength: 1,
+			Timestamp: "2024-06-01T10:00:00Z",
+			Model:     "claude-3-5-sonnet",
+		},
+	)
+
+	resp, err := d.GetAnalyticsHourOfWeek(ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o",
+	})
+	require.NoError(t, err, "GetAnalyticsHourOfWeek")
+	assert.Equal(t, 1, findHOWCell(resp.Cells, 5, 9), "Sat 09:00")
+	assert.Equal(t, 0, findHOWCell(resp.Cells, 5, 10), "Sat 10:00")
+}
+
+func TestGetAnalyticsHourOfWeekModelFilterIncludesPairedUserTurns(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "how-paired", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T10:30:00Z")
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "how-paired", Ordinal: 0, Role: "user",
+			Content: "q", ContentLength: 1,
+			Timestamp: "2024-06-01T09:00:00Z",
+			// Empty model: this user turn is paired with the selected-model
+			// assistant below, so the heatmap must count it like the summary,
+			// activity, velocity, and trends panels do.
+		},
+		Message{
+			SessionID: "how-paired", Ordinal: 1, Role: "assistant",
+			Content: "a", ContentLength: 1,
+			Timestamp: "2024-06-01T10:00:00Z",
+			Model:     "gpt-4o",
+		},
+	)
+
+	resp, err := d.GetAnalyticsHourOfWeek(ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o",
+	})
+	require.NoError(t, err, "GetAnalyticsHourOfWeek")
+	assert.Equal(t, 1, findHOWCell(resp.Cells, 5, 9),
+		"paired empty-model user turn at Sat 09:00")
+	assert.Equal(t, 1, findHOWCell(resp.Cells, 5, 10),
+		"selected-model assistant at Sat 10:00")
+}
+
 func findHOWCell(cells []HourOfWeekCell, dow, hour int) int {
 	for _, c := range cells {
 		if c.DayOfWeek == dow && c.Hour == hour {
@@ -866,6 +1925,74 @@ func TestGetAnalyticsSessionShape(t *testing.T) {
 		require.NoError(t, err, "GetAnalyticsSessionShape")
 		assert.Equal(t, 0, resp.Count, "Count")
 	})
+}
+
+func TestGetAnalyticsSessionShapeModelFilterUsesMatchingRowsOnly(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "shape-model-filter", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T09:30:00Z")
+		s.MessageCount = 6
+		s.Agent = "mixed"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "shape-model-filter", Ordinal: 0, Role: "user",
+			Content: "gpt q", ContentLength: 5,
+			Timestamp: "2024-06-01T09:00:00Z",
+		},
+		Message{
+			SessionID: "shape-model-filter", Ordinal: 1, Role: "assistant",
+			Content: "gpt tool", ContentLength: 8,
+			Timestamp:  "2024-06-01T09:01:00Z",
+			Model:      "gpt-4o",
+			HasToolUse: true,
+			ToolCalls: []ToolCall{
+				{SessionID: "shape-model-filter", ToolName: "Read", Category: "Read"},
+			},
+		},
+		Message{
+			SessionID: "shape-model-filter", Ordinal: 2, Role: "user",
+			Content: "claude q1", ContentLength: 9,
+			Timestamp: "2024-06-01T09:02:00Z",
+			Model:     "claude-3-5-sonnet",
+		},
+		Message{
+			SessionID: "shape-model-filter", Ordinal: 3, Role: "user",
+			Content: "claude q2", ContentLength: 9,
+			Timestamp: "2024-06-01T09:03:00Z",
+			Model:     "claude-3-5-sonnet",
+		},
+		Message{
+			SessionID: "shape-model-filter", Ordinal: 4, Role: "user",
+			Content: "claude q3", ContentLength: 9,
+			Timestamp: "2024-06-01T09:04:00Z",
+			Model:     "claude-3-5-sonnet",
+		},
+		Message{
+			SessionID: "shape-model-filter", Ordinal: 5, Role: "assistant",
+			Content: "claude reply", ContentLength: 12,
+			Timestamp: "2024-06-01T09:05:00Z",
+			Model:     "claude-3-5-sonnet",
+		},
+	)
+
+	resp, err := d.GetAnalyticsSessionShape(ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o",
+	})
+	require.NoError(t, err, "GetAnalyticsSessionShape")
+	assert.Equal(t, 1, resp.Count, "Count")
+
+	lenMap := bucketMap(resp.LengthDistribution)
+	assert.Equal(t, 1, lenMap["1-5"], "filtered 2-message session stays in 1-5")
+	assert.Equal(t, 0, lenMap["6-15"], "full-session count must not leak")
+
+	autoMap := bucketMap(resp.AutonomyDistribution)
+	assert.Equal(t, 1, autoMap["1-2"], "filtered autonomy bucket")
+	assert.Equal(t, 0, autoMap["<0.5"], "off-model user turns must not leak")
 }
 
 func bucketMap(
@@ -1153,45 +2280,137 @@ func TestGetAnalyticsVelocity_ToolUsage(t *testing.T) {
 	})
 }
 
-func TestVelocityChunkedQuery(t *testing.T) {
+func TestGetAnalyticsVelocity_ModelFilterUsesMatchingRowsOnly(t *testing.T) {
 	d := testDB(t)
 	ctx := context.Background()
 
-	// Seed >500 sessions to exercise chunked IN-clause logic.
-	const n = 600
-	for i := range n {
-		id := fmt.Sprintf("chunk-%d", i)
-		insertSession(t, d, id, "proj", func(s *Session) {
-			s.StartedAt = new("2024-06-01T09:00:00Z")
-			s.MessageCount = 2
-			s.Agent = "claude"
-		})
-		insertMessages(t, d,
-			Message{
-				SessionID: id, Ordinal: 0, Role: "user",
-				Content: "q", ContentLength: 1,
-				Timestamp: "2024-06-01T09:00:00Z",
+	insertSession(t, d, "velocity-model", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T09:11:00Z")
+		s.MessageCount = 4
+		s.Agent = "mixed"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "velocity-model", Ordinal: 0, Role: "user",
+			Content: "claude q", ContentLength: 8,
+			Timestamp: "2024-06-01T09:00:00Z",
+			Model:     "claude-3-5-sonnet",
+		},
+		Message{
+			SessionID: "velocity-model", Ordinal: 1, Role: "assistant",
+			Content: "offscope-offscope-xx", ContentLength: 20,
+			Timestamp:  "2024-06-01T09:00:10Z",
+			Model:      "claude-3-5-sonnet",
+			HasToolUse: true,
+			ToolCalls: []ToolCall{
+				{SessionID: "velocity-model", ToolName: "Read", Category: "Read"},
+				{SessionID: "velocity-model", ToolName: "Bash", Category: "Bash"},
+				{SessionID: "velocity-model", ToolName: "Grep", Category: "Grep"},
 			},
-			Message{
-				SessionID: id, Ordinal: 1,
-				Role:    "assistant",
-				Content: "a", ContentLength: 1,
-				Timestamp: "2024-06-01T09:00:10Z",
+		},
+		Message{
+			SessionID: "velocity-model", Ordinal: 2, Role: "user",
+			Content: "gpt q", ContentLength: 5,
+			Timestamp: "2024-06-01T09:10:00Z",
+		},
+		Message{
+			SessionID: "velocity-model", Ordinal: 3, Role: "assistant",
+			Content: "reply", ContentLength: 5,
+			Timestamp:  "2024-06-01T09:11:00Z",
+			Model:      "gpt-4o",
+			HasToolUse: true,
+			ToolCalls: []ToolCall{
+				{SessionID: "velocity-model", ToolName: "Edit", Category: "Edit"},
+				{SessionID: "velocity-model", ToolName: "Write", Category: "Write"},
 			},
-		)
+		},
+	)
+
+	resp, err := d.GetAnalyticsVelocity(ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o",
+	})
+	require.NoError(t, err, "GetAnalyticsVelocity")
+	assert.Equal(t, 60.0, resp.Overall.FirstResponseSec.P50,
+		"FirstResponse P50")
+	assert.Equal(t, 2.0, resp.Overall.MsgsPerActiveMin,
+		"MsgsPerActiveMin")
+	assert.Equal(t, 5.0, resp.Overall.CharsPerActiveMin,
+		"CharsPerActiveMin")
+	assert.Equal(t, 2.0, resp.Overall.ToolCallsPerActiveMin,
+		"ToolCallsPerActiveMin")
+}
+
+func TestGetAnalyticsVelocityModelFilterUsesMatchingComplexityBucket(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "velocity-model-complexity", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T09:15:00Z")
+		s.MessageCount = 16
+		s.Agent = "mixed"
+	})
+	msgs := []Message{
+		{
+			SessionID: "velocity-model-complexity", Ordinal: 0, Role: "user",
+			Content: "gpt q", ContentLength: 5,
+			Timestamp: "2024-06-01T09:00:00Z",
+		},
+		{
+			SessionID: "velocity-model-complexity", Ordinal: 1, Role: "assistant",
+			Content: "reply", ContentLength: 5,
+			Timestamp: "2024-06-01T09:01:00Z",
+			Model:     "gpt-4o",
+		},
 	}
+	for i := 2; i < 16; i++ {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		msgs = append(msgs, Message{
+			SessionID:     "velocity-model-complexity",
+			Ordinal:       i,
+			Role:          role,
+			Content:       "claude",
+			ContentLength: 6,
+			Timestamp:     fmt.Sprintf("2024-06-01T09:%02d:00Z", i),
+			Model:         "claude-3-5-sonnet",
+		})
+	}
+	insertMessages(t, d, msgs...)
+
+	resp, err := d.GetAnalyticsVelocity(ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o",
+	})
+	require.NoError(t, err, "GetAnalyticsVelocity")
+	require.Len(t, resp.ByComplexity, 1, "len(ByComplexity)")
+	assert.Equal(t, "1-15", resp.ByComplexity[0].Label,
+		"complexity bucket should use filtered message count")
+	assert.Equal(t, 1, resp.ByComplexity[0].Sessions, "Sessions")
+}
+
+func TestVelocityChunkedQuery(t *testing.T) {
+	d := openChunkedAnalyticsFixtureDB(t)
+	ctx := context.Background()
 
 	// Velocity must not fail even with >500 sessions
 	resp, err := d.GetAnalyticsVelocity(ctx, baseFilter())
 	require.NoError(t, err,
-		"GetAnalyticsVelocity with %d sessions", n)
-	assert.Equal(t, n, resp.ByComplexity[0].Sessions, "sessions")
+		"GetAnalyticsVelocity with %d sessions",
+		chunkedAnalyticsFixtureSessionCount)
+	assert.Equal(t, chunkedAnalyticsFixtureSessionCount,
+		resp.ByComplexity[0].Sessions, "sessions")
 
 	// SessionShape must not fail either
 	shape, err := d.GetAnalyticsSessionShape(ctx, baseFilter())
 	require.NoError(t, err,
-		"GetAnalyticsSessionShape with %d sessions", n)
-	assert.Equal(t, n, shape.Count, "Count")
+		"GetAnalyticsSessionShape with %d sessions",
+		chunkedAnalyticsFixtureSessionCount)
+	assert.Equal(t, chunkedAnalyticsFixtureSessionCount, shape.Count, "Count")
 }
 
 // TestGetAnalyticsVelocity_NullTimestamp guards against the velocity scan
@@ -1202,6 +2421,7 @@ func TestVelocityChunkedQuery(t *testing.T) {
 // is treated as an invalid timestamp and excluded while the rest of the
 // session's messages still drive velocity metrics.
 func TestGetAnalyticsVelocity_NullTimestamp(t *testing.T) {
+
 	d := testDB(t)
 	ctx := context.Background()
 
@@ -1271,18 +2491,21 @@ func TestGetAnalyticsTools(t *testing.T) {
 		s.MessageCount = 3
 		s.Agent = "claude"
 	})
-	m1 := asstMsg("t1", 0, "[Read: a.go]")
+	m1 := asstMsgAt("t1", 0, "[Read: a.go]",
+		"2024-06-01T09:00:00Z")
 	m1.HasToolUse = true
 	m1.ToolCalls = []ToolCall{
 		{SessionID: "t1", ToolName: "Read", Category: "Read"},
 		{SessionID: "t1", ToolName: "Read", Category: "Read"},
 	}
-	m2 := asstMsg("t1", 1, "[Bash: ls]")
+	m2 := asstMsgAt("t1", 1, "[Bash: ls]",
+		"2024-06-01T09:05:00Z")
 	m2.HasToolUse = true
 	m2.ToolCalls = []ToolCall{
 		{SessionID: "t1", ToolName: "Bash", Category: "Bash"},
 	}
-	m3 := asstMsg("t1", 2, "[Edit: b.go]")
+	m3 := asstMsgAt("t1", 2, "[Edit: b.go]",
+		"2024-06-01T09:10:00Z")
 	m3.HasToolUse = true
 	m3.ToolCalls = []ToolCall{
 		{SessionID: "t1", ToolName: "Edit", Category: "Edit"},
@@ -1294,7 +2517,8 @@ func TestGetAnalyticsTools(t *testing.T) {
 		s.MessageCount = 1
 		s.Agent = "codex"
 	})
-	m4 := asstMsg("t2", 0, "[Read: c.go]")
+	m4 := asstMsgAt("t2", 0, "[Read: c.go]",
+		"2024-06-02T10:00:00Z")
 	m4.HasToolUse = true
 	m4.ToolCalls = []ToolCall{
 		{SessionID: "t2", ToolName: "Read", Category: "Read"},
@@ -1375,13 +2599,101 @@ func TestGetAnalyticsTools(t *testing.T) {
 }
 
 func TestAnalyticsToolsToolCallsQueryAggregatesInSQL(t *testing.T) {
-	q := analyticsToolsQuery("(?,?)")
+	q := analyticsToolsQuery("(?,?)", "", false)
 	normalized := strings.Join(strings.Fields(strings.ToLower(q)), " ")
 
 	assert.Contains(t, normalized,
-		"select session_id, category, count(*)")
+		"select tc.session_id, tc.category, count(*)")
 	assert.Contains(t, normalized,
-		"group by session_id, category")
+		"group by tc.session_id, tc.category")
+}
+
+func TestGetAnalyticsToolsModelFilterCountsOnlyMatchingToolCalls(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "tool-model-1", "alpha", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.MessageCount = 2
+		s.Agent = "claude"
+	})
+
+	m1 := asstMsgAt("tool-model-1", 0, "[Read: a.go]", "2024-06-01T09:00:00Z")
+	m1.Model = "gpt-4o"
+	m1.HasToolUse = true
+	m1.ToolCalls = []ToolCall{
+		{SessionID: "tool-model-1", ToolName: "Read", Category: "Read"},
+		{SessionID: "tool-model-1", ToolName: "Bash", Category: "Bash"},
+	}
+
+	m2 := asstMsgAt("tool-model-1", 1, "[Grep: b.go]", "2024-06-01T09:05:00Z")
+	m2.Model = "claude-3-5-sonnet"
+	m2.HasToolUse = true
+	m2.ToolCalls = []ToolCall{
+		{SessionID: "tool-model-1", ToolName: "Grep", Category: "Grep"},
+	}
+
+	insertMessages(t, d, m1, m2)
+
+	resp, err := d.GetAnalyticsTools(ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o",
+	})
+	require.NoError(t, err, "GetAnalyticsTools")
+	assert.Equal(t, 2, resp.TotalCalls, "TotalCalls")
+	require.Len(t, resp.ByCategory, 2, "len(ByCategory)")
+
+	catMap := make(map[string]int)
+	for _, c := range resp.ByCategory {
+		catMap[c.Category] = c.Count
+	}
+	assert.Equal(t, 1, catMap["Read"], "Read")
+	assert.Equal(t, 1, catMap["Bash"], "Bash")
+	assert.Zero(t, catMap["Grep"], "Grep")
+}
+
+func TestGetAnalyticsToolsModelAndHourFilterCountsOnlyMatchingHourToolCalls(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "tool-model-hour", "alpha", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T10:30:00Z")
+		s.MessageCount = 2
+		s.Agent = "claude"
+	})
+
+	m1 := asstMsgAt("tool-model-hour", 0, "[Read: a.go]", "2024-06-01T09:00:00Z")
+	m1.Model = "gpt-4o"
+	m1.HasToolUse = true
+	m1.ToolCalls = []ToolCall{
+		{SessionID: "tool-model-hour", ToolName: "Read", Category: "Read"},
+		{SessionID: "tool-model-hour", ToolName: "Bash", Category: "Bash"},
+	}
+
+	m2 := asstMsgAt("tool-model-hour", 1, "[Grep: b.go]", "2024-06-01T10:00:00Z")
+	m2.Model = "gpt-4o"
+	m2.HasToolUse = true
+	m2.ToolCalls = []ToolCall{
+		{SessionID: "tool-model-hour", ToolName: "Grep", Category: "Grep"},
+	}
+
+	insertMessages(t, d, m1, m2)
+
+	hour := 10
+	resp, err := d.GetAnalyticsTools(ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o", Hour: &hour,
+	})
+	require.NoError(t, err, "GetAnalyticsTools")
+	assert.Equal(t, 1, resp.TotalCalls, "TotalCalls")
+	require.Len(t, resp.ByCategory, 1, "len(ByCategory)")
+	assert.Equal(t, "Grep", resp.ByCategory[0].Category, "Category")
+	assert.Equal(t, 1, resp.ByCategory[0].Count, "Count")
 }
 
 func TestGetAnalyticsSkills(t *testing.T) {
@@ -1755,7 +3067,7 @@ func TestGetAnalyticsSkillsDateBoundaries(t *testing.T) {
 }
 
 func TestAnalyticsSkillsToolCallsQueryAggregatesInSQL(t *testing.T) {
-	q := analyticsSkillsQuery("(?,?)")
+	q := analyticsSkillsQuery("(?,?)", "")
 	normalized := strings.Join(strings.Fields(strings.ToLower(q)), " ")
 
 	assert.Contains(t, normalized,
@@ -1769,6 +3081,58 @@ func TestAnalyticsSkillsToolCallsQueryAggregatesInSQL(t *testing.T) {
 	assert.Contains(t, normalized,
 		"group by tc.session_id, trim(tc.skill_name), "+
 			"coalesce(m.timestamp, '')")
+}
+
+func TestGetAnalyticsSkillsModelFilterCountsOnlyMatchingSkillCalls(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "skill-model-1", "alpha", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.MessageCount = 2
+		s.Agent = "claude"
+	})
+
+	m1 := asstMsgAt("skill-model-1", 0, "skill call", "2024-06-01T09:00:00Z")
+	m1.Model = "gpt-4o"
+	m1.HasToolUse = true
+	m1.ToolCalls = []ToolCall{
+		{
+			SessionID: "skill-model-1",
+			ToolName:  "Skill",
+			Category:  "Skill",
+			SkillName: "review-code",
+		},
+	}
+
+	m2 := asstMsgAt("skill-model-1", 1, "skill call", "2024-06-01T09:05:00Z")
+	m2.Model = "claude-3-5-sonnet"
+	m2.HasToolUse = true
+	m2.ToolCalls = []ToolCall{
+		{
+			SessionID: "skill-model-1",
+			ToolName:  "Skill",
+			Category:  "Skill",
+			SkillName: "write-tests",
+		},
+	}
+
+	insertMessages(t, d, m1, m2)
+
+	resp, err := d.GetAnalyticsSkills(ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o",
+	})
+	require.NoError(t, err, "GetAnalyticsSkills")
+	assert.Equal(t, 1, resp.TotalSkillCalls, "TotalSkillCalls")
+	assert.Equal(t, 1, resp.DistinctSkills, "DistinctSkills")
+	require.Len(t, resp.BySkill, 1, "len(BySkill)")
+	assert.Equal(t, "review-code", resp.BySkill[0].SkillName, "SkillName")
+	assert.Equal(t, 1, resp.BySkill[0].CallCount, "CallCount")
+	assert.Equal(t, "2024-06-01T09:00:00Z", resp.BySkill[0].LastUsedAt,
+		"LastUsedAt")
 }
 
 func TestGetAnalyticsToolsCanceled(t *testing.T) {
@@ -1815,6 +3179,42 @@ func TestActivityToolAndThinkingCounts(t *testing.T) {
 	assert.Equal(t, 2, entry.ToolCalls, "ToolCalls")
 }
 
+func TestActivityToolCallsRespectModelFilter(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "at-model", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.MessageCount = 2
+		s.Agent = "claude"
+	})
+
+	m1 := asstMsgAt("at-model", 0, "[Read: a.go]", "2024-06-01T09:00:00Z")
+	m1.Model = "gpt-4o"
+	m1.HasToolUse = true
+	m1.ToolCalls = []ToolCall{
+		{SessionID: "at-model", ToolName: "Read", Category: "Read"},
+		{SessionID: "at-model", ToolName: "Bash", Category: "Bash"},
+	}
+
+	m2 := asstMsgAt("at-model", 1, "[Grep: b.go]", "2024-06-01T09:05:00Z")
+	m2.Model = "claude-3-5-sonnet"
+	m2.HasToolUse = true
+	m2.ToolCalls = []ToolCall{
+		{SessionID: "at-model", ToolName: "Grep", Category: "Grep"},
+	}
+
+	insertMessages(t, d, m1, m2)
+
+	resp := mustActivity(t, d, ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o",
+	}, "day")
+	require.Len(t, resp.Series, 1, "len(Series)")
+	assert.Equal(t, 1, resp.Series[0].Messages, "Messages")
+	assert.Equal(t, 2, resp.Series[0].ToolCalls, "ToolCalls")
+}
+
 func TestGetAnalyticsTopSessions(t *testing.T) {
 	d := testDB(t)
 	ctx := context.Background()
@@ -1859,6 +3259,403 @@ func TestGetAnalyticsTopSessions(t *testing.T) {
 		}
 	})
 
+	t.Run("ByDurationRanksByActiveDuration", func(t *testing.T) {
+		insertSession(t, d, "wall-dominant", "project-gamma", func(s *Session) {
+			s.StartedAt = Ptr("2024-06-02T09:00:00Z")
+			s.EndedAt = Ptr("2024-06-02T11:00:00Z")
+			s.MessageCount = 3
+		})
+		insertMessages(
+			t,
+			d,
+			userMsgAt("wall-dominant", 0, "noop", "2024-06-02T09:00:00Z"),
+			func() Message {
+				m := asstMsgAt(
+					"wall-dominant",
+					1,
+					"idle wait",
+					"2024-06-02T10:59:00Z",
+				)
+				m.HasToolUse = true
+				return m
+			}(),
+			userMsgAt(
+				"wall-dominant",
+				2,
+				"done",
+				"2024-06-02T11:00:00Z",
+			),
+		)
+
+		insertSession(t, d, "actively-working", "project-gamma", func(s *Session) {
+			s.StartedAt = Ptr("2024-06-02T09:30:00Z")
+			s.EndedAt = Ptr("2024-06-02T09:50:00Z")
+			s.MessageCount = 3
+		})
+		insertMessages(
+			t,
+			d,
+			userMsgAt("actively-working", 0, "start", "2024-06-02T09:30:00Z"),
+			func() Message {
+				m := asstMsgAt(
+					"actively-working",
+					1,
+					"tooling",
+					"2024-06-02T09:35:00Z",
+				)
+				m.HasToolUse = true
+				return m
+			}(),
+			userMsgAt("actively-working", 2, "finish", "2024-06-02T09:50:00Z"),
+		)
+
+		resp, err := d.GetAnalyticsTopSessions(
+			ctx, AnalyticsFilter{Project: "project-gamma"}, "duration",
+		)
+		require.NoError(t, err, "GetAnalyticsTopSessions")
+		assert.Equal(t, "duration", resp.Metric, "Metric")
+		require.Len(t, resp.Sessions, 2, "sessions")
+		assert.Equal(t, "actively-working", resp.Sessions[0].ID, "top session by active duration")
+		assert.Equal(t, 20.0, resp.Sessions[0].DurationMin, "active total duration")
+		// 5 min user->asst gap + a 15 min gap capped at the 5 min idle
+		// cap = 10.
+		assert.Equal(t, 10.0, resp.Sessions[0].ActiveDurationMin, "active duration")
+		assert.Equal(t, 120.0, resp.Sessions[1].DurationMin, "wall-only duration")
+		// 119 min idle gap capped to 5 + a 1 min gap = 6, so the
+		// mostly-idle 2-hour session ranks below the engaged 20-min one.
+		assert.Equal(t, 6.0, resp.Sessions[1].ActiveDurationMin, "idle active duration")
+	})
+
+	t.Run("ByDurationKeepsNearTieOrderBeforeDisplayRounding", func(t *testing.T) {
+		// Two sessions whose active durations differ only below the
+		// display-rounding granularity (2.504 vs 2.496 min). Both render
+		// as "2.5", but the raw value must decide the rank. The single
+		// gap stays under the 5 min idle cap so the clamp does not
+		// flatten the sub-second difference.
+		insertSession(t, d, "near-tie-longer", "project-precision", func(s *Session) {
+			s.StartedAt = Ptr("2024-06-03T09:00:00.000Z")
+			s.EndedAt = Ptr("2024-06-03T09:02:30.240Z")
+			s.MessageCount = 2
+		})
+		insertMessages(
+			t,
+			d,
+			userMsgAt("near-tie-longer", 0, "start", "2024-06-03T09:00:00.000Z"),
+			asstMsgAt("near-tie-longer", 1, "work", "2024-06-03T09:02:30.240Z"),
+		)
+
+		insertSession(t, d, "near-tie-shorter", "project-precision", func(s *Session) {
+			s.StartedAt = Ptr("2024-06-03T09:00:00.000Z")
+			s.EndedAt = Ptr("2024-06-03T09:02:29.760Z")
+			s.MessageCount = 2
+		})
+		insertMessages(
+			t,
+			d,
+			userMsgAt("near-tie-shorter", 0, "start", "2024-06-03T09:00:00.000Z"),
+			asstMsgAt("near-tie-shorter", 1, "work", "2024-06-03T09:02:29.760Z"),
+		)
+
+		resp, err := d.GetAnalyticsTopSessions(ctx, AnalyticsFilter{
+			Project: "project-precision",
+			From:    "2024-06-03",
+			To:      "2024-06-03",
+		}, "duration")
+		require.NoError(t, err, "GetAnalyticsTopSessions")
+		require.Len(t, resp.Sessions, 2, "precision sessions")
+		assert.Equal(t, "near-tie-longer", resp.Sessions[0].ID, "raw active duration should decide the rank")
+		assert.Equal(t, 2.5, resp.Sessions[0].ActiveDurationMin, "display rounding")
+		assert.Equal(t, 2.5, resp.Sessions[1].ActiveDurationMin, "display rounding")
+	})
+
+	t.Run("ByDurationRanksByActiveDurationInGoFallback", func(t *testing.T) {
+		writes := make([]SessionBatchWrite, 0, 202)
+		for i := range 201 {
+			id := fmt.Sprintf("dst-wall-%03d", i)
+			writes = append(writes, SessionBatchWrite{
+				Session: Session{
+					ID:               id,
+					Project:          "project-dst",
+					Machine:          defaultMachine,
+					Agent:            defaultAgent,
+					StartedAt:        Ptr("2026-03-10T09:00:00Z"),
+					EndedAt:          Ptr("2026-03-10T11:00:00Z"),
+					MessageCount:     3,
+					UserMessageCount: 2,
+				},
+				Messages: []Message{
+					userMsgAt(id, 0, "noop", "2026-03-10T09:00:00Z"),
+					func() Message {
+						m := asstMsgAt(
+							id,
+							1,
+							"idle wait",
+							"2026-03-10T10:59:00Z",
+						)
+						m.HasToolUse = true
+						return m
+					}(),
+					userMsgAt(id, 2, "done", "2026-03-10T11:00:00Z"),
+				},
+			})
+		}
+		writes = append(writes, SessionBatchWrite{
+			Session: Session{
+				ID:               "dst-actively-working",
+				Project:          "project-dst",
+				Machine:          defaultMachine,
+				Agent:            defaultAgent,
+				StartedAt:        Ptr("2026-03-10T09:30:00Z"),
+				EndedAt:          Ptr("2026-03-10T09:50:00Z"),
+				MessageCount:     3,
+				UserMessageCount: 2,
+			},
+			Messages: []Message{
+				userMsgAt("dst-actively-working", 0, "start", "2026-03-10T09:30:00Z"),
+				func() Message {
+					m := asstMsgAt(
+						"dst-actively-working",
+						1,
+						"tooling",
+						"2026-03-10T09:35:00Z",
+					)
+					m.HasToolUse = true
+					return m
+				}(),
+				userMsgAt("dst-actively-working", 2, "finish", "2026-03-10T09:50:00Z"),
+			},
+		})
+		result, err := d.WriteSessionBatchAtomic(writes)
+		require.NoError(t, err)
+		require.Equal(t, len(writes), result.WrittenSessions)
+		require.Equal(t, 3*len(writes), result.WrittenMessages)
+
+		resp, err := d.GetAnalyticsTopSessions(ctx, AnalyticsFilter{
+			Project:  "project-dst",
+			From:     "2026-03-01",
+			To:       "2026-03-31",
+			Timezone: "America/New_York",
+		}, "duration")
+		require.NoError(t, err, "GetAnalyticsTopSessions")
+		require.NotEmpty(t, resp.Sessions, "sessions")
+		assert.Equal(t, "dst-actively-working", resp.Sessions[0].ID, "top session by active duration in fallback")
+		// 5 + 5 (15 min gap capped at the 5 min idle cap) = 10.
+		assert.Equal(t, 10.0, resp.Sessions[0].ActiveDurationMin, "fallback active duration")
+	})
+
+	t.Run("ByDurationKeepsNearTieOrderInGoFallback", func(t *testing.T) {
+		// Same near-tie invariant as the SQLite SQL case, but the
+		// timezone filter forces the Go fallback ranking path.
+		insertSession(t, d, "dst-near-tie-longer", "project-dst-precision", func(s *Session) {
+			s.StartedAt = Ptr("2026-03-10T09:00:00.000Z")
+			s.EndedAt = Ptr("2026-03-10T09:02:30.240Z")
+			s.MessageCount = 2
+		})
+		insertMessages(
+			t,
+			d,
+			userMsgAt("dst-near-tie-longer", 0, "start", "2026-03-10T09:00:00.000Z"),
+			asstMsgAt("dst-near-tie-longer", 1, "work", "2026-03-10T09:02:30.240Z"),
+		)
+
+		insertSession(t, d, "dst-near-tie-shorter", "project-dst-precision", func(s *Session) {
+			s.StartedAt = Ptr("2026-03-10T09:00:00.000Z")
+			s.EndedAt = Ptr("2026-03-10T09:02:29.760Z")
+			s.MessageCount = 2
+		})
+		insertMessages(
+			t,
+			d,
+			userMsgAt("dst-near-tie-shorter", 0, "start", "2026-03-10T09:00:00.000Z"),
+			asstMsgAt("dst-near-tie-shorter", 1, "work", "2026-03-10T09:02:29.760Z"),
+		)
+
+		resp, err := d.GetAnalyticsTopSessions(ctx, AnalyticsFilter{
+			Project:  "project-dst-precision",
+			From:     "2026-03-01",
+			To:       "2026-03-31",
+			Timezone: "America/New_York",
+		}, "duration")
+		require.NoError(t, err, "GetAnalyticsTopSessions")
+		require.Len(t, resp.Sessions, 2, "fallback precision sessions")
+		assert.Equal(t, "dst-near-tie-longer", resp.Sessions[0].ID, "fallback should keep raw active ordering")
+		assert.Equal(t, 2.5, resp.Sessions[0].ActiveDurationMin, "fallback display rounding")
+		assert.Equal(t, 2.5, resp.Sessions[1].ActiveDurationMin, "fallback display rounding")
+	})
+
+	t.Run("ByDurationCapsLongGapsAndCountsGeneration", func(t *testing.T) {
+		// No tool calls anywhere: under the old tool-execution-only
+		// definition this session scored 0. The clamp counts every gap
+		// -- model generation included -- and bounds the one long idle
+		// gap at the 5 min cap: 4 (gen) + 60->5 (idle cap) + 1 = 10.
+		insertSession(t, d, "clamp-mixed", "project-clamp-sql", func(s *Session) {
+			s.StartedAt = Ptr("2024-06-04T09:00:00Z")
+			s.EndedAt = Ptr("2024-06-04T10:05:00Z")
+			s.MessageCount = 4
+		})
+		insertMessages(
+			t,
+			d,
+			userMsgAt("clamp-mixed", 0, "start", "2024-06-04T09:00:00Z"),
+			asstMsgAt("clamp-mixed", 1, "thinking", "2024-06-04T09:04:00Z"),
+			userMsgAt("clamp-mixed", 2, "back", "2024-06-04T10:04:00Z"),
+			asstMsgAt("clamp-mixed", 3, "reply", "2024-06-04T10:05:00Z"),
+		)
+
+		resp, err := d.GetAnalyticsTopSessions(ctx, AnalyticsFilter{
+			Project: "project-clamp-sql",
+		}, "duration")
+		require.NoError(t, err, "GetAnalyticsTopSessions")
+		require.Len(t, resp.Sessions, 1, "clamp session")
+		assert.Equal(t, "clamp-mixed", resp.Sessions[0].ID)
+		assert.Equal(t, 65.0, resp.Sessions[0].DurationMin, "wall duration")
+		assert.Equal(t, 10.0, resp.Sessions[0].ActiveDurationMin, "clamped active duration")
+	})
+
+	t.Run("ByDurationCapsLongGapsAndCountsGenerationInGoFallback", func(t *testing.T) {
+		// Same clamp + generation accounting as the SQLite SQL case,
+		// exercised through the timezone-aware Go fallback path.
+		insertSession(t, d, "dst-clamp-mixed", "project-clamp-fallback", func(s *Session) {
+			s.StartedAt = Ptr("2026-03-10T09:00:00Z")
+			s.EndedAt = Ptr("2026-03-10T10:05:00Z")
+			s.MessageCount = 4
+		})
+		insertMessages(
+			t,
+			d,
+			userMsgAt("dst-clamp-mixed", 0, "start", "2026-03-10T09:00:00Z"),
+			asstMsgAt("dst-clamp-mixed", 1, "thinking", "2026-03-10T09:04:00Z"),
+			userMsgAt("dst-clamp-mixed", 2, "back", "2026-03-10T10:04:00Z"),
+			asstMsgAt("dst-clamp-mixed", 3, "reply", "2026-03-10T10:05:00Z"),
+		)
+
+		resp, err := d.GetAnalyticsTopSessions(ctx, AnalyticsFilter{
+			Project:  "project-clamp-fallback",
+			From:     "2026-03-01",
+			To:       "2026-03-31",
+			Timezone: "America/New_York",
+		}, "duration")
+		require.NoError(t, err, "GetAnalyticsTopSessions")
+		require.Len(t, resp.Sessions, 1, "fallback clamp session")
+		assert.Equal(t, "dst-clamp-mixed", resp.Sessions[0].ID)
+		assert.Equal(t, 65.0, resp.Sessions[0].DurationMin, "wall duration")
+		assert.Equal(t, 10.0, resp.Sessions[0].ActiveDurationMin, "fallback clamped active duration")
+	})
+
+	t.Run("ByDurationExcludesReversedAndEmptyTimestamps", func(t *testing.T) {
+		// A reversed (ended < started) or empty-timestamp session can
+		// still accumulate positive message-gap active duration, so
+		// without an eligibility guard it would rank into the duration
+		// list. The SQL path must reject both, matching DuckDB and the Go
+		// fallback.
+		insertSession(t, d, "elig-valid", "project-elig-sql", func(s *Session) {
+			s.StartedAt = Ptr("2024-07-01T09:00:00Z")
+			s.EndedAt = Ptr("2024-07-01T09:30:00Z")
+			s.MessageCount = 2
+		})
+		insertMessages(
+			t, d,
+			userMsgAt("elig-valid", 0, "start", "2024-07-01T09:00:00Z"),
+			asstMsgAt("elig-valid", 1, "work", "2024-07-01T09:03:00Z"),
+		)
+
+		insertSession(t, d, "elig-reversed", "project-elig-sql", func(s *Session) {
+			s.StartedAt = Ptr("2024-07-01T10:00:00Z")
+			s.EndedAt = Ptr("2024-07-01T09:00:00Z")
+			s.MessageCount = 2
+		})
+		insertMessages(
+			t, d,
+			userMsgAt("elig-reversed", 0, "start", "2024-07-01T09:00:00Z"),
+			asstMsgAt("elig-reversed", 1, "work", "2024-07-01T09:04:00Z"),
+		)
+
+		insertSession(t, d, "elig-empty", "project-elig-sql", func(s *Session) {
+			s.StartedAt = Ptr("")
+			s.EndedAt = Ptr("")
+			s.MessageCount = 2
+		})
+		insertMessages(
+			t, d,
+			userMsgAt("elig-empty", 0, "start", "2024-07-01T09:00:00Z"),
+			asstMsgAt("elig-empty", 1, "work", "2024-07-01T09:04:00Z"),
+		)
+
+		resp, err := d.GetAnalyticsTopSessions(
+			ctx, AnalyticsFilter{Project: "project-elig-sql"}, "duration",
+		)
+		require.NoError(t, err, "GetAnalyticsTopSessions")
+		var ids []string
+		for _, s := range resp.Sessions {
+			ids = append(ids, s.ID)
+		}
+		assert.Equal(t, []string{"elig-valid"}, ids,
+			"reversed and empty duration rows must be excluded")
+	})
+
+	t.Run("ByDurationExcludesReversedAndEmptyTimestampsInGoFallback", func(t *testing.T) {
+		// Same eligibility guard as the SQL path, but the timezone filter
+		// forces the Go fallback ranking path. Parity matters because the
+		// ranking is by message-gap active duration, which stays positive
+		// regardless of reversed or missing wall-clock timestamps.
+		insertSession(t, d, "elig-fb-valid", "project-elig-fb", func(s *Session) {
+			s.StartedAt = Ptr("2026-03-12T09:00:00Z")
+			s.EndedAt = Ptr("2026-03-12T09:30:00Z")
+			s.MessageCount = 2
+		})
+		insertMessages(
+			t, d,
+			userMsgAt("elig-fb-valid", 0, "start", "2026-03-12T09:00:00Z"),
+			asstMsgAt("elig-fb-valid", 1, "work", "2026-03-12T09:03:00Z"),
+		)
+
+		insertSession(t, d, "elig-fb-reversed", "project-elig-fb", func(s *Session) {
+			s.StartedAt = Ptr("2026-03-12T10:00:00Z")
+			s.EndedAt = Ptr("2026-03-12T09:00:00Z")
+			s.MessageCount = 2
+		})
+		insertMessages(
+			t, d,
+			userMsgAt("elig-fb-reversed", 0, "start", "2026-03-12T09:00:00Z"),
+			asstMsgAt("elig-fb-reversed", 1, "work", "2026-03-12T09:04:00Z"),
+		)
+
+		insertSession(t, d, "elig-fb-empty", "project-elig-fb", func(s *Session) {
+			s.StartedAt = Ptr("")
+			s.EndedAt = Ptr("")
+			s.MessageCount = 2
+		})
+		insertMessages(
+			t, d,
+			userMsgAt("elig-fb-empty", 0, "start", "2026-03-12T09:00:00Z"),
+			asstMsgAt("elig-fb-empty", 1, "work", "2026-03-12T09:04:00Z"),
+		)
+		// created_at is not bound by UpsertSession and otherwise defaults
+		// to insertion time, which the date filter would drop before the
+		// eligibility guard is reached. Pin it into the filter window so
+		// this row genuinely exercises the empty-timestamp NULLIF guard
+		// rather than being excluded by the date range.
+		_, err := d.getWriter().Exec(
+			"UPDATE sessions SET created_at = ? WHERE id = ?",
+			"2026-03-12T00:00:00Z", "elig-fb-empty",
+		)
+		require.NoError(t, err, "pin elig-fb-empty created_at")
+
+		resp, err := d.GetAnalyticsTopSessions(ctx, AnalyticsFilter{
+			Project:  "project-elig-fb",
+			From:     "2026-03-01",
+			To:       "2026-03-31",
+			Timezone: "America/New_York",
+		}, "duration")
+		require.NoError(t, err, "GetAnalyticsTopSessions")
+		var ids []string
+		for _, s := range resp.Sessions {
+			ids = append(ids, s.ID)
+		}
+		assert.Equal(t, []string{"elig-fb-valid"}, ids,
+			"reversed and empty duration rows must be excluded in fallback")
+	})
+
 	t.Run("DefaultMetric", func(t *testing.T) {
 		resp, err := d.GetAnalyticsTopSessions(
 			ctx, baseFilter(), "",
@@ -1887,6 +3684,92 @@ func TestGetAnalyticsTopSessions(t *testing.T) {
 		require.NoError(t, err, "GetAnalyticsTopSessions")
 		assert.Len(t, resp.Sessions, 0, "len(Sessions)")
 	})
+}
+
+func TestGetAnalyticsTopSessionsOutputTokensUseFilteredModelTotals(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "top-output-mixed", "alpha", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T10:00:00Z")
+		s.MessageCount = 2
+		s.Agent = "mixed"
+		s.TotalOutputTokens = 510
+		s.HasTotalOutputTokens = true
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "top-output-mixed", Ordinal: 0, Role: "assistant",
+			Content: "gpt", ContentLength: 3,
+			Timestamp: "2024-06-01T09:00:00Z",
+			Model:     "gpt-4o", OutputTokens: 10, HasOutputTokens: true,
+		},
+		Message{
+			SessionID: "top-output-mixed", Ordinal: 1, Role: "assistant",
+			Content: "claude", ContentLength: 6,
+			Timestamp:    "2024-06-01T09:05:00Z",
+			Model:        "claude-3-5-sonnet",
+			OutputTokens: 500, HasOutputTokens: true,
+		},
+	)
+
+	insertSession(t, d, "top-output-gpt", "alpha", func(s *Session) {
+		s.StartedAt = new("2024-06-01T11:00:00Z")
+		s.EndedAt = new("2024-06-01T12:00:00Z")
+		s.MessageCount = 1
+		s.Agent = "gpt"
+		s.TotalOutputTokens = 30
+		s.HasTotalOutputTokens = true
+	})
+	insertMessages(t, d, Message{
+		SessionID: "top-output-gpt", Ordinal: 0, Role: "assistant",
+		Content: "gpt", ContentLength: 3,
+		Timestamp: "2024-06-01T11:00:00Z",
+		Model:     "gpt-4o", OutputTokens: 30, HasOutputTokens: true,
+	})
+
+	insertSession(t, d, "top-output-uncovered", "alpha", func(s *Session) {
+		s.StartedAt = new("2024-06-01T13:00:00Z")
+		s.EndedAt = new("2024-06-01T14:00:00Z")
+		s.MessageCount = 2
+		s.Agent = "mixed"
+		s.TotalOutputTokens = 900
+		s.HasTotalOutputTokens = true
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "top-output-uncovered", Ordinal: 0,
+			Role:    "assistant",
+			Content: "gpt", ContentLength: 3,
+			Timestamp: "2024-06-01T13:00:00Z",
+			Model:     "gpt-4o",
+		},
+		Message{
+			SessionID: "top-output-uncovered", Ordinal: 1,
+			Role:    "assistant",
+			Content: "claude", ContentLength: 6,
+			Timestamp:    "2024-06-01T13:05:00Z",
+			Model:        "claude-3-5-sonnet",
+			OutputTokens: 900, HasOutputTokens: true,
+		},
+	)
+
+	resp, err := d.GetAnalyticsTopSessions(ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o",
+	}, "output_tokens")
+	require.NoError(t, err, "GetAnalyticsTopSessions")
+	require.Len(t, resp.Sessions, 2, "len(Sessions)")
+	assert.Equal(t, "top-output-gpt", resp.Sessions[0].ID, "top session")
+	assert.Equal(t, 30, resp.Sessions[0].OutputTokens,
+		"top OutputTokens")
+	assert.Equal(t, "top-output-mixed", resp.Sessions[1].ID,
+		"second session")
+	assert.Equal(t, 10, resp.Sessions[1].OutputTokens,
+		"second OutputTokens")
 }
 
 func TestGetAnalyticsTopSessionsDisplayName(t *testing.T) {
@@ -1938,6 +3821,121 @@ func TestGetAnalyticsTopSessionsDisplayName(t *testing.T) {
 	require.NotNil(t, custom.DisplayName,
 		"custom display_name should be exposed")
 	assert.Equal(t, customName, *custom.DisplayName)
+}
+
+func TestGetAnalyticsTopSessionsMessagesUseFilteredModelCounts(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "top-mixed", "alpha", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T10:00:00Z")
+		s.MessageCount = 3
+		s.Agent = "mixed"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "top-mixed", Ordinal: 0, Role: "assistant",
+			Content: "gpt", ContentLength: 3,
+			Timestamp: "2024-06-01T09:00:00Z",
+			Model:     "gpt-4o",
+		},
+		Message{
+			SessionID: "top-mixed", Ordinal: 1, Role: "assistant",
+			Content: "claude", ContentLength: 6,
+			Timestamp: "2024-06-01T09:05:00Z",
+			Model:     "claude-3-5-sonnet",
+		},
+		Message{
+			SessionID: "top-mixed", Ordinal: 2, Role: "assistant",
+			Content: "claude", ContentLength: 6,
+			Timestamp: "2024-06-01T09:06:00Z",
+			Model:     "claude-3-5-sonnet",
+		},
+	)
+
+	insertSession(t, d, "top-gpt", "alpha", func(s *Session) {
+		s.StartedAt = new("2024-06-01T11:00:00Z")
+		s.EndedAt = new("2024-06-01T12:00:00Z")
+		s.MessageCount = 2
+		s.Agent = "gpt"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "top-gpt", Ordinal: 0, Role: "assistant",
+			Content: "gpt", ContentLength: 3,
+			Timestamp: "2024-06-01T11:00:00Z",
+			Model:     "gpt-4o",
+		},
+		Message{
+			SessionID: "top-gpt", Ordinal: 1, Role: "assistant",
+			Content: "gpt", ContentLength: 3,
+			Timestamp: "2024-06-01T11:05:00Z",
+			Model:     "gpt-4o",
+		},
+	)
+
+	resp, err := d.GetAnalyticsTopSessions(ctx, AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+		Model: "gpt-4o",
+	}, "messages")
+	require.NoError(t, err, "GetAnalyticsTopSessions")
+	require.Len(t, resp.Sessions, 2, "len(Sessions)")
+	assert.Equal(t, "top-gpt", resp.Sessions[0].ID, "top session")
+	assert.Equal(t, 2, resp.Sessions[0].MessageCount, "top MessageCount")
+	assert.Equal(t, "top-mixed", resp.Sessions[1].ID, "second session")
+	assert.Equal(t, 1, resp.Sessions[1].MessageCount, "second MessageCount")
+}
+
+func TestGetAnalyticsTopSessionsModelFilterCapsAtTen(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	// Twelve sessions all match the gpt-4o filter, so the model-scoped
+	// re-sort drops the SQL LIMIT and ranks every matching session. The
+	// caller must still cap the result at the top ten. Session i carries
+	// i+1 gpt-4o assistant messages of ten output tokens each, so
+	// "top-cap-11" has the most messages and the most tokens.
+	for i := range 12 {
+		id := fmt.Sprintf("top-cap-%d", i)
+		count := i + 1
+		hour := fmt.Sprintf("%02d", 8+i)
+		insertSession(t, d, id, "alpha", func(s *Session) {
+			s.StartedAt = new("2024-06-01T" + hour + ":00:00Z")
+			s.EndedAt = new("2024-06-01T" + hour + ":30:00Z")
+			s.MessageCount = count
+			s.Agent = "gpt"
+			s.TotalOutputTokens = count * 10
+			s.HasTotalOutputTokens = true
+		})
+		msgs := make([]Message, count)
+		for j := range msgs {
+			msgs[j] = Message{
+				SessionID: id, Ordinal: j, Role: "assistant",
+				Content: "gpt", ContentLength: 3,
+				Timestamp:    "2024-06-01T" + hour + ":00:00Z",
+				Model:        "gpt-4o",
+				OutputTokens: 10, HasOutputTokens: true,
+			}
+		}
+		insertMessages(t, d, msgs...)
+	}
+
+	for _, metric := range []string{"messages", "output_tokens"} {
+		t.Run(metric, func(t *testing.T) {
+			resp, err := d.GetAnalyticsTopSessions(ctx, AnalyticsFilter{
+				From: "2024-06-01", To: "2024-06-01", Timezone: "UTC",
+				Model: "gpt-4o",
+			}, metric)
+			require.NoError(t, err, "GetAnalyticsTopSessions")
+			require.Len(t, resp.Sessions, 10,
+				"model-filtered top sessions capped at ten")
+			assert.Equal(t, "top-cap-11", resp.Sessions[0].ID,
+				"highest-count session ranks first")
+		})
+	}
 }
 
 func TestBuildWhereProjectFilter(t *testing.T) {
@@ -2723,6 +4721,110 @@ func TestGetAnalyticsSignalSessionsRejectsUnsupportedSignal(t *testing.T) {
 	if !errors.Is(err, ErrUnsupportedAnalyticsSignal) {
 		t.Fatalf("err = %v, want ErrUnsupportedAnalyticsSignal", err)
 	}
+}
+
+func TestGetAnalyticsSignalSessionsModelFilterUsesMatchingMessages(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "signal-mixed", "alpha", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T09:10:00Z")
+		s.MessageCount = 2
+		s.Agent = "mixed"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "signal-mixed", Ordinal: 0, Role: "assistant",
+			Content: "claude tool evidence", ContentLength: 20,
+			Timestamp:  "2024-06-01T09:05:00Z",
+			Model:      "claude-3-5-sonnet",
+			HasToolUse: true,
+		},
+		Message{
+			SessionID: "signal-mixed", Ordinal: 1, Role: "assistant",
+			Content: "gpt tool evidence", ContentLength: 17,
+			Timestamp:  "2024-06-01T09:06:00Z",
+			Model:      "gpt-4o",
+			HasToolUse: true,
+		},
+	)
+	require.NoError(t, d.UpdateSessionSignals(
+		"signal-mixed",
+		SessionSignalUpdate{ToolFailureSignalCount: 1},
+	))
+
+	resp, err := d.GetAnalyticsSignalSessions(
+		ctx,
+		AnalyticsFilter{
+			From:     "2024-06-01",
+			To:       "2024-06-01",
+			Timezone: "UTC",
+			Model:    "gpt-4o",
+		},
+		"tool_failure_signals",
+		10,
+	)
+	require.NoError(t, err, "GetAnalyticsSignalSessions")
+	require.Len(t, resp.Sessions, 1, "len(Sessions)")
+	assert.Equal(t, "gpt tool evidence", resp.Sessions[0].Excerpt)
+	require.NotNil(t, resp.Sessions[0].MessageOrdinal)
+	assert.Equal(t, 1, *resp.Sessions[0].MessageOrdinal)
+}
+
+func TestGetAnalyticsSignalSessionsModelFilterKeepsParserUserEvidence(
+	t *testing.T,
+) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	insertSession(t, d, "signal-parser-user", "alpha", func(s *Session) {
+		s.StartedAt = new("2024-06-01T09:00:00Z")
+		s.EndedAt = new("2024-06-01T09:10:00Z")
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.Agent = "mixed"
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "signal-parser-user", Ordinal: 0, Role: "user",
+			Content: "help", ContentLength: 4,
+			Timestamp: "2024-06-01T09:00:00Z",
+			Model:     "",
+		},
+		Message{
+			SessionID: "signal-parser-user", Ordinal: 1, Role: "assistant",
+			Content: "reply", ContentLength: 5,
+			Timestamp:  "2024-06-01T09:01:00Z",
+			Model:      "gpt-4o",
+			HasToolUse: true,
+		},
+	)
+	updateSignals(t, d, "signal-parser-user", SessionSignalUpdate{
+		QualitySignals: QualitySignals{
+			Version:          1,
+			ShortPromptCount: 1,
+		},
+	})
+
+	resp, err := d.GetAnalyticsSignalSessions(
+		ctx,
+		AnalyticsFilter{
+			From:     "2024-06-01",
+			To:       "2024-06-01",
+			Timezone: "UTC",
+			Model:    "gpt-4o",
+		},
+		"short_prompt_count",
+		10,
+	)
+	require.NoError(t, err, "GetAnalyticsSignalSessions")
+	require.Len(t, resp.Sessions, 1, "len(Sessions)")
+	assert.Equal(t, "help", resp.Sessions[0].Excerpt)
+	require.NotNil(t, resp.Sessions[0].MessageOrdinal)
+	assert.Equal(t, 0, *resp.Sessions[0].MessageOrdinal)
 }
 
 func TestParseEvidenceTimeAcceptsPostgresUTCFormat(t *testing.T) {

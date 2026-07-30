@@ -6,6 +6,7 @@ import {
   todayStr,
   type DateRange,
 } from "./dateRangeSelector.js";
+import { m } from "../../i18n/index.js";
 
 /**
  * The three ways a user can pick a range with the unified RangePicker. Every
@@ -42,34 +43,19 @@ export type RangeSelection =
 
 export interface RelativePreset {
   /** Compact pill label. */
-  label: string;
+  label: () => string;
   /** Trigger-button label. */
-  longLabel: string;
+  longLabel: () => string;
   /** Days back from today; 0 means all-time. */
   days: number;
 }
 
 export const RELATIVE_PRESETS: RelativePreset[] = [
-  { label: "7d", longLabel: "Last 7 days", days: 7 },
-  { label: "30d", longLabel: "Last 30 days", days: 30 },
-  { label: "90d", longLabel: "Last 90 days", days: 90 },
-  { label: "1y", longLabel: "Last year", days: 365 },
-  { label: "All", longLabel: "All time", days: 0 },
-];
-
-export const CALENDAR_UNITS: { unit: CalendarUnit; label: string }[] = [
-  { unit: "day", label: "Day" },
-  { unit: "week", label: "Week" },
-  { unit: "month", label: "Month" },
-];
-
-const MONTHS_SHORT = [
-  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-const MONTHS_LONG = [
-  "January", "February", "March", "April", "May", "June",
-  "July", "August", "September", "October", "November", "December",
+  { label: () => "7d", longLabel: () => m.shared_range_last_days({ count: 7 }), days: 7 },
+  { label: () => "30d", longLabel: () => m.shared_range_last_days({ count: 30 }), days: 30 },
+  { label: () => "90d", longLabel: () => m.shared_range_last_days({ count: 90 }), days: 90 },
+  { label: () => "1y", longLabel: m.shared_range_preset_last_year, days: 365 },
+  { label: m.shared_range_preset_all, longLabel: m.shared_range_preset_all_time, days: 0 },
 ];
 
 /** Parse a YYYY-MM-DD date string as local midnight. */
@@ -101,35 +87,6 @@ export function periodBounds(unit: CalendarUnit, anchor: string): DateRange {
   return { from: localDateStr(first), to: localDateStr(last) };
 }
 
-/**
- * Move a calendar anchor one period in `dir`: one day, seven days, or one
- * calendar month (clamping the day so Jan 31 -> Feb 28 rather than overflowing
- * into March). Mirrors the activity store's step() so period navigation is
- * unchanged.
- */
-export function stepAnchor(
-  unit: CalendarUnit,
-  anchor: string,
-  dir: -1 | 1,
-): string {
-  const d = parseLocal(anchor);
-  if (unit === "day") {
-    d.setDate(d.getDate() + dir);
-  } else if (unit === "week") {
-    d.setDate(d.getDate() + 7 * dir);
-  } else {
-    const target = new Date(d.getFullYear(), d.getMonth() + dir, 1);
-    const lastDay = new Date(
-      target.getFullYear(),
-      target.getMonth() + 1,
-      0,
-    ).getDate();
-    target.setDate(Math.min(d.getDate(), lastDay));
-    d.setTime(target.getTime());
-  }
-  return localDateStr(d);
-}
-
 /** Turn any selection into the concrete {from, to} the stores consume. */
 export function resolveRange(
   sel: RangeSelection,
@@ -143,68 +100,6 @@ export function resolveRange(
     case "custom":
       return { from: sel.from, to: sel.to };
   }
-}
-
-/** Human label for the period a calendar selection currently points at. */
-export function calendarLabel(unit: CalendarUnit, anchor: string): string {
-  const d = parseLocal(anchor);
-  if (unit === "day") {
-    return `${MONTHS_SHORT[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`;
-  }
-  if (unit === "month") {
-    return `${MONTHS_LONG[d.getMonth()]} ${d.getFullYear()}`;
-  }
-  const start = parseLocal(periodBounds("week", anchor).from);
-  return `Week of ${MONTHS_SHORT[start.getMonth()]} ${start.getDate()}`;
-}
-
-/** Short label for the trigger button reflecting the current selection. */
-export function rangeLabel(sel: RangeSelection): string {
-  if (sel.mode === "relative") {
-    const preset = RELATIVE_PRESETS.find((p) => p.days === sel.days);
-    return preset ? preset.longLabel : `Last ${sel.days} days`;
-  }
-  if (sel.mode === "calendar") {
-    return calendarLabel(sel.unit, sel.anchor);
-  }
-  if (!sel.from || !sel.to) return "Custom range";
-  const from = parseLocal(sel.from);
-  const to = parseLocal(sel.to);
-  if (sel.from === sel.to) {
-    return `${MONTHS_SHORT[from.getMonth()]} ${from.getDate()}`;
-  }
-  return (
-    `${MONTHS_SHORT[from.getMonth()]} ${from.getDate()} - ` +
-    `${MONTHS_SHORT[to.getMonth()]} ${to.getDate()}`
-  );
-}
-
-/**
- * Build the default selection for a tab the user just switched to, seeded from
- * the current selection so switching tabs never jumps the visible range
- * unexpectedly. `current` supplies a sensible anchor/range; `earliestSession`
- * feeds the "All" fallback.
- */
-export function defaultForMode(
-  mode: RangeMode,
-  current: RangeSelection,
-  earliestSession?: string | null,
-): RangeSelection {
-  if (mode === "relative") {
-    return { mode: "relative", days: 30 };
-  }
-  if (mode === "calendar") {
-    const anchor =
-      current.mode === "custom" && current.to
-        ? current.to
-        : current.mode === "calendar"
-          ? current.anchor
-          : todayStr();
-    const unit = current.mode === "calendar" ? current.unit : "week";
-    return { mode: "calendar", unit, anchor };
-  }
-  const resolved = resolveRange(current, earliestSession);
-  return { mode: "custom", from: resolved.from, to: resolved.to };
 }
 
 /**

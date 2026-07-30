@@ -1,7 +1,7 @@
 <script lang="ts">
+  import { CopyButton, EmptyState } from "@kenn-io/kit-ui";
+  import { m } from "../../i18n/index.js";
   import {
-    CheckIcon,
-    CopyIcon,
     ExternalLinkIcon,
     PinIcon,
     XIcon,
@@ -92,29 +92,25 @@
 <div class="pinned-page">
   <div class="pinned-header">
     <PinIcon size="18" strokeWidth="2" class="pin-icon" aria-hidden="true" />
-    <h2>Pinned Messages</h2>
+    <h2>{m.pinned_title()}</h2>
     {#if pins.pins.length > 0}
       <span class="pin-count">{pins.pins.length}</span>
     {/if}
   </div>
 
   {#if pins.loading}
-    <div class="loading-state">Loading pins...</div>
+    <div class="loading-state">{m.pinned_loading()}</div>
   {:else if pins.pins.length === 0 && sessions.filters.project}
-    <div class="empty-state">
-      <p class="empty-title">No pinned messages for this project</p>
-      <p class="empty-desc">
-        Try selecting a different project or clear the project filter.
-      </p>
-    </div>
+    <EmptyState
+      title={m.pinned_none_for_project()}
+      description={m.pinned_none_for_project_hint()}
+    />
   {:else if pins.pins.length === 0}
-    <div class="empty-state">
-      <PinIcon size="40" strokeWidth="1.6" class="empty-icon" aria-hidden="true" />
-      <p class="empty-title">No pinned messages</p>
-      <p class="empty-desc">
-        Pin messages from any session by clicking the pin icon in the message header.
-      </p>
-    </div>
+    <EmptyState title={m.pinned_none()} description={m.pinned_none_hint()}>
+      {#snippet icon()}
+        <PinIcon size="40" strokeWidth="1.6" aria-hidden="true" />
+      {/snippet}
+    </EmptyState>
   {:else}
     <div class="pin-list">
       {#each pins.pins as pin (pin.id)}
@@ -156,7 +152,7 @@
             <button
               class="pin-card-meta"
               onclick={() => navigateToPin(pin.session_id, pin.ordinal)}
-              title="Go to message"
+              title={m.pinned_go_to_message()}
             >
               <ExternalLinkIcon size="10" strokeWidth="2.2" aria-hidden="true" />
               <span>{info.project}</span>
@@ -167,23 +163,20 @@
                   class="expand-btn"
                   onclick={() => toggleExpand(pin.id)}
                 >
-                  {isExpanded ? "Collapse" : "Expand"}
+                  {isExpanded ? m.pinned_collapse() : m.pinned_expand()}
                 </button>
               {/if}
-              <button
-                class="copy-btn"
-                title="Copy message"
+              <CopyButton
+                copied={copiedId === pin.id}
+                ariaLabel={m.pinned_copy_message()}
+                copiedAriaLabel={m.pinned_copied_message()}
+                title={m.pinned_copy_message()}
+                copiedTitle={m.pinned_copied_message()}
                 onclick={() => handleCopy(pin.id, pin.content)}
-              >
-                {#if copiedId === pin.id}
-                  <CheckIcon size="12" strokeWidth="2.4" aria-hidden="true" />
-                {:else}
-                  <CopyIcon size="12" strokeWidth="2" aria-hidden="true" />
-                {/if}
-              </button>
+              />
               <button
                 class="unpin-btn"
-                title="Unpin"
+                title={m.pinned_unpin()}
                 onclick={() => pins.unpin(pin.session_id, pin.message_id)}
               >
                 <XIcon size="12" strokeWidth="2.4" aria-hidden="true" />
@@ -206,7 +199,7 @@
   .pinned-header {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: var(--space-4);
     margin-bottom: 28px;
   }
 
@@ -223,7 +216,7 @@
 
   .pin-count {
     background: var(--accent-blue);
-    color: white;
+    color: var(--accent-blue-foreground);
     font-size: 11px;
     font-weight: 600;
     padding: 1px 7px;
@@ -235,29 +228,6 @@
     color: var(--text-muted);
     padding: 40px 0;
     font-size: 13px;
-  }
-
-  .empty-state {
-    text-align: center;
-    padding: 60px 20px;
-    color: var(--text-muted);
-  }
-
-  :global(.empty-icon) {
-    opacity: 0.15;
-    margin-bottom: 16px;
-  }
-
-  .empty-title {
-    font-size: 16px;
-    font-weight: 500;
-    color: var(--text-secondary);
-    margin: 0 0 6px;
-  }
-
-  .empty-desc {
-    font-size: 13px;
-    margin: 0;
   }
 
   .pin-list {
@@ -293,7 +263,7 @@
     justify-content: center;
     font-size: 9px;
     font-weight: 700;
-    color: white;
+    color: var(--accent-purple-foreground);
     flex-shrink: 0;
     line-height: 1;
     background: var(--accent-purple);
@@ -301,6 +271,7 @@
 
   .role-badge.user {
     background: var(--accent-blue);
+    color: var(--accent-blue-foreground);
   }
 
   .pin-agent {
@@ -418,7 +389,7 @@
   .pin-card-meta {
     display: flex;
     align-items: center;
-    gap: 5px;
+    gap: var(--space-2);
     font-size: 10px;
     color: var(--text-muted);
     background: none;
@@ -474,26 +445,6 @@
   .unpin-btn:hover {
     background: color-mix(in srgb, var(--accent-red, #e55) 12%, transparent);
     color: var(--accent-red, #e55);
-  }
-
-  .copy-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 26px;
-    height: 26px;
-    border: none;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--text-muted);
-    cursor: pointer;
-    flex-shrink: 0;
-    transition: background 0.15s, color 0.15s;
-  }
-
-  .copy-btn:hover {
-    background: var(--bg-surface-hover);
-    color: var(--text-secondary);
   }
 
   /* Make expanded cards span full width in grid */

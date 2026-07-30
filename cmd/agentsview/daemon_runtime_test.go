@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -12,9 +14,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/db"
@@ -29,6 +35,15 @@ func requirePOSIXSignals(t *testing.T, reason string) {
 	if runtime.GOOS == "windows" {
 		t.Skip(reason)
 	}
+}
+
+func setStartProbeTickForTest(t *testing.T, tick time.Duration) {
+	t.Helper()
+	require.Positive(t, tick)
+	old := time.Duration(atomic.SwapInt64(&startProbeTickNanos, int64(tick)))
+	t.Cleanup(func() {
+		atomic.StoreInt64(&startProbeTickNanos, int64(old))
+	})
 }
 
 // startSleepProcess starts a long-lived child process and reaps it during
@@ -137,6 +152,10 @@ func withRuntimeVersion(v string) runtimeRecordOption {
 	return func(rec *daemon.RuntimeRecord) { rec.Version = v }
 }
 
+func withRuntimeStartedAt(startedAt time.Time) runtimeRecordOption {
+	return func(rec *daemon.RuntimeRecord) { rec.StartedAt = startedAt }
+}
+
 func withRuntimePID(pid int) runtimeRecordOption {
 	return func(rec *daemon.RuntimeRecord) { rec.PID = pid }
 }
@@ -220,6 +239,200 @@ func runtimeTestDir(t *testing.T) string {
 	return dir
 }
 
+// TestSameProcessStartMarkerNeverReportsExternal hammers the race between
+// markDaemonStarting's flock-acquire-then-register sequence and the
+// isExternalDaemonStarting probe: a start marker owned by this process must
+// never be classified as an external daemon startup, even mid-acquisition.
+// Misclassification makes waitForExternalServeStartup return before the
+// same-process owner publishes its runtime record, which surfaced as a flaky
+// "serve --background is already in progress" error in
+// TestEnsureBackgroundServeConcurrentLaunchConvergesOnDaemon.
+func TestSameProcessStartMarkerNeverReportsExternal(t *testing.T) {
+	dir := runtimeTestDir(t)
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			MarkDaemonStarting(dir)
+			UnmarkDaemonStarting(dir)
+		}
+	})
+	t.Cleanup(func() {
+		close(stop)
+		wg.Wait()
+		UnmarkDaemonStarting(dir)
+	})
+
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		require.False(t, isExternalDaemonStarting(dir),
+			"same-process start marker reported as external")
+	}
+}
+
+func holdExternalDaemonStartLock(t *testing.T, dataDir string) func() {
+	t.Helper()
+	stdin := startExternalDaemonStartLockHelper(t, dataDir)
+
+	var once sync.Once
+	unlock := func() {
+		once.Do(func() { _ = stdin.Close() })
+	}
+	t.Cleanup(unlock)
+	return unlock
+}
+
+func startExternalDaemonStartLockHelper(t *testing.T, dataDir string) io.Closer {
+	t.Helper()
+	cmd := exec.Command(
+		os.Args[0],
+		"-test.run=^TestHoldExternalDaemonStartLockHelperProcess$",
+	)
+	cmd.Env = append(
+		os.Environ(),
+		"AGENTSVIEW_HOLD_EXTERNAL_START_LOCK_HELPER=1",
+		"AGENTSVIEW_HOLD_EXTERNAL_START_LOCK_DATA_DIR="+dataDir,
+	)
+	stdin, err := cmd.StdinPipe()
+	require.NoError(t, err)
+	stdout, err := cmd.StdoutPipe()
+	require.NoError(t, err)
+	cmd.Stderr = os.Stderr
+	require.NoError(t, cmd.Start())
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	t.Cleanup(func() {
+		_ = stdin.Close()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			_ = cmd.Process.Kill()
+			<-done
+		}
+	})
+
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil {
+		_ = cmd.Process.Kill()
+		require.NoError(t, err)
+	}
+	if strings.TrimSpace(line) != "ready" {
+		_ = cmd.Process.Kill()
+		require.Equal(t, "ready", strings.TrimSpace(line))
+	}
+	require.Eventually(t, func() bool {
+		return isExternalDaemonStarting(dataDir)
+	}, 2*time.Second, 10*time.Millisecond,
+		"external daemon start lock should be visible to parent")
+	return stdin
+}
+
+func holdExternalBackgroundLaunchLock(t *testing.T, dataDir string) func() {
+	t.Helper()
+	stdin := startExternalBackgroundLaunchLockHelper(t, dataDir)
+
+	var once sync.Once
+	unlock := func() {
+		once.Do(func() { _ = stdin.Close() })
+	}
+	t.Cleanup(unlock)
+	return unlock
+}
+
+func startExternalBackgroundLaunchLockHelper(
+	t *testing.T,
+	dataDir string,
+) io.Closer {
+	t.Helper()
+	cmd := exec.Command(
+		os.Args[0],
+		"-test.run=^TestHoldExternalBackgroundLaunchLockHelperProcess$",
+	)
+	cmd.Env = append(
+		os.Environ(),
+		"AGENTSVIEW_HOLD_EXTERNAL_BACKGROUND_LAUNCH_LOCK_HELPER=1",
+		"AGENTSVIEW_HOLD_EXTERNAL_BACKGROUND_LAUNCH_LOCK_DATA_DIR="+dataDir,
+	)
+	stdin, err := cmd.StdinPipe()
+	require.NoError(t, err)
+	stdout, err := cmd.StdoutPipe()
+	require.NoError(t, err)
+	cmd.Stderr = os.Stderr
+	require.NoError(t, cmd.Start())
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	t.Cleanup(func() {
+		_ = stdin.Close()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			_ = cmd.Process.Kill()
+			<-done
+		}
+	})
+
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil {
+		_ = cmd.Process.Kill()
+		require.NoError(t, err)
+	}
+	if strings.TrimSpace(line) != "ready" {
+		_ = cmd.Process.Kill()
+		require.Equal(t, "ready", strings.TrimSpace(line))
+	}
+	require.Eventually(t, func() bool {
+		return isBackgroundLaunchActive(dataDir)
+	}, 2*time.Second, 10*time.Millisecond,
+		"external background launch lock should be visible to parent")
+	return stdin
+}
+
+func TestHoldExternalDaemonStartLockHelperProcess(t *testing.T) {
+	if os.Getenv("AGENTSVIEW_HOLD_EXTERNAL_START_LOCK_HELPER") != "1" {
+		return
+	}
+	dataDir := os.Getenv("AGENTSVIEW_HOLD_EXTERNAL_START_LOCK_DATA_DIR")
+	require.NotEmpty(t, dataDir)
+	lockPath, err := runtimeStore(dataDir).LockPath()
+	require.NoError(t, err)
+	lock := flock.New(lockPath)
+	locked, err := lock.TryLock()
+	require.NoError(t, err)
+	require.True(t, locked)
+	fmt.Println("ready")
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	require.NoError(t, lock.Unlock())
+}
+
+func TestHoldExternalBackgroundLaunchLockHelperProcess(t *testing.T) {
+	if os.Getenv(
+		"AGENTSVIEW_HOLD_EXTERNAL_BACKGROUND_LAUNCH_LOCK_HELPER",
+	) != "1" {
+		return
+	}
+	dataDir := os.Getenv(
+		"AGENTSVIEW_HOLD_EXTERNAL_BACKGROUND_LAUNCH_LOCK_DATA_DIR",
+	)
+	require.NotEmpty(t, dataDir)
+	require.NoError(t, os.MkdirAll(dataDir, 0o700))
+	lock := flock.New(backgroundLaunchLockPath(dataDir))
+	locked, err := lock.TryLock()
+	require.NoError(t, err)
+	require.True(t, locked)
+	fmt.Println("ready")
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	require.NoError(t, lock.Unlock())
+}
+
 func serverEndpoint(t *testing.T, ts *httptest.Server) testDaemonEndpoint {
 	t.Helper()
 	u, err := url.Parse(ts.URL)
@@ -243,6 +456,22 @@ func newPingDaemon(t *testing.T) testDaemonEndpoint {
 	}))
 	t.Cleanup(ts.Close)
 	return serverEndpoint(t, ts)
+}
+
+func newPingDaemonWithProbeSignal(t *testing.T) (testDaemonEndpoint, <-chan struct{}) {
+	t.Helper()
+	pinged := make(chan struct{})
+	var pingedOnce sync.Once
+	ping := daemon.NewPingHandler(daemon.PingHandlerOptions{
+		Service: daemonService,
+		Version: "test",
+	})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pingedOnce.Do(func() { close(pinged) })
+		ping.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	return serverEndpoint(t, ts), pinged
 }
 
 func testPingServer(t *testing.T) (host string, port int) {

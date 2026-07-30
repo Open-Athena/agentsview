@@ -2,8 +2,11 @@ package server
 
 import (
 	"context"
+	"errors"
+	"net/http"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/service"
 	"go.kenn.io/agentsview/internal/update"
 )
 
@@ -12,8 +15,10 @@ func (s *Server) registerMetadataRoutes() {
 
 	get(s, group, "/projects", "List projects", s.humaListProjects)
 	get(s, group, "/machines", "List machines", s.humaListMachines)
+	get(s, group, "/branches", "List branches", s.humaListBranches)
 	get(s, group, "/agents", "List agents", s.humaListAgents)
 	get(s, group, "/stats", "Get stats", s.humaGetStats)
+	get(s, group, "/session-stats", "Get session stats", s.humaGetSessionStats)
 	get(s, group, "/version", "Get server version", s.humaGetVersion)
 	get(s, group, "/update/check", "Check for updates", s.humaCheckUpdate)
 }
@@ -22,12 +27,27 @@ type statsInput struct {
 	BoolIncludeInput
 }
 
+type sessionStatsInput struct {
+	Since                 string   `query:"since" doc:"Start of window"`
+	Until                 string   `query:"until" doc:"End of window"`
+	Agent                 string   `query:"agent" doc:"Filter by agent"`
+	IncludeProjects       []string `query:"include_project" doc:"Restrict to these projects"`
+	ExcludeProjects       []string `query:"exclude_project" doc:"Exclude these projects"`
+	Timezone              string   `query:"timezone" doc:"IANA timezone name"`
+	IncludeGitOutcomes    bool     `query:"include_git_outcomes" doc:"Include git-derived outcome stats"`
+	IncludeGitHubOutcomes bool     `query:"include_github_outcomes" doc:"Include GitHub PR outcome stats"`
+}
+
 type projectsResponse struct {
 	Projects []db.ProjectInfo `json:"projects"`
 }
 
 type machinesResponse struct {
 	Machines []string `json:"machines"`
+}
+
+type branchesResponse struct {
+	Branches []db.BranchInfo `json:"branches"`
 }
 
 type agentsResponse struct {
@@ -43,6 +63,41 @@ func (s *Server) humaGetStats(
 		return nil, serverError(err)
 	}
 	return &jsonOutput[db.Stats]{Body: stats}, nil
+}
+
+func (s *Server) humaGetSessionStats(
+	ctx context.Context,
+	in *sessionStatsInput,
+) (*jsonOutput[*service.SessionStats], error) {
+	githubToken := ""
+	if in.IncludeGitHubOutcomes {
+		githubToken = s.githubToken(ctx)
+	}
+	stats, err := s.sessions.Stats(ctx, service.StatsFilter{
+		Since:                 in.Since,
+		Until:                 in.Until,
+		Agent:                 in.Agent,
+		IncludeProjects:       in.IncludeProjects,
+		ExcludeProjects:       in.ExcludeProjects,
+		Timezone:              in.Timezone,
+		IncludeGitOutcomes:    in.IncludeGitOutcomes,
+		IncludeGitHubOutcomes: in.IncludeGitHubOutcomes,
+		GHToken:               githubToken,
+	})
+	if err != nil {
+		if handled := handleHumaContextError(err); handled != nil {
+			return nil, handled
+		}
+		if handled := handleHumaReadOnly(err); handled != nil {
+			return nil, handled
+		}
+		var inputErr *db.StatsInputError
+		if errors.As(err, &inputErr) {
+			return nil, apiError(http.StatusBadRequest, inputErr.Msg)
+		}
+		return nil, internalError("session stats error", err)
+	}
+	return &jsonOutput[*service.SessionStats]{Body: stats}, nil
 }
 
 func (s *Server) humaListProjects(
@@ -65,6 +120,17 @@ func (s *Server) humaListMachines(
 		return nil, serverError(err)
 	}
 	return &jsonOutput[machinesResponse]{Body: machinesResponse{Machines: machines}}, nil
+}
+
+func (s *Server) humaListBranches(
+	ctx context.Context,
+	in *statsInput,
+) (*jsonOutput[branchesResponse], error) {
+	branches, err := s.db.GetBranches(ctx, !in.IncludeOneShot, !in.IncludeAutomated)
+	if err != nil {
+		return nil, serverError(err)
+	}
+	return &jsonOutput[branchesResponse]{Body: branchesResponse{Branches: branches}}, nil
 }
 
 func (s *Server) humaListAgents(

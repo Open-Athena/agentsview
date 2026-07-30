@@ -22,6 +22,7 @@ export interface AnalyticsSummary {
   total_messages: number;
   total_output_tokens?: number;
   token_reporting_sessions?: number;
+  models?: string[];
   active_projects: number;
   active_days: number;
   avg_messages: number;
@@ -139,6 +140,7 @@ export interface TopSession {
   message_count: number;
   output_tokens: number;
   duration_min: number;
+  active_duration_min: number;
   /** ISO timestamps used by the StatusDot component to compute
    * the active/stale/unclean tier — the column needs the same
    * recency inputs as the sidebar list. */

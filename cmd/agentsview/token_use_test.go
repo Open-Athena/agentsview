@@ -2,24 +2,23 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
 
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
-// newTestDB opens a fresh SQLite DB in a temp dir for a single test.
+// newTestDB opens a fresh SQLite DB for a single test.
 func newTestDB(t *testing.T) *db.DB {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "test.db")
-	d, err := db.Open(path)
-	require.NoError(t, err, "opening test db")
-	t.Cleanup(func() { d.Close() })
-	return d
+	return dbtest.OpenTestDB(t)
 }
 
 // upsertSession inserts a session with minimal required fields.
@@ -228,9 +227,8 @@ func TestResolveSessionID_CanonicalCodexID_OnDiskNotInDB(t *testing.T) {
 	ctx := context.Background()
 
 	// Canonical "codex:<uuid>" not yet synced but present on
-	// disk must resolve via the canonical disk probe — which
-	// strips the prefix before calling FindSourceFunc (the
-	// underlying finder rejects colon-bearing IDs).
+	// disk must resolve via the canonical disk probe, which strips
+	// the prefix before asking the agent source lookup.
 	codexDir := filepath.Join(t.TempDir(), "codex-sessions")
 	uuid := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 	dayDir := filepath.Join(codexDir, "2026", "04", "17")
@@ -247,6 +245,82 @@ func TestResolveSessionID_CanonicalCodexID_OnDiskNotInDB(t *testing.T) {
 	got, known := resolveRawSessionID(ctx, d, agentDirs, input)
 	assert.Equal(t, input, got, "canonical on disk")
 	assert.True(t, known, "canonical disk probe")
+}
+
+func TestResolveSessionID_ProviderAuthoritativeCursorOnDiskNotInDB(t *testing.T) {
+	d := newTestDB(t)
+	ctx := context.Background()
+
+	cursorDir := t.TempDir()
+	rawID := "provider-cursor"
+	transcriptPath := filepath.Join(
+		cursorDir,
+		"Users-fiona-Documents-demo",
+		"agent-transcripts",
+		rawID+".jsonl",
+	)
+	require.NoError(t, os.MkdirAll(filepath.Dir(transcriptPath), 0o755))
+	require.NoError(t, os.WriteFile(
+		transcriptPath,
+		[]byte(`{"role":"user","content":"hi"}`+"\n"),
+		0o644,
+	))
+
+	agentDirs := map[parser.AgentType][]string{
+		parser.AgentCursor: {cursorDir},
+	}
+	got, known := resolveRawSessionID(ctx, d, agentDirs, rawID)
+	assert.Equal(t, "cursor:"+rawID, got,
+		"provider FindSource should resolve unsynced raw cursor IDs")
+	assert.True(t, known, "provider disk probe")
+
+	got, known = resolveRawSessionID(ctx, d, agentDirs, "cursor:"+rawID)
+	assert.Equal(t, "cursor:"+rawID, got,
+		"canonical provider ID should resolve via provider FindSource")
+	assert.True(t, known, "canonical provider disk probe")
+}
+
+func TestResolveSessionID_DevinCanonicalID_OnDiskNotInDB(t *testing.T) {
+	d := newTestDB(t)
+	ctx := context.Background()
+
+	root := t.TempDir()
+	cliDir := filepath.Join(root, "cli")
+	transcriptsDir := filepath.Join(cliDir, "transcripts")
+	require.NoError(t, os.MkdirAll(transcriptsDir, 0o755))
+	dbPath := filepath.Join(cliDir, "sessions.db")
+	devinDB, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, devinDB.Close()) })
+	_, err = devinDB.Exec(`
+		CREATE TABLE sessions (
+			id TEXT PRIMARY KEY,
+			title TEXT,
+			working_directory TEXT,
+			model TEXT,
+			created_at INTEGER,
+			last_activity_at INTEGER,
+			hidden INTEGER NOT NULL DEFAULT 0
+		);
+		INSERT INTO sessions
+			(id, title, working_directory, model, created_at, last_activity_at, hidden)
+		VALUES
+			('session-123', 'Devin session', '/cwd/devin', 'devin-1', 1700000000000, 1700000001000, 0);
+	`)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(transcriptsDir, "session-123.json"),
+		[]byte(`{"messages":[]}`+"\n"),
+		0o644,
+	))
+
+	agentDirs := map[parser.AgentType][]string{
+		parser.AgentDevin: {root},
+	}
+	got, known := resolveRawSessionID(ctx, d, agentDirs, "devin:session-123")
+	assert.Equal(t, "devin:session-123", got)
+	assert.True(t, known,
+		"provider-backed Devin IDs should resolve via FindSource even though FileBased is false")
 }
 
 func TestResolveSessionID_RawOpenClawCollidesWithCodexPrefix(t *testing.T) {
@@ -289,6 +363,34 @@ func TestResolveSessionID_UnderscoreID_NoFalseMatch(t *testing.T) {
 	got, known := resolveRawSessionID(ctx, d, nil, raw)
 	assert.Equal(t, real, got, "underscore is literal")
 	assert.True(t, known)
+}
+
+func TestAgentHasDiskSourceLookupIncludesFileBackedAgentsAndDevin(t *testing.T) {
+	for _, agent := range []parser.AgentType{
+		parser.AgentGptme,
+		parser.AgentPi,
+		parser.AgentOMP,
+		parser.AgentWorkBuddy,
+		parser.AgentCortex,
+		parser.AgentKimi,
+		parser.AgentQwenPaw,
+		parser.AgentOpenHands,
+		parser.AgentCursor,
+		parser.AgentDevin,
+		parser.AgentVibe,
+		parser.AgentClaude,
+		parser.AgentCowork,
+		parser.AgentHermes,
+	} {
+		def, ok := parser.AgentByType(agent)
+		require.True(t, ok, "agent %s", agent)
+		assert.True(t, agentHasDiskSourceLookup(def),
+			"token-use source probe must include %s", agent)
+	}
+	warpDef, ok := parser.AgentByType(parser.AgentWarp)
+	require.True(t, ok, "agent %s", parser.AgentWarp)
+	assert.False(t, agentHasDiskSourceLookup(warpDef),
+		"token-use source probe must exclude non-Devin non-file-backed agents")
 }
 
 func TestUsageExitCode_TokenData(t *testing.T) {

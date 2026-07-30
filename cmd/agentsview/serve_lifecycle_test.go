@@ -1,7 +1,10 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"net"
+	"net/http/httptest"
 	"os"
 	"strconv"
 	"strings"
@@ -68,6 +71,150 @@ func TestServeStatusLinesReadOnly(t *testing.T) {
 	out := strings.Join(serveStatusLines(rt), "\n")
 	assert.Contains(t, out, "mode:    read-only")
 	assert.NotContains(t, out, "uptime:", "zero StartedAt must omit uptime")
+}
+
+func TestRunServeStatusReportsIncompatibleWritableDaemon(t *testing.T) {
+	dir := runtimeTestDir(t)
+	host, port := testPingServer(t)
+	writeRuntimeRecordFixture(t, dir, daemonRuntimeRecord(
+		host, port,
+		withRuntimeVersion("1.0.0"),
+		withRuntimeAPIVersion(0),
+	))
+
+	out := captureStdout(t, func() {
+		runServeStatus(config.Config{DataDir: dir})
+	})
+
+	assert.Contains(t, out, "incompatible")
+	assert.Contains(t, out, "running")
+	assert.Contains(t, out, fmt.Sprintf("http://%s:%d", host, port))
+	assert.Contains(t, out, strconv.Itoa(os.Getpid()))
+	assert.Contains(t, out, "daemon version")
+	assert.Contains(t, out, "binary version")
+	assert.Contains(t, out, "API version")
+	assert.Contains(t, out, "data version")
+	assert.Contains(t, out, "compatibility")
+	assert.Contains(t, out, "serve --replace")
+	assert.Contains(t, out, "serve stop")
+	assert.NotContains(t, out, "not responding")
+}
+
+func TestRunServeStatusPrefersIncompatibleWritableOverReadOnly(t *testing.T) {
+	dir := runtimeTestDir(t)
+	readOnlyHost, readOnlyPort := testPingServer(t)
+	_, err := WriteDaemonRuntime(
+		dir, readOnlyHost, readOnlyPort, "1.0.0", true,
+	)
+	require.NoError(t, err)
+
+	writablePID := startSleepProcess(t)
+	writableEndpoint := newPingDaemonWithPID(t, writablePID)
+	_, err = writeRuntimeRecordForTest(dir, daemonRuntimeRecord(
+		writableEndpoint.Host, writableEndpoint.Port,
+		withRuntimePID(writablePID),
+		withRuntimeVersion("1.0.0"),
+		withRuntimeAPIVersion(0),
+	))
+	require.NoError(t, err)
+
+	out := captureStdout(t, func() {
+		runServeStatus(config.Config{DataDir: dir})
+	})
+
+	assert.Contains(t, out, "incompatible")
+	assert.Contains(t, out, strconv.Itoa(writablePID))
+	assert.Contains(t, out, "serve --replace")
+	assert.NotContains(t, out, "mode:    read-only")
+}
+
+func TestRunServeStatusPrefersStartingOverReadOnly(t *testing.T) {
+	dir := runtimeTestDir(t)
+	readOnlyHost, readOnlyPort := testPingServer(t)
+	_, err := WriteDaemonRuntime(
+		dir, readOnlyHost, readOnlyPort, "1.0.0", true,
+	)
+	require.NoError(t, err)
+	MarkDaemonStarting(dir)
+	t.Cleanup(func() { UnmarkDaemonStarting(dir) })
+
+	out := captureStdout(t, func() {
+		runServeStatus(config.Config{DataDir: dir})
+	})
+
+	assert.Contains(t, out, "agentsview is starting up.")
+	assert.NotContains(t, out, "mode:    read-only")
+}
+
+func TestRunServeStatusReportsStartupProgress(t *testing.T) {
+	dir := runtimeTestDir(t)
+	MarkDaemonStarting(dir)
+	t.Cleanup(func() { UnmarkDaemonStarting(dir) })
+
+	// Backdated started_at keeps the elapsed assertion stable.
+	state, err := json.Marshal(startupState{
+		PID:       os.Getpid(),
+		StartedAt: time.Now().Add(-90 * time.Second),
+		Phase:     "full resync",
+		Detail:    "claude: 12/38 sessions (32%)",
+		LogPath:   serveLogPath(dir),
+		UpdatedAt: time.Now(),
+	})
+	require.NoError(t, err, "marshal startup state")
+	require.NoError(t, os.WriteFile(startupStatePath(dir), state, 0o600),
+		"write startup state")
+
+	out := captureStdout(t, func() {
+		runServeStatus(config.Config{DataDir: dir})
+	})
+
+	assert.Contains(t, out, "agentsview is starting up.")
+	assert.Contains(t, out, fmt.Sprintf("pid:     %d", os.Getpid()))
+	// runServeStatus computes elapsed from a live clock, so allow a
+	// few seconds of scheduler slack; exact rendering is covered by
+	// the fixed-clock serveStartingStatusLines unit test.
+	assert.Regexp(t, `elapsed: 1m3[0-5]s`, out)
+	assert.Contains(t, out,
+		"phase:   full resync: claude: 12/38 sessions (32%)")
+	assert.Contains(t, out, "log:     "+serveLogPath(dir))
+}
+
+func TestRunServeStatusStartingWithoutStateFallsBack(t *testing.T) {
+	dir := runtimeTestDir(t)
+	MarkDaemonStarting(dir)
+	t.Cleanup(func() { UnmarkDaemonStarting(dir) })
+	require.NoError(t, os.WriteFile(
+		startupStatePath(dir), []byte("{corrupt"), 0o600,
+	), "plant corrupt state file")
+
+	out := captureStdout(t, func() {
+		runServeStatus(config.Config{DataDir: dir})
+	})
+
+	assert.Contains(t, out, "agentsview is starting up.")
+	assert.NotContains(t, out, "phase:")
+}
+
+func TestUnmarkDaemonStartingRemovesStartupState(t *testing.T) {
+	dir := runtimeTestDir(t)
+	MarkDaemonStarting(dir)
+	newStartupStateWriter(dir, time.Now).SetPhase("opening database")
+	require.NotNil(t, readStartupState(dir), "state written during startup")
+
+	UnmarkDaemonStarting(dir)
+	assert.Nil(t, readStartupState(dir),
+		"state must not outlive the start lock")
+}
+
+func newPingDaemonWithPID(t *testing.T, pid int) testDaemonEndpoint {
+	t.Helper()
+	ts := httptest.NewServer(daemon.NewPingHandler(daemon.PingHandlerOptions{
+		Service: daemonService,
+		Version: "test",
+		PID:     pid,
+	}))
+	t.Cleanup(ts.Close)
+	return serverEndpoint(t, ts)
 }
 
 func TestAcquireBackgroundLaunchLockSerializes(t *testing.T) {

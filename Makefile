@@ -20,7 +20,7 @@ AIR_BIN := $(shell if command -v air >/dev/null 2>&1; then command -v air; \
 	elif [ -x "$(GOPATH_FIRST)/bin/air" ]; then printf "%s" "$(GOPATH_FIRST)/bin/air"; \
 	fi)
 
-.PHONY: build build-release install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app docs-install docs-build docs-serve docs-check docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy test test-short bench-backends test-postgres test-postgres-ci postgres-up postgres-down test-ssh test-ssh-ci ssh-up ssh-down e2e e2e-duckdb vet lint lint-ci lint-golangci lint-golangci-ci nilaway nilaway-golangci-build lint-tools tidy clean release release-darwin-arm64 release-darwin-amd64 release-linux-amd64 install-hooks ensure-embed-dir pricing-snapshot dev-snapshot help
+.PHONY: build build-release install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app docs-install docs-build docs-serve docs-check docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy test test-short bench-backends bench-gate bench-gate-config test-postgres test-postgres-ci test-s3 postgres-up postgres-down test-ssh test-ssh-ci ssh-up ssh-down e2e e2e-duckdb vet lint lint-ci lint-golangci lint-golangci-ci nilaway nilaway-golangci-build lint-tools tidy clean release release-darwin-arm64 release-darwin-amd64 release-linux-amd64 install-hooks ensure-embed-dir pricing-snapshot dev-snapshot help
 
 # Ensure go:embed has at least one file (no-op if frontend is built)
 ensure-embed-dir:
@@ -45,11 +45,14 @@ build-release: pricing-snapshot frontend
 	CGO_ENABLED=1 go build -tags fts5 -ldflags="$(LDFLAGS_RELEASE)" -trimpath -o agentsview ./cmd/agentsview
 	@chmod +x agentsview
 
-# Install to ~/.local/bin, $GOBIN, or $GOPATH/bin
+# Install to ~/.local/bin, $GOBIN, or $GOPATH/bin.
+# Copy to a temp file in the destination directory, then rename into place.
+# Rename is atomic and produces a fresh inode, so overwriting the binary while
+# an old agentsview is still running does not leave the kernel validating exec
+# against stale code-signature pages (which SIGKILLs the new process on macOS).
 install: build-release
 	@if [ -d "$(HOME)/.local/bin" ]; then \
-		echo "Installing to ~/.local/bin/agentsview"; \
-		cp agentsview "$(HOME)/.local/bin/agentsview"; \
+		INSTALL_DIR="$(HOME)/.local/bin"; \
 	else \
 		INSTALL_DIR="$${GOBIN:-$$(go env GOBIN)}"; \
 		if [ -z "$$INSTALL_DIR" ]; then \
@@ -57,9 +60,16 @@ install: build-release
 			INSTALL_DIR="$$GOPATH_FIRST/bin"; \
 		fi; \
 		mkdir -p "$$INSTALL_DIR"; \
-		echo "Installing to $$INSTALL_DIR/agentsview"; \
-		cp agentsview "$$INSTALL_DIR/agentsview"; \
-	fi
+	fi; \
+	echo "Installing to $$INSTALL_DIR/agentsview"; \
+	tmp="$$(mktemp "$$INSTALL_DIR/agentsview.tmp.XXXXXX")" || exit $$?; \
+	cleanup() { rm -f "$$tmp"; }; \
+	trap cleanup EXIT HUP INT TERM; \
+	cp agentsview "$$tmp" && chmod 755 "$$tmp" && mv -f "$$tmp" "$$INSTALL_DIR/agentsview"; \
+	status=$$?; \
+	trap - EXIT HUP INT TERM; \
+	cleanup; \
+	exit $$status
 
 # Build frontend SPA and copy into embed directory
 frontend:
@@ -188,13 +198,29 @@ desktop-windows-installer:
 	cd desktop && npm ci && npm run tauri:build:windows
 	mkdir -p $(DESKTOP_DIST_DIR)/windows
 	rm -f $(DESKTOP_DIST_DIR)/windows/*.exe
-	@exe_count=$$(find desktop/src-tauri/target/release/bundle/nsis \
-		-maxdepth 1 -type f -name '*.exe' | wc -l | tr -d ' '); \
-	if [ "$$exe_count" -eq 0 ]; then \
-		echo "error: no Windows installer (.exe) found in bundle output" >&2; \
+	@bundle_dir="desktop/src-tauri/target/release/bundle/nsis"; \
+	target_triple="$${TAURI_ENV_TARGET_TRIPLE:-$${CARGO_BUILD_TARGET:-}}"; \
+	if [ -z "$$target_triple" ] && command -v rustc >/dev/null 2>&1; then \
+		host_triple=$$(rustc -vV | awk '/^host: /{print $$2}'); \
+		if [ "$$host_triple" = "aarch64-pc-windows-msvc" ]; then \
+			target_triple="$$host_triple"; \
+		fi; \
+	fi; \
+	if [ -n "$$target_triple" ] && \
+		[ -d "desktop/src-tauri/target/$$target_triple/release/bundle/nsis" ]; then \
+		bundle_dir="desktop/src-tauri/target/$$target_triple/release/bundle/nsis"; \
+	fi; \
+	if [ ! -d "$$bundle_dir" ]; then \
+		echo "error: Windows bundle output directory not found: $$bundle_dir" >&2; \
 		exit 1; \
 	fi; \
-	find desktop/src-tauri/target/release/bundle/nsis \
+	exe_count=$$(find "$$bundle_dir" \
+		-maxdepth 1 -type f -name '*.exe' | wc -l | tr -d ' '); \
+	if [ "$$exe_count" -eq 0 ]; then \
+		echo "error: no Windows installer (.exe) found in $$bundle_dir" >&2; \
+		exit 1; \
+	fi; \
+	find "$$bundle_dir" \
 		-maxdepth 1 -type f -name '*.exe' \
 		-exec cp {} $(DESKTOP_DIST_DIR)/windows/ \;; \
 	echo "Copied $$exe_count Windows installer(s) to $(DESKTOP_DIST_DIR)/windows/"
@@ -204,6 +230,8 @@ desktop-windows-installer:
 desktop-linux-appimage:
 	cd desktop && npm ci && npm run tauri:build:linux \
 		$(if $(TAURI_SIGNING_PRIVATE_KEY),,-- --config '{"bundle":{"createUpdaterArtifacts":false}}')
+	cd desktop && bash scripts/repair-appimage-diricon.sh \
+		src-tauri/target/release/bundle/appimage/*.AppImage
 	mkdir -p $(DESKTOP_DIST_DIR)/linux
 	rm -f $(DESKTOP_DIST_DIR)/linux/*.AppImage
 	@ai_count=$$(find desktop/src-tauri/target/release/bundle/appimage \
@@ -238,6 +266,35 @@ bench-backends: pricing-snapshot ensure-embed-dir
 		AGENTSVIEW_BENCH_MESSAGES_PER_SESSION=$(BENCH_BACKENDS_MESSAGES_PER_SESSION) \
 		CGO_ENABLED=1 go test -tags "fts5,benchdb" ./internal/backendbench $(BENCH_BACKENDS_FLAGS)
 
+# Hot-path benchmark gate. Runs every benchmark in the gated packages
+# (sync engine warm/cold/append, message write paths, usage
+# aggregation, secret scanning). This target is the single source of
+# truth for the gate configuration: CI's bench.yml runs it on both
+# the PR head and the merge base, then compares the outputs with
+# `go run ./cmd/benchgate -old old.txt -new new.txt`. Run it before
+# and after touching a sync or DB hot path.
+BENCH_GATE_PACKAGES ?= ./internal/sync ./internal/db ./internal/secrets
+# Count must stay >= 5: benchgate's time gate needs at least 5
+# candidate samples for its significance test.
+BENCH_GATE_COUNT ?= 6
+# Fixed iterations, not a duration: some gated benchmarks grow their
+# fixture as they iterate, so baseline and candidate must run the
+# same iteration count to measure identical workloads.
+BENCH_GATE_TIME ?= 20x
+bench-gate: pricing-snapshot ensure-embed-dir
+	CGO_ENABLED=1 go test -tags "fts5" -run '^$$' \
+		-bench . -benchmem \
+		-count $(BENCH_GATE_COUNT) -benchtime $(BENCH_GATE_TIME) \
+		-timeout 25m $(BENCH_GATE_PACKAGES)
+
+# Prints the gate's sample/iteration configuration in shell-evalable
+# form. CI evaluates this on the PR head and passes the values into
+# the merge-base `make bench-gate` invocation, so both sides measure
+# identical workloads even when a PR changes the defaults above (the
+# package list intentionally stays per-side).
+bench-gate-config:
+	@echo "BENCH_GATE_COUNT=$(BENCH_GATE_COUNT) BENCH_GATE_TIME=$(BENCH_GATE_TIME)"
+
 # Start test PostgreSQL container
 postgres-up:
 	docker compose -f docker-compose.test.yml up -d --wait
@@ -256,6 +313,12 @@ test-postgres: pricing-snapshot ensure-embed-dir postgres-up
 # PostgreSQL integration tests for CI (postgres already running as service)
 test-postgres-ci: pricing-snapshot ensure-embed-dir
 	CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/postgres/... ./internal/activity/... -count=1
+
+# S3 discovery integration tests. testcontainers starts and tears down a
+# rustfs (S3-compatible) container automatically, so only a working Docker
+# daemon is required.
+test-s3: pricing-snapshot ensure-embed-dir
+	CGO_ENABLED=1 go test -tags "fts5,s3test" -v ./internal/sync/... -run TestS3 -count=1
 
 # Start test SSH container
 ssh-up:
@@ -336,7 +399,19 @@ nilaway-golangci-build:
 
 # Run NilAway through the custom golangci-lint module plugin.
 nilaway: pricing-snapshot ensure-embed-dir nilaway-golangci-build
-	$(CUSTOM_GCL) run --config .golangci.nilaway.yml ./...
+	@set -e; \
+	root=$$(pwd); \
+	dirs=$$(go list -f '{{.Dir}}' ./...); \
+	for dir in $$dirs; do \
+		if [ "$$dir" = "$$root" ]; then \
+			pkg="."; \
+		else \
+			pkg="./$${dir#$$root/}"; \
+		fi; \
+		echo "$(CUSTOM_GCL) run --config .golangci.nilaway.yml $$pkg"; \
+		GOMAXPROCS=$${GOMAXPROCS:-1} GOGC=$${GOGC:-10} GOMEMLIMIT=$${GOMEMLIMIT:-512MiB} \
+			$(CUSTOM_GCL) run --config .golangci.nilaway.yml "$$pkg"; \
+	done
 
 # Install pinned local lint tools.
 lint-tools:
@@ -442,7 +517,9 @@ help:
 	@echo "  test           - Run all tests"
 	@echo "  test-short     - Run fast tests only"
 	@echo "  bench-backends - Benchmark SQLite, DuckDB, and PostgreSQL stores"
+	@echo "  bench-gate     - Run the hot-path benchmarks CI gates PRs on"
 	@echo "  test-postgres  - Run PostgreSQL integration tests"
+	@echo "  test-s3        - Run S3 discovery integration tests (Docker)"
 	@echo "  postgres-up    - Start test PostgreSQL container"
 	@echo "  postgres-down  - Stop test PostgreSQL container"
 	@echo "  test-ssh       - Run SSH integration tests"

@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 )
 
 const testConversationsJSON = `[
@@ -47,12 +48,76 @@ const testConversationsJSON = `[
   }
 ]`
 
+const testConversationsWithAttachmentJSON = `[{
+  "uuid": "import-test-002",
+  "name": "Attachment Chat",
+  "summary": "",
+  "created_at": "2026-02-02T09:00:00.000000Z",
+  "updated_at": "2026-02-02T09:15:00.000000Z",
+  "account": {"uuid":"acct-1"},
+  "chat_messages": [
+    {
+      "uuid":"m1",
+      "text":"Can you show me the config?",
+      "content":[{"type":"text","text":"Can you show me the config?"}],
+      "sender":"human",
+      "created_at":"2026-02-02T09:00:00.000000Z",
+      "updated_at":"2026-02-02T09:00:00.000000Z",
+      "attachments":[],
+      "files":[]
+    },
+    {
+      "uuid":"m2",
+      "text":"Sure, here it is.",
+      "content":[{"type":"text","text":"Sure, here it is."}],
+      "sender":"assistant",
+      "created_at":"2026-02-02T09:00:05.000000Z",
+      "updated_at":"2026-02-02T09:00:05.000000Z",
+      "attachments":[
+        {
+          "file_name":"agent.yaml",
+          "extracted_content":"model: claude-3.7\nmode: debug"
+        }
+      ],
+      "files":[]
+    }
+  ]
+}]`
+
+const testConversationsWithoutAttachmentJSON = `[{
+  "uuid": "import-test-002",
+  "name": "Attachment Chat",
+  "summary": "",
+  "created_at": "2026-02-02T09:00:00.000000Z",
+  "updated_at": "2026-02-02T09:15:00.000000Z",
+  "account": {"uuid":"acct-1"},
+  "chat_messages": [
+    {
+      "uuid":"m1",
+      "text":"Can you show me the config?",
+      "content":[{"type":"text","text":"Can you show me the config?"}],
+      "sender":"human",
+      "created_at":"2026-02-02T09:00:00.000000Z",
+      "updated_at":"2026-02-02T09:00:00.000000Z",
+      "attachments":[],
+      "files":[]
+    },
+    {
+      "uuid":"m2",
+      "text":"Sure, here it is.",
+      "content":[{"type":"text","text":"Sure, here it is."}],
+      "sender":"assistant",
+      "created_at":"2026-02-02T09:00:05.000000Z",
+      "updated_at":"2026-02-02T09:00:05.000000Z",
+      "attachments":[],
+      "files":[]
+    }
+  ]
+}]`
+
 func testDB(t *testing.T) *db.DB {
 	t.Helper()
-	d, err := db.Open(t.TempDir() + "/test.db")
-	require.NoError(t, err)
-	t.Cleanup(func() { d.Close() })
-	return d
+	return dbtest.OpenTestDB(t)
 }
 
 func TestImportClaudeAI(t *testing.T) {
@@ -77,6 +142,67 @@ func TestImportClaudeAI(t *testing.T) {
 	msgs, err := d.GetAllMessages(ctx, "claude-ai:import-test-001")
 	require.NoError(t, err)
 	assert.Len(t, msgs, 2)
+}
+
+func TestImportClaudeAIIncludesAttachmentContent(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	stats, err := ImportClaudeAI(
+		ctx, d, strings.NewReader(testConversationsWithAttachmentJSON), nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.Imported)
+	assert.Equal(t, 0, stats.Updated)
+
+	msgs, err := d.GetAllMessages(
+		ctx, "claude-ai:import-test-002",
+	)
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, "Can you show me the config?", msgs[0].Content)
+	assert.Equal(
+		t,
+		"Sure, here it is.\n\n[Attachment: agent.yaml]\nmodel: claude-3.7\nmode: debug",
+		msgs[1].Content,
+	)
+}
+
+func TestImportClaudeAIReimportRefreshesAttachmentContent(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	stats, err := ImportClaudeAI(
+		ctx, d, strings.NewReader(testConversationsWithoutAttachmentJSON), nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.Imported)
+
+	msgs, err := d.GetAllMessages(
+		ctx, "claude-ai:import-test-002",
+	)
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, "Sure, here it is.", msgs[1].Content)
+
+	stats, err = ImportClaudeAI(
+		ctx, d, strings.NewReader(testConversationsWithAttachmentJSON), nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 0, stats.Imported)
+	assert.Equal(t, 1, stats.Updated)
+	assert.Equal(t, 0, stats.Skipped)
+
+	msgs, err = d.GetAllMessages(
+		ctx, "claude-ai:import-test-002",
+	)
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+	assert.Equal(
+		t,
+		"Sure, here it is.\n\n[Attachment: agent.yaml]\nmodel: claude-3.7\nmode: debug",
+		msgs[1].Content,
+	)
 }
 
 func TestImportClaudeAI_ReimportSkipsUnchanged(t *testing.T) {
@@ -171,6 +297,57 @@ func TestImportChatGPT(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, s)
 	assert.Equal(t, "chatgpt.com", s.Project)
+}
+
+func TestImportChatGPTSanitizesParserRows(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	longModel := strings.Repeat("m", db.MaxModelLen+16)
+	conv := `[{
+  "id":"cg-sanitize","conversation_id":"cg-sanitize",
+  "title":"Sanitize","create_time":7258118400.0,
+  "update_time":7258118460.0,"current_node":"n2",
+  "mapping":{
+    "r":{"id":"r","parent":null,"children":["n1"],"message":null},
+    "n1":{"id":"n1","parent":"r","children":["n2"],"message":{
+      "id":"m1","create_time":7258118400.0,
+      "author":{"role":"user","name":null,"metadata":{}},
+      "content":{"content_type":"text","parts":["Hello\u0000\u001b[31m"]},
+      "status":"finished_successfully","metadata":{}}},
+    "n2":{"id":"n2","parent":"n1","children":[],"message":{
+      "id":"m2","create_time":7258118401.0,
+      "author":{"role":"assistant","name":null,"metadata":{}},
+      "content":{"content_type":"text","parts":["Hi"]},
+      "status":"finished_successfully",
+      "metadata":{"model_slug":"` + longModel + `"}}}
+  }
+}]`
+
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "conversations-000.json"),
+		[]byte(conv), 0o644,
+	))
+	assetsDir := filepath.Join(t.TempDir(), "assets")
+
+	stats, err := ImportChatGPT(ctx, d, dir, assetsDir, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.Imported)
+
+	s, err := d.GetSession(ctx, "chatgpt:cg-sanitize")
+	require.NoError(t, err)
+	require.NotNil(t, s)
+	assert.Nil(t, s.StartedAt)
+	assert.Nil(t, s.EndedAt)
+
+	msgs, err := d.GetAllMessages(ctx, "chatgpt:cg-sanitize")
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, "Hello[31m", msgs[0].Content)
+	assert.Empty(t, msgs[0].Timestamp)
+	assert.Empty(t, msgs[1].Timestamp)
+	assert.Len(t, msgs[1].Model, db.MaxModelLen)
 }
 
 func TestImportAdvancesLocalModifiedAt(t *testing.T) {
@@ -287,6 +464,40 @@ func TestImportChatGPT_UpdatesSessionNameOnReimport(t *testing.T) {
 	require.NotNil(t, s.DisplayName)
 	assert.Equal(t, "Renamed GPT Session", *s.DisplayName,
 		"session_name should be refreshed on ChatGPT re-import")
+}
+
+func TestImportChatGPTSanitizesSessionNameOnReimport(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "conversations-000.json"),
+		[]byte(testChatGPTConv), 0o644,
+	))
+	assetsDir := filepath.Join(t.TempDir(), "assets")
+
+	_, err := ImportChatGPT(ctx, d, dir, assetsDir, nil)
+	require.NoError(t, err)
+
+	dirty := strings.ReplaceAll(
+		testChatGPTConv,
+		`"title":"Test"`,
+		`"title":"Renamed\u0000\u001b[31m"`,
+	)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "conversations-000.json"),
+		[]byte(dirty), 0o644,
+	))
+
+	_, err = ImportChatGPT(ctx, d, dir, assetsDir, nil)
+	require.NoError(t, err)
+
+	s, err := d.GetSession(ctx, "chatgpt:cg-1")
+	require.NoError(t, err)
+	require.NotNil(t, s)
+	require.NotNil(t, s.DisplayName)
+	assert.Equal(t, "Renamed[31m", *s.DisplayName)
 }
 
 func TestImportChatGPT_ReimportPreservesExistingFields(t *testing.T) {

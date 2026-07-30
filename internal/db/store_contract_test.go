@@ -4,8 +4,12 @@ import (
 	"context"
 	"errors"
 	"math"
+	"os"
+	"path/filepath"
 	"slices"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,18 +41,84 @@ func storeContractBackends() []storeContractBackend {
 			name: "sqlite",
 			open: func(t *testing.T) Store {
 				t.Helper()
-				return testDB(t)
+				return openStoreContractSQLiteFixtureDB(t)
 			},
 			seed: func(t *testing.T, store Store) storeContractFixture {
 				t.Helper()
-				return seedStoreContractSQLite(t, store)
+				return storeContractSQLiteFixtureForTest(t)
 			},
 			supportsLocalWrites: true,
 		},
 	}
 }
 
+var (
+	storeContractSQLiteTemplateOnce    sync.Once
+	storeContractSQLiteTemplateDir     string
+	storeContractSQLiteTemplatePath    string
+	storeContractSQLiteTemplateFixture storeContractFixture
+	storeContractSQLiteTemplateErr     error
+)
+
+func openStoreContractSQLiteFixtureDB(t *testing.T) Store {
+	t.Helper()
+	src, _ := storeContractSQLiteTemplate(t)
+
+	dst := filepath.Join(t.TempDir(), "test.db")
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		require.NoError(t,
+			copyTemplateDBFile(src+suffix, dst+suffix, suffix == ""),
+			"copy store-contract fixture %q", suffix)
+	}
+	d, err := OpenPreparedTestDB(dst)
+	require.NoError(t, err, "open store-contract fixture")
+	t.Cleanup(func() { require.NoError(t, d.Close()) })
+	return d
+}
+
+func storeContractSQLiteFixtureForTest(t *testing.T) storeContractFixture {
+	t.Helper()
+	_, fixture := storeContractSQLiteTemplate(t)
+	return fixture
+}
+
+func storeContractSQLiteTemplate(t *testing.T) (string, storeContractFixture) {
+	t.Helper()
+	storeContractSQLiteTemplateOnce.Do(func() {
+		storeContractSQLiteTemplateDir, storeContractSQLiteTemplateErr =
+			os.MkdirTemp("", "agentsview-store-contract-*")
+		if storeContractSQLiteTemplateErr != nil {
+			return
+		}
+		storeContractSQLiteTemplatePath = filepath.Join(
+			storeContractSQLiteTemplateDir, "test.db")
+		storeContractSQLiteTemplateErr = copyTestDBTemplate(
+			storeContractSQLiteTemplatePath)
+		if storeContractSQLiteTemplateErr != nil {
+			return
+		}
+
+		var d *DB
+		d, storeContractSQLiteTemplateErr = OpenPreparedTestDB(
+			storeContractSQLiteTemplatePath)
+		if storeContractSQLiteTemplateErr != nil {
+			return
+		}
+		storeContractSQLiteTemplateFixture = seedStoreContractSQLite(t, d)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		storeContractSQLiteTemplateErr = d.CheckpointWALTruncate(ctx)
+		if closeErr := d.Close(); storeContractSQLiteTemplateErr == nil {
+			storeContractSQLiteTemplateErr = closeErr
+		}
+	})
+	require.NoError(t, storeContractSQLiteTemplateErr,
+		"build store-contract fixture")
+	return storeContractSQLiteTemplatePath, storeContractSQLiteTemplateFixture
+}
+
 func TestStoreContract(t *testing.T) {
+
 	tests := []struct {
 		name string
 		run  func(t *testing.T, store Store, fixture storeContractFixture, backend storeContractBackend)
@@ -367,13 +437,16 @@ func contractAnalyticsTrendsAndUsage(
 		Timezone: "UTC",
 	})
 	require.NoError(t, err)
-	require.Equal(t, 5, summary.TotalSessions)
-	require.Equal(t, 13, summary.TotalMessages)
-	require.Equal(t, 440, summary.TotalOutputTokens)
-	require.Equal(t, 4, summary.TokenReportingSessions)
+	// The subagent child (contract-alpha-child) is now counted in the
+	// summary aggregate: +1 claude session, +1 message, +70 output
+	// tokens. The fork/automated/deleted rows stay excluded as before.
+	require.Equal(t, 6, summary.TotalSessions)
+	require.Equal(t, 14, summary.TotalMessages)
+	require.Equal(t, 510, summary.TotalOutputTokens)
+	require.Equal(t, 5, summary.TokenReportingSessions)
 	require.Equal(t, 3, summary.ActiveProjects)
 	require.Equal(t, 4, summary.ActiveDays)
-	require.Equal(t, 2, summary.Agents["claude"].Sessions)
+	require.Equal(t, 3, summary.Agents["claude"].Sessions)
 
 	noAutomation, err := store.GetAnalyticsSummary(ctx, AnalyticsFilter{
 		From:             "2026-01-09",
@@ -381,7 +454,43 @@ func contractAnalyticsTrendsAndUsage(
 		ExcludeAutomated: true,
 	})
 	require.NoError(t, err)
-	require.Equal(t, 4, noAutomation.TotalSessions)
+	require.Equal(t, 5, noAutomation.TotalSessions)
+
+	// With one-shot exclusion on (the summary endpoint default), the
+	// one-shot subagent child must still be counted (workflow subagents
+	// are inherently one-shot) while one-shot root sessions drop. This
+	// exercises OneShotExclusionSQL on every backend, including PG.
+	//
+	// Kept rows: alpha (3 user msgs, 320 tok), gamma (2 user, 60 tok),
+	// automated (roborev, kept via is_automated, 0 tok), and the subagent
+	// child (1 user, 70 tok, kept via the subagent exemption). Dropped:
+	// beta and old (one-shot roots). Exact totals are asserted so a
+	// regression that re-excludes the subagent — which would give 3
+	// sessions / 380 tokens — fails loudly rather than passing a looser
+	// bound that the surviving root sessions already satisfy.
+	oneShotExcluded, err := store.GetAnalyticsSummary(ctx, AnalyticsFilter{
+		From:           "2026-01-09",
+		To:             "2026-01-12",
+		Timezone:       "UTC",
+		ExcludeOneShot: true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 4, oneShotExcluded.TotalSessions,
+		"one-shot roots drop; subagent child stays")
+	require.Equal(t, 450, oneShotExcluded.TotalOutputTokens,
+		"includes the subagent child's 70 tokens (380 would mean dropped)")
+	require.Equal(t, 3, oneShotExcluded.TokenReportingSessions)
+
+	// Distribution surfaces stay root-only: the subagent child must NOT
+	// be counted in session-shape, so its short duration cannot skew the
+	// distributions. It is one fewer session than the summary aggregate.
+	shape, err := store.GetAnalyticsSessionShape(ctx, AnalyticsFilter{
+		From:     "2026-01-09",
+		To:       "2026-01-12",
+		Timezone: "UTC",
+	})
+	require.NoError(t, err)
+	require.Equal(t, 5, shape.Count)
 
 	activity, err := store.GetAnalyticsActivity(ctx, AnalyticsFilter{
 		From:     "2026-01-09",
@@ -420,6 +529,8 @@ func contractAnalyticsTrendsAndUsage(
 	require.NoError(t, err)
 	require.Equal(t, "day", trends.Granularity)
 	require.Equal(t, 2, trends.Series[0].Total)
+	// Trends is a distribution surface (root-only), so the subagent
+	// child's message is not counted here.
 	require.Equal(t, 13, trends.MessageCount)
 
 	daily, err := store.GetDailyUsage(ctx, UsageFilter{
@@ -531,6 +642,85 @@ func contractLocalOnlyMethods(
 	require.NoError(t, err)
 	require.Len(t, list, 1)
 	require.NoError(t, store.DeleteInsight(insightID))
+}
+
+func TestStoreContractGetUsageMatchingSessionCountCountsCopilotSessionsWithoutUsageRows(
+	t *testing.T,
+) {
+	store, ok := openStoreContractSQLiteFixtureDB(t).(*DB)
+	require.True(t, ok, "sqlite fixture should expose *DB")
+	ctx := context.Background()
+
+	insertSession(t, store, "contract-copilot-empty", "alpha", func(s *Session) {
+		ts := "2026-01-12T16:00:00Z"
+		s.Agent = "copilot"
+		s.StartedAt = &ts
+		s.EndedAt = &ts
+	})
+	insertMessages(t, store, Message{
+		SessionID:  "contract-copilot-empty",
+		Ordinal:    0,
+		Role:       "assistant",
+		Timestamp:  "2026-01-12T16:00:00Z",
+		Model:      "gpt-5.3-codex",
+		TokenUsage: nil,
+	})
+
+	count, err := store.GetUsageMatchingSessionCount(ctx, UsageFilter{
+		From:     "2026-01-12",
+		To:       "2026-01-12",
+		Timezone: "UTC",
+		Agent:    "copilot",
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
+}
+
+func TestStoreContractGetUsageMatchingSessionCountCountsCopilotSessionByMessageTimestampOutsideSessionWindow(
+	t *testing.T,
+) {
+	store, ok := openStoreContractSQLiteFixtureDB(t).(*DB)
+	require.True(t, ok, "sqlite fixture should expose *DB")
+	ctx := context.Background()
+
+	insertSession(t, store, "contract-copilot-late-message", "alpha", func(s *Session) {
+		ts := "2026-02-08T10:00:00Z"
+		s.Agent = "copilot"
+		s.StartedAt = &ts
+		s.EndedAt = &ts
+	})
+	insertMessages(t, store, Message{
+		SessionID:  "contract-copilot-late-message",
+		Ordinal:    0,
+		Role:       "assistant",
+		Timestamp:  "2026-02-10T12:00:00Z",
+		Model:      "gpt-5.3-codex",
+		TokenUsage: nil,
+	})
+
+	insertSession(t, store, "contract-copilot-out-of-range", "alpha", func(s *Session) {
+		ts := "2026-02-08T10:00:00Z"
+		s.Agent = "copilot"
+		s.StartedAt = &ts
+		s.EndedAt = &ts
+	})
+	insertMessages(t, store, Message{
+		SessionID:  "contract-copilot-out-of-range",
+		Ordinal:    0,
+		Role:       "assistant",
+		Timestamp:  "2026-02-08T10:00:00Z",
+		Model:      "gpt-5.3-codex",
+		TokenUsage: nil,
+	})
+
+	count, err := store.GetUsageMatchingSessionCount(ctx, UsageFilter{
+		From:     "2026-02-10",
+		To:       "2026-02-10",
+		Timezone: "UTC",
+		Agent:    "copilot",
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
 }
 
 func seedStoreContractSQLite(
@@ -769,6 +959,7 @@ func seedStoreContractSQLite(
 			startedAt:    "2026-01-10T12:02:30Z",
 			endedAt:      "2026-01-10T12:03:00Z",
 			userMessages: 1,
+			outputTokens: 70,
 			parentID:     fixture.alphaID,
 			relationship: "subagent",
 			messages: []Message{

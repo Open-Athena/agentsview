@@ -15,30 +15,48 @@
   import { messages as messagesStore } from "../../stores/messages.svelte.js";
   import { sessionTiming } from "../../stores/sessionTiming.svelte.js";
   import { liveTick } from "../../stores/liveTick.svelte.js";
+  import {
+    configureGeneratedClient,
+    isRemoteConnection,
+  } from "../../api/runtime.js";
+  import {
+    SessionsService,
+    type ResumeRequest,
+    type ResumeResponse,
+  } from "../../api/generated/index";
   import ThinkingBlock from "./ThinkingBlock.svelte";
   import ToolBlock from "./ToolBlock.svelte";
   import ParallelGroup from "./ParallelGroup.svelte";
   import CodeBlock from "./CodeBlock.svelte";
   import SkillBlock from "./SkillBlock.svelte";
-  import CopyButton from "../shared/CopyButton.svelte";
+  import { CopyButton } from "@kenn-io/kit-ui";
   import { ui } from "../../stores/ui.svelte.js";
   import { pins } from "../../stores/pins.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
+  import { sync } from "../../stores/sync.svelte.js";
   import { applyHighlight } from "../../utils/highlight.js";
   import { highlightCodeFences } from "../../utils/highlight-fences.js";
   import { renderMarkdown } from "../../utils/markdown.js";
   import { displayToolName } from "../../utils/toolDisplay.js";
-  import { PinIcon } from "../../icons.js";
+  import { CirclePlayIcon, PinIcon } from "../../icons.js";
   import type { Session } from "../../api/types.js";
+  import { m } from "../../i18n/index.js";
 
   interface Props {
     message: Message;
+    session?: Session | null;
     isSubagentContext?: boolean;
     highlightQuery?: string;
     isCurrentHighlight?: boolean;
   }
 
-  let { message, isSubagentContext = false, highlightQuery = "", isCurrentHighlight = false }: Props = $props();
+  let {
+    message,
+    session,
+    isSubagentContext = false,
+    highlightQuery = "",
+    isCurrentHighlight = false,
+  }: Props = $props();
 
   let copied = $state(false);
 
@@ -85,10 +103,12 @@
     ),
   );
 
-  /** Resolve the session that owns this message, falling back to activeSession. */
+  /** Resolve the owning session, favoring explicit embedded-session context. */
   let owningSession = $derived(
-    sessions.sessions.find((s) => s.id === message.session_id) ??
-      sessions.activeSession,
+    session !== undefined
+      ? session
+      : sessions.sessions.find((s) => s.id === message.session_id) ??
+        sessions.activeSession,
   );
 
   /** Walk the parent chain to check if any ancestor has the teammate tag. */
@@ -135,11 +155,11 @@
 
   /** Context-aware role labels based on session type. */
   let roleLabel = $derived.by(() => {
-    if (!isUser) return "Assistant";
-    if (isSubagentContext) return "Agent";
-    if (sessionKind === "teammate") return "Teammate";
-    if (sessionKind === "subagent") return "Agent";
-    return "User";
+    if (!isUser) return m.message_content_role_assistant();
+    if (isSubagentContext) return m.message_content_role_agent();
+    if (sessionKind === "teammate") return m.message_content_role_teammate();
+    if (sessionKind === "subagent") return m.message_content_role_agent();
+    return m.message_content_role_user();
   });
 
   let roleIcon = $derived.by(() => {
@@ -160,6 +180,9 @@
   let accentColor = $derived(
     isUser ? "var(--accent-blue)" : "var(--accent-purple)",
   );
+  let accentForeground = $derived(
+    isUser ? "var(--accent-blue-foreground)" : "var(--accent-purple-foreground)",
+  );
 
   let roleBg = $derived(
     isUser ? "var(--user-bg)" : "var(--assistant-bg)",
@@ -167,6 +190,7 @@
 
   let pinned = $derived(pins.isPinned(message.id));
   let pinFeedback = $state("");
+  let forkFeedback = $state("");
 
   /** Index turn timings by message id for O(1) lookup. */
   let turnByMessage = $derived.by(() => {
@@ -209,7 +233,9 @@
       const elapsed = Number.isNaN(startMs)
         ? 0
         : Math.max(0, liveTick.now - startMs);
-      return `running ${formatDuration(elapsed)}+`;
+      return m.message_content_running_duration({
+        duration: formatDuration(elapsed),
+      });
     }
     return undefined;
   }
@@ -230,7 +256,10 @@
     const turn = turnByMessage.get(message.id);
     if (turn?.duration_ms != null) {
       return {
-        text: `turn ${formatDuration(turn.duration_ms)} · ${calls} call${calls === 1 ? "" : "s"}`,
+        text: m.message_content_turn_summary({
+          duration: formatDuration(turn.duration_ms),
+          count: calls,
+        }),
         slow: false,
         running: false,
       };
@@ -242,7 +271,10 @@
         ? 0
         : Math.max(0, liveTick.now - startMs);
       return {
-        text: `running ${formatDuration(elapsed)}+ · ${calls} call${calls === 1 ? "" : "s"}`,
+        text: m.message_content_running_turn_summary({
+          duration: formatDuration(elapsed),
+          count: calls,
+        }),
         slow: false,
         running: true,
       };
@@ -252,6 +284,7 @@
 
   let copyTimer: ReturnType<typeof setTimeout>;
   let pinTimer: ReturnType<typeof setTimeout>;
+  let forkTimer: ReturnType<typeof setTimeout>;
 
   async function handleCopy() {
     const ok = await copyToClipboard(formatMessageForCopy(message));
@@ -271,11 +304,57 @@
         message.ordinal,
       );
       clearTimeout(pinTimer);
-      pinFeedback = wasPinned ? "Unpinned" : "Pinned";
+      pinFeedback = wasPinned
+        ? m.message_content_unpinned()
+        : m.message_content_pinned();
       pinTimer = setTimeout(() => { pinFeedback = ""; }, 1500);
     } catch {
       // silently fail
     }
+  }
+
+  let canForkFromMessage = $derived(
+    owningSession?.agent === "claude" &&
+      !(owningSession?.id ?? "").includes("~") &&
+      !(sync.readOnly && isRemoteConnection()),
+  );
+
+  async function handleForkFromHere() {
+    if (!canForkFromMessage) return;
+    clearTimeout(forkTimer);
+    try {
+      configureGeneratedClient();
+      const resp =
+        await SessionsService.postApiV1SessionsIdResume({
+          id: message.session_id,
+          requestBody: {
+            ...(sync.readOnly && !isRemoteConnection()
+              ? { command_only: true }
+              : {}),
+            from_ordinal: message.ordinal,
+            fork_session: true,
+          } satisfies ResumeRequest,
+        }) as ResumeResponse;
+      if (resp.launched) {
+        forkFeedback = m.session_breadcrumb_resumed_in({
+          target: resp.terminal ?? "terminal",
+        });
+        forkTimer = setTimeout(() => { forkFeedback = ""; }, 2000);
+        return;
+      }
+      if (resp.command) {
+        const ok = await copyToClipboard(resp.command);
+        forkFeedback = ok
+          ? m.session_breadcrumb_command_copied()
+          : m.session_breadcrumb_failed();
+        forkTimer = setTimeout(() => { forkFeedback = ""; }, 2000);
+        return;
+      }
+    } catch {
+      // silently fail
+    }
+    forkFeedback = m.session_breadcrumb_failed();
+    forkTimer = setTimeout(() => { forkFeedback = ""; }, 2000);
   }
 </script>
 
@@ -289,6 +368,7 @@
     <span
       class="role-icon"
       style:background={accentColor}
+      style:color={accentForeground}
     >
       {roleIcon}
     </span>
@@ -299,24 +379,41 @@
       {roleLabel}
     </span>
     <CopyButton
+      revealOnHover
       {copied}
-      ariaLabel="Copy message"
-      copiedAriaLabel="Copied message"
-      title="Copy message"
-      copiedTitle="Copied!"
+      ariaLabel={m.message_content_copy_message()}
+      copiedAriaLabel={m.message_content_copied_message()}
+      title={m.message_content_copy_message()}
+      copiedTitle={m.message_content_copied()}
       onclick={handleCopy}
     />
     <button
       type="button"
       class="pin-btn"
       class:pinned
-      title={pinned ? "Unpin message" : "Pin message"}
+      title={pinned
+        ? m.message_content_unpin_message()
+        : m.message_content_pin_message()}
       onclick={handleTogglePin}
     >
       <PinIcon size="14" strokeWidth="1.8" aria-hidden="true" />
     </button>
+    {#if canForkFromMessage}
+      <button
+        type="button"
+        class="pin-btn fork-btn"
+        title={m.session_breadcrumb_resume_session()}
+        aria-label={m.session_breadcrumb_resume_session()}
+        onclick={handleForkFromHere}
+      >
+        <CirclePlayIcon size="14" strokeWidth="1.8" aria-hidden="true" />
+      </button>
+    {/if}
     {#if pinFeedback}
       <span class="pin-feedback">{pinFeedback}</span>
+    {/if}
+    {#if forkFeedback}
+      <span class="fork-feedback">{forkFeedback}</span>
     {/if}
     <div class="header-meta">
       {#if tokenSummary}
@@ -508,10 +605,10 @@
     font-family: var(--font-mono);
     font-size: 10px;
     color: var(--text-muted);
-    background: rgba(255, 255, 255, 0.04);
+    background: color-mix(in srgb, var(--text-primary) 4%, transparent);
     padding: 2px 8px;
     border-radius: var(--radius-sm);
-    border: 1px solid rgba(255, 255, 255, 0.04);
+    border: 1px solid color-mix(in srgb, var(--text-primary) 4%, transparent);
     white-space: nowrap;
     flex-shrink: 0;
   }
@@ -529,7 +626,7 @@
     animation: duration-pulse 1.6s ease-in-out infinite;
   }
 
-  .message:hover :global(.copy-btn) {
+  .message:hover :global(.kit-copy-btn) {
     opacity: 1;
   }
 
@@ -575,6 +672,12 @@
   }
 
   .pin-feedback {
+    font-size: 11px;
+    color: var(--text-muted);
+    animation: fade-in-out 1.5s ease-in-out;
+  }
+
+  .fork-feedback {
     font-size: 11px;
     color: var(--text-muted);
     animation: fade-in-out 1.5s ease-in-out;

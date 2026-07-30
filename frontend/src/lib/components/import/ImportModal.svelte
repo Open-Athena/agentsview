@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { Button, Modal, Spinner } from "@kenn-io/kit-ui";
+  import { m } from "../../i18n/index.js";
   import { untrack } from "svelte";
   import {
     importClaudeAI,
@@ -11,7 +13,6 @@
     FileXIcon,
     TriangleAlertIcon,
     UploadIcon,
-    XIcon,
   } from "../../icons.js";
 
   interface Props {
@@ -172,7 +173,7 @@
       error =
         e instanceof Error
           ? e.message
-          : "Import failed";
+          : m.import_failed();
     } finally {
       importing = false;
     }
@@ -197,266 +198,216 @@
   }
 </script>
 
+{#snippet actions()}
+  {#if result}
+    <Button
+      label={m.import_import_more()}
+      tone="neutral"
+      surface="outline"
+      onclick={handleReset}
+    />
+    <Button
+      label={m.import_done()}
+      tone="info"
+      surface="solid"
+      onclick={handleClose}
+    />
+  {:else}
+    <Button
+      label={m.import_cancel()}
+      tone="neutral"
+      surface="outline"
+      disabled={importing}
+      onclick={handleClose}
+    />
+    <Button
+      label={m.import_import()}
+      tone="info"
+      surface="solid"
+      disabled={!selectedFile || importing}
+      onclick={handleImport}
+    />
+  {/if}
+{/snippet}
+
 {#if open}
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div
-    class="modal-overlay"
-    onclick={(e) => {
-      if (
-        (e.target as HTMLElement).classList.contains(
-          "modal-overlay",
-        )
-      )
-        handleClose();
-    }}
-    onkeydown={(e) => {
-      if (e.key === "Escape") handleClose();
-    }}
+  <Modal
+    title={m.import_title()}
+    width="460px"
+    maxWidth="min(460px, 92vw)"
+    closable={!importing}
+    closeOnOverlayClick={!importing}
+    onclose={handleClose}
+    footer={actions}
   >
-    <div
-      class="modal-panel import-panel"
-      role="dialog"
-      aria-modal="true"
-      aria-label="Import conversations"
-    >
-      <div class="modal-header">
-        <h3 class="modal-title">Import Conversations</h3>
+    {#if result}
+      <!-- ── Results ── -->
+      <div class="result-view">
+        <div class="result-check">
+          <FileCheckIcon size="32" strokeWidth="1.5" aria-hidden="true" />
+        </div>
+
+        <p class="result-heading">
+          {m.import_processed({ count: totalProcessed })}
+        </p>
+
+        <div class="result-stats">
+          <div class="stat">
+            <span class="stat-num new">
+              {result.imported}
+            </span>
+            <span class="stat-lbl">{m.import_new()}</span>
+          </div>
+          <div class="stat">
+            <span class="stat-num updated">
+              {result.updated}
+            </span>
+            <span class="stat-lbl">{m.import_updated()}</span>
+          </div>
+          {#if result.skipped > 0}
+            <div class="stat">
+              <span class="stat-num skipped">
+                {result.skipped}
+              </span>
+              <span class="stat-lbl">{m.import_unchanged()}</span>
+            </div>
+          {/if}
+          {#if result.errors > 0}
+            <div class="stat">
+              <span class="stat-num errors">
+                {result.errors}
+              </span>
+              <span class="stat-lbl">{m.import_errors()}</span>
+            </div>
+          {/if}
+        </div>
+      </div>
+    {:else}
+      <!-- ── Provider selector ── -->
+      <div class="provider-strip">
         <button
-          class="modal-close"
-          onclick={handleClose}
+          class="provider-pill"
+          class:selected={provider === "claude-ai"}
+          onclick={() => selectProvider("claude-ai")}
           disabled={importing}
-          title="Close import dialog"
-          aria-label="Close"
         >
-          <XIcon size="14" strokeWidth="2.2" aria-hidden="true" />
+          <span class="pdot claude"></span>
+          <span>Claude.ai</span>
+        </button>
+        <button
+          class="provider-pill"
+          class:selected={provider === "chatgpt"}
+          onclick={() => selectProvider("chatgpt")}
+          disabled={importing}
+        >
+          <span class="pdot chatgpt"></span>
+          <span>ChatGPT</span>
         </button>
       </div>
 
-      <div class="modal-body">
-        {#if result}
-          <!-- ── Results ── -->
-          <div class="result-view">
-            <div class="result-check">
-              <FileCheckIcon size="32" strokeWidth="1.5" aria-hidden="true" />
-            </div>
-
-            <p class="result-heading">
-              {totalProcessed}
-              conversation{totalProcessed !== 1
-                ? "s"
-                : ""}
-              processed
-            </p>
-
-            <div class="result-stats">
-              <div class="stat">
-                <span class="stat-num new">
-                  {result.imported}
-                </span>
-                <span class="stat-lbl">new</span>
-              </div>
-              <div class="stat">
-                <span class="stat-num updated">
-                  {result.updated}
-                </span>
-                <span class="stat-lbl">updated</span>
-              </div>
-              {#if result.skipped > 0}
-                <div class="stat">
-                  <span class="stat-num skipped">
-                    {result.skipped}
-                  </span>
-                  <span class="stat-lbl">unchanged</span>
-                </div>
-              {/if}
-              {#if result.errors > 0}
-                <div class="stat">
-                  <span class="stat-num errors">
-                    {result.errors}
-                  </span>
-                  <span class="stat-lbl">errors</span>
-                </div>
-              {/if}
-            </div>
-
-            <div class="result-actions">
-              <button
-                class="modal-btn"
-                onclick={handleReset}
-              >
-                Import more
-              </button>
-              <button
-                class="modal-btn modal-btn-primary"
-                onclick={handleClose}
-              >
-                Done
-              </button>
-            </div>
-          </div>
+      <p class="hint">
+        {#if provider === "claude-ai"}
+          {m.import_hint_claude({ json: "conversations.json", zip: ".zip" })}
         {:else}
-          <!-- ── Provider selector ── -->
-          <div class="provider-strip">
-            <button
-              class="provider-pill"
-              class:selected={provider === "claude-ai"}
-              onclick={() => selectProvider("claude-ai")}
-              disabled={importing}
-            >
-              <span class="pdot claude"></span>
-              <span>Claude.ai</span>
-            </button>
-            <button
-              class="provider-pill"
-              class:selected={provider === "chatgpt"}
-              onclick={() => selectProvider("chatgpt")}
-              disabled={importing}
-            >
-              <span class="pdot chatgpt"></span>
-              <span>ChatGPT</span>
-            </button>
-          </div>
-
-          <p class="hint">
-            {#if provider === "claude-ai"}
-              Upload <code>conversations.json</code> or
-              the <code>.zip</code> from a Claude.ai data
-              export.
-            {:else}
-              Upload the <code>.zip</code> from a ChatGPT
-              data export.
-            {/if}
-          </p>
-
-          <!-- ── Drop zone ── -->
-          {#if importing}
-            <div class="zone zone-importing">
-              <div class="modal-spinner"></div>
-              {#if phase === "indexing"}
-                <span class="importing-label">
-                  Rebuilding search index...
-                </span>
-              {:else if progressStats}
-                {@const n =
-                  progressStats.imported +
-                  progressStats.updated +
-                  progressStats.skipped +
-                  progressStats.errors}
-                <span class="importing-label">
-                  {n} conversation{n !== 1 ? "s" : ""}
-                  processed...
-                </span>
-              {:else}
-                <span class="importing-label">
-                  Importing conversations...
-                </span>
-              {/if}
-            </div>
-          {:else if selectedFile}
-            <div class="zone zone-file">
-              <div class="file-row">
-                <FileIcon class="file-icon" size="20" strokeWidth="1.6" aria-hidden="true" />
-                <div class="file-meta">
-                  <span class="file-name">
-                    {selectedFile.name}
-                  </span>
-                  <span class="file-size">
-                    {fileSize}
-                  </span>
-                </div>
-                <button
-                  class="file-clear"
-                  onclick={clearFile}
-                  title="Remove file"
-                  aria-label="Remove file"
-                >
-                  <FileXIcon size="14" strokeWidth="1.8" aria-hidden="true" />
-                </button>
-              </div>
-            </div>
-          {:else}
-            <div
-              class="zone zone-empty"
-              class:drag-over={dragOver}
-              role="button"
-              tabindex="0"
-              ondragenter={handleDragEnter}
-              ondragover={handleDragOver}
-              ondragleave={handleDragLeave}
-              ondrop={handleDrop}
-              onclick={() => fileInput?.click()}
-              onkeydown={(e) => {
-                if (
-                  e.key === "Enter" ||
-                  e.key === " "
-                ) {
-                  e.preventDefault();
-                  fileInput?.click();
-                }
-              }}
-            >
-              <UploadIcon class="upload-icon" size="28" strokeWidth="1.5" aria-hidden="true" />
-              <span class="drop-label">
-                Drop your file here
-              </span>
-              <span class="drop-sub">
-                or click to browse
-              </span>
-            </div>
-          {/if}
-
-          <input
-            bind:this={fileInput}
-            type="file"
-            accept={accepted}
-            onchange={handleFileChange}
-            class="sr-only"
-          />
-
-          {#if error}
-            <div class="import-error">
-              <TriangleAlertIcon size="14" strokeWidth="1.8" aria-hidden="true" />
-              <span>{error}</span>
-            </div>
-          {/if}
-
-          <div class="import-actions">
-            <button
-              class="modal-btn"
-              onclick={handleClose}
-              disabled={importing}
-            >
-              Cancel
-            </button>
-            <button
-              class="modal-btn modal-btn-primary"
-              onclick={handleImport}
-              disabled={!selectedFile || importing}
-            >
-              Import
-            </button>
-          </div>
+          {m.import_hint_chatgpt({ zip: ".zip" })}
         {/if}
-      </div>
-    </div>
-  </div>
+      </p>
+
+      <!-- ── Drop zone ── -->
+      {#if importing}
+        <div class="zone zone-importing">
+          <Spinner />
+          {#if phase === "indexing"}
+            <span class="importing-label">
+              {m.import_rebuilding_index()}
+            </span>
+          {:else if progressStats}
+            {@const n =
+              progressStats.imported +
+              progressStats.updated +
+              progressStats.skipped +
+              progressStats.errors}
+            <span class="importing-label">
+              {m.import_processing_progress({ count: n })}
+            </span>
+          {:else}
+            <span class="importing-label">
+              {m.import_importing()}
+            </span>
+          {/if}
+        </div>
+      {:else if selectedFile}
+        <div class="zone zone-file">
+          <div class="file-row">
+            <FileIcon class="file-icon" size="20" strokeWidth="1.6" aria-hidden="true" />
+            <div class="file-meta">
+              <span class="file-name">
+                {selectedFile.name}
+              </span>
+              <span class="file-size">
+                {fileSize}
+              </span>
+            </div>
+            <button
+              class="file-clear"
+              onclick={clearFile}
+              title={m.import_remove_file()}
+              aria-label={m.import_remove_file()}
+            >
+              <FileXIcon size="14" strokeWidth="1.8" aria-hidden="true" />
+            </button>
+          </div>
+        </div>
+      {:else}
+        <div
+          class="zone zone-empty"
+          class:drag-over={dragOver}
+          role="button"
+          tabindex="0"
+          ondragenter={handleDragEnter}
+          ondragover={handleDragOver}
+          ondragleave={handleDragLeave}
+          ondrop={handleDrop}
+          onclick={() => fileInput?.click()}
+          onkeydown={(e) => {
+            if (
+              e.key === "Enter" ||
+              e.key === " "
+            ) {
+              e.preventDefault();
+              fileInput?.click();
+            }
+          }}
+        >
+          <UploadIcon class="upload-icon" size="28" strokeWidth="1.5" aria-hidden="true" />
+          <span class="drop-label">
+            {m.import_drop_here()}
+          </span>
+          <span class="drop-sub">
+            {m.import_or_browse()}
+          </span>
+        </div>
+      {/if}
+
+      <input
+        bind:this={fileInput}
+        type="file"
+        accept={accepted}
+        onchange={handleFileChange}
+        class="kit-sr-only"
+      />
+
+      {#if error}
+        <div class="import-error">
+          <TriangleAlertIcon size="14" strokeWidth="1.8" aria-hidden="true" />
+          <span>{error}</span>
+        </div>
+      {/if}
+    {/if}
+  </Modal>
 {/if}
 
 <style>
-  /* ── Panel ── */
-  .import-panel {
-    width: 460px;
-    max-width: 92vw;
-    animation: panel-in 0.2s ease-out;
-  }
-
-  @keyframes panel-in {
-    from {
-      opacity: 0;
-      transform: translateY(8px) scale(0.98);
-    }
-  }
-
   /* ── Provider strip ── */
   .provider-strip {
     display: flex;
@@ -472,7 +423,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: 7px;
+    gap: var(--space-4);
     height: 34px;
     font-size: 12px;
     font-weight: 500;
@@ -519,7 +470,7 @@
     line-height: 1.5;
   }
 
-  .hint code {
+  .hint :global(code) {
     font-family: var(--font-mono);
     font-size: 11px;
     background: var(--bg-inset);
@@ -536,7 +487,6 @@
     justify-content: center;
     gap: 6px;
     border-radius: var(--radius-lg);
-    margin-bottom: 12px;
     transition:
       border-color 0.15s,
       background 0.15s,
@@ -549,7 +499,7 @@
     padding: 24px;
     border: 2px dashed var(--border-default);
     cursor: pointer;
-    box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.03);
+    box-shadow: inset 0 1px 3px color-mix(in srgb, var(--overlay-bg) 10%, transparent);
   }
 
   .zone-empty:hover {
@@ -622,7 +572,7 @@
   .file-row {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: var(--space-4);
     width: 100%;
   }
 
@@ -694,20 +644,13 @@
     border-radius: var(--radius-sm);
     font-size: 12px;
     color: var(--accent-red);
-    margin-bottom: 12px;
+    margin-top: 12px;
     word-break: break-word;
   }
 
   .import-error :global(svg) {
     flex-shrink: 0;
     margin-top: 1px;
-  }
-
-  /* ── Actions ── */
-  .import-actions {
-    display: flex;
-    gap: 8px;
-    justify-content: flex-end;
   }
 
   /* ── Result view ── */
@@ -814,11 +757,5 @@
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.04em;
-  }
-
-  .result-actions {
-    display: flex;
-    gap: 8px;
-    margin-top: 8px;
   }
 </style>

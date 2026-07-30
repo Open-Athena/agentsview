@@ -205,6 +205,11 @@ func (d *DB) CopyOrphanedDataFromExcluding(
 	if err := copySessionDataForIDs(ctx, tx, "_orphaned_ids"); err != nil {
 		return 0, fmt.Errorf("copying orphaned data: %w", err)
 	}
+	if err := sanitizeCopiedSessionContent(
+		ctx, tx, "_orphaned_ids", copiedSourceDataVersion(ctx, tx),
+	); err != nil {
+		return 0, fmt.Errorf("sanitizing orphaned data: %w", err)
+	}
 
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf(
@@ -292,6 +297,11 @@ func (d *DB) CopyTrashedDataFrom(sourcePath string) (int, error) {
 	if err := copySessionDataForIDs(ctx, tx, "_trashed_ids"); err != nil {
 		return 0, fmt.Errorf("copying trashed data: %w", err)
 	}
+	if err := sanitizeCopiedSessionContent(
+		ctx, tx, "_trashed_ids", copiedSourceDataVersion(ctx, tx),
+	); err != nil {
+		return 0, fmt.Errorf("sanitizing trashed data: %w", err)
+	}
 
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("committing trashed copy: %w", err)
@@ -332,9 +342,6 @@ func (d *DB) CopySyncStateFrom(sourcePath string) error {
 			return nil
 		}
 		return fmt.Errorf("probing pg_sync_state table: %w", err)
-	}
-	if tableExists != 1 {
-		return nil
 	}
 
 	_, err = conn.ExecContext(ctx, `
@@ -386,9 +393,6 @@ func (d *DB) CopyExcludedSessionsFrom(
 		}
 		return fmt.Errorf("probing excluded_sessions table: %w", err)
 	}
-	if tableExists != 1 {
-		return nil
-	}
 
 	_, err = conn.ExecContext(ctx, `
 		INSERT OR IGNORE INTO excluded_sessions (id, created_at)
@@ -402,8 +406,9 @@ func (d *DB) CopyExcludedSessionsFrom(
 
 // CopySessionMetadataFrom merges user-managed data from the
 // source DB into sessions that were re-synced into this DB.
-// This preserves display_name, deleted_at, starred_sessions,
-// pinned_messages, and worktree_project_mappings across full DB rebuilds.
+// This preserves display_name, deleted_at, starred_sessions, pinned_messages,
+// archive metadata, project identity observations, and worktree project
+// mappings across full DB rebuilds.
 func (d *DB) CopySessionMetadataFrom(
 	sourcePath string,
 ) error {
@@ -513,6 +518,79 @@ func (d *DB) CopySessionMetadataFrom(
 		}
 	}
 
+	if oldDBHasTable(ctx, tx, "cursor_usage_events") {
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM main.cursor_usage_events`); err != nil {
+			return fmt.Errorf("clearing cursor usage events: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO main.cursor_usage_events (
+				occurred_at, model, kind,
+				input_tokens, output_tokens,
+				cache_write_tokens, cache_read_tokens,
+				charged_cents, cursor_token_fee,
+				user_id, user_email, is_headless, dedup_key
+			)
+			SELECT
+				occurred_at, model, kind,
+				input_tokens, output_tokens,
+				cache_write_tokens, cache_read_tokens,
+				charged_cents, cursor_token_fee,
+				user_id, user_email, is_headless, dedup_key
+			FROM old_db.cursor_usage_events
+			ORDER BY occurred_at, id`); err != nil {
+			return fmt.Errorf("copying cursor usage events: %w", err)
+		}
+	}
+
+	if oldDBHasTable(ctx, tx, "archive_metadata") {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO main.archive_metadata (key, value, created_at, updated_at)
+			SELECT key, value, created_at, updated_at
+			FROM old_db.archive_metadata
+			WHERE true
+			ON CONFLICT(key) DO UPDATE SET
+				value = excluded.value,
+				created_at = excluded.created_at,
+				updated_at = excluded.updated_at`); err != nil {
+			return fmt.Errorf("copying archive metadata: %w", err)
+		}
+	}
+
+	if oldDBHasTable(ctx, tx, "project_identity_observations") {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO main.project_identity_observations (
+				project, machine, root_path, git_remote, git_remote_name,
+				worktree_name, worktree_root_path, observed_at,
+				normalized_remote, key_source, key
+			)
+			SELECT project, machine, root_path, git_remote, git_remote_name,
+				worktree_name, worktree_root_path, observed_at,
+				normalized_remote, key_source, key
+			FROM old_db.project_identity_observations
+			WHERE true
+			ON CONFLICT(project, machine, root_path, git_remote) DO NOTHING`); err != nil {
+			return fmt.Errorf("copying project identity observations: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM main.project_identity_observations
+			WHERE git_remote = ''
+			  AND EXISTS (
+				SELECT 1
+				FROM main.project_identity_observations remote
+				WHERE remote.project = main.project_identity_observations.project
+				  AND remote.machine = main.project_identity_observations.machine
+				  AND remote.root_path = main.project_identity_observations.root_path
+				  AND remote.git_remote != ''
+			  )`); err != nil {
+			return fmt.Errorf(
+				"removing stale project identity root fallbacks: %w", err)
+		}
+		if err := scrubProjectIdentityGitRemoteCredentialsTx(ctx, tx); err != nil {
+			return err
+		}
+	}
+
 	// Copy persistent worktree project mappings. Omit id so
 	// primary-key values from old_db cannot shadow existing
 	// destination rows. ResyncAll may pre-copy mappings into
@@ -604,8 +682,8 @@ func orphanSessionCols(ctx context.Context, tx *sql.Tx) string {
 		"duplicate_prompt_count", "no_code_context_count",
 		"runaway_tool_loop_count",
 		"cwd", "git_branch", "source_session_id",
-		"source_version", "parser_malformed_lines",
-		"is_truncated",
+		"source_version", "transcript_fidelity", "parser_malformed_lines",
+		"is_truncated", "last_write_incremental",
 		"secret_leak_count", "secrets_rules_version",
 	} {
 		if oldDBHasColumn(ctx, tx, "sessions", c) {
@@ -684,6 +762,20 @@ func copySessionDataForIDs(
 	}
 	toolCallCols = append(toolCallCols, "subagent_session_id")
 	toolCallSelect = append(toolCallSelect, "otc.subagent_session_id")
+	if oldDBHasColumn(ctx, tx, "tool_calls", "file_path") {
+		toolCallCols = append(toolCallCols, "file_path")
+		toolCallSelect = append(toolCallSelect, "otc.file_path")
+	} else {
+		toolCallCols = append(toolCallCols, "file_path")
+		toolCallSelect = append(toolCallSelect, "NULL")
+	}
+	if oldDBHasColumn(ctx, tx, "tool_calls", "call_index") {
+		toolCallCols = append(toolCallCols, "call_index")
+		toolCallSelect = append(toolCallSelect, "otc.call_index")
+	} else {
+		toolCallCols = append(toolCallCols, "call_index")
+		toolCallSelect = append(toolCallSelect, "NULL")
+	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO tool_calls
 			(`+strings.Join(toolCallCols, ", ")+`)
@@ -753,6 +845,316 @@ func copySessionDataForIDs(
 		return err
 	}
 	return nil
+}
+
+// sanitizedSourceDataVersion is the first data version at which write
+// paths into an archive sanitize message content, tool result content,
+// and tool result events: dataVersion 58 forced a full resync that
+// re-ingested live sessions through SanitizeUTF8 and ran the copy-time
+// sanitize pass over preserved orphans, and later writers sanitize at
+// ingest. Copying from a source at or above this version skips those
+// row-by-row passes, which otherwise dominate resync time on large
+// archives.
+//
+// sanitizedInputSourceDataVersion is the same watermark for
+// tool_calls.input_json, which ingest did not sanitize until
+// dataVersion 59. Sources between the two versions only pay the
+// single-column input pass.
+//
+// Bump the relevant constant to the then-current dataVersion if
+// SanitizeUTF8 ever gains rules that must apply to already-stored
+// rows.
+const (
+	sanitizedSourceDataVersion      = 58
+	sanitizedInputSourceDataVersion = 59
+)
+
+// copiedSourceDataVersion reads the attached old_db's data version.
+// Read errors are logged and returned as 0 so the copy conservatively
+// re-sanitizes everything.
+func copiedSourceDataVersion(ctx context.Context, tx *sql.Tx) int {
+	var version int
+	if err := tx.QueryRowContext(
+		ctx, "PRAGMA old_db.user_version",
+	).Scan(&version); err != nil {
+		log.Printf("resync: reading source data version: %v", err)
+		return 0
+	}
+	return version
+}
+
+func sanitizeCopiedSessionContent(
+	ctx context.Context,
+	tx *sql.Tx,
+	tempIDsTable string,
+	sourceVersion int,
+) error {
+	// Each pass runs only when the source predates the version at
+	// which ingest started sanitizing that field, so a v58 source
+	// upgrading to v59 pays only the single-column input pass.
+	if sourceVersion < sanitizedInputSourceDataVersion {
+		if err := sanitizeCopiedToolCallInputs(ctx, tx, tempIDsTable); err != nil {
+			return err
+		}
+	}
+	if sourceVersion >= sanitizedSourceDataVersion {
+		return nil
+	}
+	if err := sanitizeCopiedMessageContent(ctx, tx, tempIDsTable); err != nil {
+		return err
+	}
+	if err := sanitizeCopiedToolCallResults(ctx, tx, tempIDsTable); err != nil {
+		return err
+	}
+	return sanitizeCopiedToolResultEvents(ctx, tx, tempIDsTable)
+}
+
+type copiedTextUpdate struct {
+	id      int64
+	content string
+	length  int
+}
+
+func sanitizeCopiedMessageContent(
+	ctx context.Context,
+	tx *sql.Tx,
+	tempIDsTable string,
+) error {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id, content, content_length
+		 FROM main.messages
+		 WHERE session_id IN (SELECT id FROM `+tempIDsTable+`)`,
+	)
+	if err != nil {
+		return fmt.Errorf("querying copied messages: %w", err)
+	}
+	defer rows.Close()
+
+	var updates []copiedTextUpdate
+	for rows.Next() {
+		var row copiedTextUpdate
+		var storedLength int
+		if err := rows.Scan(&row.id, &row.content, &storedLength); err != nil {
+			return fmt.Errorf("scanning copied message: %w", err)
+		}
+		sanitized := SanitizeUTF8(row.content)
+		if sanitized == row.content {
+			continue
+		}
+		row.length = sanitizedCopiedTextLength(
+			row.content, sanitized, storedLength,
+		)
+		row.content = sanitized
+		updates = append(updates, row)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterating copied messages: %w", err)
+	}
+	for _, row := range updates {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE main.messages
+			 SET content = ?, content_length = ?
+			 WHERE id = ?`,
+			row.content, row.length, row.id,
+		); err != nil {
+			return fmt.Errorf("updating copied message %d: %w", row.id, err)
+		}
+	}
+	return nil
+}
+
+type copiedNullableTextUpdate struct {
+	id      int64
+	content any
+	length  any
+}
+
+func sanitizeCopiedToolCallInputs(
+	ctx context.Context,
+	tx *sql.Tx,
+	tempIDsTable string,
+) error {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id, input_json
+		 FROM main.tool_calls
+		 WHERE session_id IN (SELECT id FROM `+tempIDsTable+`)
+		   AND input_json IS NOT NULL`,
+	)
+	if err != nil {
+		return fmt.Errorf("querying copied tool call inputs: %w", err)
+	}
+	defer rows.Close()
+
+	var updates []copiedNullableTextUpdate
+	for rows.Next() {
+		var row copiedNullableTextUpdate
+		var content sql.NullString
+		if err := rows.Scan(&row.id, &content); err != nil {
+			return fmt.Errorf("scanning copied tool call input: %w", err)
+		}
+		if !content.Valid {
+			continue
+		}
+		sanitized := SanitizeUTF8(content.String)
+		if sanitized == content.String {
+			continue
+		}
+		if sanitized == "" {
+			row.content = nil
+		} else {
+			row.content = sanitized
+		}
+		updates = append(updates, row)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterating copied tool call inputs: %w", err)
+	}
+	for _, row := range updates {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE main.tool_calls
+			 SET input_json = ?
+			 WHERE id = ?`,
+			row.content, row.id,
+		); err != nil {
+			return fmt.Errorf("updating copied tool call input %d: %w", row.id, err)
+		}
+	}
+	return nil
+}
+
+func sanitizeCopiedToolCallResults(
+	ctx context.Context,
+	tx *sql.Tx,
+	tempIDsTable string,
+) error {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id, result_content, result_content_length
+		 FROM main.tool_calls
+		 WHERE session_id IN (SELECT id FROM `+tempIDsTable+`)
+		   AND result_content IS NOT NULL`,
+	)
+	if err != nil {
+		return fmt.Errorf("querying copied tool calls: %w", err)
+	}
+	defer rows.Close()
+
+	var updates []copiedNullableTextUpdate
+	for rows.Next() {
+		var id int64
+		var content sql.NullString
+		var storedLength sql.NullInt64
+		if err := rows.Scan(&id, &content, &storedLength); err != nil {
+			return fmt.Errorf("scanning copied tool call: %w", err)
+		}
+		if !content.Valid {
+			continue
+		}
+		sanitized := SanitizeUTF8(content.String)
+		if sanitized == content.String {
+			continue
+		}
+		update := copiedNullableTextUpdate{id: id}
+		if sanitized == "" {
+			update.content = nil
+		} else {
+			update.content = sanitized
+		}
+		update.length = sanitizedCopiedNullableTextLength(
+			content.String, sanitized, storedLength,
+		)
+		updates = append(updates, update)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterating copied tool calls: %w", err)
+	}
+	for _, row := range updates {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE main.tool_calls
+			 SET result_content = ?, result_content_length = ?
+			 WHERE id = ?`,
+			row.content, row.length, row.id,
+		); err != nil {
+			return fmt.Errorf("updating copied tool call %d: %w", row.id, err)
+		}
+	}
+	return nil
+}
+
+func sanitizeCopiedToolResultEvents(
+	ctx context.Context,
+	tx *sql.Tx,
+	tempIDsTable string,
+) error {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id, content, content_length
+		 FROM main.tool_result_events
+		 WHERE session_id IN (SELECT id FROM `+tempIDsTable+`)`,
+	)
+	if err != nil {
+		return fmt.Errorf("querying copied tool result events: %w", err)
+	}
+	defer rows.Close()
+
+	var updates []copiedTextUpdate
+	for rows.Next() {
+		var row copiedTextUpdate
+		var storedLength int
+		if err := rows.Scan(&row.id, &row.content, &storedLength); err != nil {
+			return fmt.Errorf("scanning copied tool result event: %w", err)
+		}
+		sanitized := SanitizeUTF8(row.content)
+		if sanitized == row.content {
+			continue
+		}
+		row.length = sanitizedCopiedTextLength(
+			row.content, sanitized, storedLength,
+		)
+		row.content = sanitized
+		updates = append(updates, row)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterating copied tool result events: %w", err)
+	}
+	for _, row := range updates {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE main.tool_result_events
+			 SET content = ?, content_length = ?
+			 WHERE id = ?`,
+			row.content, row.length, row.id,
+		); err != nil {
+			return fmt.Errorf(
+				"updating copied tool result event %d: %w",
+				row.id, err,
+			)
+		}
+	}
+	return nil
+}
+
+func sanitizedCopiedTextLength(
+	original, sanitized string,
+	storedLength int,
+) int {
+	removed := len(original) - len(sanitized)
+	if removed > 0 {
+		subtractRemovedBytes(&storedLength, removed)
+	}
+	return storedLength
+}
+
+func sanitizedCopiedNullableTextLength(
+	original, sanitized string,
+	storedLength sql.NullInt64,
+) any {
+	if !storedLength.Valid {
+		return nil
+	}
+	length := int(storedLength.Int64)
+	removed := len(original) - len(sanitized)
+	if removed > 0 {
+		subtractRemovedBytes(&length, removed)
+	}
+	return int64(length)
 }
 
 func copyPinnedMessagesForIDs(

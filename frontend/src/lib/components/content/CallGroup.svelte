@@ -1,7 +1,9 @@
 <!-- ABOUTME: Visual grouping for parallel calls in the Calls section — left rail + header chip + member CallRows. -->
 <script lang="ts">
+  import { m } from "../../i18n/index.js";
   import type { CallTiming } from "../../api/types/timing.js";
   import { formatDuration } from "../../utils/duration.js";
+  import { formatNumber } from "../../utils/format.js";
   import CallRow from "./CallRow.svelte";
 
   interface Props {
@@ -54,7 +56,12 @@
   <div class="cg-rail"></div>
   <div class="cg-members">
     <div class="cg-header">
-      <span class="cg-h-label">parallel · {calls.length} calls</span>
+      <span class="cg-h-label">
+        {m.call_group_parallel_label()} · {m.call_group_parallel_call_count({
+          count: calls.length,
+          countLabel: formatNumber(calls.length),
+        })}
+      </span>
       <span class="cg-h-bar-wrap">
         <span class="cg-h-bar" style="width: {headerBarPct}%"></span>
       </span>
@@ -83,14 +90,13 @@
 </div>
 
 <style>
-  /* Copied verbatim from
-     docs/superpowers/specs/2026-04-26-session-duration-ux-mockup.html
-     (.cgroup rules, lines 608–668). */
+  /* Adapted from the session-duration UX mockup, with the raw dark-theme
+     colors mapped to theme tokens. */
   .cgroup {
     display: grid;
     grid-template-columns: 14px 1fr;
     margin: 3px 0;
-    background: rgba(255, 255, 255, 0.025);
+    background: color-mix(in srgb, var(--text-primary) 3%, transparent);
     border-radius: 3px;
     padding: 3px 0;
   }
@@ -105,7 +111,7 @@
     top: 0;
     bottom: 0;
     width: 2px;
-    background: #4a4a4a;
+    background: var(--cat-mixed);
     border-radius: 1px;
   }
   .cgroup .cg-members {
@@ -116,7 +122,7 @@
   .cgroup .cg-header {
     display: grid;
     grid-template-columns: 1fr 56px 56px;
-    gap: 5px;
+    gap: var(--space-2);
     align-items: center;
     padding: 0 5px 4px;
     margin-bottom: 2px;
@@ -124,13 +130,13 @@
   .cgroup .cg-h-label {
     font-family: ui-monospace, monospace;
     font-size: 9px;
-    color: #888;
+    color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.5px;
   }
   .cgroup .cg-h-bar-wrap {
     height: 7px;
-    background: #1c1c1c;
+    background: var(--bg-inset);
     border-radius: 1px;
     position: relative;
     overflow: hidden;
@@ -140,19 +146,26 @@
     inset: 0 auto 0 0;
     background: linear-gradient(
       90deg,
-      rgba(124, 124, 124, 0.6),
-      rgba(124, 124, 124, 0.3)
+      color-mix(in srgb, var(--text-muted) 60%, transparent),
+      color-mix(in srgb, var(--text-muted) 30%, transparent)
     );
     border-radius: 1px;
   }
   .cgroup .cg-h-dur {
     font-family: ui-monospace, monospace;
     font-size: 10px;
-    color: #aaa;
+    color: var(--text-secondary);
     text-align: right;
   }
   .cgroup.dimmed {
     opacity: 0.3;
     transition: opacity 0.18s;
+  }
+  :global(.high-contrast) .cgroup .cg-h-label,
+  :global(.high-contrast) .cgroup .cg-h-dur {
+    color: var(--text-secondary);
+  }
+  :global(.high-contrast) .cgroup .cg-rail::before {
+    background: var(--border-default);
   }
 </style>

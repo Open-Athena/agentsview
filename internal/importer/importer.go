@@ -111,7 +111,20 @@ func ImportClaudeAI(
 		}
 	}()
 
-	err := parser.ParseClaudeAIExport(r, func(
+	provider, ok := parser.NewProvider(
+		parser.AgentClaudeAI, parser.ProviderConfig{},
+	)
+	if !ok {
+		return stats, fmt.Errorf("claude.ai provider unavailable")
+	}
+	exporter, ok := provider.(parser.ClaudeAIExportParser)
+	if !ok {
+		return stats, fmt.Errorf(
+			"claude.ai provider does not support exports",
+		)
+	}
+
+	err := exporter.ParseClaudeAIExport(r, func(
 		result parser.ParseResult,
 	) error {
 		if ctx.Err() != nil {
@@ -164,6 +177,18 @@ func upsertConversation(
 ) (importStatus, error) {
 	s := result.Session
 
+	msgs := make([]db.Message, len(result.Messages))
+	for i, m := range result.Messages {
+		msgs[i] = db.Message{
+			SessionID:     s.ID,
+			Ordinal:       m.Ordinal,
+			Role:          string(m.Role),
+			Content:       m.Content,
+			Timestamp:     m.Timestamp.UTC().Format(time.RFC3339Nano),
+			ContentLength: m.ContentLength,
+		}
+	}
+
 	existing, err := store.GetSession(ctx, s.ID)
 	if err != nil {
 		return importNew, fmt.Errorf("checking session: %w", err)
@@ -206,25 +231,20 @@ func upsertConversation(
 	if !isNew && existing != nil && existing.MessageCount == s.MessageCount {
 		newEnd := timeStr(s.EndedAt)
 		if ptrEqual(existing.EndedAt, newEnd) {
-			return importSkipped, nil
+			existingMsgs, err := store.GetAllMessages(ctx, s.ID)
+			if err != nil {
+				return importNew,
+					fmt.Errorf("loading existing messages: %w", err)
+			}
+			if sameMessages(existingMsgs, msgs) {
+				return importSkipped, nil
+			}
 		}
 	}
 
 	// Suspend FTS before first message-changing operation to
 	// avoid per-row trigger overhead during bulk work.
 	fts.suspend()
-
-	msgs := make([]db.Message, len(result.Messages))
-	for i, m := range result.Messages {
-		msgs[i] = db.Message{
-			SessionID:     s.ID,
-			Ordinal:       m.Ordinal,
-			Role:          string(m.Role),
-			Content:       m.Content,
-			Timestamp:     m.Timestamp.UTC().Format(time.RFC3339Nano),
-			ContentLength: m.ContentLength,
-		}
-	}
 
 	if err := store.ReplaceSessionMessages(s.ID, msgs); err != nil {
 		return importNew, fmt.Errorf("replacing messages: %w", err)
@@ -279,7 +299,20 @@ func ImportChatGPT(
 		assetsDir: assetsDir,
 	}
 
-	err := parser.ParseChatGPTExport(dir, resolver,
+	provider, ok := parser.NewProvider(
+		parser.AgentChatGPT, parser.ProviderConfig{},
+	)
+	if !ok {
+		return stats, fmt.Errorf("chatgpt provider unavailable")
+	}
+	exporter, ok := provider.(parser.ChatGPTExportParser)
+	if !ok {
+		return stats, fmt.Errorf(
+			"chatgpt provider does not support exports",
+		)
+	}
+
+	err := exporter.ParseChatGPTExport(dir, resolver,
 		func(result parser.ParseResult) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -395,6 +428,22 @@ func ptrEqual(a, b *string) bool {
 	return *a == *b
 }
 
+func sameMessages(existing, incoming []db.Message) bool {
+	if len(existing) != len(incoming) {
+		return false
+	}
+	for i := range existing {
+		if existing[i].Ordinal != incoming[i].Ordinal ||
+			existing[i].Role != incoming[i].Role ||
+			existing[i].Content != incoming[i].Content ||
+			existing[i].Timestamp != incoming[i].Timestamp ||
+			existing[i].ContentLength != incoming[i].ContentLength {
+			return false
+		}
+	}
+	return true
+}
+
 func strPtr(s string) *string {
 	if s == "" {
 		return nil
@@ -418,12 +467,17 @@ func convertToolCalls(
 	}
 	calls := make([]db.ToolCall, len(parsed))
 	for i, tc := range parsed {
+		filePath := tc.FilePath
+		if filePath == "" {
+			filePath = parser.ResolveFilePathFromJSON(tc.InputJSON)
+		}
 		calls[i] = db.ToolCall{
 			SessionID: sessionID,
 			ToolName:  tc.ToolName,
 			Category:  tc.Category,
 			ToolUseID: tc.ToolUseID,
 			InputJSON: tc.InputJSON,
+			FilePath:  filePath,
 			SkillName: tc.SkillName,
 		}
 		// Map execution output from ResultEvents to

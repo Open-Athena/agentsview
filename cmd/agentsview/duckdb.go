@@ -2,14 +2,16 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -24,6 +26,9 @@ type DuckDBPushConfig struct {
 	ProjectsFlag    string
 	ExcludeProjects string
 	AllProjects     bool
+	Watch           bool
+	Debounce        time.Duration
+	Interval        time.Duration
 }
 
 type DuckDBQuackServeConfig struct {
@@ -51,8 +56,17 @@ func runDuckDBPush(cfg DuckDBPushConfig) {
 	if err != nil {
 		fatal("duckdb push: %v", err)
 	}
+	if err := duckdbsync.ValidatePushTarget(duckCfg); err != nil {
+		fatal("duckdb push: %v", err)
+	}
+	syncStateTarget := duckdbsync.SyncStateTargetForConfig(duckCfg)
+	writeDuckDBPushPlan(
+		os.Stdout, duckCfg, cfg, projects, excludeProjects, syncStateTarget,
+	)
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(
+		context.Background(), duckDBLongRunningSignals()...,
+	)
 	defer stop()
 
 	backend, cleanup, err := resolveArchiveWriteBackend(ctx, appCfg)
@@ -61,12 +75,28 @@ func runDuckDBPush(cfg DuckDBPushConfig) {
 	}
 	defer cleanup()
 
+	if cfg.Watch {
+		fmt.Printf(
+			"agentsview duckdb watch: pushing to DuckDB "+
+				"(debounce %s, floor %s)\n",
+			cfg.Debounce, cfg.Interval,
+		)
+		if err := backend.DuckDBPushWatch(
+			ctx, duckCfg, cfg, projects, excludeProjects,
+			cfg.Debounce, cfg.Interval,
+		); err != nil {
+			fatal("duckdb watch: %v", err)
+		}
+		return
+	}
+
 	result, err := backend.DuckDBPush(
 		ctx, duckCfg, cfg, projects, excludeProjects,
 	)
 	if err != nil {
 		fatal("duckdb push: %v", err)
 	}
+	writeDuckDBPushDiagnostics(os.Stdout, result)
 	fmt.Printf(
 		"Pushed %d sessions, %d messages to DuckDB in %s\n",
 		result.SessionsPushed,
@@ -76,6 +106,88 @@ func runDuckDBPush(cfg DuckDBPushConfig) {
 	if result.Errors > 0 {
 		fatal("duckdb push: %d session(s) failed", result.Errors)
 	}
+}
+
+func writeDuckDBPushPlan(
+	w io.Writer,
+	duckCfg config.DuckDBConfig,
+	cfg DuckDBPushConfig,
+	projects []string,
+	excludeProjects []string,
+	syncStateTarget string,
+) {
+	target := "local file " + duckCfg.Path
+	if duckCfg.URL != "" {
+		target = "remote Quack endpoint"
+	}
+	mode := "incremental"
+	if cfg.Full {
+		mode = "full"
+	}
+	scope := "default"
+	if syncStateTarget != "" {
+		scope = syncStateTarget
+	}
+	fmt.Fprintf(
+		w,
+		"DuckDB push target: %s; machine %q; mode %s; sync scope %s\n",
+		target, duckCfg.MachineName, mode, scope,
+	)
+	fmt.Fprintf(
+		w, "DuckDB push filters: %s\n",
+		formatDuckDBPushFilters(projects, excludeProjects),
+	)
+}
+
+func writeDuckDBPushDiagnostics(w io.Writer, result duckdbsync.PushResult) {
+	if result.Diagnostics.Cutoff == "" {
+		return
+	}
+	fmt.Fprintf(
+		w,
+		"DuckDB push source: local %s; candidates %s; skipped unchanged %s; stale deleted %d\n",
+		formatDuckDBPushSessionCounts(result.Diagnostics.LocalSessions),
+		formatDuckDBPushSessionCounts(result.Diagnostics.CandidateSessions),
+		formatDuckDBPushSessionCounts(result.Diagnostics.SkippedUnchangedSessions),
+		result.Diagnostics.DeletedStaleSessions,
+	)
+	fmt.Fprintf(
+		w,
+		"DuckDB push wrote: sessions %s, messages %d\n",
+		formatDuckDBPushSessionCounts(result.Diagnostics.PushedSessions),
+		result.MessagesPushed,
+	)
+}
+
+func formatDuckDBPushFilters(projects []string, excludeProjects []string) string {
+	switch {
+	case len(projects) > 0:
+		return "include projects " + strings.Join(projects, ", ")
+	case len(excludeProjects) > 0:
+		return "exclude projects " + strings.Join(excludeProjects, ", ")
+	default:
+		return "all projects"
+	}
+}
+
+func formatDuckDBPushSessionCounts(counts duckdbsync.PushSessionCounts) string {
+	if len(counts.ByAgent) == 0 {
+		return fmt.Sprintf("%d", counts.Total)
+	}
+	agents := make([]string, 0, len(counts.ByAgent))
+	for agent := range counts.ByAgent {
+		agents = append(agents, agent)
+	}
+	sort.Strings(agents)
+	parts := make([]string, 0, len(agents))
+	for _, agent := range agents {
+		parts = append(parts, fmt.Sprintf("%s=%d", agent, counts.ByAgent[agent]))
+	}
+	return fmt.Sprintf("%d (%s)", counts.Total, strings.Join(parts, ", "))
+}
+
+func duckDBLongRunningSignals() []os.Signal {
+	return []os.Signal{os.Interrupt, syscall.SIGTERM}
 }
 
 func runDuckDBStatus() {
@@ -88,29 +200,34 @@ func runDuckDBStatus() {
 	}
 	setupLogFile(appCfg.DataDir)
 
-	database, err := openReadOnlyDB(appCfg)
-	if err != nil {
-		fatal("opening database: %v", err)
-	}
-	defer database.Close()
-
 	duckCfg, err := appCfg.ResolveDuckDB()
 	if err != nil {
 		fatal("duckdb status: %v", err)
 	}
-	syncer, err := duckdbsync.New(
-		duckCfg.Path, database, duckCfg.MachineName,
-		duckdbsync.SyncOptions{},
-	)
+	lastPush := ""
+	syncStateTarget := duckdbsync.SyncStateTargetForConfig(duckCfg)
+	database, err := openReadOnlyDB(appCfg)
 	if err != nil {
-		fatal("duckdb status: %v", err)
+		if duckCfg.URL == "" {
+			fatal("opening database: %v", err)
+		}
+		log.Printf(
+			"warning: reading local duckdb status watermark: %v",
+			err,
+		)
+	} else {
+		defer database.Close()
+		lastPush, err = duckdbsync.ReadLastPushAt(database, syncStateTarget)
+		if err != nil {
+			log.Printf("warning: reading duckdb last push: %v", err)
+			lastPush = ""
+		}
 	}
-	defer syncer.Close()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	status, err := syncer.Status(ctx)
+	status, err := duckdbsync.ReadStatusFromConfig(ctx, duckCfg, lastPush)
 	if err != nil {
 		fatal("duckdb status: %v", err)
 	}
@@ -172,8 +289,7 @@ func runDuckDBServe(appCfg config.Config, basePath string) {
 	}
 
 	ctx, stop := signal.NotifyContext(
-		context.Background(),
-		os.Interrupt, syscall.SIGTERM,
+		context.Background(), duckDBLongRunningSignals()...,
 	)
 	defer stop()
 
@@ -182,9 +298,15 @@ func runDuckDBServe(appCfg config.Config, basePath string) {
 			fatal("duckdb serve: schema migration failed: %v", err)
 		}
 	}
-	if err := duckdbsync.CheckSchemaCompat(ctx, store.DB()); err != nil {
+	var schemaErr error
+	if duckCfg.URL == "" {
+		schemaErr = duckdbsync.CheckSchemaCompat(ctx, store.DB())
+	} else {
+		schemaErr = duckdbsync.CheckSchemaCompatViaQuack(ctx, store.DB())
+	}
+	if schemaErr != nil {
 		fatal("duckdb serve: schema incompatible: %v\n"+
-			"Run 'agentsview duckdb push --full' to repopulate the mirror.", err)
+			"Run 'agentsview duckdb push --full' to repopulate the mirror.", schemaErr)
 	}
 
 	rtOpts := serveRuntimeOptions{
@@ -230,7 +352,7 @@ func runDuckDBServe(appCfg config.Config, basePath string) {
 		defer RemoveDaemonRuntime(rt.Cfg.DataDir)
 	}
 	if rt.Cfg.RequireAuth && rt.Cfg.AuthToken != "" {
-		fmt.Printf("Auth token: %s\n", rt.Cfg.AuthToken)
+		fmt.Println("Auth enabled. Token is configured.")
 	}
 	if rt.PublicURL == rt.LocalURL {
 		fmt.Printf(
@@ -276,11 +398,9 @@ func runDuckDBQuackServe(cfg DuckDBQuackServeConfig) {
 	); err != nil {
 		fatal("duckdb quack serve: %v", err)
 	}
-	token, generated, err := resolveQuackServeToken(
-		cfg.Token, duckCfg.Token, generateQuackToken,
-	)
+	token, err := resolveQuackServeToken(cfg.Token, duckCfg.Token)
 	if err != nil {
-		fatal("duckdb quack serve: generating token: %v", err)
+		fatal("duckdb quack serve: %v", err)
 	}
 
 	conn, err := duckdbsync.Open(duckCfg.Path)
@@ -290,7 +410,7 @@ func runDuckDBQuackServe(cfg DuckDBQuackServeConfig) {
 	defer conn.Close()
 
 	ctx, stop := signal.NotifyContext(
-		context.Background(), os.Interrupt, syscall.SIGTERM,
+		context.Background(), duckDBLongRunningSignals()...,
 	)
 	defer stop()
 
@@ -322,48 +442,50 @@ func runDuckDBQuackServe(cfg DuckDBQuackServeConfig) {
 		}
 	}()
 
-	fmt.Printf("DuckDB file: %s\n", duckCfg.Path)
-	if info.ListenURI != "" {
-		fmt.Printf("Quack URI:   %s\n", info.ListenURI)
-	} else {
-		fmt.Printf("Quack URI:   %s\n", cfg.Bind)
-	}
-	if info.HTTPURL != "" {
-		fmt.Printf("HTTP URL:    %s\n", info.HTTPURL)
-	}
-	if generated {
-		fmt.Printf("Token:       %s\n", token)
-	} else {
-		fmt.Println("Token:       configured")
-	}
-	fmt.Println("Press Ctrl+C to stop.")
+	writeDuckDBQuackServeStartup(os.Stdout, duckDBQuackServeStartup{
+		Path: duckCfg.Path,
+		Bind: cfg.Bind,
+		Info: info,
+	})
 
 	<-ctx.Done()
 }
 
-func resolveQuackServeToken(
-	flagToken, configuredToken string,
-	generate func() (string, error),
-) (string, bool, error) {
-	if flagToken != "" {
-		return flagToken, false, nil
-	}
-	if configuredToken != "" {
-		return configuredToken, false, nil
-	}
-	token, err := generate()
-	if err != nil {
-		return "", false, err
-	}
-	return token, true, nil
+type duckDBQuackServeStartup struct {
+	Path string
+	Bind string
+	Info quackServeInfo
 }
 
-func generateQuackToken() (string, error) {
-	var buf [32]byte
-	if _, err := rand.Read(buf[:]); err != nil {
-		return "", err
+func writeDuckDBQuackServeStartup(
+	out io.Writer,
+	startup duckDBQuackServeStartup,
+) {
+	fmt.Fprintf(out, "DuckDB file: %s\n", startup.Path)
+	if startup.Info.ListenURI != "" {
+		fmt.Fprintf(out, "Quack URI:   %s\n", startup.Info.ListenURI)
+	} else {
+		fmt.Fprintf(out, "Quack URI:   %s\n", startup.Bind)
 	}
-	return base64.RawURLEncoding.EncodeToString(buf[:]), nil
+	if startup.Info.HTTPURL != "" {
+		fmt.Fprintf(out, "HTTP URL:    %s\n", startup.Info.HTTPURL)
+	}
+	fmt.Fprintln(out, "Token:       configured")
+	fmt.Fprintln(out, "Press Ctrl+C to stop.")
+}
+
+func resolveQuackServeToken(
+	flagToken, configuredToken string,
+) (string, error) {
+	if flagToken != "" {
+		return flagToken, nil
+	}
+	if configuredToken != "" {
+		return configuredToken, nil
+	}
+	return "", fmt.Errorf(
+		"token is required; set --token, AGENTSVIEW_DUCKDB_TOKEN, or [duckdb].token",
+	)
 }
 
 func identifyQuackNode(ctx context.Context, conn *sql.DB, machine string) {
@@ -383,22 +505,31 @@ func identifyQuackNode(ctx context.Context, conn *sql.DB, machine string) {
 type quackServeInfo struct {
 	ListenURI string
 	HTTPURL   string
-	AuthToken string
 }
 
 func startQuackServer(
 	ctx context.Context, conn *sql.DB, bind, token string, allowOther bool,
 ) (quackServeInfo, error) {
-	query := `CALL quack_serve(?, token => ?)`
+	query := `SELECT listen_uri, listen_url FROM quack_serve(?, token => ?)`
 	args := []any{bind, token}
 	if allowOther {
-		query = `CALL quack_serve(?, token => ?, allow_other_hostname => ?)`
+		query = `SELECT listen_uri, listen_url FROM quack_serve(?, token => ?, allow_other_hostname => ?)`
 		args = append(args, allowOther)
 	}
-	if _, err := conn.ExecContext(ctx, query, args...); err != nil {
+	var listenURI, httpURL sql.NullString
+	if err := conn.QueryRowContext(ctx, query, args...).Scan(
+		&listenURI, &httpURL,
+	); err != nil {
 		return quackServeInfo{}, fmt.Errorf("starting quack server: %w", err)
 	}
-	return quackServeInfo{ListenURI: bind, AuthToken: token}, nil
+	info := quackServeInfo{ListenURI: bind}
+	if listenURI.Valid && listenURI.String != "" {
+		info.ListenURI = listenURI.String
+	}
+	if httpURL.Valid {
+		info.HTTPURL = httpURL.String
+	}
+	return info, nil
 }
 
 func resolveDuckDBPushProjects(

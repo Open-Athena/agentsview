@@ -16,14 +16,6 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 )
 
-func testDB(t *testing.T) *db.DB {
-	t.Helper()
-	d, err := db.Open(t.TempDir() + "/test.db")
-	require.NoError(t, err, "opening test db")
-	t.Cleanup(func() { d.Close() })
-	return d
-}
-
 func cleanPGSchema(t *testing.T, pgURL string) {
 	t.Helper()
 	pg, err := sql.Open("pgx", pgURL)
@@ -70,6 +62,87 @@ func TestEnsureSchemaIdempotent(t *testing.T) {
 	if err != nil && err != sql.ErrNoRows {
 		t.Fatalf("tool_result_events schema probe: %v", err)
 	}
+}
+
+func TestSyncEffectiveSyncStateFallsBackToLocalDB(t *testing.T) {
+	local := testDB(t)
+	require.NoError(t, local.SetSyncState(
+		"last_push_at",
+		"2026-03-11T12:34:56.123456789Z",
+	))
+
+	sync := &Sync{local: local}
+	require.NoError(t, NormalizeLocalSyncStateTimestamps(
+		sync.effectiveSyncState(),
+	))
+
+	got, err := sync.effectiveSyncState().GetSyncState("last_push_at")
+	require.NoError(t, err)
+	assert.Equal(t, "2026-03-11T12:34:56.123Z", got)
+}
+
+func TestSyncScopedStateUsesTargetKeys(t *testing.T) {
+	pgURL := testPGURL(t)
+	cleanPGSchema(t, pgURL)
+	t.Cleanup(func() { cleanPGSchema(t, pgURL) })
+
+	local := testDB(t)
+	ps, err := New(
+		pgURL, "agentsview", local,
+		"test-machine", true,
+		SyncOptions{
+			SyncStateTarget:        "work",
+			MigrateLegacySyncState: true,
+		},
+	)
+	require.NoError(t, err, "creating sync")
+	defer ps.Close()
+
+	ctx := context.Background()
+	require.NoError(t, ps.EnsureSchema(ctx), "ensure schema")
+
+	started := "2026-03-11T12:00:00Z"
+	require.NoError(t, local.UpsertSession(db.Session{
+		ID:           "sess-scoped-001",
+		Project:      "test-project",
+		Machine:      "local",
+		Agent:        "claude",
+		StartedAt:    &started,
+		MessageCount: 1,
+	}), "upsert session")
+	require.NoError(t, local.InsertMessages([]db.Message{{
+		SessionID: "sess-scoped-001",
+		Ordinal:   0,
+		Role:      "user",
+		Content:   "hello",
+	}}), "insert message")
+
+	_, err = ps.Push(ctx, false, nil)
+	require.NoError(t, err, "push")
+
+	scopedLastPush, err := local.GetSyncState("last_push_at:work")
+	require.NoError(t, err)
+	assert.NotEmpty(t, scopedLastPush)
+
+	legacyLastPush, err := local.GetSyncState("last_push_at")
+	require.NoError(t, err)
+	assert.Empty(t, legacyLastPush)
+
+	scopedBoundary, err := local.GetSyncState(
+		lastPushBoundaryStateKey + ":work",
+	)
+	require.NoError(t, err)
+	assert.NotEmpty(t, scopedBoundary)
+
+	scopedFingerprint, err := local.GetSyncState(
+		lastPushTargetFingerprintKey + ":work",
+	)
+	require.NoError(t, err)
+	assert.NotEmpty(t, scopedFingerprint)
+
+	status, err := ps.Status(ctx)
+	require.NoError(t, err, "status")
+	assert.Equal(t, scopedLastPush, status.LastPushAt)
 }
 
 func TestEnsureSchemaMigratesLegacySchema(t *testing.T) {
@@ -831,9 +904,15 @@ func TestPushDetectsPGTargetChangeAfterFilteredPush(t *testing.T) {
 
 	lastPush, err := local.GetSyncState("last_push_at")
 	require.NoError(t, err, "reading filtered watermark")
-	assert.Empty(t, lastPush, "filtered push should keep last_push_at empty")
+	assert.Empty(t, lastPush,
+		"filtered push should keep global last_push_at empty")
 
-	boundaryState, err := local.GetSyncState(lastPushBoundaryStateKey)
+	scopedLastPush, err := filteredA.effectiveSyncState().GetSyncState("last_push_at")
+	require.NoError(t, err, "reading filtered scoped watermark")
+	assert.NotEmpty(t, scopedLastPush,
+		"filtered push should advance scoped last_push_at")
+
+	boundaryState, err := filteredA.effectiveSyncState().GetSyncState(lastPushBoundaryStateKey)
 	require.NoError(t, err, "reading filtered boundary state")
 	require.NotEmpty(t, boundaryState,
 		"filtered push should persist boundary fingerprints")
@@ -887,6 +966,43 @@ func TestPushFullAfterSchemaDropRecreatesSchema(
 	// schemaDone is memoized from the first push.
 	r2, err := ps.Push(ctx, true, nil)
 	require.NoError(t, err, "full push after drop")
+	assert.Equal(t, 1, r2.SessionsPushed)
+}
+
+func TestScopedPushFullAfterSchemaDropRecreatesSchema(
+	t *testing.T,
+) {
+	pgURL := testPGURL(t)
+	const schema = "agentsview_scoped_full_drop"
+	cleanNamedPGSchema(t, pgURL, schema)
+	t.Cleanup(func() { cleanNamedPGSchema(t, pgURL, schema) })
+
+	local := testDB(t)
+	ps, err := New(
+		pgURL, schema, local,
+		"test-machine", true,
+		SyncOptions{Projects: []string{"proj"}},
+	)
+	require.NoError(t, err, "creating sync")
+	ctx := context.Background()
+
+	sess := db.Session{
+		ID:        "sess-scoped-full-drop",
+		Project:   "proj",
+		Machine:   "test-machine",
+		Agent:     "claude",
+		CreatedAt: "2026-03-11T12:00:00.000Z",
+	}
+	require.NoError(t, local.UpsertSession(sess), "upsert session")
+
+	r1, err := ps.Push(ctx, false, nil)
+	require.NoError(t, err, "initial push")
+	require.Equal(t, 1, r1.SessionsPushed)
+
+	cleanNamedPGSchema(t, pgURL, schema)
+
+	r2, err := ps.Push(ctx, true, nil)
+	require.NoError(t, err, "scoped full push after drop")
 	assert.Equal(t, 1, r2.SessionsPushed)
 }
 
@@ -1176,6 +1292,178 @@ func TestPushFilteredByProject(t *testing.T) {
 	assert.Equal(t, 0, r3.SessionsPushed)
 }
 
+func TestFilteredPushAfterResetDoesNotMaskUnfilteredResetRecovery(t *testing.T) {
+	pgURL := testPGURL(t)
+	const schema = "agentsview_filtered_reset_marker"
+	cleanNamedPGSchema(t, pgURL, schema)
+	t.Cleanup(func() { cleanNamedPGSchema(t, pgURL, schema) })
+
+	local := testDB(t)
+	ctx := context.Background()
+
+	for _, s := range []db.Session{
+		{
+			ID: "reset-alpha", Project: "alpha",
+			Machine: "local", Agent: "claude",
+			CreatedAt:    "2026-03-11T12:00:00Z",
+			MessageCount: 1,
+		},
+		{
+			ID: "reset-beta", Project: "beta",
+			Machine: "local", Agent: "claude",
+			CreatedAt:    "2026-03-11T12:05:00Z",
+			MessageCount: 1,
+		},
+	} {
+		require.NoError(t, local.UpsertSession(s), "upsert %s", s.ID)
+		require.NoError(t, local.InsertMessages([]db.Message{{
+			SessionID: s.ID,
+			Ordinal:   0,
+			Role:      "user",
+			Content:   "msg " + s.ID,
+			Timestamp: s.CreatedAt,
+		}}), "insert message %s", s.ID)
+	}
+
+	unfiltered, err := New(
+		pgURL, schema, local,
+		"test-machine", true,
+		SyncOptions{},
+	)
+	require.NoError(t, err, "creating unfiltered sync")
+	defer unfiltered.Close()
+
+	r1, err := unfiltered.Push(ctx, false, nil)
+	require.NoError(t, err, "initial unfiltered push")
+	require.Equal(t, 2, r1.SessionsPushed)
+
+	cleanNamedPGSchema(t, pgURL, schema)
+
+	filtered, err := New(
+		pgURL, schema, local,
+		"test-machine", true,
+		SyncOptions{Projects: []string{"alpha"}},
+	)
+	require.NoError(t, err, "creating filtered sync")
+	defer filtered.Close()
+
+	r2, err := filtered.Push(ctx, false, nil)
+	require.NoError(t, err, "filtered push after reset")
+	require.Equal(t, 1, r2.SessionsPushed)
+
+	unfilteredAfterReset, err := New(
+		pgURL, schema, local,
+		"test-machine", true,
+		SyncOptions{},
+	)
+	require.NoError(t, err, "creating unfiltered sync after reset")
+	defer unfilteredAfterReset.Close()
+
+	_, err = unfilteredAfterReset.Push(ctx, false, nil)
+	require.NoError(t, err, "unfiltered push after filtered reset")
+
+	var count int
+	err = unfilteredAfterReset.DB().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM sessions WHERE project IN ('alpha', 'beta')",
+	).Scan(&count)
+	require.NoError(t, err, "counting restored sessions")
+	assert.Equal(t, 2, count)
+}
+
+func TestFilteredPartialPushDetectsResetWithEmptyWatermark(t *testing.T) {
+	pgURL := testPGURL(t)
+	const schema = "agentsview_filtered_partial_reset"
+	cleanNamedPGSchema(t, pgURL, schema)
+	t.Cleanup(func() { cleanNamedPGSchema(t, pgURL, schema) })
+
+	local := testDB(t)
+	ctx := context.Background()
+
+	for _, s := range []db.Session{
+		{
+			ID: "partial-good", Project: "alpha",
+			Machine: "local", Agent: "claude",
+			CreatedAt:    "2026-03-11T12:00:00Z",
+			MessageCount: 1,
+		},
+		{
+			ID: "partial-bad", Project: "alpha",
+			Machine: "local", Agent: "claude",
+			CreatedAt:    "2026-03-11T12:05:00Z",
+			MessageCount: 1,
+		},
+	} {
+		require.NoError(t, local.UpsertSession(s), "upsert %s", s.ID)
+		require.NoError(t, local.InsertMessages([]db.Message{{
+			SessionID: s.ID,
+			Ordinal:   0,
+			Role:      "user",
+			Content:   "msg " + s.ID,
+			Timestamp: s.CreatedAt,
+		}}), "insert message %s", s.ID)
+	}
+
+	filtered, err := New(
+		pgURL, schema, local,
+		"test-machine", true,
+		SyncOptions{Projects: []string{"alpha"}},
+	)
+	require.NoError(t, err, "creating filtered sync")
+	defer filtered.Close()
+	require.NoError(t, filtered.EnsureSchema(ctx), "ensure schema")
+
+	quotedSchema, err := quoteIdentifier(schema)
+	require.NoError(t, err, "quote schema")
+	_, err = filtered.DB().ExecContext(ctx, fmt.Sprintf(`
+		CREATE OR REPLACE FUNCTION %[1]s.fail_partial_bad()
+		RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.id = 'partial-bad' THEN
+				RAISE EXCEPTION 'forced partial push failure';
+			END IF;
+			RETURN NEW;
+		END;
+		$$;
+		CREATE TRIGGER fail_partial_bad
+		BEFORE INSERT OR UPDATE ON %[1]s.sessions
+		FOR EACH ROW EXECUTE FUNCTION %[1]s.fail_partial_bad();
+	`, quotedSchema))
+	require.NoError(t, err, "install partial failure trigger")
+
+	r1, err := filtered.Push(ctx, false, nil)
+	require.NoError(t, err, "initial partial filtered push")
+	require.Equal(t, 1, r1.SessionsPushed)
+	require.Equal(t, 1, r1.Errors)
+
+	scopedLastPush, err := filtered.effectiveSyncState().GetSyncState("last_push_at")
+	require.NoError(t, err, "reading scoped watermark")
+	require.Empty(t, scopedLastPush)
+	boundaryState, err := filtered.effectiveSyncState().GetSyncState(lastPushBoundaryStateKey)
+	require.NoError(t, err, "reading scoped boundary state")
+	require.NotEmpty(t, boundaryState)
+
+	cleanNamedPGSchema(t, pgURL, schema)
+
+	filteredAfterReset, err := New(
+		pgURL, schema, local,
+		"test-machine", true,
+		SyncOptions{Projects: []string{"alpha"}},
+	)
+	require.NoError(t, err, "creating filtered sync after reset")
+	defer filteredAfterReset.Close()
+
+	r2, err := filteredAfterReset.Push(ctx, false, nil)
+	require.NoError(t, err, "filtered push after reset")
+	require.Equal(t, 2, r2.SessionsPushed)
+
+	var count int
+	err = filteredAfterReset.DB().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM sessions WHERE project = 'alpha'",
+	).Scan(&count)
+	require.NoError(t, err, "counting restored filtered sessions")
+	assert.Equal(t, 2, count)
+}
+
 func TestPushExcludeProject(t *testing.T) {
 	pgURL := testPGURL(t)
 	cleanPGSchema(t, pgURL)
@@ -1267,10 +1555,12 @@ func TestPushFilteredFullIsIncremental(t *testing.T) {
 	require.NoError(t, err, "reading watermark")
 	assert.Empty(t, wm, "watermark after filtered --full")
 
+	scopedWM, err := ps.effectiveSyncState().GetSyncState("last_push_at")
+	require.NoError(t, err, "reading scoped watermark")
+	assert.NotEmpty(t, scopedWM, "scoped watermark after filtered --full")
+
 	// Boundary fingerprints must have been written.
-	bs, err := local.GetSyncState(
-		"last_push_boundary_state",
-	)
+	bs, err := ps.effectiveSyncState().GetSyncState(lastPushBoundaryStateKey)
 	require.NoError(t, err, "reading boundary state")
 	require.NotEmpty(t, bs, "boundary state empty after filtered --full")
 

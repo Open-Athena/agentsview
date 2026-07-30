@@ -434,6 +434,241 @@ func TestStoreGetUsageSessionCountsDedupesClaudeKeys(t *testing.T) {
 	assert.False(t, ok, "proj-b should have been deduped out: %#v", counts.ByProject)
 }
 
+func TestStoreGetUsageMatchingSessionCountCountsCopilotSessionsWithoutUsageRows(
+	t *testing.T,
+) {
+	_, store := prepareUsageSchema(t, "agentsview_usage_matching_sessions_test")
+
+	ctx := context.Background()
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at, ended_at,
+			message_count, user_message_count
+		) VALUES
+			('copilot-empty', 'test-machine', 'proj-a', 'copilot',
+			 '2026-03-12T10:00:00Z'::timestamptz,
+			 '2026-03-12T10:00:00Z'::timestamptz, 1, 1),
+			('claude-usage', 'test-machine', 'proj-a', 'claude',
+			 '2026-03-12T11:00:00Z'::timestamptz,
+			 '2026-03-12T11:00:00Z'::timestamptz, 1, 1)`)
+	require.NoError(t, err, "insert sessions")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO messages (
+			session_id, ordinal, role, content, timestamp, content_length,
+			model, token_usage
+		) VALUES
+			('copilot-empty', 0, 'assistant', 'copilot',
+			 '2026-03-12T10:00:00Z'::timestamptz, 7,
+			 'gpt-5.3-codex', ''),
+			('claude-usage', 0, 'assistant', 'claude',
+			 '2026-03-12T11:00:00Z'::timestamptz, 6,
+			 'claude-sonnet-4-20250514', '{"input_tokens":1}')`)
+	require.NoError(t, err, "insert messages")
+
+	count, err := store.GetUsageMatchingSessionCount(ctx, db.UsageFilter{
+		From:     "2026-03-12",
+		To:       "2026-03-12",
+		Timezone: "UTC",
+		Agent:    "copilot",
+		Model:    "gpt-5.3-codex",
+	})
+	require.NoError(t, err, "GetUsageMatchingSessionCount")
+	assert.Equal(t, 1, count)
+}
+
+func TestStoreGetUsageMatchingSessionCountCountsCopilotSessionByMessageTimestampOutsideSessionWindow(
+	t *testing.T,
+) {
+	_, store := prepareUsageSchema(t, "agentsview_usage_matching_sessions_late_test")
+
+	ctx := context.Background()
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at, ended_at,
+			message_count, user_message_count
+		) VALUES
+			('copilot-late-message', 'test-machine', 'proj-a', 'copilot',
+			 '2026-02-08T10:00:00Z'::timestamptz,
+			 '2026-02-08T10:00:00Z'::timestamptz, 1, 1),
+			('copilot-out-of-range', 'test-machine', 'proj-a', 'copilot',
+			 '2026-02-08T10:00:00Z'::timestamptz,
+			 '2026-02-08T10:00:00Z'::timestamptz, 1, 1)`)
+	require.NoError(t, err, "insert sessions")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO messages (
+			session_id, ordinal, role, content, timestamp, content_length,
+			model, token_usage
+		) VALUES
+			('copilot-late-message', 0, 'assistant', 'copilot',
+			 '2026-02-10T12:00:00Z'::timestamptz, 7,
+			 'gpt-5.3-codex', ''),
+			('copilot-out-of-range', 0, 'assistant', 'copilot',
+			 '2026-02-08T10:00:00Z'::timestamptz, 7,
+			 'gpt-5.3-codex', '')`)
+	require.NoError(t, err, "insert messages")
+
+	count, err := store.GetUsageMatchingSessionCount(ctx, db.UsageFilter{
+		From:     "2026-02-10",
+		To:       "2026-02-10",
+		Timezone: "UTC",
+		Agent:    "copilot",
+	})
+	require.NoError(t, err, "GetUsageMatchingSessionCount")
+	assert.Equal(t, 1, count)
+}
+
+// TestStoreGetUsageMatchingSessionCountModelFilterAppliesToBoundedRow
+// guards against the model/exclude-model predicate matching session-wide
+// instead of on the in-range message row: a session with an out-of-range
+// message on the filtered model but an in-range message on a different
+// model must not match a Model filter for the out-of-range model.
+func TestStoreGetUsageMatchingSessionCountModelFilterAppliesToBoundedRow(
+	t *testing.T,
+) {
+	_, store := prepareUsageSchema(t, "agentsview_usage_matching_sessions_model_test")
+
+	ctx := context.Background()
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at, ended_at,
+			message_count, user_message_count
+		) VALUES
+			('copilot-mixed-model', 'test-machine', 'proj-a', 'copilot',
+			 '2026-02-08T10:00:00Z'::timestamptz,
+			 '2026-02-10T12:00:00Z'::timestamptz, 2, 1)`)
+	require.NoError(t, err, "insert sessions")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO messages (
+			session_id, ordinal, role, content, timestamp, content_length,
+			model, token_usage
+		) VALUES
+			('copilot-mixed-model', 0, 'assistant', 'copilot',
+			 '2026-02-08T10:00:00Z'::timestamptz, 7,
+			 'gpt-5.3-codex', ''),
+			('copilot-mixed-model', 1, 'assistant', 'claude',
+			 '2026-02-10T12:00:00Z'::timestamptz, 6,
+			 'claude-sonnet', '')`)
+	require.NoError(t, err, "insert messages")
+
+	count, err := store.GetUsageMatchingSessionCount(ctx, db.UsageFilter{
+		From:     "2026-02-10",
+		To:       "2026-02-10",
+		Timezone: "UTC",
+		Agent:    "copilot",
+		Model:    "gpt-5.3-codex",
+	})
+	require.NoError(t, err, "GetUsageMatchingSessionCount")
+	assert.Equal(t, 0, count,
+		"out-of-range message's model must not match the bounded window")
+}
+
+// TestStoreGetUsageMatchingSessionCountCountsAssistantMessageWithNoModel
+// guards against gating matching-session eligibility on m.model != ”:
+// some Copilot assistant messages parse before a model name is known, so
+// an assistant message with an empty model must still count toward the
+// matching-session total when no Model/ExcludeModel filter narrows it.
+func TestStoreGetUsageMatchingSessionCountCountsAssistantMessageWithNoModel(
+	t *testing.T,
+) {
+	_, store := prepareUsageSchema(t, "agentsview_usage_matching_sessions_no_model_test")
+
+	ctx := context.Background()
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at, ended_at,
+			message_count, user_message_count
+		) VALUES
+			('copilot-no-model', 'test-machine', 'proj-a', 'copilot',
+			 '2026-02-10T10:00:00Z'::timestamptz,
+			 '2026-02-10T10:00:00Z'::timestamptz, 1, 1)`)
+	require.NoError(t, err, "insert sessions")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO messages (
+			session_id, ordinal, role, content, timestamp, content_length,
+			model, token_usage
+		) VALUES
+			('copilot-no-model', 0, 'assistant', 'copilot',
+			 '2026-02-10T10:00:00Z'::timestamptz, 7,
+			 '', '')`)
+	require.NoError(t, err, "insert messages")
+
+	count, err := store.GetUsageMatchingSessionCount(ctx, db.UsageFilter{
+		From:     "2026-02-10",
+		To:       "2026-02-10",
+		Timezone: "UTC",
+		Agent:    "copilot",
+	})
+	require.NoError(t, err, "GetUsageMatchingSessionCount")
+	assert.Equal(t, 1, count,
+		"assistant message with no model must still count without a model filter")
+}
+
+// TestStoreGetUsageMatchingSessionCountUnboundedMatchesBoundedSemantics
+// guards against the unbounded (no From/To) branch drifting from the
+// bounded branch: soft-deleted sessions and sessions without
+// assistant/event activity must not count, and empty-model assistant
+// messages must survive an ExcludeModel filter, exactly as on the
+// bounded path.
+func TestStoreGetUsageMatchingSessionCountUnboundedMatchesBoundedSemantics(
+	t *testing.T,
+) {
+	_, store := prepareUsageSchema(t, "agentsview_usage_matching_sessions_unbounded_test")
+
+	ctx := context.Background()
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at, ended_at,
+			message_count, user_message_count, deleted_at
+		) VALUES
+			('copilot-live', 'test-machine', 'proj-a', 'copilot',
+			 '2026-03-01T10:00:00Z'::timestamptz,
+			 '2026-03-01T10:00:00Z'::timestamptz, 1, 1, NULL),
+			('copilot-trashed', 'test-machine', 'proj-a', 'copilot',
+			 '2026-03-01T10:00:00Z'::timestamptz,
+			 '2026-03-01T10:00:00Z'::timestamptz, 1, 1,
+			 '2026-03-02T00:00:00Z'::timestamptz),
+			('copilot-user-only', 'test-machine', 'proj-a', 'copilot',
+			 '2026-03-01T10:00:00Z'::timestamptz,
+			 '2026-03-01T10:00:00Z'::timestamptz, 1, 1, NULL)`)
+	require.NoError(t, err, "insert sessions")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO messages (
+			session_id, ordinal, role, content, timestamp, content_length,
+			model, token_usage
+		) VALUES
+			('copilot-live', 0, 'assistant', 'copilot',
+			 '2026-03-01T10:00:00Z'::timestamptz, 7,
+			 '', ''),
+			('copilot-trashed', 0, 'assistant', 'copilot',
+			 '2026-03-01T10:00:00Z'::timestamptz, 7,
+			 'gpt-5.3-codex', ''),
+			('copilot-user-only', 0, 'user', 'hello',
+			 '2026-03-01T10:00:00Z'::timestamptz, 5,
+			 '', '')`)
+	require.NoError(t, err, "insert messages")
+
+	unbounded := db.UsageFilter{Timezone: "UTC", Agent: "copilot"}
+	count, err := store.GetUsageMatchingSessionCount(ctx, unbounded)
+	require.NoError(t, err, "GetUsageMatchingSessionCount unbounded")
+	assert.Equal(t, 1, count,
+		"soft-deleted and assistant-less sessions must not count unbounded")
+
+	bounded := unbounded
+	bounded.From = "2026-03-01"
+	bounded.To = "2026-03-01"
+	boundedCount, err := store.GetUsageMatchingSessionCount(ctx, bounded)
+	require.NoError(t, err, "GetUsageMatchingSessionCount bounded")
+	assert.Equal(t, count, boundedCount,
+		"bounded and unbounded requests must match the same sessions")
+
+	excluded := unbounded
+	excluded.ExcludeModel = "gpt-5.3-codex"
+	excludedCount, err := store.GetUsageMatchingSessionCount(ctx, excluded)
+	require.NoError(t, err, "GetUsageMatchingSessionCount exclude-model")
+	assert.Equal(t, 1, excludedCount,
+		"empty-model assistant message must survive an ExcludeModel filter")
+}
+
 func TestStoreGetUsageSessionCountsDedupesSourceUUIDFallback(t *testing.T) {
 	_, store := prepareUsageSchema(t, "agentsview_usage_counts_source_uuid_test")
 
@@ -542,6 +777,160 @@ func TestPostgresUsageQueriesUnionUsageEvents(t *testing.T) {
 	assert.Equal(t, 3, counts.Total)
 	assert.Equal(t, 2, counts.ByAgent["hermes"])
 	assert.Equal(t, 2, counts.ByProject["proj-b"])
+}
+
+func TestPostgresUsagePreservesSessionSummaryUsageEventTokens(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_usage_summary_event_test")
+
+	ctx := context.Background()
+	rawInput := db.MaxPlausibleTokens + 250_000
+	rawOutput := db.MaxPlausibleTokens + 500_000
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO model_pricing (
+			model_pattern, input_per_mtok, output_per_mtok,
+			cache_creation_per_mtok, cache_read_per_mtok, updated_at
+		) VALUES ('gpt-5.4', 1, 2, 0, 0, 'seed')`)
+	require.NoError(t, err, "insert pricing")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at,
+			message_count, user_message_count,
+			total_output_tokens, peak_context_tokens,
+			has_total_output_tokens, has_peak_context_tokens
+		) VALUES (
+			'hermes-summary', 'test-machine', 'proj', 'hermes',
+			'2026-05-14T10:00:00Z'::timestamptz, 1, 1,
+			$1, $2, true, true
+		)`, rawOutput, rawInput)
+	require.NoError(t, err, "insert session")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO usage_events (
+			session_id, source, model, input_tokens, output_tokens,
+			occurred_at, dedup_key
+		) VALUES (
+			'hermes-summary', 'session', 'gpt-5.4', $1, $2,
+			'2026-05-14T10:05:00Z'::timestamptz, 'session:hermes-summary'
+		)`, rawInput, rawOutput)
+	require.NoError(t, err, "insert usage event")
+
+	daily, err := store.GetDailyUsage(ctx, db.UsageFilter{
+		From:     "2026-05-14",
+		To:       "2026-05-14",
+		Timezone: "UTC",
+	})
+	require.NoError(t, err, "GetDailyUsage")
+	require.Len(t, daily.Daily, 1, "daily entries")
+	assert.Equal(t, rawInput, daily.Totals.InputTokens, "daily input")
+	assert.Equal(t, rawOutput, daily.Totals.OutputTokens, "daily output")
+
+	usage, err := store.GetSessionUsage(ctx, "hermes-summary")
+	require.NoError(t, err, "GetSessionUsage")
+	require.NotNil(t, usage, "session usage")
+	assert.Equal(t, rawOutput, usage.TotalOutputTokens)
+	assert.Equal(t, rawInput, usage.PeakContextTokens)
+	require.True(t, usage.HasCost, "HasCost")
+	wantCost := (float64(rawInput)*1.0 + float64(rawOutput)*2.0) / 1_000_000
+	assert.InDelta(t, wantCost, usage.CostUSD, 1e-9, "session cost")
+}
+
+func TestPostgresUsageCostsMessageReasoningTokens(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_usage_message_reasoning_test")
+
+	ctx := context.Background()
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO model_pricing (
+			model_pattern, input_per_mtok, output_per_mtok,
+			cache_creation_per_mtok, cache_read_per_mtok, updated_at
+		) VALUES ('gpt-5.4', 1, 2, 0, 0, 'seed')`)
+	require.NoError(t, err, "insert pricing")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at,
+			message_count, user_message_count
+		) VALUES (
+			'pg-message-reasoning', 'test-machine', 'proj', 'codex',
+			'2026-05-14T10:00:00Z'::timestamptz, 1, 1
+		)`)
+	require.NoError(t, err, "insert session")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO messages (
+			session_id, ordinal, role, content, timestamp,
+			content_length, model, token_usage
+		) VALUES (
+			'pg-message-reasoning', 0, 'assistant', 'done',
+			'2026-05-14T10:30:00Z'::timestamptz, 4,
+			'gpt-5.4',
+			'{"input_tokens":1000,"output_tokens":0,"reasoning_tokens":3000000000}'
+		)`)
+	require.NoError(t, err, "insert message")
+
+	daily, err := store.GetDailyUsage(ctx, db.UsageFilter{
+		From:     "2026-05-14",
+		To:       "2026-05-14",
+		Timezone: "UTC",
+	})
+	require.NoError(t, err, "GetDailyUsage")
+	require.Len(t, daily.Daily, 1, "daily entries")
+	assert.Equal(t, 1000, daily.Totals.InputTokens)
+	assert.Zero(t, daily.Totals.OutputTokens)
+	assert.InDelta(t, 4.001, daily.Totals.TotalCost, 1e-12)
+
+	usage, err := store.GetSessionUsage(ctx, "pg-message-reasoning")
+	require.NoError(t, err, "GetSessionUsage")
+	require.NotNil(t, usage)
+	assert.True(t, usage.HasCost)
+	assert.InDelta(t, 4.001, usage.CostUSD, 1e-12)
+}
+
+func TestStoreGetDailyUsageSkipsCursorUsageForTerminationFilter(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_usage_cursor_termination_test")
+
+	ctx := context.Background()
+	_, err := store.DB().ExecContext(ctx, `
+		INSERT INTO sessions (
+			id, machine, project, agent, started_at,
+			message_count, user_message_count, termination_status
+		) VALUES (
+			'clean-session', 'test-machine', 'proj', 'claude',
+			'2026-05-14T10:00:00Z'::timestamptz, 1, 1, 'clean'
+		)`)
+	require.NoError(t, err, "insert session")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO messages (
+			session_id, ordinal, role, content, timestamp,
+			content_length, model, token_usage
+		) VALUES (
+			'clean-session', 0, 'assistant', 'one',
+			'2026-05-14T10:30:00Z'::timestamptz, 3,
+			'claude-sonnet-4-20250514',
+			'{"input_tokens":100,"output_tokens":40}'
+		)`)
+	require.NoError(t, err, "insert message")
+	_, err = store.DB().ExecContext(ctx, `
+		INSERT INTO cursor_usage_events (
+			occurred_at, model, kind, input_tokens, output_tokens,
+			cache_read_tokens, charged_cents, cursor_token_fee,
+			user_id, user_email, dedup_key
+		) VALUES (
+			'2026-05-14T10:05:00Z'::timestamptz,
+			'claude-4.6-opus-high-thinking',
+			'USAGE_EVENT_KIND_USAGE_BASED',
+			1234, 567, 8901, 15.66, 3.32,
+			'152683922', 'member@example.com', 'cursor:termination'
+		)`)
+	require.NoError(t, err, "insert cursor usage")
+
+	result, err := store.GetDailyUsage(ctx, db.UsageFilter{
+		From:        "2026-05-14",
+		To:          "2026-05-14",
+		Timezone:    "UTC",
+		Termination: "clean",
+	})
+	require.NoError(t, err, "GetDailyUsage clean termination")
+	require.Len(t, result.Daily, 1, "daily entries")
+	assert.Equal(t, 100, result.Totals.InputTokens, "InputTokens")
+	assert.Equal(t, 40, result.Totals.OutputTokens, "OutputTokens")
+	assert.Equal(t, 1, result.SessionCounts.Total, "SessionCounts.Total")
 }
 
 func TestPushSyncsModelPricingToPostgres(t *testing.T) {

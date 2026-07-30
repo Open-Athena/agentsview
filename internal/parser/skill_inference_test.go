@@ -451,6 +451,7 @@ func TestParseCodexSessionInfersSkillName(t *testing.T) {
 }
 
 func TestParseCodexSessionInfersSkillNameFromSessionCwd(t *testing.T) {
+
 	path := writeTestSkill(t, "index", "data-analytics:index")
 	cwd := filepath.Dir(filepath.Dir(filepath.Dir(path)))
 	content := testjsonl.JoinJSONL(
@@ -469,6 +470,7 @@ func TestParseCodexSessionInfersSkillNameFromSessionCwd(t *testing.T) {
 }
 
 func TestParseCodexSessionFromInfersSkillNameFromSeededCwd(t *testing.T) {
+
 	path := writeTestSkill(t, "index", "data-analytics:index")
 	cwd := filepath.Dir(filepath.Dir(filepath.Dir(path)))
 
@@ -477,7 +479,7 @@ func TestParseCodexSessionFromInfersSkillNameFromSeededCwd(t *testing.T) {
 		testjsonl.CodexMsgJSON("user", "use the dashboard skill", tsEarlyS1),
 	)
 	file := createTestFile(t, "incremental-skill.jsonl", initial)
-	_, msgs, err := ParseCodexSession(file, "local", false)
+	_, msgs, err := parseCodexTestSession(t, file, "local", false)
 	require.NoError(t, err)
 
 	info, err := os.Stat(file)
@@ -494,7 +496,7 @@ func TestParseCodexSessionFromInfersSkillNameFromSeededCwd(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	newMsgs, _, _, err := ParseCodexSessionFrom(file, offset, len(msgs), false)
+	newMsgs, _, _, err := parseCodexTestSessionFrom(t, file, offset, len(msgs), false)
 	require.NoError(t, err)
 	require.Len(t, newMsgs, 1)
 	require.Len(t, newMsgs[0].ToolCalls, 1)

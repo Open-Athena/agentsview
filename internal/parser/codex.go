@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -30,6 +31,11 @@ const (
 var errCodexIncrementalNeedsFullParse = errors.New(
 	"codex incremental event requires full parse",
 )
+
+const codexGoalContextSourceAttr = `source="goal"`
+
+var codexGoalContextSourceAttrRe = regexp.MustCompile(`(?:^|\s)` +
+	regexp.QuoteMeta(codexGoalContextSourceAttr) + `(?:\s|/|$)`)
 
 var codexSessionIndexCache = struct {
 	mu      sync.Mutex
@@ -1299,11 +1305,12 @@ func IsCodexExecSessionFile(path string) bool {
 	return false
 }
 
-// ParseCodexSession parses a Codex JSONL session file.
-// The includeExec parameter is retained for backward
-// compatibility; exec-originated sessions are now always
-// parsed and imported.
-func ParseCodexSession(
+// parseSession parses a Codex JSONL session file into a session and its
+// messages. The includeExec parameter is retained for backward compatibility;
+// exec-originated sessions are now always parsed and imported. This is the
+// provider-owned parse entrypoint; the package-level free function was folded
+// onto the provider.
+func (p *codexProvider) parseSession(
 	path, machine string, includeExec bool,
 ) (*ParsedSession, []ParsedMessage, error) {
 	info, err := os.Stat(path)
@@ -1407,6 +1414,15 @@ func CodexSessionIndexTitles(indexPath string) map[string]string {
 	return titles
 }
 
+// EvictCodexSessionIndex removes one cached session_index.jsonl entry. S3
+// sync uses transient temp files for hydrated indexes, so those cache entries
+// should not live beyond the parse that needed them.
+func EvictCodexSessionIndex(indexPath string) {
+	codexSessionIndexCache.mu.Lock()
+	delete(codexSessionIndexCache.entries, indexPath)
+	codexSessionIndexCache.mu.Unlock()
+}
+
 // LookupCodexThreadName returns the current Codex thread name for a session
 // from the session_index.jsonl file next to the session root.
 func LookupCodexThreadName(sessionPath, sessionID string) string {
@@ -1478,8 +1494,27 @@ func loadCodexSessionIndex(indexPath string) (map[string]string, error) {
 	}
 	defer f.Close()
 
+	titles, err := ParseCodexSessionIndexTitles(f)
+	if err != nil {
+		return nil, err
+	}
+
+	codexSessionIndexCache.mu.Lock()
+	codexSessionIndexCache.entries[indexPath] = codexSessionIndexEntry{
+		mtime:  mtime,
+		size:   size,
+		titles: titles,
+	}
+	codexSessionIndexCache.mu.Unlock()
+
+	return titles, nil
+}
+
+// ParseCodexSessionIndexTitles reads a Codex session_index.jsonl stream and
+// returns session UUIDs mapped to non-empty thread titles.
+func ParseCodexSessionIndexTitles(r io.Reader) (map[string]string, error) {
 	titles := make(map[string]string)
-	s := bufio.NewScanner(f)
+	s := bufio.NewScanner(r)
 	s.Buffer(make([]byte, 0, 64*1024), maxLineSize)
 	for s.Scan() {
 		line := s.Text()
@@ -1496,15 +1531,6 @@ func loadCodexSessionIndex(indexPath string) (map[string]string, error) {
 	if err := s.Err(); err != nil {
 		return nil, err
 	}
-
-	codexSessionIndexCache.mu.Lock()
-	codexSessionIndexCache.entries[indexPath] = codexSessionIndexEntry{
-		mtime:  mtime,
-		size:   size,
-		titles: titles,
-	}
-	codexSessionIndexCache.mu.Unlock()
-
 	return titles, nil
 }
 
@@ -1642,12 +1668,21 @@ func (s *codexIncrementalSeed) observeUserMessage(
 	}
 }
 
-// ParseCodexSessionFrom parses only new lines from a Codex
-// JSONL file starting at the given byte offset. Returns only
-// the newly parsed messages (with ordinals starting at
-// startOrdinal) and the latest timestamp seen. Used for
-// incremental re-parsing of large append-only session files.
-func ParseCodexSessionFrom(
+// CodexTranscriptConsumedSize returns the byte offset after the last complete,
+// valid JSON line in a Codex transcript. Bytes after this offset are ignored by
+// the Codex JSONL parser, so partial trailing writes are not part of the parsed
+// source snapshot.
+func CodexTranscriptConsumedSize(path string) (int64, error) {
+	return readJSONLFrom(path, 0, func(line string) {})
+}
+
+// parseSessionFrom parses only new lines from a Codex JSONL file starting at
+// the given byte offset. Returns only the newly parsed messages (with ordinals
+// starting at startOrdinal) and the latest timestamp seen. Used for incremental
+// re-parsing of large append-only session files. This is the provider-owned
+// incremental parse entrypoint; the package-level free function was folded onto
+// the provider.
+func (p *codexProvider) parseSessionFrom(
 	path string,
 	offset int64,
 	startOrdinal int,
@@ -1719,7 +1754,30 @@ func isCodexSystemMessage(content string) bool {
 		strings.HasPrefix(content, "<INSTRUCTIONS>") ||
 		isCodexTurnAbortedMessage(content) ||
 		strings.HasPrefix(trimmed, "<skill>") ||
-		isCodexSubagentNotification(content)
+		isCodexSubagentNotification(content) ||
+		isCodexGoalContext(content)
+}
+
+// isCodexGoalContext reports whether content is a Codex /goal
+// continuation envelope. These are harness-injected as role=user
+// records to keep the model working toward an active thread goal, but
+// they are not user-authored turns and should be treated as system
+// content. Current sessions wrap the body in
+// <codex_internal_context source="goal">; older sessions used
+// <goal_context>. Detection is scoped to the structured wrapper (and,
+// for the modern form, the goal source specifically) so that other
+// internal-context envelopes and real user messages quoting the goal
+// text are left untouched.
+func isCodexGoalContext(content string) bool {
+	trimmed := strings.TrimSpace(content)
+	if strings.HasPrefix(trimmed, "<goal_context>") {
+		return true
+	}
+	if strings.HasPrefix(trimmed, "<codex_internal_context") {
+		openTag, _, ok := strings.Cut(trimmed, ">")
+		return ok && codexGoalContextSourceAttrRe.MatchString(openTag)
+	}
+	return false
 }
 
 func isCodexTurnAbortedMessage(content string) bool {

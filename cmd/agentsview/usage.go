@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,7 +17,10 @@ import (
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/pricing"
+	"go.kenn.io/agentsview/internal/service"
 	"go.kenn.io/agentsview/internal/sync"
 )
 
@@ -67,15 +69,85 @@ type UsageDailyConfig struct {
 	Timezone  string
 }
 
+// resolveUsageWindow resolves the raw --since/--until flags into concrete
+// inclusive YYYY-MM-DD bounds. Both accept a duration like 28d or a date,
+// the same syntax as `stats`. --until resolves first; a duration --since is
+// then measured back from the resolved --until (or from now when --until is
+// open), matching how stats anchors a duration window. An inverted explicit
+// window is rejected so a reversed range fails loudly instead of returning
+// an empty result.
+func resolveUsageWindow(
+	since, until string, now time.Time, loc *time.Location,
+) (string, string, error) {
+	if loc == nil {
+		loc = time.UTC
+	}
+	now = now.In(loc)
+	// Resolve --until first and keep it as the anchor for --since:
+	// ParseWindowPoint measures a duration back from its time argument, so
+	// a duration --since is measured from the resolved --until while a date
+	// stands alone. --until open leaves the anchor at now.
+	anchor := now
+	to := ""
+	if until != "" {
+		t, date, err := resolveUsageWindowPoint(until, now, loc)
+		if err != nil {
+			return "", "", fmt.Errorf("invalid --until: %w", err)
+		}
+		anchor, to = t, date
+	}
+	from := ""
+	if since != "" {
+		_, date, err := resolveUsageWindowPoint(since, anchor, loc)
+		if err != nil {
+			return "", "", fmt.Errorf("invalid --since: %w", err)
+		}
+		from = date
+	}
+	// Bounds are inclusive, so from == to is a valid single day (hence >
+	// not >=). String comparison is valid because YYYY-MM-DD sorts
+	// lexically.
+	if from != "" && to != "" && from > to {
+		return "", "", fmt.Errorf(
+			"--since (%s) must not be after --until (%s)", from, to)
+	}
+	return from, to, nil
+}
+
+func resolveUsageWindowPoint(
+	raw string, anchor time.Time, loc *time.Location,
+) (time.Time, string, error) {
+	if t, err := time.ParseInLocation("2006-01-02", raw, loc); err == nil {
+		return t, raw, nil
+	}
+	t, err := db.ParseWindowPoint(raw, anchor)
+	if err != nil {
+		return time.Time{}, "", err
+	}
+	return t, t.In(loc).Format("2006-01-02"), nil
+}
+
 func runUsageDaily(cfg UsageDailyConfig) {
 	tz := cfg.Timezone
 	if tz == "" {
 		tz = localTimezone()
 	}
 
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: invalid --timezone: %v\n", err)
+		os.Exit(1)
+	}
+
+	since, until, err := resolveUsageWindow(cfg.Since, cfg.Until, time.Now(), loc)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
 	filter := db.UsageFilter{
-		From:     cfg.Since,
-		To:       cfg.Until,
+		From:     since,
+		To:       until,
 		Agent:    cfg.Agent,
 		Timezone: tz,
 	}
@@ -117,6 +189,32 @@ func runUsageDaily(cfg UsageDailyConfig) {
 	}
 
 	printDailyTable(result, cfg.Breakdown)
+	if note := noTokenDataNote(cfg.Agent, result.Totals); note != "" {
+		fmt.Fprintln(os.Stderr, note)
+	}
+}
+
+// noTokenDataNote returns a one-line stderr note for a zero usage result when
+// the user has filtered to agents that do not record per-message token usage.
+// The wording follows the service's unsupported-usage kind for the same
+// filter, so the CLI and the dashboard cannot drift: all-Copilot filters keep
+// the Copilot-specific wording and every other no-token filter gets the
+// generic note. It returns "" when the filter does not select only
+// no-token-data agents or real token/cost data exists. This is an
+// agent-property statement (issue #349) shown in response to an explicit
+// --agent the user typed, so it needs no session-presence check; it is
+// appropriate even for an empty window.
+func noTokenDataNote(agent string, totals db.UsageTotals) string {
+	if !parser.AgentFilterLacksPerMessageTokenData(agent) ||
+		!db.NoTokenData(totals) {
+		return ""
+	}
+	if service.UnsupportedUsageKindForAgentFilter(agent) ==
+		service.UnsupportedUsageKindCopilotNoTokenData {
+		return "note: these GitHub Copilot records do not include token " +
+			"or cost data that agentsview can total."
+	}
+	return "note: matching sessions do not record per-message token usage."
 }
 
 type UsageProjectsConfig struct {
@@ -452,10 +550,13 @@ func ensureFreshData(
 			AgentDirs: appCfg.AgentDirs,
 			Machine:   "local",
 		})
+		defer engine.Close()
 		fmt.Fprintln(os.Stderr,
 			"Data version changed, running full resync...")
 		t := time.Now()
-		stats := engine.ResyncAll(ctx, printSyncProgressStderr)
+		progress := newResyncProgressPrinter(os.Stderr, time.Now)
+		stats := engine.ResyncAll(ctx, progress.Print)
+		progress.Finish()
 		printSyncSummaryStderr(stats, t)
 		return
 	}
@@ -472,6 +573,7 @@ func ensureFreshData(
 		AgentDirs: appCfg.AgentDirs,
 		Machine:   "local",
 	})
+	defer engine.Close()
 
 	since := engine.LastSyncStartedAt()
 	if !since.IsZero() {
@@ -481,21 +583,8 @@ func ensureFreshData(
 	engine.SyncAllSince(ctx, since, func(sync.Progress) {})
 }
 
-// printSyncProgressStderr mirrors printSyncProgress but writes
-// to stderr so it does not pollute stdout-bound JSON or
-// statusline output from the usage commands.
-func printSyncProgressStderr(p sync.Progress) {
-	if p.SessionsTotal > 0 {
-		fmt.Fprintf(os.Stderr,
-			"\r  %d/%d sessions (%.0f%%) · %d messages\x1b[K",
-			p.SessionsDone, p.SessionsTotal,
-			p.Percent(), p.MessagesIndexed,
-		)
-	}
-}
-
 // printSyncSummaryStderr mirrors printSyncSummary but writes to
-// stderr, for the same reason as printSyncProgressStderr.
+// stderr so it does not pollute stdout-bound JSON or statusline output.
 func printSyncSummaryStderr(stats sync.SyncStats, t time.Time) {
 	summary := fmt.Sprintf(
 		"\nSync complete: %d sessions synced",
@@ -513,6 +602,7 @@ func printSyncSummaryStderr(stats sync.SyncStats, t time.Time) {
 	summary += fmt.Sprintf(
 		" in %s\n", time.Since(t).Round(time.Millisecond),
 	)
+	summary += formatAnomalySummary(stats.Anomalies)
 	fmt.Fprint(os.Stderr, summary)
 	for _, w := range stats.Warnings {
 		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
@@ -647,6 +737,7 @@ func applyFallbackPricing(
 	database *db.DB, custom map[string]config.CustomModelRate,
 ) {
 	rates := make(map[string]config.CustomModelRate)
+	sources := make(map[string]export.PricingRowSource)
 	for _, p := range pricing.FallbackPricing() {
 		// These keys are the same concrete model-pattern keys that the
 		// model_pricing table stores. SQLite usage lookups run the merged map
@@ -658,9 +749,13 @@ func applyFallbackPricing(
 			CacheCreation: p.CacheCreationPerMTok,
 			CacheRead:     p.CacheReadPerMTok,
 		}
+		sources[p.ModelPattern] = export.PricingRowSourceEmbedded
 	}
-	maps.Copy(rates, custom)
-	database.SetCustomPricing(rates)
+	for model, rate := range custom {
+		rates[model] = rate
+		sources[model] = export.PricingRowSourceCustom
+	}
+	database.SetEffectivePricing(rates, sources)
 }
 
 func ensurePricingWithFetcher(
@@ -737,14 +832,23 @@ func fetchHTTPDailyUsage(
 		)
 	}
 	var out struct {
-		Totals        db.UsageTotals        `json:"totals"`
-		Daily         []db.DailyUsageEntry  `json:"daily"`
-		SessionCounts db.UsageSessionCounts `json:"sessionCounts"`
+		SchemaVersion int                               `json:"schema_version,omitempty"`
+		Pricing       *export.PricingBlock              `json:"pricing,omitempty"`
+		Projects      map[string]export.ProjectMapEntry `json:"projects,omitempty"`
+		Totals        db.UsageTotals                    `json:"totals"`
+		Daily         []db.DailyUsageEntry              `json:"daily"`
+		SessionCounts db.UsageSessionCounts             `json:"sessionCounts"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return db.DailyUsageResult{}, err
 	}
+	if out.Projects == nil {
+		out.Projects = map[string]export.ProjectMapEntry{}
+	}
 	return db.DailyUsageResult{
+		SchemaVersion: out.SchemaVersion,
+		Pricing:       out.Pricing,
+		Projects:      out.Projects,
 		Daily:         out.Daily,
 		Totals:        out.Totals,
 		SessionCounts: out.SessionCounts,

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { m } from "../../i18n/index.js";
   import {
+    getSessionStatus,
     sessions,
     type SessionGroupInput,
   } from "../../stores/sessions.svelte.js";
@@ -18,7 +19,8 @@
     UserRoundIcon,
     UsersRoundIcon,
   } from "../../icons.js";
-  import StatusDot from "../common/StatusDot.svelte";
+  import { StatusDot } from "@kenn-io/kit-ui";
+  import { sessionStatusLabel } from "../../utils/sessionStatus.js";
   import { router } from "../../stores/router.svelte.js";
 
   interface Props {
@@ -49,6 +51,10 @@
     hasSubagents?: boolean;
     /** Whether the group contains teammate children. */
     hasTeammates?: boolean;
+    /** Whether multi-select mode is active in the sidebar. */
+    selectMode?: boolean;
+    /** Whether this item is currently selected in multi-select mode. */
+    selected?: boolean;
   }
 
   let {
@@ -65,7 +71,11 @@
     isLastChild = false,
     hasSubagents = false,
     hasTeammates = false,
+    selectMode = false,
+    selected = false,
   }: Props = $props();
+
+  let sessionStatus = $derived(getSessionStatus(session, groupSessions));
 
   let isActive = $derived.by(() => {
     const aid = sessions.activeSessionId;
@@ -233,7 +243,11 @@
       return;
     }
     e.preventDefault();
-    sessions.selectSession(session.id);
+    if (selectMode) {
+      sessions.toggleSelection(session.id);
+    } else {
+      sessions.selectSession(session.id);
+    }
   }
 
   function handleRowClick(e: MouseEvent) {
@@ -253,7 +267,17 @@
     if (target.closest("a, button, input")) {
       return;
     }
-    sessions.selectSession(session.id);
+    if (selectMode) {
+      sessions.toggleSelection(session.id);
+    } else {
+      sessions.selectSession(session.id);
+    }
+  }
+
+  function handleSelectClick(e: MouseEvent) {
+    e.stopPropagation();
+    e.preventDefault();
+    sessions.toggleSelection(session.id);
   }
 
   $effect(() => {
@@ -306,7 +330,11 @@
     }
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
-      sessions.selectSession(session.id);
+      if (selectMode) {
+        sessions.toggleSelection(session.id);
+      } else {
+        sessions.selectSession(session.id);
+      }
     }
   }}
   oncontextmenu={handleContextMenu}
@@ -332,7 +360,26 @@
     <span class="tree-spacer"></span>
   {/if}
 
-  <StatusDot {session} {groupSessions} size={6} />
+  {#if selectMode}
+    <button
+      type="button"
+      class="select-checkbox"
+      class:checked={selected}
+      onclick={handleSelectClick}
+      tabindex="-1"
+      aria-label={selected
+        ? m.sidebar_row_deselect_session()
+        : m.sidebar_row_select_session()}
+    >
+      {#if selected}
+        <svg width="10" height="10" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+          <path d="M2.5 6L5 8.5L9.5 3.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      {/if}
+    </button>
+  {/if}
+
+  <StatusDot status={sessionStatus} label={sessionStatusLabel(sessionStatus)} size={6} />
 
 
   <div class="session-info">
@@ -450,7 +497,7 @@
   .session-item {
     display: flex;
     align-items: center;
-    gap: 5px;
+    gap: var(--space-2);
     width: 100%;
     height: 42px;
     padding: 0 10px;
@@ -545,7 +592,7 @@
     display: flex;
     flex-direction: column;
     align-items: flex-end;
-    gap: 3px;
+    gap: var(--space-1);
     min-width: 0;
     flex-shrink: 0;
     margin-left: 4px;
@@ -712,11 +759,11 @@
 
   :global(.context-menu) {
     position: fixed;
-    z-index: 9999;
+    z-index: var(--z-popover);
     background: var(--bg-surface);
     border: 1px solid var(--border-default);
     border-radius: 6px;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+    box-shadow: var(--shadow-lg);
     padding: 4px 0;
     min-width: 120px;
   }
@@ -744,5 +791,29 @@
 
   :global(.context-menu .context-menu-item.danger:hover) {
     background: color-mix(in srgb, var(--accent-red, #e55) 10%, transparent);
+  }
+
+  .select-checkbox {
+    all: unset;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+    border: 1.5px solid var(--border-default);
+    border-radius: 3px;
+    cursor: pointer;
+    color: white;
+    transition: background 0.1s, border-color 0.1s;
+  }
+
+  .select-checkbox:hover {
+    border-color: var(--accent-blue);
+  }
+
+  .select-checkbox.checked {
+    background: var(--accent-blue);
+    border-color: var(--accent-blue);
   }
 </style>

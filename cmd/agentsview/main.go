@@ -5,11 +5,14 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"maps"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"slices"
+	"strings"
 	"syscall"
 	"time"
 	_ "time/tzdata"
@@ -18,6 +21,7 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/remotesync"
 	"go.kenn.io/agentsview/internal/secrets"
 	"go.kenn.io/agentsview/internal/server"
 	"go.kenn.io/agentsview/internal/signals"
@@ -33,7 +37,6 @@ var (
 
 const (
 	periodicSyncInterval  = 15 * time.Minute
-	daemonIdleTimeout     = 20 * time.Minute
 	telemetryPingInterval = 24 * time.Hour
 	unwatchedPollInterval = 2 * time.Minute
 	watcherDebounce       = 500 * time.Millisecond
@@ -50,7 +53,9 @@ func main() {
 
 	if err := executeCLI(); err != nil {
 		code := exitCodeFromError(err)
-		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
+		if !isSilentExitError(err) {
+			fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
+		}
 		os.Exit(code)
 	}
 }
@@ -60,6 +65,9 @@ func main() {
 // inaccessible.
 func warnMissingDirs(dirs []string, label string) {
 	for _, d := range dirs {
+		if strings.HasPrefix(d, "s3://") {
+			continue // remote source has no local path
+		}
 		_, err := os.Stat(d)
 		if err == nil {
 			continue
@@ -78,7 +86,13 @@ func warnMissingDirs(dirs []string, label string) {
 	}
 }
 
-func runServe(cfg config.Config) {
+type serveOptions struct {
+	ReplaceDaemon  bool
+	NoSyncExplicit bool
+	Pprof          bool
+}
+
+func runServe(cfg config.Config, opts serveOptions) {
 	start := time.Now()
 	setupLogFile(cfg.DataDir)
 
@@ -86,27 +100,42 @@ func runServe(cfg config.Config) {
 		fatal("invalid serve config: %v", err)
 	}
 
-	// When auth is required, ensure a token exists before publishing
-	// startup state so waiting CLI probes can authenticate the first
-	// protected /api/ping after startup completes.
+	// Remote sync archive endpoints always require bearer auth, even when
+	// general API auth is disabled. Ensure a token exists before publishing
+	// startup state so daemon probes and remote collectors share one token.
+	if err := ensureServeAuthToken(&cfg); err != nil {
+		log.Fatalf("Failed to generate auth token: %v", err)
+	}
 	if cfg.RequireAuth {
-		if err := cfg.EnsureAuthToken(); err != nil {
-			log.Fatalf("Failed to generate auth token: %v", err)
-		}
-		// A background child redirects stdout to serve.log; printing the
-		// token there would persist it to a file. The parent already
-		// printed the token to the invoking terminal, so the child stays
-		// quiet about it.
+		// Startup output may be captured by service managers or log files,
+		// so never write the bearer token itself.
 		if cfg.AuthToken != "" && !runningAsBackgroundChild() {
-			fmt.Printf("Auth enabled. Token: %s\n", cfg.AuthToken)
+			fmt.Println("Auth enabled. Token is configured.")
 		}
 	}
+
+	cont, releaseForegroundServeLaunch, err := prepareForegroundServeDaemon(
+		&cfg,
+		serveReplacementOptions{
+			Replace:        opts.ReplaceDaemon,
+			NoSyncExplicit: opts.NoSyncExplicit,
+		},
+	)
+	if err != nil {
+		fatal("%v", err)
+	}
+	if !cont {
+		return
+	}
+	defer releaseForegroundServeLaunch()
 
 	// Acquire the daemon start lock immediately after config setup,
 	// before opening the DB, so token-use never sees a window
 	// with no lock and no runtime record during startup.
 	MarkDaemonStarting(cfg.DataDir)
 	defer UnmarkDaemonStarting(cfg.DataDir)
+	startupProgress := newStartupStateWriter(cfg.DataDir, time.Now)
+	startupProgress.SetPhase("opening database")
 
 	database, writeLock := mustOpenWriteDB(context.Background(), cfg)
 	runtimeRecordDataDir := ""
@@ -138,7 +167,7 @@ func runServe(cfg config.Config) {
 		context.Background(), os.Interrupt, syscall.SIGTERM,
 	)
 	defer stop()
-	idleTracker := newDaemonIdleTracker(stop)
+	idleTracker := newDaemonIdleTracker(cfg, stop)
 
 	telemetryReporter := telemetry.NewReporterOrDisabled(telemetry.Options{
 		DataDir: cfg.DataDir,
@@ -163,28 +192,14 @@ func runServe(cfg config.Config) {
 		})
 
 		if database.NeedsResync() {
-			signalsCovered := runInitialResync(ctx, engine)
+			startupProgress.SetPhase("full resync")
+			signalsCovered := runInitialResync(ctx, engine, startupProgress)
 			if ctx.Err() == nil {
-				if err := database.Vacuum(); err != nil {
-					log.Printf("vacuum after resync: %v", err)
-				}
-				// Only short-circuit BackfillSignals when resync
-				// rewrote every session through the inline signal
-				// path. Aborted resyncs fall back to incremental
-				// sync (existing rows untouched) and orphans are
-				// copied as-is from the previous DB without
-				// recompute -- both leave sessions that still
-				// need backfill.
-				if signalsCovered {
-					if err := database.MarkSignalsBackfillDone(); err != nil {
-						log.Printf(
-							"mark signals backfill done: %v", err,
-						)
-					}
-				}
+				finishInitialResync(database, signalsCovered)
 			}
 		} else {
-			runInitialSync(ctx, engine)
+			startupProgress.SetPhase("initial sync")
+			runInitialSync(ctx, engine, startupProgress)
 		}
 		if ctx.Err() != nil {
 			return
@@ -208,15 +223,22 @@ func runServe(cfg config.Config) {
 			}
 		})
 
-		go startPeriodicSync(engine, database, idleTracker)
+		validRemotes := true
+		if err := cfg.ValidateRemoteHosts(); err != nil {
+			log.Printf("warning: remote_hosts config invalid, skipping periodic remote sync: %v", err)
+			validRemotes = false
+		}
+		go startPeriodicSync(ctx, cfg, engine, database, idleTracker, validRemotes, broadcaster)
 	}
 
-	// Seed model_pricing after any resync swap so the new DB
-	// file (which doesn't carry pricing across the swap) is
-	// populated before the dashboard starts answering
-	// requests. Synchronous fallback upsert so the first
-	// usage page load does not observe an empty table;
-	// background LiteLLM refresh follows immediately.
+	// Seed model_pricing so a fresh database (first run, or a
+	// resync whose pricing copy failed) is populated before
+	// the dashboard starts answering requests. Resyncs also
+	// copy pricing across the swap themselves, since this seed
+	// only runs once per daemon lifetime. Synchronous fallback
+	// upsert so the first usage page load does not observe an
+	// empty table; background LiteLLM refresh follows
+	// immediately.
 	seedPricing(database)
 
 	rtOpts := serveRuntimeOptions{
@@ -239,8 +261,10 @@ func runServe(cfg config.Config) {
 		server.WithBaseContext(ctx),
 		server.WithBroadcaster(broadcaster),
 		server.WithIdleTracker(idleTracker),
+		server.WithPprof(opts.Pprof),
 	)
 
+	startupProgress.SetPhase("starting HTTP server")
 	rt, err := startServerWithOptionalCaddy(ctx, cfg, srv, rtOpts)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -268,6 +292,7 @@ func runServe(cfg config.Config) {
 		runtimeRecordDataDir = rt.Cfg.DataDir
 		UnmarkDaemonStarting(rt.Cfg.DataDir)
 	}
+	releaseForegroundServeLaunch()
 	if idleTracker != nil {
 		idleTracker.Touch()
 		go idleTracker.Run(ctx)
@@ -291,6 +316,10 @@ func runServe(cfg config.Config) {
 	startTelemetryPings(ctx, telemetryReporter)
 
 	if engine != nil {
+		// Registered before stopWatcher so LIFO defer order stops
+		// the watcher first, then Close flushes any pending
+		// debounced signal recomputes.
+		defer engine.Close()
 		stopWatcher, unwatchedDirs := startFileWatcher(
 			cfg, engine, func(paths []string) {
 				idleTracker.Do(func() {
@@ -309,11 +338,18 @@ func runServe(cfg config.Config) {
 	}
 }
 
-func newDaemonIdleTracker(stop context.CancelFunc) *server.IdleTracker {
+func ensureServeAuthToken(cfg *config.Config) error {
+	if cfg == nil || cfg.AuthToken != "" {
+		return nil
+	}
+	return cfg.EnsureAuthToken()
+}
+
+func newDaemonIdleTracker(cfg config.Config, stop context.CancelFunc) *server.IdleTracker {
 	if !runningAsBackgroundChild() {
 		return nil
 	}
-	timeout := daemonIdleTimeout
+	timeout := cfg.DaemonIdleTimeout
 	if raw := os.Getenv("AGENTSVIEW_DAEMON_IDLE_TIMEOUT"); raw != "" {
 		parsed, err := time.ParseDuration(raw)
 		if err != nil {
@@ -422,7 +458,7 @@ func openReadOnlyDB(cfg config.Config) (*db.DB, error) {
 	applyClassifierConfig(cfg)
 	database, err := db.OpenReadOnly(cfg.DBPath)
 	if err != nil {
-		return nil, err
+		return nil, schemaUpgradeHint(err)
 	}
 	applyCustomPricing(database, cfg)
 	if err := applyCursorSecret(database, cfg); err != nil {
@@ -430,6 +466,32 @@ func openReadOnlyDB(cfg config.Config) (*db.DB, error) {
 		return nil, err
 	}
 	return database, nil
+}
+
+// schemaUpgradeHint augments a read-only open failure with actionable guidance
+// when the archive is simply older than this binary. The pending migration only
+// runs on a writable open, which read-only commands never perform, so the user
+// must let the daemon (re)start to upgrade the archive. Without this, the raw
+// "schema missing tool_calls.file_path" error leaves upgraders with no path
+// forward; it is the failure reported in issue #929 after a version bump while
+// an older daemon still owned the archive.
+func schemaUpgradeHint(err error) error {
+	if !db.IsSchemaUpgradeRequired(err) {
+		return err
+	}
+	return appendDaemonRestartUpgradeHint(err)
+}
+
+func appendDaemonRestartUpgradeHint(err error) error {
+	return fmt.Errorf("%w\n\n%s", err, daemonRestartUpgradeHint())
+}
+
+func daemonRestartUpgradeHint() string {
+	return "This database was written by an older agentsview version and " +
+		"must be upgraded before it can be read. The upgrade runs when a " +
+		"writable daemon starts, so restart the daemon to let it run:\n" +
+		"  - desktop app: quit and relaunch it\n" +
+		"  - CLI: run `agentsview serve --replace`"
 }
 
 func openWriteDB(
@@ -465,7 +527,9 @@ func rejectLiveWritableDaemonBeforeDirectWrite(cfg config.Config) error {
 				"or run `agentsview serve stop` first",
 		)
 	}
-	if isBackgroundLaunchActive(dataDir) && !runningAsBackgroundChild() {
+	if isBackgroundLaunchActive(dataDir) &&
+		!ownsForegroundServeLaunchLock(dataDir) &&
+		!runningAsBackgroundChild() {
 		return fmt.Errorf(
 			"local daemon launch is in progress and owns the SQLite archive; " +
 				"refusing to write directly. Retry once it is ready " +
@@ -561,10 +625,14 @@ func cleanResyncTemp(dbPath string) {
 
 func runInitialSync(
 	ctx context.Context, engine *sync.Engine,
+	startupProgress *startupStateWriter,
 ) {
 	fmt.Println("Running initial sync...")
 	t := time.Now()
-	stats := engine.SyncAll(ctx, printSyncProgress)
+	stats := engine.SyncAll(ctx, func(p sync.Progress) {
+		printSyncProgress(p)
+		startupProgress.SetDetail(startupProgressDetail(p))
+	})
 	printSyncSummary(stats, t)
 }
 
@@ -574,17 +642,26 @@ func runInitialSync(
 // path -- see resyncCoversSignals.
 func runInitialResync(
 	ctx context.Context, engine *sync.Engine,
+	startupProgress *startupStateWriter,
 ) bool {
 	fmt.Println("Data version changed, running full resync...")
 	t := time.Now()
-	stats := engine.ResyncAll(ctx, printSyncProgress)
+	progress := newResyncProgressPrinter(os.Stdout, time.Now)
+	stats := engine.ResyncAll(ctx, func(p sync.Progress) {
+		progress.Print(p)
+		startupProgress.SetDetail(startupProgressDetail(p))
+	})
+	progress.Finish()
 	printSyncSummary(stats, t)
 
 	fellBack := false
 	if stats.Aborted && ctx.Err() == nil {
 		fmt.Println("Resync incomplete, running incremental sync...")
 		t = time.Now()
-		fallback := engine.SyncAll(ctx, printSyncProgress)
+		fallback := engine.SyncAll(ctx, func(p sync.Progress) {
+			printSyncProgress(p)
+			startupProgress.SetDetail(startupProgressDetail(p))
+		})
 		printSyncSummary(fallback, t)
 		fellBack = true
 	}
@@ -593,6 +670,26 @@ func runInitialResync(
 		return false
 	}
 	return resyncCoversSignals(stats, fellBack)
+}
+
+type signalsBackfillMarker interface {
+	MarkSignalsBackfillDone() error
+}
+
+func finishInitialResync(
+	marker signalsBackfillMarker, signalsCovered bool,
+) {
+	// Only short-circuit BackfillSignals when resync rewrote every
+	// session through the inline signal path. Aborted resyncs fall
+	// back to incremental sync (existing rows untouched) and orphans
+	// are copied as-is from the previous DB without recompute -- both
+	// leave sessions that still need backfill.
+	if !signalsCovered {
+		return
+	}
+	if err := marker.MarkSignalsBackfillDone(); err != nil {
+		log.Printf("mark signals backfill done: %v", err)
+	}
 }
 
 // resyncCoversSignals returns true only when every session in
@@ -633,15 +730,214 @@ func printSyncSummary(stats sync.SyncStats, t time.Time) {
 	summary += fmt.Sprintf(
 		" in %s\n", time.Since(t).Round(time.Millisecond),
 	)
+	summary += formatAnomalySummary(stats.Anomalies)
 	fmt.Print(summary)
 	for _, w := range stats.Warnings {
 		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
 	}
 }
 
+type resyncProgressPrinter struct {
+	w        io.Writer
+	now      func() time.Time
+	label    string
+	started  time.Time
+	inPlace  bool
+	finished bool
+}
+
+func newResyncProgressPrinter(
+	w io.Writer, now func() time.Time,
+) *resyncProgressPrinter {
+	return &resyncProgressPrinter{w: w, now: now}
+}
+
+func (p *resyncProgressPrinter) Print(progress sync.Progress) {
+	if p.finished {
+		return
+	}
+	if progress.Phase == sync.PhaseDone {
+		p.printFinalInPlaceProgress(progress)
+		p.finishCurrent()
+		return
+	}
+	label := resyncProgressLabel(progress)
+	if label == "" {
+		return
+	}
+
+	if progress.Phase == sync.PhaseSyncing && progress.SessionsTotal > 0 {
+		if p.label != progress.Detail {
+			p.finishCurrent()
+			p.label = progress.Detail
+			p.started = p.now()
+		}
+		p.inPlace = true
+		fmt.Fprintf(p.w, "\r  %s\x1b[K", formatSyncProgress(progress))
+		return
+	}
+
+	if p.label == label {
+		return
+	}
+	p.finishCurrent()
+	p.label = label
+	p.started = p.now()
+	p.inPlace = false
+	fmt.Fprintf(
+		p.w, "  %s...\n",
+		strings.TrimSuffix(resyncProgressDisplayLabel(progress), "."),
+	)
+}
+
+func (p *resyncProgressPrinter) printFinalInPlaceProgress(progress sync.Progress) {
+	if !p.inPlace || p.label == "" || progress.SessionsTotal == 0 {
+		return
+	}
+	if progress.Detail == "" {
+		progress.Detail = p.label
+	}
+	fmt.Fprintf(p.w, "\r  %s\x1b[K", formatSyncProgress(progress))
+}
+
+func (p *resyncProgressPrinter) Finish() {
+	p.finished = true
+	p.finishCurrent()
+}
+
+func (p *resyncProgressPrinter) finishCurrent() {
+	if p.label == "" {
+		return
+	}
+	if p.inPlace {
+		fmt.Fprint(p.w, "\n")
+	}
+	elapsed := p.now().Sub(p.started).Round(time.Millisecond)
+	fmt.Fprintf(p.w, "  %s completed in %s\n", p.label, elapsed)
+	p.label = ""
+	p.started = time.Time{}
+	p.inPlace = false
+}
+
+func resyncProgressLabel(p sync.Progress) string {
+	return p.Detail
+}
+
+func resyncProgressDisplayLabel(p sync.Progress) string {
+	if p.Detail == "" {
+		return ""
+	}
+	if p.Hint == "" {
+		return p.Detail
+	}
+	return p.Detail + " - " + p.Hint
+}
+
+// formatAnomalySummary renders the parser/sanitizer anomaly section of a
+// sync summary. It returns an empty string on a clean run so the section
+// is omitted entirely; otherwise it returns a concise, indented block
+// listing per-agent parser malformed lines and the central-validation fix
+// counts observed during the run.
+func formatAnomalySummary(a sync.AnomalyStats) string {
+	if a.IsZero() {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Parser anomalies (this run):\n")
+	if a.MalformedLinesTotal > 0 {
+		fmt.Fprintf(&b,
+			"  malformed lines: %d total\n", a.MalformedLinesTotal,
+		)
+		for _, agent := range slices.Sorted(
+			maps.Keys(a.MalformedLinesByAgent),
+		) {
+			fmt.Fprintf(&b,
+				"    %s: %d\n", agent, a.MalformedLinesByAgent[agent],
+			)
+		}
+	}
+	if a.UnknownSchemaSessionsTotal > 0 {
+		fmt.Fprintf(&b,
+			"  unrecognized schema sessions: %d total\n",
+			a.UnknownSchemaSessionsTotal,
+		)
+		for _, agent := range slices.Sorted(
+			maps.Keys(a.UnknownSchemaSessionsByAgent),
+		) {
+			fmt.Fprintf(&b,
+				"    %s: %d\n", agent, a.UnknownSchemaSessionsByAgent[agent],
+			)
+		}
+	}
+	if a.GenMetadataWithoutUsageTotal > 0 {
+		fmt.Fprintf(&b,
+			"  gen_metadata without usage: %d total\n",
+			a.GenMetadataWithoutUsageTotal,
+		)
+		for _, agent := range slices.Sorted(
+			maps.Keys(a.GenMetadataWithoutUsageByAgent),
+		) {
+			fmt.Fprintf(&b,
+				"    %s: %d\n", agent, a.GenMetadataWithoutUsageByAgent[agent],
+			)
+		}
+	}
+	if !a.Sanitize.IsZero() {
+		fmt.Fprintf(&b,
+			"  sanitized fields: %d total\n", a.Sanitize.Total(),
+		)
+		for _, line := range sanitizeBreakdownLines(a.Sanitize) {
+			b.WriteString("    " + line + "\n")
+		}
+	}
+	return b.String()
+}
+
+// sanitizeBreakdownLines returns the non-zero per-category sanitize counts
+// as "label: n" lines in a fixed, deterministic order.
+func sanitizeBreakdownLines(s sync.SanitizeStats) []string {
+	cats := []struct {
+		label string
+		count int
+	}{
+		{"control chars stripped", s.ControlCharsStripped},
+		{"model clamped", s.ModelClamped},
+		{"tokens clamped", s.TokensClamped},
+		{"role coerced", s.RoleCoerced},
+		{"timestamps blanked", s.TimestampsBlanked},
+	}
+	var out []string
+	for _, c := range cats {
+		if c.count > 0 {
+			out = append(out, fmt.Sprintf("%s: %d", c.label, c.count))
+		}
+	}
+	return out
+}
+
+// startupProgressDetail renders a one-line sync progress snapshot for
+// the startup state file: the counted progress line when available,
+// otherwise the bare resync step label.
+func startupProgressDetail(p sync.Progress) string {
+	if detail := formatSyncProgress(p); detail != "" {
+		return detail
+	}
+	return resyncProgressDisplayLabel(p)
+}
+
 func printSyncProgress(p sync.Progress) {
+	if detail := formatSyncProgress(p); detail != "" {
+		fmt.Printf("\r  %s\x1b[K", detail)
+		return
+	}
+}
+
+func formatSyncProgress(p sync.Progress) string {
 	if p.Detail != "" {
 		detail := p.Detail
+		if p.BytesDone > 0 || p.BytesTotal > 0 {
+			detail = fmt.Sprintf("%s: %s", detail, formatByteProgress(p))
+		}
 		if p.SessionsTotal > 0 {
 			detail = fmt.Sprintf(
 				"%s: %d/%d sessions (%.0f%%) · %d messages",
@@ -652,16 +948,27 @@ func printSyncProgress(p sync.Progress) {
 		if p.Hint != "" {
 			detail += " - " + p.Hint
 		}
-		fmt.Printf("\r  %s\x1b[K", detail)
-		return
+		return detail
 	}
 	if p.SessionsTotal > 0 {
-		fmt.Printf(
-			"\r  %d/%d sessions (%.0f%%) · %d messages\x1b[K",
+		return fmt.Sprintf(
+			"%d/%d sessions (%.0f%%) · %d messages",
 			p.SessionsDone, p.SessionsTotal,
 			p.Percent(), p.MessagesIndexed,
 		)
 	}
+	return ""
+}
+
+func formatByteProgress(p sync.Progress) string {
+	if p.BytesTotal > 0 {
+		return fmt.Sprintf(
+			"%s/%s (%.0f%%)",
+			formatBytes(p.BytesDone), formatBytes(p.BytesTotal),
+			float64(p.BytesDone)/float64(p.BytesTotal)*100,
+		)
+	}
+	return formatBytes(p.BytesDone)
 }
 
 func startFileWatcher(
@@ -753,60 +1060,290 @@ func collectWatchRoots(cfg config.Config) (roots []watchRoot, unwatchedDirs []st
 		})
 	}
 	for _, def := range parser.Registry {
-		if !def.FileBased {
-			continue
-		}
 		for _, d := range cfg.ResolveDirs(def.Type) {
-			if def.ShallowWatchRootsFunc != nil {
-				for _, watchDir := range def.ShallowWatchRootsFunc(d) {
-					if _, err := os.Stat(watchDir); err == nil {
-						addRoot(d, watchDir, true)
-					}
-				}
+			_, hasProvider := parser.ProviderFactoryByType(def.Type)
+			if providerWatched, providerUnwatched := collectProviderWatchRoots(def, d, addRoot); providerWatched {
+				unwatchedDirs = append(unwatchedDirs, providerUnwatched...)
+				continue
 			}
-			if def.WatchRootsFunc != nil {
-				watchDirs := def.WatchRootsFunc(d)
-				if len(watchDirs) == 0 {
-					unwatchedDirs = append(unwatchedDirs, d)
-					continue
-				}
-				for _, watchDir := range watchDirs {
-					if _, err := os.Stat(watchDir); err == nil {
-						addRoot(d, watchDir, def.ShallowWatch)
-						continue
-					}
+			if !def.FileBased {
+				if hasProvider {
 					unwatchedDirs = append(unwatchedDirs, d)
 				}
 				continue
 			}
-			if len(def.WatchSubdirs) == 0 {
-				if _, err := os.Stat(d); err == nil {
-					addRoot(d, d, def.ShallowWatch)
-				}
-				continue
-			}
-			for _, sub := range def.WatchSubdirs {
-				watchDir := filepath.Join(d, sub)
-				if _, err := os.Stat(watchDir); err == nil {
-					addRoot(d, watchDir, def.ShallowWatch)
-				}
-			}
+			fallbackUnwatched := collectLegacyWatchRoots(def, d, addRoot)
+			unwatchedDirs = append(unwatchedDirs, fallbackUnwatched...)
 		}
 	}
 	return roots, unwatchedDirs
 }
 
+func collectProviderWatchRoots(
+	def parser.AgentDef,
+	dir string,
+	addRoot func(dir, root string, shallow bool),
+) (bool, []string) {
+	factory, ok := parser.ProviderFactoryByType(def.Type)
+	if !ok {
+		return false, nil
+	}
+	provider := factory.NewProvider(parser.ProviderConfig{
+		Roots: []string{dir},
+	})
+	plan, err := provider.WatchPlan(context.Background())
+	if err != nil || len(plan.Roots) == 0 {
+		if err != nil && !errors.Is(err, parser.ErrUnsupportedProviderFeature) {
+			log.Printf("%s provider watch plan: %v", def.Type, err)
+		}
+		return false, nil
+	}
+	added := false
+	var addedRoots []watchRoot
+	var missingRoots []string
+	var unwatchedDirs []string
+	for _, providerRoot := range plan.Roots {
+		root := filepath.Clean(providerRoot.Path)
+		if root == "" || root == "." {
+			continue
+		}
+		if providerRoot.Recursive && isSymlinkPath(root) {
+			unwatchedDirs = appendUniqueString(unwatchedDirs, dir)
+			continue
+		}
+		if _, err := os.Stat(root); err == nil {
+			addRoot(dir, root, !providerRoot.Recursive)
+			added = true
+			addedRoots = append(addedRoots, watchRoot{
+				root:    root,
+				shallow: !providerRoot.Recursive,
+			})
+			continue
+		}
+		missingRoots = append(missingRoots, root)
+	}
+	if !added {
+		if len(unwatchedDirs) > 0 {
+			return true, unwatchedDirs
+		}
+		return false, nil
+	}
+	// A watch target that does not exist yet but lives under an already-watched
+	// root needs no separate polling only when the ancestor is recursive or
+	// when a shallow root can observe creation of the missing root itself. A
+	// shallow ancestor sees only immediate child creation, so it cannot cover a
+	// missing nested provider root.
+	for _, missing := range missingRoots {
+		if !pathCoveredByAnyWatchRootCreation(missing, addedRoots) {
+			unwatchedDirs = appendUniqueString(unwatchedDirs, dir)
+		}
+	}
+	return true, unwatchedDirs
+}
+
+func isSymlinkPath(path string) bool {
+	info, err := os.Lstat(path)
+	if err != nil || info == nil {
+		return false
+	}
+	return info.Mode()&os.ModeSymlink != 0
+}
+
+func appendUniqueString(values []string, value string) []string {
+	if slices.Contains(values, value) {
+		return values
+	}
+	return append(values, value)
+}
+
+// pathCoveredByAnyWatchRootCreation reports whether path is covered by an
+// existing watch root strongly enough to observe creation of the missing root.
+// Recursive roots cover the whole subtree. Shallow roots only cover direct
+// children because fsnotify can report that immediate directory creation, after
+// which the next watcher setup can add the provider's deeper watch root.
+func pathCoveredByAnyWatchRootCreation(path string, roots []watchRoot) bool {
+	for _, root := range roots {
+		if root.shallow {
+			if filepath.Dir(path) == root.root {
+				return true
+			}
+			continue
+		}
+		if path == root.root ||
+			strings.HasPrefix(path, root.root+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+func collectLegacyWatchRoots(
+	def parser.AgentDef,
+	dir string,
+	addRoot func(dir, root string, shallow bool),
+) []string {
+	var unwatchedDirs []string
+	if def.ShallowWatchRootsFunc != nil {
+		for _, watchDir := range def.ShallowWatchRootsFunc(dir) {
+			if _, err := os.Stat(watchDir); err == nil {
+				addRoot(dir, watchDir, true)
+			}
+		}
+	}
+	if def.WatchRootsFunc != nil {
+		watchDirs := def.WatchRootsFunc(dir)
+		if len(watchDirs) == 0 {
+			return append(unwatchedDirs, dir)
+		}
+		for _, watchDir := range watchDirs {
+			if _, err := os.Stat(watchDir); err == nil {
+				addRoot(dir, watchDir, def.ShallowWatch)
+				continue
+			}
+			unwatchedDirs = append(unwatchedDirs, dir)
+		}
+		return unwatchedDirs
+	}
+	if len(def.WatchSubdirs) == 0 {
+		if _, err := os.Stat(dir); err == nil {
+			addRoot(dir, dir, def.ShallowWatch)
+		}
+		return unwatchedDirs
+	}
+	for _, sub := range def.WatchSubdirs {
+		watchDir := filepath.Join(dir, sub)
+		if _, err := os.Stat(watchDir); err == nil {
+			addRoot(dir, watchDir, def.ShallowWatch)
+		}
+	}
+	return unwatchedDirs
+}
+
 func startPeriodicSync(
-	engine *sync.Engine, database *db.DB, idleTracker *server.IdleTracker,
+	ctx context.Context,
+	cfg config.Config,
+	engine *sync.Engine,
+	database *db.DB,
+	idleTracker *server.IdleTracker,
+	validRemotes bool,
+	emitter sync.Emitter,
 ) {
+	if validRemotes {
+		for _, rh := range cfg.RemoteHosts {
+			if rh.Interval > 0 {
+				go startRemoteHostSync(
+					ctx, cfg, database, engine, rh, emitter, idleTracker,
+				)
+			}
+		}
+	}
 	ticker := time.NewTicker(periodicSyncInterval)
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 		log.Println("Running scheduled sync...")
 		idleTracker.Do(func() {
-			engine.SyncAll(context.Background(), nil)
+			engine.SyncAll(ctx, nil)
 			recomputePendingSessions(engine, database)
 		})
+	}
+}
+
+func startRemoteHostSync(
+	ctx context.Context,
+	cfg config.Config,
+	database *db.DB,
+	engine *sync.Engine,
+	rh config.RemoteHost,
+	emitter sync.Emitter,
+	idleTracker *server.IdleTracker,
+) {
+	syncFn := remoteHostSyncFunc(
+		ctx, cfg, database, engine, rh,
+		runRemoteSyncTransport,
+	)
+	runRemoteHostSyncLoop(ctx, rh.Host, rh.Interval, syncFn, emitter, idleTracker, nil)
+}
+
+type remoteSyncExclusiveRunner interface {
+	RunExclusive(func() error) error
+}
+
+type remoteSyncRunner func(
+	context.Context,
+	config.Config,
+	*db.DB,
+	config.RemoteHost,
+	bool,
+) (remotesync.SyncStats, error)
+
+func remoteHostSyncFunc(
+	ctx context.Context,
+	cfg config.Config,
+	database *db.DB,
+	runner remoteSyncExclusiveRunner,
+	rh config.RemoteHost,
+	runRemote remoteSyncRunner,
+) func() (int, error) {
+	return func() (int, error) {
+		if runner == nil {
+			return 0, fmt.Errorf("scheduled remote sync missing exclusive runner")
+		}
+		var stats remotesync.SyncStats
+		err := runner.RunExclusive(func() error {
+			var err error
+			stats, err = runRemote(ctx, cfg, database, rh, database.NeedsResync())
+			return err
+		})
+		return stats.SessionsSynced, err
+	}
+}
+
+// runRemoteHostSyncLoop drives the per-host sync ticker. syncFn returns
+// the number of sessions synced so we only emit when data changed.
+// When done is non-nil, closing it stops the loop.
+func runRemoteHostSyncLoop(
+	ctx context.Context,
+	host string,
+	interval time.Duration,
+	syncFn func() (int, error),
+	emitter sync.Emitter,
+	idleTracker *server.IdleTracker,
+	done <-chan struct{},
+) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		case <-ticker.C:
+		}
+		log.Printf("Running scheduled remote sync for %s...", host)
+		finishWork, ok := idleTracker.BeginWork()
+		if !ok {
+			log.Printf("scheduled remote sync %s skipped: daemon is shutting down", host)
+			continue
+		}
+		var synced int
+		var err error
+		func() {
+			defer finishWork()
+			synced, err = syncFn()
+		}()
+		if err != nil {
+			log.Printf("scheduled remote sync %s: %v", host, err)
+			continue
+		}
+		if synced > 0 && emitter != nil {
+			emitter.Emit("sessions")
+		}
 	}
 }
 

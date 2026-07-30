@@ -5,149 +5,51 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/tidwall/gjson"
 )
 
-// DiscoverKimiSessions finds all wire.jsonl files under the Kimi
-// sessions directory. It supports two layouts:
+// defaultKimiModel is the model name used to price Kimi turns when the
+// session files carry no model identifier (Kimi wire logs omit it).
 //
-// Legacy (".kimi/sessions"):
+// How the estimate works:
 //
-//	<sessionsDir>/<project-hash>/<session-uuid>/wire.jsonl
+//   - The wire logs do not record which model served each turn, and Kimi
+//     offers several models concurrently at different rates (e.g.
+//     kimi-k2.7-code, kimi-k2.6, kimi-k2.5), so the exact price is
+//     unknowable from the logs. We approximate it with a recent Kimi
+//     model that has a cleanly matchable rate in the pricing catalog.
+//   - Prices come from the LiteLLM catalog (a community-maintained price
+//     list), not from Kimi/Moonshot directly, so the rate itself is also
+//     an approximation. The cost engine canonicalizes model names before
+//     matching (drops the provider prefix before the last "/", lowercases,
+//     strips non-alphanumerics) and rejects a catalog entry whose provider
+//     conflicts with the model's. "moonshot/kimi-k2.6" therefore resolves
+//     to the catalog's "moonshot/kimi-k2.6" rate (currently 0.95 in /
+//     4.0 out per Mtok).
+//   - k2.6 rather than k2.7 is deliberate: as of this writing the catalog
+//     prices k2.7 only under a cloudflare-namespaced key
+//     ("cloudflare/@cf/moonshotai/kimi-k2.7-code"), which the provider
+//     conflict rule rejects for a "moonshot/" model. k2.6 has a clean
+//     "moonshot/kimi-k2.6" entry and the same 0.95/4.0 rate, so it is the
+//     more robust proxy at an identical price. Switch to k2.7 once the
+//     catalog gains a cleanly matchable (moonshot/ or unqualified) entry.
 //
-// New (".kimi-code/sessions"):
+// This is deliberately an ESTIMATE, not exact billing:
 //
-//	<sessionsDir>/<workdir>_<hash>/session_<uuid>/agents/<agent>/wire.jsonl
-func DiscoverKimiSessions(sessionsDir string) []DiscoveredFile {
-	if sessionsDir == "" {
-		return nil
-	}
-
-	projDirs, err := os.ReadDir(sessionsDir)
-	if err != nil {
-		return nil
-	}
-
-	var files []DiscoveredFile
-	for _, projEntry := range projDirs {
-		if !isDirOrSymlink(projEntry, sessionsDir) {
-			continue
-		}
-
-		projDir := filepath.Join(sessionsDir, projEntry.Name())
-		sessionDirs, err := os.ReadDir(projDir)
-		if err != nil {
-			continue
-		}
-
-		for _, sessEntry := range sessionDirs {
-			if !isDirOrSymlink(sessEntry, projDir) {
-				continue
-			}
-
-			sessDir := filepath.Join(projDir, sessEntry.Name())
-
-			// Legacy layout.
-			wirePath := filepath.Join(sessDir, "wire.jsonl")
-			if _, err := os.Stat(wirePath); err == nil {
-				// The project and session names become ':'-delimited
-				// session-ID components; skip sessions whose names
-				// cannot round-trip through FindKimiSourceFile.
-				if kimiIDComponentsValid(
-					projEntry.Name(), sessEntry.Name(),
-				) {
-					files = append(files, DiscoveredFile{
-						Path:    wirePath,
-						Project: DecodeKimiProjectDir(projEntry.Name()),
-						Agent:   AgentKimi,
-					})
-				}
-				continue
-			}
-
-			// New .kimi-code layout.
-			agentsDir := filepath.Join(sessDir, "agents")
-			agentEntries, err := os.ReadDir(agentsDir)
-			if err != nil {
-				continue
-			}
-			for _, agentEntry := range agentEntries {
-				if !isDirOrSymlink(agentEntry, agentsDir) {
-					continue
-				}
-				wirePath = filepath.Join(
-					agentsDir, agentEntry.Name(), "wire.jsonl",
-				)
-				if _, err := os.Stat(wirePath); err == nil &&
-					kimiIDComponentsValid(
-						projEntry.Name(),
-						sessEntry.Name(),
-						agentEntry.Name(),
-					) {
-					files = append(files, DiscoveredFile{
-						Path:    wirePath,
-						Project: DecodeKimiProjectDir(projEntry.Name()),
-						Agent:   AgentKimi,
-					})
-				}
-			}
-		}
-	}
-
-	sort.Slice(files, func(i, j int) bool {
-		return files[i].Path < files[j].Path
-	})
-	return files
-}
-
-// FindKimiSourceFile locates a Kimi session file by its raw
-// session ID (without the "kimi:" prefix). Supported raw ID formats:
+//   - The real per-turn model is unknown; turns served by a cheaper or
+//     pricier Kimi model are mis-estimated by the rate gap between them.
+//   - Kimi's aggregate logs only expose output tokens, so input and cache
+//     tokens are not priced here (see ParseKimiSession). The figure is a
+//     floor that tracks output volume, not a full invoice.
+//   - Catalog prices drift; we pin to one representative version rather
+//     than guessing per-session rates.
 //
-// Legacy:
-//
-//	<project-hash>:<session-uuid>
-//	  → <sessionsDir>/<project-hash>/<session-uuid>/wire.jsonl
-//
-// New (.kimi-code):
-//
-//	<workdir>_<hash>:<agent>:<session-uuid>
-//	  → <sessionsDir>/<workdir>_<hash>/<session-uuid>/agents/<agent>/wire.jsonl
-func FindKimiSourceFile(sessionsDir, rawID string) string {
-	if sessionsDir == "" {
-		return ""
-	}
-
-	parts := strings.Split(rawID, ":")
-	for _, p := range parts {
-		if !IsValidSessionID(p) {
-			return ""
-		}
-	}
-
-	switch len(parts) {
-	case 2:
-		// Legacy layout.
-		candidate := filepath.Join(
-			sessionsDir, parts[0], parts[1], "wire.jsonl",
-		)
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate
-		}
-	case 3:
-		// New .kimi-code layout.
-		candidate := filepath.Join(
-			sessionsDir, parts[0], parts[2], "agents", parts[1], "wire.jsonl",
-		)
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate
-		}
-	}
-	return ""
-}
+// Bump this constant when the catalog gains a newer, cleanly matchable
+// Kimi model so the estimate keeps tracking a current rate.
+const defaultKimiModel = "moonshot/kimi-k2.6"
 
 // kimiSessionIDFromPath extracts the raw Kimi session ID from its
 // wire.jsonl path. Legacy paths yield "<project>:<session>"; .kimi-code
@@ -208,7 +110,7 @@ func isKimiHash(s string) bool {
 }
 
 // kimiIDComponentsValid reports whether the given path-derived
-// components can form a session ID that FindKimiSourceFile can
+// components can form a session ID that provider raw-ID lookup can
 // round-trip back to the source file. Each component must itself be a
 // valid session ID (alphanumeric, '-', '_'); a ':' or any other
 // character outside that set would break the ':'-delimited ID split
@@ -223,11 +125,11 @@ func kimiIDComponentsValid(components ...string) bool {
 	return true
 }
 
-// ParseKimiSession parses a Kimi wire.jsonl file. Legacy Kimi CLI
+// parseSession parses a Kimi wire.jsonl file. Legacy Kimi CLI
 // sessions store nested message.type records (TurnBegin, ContentPart,
 // ToolCall, ToolResult, StatusUpdate, TurnEnd). Kimi Code sessions store
 // top-level records (turn.prompt, context.append_loop_event, usage.record).
-func ParseKimiSession(
+func parseKimiSession(
 	path, project, machine string,
 ) (*ParsedSession, []ParsedMessage, error) {
 	info, err := os.Stat(path)
@@ -281,7 +183,7 @@ func ParseKimiSession(
 		currentTS time.Time
 		pendingTS time.Time
 
-		currentModel string
+		currentModel = defaultKimiModel
 	)
 
 	resetAssistantTurn := func() {
@@ -308,6 +210,13 @@ func ParseKimiSession(
 			return
 		}
 
+		// Kimi wire logs often omit the model; fall back to the current
+		// (defaulted) model so turns can still be priced.
+		turnModel := pendingModel
+		if turnModel == "" {
+			turnModel = currentModel
+		}
+
 		messages = append(messages, ParsedMessage{
 			Ordinal:          ordinal,
 			Role:             RoleAssistant,
@@ -318,7 +227,7 @@ func ParseKimiSession(
 			HasToolUse:       hasToolUse,
 			ContentLength:    len(content),
 			ToolCalls:        pendingToolCall,
-			Model:            pendingModel,
+			Model:            turnModel,
 			TokenUsage:       pendingTokenUsage,
 			ContextTokens:    pendingContextTokens,
 			OutputTokens:     pendingOutputTokens,
@@ -480,7 +389,9 @@ func ParseKimiSession(
 					ordinal++
 
 				case "step.end":
-					if pendingModel == "" {
+					if model := event.Get("model").Str; model != "" {
+						pendingModel = model
+					} else if pendingModel == "" {
 						pendingModel = currentModel
 					}
 					pendingStopReason = event.Get("finishReason").Str
@@ -734,6 +645,39 @@ func ParseKimiSession(
 			Size:  info.Size(),
 			Mtime: info.ModTime().UnixNano(),
 		},
+	}
+
+	// When Kimi wire logs carry only session-level token aggregates
+	// (StatusUpdate path) rather than per-message step.end usage,
+	// individual messages have no token_usage JSON and no model, so the
+	// cost engine prices 0 tokens and the session shows $0.
+	//
+	// Emit one session-level usage event so the engine can produce an
+	// estimate (see defaultKimiModel for the estimation principle).
+	// Only output tokens are available from these aggregates, so input
+	// and cache tokens are intentionally left at zero — the resulting
+	// cost is a lower-bound estimate driven by output volume. Sessions
+	// whose messages already carry per-message token_usage (native
+	// step.end protocol) are priced message-by-message and skipped here
+	// to avoid double counting.
+	if hasTotalOutputTokens && totalOutputTokens > 0 {
+		hasPerMessageTokens := false
+		for _, m := range messages {
+			if len(m.TokenUsage) > 0 {
+				hasPerMessageTokens = true
+				break
+			}
+		}
+		if !hasPerMessageTokens {
+			sess.UsageEvents = []ParsedUsageEvent{{
+				SessionID:    sess.ID,
+				Source:       "session",
+				Model:        currentModel,
+				OutputTokens: totalOutputTokens,
+				OccurredAt:   timeString(endTime, startTime),
+				DedupKey:     "kimi:session:" + sessionID,
+			}}
+		}
 	}
 
 	return sess, messages, nil

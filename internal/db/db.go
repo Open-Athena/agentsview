@@ -19,6 +19,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 
 	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
@@ -52,6 +53,10 @@ import (
 // Bumped to 45: the Codex parser now imports renamed session
 // titles from session_index.jsonl. Existing Codex rows need
 // re-parsing so their titles reflect later renames.
+//
+// Bumped to 52: the Pi parser now persists per-message
+// source_uuid and source_parent_uuid lineage. Existing Pi rows need
+// re-parsing so stored message trees gain the new lineage anchors.
 //
 // Bumped to 44: the VSCode Copilot parser now extracts per-turn
 // token usage (promptTokens/outputTokens) and the resolved model from
@@ -237,12 +242,46 @@ import (
 // classification, so historical skill usage is backfilled on
 // re-parse.)
 //
+// (59: Ingest sanitization now covers tool_calls.input_json, which v58
+// left raw. Existing live rows need re-parsing so NUL/control bytes in
+// stored inputs are stripped before they can poison PostgreSQL/DuckDB
+// pushes; orphaned/trashed rows are cleaned by the copy-time input pass
+// during the same resync.)
+//
+// (58: Persisted message/result content sanitization now covers
+// tool_calls.result_content and tool_result_events.content. Existing rows
+// need re-parsing so NUL/control bytes accepted by SQLite are stripped before
+// they can poison DuckDB mirrors.)
+//
+// (57: Antigravity-CLI transcript fidelity classification. Re-parsing
+// populates transcript_fidelity ("full"/"summary") on existing
+// Antigravity CLI rows so sessions built from summary transcripts are
+// distinguishable from full-fidelity captures.)
+// (55: Kimi session-level usage events and native step.end model
+// backfill. Re-parsing persists estimated usage events for existing
+// aggregate-only Kimi sessions and preserves explicit native event
+// model names instead of the proxy fallback.)
+// (56: Codex goal-continuation context wrappers are filtered from
+// persisted messages and user_message_count. Existing Codex rows need
+// re-parsing so synthetic /goal continuation records are removed.)
+// (54: Antigravity .db sessions record a schema-fingerprint
+// source_version. Re-parsing populates source_version on existing
+// Antigravity IDE and CLI rows so "which agy release produced this
+// session" is queryable instead of blank.)
+// (53: Recent Edits tool-call file_path extraction. Re-parsing
+// populates tool_calls.file_path for edit/write calls -- including
+// Kiro raw-diff inputs the JSON-only SQL backfill cannot recover --
+// and the resync's fresh created_at re-pushes affected sessions to the
+// PostgreSQL and DuckDB mirrors.)
+// (52: Pi source lineage reparse.)
 // (51: Gemini cumulative-to-delta token reparse.)
 // (17: Codex <skill> template filtering.)
 // (16: <turn_aborted> system messages.)
-const dataVersion = 51
+const dataVersion = 59
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
+
+const toolCallFieldBackfillStatsKey = "tool_call_field_backfill_v1"
 
 const (
 	walJournalSizeLimitBytes = 256 * 1024 * 1024
@@ -334,7 +373,8 @@ type DB struct {
 	cursorMu     sync.RWMutex
 	cursorSecret []byte
 
-	customPricing map[string]config.CustomModelRate
+	customPricing        map[string]config.CustomModelRate
+	customPricingSources map[string]export.PricingRowSource
 
 	checkpointMu   sync.Mutex
 	checkpointStop chan struct{}
@@ -412,6 +452,14 @@ func (r *readerHandle) QueryRowContext(
 	r.owner.connMu.RLock()
 	defer r.owner.connMu.RUnlock()
 	return r.current().QueryRowContext(ctx, query, args...)
+}
+
+func (r *readerHandle) BeginTx(
+	ctx context.Context, opts *sql.TxOptions,
+) (*sql.Tx, error) {
+	r.owner.connMu.RLock()
+	defer r.owner.connMu.RUnlock()
+	return r.current().BeginTx(ctx, opts)
 }
 
 func (w *writerHandle) current() (*sql.DB, error) {
@@ -564,6 +612,17 @@ func (db *DB) requireWritable() error {
 
 func (db *DB) SetCustomPricing(p map[string]config.CustomModelRate) {
 	db.customPricing = p
+	db.customPricingSources = nil
+}
+
+// SetEffectivePricing installs in-memory pricing rows with explicit provenance
+// sources for read-only fallback paths that cannot seed model_pricing.
+func (db *DB) SetEffectivePricing(
+	p map[string]config.CustomModelRate,
+	sources map[string]export.PricingRowSource,
+) {
+	db.customPricing = p
+	db.customPricingSources = sources
 }
 
 // SetCursorSecret updates the secret key used for cursor signing.
@@ -624,6 +683,10 @@ func Open(path string) (*DB, error) {
 	if err := d.migrateColumns(); err != nil {
 		d.Close()
 		return nil, fmt.Errorf("migrating columns: %w", err)
+	}
+	if _, err := d.GetOrCreateDatabaseID(context.Background()); err != nil {
+		d.Close()
+		return nil, fmt.Errorf("initializing database id: %w", err)
 	}
 
 	if dataStale && !schemaStale {
@@ -720,6 +783,8 @@ var readOnlyRequiredTables = []string{
 	"starred_sessions",
 	"excluded_sessions",
 	"worktree_project_mappings",
+	"archive_metadata",
+	"project_identity_observations",
 	"pg_sync_state",
 	"model_pricing",
 	"secret_findings",
@@ -807,6 +872,34 @@ func tableColumns(
 	return out, nil
 }
 
+// SchemaUpgradeRequiredError reports that a read-only open failed because the
+// on-disk archive is missing a column the current binary's schema defines. The
+// file is not corrupt: it was written by an older agentsview version and has
+// not been migrated yet. Read-only opens never run migrations, so the archive
+// can only be upgraded by a writable process (the daemon). Callers can detect
+// this with IsSchemaUpgradeRequired and point the user at restarting the daemon
+// so the migration runs. The Error text preserves the historical
+// "schema missing <table>.<column>" wording so existing diagnostics still match.
+type SchemaUpgradeRequiredError struct {
+	Table  string
+	Column string
+}
+
+func (e *SchemaUpgradeRequiredError) Error() string {
+	return fmt.Sprintf(
+		"opening read-only database: schema missing %s.%s",
+		e.Table, e.Column,
+	)
+}
+
+// IsSchemaUpgradeRequired reports whether err indicates a read-only open failed
+// because the archive predates this binary's schema and needs a writable
+// migration to run.
+func IsSchemaUpgradeRequired(err error) bool {
+	var target *SchemaUpgradeRequiredError
+	return errors.As(err, &target)
+}
+
 func checkReadOnlySchemaCompatibility(conn *sql.DB) error {
 	required, err := readOnlyRequiredSchema()
 	if err != nil {
@@ -823,14 +916,22 @@ func checkReadOnlySchemaCompatibility(conn *sql.DB) error {
 		}
 		for _, column := range columns {
 			if !have[column] {
-				return fmt.Errorf(
-					"opening read-only database: schema missing %s.%s",
-					table, column,
-				)
+				return &SchemaUpgradeRequiredError{
+					Table:  table,
+					Column: column,
+				}
 			}
 		}
 	}
 	return nil
+}
+
+func (db *DB) hasCursorUsageTable() bool {
+	var n int
+	err := db.getReader().QueryRow(
+		"SELECT 1 FROM sqlite_master WHERE type='table' AND name='cursor_usage_events'",
+	).Scan(&n)
+	return err == nil && n == 1
 }
 
 // CheckDataVersion verifies that the database file, when present, was not
@@ -1172,12 +1273,26 @@ func (db *DB) migrateColumns() error {
 			"ALTER TABLE sessions ADD COLUMN source_version TEXT NOT NULL DEFAULT ''",
 		},
 		{
+			"sessions", "transcript_fidelity",
+			"ALTER TABLE sessions ADD COLUMN transcript_fidelity TEXT NOT NULL DEFAULT ''",
+		},
+		{
 			"sessions", "parser_malformed_lines",
 			"ALTER TABLE sessions ADD COLUMN parser_malformed_lines INTEGER NOT NULL DEFAULT 0",
 		},
 		{
 			"sessions", "is_truncated",
 			"ALTER TABLE sessions ADD COLUMN is_truncated INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			// Non-destructive column add: no dataVersion bump and no
+			// resync. The column defaults false and self-heals to true on
+			// the next incremental write of each row; a pre-migration
+			// archive simply reads false everywhere until then, which
+			// keeps parse-diff scrutiny conservative (drift is reported,
+			// never masked) rather than the reverse.
+			"sessions", "last_write_incremental",
+			"ALTER TABLE sessions ADD COLUMN last_write_incremental INTEGER NOT NULL DEFAULT 0",
 		},
 		{
 			"sessions", "file_inode",
@@ -1248,6 +1363,14 @@ func (db *DB) migrateColumns() error {
 			"ALTER TABLE insights ADD COLUMN structured_json TEXT NOT NULL DEFAULT ''",
 		},
 		{
+			"tool_calls", "file_path",
+			"ALTER TABLE tool_calls ADD COLUMN file_path TEXT",
+		},
+		{
+			"tool_calls", "call_index",
+			"ALTER TABLE tool_calls ADD COLUMN call_index INTEGER",
+		},
+		{
 			"model_pricing", "cache_creation_1h_per_mtok",
 			"ALTER TABLE model_pricing ADD COLUMN cache_creation_1h_per_mtok REAL NOT NULL DEFAULT 0",
 		},
@@ -1284,6 +1407,19 @@ func (db *DB) migrateColumns() error {
 	}
 	if err := db.backfillIsAutomatedLocked(w); err != nil {
 		return err
+	}
+	if err := db.backfillToolCallFieldsLocked(w); err != nil {
+		return err
+	}
+
+	if _, err := w.Exec(
+		`CREATE INDEX IF NOT EXISTS idx_tool_calls_file_path
+		 ON tool_calls(file_path)
+		 WHERE file_path IS NOT NULL`,
+	); err != nil {
+		return fmt.Errorf(
+			"creating idx_tool_calls_file_path: %w", err,
+		)
 	}
 
 	if _, err := w.Exec(
@@ -1338,7 +1474,57 @@ func (db *DB) migrateColumns() error {
 		)
 	}
 
+	if _, err := w.Exec(`
+		CREATE TABLE IF NOT EXISTS archive_metadata (
+			key        TEXT PRIMARY KEY,
+			value      TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+			updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+		);
+		CREATE TABLE IF NOT EXISTS project_identity_observations (
+			project            TEXT NOT NULL,
+			machine            TEXT NOT NULL,
+			root_path          TEXT NOT NULL DEFAULT '',
+			git_remote         TEXT NOT NULL DEFAULT '',
+			git_remote_name    TEXT NOT NULL DEFAULT '',
+			worktree_name      TEXT NOT NULL DEFAULT '',
+			worktree_root_path TEXT NOT NULL DEFAULT '',
+			observed_at        TEXT NOT NULL,
+			normalized_remote  TEXT NOT NULL DEFAULT '',
+			key_source         TEXT NOT NULL DEFAULT '',
+			key                TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY (project, machine, root_path, git_remote)
+		);
+		CREATE INDEX IF NOT EXISTS idx_project_identity_observations_project
+			ON project_identity_observations(project);
+	`); err != nil {
+		return fmt.Errorf(
+			"creating project identity metadata: %w", err,
+		)
+	}
+	if _, err := w.Exec(`
+		DELETE FROM project_identity_observations
+		WHERE git_remote = ''
+		  AND EXISTS (
+			SELECT 1 FROM project_identity_observations remote
+			WHERE remote.project = project_identity_observations.project
+			  AND remote.machine = project_identity_observations.machine
+			  AND remote.root_path = project_identity_observations.root_path
+			  AND remote.git_remote != ''
+		  );
+	`); err != nil {
+		return fmt.Errorf(
+			"removing stale project identity root fallbacks: %w", err,
+		)
+	}
+	if err := db.scrubProjectIdentityGitRemoteCredentialsLocked(w); err != nil {
+		return err
+	}
+
 	if err := db.ensureUsageEventsSchemaLocked(w); err != nil {
+		return err
+	}
+	if err := db.ensureCursorUsageEventsSchemaLocked(w); err != nil {
 		return err
 	}
 
@@ -1358,12 +1544,33 @@ func (db *DB) migrateColumns() error {
 	return nil
 }
 
+func (db *DB) scrubProjectIdentityGitRemoteCredentialsLocked(
+	w *writerHandle,
+) error {
+	tx, err := w.BeginTx(context.Background(), nil)
+	if err != nil {
+		return fmt.Errorf("starting project identity remote scrub: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := scrubProjectIdentityGitRemoteCredentialsTx(
+		context.Background(), tx,
+	); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing project identity remote scrub: %w", err)
+	}
+	return nil
+}
+
 // createPartialIndexesLocked creates partial indexes that are not
 // covered by the initial schema DDL. Idempotent via IF NOT EXISTS.
 func (db *DB) createPartialIndexesLocked(w *writerHandle) error {
 	indexes := []string{
 		`CREATE INDEX IF NOT EXISTS idx_sessions_cwd
 		 ON sessions(cwd) WHERE cwd != ''`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_project_git_branch
+		 ON sessions(project, git_branch) WHERE git_branch != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_compact_boundary
 		 ON messages(session_id, ordinal) WHERE is_compact_boundary = 1`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_sidechain
@@ -1378,6 +1585,9 @@ func (db *DB) createPartialIndexesLocked(w *writerHandle) error {
 		   AND model != '<synthetic>'`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_has_secret
 		 ON sessions(secret_leak_count) WHERE secret_leak_count > 0`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_agent_file_path_active
+		 ON sessions(agent, file_path)
+		 WHERE file_path IS NOT NULL AND deleted_at IS NULL`,
 	}
 	for _, ddl := range indexes {
 		if _, err := w.Exec(ddl); err != nil {
@@ -1507,6 +1717,84 @@ func (db *DB) backfillIsAutomatedLocked(w *writerHandle) error {
 	); err != nil {
 		return fmt.Errorf(
 			"storing classifier hash: %w", err,
+		)
+	}
+	return nil
+}
+
+// backfillToolCallFieldsLocked fills file_path and call_index on tool_calls
+// rows that predate those columns. file_path is extracted from valid JSON
+// only (raw-diff inputs stay NULL); call_index is the 0-based position within
+// the message by insertion id. Both UPDATEs touch only NULL rows, so the work
+// is idempotent, but a stats sentinel makes it run once per database: after a
+// resync (or the first populate) every row already carries the columns, so
+// later Opens skip the unindexed full-table NULL scan. Caller holds db.mu.
+func (db *DB) backfillToolCallFieldsLocked(w *writerHandle) error {
+	should, err := db.shouldRunToolCallFieldBackfillLocked(w)
+	if err != nil {
+		return err
+	}
+	if !should {
+		return nil
+	}
+	if _, err := w.Exec(`
+		UPDATE tool_calls
+		SET file_path = COALESCE(
+			json_extract(input_json,'$.file_path'),
+			json_extract(input_json,'$.path'),
+			json_extract(input_json,'$.filePath'),
+			json_extract(input_json,'$.file'))
+		WHERE category IN ('Edit','Write')
+		  AND file_path IS NULL
+		  AND input_json IS NOT NULL
+		  AND json_valid(input_json)`); err != nil {
+		return fmt.Errorf("backfilling tool_calls.file_path: %w", err)
+	}
+	if _, err := w.Exec(`
+		UPDATE tool_calls
+		SET call_index = (
+			SELECT COUNT(*) FROM tool_calls t2
+			WHERE t2.message_id = tool_calls.message_id
+			  AND t2.id < tool_calls.id)
+		WHERE call_index IS NULL`); err != nil {
+		return fmt.Errorf("backfilling tool_calls.call_index: %w", err)
+	}
+	return db.markToolCallFieldBackfillDoneLocked(w)
+}
+
+// shouldRunToolCallFieldBackfillLocked reports whether the one-time
+// tool_calls file_path/call_index backfill still needs to run. Caller holds
+// db.mu.
+func (db *DB) shouldRunToolCallFieldBackfillLocked(
+	w *writerHandle,
+) (bool, error) {
+	var done int
+	if err := w.QueryRow(
+		`SELECT count(*)
+		 FROM stats
+		 WHERE key = ? AND value != 0`,
+		toolCallFieldBackfillStatsKey,
+	).Scan(&done); err != nil {
+		return false, fmt.Errorf(
+			"probing tool_call field backfill marker: %w", err,
+		)
+	}
+	return done == 0, nil
+}
+
+// markToolCallFieldBackfillDoneLocked records that the one-time tool_calls
+// field backfill has completed so later Opens skip it. Caller holds db.mu.
+func (db *DB) markToolCallFieldBackfillDoneLocked(
+	w *writerHandle,
+) error {
+	if _, err := w.Exec(
+		`INSERT INTO stats (key, value)
+		 VALUES (?, 1)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		toolCallFieldBackfillStatsKey,
+	); err != nil {
+		return fmt.Errorf(
+			"storing tool_call field backfill marker: %w", err,
 		)
 	}
 	return nil

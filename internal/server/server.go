@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	httppprof "net/http/pprof"
 	"net/url"
 	"sort"
 	"strconv"
@@ -29,15 +30,21 @@ import (
 
 // VersionInfo holds build-time version metadata.
 type VersionInfo struct {
-	Version     string `json:"version"`
-	Commit      string `json:"commit"`
-	BuildDate   string `json:"build_date"`
-	ReadOnly    bool   `json:"read_only,omitempty"`
-	APIVersion  int    `json:"api_version"`
-	DataVersion int    `json:"data_version"`
+	Version                    string `json:"version"`
+	Commit                     string `json:"commit"`
+	BuildDate                  string `json:"build_date"`
+	ReadOnly                   bool   `json:"read_only,omitempty"`
+	InsightGenerationAvailable bool   `json:"insight_generation_available,omitempty"`
+	APIVersion                 int    `json:"api_version"`
+	DataVersion                int    `json:"data_version"`
 }
 
 const daemonService = "agentsview"
+
+const (
+	defaultInsightLogDrainTimeout    = 2 * time.Second
+	defaultInsightLogStopWaitTimeout = 500 * time.Millisecond
+)
 
 // Server is the HTTP server that serves the SPA and REST API.
 type Server struct {
@@ -63,6 +70,9 @@ type Server struct {
 	spaFS              fs.FS
 	spaHandler         http.Handler
 
+	insightLogDrainTimeout    time.Duration
+	insightLogStopWaitTimeout time.Duration
+
 	// handlerDelay is injected before each timeout-wrapped
 	// handler, used only by tests to guarantee handlers
 	// exceed a short timeout. Zero in production.
@@ -79,6 +89,11 @@ type Server struct {
 	// into the SPA's index.html.
 	basePath string
 	idle     *IdleTracker
+
+	// pprofEnabled registers net/http/pprof handlers under
+	// /debug/pprof/ so a running daemon can be profiled. Off by
+	// default; enabled by the hidden serve --pprof flag.
+	pprofEnabled bool
 }
 
 // New creates a new Server.
@@ -91,24 +106,26 @@ func New(
 		log.Fatalf("embedded frontend not found: %v", err)
 	}
 
-	// Pick the backend that matches the concrete store. A local
-	// *db.DB plus a sync engine yields a full read/write backend;
-	// any other combination (PG reader, or local DB with nil
-	// engine when used by a read-only daemon) yields a read-only
-	// backend whose Sync returns db.ErrReadOnly.
+	// Pick the backend that matches the concrete store. A local *db.DB uses
+	// the direct backend even when the sync engine is nil; direct Sync already
+	// returns db.ErrReadOnly without an engine, while read APIs such as stats
+	// still need the local handle. Non-SQLite stores use the generic read-only
+	// backend.
 	var sessions service.SessionService
-	if local, ok := database.(*db.DB); ok && engine != nil {
+	if local, ok := database.(*db.DB); ok {
 		sessions = service.NewDirectBackend(local, engine)
 	} else {
 		sessions = service.NewReadOnlyBackend(database)
 	}
 
 	s := &Server{
-		cfg:      cfg,
-		db:       database,
-		engine:   engine,
-		sessions: sessions,
-		mux:      http.NewServeMux(),
+		cfg:                       cfg,
+		db:                        database,
+		engine:                    engine,
+		sessions:                  sessions,
+		mux:                       http.NewServeMux(),
+		insightLogDrainTimeout:    defaultInsightLogDrainTimeout,
+		insightLogStopWaitTimeout: defaultInsightLogStopWaitTimeout,
 		generateStreamFunc: func(
 			ctx context.Context, agent, prompt string,
 			onLog insight.LogFunc,
@@ -127,7 +144,7 @@ func New(
 		opt(s)
 	}
 	if s.version.APIVersion == 0 {
-		s.version.APIVersion = 1
+		s.version.APIVersion = 2
 	}
 	if s.version.DataVersion == 0 {
 		s.version.DataVersion = db.CurrentDataVersion()
@@ -147,7 +164,11 @@ func insightAgentConfig(
 	}
 	agents := make(map[string]insight.AgentConfig, len(cfg))
 	for name, agentCfg := range cfg {
-		agents[name] = insight.AgentConfig{Binary: agentCfg.Binary}
+		agents[name] = insight.AgentConfig{
+			Binary:      agentCfg.Binary,
+			Sandbox:     agentCfg.Sandbox,
+			AllowUnsafe: agentCfg.AllowUnsafe,
+		}
 	}
 	return agents
 }
@@ -221,8 +242,27 @@ func WithGenerateStreamFunc(f insight.GenerateStreamFunc) Option {
 	}
 }
 
+// WithInsightLogDrainTimeouts overrides SSE insight log stream drain timeouts.
+// Zero or negative values keep the production defaults.
+func WithInsightLogDrainTimeouts(drain, stopWait time.Duration) Option {
+	return func(s *Server) {
+		if drain > 0 {
+			s.insightLogDrainTimeout = drain
+		}
+		if stopWait > 0 {
+			s.insightLogStopWaitTimeout = stopWait
+		}
+	}
+}
+
 func WithIdleTracker(t *IdleTracker) Option {
 	return func(s *Server) { s.idle = t }
+}
+
+// WithPprof enables the net/http/pprof handlers under
+// /debug/pprof/ for live profiling of a running daemon.
+func WithPprof(enabled bool) Option {
+	return func(s *Server) { s.pprofEnabled = enabled }
 }
 
 func (s *Server) humaConfig() huma.Config {
@@ -253,6 +293,14 @@ func (s *Server) routes() {
 	configureHumaErrors()
 	s.api = humago.New(s.mux, s.humaConfig())
 	s.registerTypedAPIRoutes()
+
+	if s.pprofEnabled {
+		s.mux.HandleFunc("/debug/pprof/", httppprof.Index)
+		s.mux.HandleFunc("/debug/pprof/cmdline", httppprof.Cmdline)
+		s.mux.HandleFunc("/debug/pprof/profile", httppprof.Profile)
+		s.mux.HandleFunc("/debug/pprof/symbol", httppprof.Symbol)
+		s.mux.HandleFunc("/debug/pprof/trace", httppprof.Trace)
+	}
 
 	// SPA fallback: serve embedded frontend
 	// Do not use timeout handler for static assets to avoid buffering.
@@ -342,11 +390,12 @@ func (s *Server) SetGithubToken(token string) {
 	s.cfg.GithubToken = token
 }
 
-// githubToken returns the current GitHub token (thread-safe).
-func (s *Server) githubToken() string {
+// githubToken returns the configured GitHub token or a fallback token
+// from the process environment / GitHub CLI (thread-safe).
+func (s *Server) githubToken(ctx context.Context) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.cfg.GithubToken
+	return resolveGitHubToken(ctx, s.cfg.GithubToken)
 }
 
 // Handler returns the http.Handler with middleware applied.
@@ -369,6 +418,7 @@ func (s *Server) Handler() http.Handler {
 		s.authMiddleware(
 			hostCheckMiddleware(
 				allowedHosts, bindAll, s.cfg.Port, bindAllIPs,
+				s.protectedPath,
 				corsMiddleware(
 					allowedOrigins, bindAll, s.cfg.Port, bindAllIPs,
 					gzipMiddleware(logMiddleware(s.mux)),
@@ -570,13 +620,15 @@ func buildAllowedHosts(
 }
 
 // hostCheckMiddleware validates the Host header against expected
-// values to prevent DNS rebinding attacks. Only applied to /api/
-// routes — the SPA fallback is left accessible for flexibility.
+// values to prevent DNS rebinding attacks. Only applied to paths the
+// protected predicate matches (API routes, and pprof when enabled) —
+// the SPA fallback is left accessible for flexibility.
 func hostCheckMiddleware(
-	allowedHosts map[string]bool, bindAll bool, port int, allowedIPs map[string]bool, next http.Handler,
+	allowedHosts map[string]bool, bindAll bool, port int, allowedIPs map[string]bool,
+	protected func(path string) bool, next http.Handler,
 ) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/api/") {
+		if protected(r.URL.Path) {
 			// Authenticated remote requests bypass host checks.
 			if isRemoteAuth(r) {
 				next.ServeHTTP(w, r)
@@ -796,6 +848,27 @@ func localInterfaceIPs() map[string]bool {
 // ListenAndServe starts the HTTP server.
 func (s *Server) ListenAndServe() error {
 	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
+	listenCtx := context.Background()
+	if s.baseCtx != nil {
+		listenCtx = s.baseCtx
+	}
+	ln, err := daemon.Listen(
+		listenCtx,
+		daemon.Endpoint{
+			Network: daemon.NetworkTCP,
+			Address: addr,
+		},
+		daemon.WithRuntimeStore(daemon.RuntimeStore{Dir: s.dataDir}),
+	)
+	if err != nil {
+		return err
+	}
+	return s.Serve(ln)
+}
+
+// Serve starts the HTTP server on an existing listener.
+func (s *Server) Serve(ln net.Listener) error {
+	addr := ln.Addr().String()
 	srv := &http.Server{
 		Addr:        addr,
 		Handler:     s.Handler(),
@@ -812,34 +885,29 @@ func (s *Server) ListenAndServe() error {
 	s.httpSrv = srv
 	s.mu.Unlock()
 	log.Printf("Starting server at http://%s", addr)
-
-	listenCtx := context.Background()
-	if s.baseCtx != nil {
-		listenCtx = s.baseCtx
-	}
-	ln, err := daemon.Listen(
-		listenCtx,
-		daemon.Endpoint{
-			Network: daemon.NetworkTCP,
-			Address: addr,
-		},
-		daemon.WithRuntimeStore(daemon.RuntimeStore{Dir: s.dataDir}),
-	)
-	if err != nil {
-		return err
-	}
 	return srv.Serve(ln)
 }
 
-// Shutdown gracefully shuts down the HTTP server.
+// Shutdown gracefully shuts down the HTTP server, then closes the
+// server-owned on-demand sync engine (if one was lazily created) so
+// its pending debounced signal recomputes flush while the DB is
+// still open. Injected engines are closed by their owner.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.RLock()
 	srv := s.httpSrv
 	s.mu.RUnlock()
-	if srv == nil {
-		return nil
+	var err error
+	if srv != nil {
+		err = srv.Shutdown(ctx)
 	}
-	return srv.Shutdown(ctx)
+	s.mu.Lock()
+	engine := s.onDemandEngine
+	s.onDemandEngine = nil
+	s.mu.Unlock()
+	if engine != nil {
+		engine.Close()
+	}
+	return err
 }
 
 // FindAvailablePort finds an available port starting from the

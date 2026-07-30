@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
 	"time"
 
 	"go.kenn.io/agentsview/internal/db"
@@ -22,7 +21,7 @@ func (s *Store) GetMessages(
 		dir = "DESC"
 		op = "<="
 	}
-	rows, err := s.duck.QueryContext(ctx, `
+	rows, err := s.queryContext(ctx, `
 		SELECT id, session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use, content_length,
 			is_system, model, token_usage, context_tokens, output_tokens,
@@ -50,7 +49,7 @@ func (s *Store) GetMessages(
 }
 
 func (s *Store) GetAllMessages(ctx context.Context, sessionID string) ([]db.Message, error) {
-	rows, err := s.duck.QueryContext(ctx, `
+	rows, err := s.queryContext(ctx, `
 		SELECT id, session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use, content_length,
 			is_system, model, token_usage, context_tokens, output_tokens,
@@ -110,12 +109,13 @@ func (s *Store) attachToolCalls(ctx context.Context, msgs []db.Message) error {
 	for i, msg := range msgs {
 		index[msg.Ordinal] = i
 	}
-	rows, err := s.duck.QueryContext(ctx, `
+	rows, err := s.queryContext(ctx, `
 		SELECT m.ordinal, tc.call_index, tc.tool_name, tc.category,
 			COALESCE(tc.tool_use_id, ''), COALESCE(tc.input_json, ''),
 			COALESCE(tc.skill_name, ''), COALESCE(tc.result_content_length, 0),
 			COALESCE(tc.result_content, ''),
-			COALESCE(tc.subagent_session_id, '')
+			COALESCE(tc.subagent_session_id, ''),
+			COALESCE(tc.file_path, '')
 		FROM tool_calls tc
 		JOIN messages m ON m.session_id = tc.session_id
 			AND m.id = tc.message_id
@@ -133,9 +133,10 @@ func (s *Store) attachToolCalls(ctx context.Context, msgs []db.Message) error {
 		if err := rows.Scan(&ordinal, &callIndex, &tc.ToolName,
 			&tc.Category, &tc.ToolUseID, &tc.InputJSON,
 			&tc.SkillName, &tc.ResultContentLength,
-			&tc.ResultContent, &tc.SubagentSessionID); err != nil {
+			&tc.ResultContent, &tc.SubagentSessionID, &tc.FilePath); err != nil {
 			return err
 		}
+		tc.CallIndex = callIndex
 		// A negative call_index (corrupt or malformed mirror row) would
 		// skip the grow loop and panic on the [callIndex] assignment, so
 		// guard it the same way the Postgres store does.
@@ -155,7 +156,7 @@ func (s *Store) attachToolCalls(ctx context.Context, msgs []db.Message) error {
 func (s *Store) attachToolResultEvents(
 	ctx context.Context, msgs []db.Message, index map[int]int, sessionID string,
 ) error {
-	rows, err := s.duck.QueryContext(ctx, `
+	rows, err := s.queryContext(ctx, `
 		SELECT tool_call_message_ordinal, call_index,
 			COALESCE(tool_use_id, ''), COALESCE(agent_id, ''),
 			COALESCE(subagent_session_id, ''), source, status,
@@ -283,7 +284,7 @@ func (s *Store) GetSessionTiming(ctx context.Context, sessionID string) (*db.Ses
 func (s *Store) queryTurnRows(
 	ctx context.Context, sess *db.Session,
 ) ([]db.TurnRow, error) {
-	rows, err := s.duck.QueryContext(ctx, `
+	rows, err := s.queryContext(ctx, `
 		SELECT id, ordinal, timestamp, has_tool_use
 		FROM messages
 		WHERE session_id = ?
@@ -328,7 +329,7 @@ func (s *Store) queryTurnRows(
 func (s *Store) queryCallRows(
 	ctx context.Context, sessionID string,
 ) ([]db.CallRow, error) {
-	rows, err := s.duck.QueryContext(ctx, `
+	rows, err := s.queryContext(ctx, `
 		SELECT tc.message_id, COALESCE(tc.tool_use_id, ''),
 			tc.tool_name, tc.category, tc.skill_name,
 			tc.subagent_session_id, COALESCE(tc.input_json, ''),
@@ -388,14 +389,5 @@ func timingMillis(start, end string) (int64, bool) {
 }
 
 func hasSystemPrefix(msg db.Message) bool {
-	if msg.Role != "user" {
-		return false
-	}
-	content := strings.TrimSpace(msg.Content)
-	for _, prefix := range db.SystemMsgPrefixes {
-		if strings.HasPrefix(content, prefix) {
-			return true
-		}
-	}
-	return false
+	return db.IsSystemPrefixed(msg.Content, msg.Role)
 }

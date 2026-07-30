@@ -44,12 +44,13 @@ var waitForDaemonStartupForTransport = WaitForDaemonStartupContext
 // transport captures how to reach the session-data layer from a
 // CLI subcommand. Either the HTTP daemon (URL set) or the local DB.
 type transport struct {
-	Mode           transportMode
-	URL            string
-	ReadOnly       bool // daemon runtime ReadOnly flag (true for pg serve)
-	DirectReadOnly bool // writable daemon owns DB but is not reachable
-	DirectReason   string
-	Runtime        *DaemonRuntime
+	Mode               transportMode
+	URL                string
+	ReadOnly           bool // daemon runtime ReadOnly flag (true for pg serve)
+	DirectReadOnly     bool // writable daemon owns DB but is not reachable
+	DirectIncompatible bool // live daemon owns DB but cannot serve this client
+	DirectReason       string
+	Runtime            *DaemonRuntime
 }
 
 type customPricingStore interface {
@@ -94,6 +95,22 @@ func detectTransportContext(
 	if err := ctx.Err(); err != nil {
 		return transport{}, err
 	}
+	if isExternalDaemonStarting(dataDir) {
+		fmt.Fprintln(os.Stderr,
+			"server is starting up, waiting...")
+		if waitTimeout <= 0 {
+			waitTimeout = startupWaitTimeout
+		}
+		_, _, err := waitForExternalServeStartup(
+			ctx, dataDir, authToken, waitTimeout,
+		)
+		if err != nil && errors.Is(err, errServeStartupInProgress) {
+			return transport{}, err
+		}
+		if err := ctx.Err(); err != nil {
+			return transport{}, err
+		}
+	}
 	if sf := FindDaemonRuntime(dataDir, authToken); sf != nil {
 		return transportFromRuntime(sf), nil
 	}
@@ -115,13 +132,16 @@ func detectTransportContext(
 	}
 	if IsLocalDaemonActive(dataDir, authToken) {
 		reason := errLocalDaemonUnreachable.Error()
+		incompatible := false
 		if _, err := FindIncompatibleDaemonRuntime(dataDir, authToken); err != nil {
 			reason = err.Error()
+			incompatible = true
 		}
 		return transport{
-			Mode:           transportDirect,
-			DirectReadOnly: true,
-			DirectReason:   reason,
+			Mode:               transportDirect,
+			DirectReadOnly:     true,
+			DirectIncompatible: incompatible,
+			DirectReason:       reason,
 		}, nil
 	}
 	return transport{Mode: transportDirect}, nil
@@ -149,8 +169,20 @@ func ensureTransportContext(
 	if err := ctx.Err(); err != nil {
 		return transport{}, err
 	}
-	if intent == transportIntentArchiveWrite && waitTimeout <= 0 {
+	if (intent == transportIntentRead || intent == transportIntentArchiveWrite) &&
+		waitTimeout <= 0 {
 		waitTimeout = backgroundAutoStartReadyTimeout
+	}
+	if intent == transportIntentArchiveWrite {
+		waited, err := waitForBackgroundLaunchBeforeArchiveWrite(
+			ctx, cfg.DataDir, waitTimeout,
+		)
+		if err != nil {
+			return transport{}, err
+		}
+		if waited && cfg.AuthToken == "" {
+			adoptBackgroundLaunchConfig(cfg)
+		}
 	}
 	tr, err := detectTransportContext(
 		ctx, cfg.DataDir, cfg.AuthToken, waitTimeout,
@@ -158,16 +190,34 @@ func ensureTransportContext(
 	if err != nil {
 		return transport{}, err
 	}
+	if intent == transportIntentRead && cfg.AuthToken == "" &&
+		tr.Mode == transportDirect && tr.DirectReadOnly {
+		adoptBackgroundLaunchConfig(cfg)
+		if cfg.AuthToken != "" {
+			tr, err = detectTransportContext(
+				ctx, cfg.DataDir, cfg.AuthToken, waitTimeout,
+			)
+			if err != nil {
+				return transport{}, err
+			}
+		}
+	}
 	if tr.Mode == transportHTTP {
-		if intent == transportIntentArchiveWrite &&
+		if (intent == transportIntentRead ||
+			intent == transportIntentArchiveWrite) &&
 			shouldUpgradeDaemonRuntime(tr.Runtime, version) {
 			if daemonAutostartDisabled() {
+				if intent == transportIntentRead {
+					return transport{}, appendDaemonRestartUpgradeHint(
+						errors.New("daemon restart required: running daemon is older than this client"),
+					)
+				}
 				return tr, nil
 			}
 			if err := guardDaemonAutoStartConfig(*cfg); err != nil {
 				return transport{}, err
 			}
-			cfg.NoSync = tr.Runtime.NoSync
+			cfg.NoSync = cfg.NoSync || tr.Runtime.NoSync
 			rt, err := startBackgroundServeForTransport(
 				ctx, cfg, waitTimeout,
 			)
@@ -178,7 +228,8 @@ func ensureTransportContext(
 		}
 		return tr, nil
 	}
-	if intent == transportIntentArchiveWrite && !daemonAutostartDisabled() {
+	if (intent == transportIntentRead || intent == transportIntentArchiveWrite) &&
+		!daemonAutostartDisabled() {
 		if rt, err := FindIncompatibleDaemonRuntime(
 			cfg.DataDir, cfg.AuthToken,
 		); err != nil && rt != nil &&
@@ -186,7 +237,7 @@ func ensureTransportContext(
 			if err := guardDaemonAutoStartConfig(*cfg); err != nil {
 				return transport{}, err
 			}
-			cfg.NoSync = rt.NoSync
+			cfg.NoSync = cfg.NoSync || rt.NoSync
 			rt, err := startBackgroundServeForTransport(
 				ctx, cfg, waitTimeout,
 			)
@@ -196,7 +247,36 @@ func ensureTransportContext(
 			return transportFromRuntime(rt), nil
 		}
 	}
-	if intent == transportIntentRead || daemonAutostartDisabled() {
+	if intent == transportIntentRead {
+		if daemonAutostartDisabled() {
+			return transport{}, errors.New(
+				"daemon autostart is disabled; direct SQLite reads are " +
+					"not supported for this command. Start a daemon with " +
+					"`agentsview serve --background` or unset " +
+					"AGENTSVIEW_NO_DAEMON",
+			)
+		}
+		if tr.DirectReadOnly {
+			if tr.DirectReason != "" {
+				if tr.DirectReason == errLocalDaemonUnreachable.Error() {
+					return transport{}, errLocalDaemonUnreachable
+				}
+				return transport{}, appendDaemonRestartUpgradeHint(
+					errors.New(tr.DirectReason),
+				)
+			}
+			return transport{}, errLocalDaemonUnreachable
+		}
+		if err := guardDaemonAutoStartConfig(*cfg); err != nil {
+			return transport{}, err
+		}
+		rt, err := startBackgroundServeForTransport(ctx, cfg, waitTimeout)
+		if err != nil {
+			return transport{}, err
+		}
+		return transportFromRuntime(rt), nil
+	}
+	if daemonAutostartDisabled() {
 		return tr, nil
 	}
 	if tr.DirectReadOnly {
@@ -218,12 +298,59 @@ func ensureTransportContext(
 	return transportFromRuntime(rt), nil
 }
 
+func waitForBackgroundLaunchBeforeArchiveWrite(
+	ctx context.Context,
+	dataDir string,
+	waitTimeout time.Duration,
+) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	info, err := os.Stat(dataDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !info.IsDir() {
+		return false, fmt.Errorf("data dir %q is not a directory", dataDir)
+	}
+	if !isBackgroundLaunchActive(dataDir) {
+		return false, nil
+	}
+	if waitTimeout <= 0 {
+		waitTimeout = backgroundAutoStartReadyTimeout
+	}
+	deadline := time.Now().Add(waitTimeout)
+	for isBackgroundLaunchActive(dataDir) {
+		if err := ctx.Err(); err != nil {
+			return true, err
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return true, errServeStartupInProgress
+		}
+		timer := time.NewTimer(min(remaining, startProbeTick()))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return true, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return true, ctx.Err()
+}
+
 func shouldUpgradeDaemonRuntime(rt *DaemonRuntime, currentVersion string) bool {
 	if rt == nil || rt.ReadOnly {
 		return false
 	}
+	if update.IsDevBuildVersion(currentVersion) {
+		return false
+	}
 	if rt.Record.Version == "" {
-		return !update.IsDevBuildVersion(currentVersion)
+		return true
 	}
 	return update.IsNewer(currentVersion, rt.Record.Version)
 }
@@ -304,6 +431,9 @@ func newService(
 		return service.NewHTTPBackend(tr.URL, cfg.AuthToken, tr.ReadOnly),
 			func() {}, nil
 	default:
+		if err := directIncompatibleDaemonError(tr); err != nil {
+			return nil, nil, err
+		}
 		d, err := openReadOnlyDB(cfg)
 		if err != nil {
 			return nil, nil, fmt.Errorf(
@@ -315,6 +445,17 @@ func newService(
 		// is handled via the HTTP daemon when one is running.
 		return service.NewDirectBackend(d, nil), cleanup, nil
 	}
+}
+
+func directIncompatibleDaemonError(tr transport) error {
+	if !tr.DirectIncompatible {
+		return nil
+	}
+	reason := strings.TrimSpace(tr.DirectReason)
+	if reason == "" {
+		reason = "local daemon is incompatible with this agentsview client"
+	}
+	return appendDaemonRestartUpgradeHint(errors.New(reason))
 }
 
 // newPGReadService builds a read-only SessionService over the

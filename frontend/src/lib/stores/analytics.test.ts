@@ -20,6 +20,7 @@ import type {
   ToolsAnalyticsResponse,
   SkillsAnalyticsResponse,
   TopSessionsResponse,
+  SignalsAnalyticsResponse,
 } from "../api/types.js";
 
 vi.mock("../api/runtime.js", () => ({
@@ -66,6 +67,7 @@ function makeSummary(): AnalyticsSummary {
     total_messages: 100,
     total_output_tokens: 42000,
     token_reporting_sessions: 8,
+    models: [],
     active_projects: 3,
     active_days: 5,
     avg_messages: 10,
@@ -143,38 +145,8 @@ function makeTopSessions(): TopSessionsResponse {
   return { metric: "messages", sessions: [] };
 }
 
-function mockAllAPIs() {
-  vi.mocked(analyticsService.getApiV1AnalyticsSummary).mockResolvedValue(
-    makeSummary(),
-  );
-  vi.mocked(analyticsService.getApiV1AnalyticsActivity).mockResolvedValue(
-    makeActivity(),
-  );
-  vi.mocked(analyticsService.getApiV1AnalyticsHeatmap).mockResolvedValue(
-    makeHeatmap(),
-  );
-  vi.mocked(analyticsService.getApiV1AnalyticsProjects).mockResolvedValue(
-    makeProjects(),
-  );
-  vi.mocked(analyticsService.getApiV1AnalyticsHourOfWeek).mockResolvedValue(
-    makeHourOfWeek(),
-  );
-  vi.mocked(analyticsService.getApiV1AnalyticsSessions).mockResolvedValue(
-    makeSessionShape(),
-  );
-  vi.mocked(analyticsService.getApiV1AnalyticsVelocity).mockResolvedValue(
-    makeVelocity(),
-  );
-  vi.mocked(analyticsService.getApiV1AnalyticsTools).mockResolvedValue(
-    makeTools(),
-  );
-  vi.mocked(analyticsService.getApiV1AnalyticsSkills).mockResolvedValue(
-    makeSkills(),
-  );
-  vi.mocked(analyticsService.getApiV1AnalyticsTopSessions).mockResolvedValue(
-    makeTopSessions(),
-  );
-  vi.mocked(analyticsService.getApiV1AnalyticsSignals).mockResolvedValue({
+function makeSignals(): SignalsAnalyticsResponse {
+  return {
     scored_sessions: 0,
     unscored_sessions: 0,
     grade_distribution: {},
@@ -224,7 +196,43 @@ function mockAllAPIs() {
     by_agent: [],
     by_project: [],
     calibration: {},
-  });
+  };
+}
+
+function mockAllAPIs() {
+  vi.mocked(analyticsService.getApiV1AnalyticsSummary).mockResolvedValue(
+    makeSummary(),
+  );
+  vi.mocked(analyticsService.getApiV1AnalyticsActivity).mockResolvedValue(
+    makeActivity(),
+  );
+  vi.mocked(analyticsService.getApiV1AnalyticsHeatmap).mockResolvedValue(
+    makeHeatmap(),
+  );
+  vi.mocked(analyticsService.getApiV1AnalyticsProjects).mockResolvedValue(
+    makeProjects(),
+  );
+  vi.mocked(analyticsService.getApiV1AnalyticsHourOfWeek).mockResolvedValue(
+    makeHourOfWeek(),
+  );
+  vi.mocked(analyticsService.getApiV1AnalyticsSessions).mockResolvedValue(
+    makeSessionShape(),
+  );
+  vi.mocked(analyticsService.getApiV1AnalyticsVelocity).mockResolvedValue(
+    makeVelocity(),
+  );
+  vi.mocked(analyticsService.getApiV1AnalyticsTools).mockResolvedValue(
+    makeTools(),
+  );
+  vi.mocked(analyticsService.getApiV1AnalyticsSkills).mockResolvedValue(
+    makeSkills(),
+  );
+  vi.mocked(analyticsService.getApiV1AnalyticsTopSessions).mockResolvedValue(
+    makeTopSessions(),
+  );
+  vi.mocked(analyticsService.getApiV1AnalyticsSignals).mockResolvedValue(
+    makeSignals(),
+  );
 }
 
 async function loadAnalyticsStore() {
@@ -243,6 +251,7 @@ function resetStore() {
   analytics.agent = "";
   analytics.includeAutomated = false;
   analytics.automatedScope = "human";
+  analytics.model = "";
   analytics.from = "2024-01-01";
   analytics.to = "2024-01-31";
   analytics.isPinned = false;
@@ -655,6 +664,132 @@ describe("AnalyticsStore automated scope params", () => {
   });
 });
 
+describe("AnalyticsStore model filter", () => {
+  it.each([
+    { name: "summary", fn: () => analyticsService.getApiV1AnalyticsSummary },
+    { name: "activity", fn: () => analyticsService.getApiV1AnalyticsActivity },
+    { name: "heatmap", fn: () => analyticsService.getApiV1AnalyticsHeatmap },
+    { name: "projects", fn: () => analyticsService.getApiV1AnalyticsProjects },
+    { name: "hourOfWeek", fn: () => analyticsService.getApiV1AnalyticsHourOfWeek },
+    { name: "sessionShape", fn: () => analyticsService.getApiV1AnalyticsSessions },
+    { name: "velocity", fn: () => analyticsService.getApiV1AnalyticsVelocity },
+    { name: "tools", fn: () => analyticsService.getApiV1AnalyticsTools },
+    { name: "skills", fn: () => analyticsService.getApiV1AnalyticsSkills },
+    { name: "topSessions", fn: () => analyticsService.getApiV1AnalyticsTopSessions },
+    { name: "signals", fn: () => analyticsService.getApiV1AnalyticsSignals },
+  ])("should include model in $name params", ({ fn }) => {
+    analytics.toggleModel("gpt-4o");
+
+    const mock = vi.mocked(fn());
+    expect(mock).toHaveBeenCalled();
+    const params = mock.mock.lastCall?.[0];
+    expect(params?.model).toBe("gpt-4o");
+  });
+
+  it("should clear model from subsequent requests", () => {
+    analytics.toggleModel("gpt-4o");
+    vi.clearAllMocks();
+
+    analytics.clearModel();
+
+    expect(analytics.model).toBe("");
+    const params =
+      vi.mocked(analyticsService.getApiV1AnalyticsSummary).mock.lastCall?.[0];
+    expect(params?.model).toBeUndefined();
+  });
+
+  it("fetchSignalsForInsights omits the model filter", async () => {
+    analytics.model = "gpt-4o";
+    vi.clearAllMocks();
+
+    await analytics.fetchSignalsForInsights();
+
+    expect(analyticsService.getApiV1AnalyticsSignals).toHaveBeenCalledWith(
+      expect.not.objectContaining({ model: expect.anything() }),
+    );
+    // The Insights page has no model control; the selected model stays put for
+    // the Analytics page rather than being cleared by viewing Insights.
+    expect(analytics.model).toBe("gpt-4o");
+  });
+
+  it("signalEvidenceParams omits the model filter", () => {
+    analytics.model = "gpt-4o";
+    expect(analytics.signalEvidenceParams().model).toBeUndefined();
+  });
+
+  it("drops stale model-scoped signals while an Insights fetch is pending", async () => {
+    // Analytics loads model-scoped signals into the shared cache.
+    analytics.model = "gpt-4o";
+    await analytics.fetchSignals();
+    expect(analytics.signals).not.toBeNull();
+
+    // The unmodelled Insights fetch is held in flight.
+    let resolve!: (v: SignalsAnalyticsResponse) => void;
+    vi.mocked(analyticsService.getApiV1AnalyticsSignals).mockReturnValue(
+      new Promise((r) => {
+        resolve = r;
+      }),
+    );
+
+    const pending = analytics.fetchSignalsForInsights();
+
+    // The model-scoped cache is dropped up front, so Insights shows a loading
+    // skeleton instead of another scope's signals during the fetch.
+    expect(analytics.signals).toBeNull();
+    expect(analytics.loading.signals).toBe(true);
+
+    resolve(makeSignals());
+    await pending;
+    expect(analytics.signals).not.toBeNull();
+  });
+
+  it("does not retain stale model-scoped signals when an Insights fetch fails", async () => {
+    // Analytics loads model-scoped signals into the shared cache.
+    analytics.model = "gpt-4o";
+    await analytics.fetchSignals();
+    expect(analytics.signals).not.toBeNull();
+
+    // The unmodelled Insights fetch fails.
+    vi.mocked(analyticsService.getApiV1AnalyticsSignals).mockRejectedValueOnce(
+      new Error("signals failed"),
+    );
+
+    await analytics.fetchSignalsForInsights();
+
+    // The wrong-scope cache is cleared and the failure surfaces rather than
+    // being swallowed as a cached refetch that keeps stale data.
+    expect(analytics.signals).toBeNull();
+    expect(analytics.errors.signals).toBe("signals failed");
+  });
+
+  it("drops stale drill-down-scoped signals when entering Insights without a model", async () => {
+    // Analytics loaded signals under a heatmap drill-down (hour) and no model,
+    // so the cache scope differs from Insights only by the drill-down filter.
+    analytics.selectedHour = 9;
+    await analytics.fetchSignals();
+    expect(analytics.signals).not.toBeNull();
+
+    // Insights clears the drill-down; hold the unmodelled fetch in flight.
+    let resolve!: (v: SignalsAnalyticsResponse) => void;
+    vi.mocked(analyticsService.getApiV1AnalyticsSignals).mockReturnValue(
+      new Promise((r) => {
+        resolve = r;
+      }),
+    );
+
+    const pending = analytics.fetchSignalsForInsights();
+
+    // The drill-down-scoped cache is dropped even though no model was set, so
+    // Insights does not show another scope's signals while the fetch runs.
+    expect(analytics.signals).toBeNull();
+    expect(analytics.loading.signals).toBe(true);
+
+    resolve(makeSignals());
+    await pending;
+    expect(analytics.signals).not.toBeNull();
+  });
+});
+
 describe("executeFetch concurrency and error handling", () => {
   it("should set loading true during fetch", async () => {
     let resolve!: (v: AnalyticsSummary) => void;
@@ -837,20 +972,20 @@ describe("AnalyticsStore rolling default date range", () => {
     const { analytics } = await loadAnalyticsStore();
     expect(analytics.isPinned).toBe(false);
     expect(analytics.windowDays).toBe(365);
-    expect(analytics.from).toBe("2025-04-25");
+    expect(analytics.from).toBe("2025-04-26");
     expect(analytics.to).toBe("2026-04-25");
   });
 
   it("fetchAll re-derives from/to against the current clock while unpinned", async () => {
     const { analytics } = await loadAnalyticsStore();
 
-    expect(analytics.from).toBe("2025-04-25");
+    expect(analytics.from).toBe("2025-04-26");
     expect(analytics.to).toBe("2026-04-25");
 
     vi.setSystemTime(new Date("2026-04-26T12:00:00"));
     await analytics.fetchAll();
 
-    expect(analytics.from).toBe("2025-04-26");
+    expect(analytics.from).toBe("2025-04-27");
     expect(analytics.to).toBe("2026-04-26");
   });
 
@@ -878,19 +1013,19 @@ describe("AnalyticsStore rolling default date range", () => {
 
     expect(analytics.isPinned).toBe(false);
     expect(analytics.windowDays).toBe(7);
-    expect(analytics.from).toBe("2026-04-18");
+    expect(analytics.from).toBe("2026-04-19");
     expect(analytics.to).toBe("2026-04-25");
   });
 
   it("after setRollingWindow, fetchAll keeps rolling", async () => {
     const { analytics } = await loadAnalyticsStore();
     analytics.setRollingWindow(7);
-    expect(analytics.from).toBe("2026-04-18");
+    expect(analytics.from).toBe("2026-04-19");
 
     vi.setSystemTime(new Date("2026-04-26T12:00:00"));
     await analytics.fetchAll();
 
-    expect(analytics.from).toBe("2026-04-19");
+    expect(analytics.from).toBe("2026-04-20");
     expect(analytics.to).toBe("2026-04-26");
   });
 
@@ -943,11 +1078,11 @@ describe("AnalyticsStore rolling default date range", () => {
     vi.setSystemTime(new Date("2026-04-26T12:00:00"));
     await analytics.fetchSignalsForInsights();
 
-    expect(analytics.from).toBe("2026-04-19");
+    expect(analytics.from).toBe("2026-04-20");
     expect(analytics.to).toBe("2026-04-26");
     expect(analyticsService.getApiV1AnalyticsSignals).toHaveBeenLastCalledWith(
       expect.objectContaining({
-        from: "2026-04-19",
+        from: "2026-04-20",
         to: "2026-04-26",
       }),
     );

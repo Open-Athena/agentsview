@@ -42,6 +42,8 @@ The command pulls together several categories of information:
   (= `abandoned` or `errored`), and `unknown` (= `unknown` plus
   any unrecognized value). The rollup applies to both the human
   summary and the JSON `outcomes` block.
+- **Code attribution** — optional AI-authored code attribution from
+  host-local attribution sources such as Cursor.
 
 ## Automation Scope
 
@@ -77,6 +79,7 @@ agentsview stats --agent claude --include-project my-app
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--format` | `human` | Output format: `human` or `json` |
+| `--json` | `false` | Alias for `--format json` |
 | `--since` | `28d` | Start of window, either a compact duration like `28d` or a `YYYY-MM-DD` date |
 | `--until` | now | End of window as `YYYY-MM-DD` |
 | `--agent` | `all` | Restrict to one agent, or leave as `all` |
@@ -84,19 +87,26 @@ agentsview stats --agent claude --include-project my-app
 | `--exclude-project` | | Repeatable project blocklist |
 | `--timezone` | local | Timezone used for temporal reporting |
 
-## Local-Only Behavior
+## Data Scope
 
-Unlike `agentsview session`, this command currently reads the local
-SQLite archive directly. It does **not** proxy through a running
-AgentsView daemon.
+Session-derived stats summarize the selected window in the local
+AgentsView archive. When the command talks to a local SQLite daemon, the
+daemon answers from that same archive. If it falls back to a direct
+read-only SQLite open, it reads the archive file directly.
 
-That means:
+Code attribution is different: it is not synced session data. When
+present, the Cursor source in the `code_attribution.sources` array is
+read live from the Cursor attribution database on the host answering
+the stats request:
+`~/.cursor/ai-tracking/ai-code-tracking.db` by default, or the path in
+`AGENTSVIEW_CURSOR_ATTRIBUTION_DB`.
 
-- a running `agentsview serve` process is not required
-- the command reflects whatever is already present in the local
-  archive
-- if you want the newest session data first, run
-  `agentsview sync` or `agentsview serve` before using it
+That means the Cursor source is machine-local. It is not aggregated
+across synced machines, is not pushed to PostgreSQL, and is not available
+from PostgreSQL read-only serving. Project filters cannot be represented
+against Cursor's attribution database, so project-filtered stats include
+a Cursor source with `status: "unsupported_filter"` instead of silently
+reporting zero attribution.
 
 ## Human Output
 
@@ -115,6 +125,7 @@ on the data available in the selected window, you may see:
 - `Temporal`
 - `Outcome stats`
 - `Outcomes`
+- `Code attribution`
 
 Some sections are optional. For example, git-based outcome stats are
 omitted when AgentsView cannot derive any repos from the sessions in
@@ -144,6 +155,18 @@ Optional blocks may also appear:
 - `adoption`
 - `outcome_stats`
 - `outcomes`
+- `code_attribution`
+
+`code_attribution.sources` lists attribution sources that contributed to
+the selected stats request. Each source carries `provider`, `scope`,
+`status`, optional `warnings`, and provider-specific `metrics`. The
+Cursor source currently uses `scope: "machine_local"`.
+
+Current source statuses are `available`, `empty`, `unavailable`, `error`,
+and `unsupported_filter`. Check a source's `warnings` before interpreting
+missing metrics or zero counters as zero AI code activity. If an agent
+filter excludes Cursor, the Cursor source is omitted. If no source
+contributes, the whole `code_attribution` block is omitted.
 
 Even though the JSON currently includes a version number, it is still
 best to treat it as experimental and additive: expect new fields,
@@ -161,7 +184,8 @@ That includes:
 - lines added and removed
 - files changed
 
-Pull-request counts are optional:
+Pull-request counts are optional and use CLI-oriented GitHub token
+sources:
 
 - If `AGENTSVIEW_GITHUB_TOKEN` is set, AgentsView uses it.
 - Otherwise it tries `gh auth token`.

@@ -3,7 +3,8 @@
   import { copyToClipboard } from "../../utils/clipboard.js";
   import { applyHighlight, applyMarks, clearMarks, escapeHTML } from "../../utils/highlight.js";
   import { highlightToHtml } from "../../utils/syntax-highlight.js";
-  import CopyButton from "../shared/CopyButton.svelte";
+  import { CopyButton } from "@kenn-io/kit-ui";
+  import { m } from "../../i18n/index.js";
 
   interface Props {
     content: string;
@@ -50,6 +51,8 @@
     };
   });
 
+  // Copy stays controlled (rather than kit-ui CopyButton's self-managed
+  // text mode) so it goes through the app's clipboard util.
   async function handleCopy() {
     const ok = await copyToClipboard(content);
     if (!ok) return;
@@ -66,14 +69,16 @@
   });
 </script>
 
+<!-- kit-ui-check-ignore: deliberately not kit-ui CodeBlock — copy must stay controlled through utils/clipboard.js (kit CodeBlock hardcodes self-managed CopyButton text mode) and the pre element hosts in-session find marks -->
 <div class="code-block">
   <CopyButton
     class="code-copy"
+    revealOnHover
     {copied}
-    ariaLabel="Copy code block"
-    copiedAriaLabel="Copied code block"
-    title="Copy code"
-    copiedTitle="Copied!"
+    ariaLabel={m.code_block_copy_code_block()}
+    copiedAriaLabel={m.code_block_copied_code_block()}
+    title={m.code_block_copy_code()}
+    copiedTitle={m.code_block_copied()}
     onclick={handleCopy}
   />
   {#if language}
@@ -87,6 +92,7 @@
 </div>
 
 <style>
+  /* kit-ui-check-ignore: app-owned code block (controlled copy + search marks), see markup note above */
   .code-block {
     position: relative;
     background: var(--code-bg);
@@ -95,14 +101,15 @@
     overflow: hidden;
   }
 
-  :global(.code-copy.copy-btn) {
+  :global(.code-copy.kit-copy-btn) {
     position: absolute;
     top: 6px;
     right: 6px;
     z-index: 1;
   }
 
-  .code-block:hover :global(.code-copy.copy-btn) {
+  /* kit-ui-check-ignore: app-owned code block (controlled copy + search marks), see markup note above */
+  .code-block:hover :global(.code-copy.kit-copy-btn) {
     opacity: 1;
   }
 
@@ -113,7 +120,9 @@
     font-weight: 500;
     color: var(--code-text);
     opacity: 0.5;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    /* --code-bg is dark in both themes, so derive the hairline from
+       --code-text rather than a theme-flipping border token. */
+    border-bottom: 1px solid color-mix(in srgb, var(--code-text) 8%, transparent);
   }
 
   .code-content {
@@ -129,7 +138,7 @@
     font-family: inherit;
   }
 
-  @media (max-width: 767px) {
+  @media (max-width: 760px) {
     .code-content {
       max-width: calc(100vw - 32px);
     }

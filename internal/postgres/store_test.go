@@ -4,6 +4,7 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -105,6 +106,14 @@ func ensureAnalyticsTokenStoreSchema(
 	require.NoError(t, err, "inserting analytics token sessions")
 }
 
+func sessionIDs(sessions []db.Session) []string {
+	ids := make([]string, 0, len(sessions))
+	for _, s := range sessions {
+		ids = append(ids, s.ID)
+	}
+	return ids
+}
+
 func TestNewStore(t *testing.T) {
 	pgURL := testPGURL(t)
 	ensureStoreSchema(t, pgURL)
@@ -115,6 +124,42 @@ func TestNewStore(t *testing.T) {
 
 	assert.True(t, store.ReadOnly())
 	assert.True(t, store.HasFTS())
+}
+
+func TestDetectInsightGenerationAvailability(t *testing.T) {
+	pgURL := testPGURL(t)
+	ensureStoreSchema(t, pgURL)
+
+	store, err := NewStore(pgURL, testSchema, true)
+	require.NoError(t, err, "NewStore")
+	defer store.Close()
+
+	require.NoError(t, store.DetectInsightGenerationAvailability(
+		context.Background(),
+	), "DetectInsightGenerationAvailability")
+	assert.True(t, store.InsightGenerationAvailable())
+}
+
+func TestProbeInsightGenerationAvailabilityTx_ReadOnly(t *testing.T) {
+	pgURL := testPGURL(t)
+	ensureStoreSchema(t, pgURL)
+
+	pg, err := Open(pgURL, testSchema, true)
+	require.NoError(t, err, "Open")
+	defer pg.Close()
+
+	tx, err := pg.BeginTx(
+		context.Background(),
+		&sql.TxOptions{ReadOnly: true},
+	)
+	require.NoError(t, err, "BeginTx")
+	defer func() { _ = tx.Rollback() }()
+
+	available, err := probeInsightGenerationAvailabilityTx(
+		context.Background(), tx,
+	)
+	require.NoError(t, err, "probeInsightGenerationAvailabilityTx")
+	assert.False(t, available)
 }
 
 func TestStoreListSessions(t *testing.T) {
@@ -1152,56 +1197,298 @@ func TestStoreAnalyticsTopSessionsDisplayName(t *testing.T) {
 	assert.Equal(t, "User renamed title", *custom.DisplayName)
 }
 
-func TestStoreWriteMethodsReturnReadOnly(t *testing.T) {
+func TestStoreAnalyticsTopSessionsMessagesAllowRunningSessions(t *testing.T) {
+	pgURL := testPGURL(t)
+	ensureStoreSchema(t, pgURL)
+
+	store, err := NewStore(pgURL, testSchema, true)
+	require.NoError(t, err, "NewStore")
+	defer store.Close()
+
+	_, err = store.DB().Exec(`
+		INSERT INTO sessions (
+			id, machine, project, agent, first_message,
+			started_at, ended_at, message_count,
+			user_message_count
+		) VALUES
+			('pg-running-session', 'test-machine', 'test-project',
+			 'claude', 'still running',
+			 '2026-03-12T13:00:00Z'::timestamptz,
+			 NULL,
+			 12, 3),
+			('pg-finished-session', 'test-machine', 'test-project',
+			 'claude', 'finished',
+			 '2026-03-12T11:00:00Z'::timestamptz,
+			 '2026-03-12T11:30:00Z'::timestamptz,
+			 10, 2)
+	`)
+	require.NoError(t, err, "inserting top sessions")
+
+	top, err := store.GetAnalyticsTopSessions(
+		context.Background(),
+		db.AnalyticsFilter{
+			From: "2026-03-12",
+			To:   "2026-03-12",
+		},
+		"messages",
+	)
+	require.NoError(t, err, "GetAnalyticsTopSessions")
+
+	byID := map[string]db.TopSession{}
+	for _, session := range top.Sessions {
+		byID[session.ID] = session
+	}
+
+	running, ok := byID["pg-running-session"]
+	require.True(t, ok, "running session missing from top sessions")
+	assert.Equal(t, 0.0, running.DurationMin)
+}
+
+func TestStoreAnalyticsTopSessionsDurationUsesClampedActiveDuration(t *testing.T) {
+	pgURL := testPGURL(t)
+	ensureStoreSchema(t, pgURL)
+
+	store, err := NewStore(pgURL, testSchema, true)
+	require.NoError(t, err, "NewStore")
+	defer store.Close()
+
+	// Unique date so only these two sessions match the filter,
+	// regardless of what other tests leave behind in the schema.
+	_, err = store.DB().Exec(`
+		INSERT INTO sessions (
+			id, machine, project, agent, first_message,
+			started_at, ended_at, message_count, user_message_count
+		) VALUES
+			('pg-clamp-wall', 'test-machine', 'clamp-parity',
+			 'claude', 'wall start',
+			 '2027-07-15T09:00:00Z'::timestamptz,
+			 '2027-07-15T11:00:00Z'::timestamptz,
+			 3, 2),
+			('pg-clamp-active', 'test-machine', 'clamp-parity',
+			 'claude', 'active start',
+			 '2027-07-15T09:30:00Z'::timestamptz,
+			 '2027-07-15T09:50:00Z'::timestamptz,
+			 3, 2)
+	`)
+	require.NoError(t, err, "inserting sessions")
+
+	_, err = store.DB().Exec(`
+		INSERT INTO messages
+			(session_id, ordinal, role, content, timestamp) VALUES
+			('pg-clamp-wall', 0, 'user', 'noop',
+			 '2027-07-15T09:00:00Z'::timestamptz),
+			('pg-clamp-wall', 1, 'assistant', 'idle wait',
+			 '2027-07-15T10:59:00Z'::timestamptz),
+			('pg-clamp-wall', 2, 'user', 'done',
+			 '2027-07-15T11:00:00Z'::timestamptz),
+			('pg-clamp-active', 0, 'user', 'start',
+			 '2027-07-15T09:30:00Z'::timestamptz),
+			('pg-clamp-active', 1, 'assistant', 'tooling',
+			 '2027-07-15T09:35:00Z'::timestamptz),
+			('pg-clamp-active', 2, 'user', 'finish',
+			 '2027-07-15T09:50:00Z'::timestamptz)
+	`)
+	require.NoError(t, err, "inserting messages")
+
+	top, err := store.GetAnalyticsTopSessions(
+		context.Background(),
+		db.AnalyticsFilter{From: "2027-07-15", To: "2027-07-15"},
+		"duration",
+	)
+	require.NoError(t, err, "GetAnalyticsTopSessions")
+	require.Len(t, top.Sessions, 2)
+
+	// Active duration ranks ahead of wall: the engaged 20-min session
+	// (5 min gap + a 15 min gap capped at the 5 min idle cap = 10)
+	// beats the mostly-idle 2-hour session (119 min capped to 5 + a
+	// 1 min gap = 6). Generation gaps count even with no tool calls.
+	assert.Equal(t, "pg-clamp-active", top.Sessions[0].ID)
+	assert.Equal(t, 20.0, top.Sessions[0].DurationMin)
+	assert.Equal(t, 10.0, top.Sessions[0].ActiveDurationMin)
+	assert.Equal(t, "pg-clamp-wall", top.Sessions[1].ID)
+	assert.Equal(t, 120.0, top.Sessions[1].DurationMin)
+	assert.Equal(t, 6.0, top.Sessions[1].ActiveDurationMin)
+}
+
+func TestStoreAnalyticsTopSessionsDurationExcludesReversedTimestamps(t *testing.T) {
+	pgURL := testPGURL(t)
+	ensureStoreSchema(t, pgURL)
+
+	store, err := NewStore(pgURL, testSchema, true)
+	require.NoError(t, err, "NewStore")
+	defer store.Close()
+
+	// A reversed session (ended_at < started_at) still accumulates
+	// positive message-gap active duration, so without an eligibility
+	// guard it would rank into the duration list ordered by active
+	// duration. PostgreSQL must reject it, matching SQLite and DuckDB.
+	// (Empty-string timestamps are not representable in timestamptz
+	// columns, so only the reversed case applies on this backend.)
+	_, err = store.DB().Exec(`
+		INSERT INTO sessions (
+			id, machine, project, agent, first_message,
+			started_at, ended_at, message_count, user_message_count
+		) VALUES
+			('pg-elig-valid', 'test-machine', 'elig-parity',
+			 'claude', 'valid start',
+			 '2027-08-20T09:00:00Z'::timestamptz,
+			 '2027-08-20T09:30:00Z'::timestamptz,
+			 2, 1),
+			('pg-elig-reversed', 'test-machine', 'elig-parity',
+			 'claude', 'reversed start',
+			 '2027-08-20T10:00:00Z'::timestamptz,
+			 '2027-08-20T09:00:00Z'::timestamptz,
+			 2, 1)
+	`)
+	require.NoError(t, err, "inserting sessions")
+
+	_, err = store.DB().Exec(`
+		INSERT INTO messages
+			(session_id, ordinal, role, content, timestamp) VALUES
+			('pg-elig-valid', 0, 'user', 'start',
+			 '2027-08-20T09:00:00Z'::timestamptz),
+			('pg-elig-valid', 1, 'assistant', 'work',
+			 '2027-08-20T09:03:00Z'::timestamptz),
+			('pg-elig-reversed', 0, 'user', 'start',
+			 '2027-08-20T09:00:00Z'::timestamptz),
+			('pg-elig-reversed', 1, 'assistant', 'work',
+			 '2027-08-20T09:04:00Z'::timestamptz)
+	`)
+	require.NoError(t, err, "inserting messages")
+
+	top, err := store.GetAnalyticsTopSessions(
+		context.Background(),
+		db.AnalyticsFilter{From: "2027-08-20", To: "2027-08-20"},
+		"duration",
+	)
+	require.NoError(t, err, "GetAnalyticsTopSessions")
+
+	ids := []string{}
+	for _, session := range top.Sessions {
+		ids = append(ids, session.ID)
+	}
+	assert.Equal(t, []string{"pg-elig-valid"}, ids,
+		"reversed duration row must be excluded")
+}
+
+func TestStoreWriteSurfaceSplitByCapability(t *testing.T) {
 	pgURL := testPGURL(t)
 
 	store, err := NewStore(pgURL, testSchema, true)
 	require.NoError(t, err, "NewStore")
 	defer store.Close()
 
-	tests := []struct {
-		name string
-		fn   func() error
-	}{
-		{"InsertInsight", func() error {
-			_, err := store.InsertInsight(db.Insight{})
-			return err
-		}},
-		{"DeleteInsight", func() error {
-			return store.DeleteInsight(1)
-		}},
-		{"RenameSession", func() error {
-			return store.RenameSession("x", nil)
-		}},
-		{"SoftDeleteSession", func() error {
-			return store.SoftDeleteSession("x")
-		}},
-		{"RestoreSession", func() error {
-			_, err := store.RestoreSession("x")
-			return err
-		}},
-		{"DeleteSessionIfTrashed", func() error {
-			_, err := store.DeleteSessionIfTrashed("x")
-			return err
-		}},
-		{"EmptyTrash", func() error {
-			_, err := store.EmptyTrash()
-			return err
-		}},
-		{"UpsertSession", func() error {
-			return store.UpsertSession(db.Session{})
-		}},
-		{"ReplaceSessionMessages", func() error {
-			return store.ReplaceSessionMessages("x", nil)
-		}},
-		{"WriteSessionBatchAtomic", func() error {
-			_, err := store.WriteSessionBatchAtomic(nil)
-			return err
-		}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, db.ErrReadOnly, tt.fn())
-		})
-	}
+	assert.True(t, store.ReadOnly())
+
+	ctx := context.Background()
+	project := "store-capability"
+	sessionID := "store-capability-001"
+	trashedID := "store-capability-002"
+	emptyTrashID := "store-capability-003"
+	batchTrashID := "store-capability-004"
+
+	insightID, err := store.InsertInsight(db.Insight{
+		Type:     "dashboard",
+		DateFrom: "2026-03-12",
+		DateTo:   "2026-03-12",
+		Project:  &project,
+		Agent:    "claude",
+		Content:  "insight content",
+		CacheKey: "capability-cache",
+	})
+	require.NoError(t, err, "InsertInsight")
+	require.NotZero(t, insightID)
+
+	insight, err := store.GetInsight(ctx, insightID)
+	require.NoError(t, err, "GetInsight")
+	require.NotNil(t, insight)
+	assert.Equal(t, project, *insight.Project)
+
+	cached, err := store.GetCachedInsight(ctx, "capability-cache")
+	require.NoError(t, err, "GetCachedInsight")
+	require.NotNil(t, cached)
+	assert.Equal(t, insightID, cached.ID)
+
+	listed, err := store.ListInsights(ctx, db.InsightFilter{
+		Type: "dashboard",
+	})
+	require.NoError(t, err, "ListInsights")
+	require.NotEmpty(t, listed)
+	assert.Equal(t, insightID, listed[0].ID)
+
+	require.NoError(t, store.DeleteInsight(insightID), "DeleteInsight")
+	insight, err = store.GetInsight(ctx, insightID)
+	require.NoError(t, err, "GetInsight after delete")
+	assert.Nil(t, insight)
+
+	_, err = store.DB().Exec(`
+		INSERT INTO sessions (
+			id, machine, project, agent, first_message,
+			display_name, started_at, ended_at, message_count,
+			user_message_count
+		) VALUES
+			($1, 'machine', $2, 'claude', 'hello',
+			 NULL, '2026-03-12T10:00:00Z'::timestamptz,
+			 '2026-03-12T10:30:00Z'::timestamptz, 2, 1),
+			($3, 'machine', $2, 'claude', 'trash me',
+			 NULL, '2026-03-12T11:00:00Z'::timestamptz,
+			 '2026-03-12T11:30:00Z'::timestamptz, 2, 1),
+			($4, 'machine', $2, 'claude', 'empty trash me',
+			 NULL, '2026-03-12T12:00:00Z'::timestamptz,
+			 '2026-03-12T12:30:00Z'::timestamptz, 2, 1),
+			($5, 'machine', $2, 'claude', 'batch trash me',
+			 NULL, '2026-03-12T13:00:00Z'::timestamptz,
+			 '2026-03-12T13:30:00Z'::timestamptz, 2, 1)
+	`, sessionID, project, trashedID, emptyTrashID, batchTrashID)
+	require.NoError(t, err, "inserting session rows")
+
+	renamed := "Capability renamed session"
+	require.NoError(t, store.RenameSession(sessionID, &renamed),
+		"RenameSession")
+	sess, err := store.GetSession(ctx, sessionID)
+	require.NoError(t, err, "GetSession after rename")
+	require.NotNil(t, sess)
+	require.NotNil(t, sess.DisplayName)
+	assert.Equal(t, renamed, *sess.DisplayName)
+
+	require.NoError(t, store.SoftDeleteSession(sessionID),
+		"SoftDeleteSession")
+	sess, err = store.GetSession(ctx, sessionID)
+	require.NoError(t, err, "GetSession after soft delete")
+	assert.Nil(t, sess)
+	trashed, err := store.ListTrashedSessions(ctx)
+	require.NoError(t, err, "ListTrashedSessions")
+	assert.Contains(t, sessionIDs(trashed), sessionID)
+
+	restored, err := store.RestoreSession(sessionID)
+	require.NoError(t, err, "RestoreSession")
+	assert.EqualValues(t, 1, restored)
+
+	require.NoError(t, store.SoftDeleteSession(trashedID),
+		"SoftDeleteSession trashedID")
+	deleted, err := store.DeleteSessionIfTrashed(trashedID)
+	require.NoError(t, err, "DeleteSessionIfTrashed")
+	assert.EqualValues(t, 1, deleted)
+	sess, err = store.GetSessionFull(ctx, trashedID)
+	require.NoError(t, err, "GetSessionFull after permanent delete")
+	assert.Nil(t, sess)
+
+	deletedCount, err := store.SoftDeleteSessions([]string{
+		emptyTrashID, batchTrashID,
+	})
+	require.NoError(t, err, "SoftDeleteSessions")
+	assert.Equal(t, 2, deletedCount)
+	count, err := store.EmptyTrash()
+	require.NoError(t, err, "EmptyTrash")
+	assert.Equal(t, 2, count)
+	trashed, err = store.ListTrashedSessions(ctx)
+	require.NoError(t, err, "ListTrashedSessions after empty trash")
+	assert.NotContains(t, sessionIDs(trashed), emptyTrashID)
+	assert.NotContains(t, sessionIDs(trashed), batchTrashID)
+
+	assert.Equal(t, db.ErrReadOnly, store.UpsertSession(db.Session{}))
+	assert.Equal(t, db.ErrReadOnly,
+		store.ReplaceSessionMessages("x", nil))
+	_, err = store.WriteSessionBatchAtomic(nil)
+	assert.ErrorIs(t, err, db.ErrReadOnly)
 }

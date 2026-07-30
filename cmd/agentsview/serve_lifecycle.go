@@ -22,8 +22,36 @@ var stopDaemonRuntimeForUpgrade = stopDaemonRuntimeForUpgradeImpl
 // runServeStatus reports whether a server owns this data dir, and where to
 // reach it. It always exits zero; the output distinguishes the states.
 func runServeStatus(cfg config.Config) {
+	var readOnly *DaemonRuntime
 	if rt := FindDaemonRuntime(cfg.DataDir, cfg.AuthToken); rt != nil {
-		for _, line := range serveStatusLines(rt) {
+		if rt.ReadOnly {
+			readOnly = rt
+		} else {
+			for _, line := range serveStatusLines(rt) {
+				fmt.Println(line)
+			}
+			return
+		}
+	}
+	if rt, compatErr := findIncompatibleWritableDaemonRuntime(
+		cfg.DataDir, cfg.AuthToken,
+	); rt != nil {
+		for _, line := range serveIncompatibleDaemonStatusLines(rt, compatErr) {
+			fmt.Println(line)
+		}
+		return
+	}
+	if IsDaemonStarting(cfg.DataDir) {
+		fmt.Println("agentsview is starting up.")
+		for _, line := range serveStartingStatusLines(
+			readStartupState(cfg.DataDir), time.Now(),
+		) {
+			fmt.Println(line)
+		}
+		return
+	}
+	if readOnly != nil {
+		for _, line := range serveStatusLines(readOnly) {
 			fmt.Println(line)
 		}
 		return
@@ -34,10 +62,6 @@ func runServeStatus(cfg config.Config) {
 				"to health checks.\n",
 			recs[0].PID,
 		)
-		return
-	}
-	if IsDaemonStarting(cfg.DataDir) {
-		fmt.Println("agentsview is starting up.")
 		return
 	}
 	fmt.Println("No agentsview server is running.")
@@ -60,6 +84,56 @@ func serveStatusLines(rt *DaemonRuntime) []string {
 		lines = append(lines, "  mode:    read-only")
 	}
 	return lines
+}
+
+// serveStartingStatusLines renders the detail lines for a daemon that
+// holds the start lock, from its published startup state. A nil state
+// (legacy daemon version, unreadable or mid-write file) yields no
+// extra lines; the state is only trusted while the start lock is
+// held, so staleness needs no handling here.
+func serveStartingStatusLines(st *startupState, now time.Time) []string {
+	if st == nil {
+		return nil
+	}
+	var lines []string
+	if st.PID > 0 {
+		lines = append(lines, fmt.Sprintf("  pid:     %d", st.PID))
+	}
+	if !st.StartedAt.IsZero() {
+		if elapsed := now.Sub(st.StartedAt).Round(time.Second); elapsed >= 0 {
+			lines = append(lines, fmt.Sprintf("  elapsed: %s", elapsed))
+		}
+	}
+	if st.Phase != "" {
+		phase := st.Phase
+		if st.Detail != "" {
+			phase += ": " + st.Detail
+		}
+		lines = append(lines, "  phase:   "+phase)
+	}
+	if st.LogPath != "" {
+		lines = append(lines, "  log:     "+st.LogPath)
+	}
+	return lines
+}
+
+func serveIncompatibleDaemonStatusLines(
+	rt *DaemonRuntime, compatErr error,
+) []string {
+	decision := serveReplacementDecision{
+		Action:           serveReplacementRefuse,
+		Runtime:          rt,
+		CompatibilityErr: compatErr,
+		Reason:           serveDaemonRefusalReason(rt, compatErr),
+	}
+	lines := serveDaemonDecisionLines(
+		"agentsview found an incompatible running writable daemon.",
+		decision,
+	)
+	return append(lines,
+		"Run `agentsview serve --replace` to replace it, or "+
+			"`agentsview serve stop` to stop it first.",
+	)
 }
 
 // runServeStop terminates every agentsview server owning this data dir whose
@@ -316,7 +390,7 @@ func waitForProcessExit(pid int, timeout time.Duration) bool {
 		if !daemon.ProcessAlive(pid) {
 			return true
 		}
-		time.Sleep(startProbeTick)
+		time.Sleep(startProbeTick())
 	}
 	return !daemon.ProcessAlive(pid)
 }

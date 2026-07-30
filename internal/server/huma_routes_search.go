@@ -38,6 +38,7 @@ type contentSearchInput struct {
 	Project          string            `query:"project" doc:"Filter by project"`
 	ExcludeProject   string            `query:"exclude_project" doc:"Exclude a project"`
 	Machine          string            `query:"machine" doc:"Filter by machine"`
+	GitBranch        string            `query:"git_branch" doc:"Filter by git branch; opaque (project, branch) tokens from the /branches endpoint"`
 	Agent            string            `query:"agent" doc:"Filter by agent"`
 	Date             string            `query:"date" format:"date" doc:"Filter to a single YYYY-MM-DD date"`
 	DateFrom         string            `query:"date_from" format:"date" doc:"Filter start date"`
@@ -58,30 +59,29 @@ func (s *Server) humaSearch(
 	if query == "" {
 		return nil, apiError(http.StatusBadRequest, "query required")
 	}
-	if !s.db.HasFTS() {
-		return nil, apiError(http.StatusNotImplemented, "search not available")
-	}
-	limit := clampLimit(in.Limit, db.DefaultSearchLimit, db.MaxSearchLimit)
-	page, err := s.db.Search(ctx, db.SearchFilter{
-		Query:   prepareFTSQuery(query),
+	res, err := s.sessions.Search(ctx, service.SearchRequest{
+		Query:   query,
 		Project: in.Project,
 		Sort:    string(in.Sort),
 		Cursor:  in.Cursor,
-		Limit:   limit,
+		Limit:   in.Limit,
 	})
 	if err != nil {
+		if errors.Is(err, service.ErrSearchUnavailable) {
+			return nil, apiError(http.StatusNotImplemented, "search not available")
+		}
+		var inputErr *db.SearchInputError
+		if errors.As(err, &inputErr) {
+			return nil, apiError(http.StatusBadRequest, err.Error())
+		}
 		return nil, serverError(err)
-	}
-	results := page.Results
-	if results == nil {
-		results = []db.SearchResult{}
 	}
 	return &jsonOutput[searchResponse]{
 		Body: searchResponse{
 			Query:   query,
-			Results: results,
-			Count:   len(results),
-			Next:    page.NextCursor,
+			Results: res.Results,
+			Count:   len(res.Results),
+			Next:    res.NextCursor,
 		},
 	}, nil
 }
@@ -109,6 +109,7 @@ func (s *Server) humaSearchContent(
 		Project:          in.Project,
 		ExcludeProject:   in.ExcludeProject,
 		Machine:          in.Machine,
+		GitBranch:        in.GitBranch,
 		Agent:            in.Agent,
 		Date:             in.Date,
 		DateFrom:         in.DateFrom,

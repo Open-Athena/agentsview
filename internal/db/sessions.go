@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -53,6 +54,7 @@ const sessionBaseCols = `id, project, machine, agent,
 	no_code_context_count, runaway_tool_loop_count,
 	data_version,
 	cwd, git_branch, source_session_id, source_version,
+	transcript_fidelity,
 	parser_malformed_lines, is_truncated,
 	deleted_at, termination_status, created_at, private`
 
@@ -82,6 +84,7 @@ const sessionPruneCols = `id, project, machine, agent,
 	no_code_context_count, runaway_tool_loop_count,
 	data_version,
 	cwd, git_branch, source_session_id, source_version,
+	transcript_fidelity,
 	parser_malformed_lines, is_truncated,
 	deleted_at, termination_status, file_path, file_size, created_at`
 
@@ -110,7 +113,9 @@ const sessionFullCols = `id, project, machine, agent,
 	no_code_context_count, runaway_tool_loop_count,
 	data_version,
 	cwd, git_branch, source_session_id, source_version,
+	transcript_fidelity,
 	parser_malformed_lines, is_truncated,
+	last_write_incremental,
 	deleted_at, termination_status, file_path, file_size, file_mtime,
 	next_ordinal, last_entry_uuid,
 	file_inode, file_device,
@@ -158,6 +163,7 @@ func scanSessionRow(rs rowScanner) (Session, error) {
 		&s.DataVersion,
 		&s.Cwd, &s.GitBranch,
 		&s.SourceSessionID, &s.SourceVersion,
+		&s.TranscriptFidelity,
 		&s.ParserMalformedLines, &s.IsTruncated,
 		&s.DeletedAt, &s.TerminationStatus, &s.CreatedAt,
 		&s.Private,
@@ -316,6 +322,7 @@ type Session struct {
 	GitBranch                   string `json:"git_branch,omitempty"`
 	SourceSessionID             string `json:"source_session_id,omitempty"`
 	SourceVersion               string `json:"source_version,omitempty"`
+	TranscriptFidelity          string `json:"transcript_fidelity,omitempty"`
 	ParserMalformedLines        int    `json:"parser_malformed_lines,omitempty"`
 	IsTruncated                 bool   `json:"is_truncated,omitempty"`
 
@@ -326,11 +333,20 @@ type Session struct {
 	FileMtime         *int64  `json:"file_mtime,omitempty"`
 	NextOrdinal       int     `json:"-"`
 	LastEntryUUID     *string `json:"-"`
-	FileInode         *int64  `json:"file_inode,omitempty"`
-	FileDevice        *int64  `json:"file_device,omitempty"`
-	FileHash          *string `json:"file_hash,omitempty"`
-	LocalModifiedAt   *string `json:"local_modified_at,omitempty"`
-	CreatedAt         string  `json:"created_at"`
+	// LastWriteIncremental is SQLite-only sync bookkeeping (like
+	// NextOrdinal): true when the last write to this row went through
+	// the incremental-append path (updateSessionIncrementalTx) instead
+	// of a full re-normalization (upsertSessionArgs, which always resets
+	// it to false). It is consumed only by parse-diff to classify benign
+	// incremental-vs-full skew and is json:"-" so it never leaks through
+	// the HTTP session API. Deliberately not mirrored to PG/DuckDB: their
+	// push column lists omit the whole sync-bookkeeping cluster.
+	LastWriteIncremental bool    `json:"-"`
+	FileInode            *int64  `json:"file_inode,omitempty"`
+	FileDevice           *int64  `json:"file_device,omitempty"`
+	FileHash             *string `json:"file_hash,omitempty"`
+	LocalModifiedAt      *string `json:"local_modified_at,omitempty"`
+	CreatedAt            string  `json:"created_at"`
 }
 
 // SessionCursor is the opaque pagination token. EndedAt carries the
@@ -444,9 +460,11 @@ func (db *DB) DecodeCursor(s string) (SessionCursor, error) {
 
 // SessionFilter specifies how to query sessions.
 type SessionFilter struct {
-	Project          string
-	ExcludeProject   string // exclude sessions with this project name
-	Machine          string
+	Project        string
+	ExcludeProject string // exclude sessions with this project name
+	Machine        string
+	// GitBranch is a branchListSep-joined list of opaque (project, branch) tokens (EncodeBranchFilterToken).
+	GitBranch        string
 	Agent            string
 	Date             string   // exact date YYYY-MM-DD
 	DateFrom         string   // range start (inclusive)
@@ -1048,7 +1066,9 @@ func (db *DB) GetSessionFull(
 		&s.DataVersion,
 		&s.Cwd, &s.GitBranch,
 		&s.SourceSessionID, &s.SourceVersion,
+		&s.TranscriptFidelity,
 		&s.ParserMalformedLines, &s.IsTruncated,
+		&s.LastWriteIncremental,
 		&s.DeletedAt, &s.TerminationStatus, &s.FilePath, &s.FileSize,
 		&s.FileMtime, &s.NextOrdinal, &s.LastEntryUUID,
 		&s.FileInode, &s.FileDevice,
@@ -1198,12 +1218,14 @@ const upsertSessionSQL = `
 			is_automated,
 			termination_status,
 			cwd, git_branch, source_session_id,
-			source_version, parser_malformed_lines,
+			source_version, transcript_fidelity,
+			parser_malformed_lines,
 			is_truncated,
+			last_write_incremental,
 			file_path, file_size, file_mtime,
 			next_ordinal, last_entry_uuid,
 			file_inode, file_device, file_hash
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			project = excluded.project,
 			machine = excluded.machine,
@@ -1228,8 +1250,18 @@ const upsertSessionSQL = `
 			git_branch = excluded.git_branch,
 			source_session_id = excluded.source_session_id,
 			source_version = excluded.source_version,
+			transcript_fidelity = excluded.transcript_fidelity,
 			parser_malformed_lines = excluded.parser_malformed_lines,
 			is_truncated = excluded.is_truncated,
+			-- last_write_incremental is deliberately NOT touched on conflict.
+			-- A bare upsert rewrites only the session row, not the message
+			-- rows, so it is not a re-normalization: the append-only full-parse
+			-- path (Claude/Codex, ReplaceMessages=false) upserts the session and
+			-- appends new messages while leaving earlier incrementally written
+			-- rows in place. Clearing the marker here would make parse-diff
+			-- report that still-present benign skew as real drift. The marker is
+			-- reset only by a genuine full message replacement
+			-- (resetIncrementalMarkerTx), and seeded false on fresh INSERT.
 			file_path = excluded.file_path,
 			file_size = excluded.file_size,
 			file_mtime = excluded.file_mtime,
@@ -1257,8 +1289,14 @@ func upsertSessionArgs(s Session) []any {
 		sessionIsAutomated(s),
 		s.TerminationStatus,
 		s.Cwd, s.GitBranch, s.SourceSessionID,
-		s.SourceVersion, s.ParserMalformedLines,
+		s.SourceVersion, s.TranscriptFidelity,
+		s.ParserMalformedLines,
 		s.IsTruncated,
+		// last_write_incremental is seeded false on fresh INSERT: a brand-new
+		// row starts fully normalized. On conflict the column is left as-is
+		// (see upsertSessionSQL) because a bare upsert does not re-normalize
+		// the stored messages; only a full message replacement clears it.
+		false,
 		s.FilePath, s.FileSize, s.FileMtime,
 		s.NextOrdinal, s.LastEntryUUID,
 		s.FileInode, s.FileDevice, s.FileHash,
@@ -1298,6 +1336,8 @@ func (db *DB) SetSessionPrivate(id string, private bool) error {
 // Sessions that were permanently deleted (in excluded_sessions)
 // or currently in the trash are rejected.
 func (db *DB) UpsertSession(s Session) error {
+	_ = ValidateAndSanitize(&s, nil, nil)
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -1401,6 +1441,20 @@ func (db *DB) GetSessionFileInfo(
 	return s.Int64, m.Int64, true
 }
 
+// GetSessionFileHash returns file_hash for a session. The bool is false when
+// the session does not exist or the column is NULL.
+func (db *DB) GetSessionFileHash(id string) (hash string, ok bool) {
+	var h sql.NullString
+	err := db.getReader().QueryRow(
+		"SELECT file_hash FROM sessions WHERE id = ?",
+		id,
+	).Scan(&h)
+	if err != nil || !h.Valid {
+		return "", false
+	}
+	return h.String, true
+}
+
 // GetSessionFilePath returns the stored file_path for a session,
 // or empty string if not found or NULL.
 func (db *DB) GetSessionFilePath(id string) string {
@@ -1433,6 +1487,13 @@ func (db *DB) BumpLocalModifiedAt(id string) error {
 // full UpsertSession is unsafe because the caller does not have a complete
 // row to avoid overwriting existing fields with zero values.
 func (db *DB) RefreshSessionName(id string, sessionName *string) error {
+	if sessionName != nil {
+		clean := *sessionName
+		var stats ValidationStats
+		sanitizeStringField(&clean, &stats)
+		sessionName = &clean
+	}
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	_, err := db.getWriter().Exec(
@@ -1445,8 +1506,8 @@ func (db *DB) RefreshSessionName(id string, sessionName *string) error {
 	return err
 }
 
-// FindSessionIDsByPartial returns up to limit session IDs that
-// contain the given substring. Used by CLI lookups so users can
+// FindSessionIDsByPartial returns up to limit session IDs that contain the
+// given literal, case-sensitive substring. Used by CLI lookups so users can
 // reference sessions by a short prefix shown in list output.
 // Excludes soft-deleted sessions.
 func (db *DB) FindSessionIDsByPartial(
@@ -1460,14 +1521,14 @@ func (db *DB) FindSessionIDsByPartial(
 	}
 	rows, err := db.getReader().QueryContext(ctx,
 		`SELECT id FROM sessions
-		 WHERE id LIKE ? AND deleted_at IS NULL
+		 WHERE instr(id, ?) > 0 AND deleted_at IS NULL
 		 ORDER BY COALESCE(
 		     NULLIF(ended_at, ''),
 		     NULLIF(started_at, ''),
 		     created_at
 		 ) DESC
 		 LIMIT ?`,
-		"%"+partial+"%", limit,
+		partial, limit,
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -1644,6 +1705,9 @@ func (db *DB) GetSessionVersion(
 // the preview empty and a full parse should be forced.
 type IncrementalInfo struct {
 	ID                   string
+	Project              string
+	Machine              string
+	Cwd                  string
 	FileSize             int64
 	FileMtime            int64
 	NextOrdinal          int
@@ -1665,6 +1729,7 @@ type IncrementalSessionUpdate struct {
 	UserMsgCount         int
 	FileSize             int64
 	FileMtime            int64
+	FileHash             *string
 	NextOrdinal          int
 	LastEntryUUID        string
 	TotalOutputTokens    int
@@ -1697,7 +1762,7 @@ func (db *DB) GetSessionForIncremental(
 	var fs, fm, fi, fd sql.NullInt64
 	var firstMsg, lastEntryUUID sql.NullString
 	err = db.getReader().QueryRow(
-		`SELECT id, file_size, file_mtime,
+		`SELECT id, project, machine, cwd, file_size, file_mtime,
 			next_ordinal, last_entry_uuid,
 			file_inode, file_device,
 			message_count, user_message_count,
@@ -1709,7 +1774,8 @@ func (db *DB) GetSessionForIncremental(
 		   AND deleted_at IS NULL`,
 		path,
 	).Scan(
-		&info.ID, &fs, &fm, &info.NextOrdinal, &lastEntryUUID, &fi, &fd,
+		&info.ID, &info.Project, &info.Machine, &info.Cwd,
+		&fs, &fm, &info.NextOrdinal, &lastEntryUUID, &fi, &fd,
 		&info.MsgCount, &info.UserMsgCount,
 		&firstMsg,
 		&info.TotalOutputTokens, &info.PeakContextTokens,
@@ -1743,9 +1809,32 @@ func (db *DB) GetSessionForIncremental(
 	return &info, true
 }
 
+// FileIdentityChanged reports whether any active session row for path has a
+// known file identity that differs from the current file identity.
+func (db *DB) FileIdentityChanged(path string, inode, device int64) bool {
+	if path == "" || inode == 0 || device == 0 {
+		return false
+	}
+
+	var count int
+	err := db.getReader().QueryRow(
+		`SELECT COUNT(*)
+		 FROM sessions
+		 WHERE file_path = ?
+		   AND deleted_at IS NULL
+		   AND file_inode IS NOT NULL
+		   AND file_device IS NOT NULL
+		   AND file_inode != 0
+		   AND file_device != 0
+		   AND (file_inode != ? OR file_device != ?)`,
+		path, inode, device,
+	).Scan(&count)
+	return err == nil && count > 0
+}
+
 // UpdateSessionIncremental updates only the fields that change
 // during an incremental append: ended_at, message_count,
-// user_message_count, file_size, file_mtime, and token
+// user_message_count, file_size, file_mtime, optional file_hash, and token
 // aggregates. All values are absolute (not deltas) so the
 // update is idempotent on retry.
 //
@@ -1781,16 +1870,23 @@ func updateSessionIncrementalTx(
 			user_message_count = ?,
 			file_size = ?,
 			file_mtime = ?,
+			file_hash = COALESCE(?, file_hash),
 			next_ordinal = ?,
 			last_entry_uuid = ?,
 			total_output_tokens = ?,
 			peak_context_tokens = ?,
 			has_total_output_tokens = ?,
 			has_peak_context_tokens = ?,
-			termination_status = NULL
+			termination_status = NULL,
+			-- Mark the row as last written by the incremental-append path.
+			-- The full-replace writer (upsertSessionArgs) resets this to
+			-- false; parse-diff reads it to classify benign
+			-- incremental-vs-full skew.
+			last_write_incremental = 1
 		WHERE id = ?`,
 		update.EndedAt, update.MsgCount, update.UserMsgCount,
 		update.FileSize, update.FileMtime,
+		update.FileHash,
 		update.NextOrdinal, lastEntryUUID,
 		update.TotalOutputTokens, update.PeakContextTokens,
 		update.HasTotalOutputTokens, update.HasPeakContextTokens, id,
@@ -1835,6 +1931,27 @@ func (db *DB) UpdateSessionIncremental(
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing incremental update tx: %w", err)
+	}
+	return nil
+}
+
+// resetIncrementalMarkerTx clears last_write_incremental after a full
+// message re-normalization. It is the counterpart to the marker set in
+// updateSessionIncrementalTx: parse-diff reads the marker to suppress
+// benign incremental-append skew, so only a path that actually rewrites
+// every message row to the full-parse shape (ReplaceSessionContent,
+// ReplaceSessionMessages, the batch ReplaceMessages branch) may clear it.
+// A bare UpsertSession or an append-only write must not, or the
+// suppression self-heals prematurely and still-present skew reappears as
+// spurious drift.
+func resetIncrementalMarkerTx(tx *sql.Tx, sessionID string) error {
+	if _, err := tx.Exec(
+		`UPDATE sessions SET last_write_incremental = 0 WHERE id = ?`,
+		sessionID,
+	); err != nil {
+		return fmt.Errorf(
+			"resetting incremental marker for %s: %w", sessionID, err,
+		)
 	}
 	return nil
 }
@@ -1920,6 +2037,149 @@ func (db *DB) ListSessionIDsByFilePath(path, agent string) ([]string, error) {
 		return nil, fmt.Errorf("iterating session IDs by file path: %w", err)
 	}
 	return ids, nil
+}
+
+const storedSourcePathHintRootBatchSize = 100
+
+// ListStoredSourcePathHints returns active source paths for agent whose stored
+// file_path falls under any watched root. It is used by provider changed-path
+// comparison to avoid losing sessions when the changed path is a sidecar or a
+// root-scoped database event rather than the exact persisted source path.
+func (db *DB) ListStoredSourcePathHints(
+	agent string,
+	roots []string,
+) ([]string, error) {
+	if agent == "" {
+		return nil, nil
+	}
+	roots = normalizeStoredSourcePathHintRoots(roots)
+	if len(roots) == 0 {
+		return nil, nil
+	}
+
+	seen := make(map[string]struct{})
+	var hints []string
+	for start := 0; start < len(roots); start += storedSourcePathHintRootBatchSize {
+		end := min(start+storedSourcePathHintRootBatchSize, len(roots))
+		batch := roots[start:end]
+		query, args := storedSourcePathHintQuery(agent, batch)
+		rows, err := db.getReader().Query(query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("listing stored source path hints: %w", err)
+		}
+		for rows.Next() {
+			var path string
+			if err := rows.Scan(&path); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("scanning stored source path hint: %w", err)
+			}
+			path = cleanStoredSourcePathHint(path)
+			if !storedSourcePathHintInAnyRoot(path, batch) {
+				continue
+			}
+			if _, ok := seen[path]; ok {
+				continue
+			}
+			seen[path] = struct{}{}
+			hints = append(hints, path)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("closing stored source path hint rows: %w", err)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("iterating stored source path hints: %w", err)
+		}
+	}
+	sort.Strings(hints)
+	return hints, nil
+}
+
+func normalizeStoredSourcePathHintRoots(roots []string) []string {
+	seen := make(map[string]struct{}, len(roots))
+	out := make([]string, 0, len(roots))
+	for _, root := range roots {
+		root = cleanStoredSourcePathHint(root)
+		if root == "" || root == "." {
+			continue
+		}
+		if _, ok := seen[root]; ok {
+			continue
+		}
+		seen[root] = struct{}{}
+		out = append(out, root)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func storedSourcePathHintQuery(agent string, roots []string) (string, []any) {
+	clauses := make([]string, 0, len(roots))
+	args := []any{agent}
+	for _, root := range roots {
+		root = cleanStoredSourcePathHint(root)
+		if root == "" || root == "." {
+			continue
+		}
+		likeRoot := sqliteLikeEscape(root)
+		clauses = append(clauses,
+			`(file_path = ? OR
+			  file_path LIKE ? ESCAPE '!' OR
+			  file_path LIKE ? ESCAPE '!')`,
+		)
+		args = append(args,
+			root,
+			likeRoot+string(filepath.Separator)+"%",
+			likeRoot+"#%",
+		)
+	}
+	if len(clauses) == 0 {
+		return `SELECT file_path FROM sessions WHERE 0`, nil
+	}
+	query := `SELECT file_path
+		FROM sessions
+		WHERE agent = ?
+		  AND file_path IS NOT NULL
+		  AND deleted_at IS NULL
+		  AND (` + strings.Join(clauses, " OR ") + `)
+		ORDER BY file_path`
+	return query, args
+}
+
+func cleanStoredSourcePathHint(path string) string {
+	return filepath.Clean(path)
+}
+
+func storedSourcePathHintInAnyRoot(path string, roots []string) bool {
+	for _, root := range roots {
+		if storedSourcePathHintInRoot(path, root) {
+			return true
+		}
+	}
+	return false
+}
+
+func storedSourcePathHintInRoot(path, root string) bool {
+	path = cleanStoredSourcePathHint(path)
+	root = cleanStoredSourcePathHint(root)
+	if path == root || strings.HasPrefix(path, root+string(filepath.Separator)) {
+		return true
+	}
+	suffix, ok := strings.CutPrefix(path, root+"#")
+	return ok &&
+		storedSourcePathHintAllowsVirtualSuffix(root) &&
+		suffix != "" &&
+		!strings.ContainsAny(suffix, `/\`)
+}
+
+func storedSourcePathHintAllowsVirtualSuffix(root string) bool {
+	return filepath.Ext(root) != ""
+}
+
+func sqliteLikeEscape(value string) string {
+	value = strings.ReplaceAll(value, `!`, `!!`)
+	value = strings.ReplaceAll(value, `%`, `!%`)
+	value = strings.ReplaceAll(value, `_`, `!_`)
+	return value
 }
 
 // GetDataVersionByPath returns the minimum data_version for
@@ -2271,6 +2531,56 @@ func (db *DB) GetMachines(
 	return machines, rows.Err()
 }
 
+// BranchInfo is a (project, branch) pair, keyed by project so same-named
+// branches across repos stay distinct.
+type BranchInfo struct {
+	Project string `json:"project"`
+	Branch  string `json:"branch"`
+	Token   string `json:"token"`
+}
+
+// GetBranches returns distinct (project, git_branch) pairs, including the empty
+// branch used for sessions with no recorded branch. Scoping matches
+// GetProjects/GetAgents (root sessions with messages) so the dropdown reflects
+// real work rather than subagents.
+func (db *DB) GetBranches(
+	ctx context.Context,
+	excludeOneShot, excludeAutomated bool,
+) ([]BranchInfo, error) {
+	q := `SELECT DISTINCT project, git_branch
+		FROM sessions
+		WHERE message_count > 0
+		  AND relationship_type NOT IN ('subagent', 'fork')
+		  AND deleted_at IS NULL`
+	if excludeOneShot {
+		if !excludeAutomated {
+			q += " AND (user_message_count > 1 OR is_automated = 1)"
+		} else {
+			q += " AND user_message_count > 1"
+		}
+	}
+	if excludeAutomated {
+		q += " AND is_automated = 0"
+	}
+	q += " ORDER BY project, git_branch"
+	rows, err := db.getReader().QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("querying branches: %w", err)
+	}
+	defer rows.Close()
+
+	branches := []BranchInfo{}
+	for rows.Next() {
+		var bi BranchInfo
+		if err := rows.Scan(&bi.Project, &bi.Branch); err != nil {
+			return nil, fmt.Errorf("scanning branch: %w", err)
+		}
+		bi.Token = EncodeBranchFilterToken(bi.Project, bi.Branch)
+		branches = append(branches, bi)
+	}
+	return branches, rows.Err()
+}
+
 // scanSessionRows iterates rows and scans each using
 // scanSessionRow.
 func scanSessionRows(rows *sql.Rows) ([]Session, error) {
@@ -2388,6 +2698,7 @@ func (db *DB) FindPruneCandidates(
 			&s.DataVersion,
 			&s.Cwd, &s.GitBranch,
 			&s.SourceSessionID, &s.SourceVersion,
+			&s.TranscriptFidelity,
 			&s.ParserMalformedLines, &s.IsTruncated,
 			&s.DeletedAt, &s.TerminationStatus, &s.FilePath, &s.FileSize, &s.CreatedAt,
 		)
@@ -2410,6 +2721,55 @@ func (db *DB) SoftDeleteSession(id string) error {
 		 WHERE id = ? AND deleted_at IS NULL`, id,
 	)
 	return err
+}
+
+// SoftDeleteSessions marks multiple sessions as deleted by setting
+// deleted_at. Sessions that are already soft-deleted are skipped.
+// Returns the count of newly deleted rows.
+func (db *DB) SoftDeleteSessions(ids []string) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	tx, err := db.getWriter().Begin()
+	if err != nil {
+		return 0, fmt.Errorf("beginning soft-delete tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	total := 0
+	const batchSize = 500
+	for i := 0; i < len(ids); i += batchSize {
+		end := min(i+batchSize, len(ids))
+		batch := ids[i:end]
+
+		args := make([]any, len(batch))
+		for j, id := range batch {
+			args[j] = id
+		}
+		placeholders := strings.Repeat(",?", len(batch))[1:]
+
+		res, err := tx.Exec(
+			`UPDATE sessions
+			 SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+			     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+			 WHERE id IN (`+placeholders+`) AND deleted_at IS NULL`,
+			args...,
+		)
+		if err != nil {
+			return 0, fmt.Errorf("soft-deleting batch: %w", err)
+		}
+		n, _ := res.RowsAffected()
+		total += int(n)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("committing soft-delete tx: %w", err)
+	}
+	return total, nil
 }
 
 // RestoreSession clears deleted_at, making the session visible again.
@@ -2727,7 +3087,9 @@ func (db *DB) ListSessionsModifiedBetween(
 			&s.DataVersion,
 			&s.Cwd, &s.GitBranch,
 			&s.SourceSessionID, &s.SourceVersion,
+			&s.TranscriptFidelity,
 			&s.ParserMalformedLines, &s.IsTruncated,
+			&s.LastWriteIncremental,
 			&s.DeletedAt, &s.TerminationStatus, &s.FilePath, &s.FileSize,
 			&s.FileMtime, &s.NextOrdinal, &s.LastEntryUUID,
 			&s.FileInode, &s.FileDevice,

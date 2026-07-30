@@ -44,7 +44,27 @@ assert_failure_contains() {
 write_fixture() {
     local dir="$1" version="$2"
     cat >"$dir/latest.json" <<EOF
-{"version":"${version}"}
+{
+  "version": "${version}",
+  "platforms": {
+    "darwin-aarch64": {
+      "url": "https://github.com/kenn-io/agentsview/releases/download/updater/AgentsView_aarch64.app.tar.gz",
+      "signature": "YWJjCg=="
+    },
+    "darwin-x86_64": {
+      "url": "https://github.com/kenn-io/agentsview/releases/download/updater/AgentsView_x86_64.app.tar.gz",
+      "signature": "YWJjCg=="
+    },
+    "windows-x86_64": {
+      "url": "https://github.com/kenn-io/agentsview/releases/download/updater/AgentsView_0.34.5_x64-setup.nsis.zip",
+      "signature": "YWJjCg=="
+    },
+    "linux-x86_64": {
+      "url": "https://github.com/kenn-io/agentsview/releases/download/updater/AgentsView_0.34.5_amd64.AppImage.tar.gz",
+      "signature": "YWJjCg=="
+    }
+  }
+}
 EOF
 }
 

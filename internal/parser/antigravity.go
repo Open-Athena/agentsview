@@ -30,53 +30,6 @@ var antigravityUUIDLikeRE = regexp.MustCompile(
 	`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`,
 )
 
-// DiscoverAntigravitySessions returns one DiscoveredFile per
-// conversations/<uuid>.db under the IDE root.
-func DiscoverAntigravitySessions(root string) []DiscoveredFile {
-	if root == "" {
-		return nil
-	}
-	dir := filepath.Join(root, "conversations")
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil
-	}
-	var files []DiscoveredFile
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		name := e.Name()
-		if !strings.HasSuffix(name, ".db") {
-			continue
-		}
-		id := strings.TrimSuffix(name, ".db")
-		if !IsValidSessionID(id) {
-			continue
-		}
-		files = append(files, DiscoveredFile{
-			Path:  filepath.Join(dir, name),
-			Agent: AgentAntigravity,
-		})
-	}
-	sort.Slice(files, func(i, j int) bool {
-		return files[i].Path < files[j].Path
-	})
-	return files
-}
-
-// FindAntigravitySourceFile locates a session DB by id.
-func FindAntigravitySourceFile(root, id string) string {
-	if root == "" || !IsValidSessionID(id) {
-		return ""
-	}
-	p := filepath.Join(root, "conversations", id+".db")
-	if _, err := os.Stat(p); err == nil {
-		return p
-	}
-	return ""
-}
-
 // AntigravityFileInfo returns the effective file info for an IDE
 // session .db, combining the main file with its -wal/-shm sidecars,
 // the annotations/<id>.pbtxt sidecar, and the brain/<id> artifacts
@@ -89,6 +42,13 @@ func AntigravityFileInfo(path string) (os.FileInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	return antigravityCLICombinedFileInfo(
+		info,
+		antigravityIDECompanionPaths(path)...,
+	), nil
+}
+
+func antigravityIDECompanionPaths(path string) []string {
 	id := strings.TrimSuffix(filepath.Base(path), ".db")
 	root := filepath.Dir(filepath.Dir(path))
 	companions := []string{
@@ -96,14 +56,15 @@ func AntigravityFileInfo(path string) (os.FileInfo, error) {
 		path + "-shm",
 		filepath.Join(root, "annotations", id+".pbtxt"),
 	}
-	companions = append(companions, antigravityBrainCompanions(
+	return append(companions, antigravityBrainCompanions(
 		filepath.Join(root, "brain", id),
 	)...)
-	return antigravityCLICombinedFileInfo(info, companions...), nil
 }
 
-// ParseAntigravitySession parses one IDE session DB.
-func ParseAntigravitySession(
+// parseSession parses one IDE session DB. It is owned by the
+// antigravityProvider; the package-level ParseAntigravitySession
+// entrypoint was folded onto the provider.
+func (p *antigravityProvider) parseSession(
 	path, project, machine string,
 ) (*ParsedSession, []ParsedMessage, []ParsedUsageEvent, error) {
 	info, err := os.Stat(path)
@@ -120,7 +81,7 @@ func ParseAntigravitySession(
 
 	// Open read-only; SQLite session files have WAL/SHM
 	// sidecars that the driver expects in the same dir.
-	dsn := "file:" + path + "?mode=ro&immutable=0"
+	dsn := "file:" + sqliteURIPath(path) + "?mode=ro&immutable=0"
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf(
@@ -129,7 +90,12 @@ func ParseAntigravitySession(
 	}
 	defer db.Close()
 
-	messages, usageEvents, err := loadAntigravitySteps(db)
+	// Schema-fingerprint label for the producing agy build. Computed from
+	// the open DB so IDE and CLI classify identically; empty when the
+	// schema cannot be read.
+	sourceVersion := antigravitySourceVersion(db)
+
+	messages, usageEvents, hasGenMetadata, err := loadAntigravitySteps(db)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -200,6 +166,7 @@ func ParseAntigravitySession(
 		EndedAt:          endedAt,
 		MessageCount:     len(messages),
 		UserMessageCount: userCount,
+		SourceVersion:    sourceVersion,
 		File: FileInfo{
 			Path:  path,
 			Size:  size,
@@ -208,6 +175,9 @@ func ParseAntigravitySession(
 	}
 	accumulateMessageTokenUsage(sess, messages)
 	applyUsageEventTokenTotals(sess, usageEvents)
+	// gen_metadata rows with zero decoded usage events flag a possible
+	// token-block wire-format change. Derived from the final usageEvents.
+	sess.GenMetadataWithoutUsage = hasGenMetadata && len(usageEvents) == 0
 	for i := range usageEvents {
 		usageEvents[i].SessionID = sess.ID
 	}
@@ -220,18 +190,30 @@ func ParseAntigravitySession(
 	return sess, messages, usageEvents, nil
 }
 
-func loadAntigravitySteps(db *sql.DB) ([]ParsedMessage, []ParsedUsageEvent, error) {
+func loadAntigravitySteps(
+	db *sql.DB,
+) ([]ParsedMessage, []ParsedUsageEvent, bool, error) {
 	result, err := loadAntigravityStepsWithRawCount(db)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
-	return result.messages, result.usageEvents, nil
+	return result.messages, result.usageEvents, result.hasGenMetadata, nil
 }
 
 type antigravityStepLoadResult struct {
 	messages     []ParsedMessage
 	usageEvents  []ParsedUsageEvent
 	rawStepCount int
+	// hasGenMetadata reports whether the steps DB carried a non-empty
+	// gen_metadata table. Paired with an empty usageEvents slice it flags a
+	// session whose gen_metadata rows failed to decode into usage -- an early
+	// warning that a newer agy build changed the token-block wire format.
+	hasGenMetadata bool
+	// sourceVersion is the schema-fingerprint label of the .db, set by the
+	// CLI loader while the DB is open. The IDE path computes it directly
+	// from its own handle via antigravitySourceVersion, so both classify
+	// identically.
+	sourceVersion string
 }
 
 type antigravityStepKind int
@@ -319,6 +301,7 @@ func loadAntigravityStepsWithRawCount(
 	}
 
 	var result antigravityStepLoadResult
+	result.hasGenMetadata = len(genMeta) > 0
 	for rows.Next() {
 		var (
 			idx      int

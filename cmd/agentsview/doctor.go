@@ -32,14 +32,24 @@ type doctorAgentRoot struct {
 	Err            error
 }
 
+type doctorDBInspection struct {
+	DBExists                 bool
+	DBReadable               bool
+	DBError                  error
+	UserVersion              *int
+	SessionCounts            []doctorDataVersionCount
+	SessionCountsErr         error
+	AntigravityCLITotal      int
+	AntigravityCLISummary    int
+	AntigravityUnknownSchema int
+	AntigravityCountsErr     error
+	MissingSecretScans       int
+	MissingSecretScansErr    error
+}
+
 type doctorSyncReport struct {
-	Config              config.Config
-	DBExists            bool
-	DBReadable          bool
-	DBError             error
-	UserVersion         *int
-	SessionCounts       []doctorDataVersionCount
-	SessionCountsErr    error
+	Config config.Config
+	doctorDBInspection
 	TempFiles           []string
 	AgentRoots          []doctorAgentRoot
 	DebugLines          []string
@@ -87,9 +97,7 @@ func runDoctorSync(w io.Writer, cfg config.Config) error {
 func collectDoctorSyncReport(cfg config.Config) doctorSyncReport {
 	report := doctorSyncReport{Config: cfg}
 
-	report.DBExists, report.DBReadable, report.DBError,
-		report.UserVersion, report.SessionCounts,
-		report.SessionCountsErr = inspectDoctorDB(cfg.DBPath)
+	report.doctorDBInspection = inspectDoctorDB(cfg.DBPath)
 	report.TempFiles = listDoctorResyncTempFiles(cfg.DBPath)
 	report.AgentRoots = collectDoctorAgentRoots(cfg)
 	report.DebugLines, report.DebugLogErr = readDoctorDebugLines(
@@ -101,61 +109,97 @@ func collectDoctorSyncReport(cfg config.Config) doctorSyncReport {
 	return report
 }
 
-func inspectDoctorDB(
-	path string,
-) (
-	exists bool,
-	readable bool,
-	dbErr error,
-	userVersion *int,
-	counts []doctorDataVersionCount,
-	countsErr error,
-) {
+func inspectDoctorDB(path string) doctorDBInspection {
+	var insp doctorDBInspection
 	info, err := os.Stat(path)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return false, false, nil, nil, nil, nil
+		if !errors.Is(err, os.ErrNotExist) {
+			insp.DBError = err
 		}
-		return false, false, err, nil, nil, nil
+		return insp
 	}
+	insp.DBExists = true
 	if info.IsDir() {
-		return true, false, fmt.Errorf("database path is a directory"),
-			nil, nil, nil
+		insp.DBError = fmt.Errorf("database path is a directory")
+		return insp
 	}
 
 	conn, err := sql.Open("sqlite3", doctorReadOnlyDSN(path))
 	if err != nil {
-		return true, false, err, nil, nil, nil
+		insp.DBError = err
+		return insp
 	}
 	defer conn.Close()
 
 	var version int
 	if err := conn.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
-		return true, false, err, nil, nil, nil
+		insp.DBError = err
+		return insp
 	}
-	readable = true
-	userVersion = &version
+	insp.DBReadable = true
+	insp.UserVersion = &version
 
 	rows, err := conn.Query(
 		"SELECT data_version, COUNT(*) FROM sessions " +
 			"GROUP BY data_version ORDER BY data_version",
 	)
 	if err != nil {
-		return true, readable, nil, userVersion, nil, err
+		insp.SessionCountsErr = err
+		return insp
 	}
 	defer rows.Close()
 
 	for rows.Next() {
 		var row doctorDataVersionCount
 		if err := rows.Scan(&row.Version, &row.Count); err != nil {
-			return true, readable, nil, userVersion, counts, err
+			insp.SessionCountsErr = err
+			return insp
 		}
-		counts = append(counts, row)
+		insp.SessionCounts = append(insp.SessionCounts, row)
 	}
 	if err := rows.Err(); err != nil {
-		return true, readable, nil, userVersion, counts, err
+		insp.SessionCountsErr = err
+		return insp
 	}
-	return true, readable, nil, userVersion, counts, nil
+
+	// One scan collects both Antigravity operator counts: antigravity-cli
+	// summary-mode sessions (transcript fidelity) and sessions on an
+	// unrecognized schema across both Antigravity agents (decode confidence).
+	row := conn.QueryRow(
+		"SELECT " +
+			"COUNT(*) FILTER (WHERE agent = 'antigravity-cli'), " +
+			"COUNT(*) FILTER (WHERE agent = 'antigravity-cli' " +
+			"AND transcript_fidelity = 'summary'), " +
+			"COUNT(*) FILTER (WHERE agent IN ('antigravity', 'antigravity-cli') " +
+			"AND source_version LIKE 'agy-schema:%') " +
+			"FROM sessions",
+	)
+	var total, summary, unknownSchema int
+	if err := row.Scan(&total, &summary, &unknownSchema); err != nil {
+		insp.AntigravityCountsErr = err
+		return insp
+	}
+	insp.AntigravityCLITotal = total
+	insp.AntigravityCLISummary = summary
+	insp.AntigravityUnknownSchema = unknownSchema
+
+	// Sessions with current quality signals but no persisted secret
+	// scan: the signature of a findings write that failed mid-sequence
+	// under a binary predating the findings-before-signals write
+	// ordering. The filtered signals backfill deliberately does not
+	// revisit them (see db.BackfillSignals), so surface them here.
+	if err := conn.QueryRow(
+		`SELECT COUNT(*) FROM sessions
+		 WHERE quality_signal_version >= ?
+		   AND secrets_rules_version = ''
+		   AND message_count > 0
+		   AND deleted_at IS NULL`,
+		db.CurrentQualitySignalVersion,
+	).Scan(&insp.MissingSecretScans); err != nil {
+		insp.MissingSecretScansErr = err
+		return insp
+	}
+	return insp
 }
 
 func doctorReadOnlyDSN(path string) string {
@@ -280,6 +324,9 @@ func writeDoctorSyncReport(w io.Writer, report doctorSyncReport) {
 		doctorStartupDecision(report, currentVersion))
 
 	writeDoctorSessionCounts(w, report)
+	writeDoctorSummaryMode(w, report)
+	writeDoctorUnknownSchema(w, report)
+	writeDoctorMissingSecretScans(w, report)
 	writeDoctorTempFiles(w, report.TempFiles)
 	writeDoctorAgentRoots(w, report.AgentRoots)
 	writeDoctorDebugEvidence(w, report)
@@ -325,6 +372,52 @@ func writeDoctorSessionCounts(w io.Writer, report doctorSyncReport) {
 	for _, row := range report.SessionCounts {
 		fmt.Fprintf(w, "  version %d: %d\n", row.Version, row.Count)
 	}
+}
+
+func writeDoctorSummaryMode(w io.Writer, report doctorSyncReport) {
+	if report.AntigravityCountsErr != nil || report.AntigravityCLISummary == 0 {
+		return
+	}
+	fmt.Fprintf(w,
+		"antigravity-cli: %d sessions, %d in summary mode\n"+
+			"  -> install agy-reader for full transcripts: "+
+			"https://github.com/mjacobs/agy-reader\n",
+		report.AntigravityCLITotal, report.AntigravityCLISummary)
+}
+
+// writeDoctorUnknownSchema surfaces Antigravity sessions decoded from an
+// unrecognized (newer) schema fingerprint (source_version "agy-schema:..."),
+// where the heuristic decode may be incomplete or wrong. It stays silent on a
+// clean archive or when the antigravity-counts query failed.
+func writeDoctorUnknownSchema(w io.Writer, report doctorSyncReport) {
+	if report.AntigravityCountsErr != nil ||
+		report.AntigravityUnknownSchema == 0 {
+		return
+	}
+	fmt.Fprintf(w,
+		"%d session(s) on unrecognized Antigravity schema (agy-schema:...)\n"+
+			"  -> a newer Antigravity build changed the schema; "+
+			"the decode is heuristic and may be incomplete\n",
+		report.AntigravityUnknownSchema)
+}
+
+// writeDoctorMissingSecretScans surfaces sessions whose quality
+// signals are current but whose secret findings were never persisted.
+// It stays silent on a clean archive or when the count query failed.
+// Detection is partial by design: a session whose earlier findings
+// write succeeded before a later one failed keeps a stale non-empty
+// rules version and is indistinguishable from a legitimately old scan.
+func writeDoctorMissingSecretScans(w io.Writer, report doctorSyncReport) {
+	if report.MissingSecretScansErr != nil ||
+		report.MissingSecretScans == 0 {
+		return
+	}
+	fmt.Fprintf(w,
+		"%d session(s) have current quality signals but no persisted "+
+			"secret scan\n"+
+			"  -> a findings write likely failed under an older version; "+
+			"run \"agentsview secrets scan\" to rescan and persist findings\n",
+		report.MissingSecretScans)
 }
 
 func writeDoctorTempFiles(w io.Writer, files []string) {

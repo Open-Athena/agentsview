@@ -3,8 +3,11 @@ name: CI
 on:
   push:
     branches: [main]
+  # Run on every pull request regardless of base branch so stacked PRs that
+  # target another feature branch (not just main) still get the full test,
+  # lint, and e2e suite. The expensive desktop/tauri bundle builds are gated
+  # to main separately in desktop-artifacts.yml.
   pull_request:
-    branches: [main]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
@@ -17,7 +20,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           persist-credentials: false
 
@@ -36,7 +39,7 @@ jobs:
   frontend:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           persist-credentials: false
 
@@ -52,6 +55,13 @@ jobs:
         run: npm run check
         working-directory: frontend
 
+      - name: Design-system conformance (kit-ui-check)
+        # Full rule set over all of src; legitimate exceptions carry inline
+        # kit-ui-check-ignore markers with reasons (e.g. the app token
+        # definitions in app.css).
+        run: npm run check:kit-ui
+        working-directory: frontend
+
       - name: Run frontend tests
         run: npm test
         working-directory: frontend
@@ -59,7 +69,7 @@ jobs:
   frontend-node-25:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           persist-credentials: false
 
@@ -78,16 +88,16 @@ jobs:
   docs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c  # v6.0.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@85856786d1ce8acfbcc2f13a5f3fbd6b938f9f41  # v7.1.2
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
 
       - name: Install docs check tools
         run: |
@@ -100,7 +110,7 @@ jobs:
   scripts:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           persist-credentials: false
 
@@ -109,6 +119,7 @@ jobs:
           bash scripts/install_test.sh
           bash scripts/check_desktop_release_health_test.sh
           bash scripts/check_desktop_release_health_from_event_test.sh
+          bash desktop/scripts/test-repair-appimage-diricon.sh
 
   test:
     name: Go Test (${{ matrix.os }})
@@ -118,7 +129,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -131,7 +142,7 @@ jobs:
         if: runner.os == 'Windows'
         id: setup_mingw
         continue-on-error: true
-        uses: msys2/setup-msys2@e9898307ac31d1a803454791be09ab9973336e1c  # v2
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2
         with:
           msystem: MINGW64
           update: false
@@ -140,7 +151,7 @@ jobs:
 
       - name: Setup MinGW (Windows, retry on transient failure)
         if: runner.os == 'Windows' && steps.setup_mingw.outcome == 'failure'
-        uses: msys2/setup-msys2@e9898307ac31d1a803454791be09ab9973336e1c  # v2
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2
         with:
           msystem: MINGW64
           update: false
@@ -151,7 +162,7 @@ jobs:
         run: go run ./internal/pricing/cmd/litellm-snapshot -restore
 
       - name: Run Go tests
-        run: go test -tags "fts5" ./... -v -count=1
+        run: go test -tags "fts5" ./... -v -count=1 -timeout=20m
         env:
           CGO_ENABLED: "1"
 
@@ -167,7 +178,7 @@ jobs:
     name: Desktop Unit Tests (Windows)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           persist-credentials: false
 
@@ -201,7 +212,7 @@ jobs:
   coverage:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -220,7 +231,7 @@ jobs:
 
       - name: Upload coverage
         id: codecov
-        uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354  # v6.0.1
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
         with:
           files: coverage.out
         continue-on-error: true
@@ -246,7 +257,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -298,7 +309,7 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           fetch-depth: 0
           persist-credentials: false

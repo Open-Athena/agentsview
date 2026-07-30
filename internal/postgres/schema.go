@@ -11,10 +11,13 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
 const tokenCoverageRepairMetadataKey = "token_coverage_repair_v1"
+const sourceCurationBackfillMetadataKey = "source_curation_baseline_backfill_v1"
+const projectIdentityRemoteScrubMetadataKey = "git_remote_credentials_scrub_v1"
 const tokenCoverageBackfillBatchSize = 1000
 
 type columnMigration struct {
@@ -40,11 +43,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     agent              TEXT NOT NULL,
     first_message      TEXT,
     display_name       TEXT,
+    source_display_name TEXT,
     session_name       TEXT,
     created_at         TIMESTAMPTZ,
     started_at         TIMESTAMPTZ,
     ended_at           TIMESTAMPTZ,
     deleted_at         TIMESTAMPTZ,
+    source_deleted_at  TIMESTAMPTZ,
     message_count      INT NOT NULL DEFAULT 0,
     user_message_count INT NOT NULL DEFAULT 0,
     parent_session_id  TEXT,
@@ -147,9 +152,50 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_session
 CREATE INDEX IF NOT EXISTS idx_usage_events_occurred
     ON usage_events (occurred_at);
 
+CREATE TABLE IF NOT EXISTS cursor_usage_events (
+    id BIGSERIAL PRIMARY KEY,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    model TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT '',
+    input_tokens INT NOT NULL DEFAULT 0,
+    output_tokens INT NOT NULL DEFAULT 0,
+    cache_write_tokens INT NOT NULL DEFAULT 0,
+    cache_read_tokens INT NOT NULL DEFAULT 0,
+    charged_cents DOUBLE PRECISION NOT NULL DEFAULT 0,
+    cursor_token_fee DOUBLE PRECISION NOT NULL DEFAULT 0,
+    user_id TEXT NOT NULL DEFAULT '',
+    user_email TEXT NOT NULL DEFAULT '',
+    is_headless BOOLEAN NOT NULL DEFAULT FALSE,
+    dedup_key TEXT NOT NULL DEFAULT ''
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cursor_usage_events_dedup
+    ON cursor_usage_events (dedup_key)
+    WHERE dedup_key != '';
+
+CREATE INDEX IF NOT EXISTS idx_cursor_usage_events_occurred
+    ON cursor_usage_events (occurred_at);
+
+CREATE INDEX IF NOT EXISTS idx_cursor_usage_events_model
+    ON cursor_usage_events (model);
+
 CREATE TABLE IF NOT EXISTS starred_sessions (
     session_id TEXT PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (session_id)
+        REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS excluded_sessions (
+    id         TEXT PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS session_aliases (
+    session_id TEXT NOT NULL,
+    alias_id   TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (session_id, alias_id),
     FOREIGN KEY (session_id)
         REFERENCES sessions(id) ON DELETE CASCADE
 );
@@ -186,6 +232,24 @@ CREATE TABLE IF NOT EXISTS model_pricing (
     updated_at TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS project_identity_observations (
+    project            TEXT NOT NULL,
+    machine            TEXT NOT NULL,
+    root_path          TEXT NOT NULL DEFAULT '',
+    git_remote         TEXT NOT NULL DEFAULT '',
+    git_remote_name    TEXT NOT NULL DEFAULT '',
+    worktree_name      TEXT NOT NULL DEFAULT '',
+    worktree_root_path TEXT NOT NULL DEFAULT '',
+    observed_at        TIMESTAMPTZ NOT NULL,
+    normalized_remote  TEXT NOT NULL DEFAULT '',
+    key_source         TEXT NOT NULL DEFAULT '',
+    key                TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (project, machine, root_path, git_remote)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_identity_observations_project
+    ON project_identity_observations (project);
+
 CREATE TABLE IF NOT EXISTS tool_calls (
     id                    BIGSERIAL PRIMARY KEY,
     session_id            TEXT NOT NULL,
@@ -199,6 +263,7 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     result_content        TEXT,
     subagent_session_id   TEXT,
     message_ordinal       INT NOT NULL,
+    file_path             TEXT,
     FOREIGN KEY (session_id)
         REFERENCES sessions(id) ON DELETE CASCADE
 );
@@ -264,6 +329,35 @@ CREATE INDEX IF NOT EXISTS idx_secret_findings_session
 
 CREATE INDEX IF NOT EXISTS idx_secret_findings_rule
     ON secret_findings (rule_name);
+
+CREATE TABLE IF NOT EXISTS insights (
+    id               BIGSERIAL PRIMARY KEY,
+    type             TEXT NOT NULL DEFAULT '',
+    date_from        TEXT NOT NULL DEFAULT '',
+    date_to          TEXT NOT NULL DEFAULT '',
+    project          TEXT,
+    agent            TEXT NOT NULL DEFAULT '',
+    model            TEXT,
+    prompt           TEXT,
+    content          TEXT NOT NULL DEFAULT '',
+    kind             TEXT NOT NULL DEFAULT '',
+    schema_version   TEXT NOT NULL DEFAULT '',
+    template_id      TEXT NOT NULL DEFAULT '',
+    template_version TEXT NOT NULL DEFAULT '',
+    aggregate_hash   TEXT NOT NULL DEFAULT '',
+    cache_key        TEXT NOT NULL DEFAULT '',
+    cache_status     TEXT NOT NULL DEFAULT '',
+    provenance_json  TEXT NOT NULL DEFAULT '',
+    structured_json  TEXT NOT NULL DEFAULT '',
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_insights_lookup
+    ON insights (type, date_from, date_to, project);
+
+CREATE INDEX IF NOT EXISTS idx_insights_cache
+    ON insights (cache_key, created_at DESC)
+    WHERE cache_key <> '';
 `
 
 // EnsureSchema creates the schema (if needed), then runs
@@ -318,6 +412,16 @@ func EnsureSchema(
 			"sessions", "created_at",
 			`created_at TIMESTAMPTZ`,
 			"adding sessions.created_at",
+		},
+		{
+			"sessions", "source_display_name",
+			`source_display_name TEXT`,
+			"adding sessions.source_display_name",
+		},
+		{
+			"sessions", "source_deleted_at",
+			`source_deleted_at TIMESTAMPTZ`,
+			"adding sessions.source_deleted_at",
 		},
 		{
 			"sessions", "total_output_tokens",
@@ -383,6 +487,11 @@ func EnsureSchema(
 			"tool_calls", "call_index",
 			`call_index INT NOT NULL DEFAULT 0`,
 			"adding tool_calls.call_index",
+		},
+		{
+			"tool_calls", "file_path",
+			`file_path TEXT`,
+			"adding tool_calls.file_path",
 		},
 		{
 			"sessions", "is_automated",
@@ -535,6 +644,11 @@ func EnsureSchema(
 			"adding sessions.source_version",
 		},
 		{
+			"sessions", "transcript_fidelity",
+			`transcript_fidelity TEXT NOT NULL DEFAULT ''`,
+			"adding sessions.transcript_fidelity",
+		},
+		{
 			"sessions", "parser_malformed_lines",
 			`parser_malformed_lines INT NOT NULL DEFAULT 0`,
 			"adding sessions.parser_malformed_lines",
@@ -611,6 +725,7 @@ func EnsureSchema(
 	)
 	step = time.Now()
 	tokenCoverageColumnsAdded := false
+	sourceCurationColumnsAdded := false
 	addedColumns, err := ensureColumns(ctx, db, existingColumns, alters)
 	if err != nil {
 		return err
@@ -620,6 +735,8 @@ func EnsureSchema(
 		case "has_total_output_tokens", "has_peak_context_tokens",
 			"has_context_tokens", "has_output_tokens":
 			tokenCoverageColumnsAdded = true
+		case "source_display_name", "source_deleted_at":
+			sourceCurationColumnsAdded = true
 		}
 	}
 	log.Printf(
@@ -628,6 +745,43 @@ func EnsureSchema(
 		time.Since(step).Round(time.Millisecond),
 		len(addedColumns),
 	)
+	step = time.Now()
+	sourceBackfilled, err := runSourceCurationBackfill(
+		ctx, db, sourceCurationColumnsAdded,
+	)
+	if err != nil {
+		return err
+	}
+	if sourceBackfilled {
+		log.Printf(
+			"pg schema: source curation baseline backfill"+
+				" completed in %s",
+			time.Since(step).Round(time.Millisecond),
+		)
+	} else {
+		log.Printf(
+			"pg schema: source curation baseline backfill"+
+				" check completed in %s (repair skipped)",
+			time.Since(step).Round(time.Millisecond),
+		)
+	}
+	step = time.Now()
+	remoteScrubbed, err := scrubProjectIdentityGitRemoteCredentialsPG(ctx, db)
+	if err != nil {
+		return err
+	}
+	if remoteScrubbed {
+		log.Printf(
+			"pg schema: project identity remote scrub completed in %s",
+			time.Since(step).Round(time.Millisecond),
+		)
+	} else {
+		log.Printf(
+			"pg schema: project identity remote scrub check completed"+
+				" in %s (repair skipped)",
+			time.Since(step).Round(time.Millisecond),
+		)
+	}
 	step = time.Now()
 	if _, err := db.ExecContext(ctx,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_termination_status
@@ -711,6 +865,8 @@ func createPartialIndexesPG(ctx context.Context, db *sql.DB) error {
 	indexes := []string{
 		`CREATE INDEX IF NOT EXISTS idx_sessions_cwd
 		 ON sessions(cwd) WHERE cwd != ''`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_project_git_branch
+		 ON sessions(project, git_branch) WHERE git_branch != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_compact_boundary
 		 ON messages(session_id, ordinal) WHERE is_compact_boundary = TRUE`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_sidechain
@@ -725,6 +881,11 @@ func createPartialIndexesPG(ctx context.Context, db *sql.DB) error {
 		   AND model != '<synthetic>'`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_has_secret
 		 ON sessions(secret_leak_count) WHERE secret_leak_count > 0`,
+		// idx_tool_calls_file_path backs the cross-session Recent Edits feed.
+		// Created here, after the file_path column migration, mirroring the
+		// SQLite partial index so legacy schemas migrate cleanly.
+		`CREATE INDEX IF NOT EXISTS idx_tool_calls_file_path
+		 ON tool_calls(file_path) WHERE file_path IS NOT NULL`,
 	}
 	for _, ddl := range indexes {
 		if _, err := db.ExecContext(ctx, ddl); err != nil {
@@ -909,6 +1070,243 @@ func backfillIsAutomatedPG(
 	); err != nil {
 		return fmt.Errorf(
 			"storing PG classifier hash: %w", err,
+		)
+	}
+	return nil
+}
+
+// runSchemaDataRepairsPG runs the non-DDL correctness repairs that
+// EnsureSchema performs: it recomputes is_automated, backfills
+// source-curation baselines, scrubs stored project remotes, and repairs
+// token-coverage flags. These issue only row-level writes, so the
+// compatible-schema fast path can run them without the index and
+// column DDL that can block concurrent pg serve reads (issue #887).
+func runSchemaDataRepairsPG(ctx context.Context, db *sql.DB) error {
+	if err := backfillIsAutomatedPG(ctx, db); err != nil {
+		return err
+	}
+	if _, err := runSourceCurationBackfill(ctx, db, false); err != nil {
+		return err
+	}
+	if _, err := scrubProjectIdentityGitRemoteCredentialsPG(ctx, db); err != nil {
+		return err
+	}
+	runRepair, err := shouldRunTokenCoverageRepair(ctx, db, false)
+	if err != nil {
+		return err
+	}
+	if !runRepair {
+		return nil
+	}
+	if err := backfillTokenCoverageFlags(ctx, db); err != nil {
+		return err
+	}
+	return markTokenCoverageRepairDone(ctx, db)
+}
+
+func backfillSourceCurationBaselines(
+	ctx context.Context, pg *sql.DB,
+) error {
+	if _, err := pg.ExecContext(ctx,
+		`UPDATE sessions
+		 SET source_display_name = display_name
+		 WHERE source_display_name IS NULL`,
+	); err != nil {
+		return fmt.Errorf(
+			"backfilling PG source display-name baselines: %w", err,
+		)
+	}
+	if _, err := pg.ExecContext(ctx,
+		`UPDATE sessions
+		 SET source_deleted_at = deleted_at
+		 WHERE source_deleted_at IS NULL`,
+	); err != nil {
+		return fmt.Errorf(
+			"backfilling PG source deleted-at baselines: %w", err,
+		)
+	}
+	return nil
+}
+
+func runSourceCurationBackfill(
+	ctx context.Context, db *sql.DB, sourceCurationColumnsAdded bool,
+) (bool, error) {
+	runRepair, err := shouldRunSourceCurationBackfill(
+		ctx, db, sourceCurationColumnsAdded,
+	)
+	if err != nil {
+		return false, err
+	}
+	if !runRepair {
+		return false, nil
+	}
+	if err := backfillSourceCurationBaselines(ctx, db); err != nil {
+		return false, err
+	}
+	if err := markSourceCurationBackfillDone(ctx, db); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func shouldRunSourceCurationBackfill(
+	ctx context.Context, db *sql.DB, sourceCurationColumnsAdded bool,
+) (bool, error) {
+	if sourceCurationColumnsAdded {
+		return true, nil
+	}
+
+	var done bool
+	if err := db.QueryRowContext(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM sync_metadata
+			WHERE key = $1
+		)`,
+		sourceCurationBackfillMetadataKey,
+	).Scan(&done); err != nil {
+		return false, fmt.Errorf(
+			"probing source curation backfill metadata: %w", err,
+		)
+	}
+	return !done, nil
+}
+
+func markSourceCurationBackfillDone(
+	ctx context.Context, db *sql.DB,
+) error {
+	_, err := db.ExecContext(ctx,
+		`INSERT INTO sync_metadata (key, value)
+		 VALUES ($1, '1')
+		 ON CONFLICT (key) DO UPDATE
+		 SET value = EXCLUDED.value`,
+		sourceCurationBackfillMetadataKey,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"storing source curation backfill metadata: %w", err,
+		)
+	}
+	return nil
+}
+
+func scrubProjectIdentityGitRemoteCredentialsPG(
+	ctx context.Context, db *sql.DB,
+) (bool, error) {
+	var done bool
+	if err := db.QueryRowContext(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM sync_metadata
+			WHERE key = $1
+		)`,
+		projectIdentityRemoteScrubMetadataKey,
+	).Scan(&done); err != nil {
+		return false, fmt.Errorf(
+			"probing project identity remote scrub metadata: %w", err,
+		)
+	}
+	if done {
+		return false, nil
+	}
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT project, machine, root_path, git_remote, git_remote_name,
+			worktree_name, worktree_root_path, observed_at,
+			normalized_remote, key_source, key
+		FROM project_identity_observations
+		WHERE git_remote != ''
+		ORDER BY project, machine, root_path, git_remote`)
+	if err != nil {
+		return false, fmt.Errorf(
+			"listing pg project identity remotes for scrub: %w", err,
+		)
+	}
+
+	type pendingScrub struct {
+		obs       export.ProjectIdentityObservation
+		rawRemote string
+	}
+	var pending []pendingScrub
+	for rows.Next() {
+		var obs export.ProjectIdentityObservation
+		if err := rows.Scan(
+			&obs.Project,
+			&obs.Machine,
+			&obs.RootPath,
+			&obs.GitRemote,
+			&obs.GitRemoteName,
+			&obs.WorktreeName,
+			&obs.WorktreeRootPath,
+			&obs.ObservedAt,
+			&obs.NormalizedRemote,
+			&obs.KeySource,
+			&obs.Key,
+		); err != nil {
+			_ = rows.Close()
+			return false, fmt.Errorf(
+				"scanning pg project identity remote for scrub: %w", err,
+			)
+		}
+		sanitized := export.SanitizeGitRemoteForStorage(obs.GitRemote)
+		if sanitized == obs.GitRemote {
+			continue
+		}
+		pending = append(pending, pendingScrub{
+			obs:       obs,
+			rawRemote: obs.GitRemote,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return false, fmt.Errorf(
+			"iterating pg project identity remotes for scrub: %w", err,
+		)
+	}
+	if err := rows.Close(); err != nil {
+		return false, fmt.Errorf(
+			"closing pg project identity remotes for scrub: %w", err,
+		)
+	}
+
+	for _, scrub := range pending {
+		obs := export.SanitizeStoredProjectIdentityObservation(scrub.obs)
+		if err := upsertProjectIdentityObservation(
+			ctx, db, obs, scrub.rawRemote,
+		); err != nil {
+			return false, fmt.Errorf(
+				"upserting scrubbed pg project identity remote: %w", err,
+			)
+		}
+		if _, err := db.ExecContext(ctx, `
+			DELETE FROM project_identity_observations
+			WHERE project = $1 AND machine = $2 AND root_path = $3
+			  AND git_remote = $4`,
+			scrub.obs.Project, scrub.obs.Machine, scrub.obs.RootPath,
+			scrub.rawRemote,
+		); err != nil {
+			return false, fmt.Errorf(
+				"removing raw pg project identity remote: %w", err,
+			)
+		}
+	}
+	if err := markProjectIdentityRemoteScrubDone(ctx, db); err != nil {
+		return false, err
+	}
+	return len(pending) > 0, nil
+}
+
+func markProjectIdentityRemoteScrubDone(
+	ctx context.Context, db *sql.DB,
+) error {
+	_, err := db.ExecContext(ctx,
+		`INSERT INTO sync_metadata (key, value)
+		 VALUES ($1, '1')
+		 ON CONFLICT (key) DO UPDATE
+		 SET value = EXCLUDED.value`,
+		projectIdentityRemoteScrubMetadataKey,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"storing project identity remote scrub metadata: %w", err,
 		)
 	}
 	return nil
@@ -1394,6 +1792,27 @@ func inferTokenCoverage(
 }
 
 // CheckSchemaCompat verifies that the PG schema has all columns
+func pgHasTable(ctx context.Context, db *sql.DB, name string) bool {
+	var n int
+	err := db.QueryRowContext(ctx,
+		"SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = $1",
+		name,
+	).Scan(&n)
+	return err == nil && n == 1
+}
+
+// pgHasIndex reports whether an index of the given name exists in the
+// current schema.
+func pgHasIndex(ctx context.Context, db *sql.DB, name string) bool {
+	var n int
+	err := db.QueryRowContext(ctx,
+		`SELECT 1 FROM pg_indexes
+		 WHERE schemaname = current_schema() AND indexname = $1`,
+		name,
+	).Scan(&n)
+	return err == nil && n == 1
+}
+
 // required by query paths. This is a read-only probe that works
 // against any PG role. Returns nil if compatible, or an error
 // describing what is missing.
@@ -1401,9 +1820,7 @@ func CheckSchemaCompat(
 	ctx context.Context, db *sql.DB,
 ) error {
 	rows, err := db.QueryContext(ctx,
-		`SELECT id, created_at, deleted_at, updated_at,
-			termination_status, secret_leak_count, secrets_rules_version,
-			session_name
+		`SELECT updated_at, `+pgSessionCols+`
 		 FROM sessions LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
@@ -1414,7 +1831,35 @@ func CheckSchemaCompat(
 	rows.Close()
 
 	rows, err = db.QueryContext(ctx,
-		`SELECT call_index FROM tool_calls LIMIT 0`)
+		`SELECT source_display_name, source_deleted_at
+		 FROM sessions LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"sessions table missing curation columns: %w", err,
+		)
+	}
+	rows.Close()
+
+	rows, err = db.QueryContext(ctx,
+		`SELECT id FROM excluded_sessions LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"excluded_sessions table missing required columns: %w", err,
+		)
+	}
+	rows.Close()
+
+	rows, err = db.QueryContext(ctx,
+		`SELECT session_id, alias_id FROM session_aliases LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"session_aliases table missing required columns: %w", err,
+		)
+	}
+	rows.Close()
+
+	rows, err = db.QueryContext(ctx,
+		`SELECT call_index, file_path FROM tool_calls LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
 			"tool_calls table missing required columns: %w",
@@ -1424,8 +1869,15 @@ func CheckSchemaCompat(
 	rows.Close()
 
 	rows, err = db.QueryContext(ctx,
-		`SELECT is_system, model, token_usage, context_tokens,
-			output_tokens, has_context_tokens, has_output_tokens
+		`SELECT session_id, ordinal, role, content, thinking_text,
+			timestamp, has_thinking, has_tool_use,
+			content_length, is_system, model, token_usage,
+			context_tokens, output_tokens,
+			has_context_tokens, has_output_tokens,
+			claude_message_id, claude_request_id,
+			source_type, source_subtype, source_uuid,
+			source_parent_uuid, is_sidechain,
+			is_compact_boundary
 		 FROM messages LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
@@ -1502,6 +1954,35 @@ func CheckSchemaCompat(
 	rows.Close()
 
 	rows, err = db.QueryContext(ctx,
+		`SELECT id, type, date_from, date_to, project, agent,
+			model, prompt, content, kind, schema_version,
+			template_id, template_version, aggregate_hash,
+			cache_key, cache_status, provenance_json,
+			structured_json, created_at
+		 FROM insights LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf("insights table missing required columns: %w", err)
+	}
+	rows.Close()
+
+	if pgHasTable(ctx, db, "cursor_usage_events") {
+		rows, err = db.QueryContext(ctx,
+			`SELECT id, occurred_at, model, kind,
+				input_tokens, output_tokens,
+				cache_write_tokens, cache_read_tokens,
+				charged_cents, cursor_token_fee,
+				user_id, user_email, is_headless, dedup_key
+			 FROM cursor_usage_events LIMIT 0`)
+		if err != nil {
+			return fmt.Errorf(
+				"cursor_usage_events table missing required columns: %w",
+				err,
+			)
+		}
+		rows.Close()
+	}
+
+	rows, err = db.QueryContext(ctx,
 		`SELECT id, session_id, rule_name, confidence, location_kind,
 			message_ordinal, call_index, event_index,
 			match_start, match_end, match_index,
@@ -1511,7 +1992,70 @@ func CheckSchemaCompat(
 		return fmt.Errorf("secret_findings table missing required columns: %w", err)
 	}
 	rows.Close()
+	rows, err = db.QueryContext(ctx,
+		`SELECT project, machine, root_path, git_remote, git_remote_name,
+			worktree_name, worktree_root_path, observed_at,
+			normalized_remote, key_source, key
+		 FROM project_identity_observations LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"project_identity_observations table missing required columns: %w",
+			err,
+		)
+	}
+	rows.Close()
 	return nil
+}
+
+// checkPushSchemaCompat verifies schema elements that only push needs. PG serve
+// never reads sync_metadata or owner_marker, so they live outside
+// CheckSchemaCompat (which gates read-only serve startup) and are checked only
+// on the push fast path.
+func checkPushSchemaCompat(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx,
+		`SELECT key, value FROM sync_metadata LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"sync_metadata table missing required columns: %w", err)
+	}
+	rows.Close()
+
+	rows, err = db.QueryContext(ctx,
+		`SELECT owner_marker FROM sessions LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"sessions table missing push ownership columns: %w", err)
+	}
+	rows.Close()
+	return nil
+}
+
+// pushSchemaCurrent reports whether the PG schema has everything a push
+// needs. CheckSchemaCompat covers the read and PG serve write paths but does
+// not require push-only sync_metadata or sessions.owner_marker (verified by
+// checkPushSchemaCompat), model_pricing (always queried by syncModelPricing)
+// or cursor_usage_events (written by syncCursorUsageEvents), so probe those
+// explicitly. It also requires the cursor dedup index, which the cursor usage
+// insert relies on for ON CONFLICT dedup. When any of these is missing the
+// caller must run EnsureSchema so push migrates the schema instead of failing
+// or duplicating rows.
+func pushSchemaCurrent(ctx context.Context, db *sql.DB) bool {
+	if err := CheckSchemaCompat(ctx, db); err != nil {
+		return false
+	}
+	if err := checkPushSchemaCompat(ctx, db); err != nil {
+		return false
+	}
+	if !pgHasTable(ctx, db, "model_pricing") ||
+		!pgHasTable(ctx, db, "project_identity_observations") ||
+		!pgHasTable(ctx, db, "cursor_usage_events") {
+		return false
+	}
+	// bulkInsertCursorUsageEvents dedups via a targetless ON CONFLICT
+	// DO NOTHING, which only suppresses duplicates when this partial
+	// unique index exists. Fall back to EnsureSchema when it is missing
+	// so repeated pushes cannot duplicate cursor usage rows.
+	return pgHasIndex(ctx, db, "idx_cursor_usage_events_dedup")
 }
 
 // CheckDataVersionCompat rejects PG datasets containing rows written by a

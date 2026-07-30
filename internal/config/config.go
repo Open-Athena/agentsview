@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,6 +67,29 @@ type PGConfig struct {
 	ExcludeProjects []string `toml:"exclude_projects" json:"exclude_projects,omitempty"`
 }
 
+type pgEnvOverrides struct {
+	URL         string
+	Schema      string
+	MachineName string
+}
+
+// ResolvedPGTarget is one PostgreSQL target after target selection,
+// defaulting, and default-target env overrides are applied.
+type ResolvedPGTarget struct {
+	Name      string
+	Config    PGConfig
+	IsDefault bool
+}
+
+var pgConfigKeys = map[string]struct{}{
+	"url":              {},
+	"schema":           {},
+	"machine_name":     {},
+	"allow_insecure":   {},
+	"projects":         {},
+	"exclude_projects": {},
+}
+
 // DuckDBConfig holds DuckDB mirror and Quack connection settings.
 type DuckDBConfig struct {
 	Path            string   `toml:"path" json:"path"`
@@ -80,14 +104,18 @@ type DuckDBConfig struct {
 // AutomatedConfig holds user-supplied additions to the
 // automated-session classifier. Parse-only; all semantic
 // normalization (trim, dedupe, length cap, built-in overlap
-// drop) happens inside db.SetUserAutomationPrefixes.
+// drop) happens inside the db setters.
 type AutomatedConfig struct {
-	Prefixes []string `toml:"prefixes" json:"prefixes,omitempty"`
+	Prefixes     []string `toml:"prefixes" json:"prefixes,omitempty"`
+	Substrings   []string `toml:"substrings" json:"substrings,omitempty"`
+	ExactMatches []string `toml:"exact_matches" json:"exact_matches,omitempty"`
 }
 
 // AgentConfig holds per-agent runtime overrides.
 type AgentConfig struct {
-	Binary string `json:"binary,omitempty" toml:"binary"`
+	Binary      string `json:"binary,omitempty" toml:"binary"`
+	Sandbox     string `json:"sandbox,omitempty" toml:"sandbox"`
+	AllowUnsafe bool   `json:"allow_unsafe,omitempty" toml:"allow_unsafe"`
 }
 
 type CustomModelRate struct {
@@ -97,13 +125,26 @@ type CustomModelRate struct {
 	CacheRead     float64 `json:"cache_read,omitempty" toml:"cache_read"`
 }
 
-// RemoteHost describes one SSH target for config-driven
-// `agentsview sync` fan-out. Host is required; User and Port are
-// optional (Port 0 means the ssh default of 22).
+type RemoteTransport string
+
+const (
+	RemoteTransportSSH  RemoteTransport = "ssh"
+	RemoteTransportHTTP RemoteTransport = "http"
+)
+
+// RemoteHost describes one target for config-driven `agentsview sync`
+// fan-out. Host is required. SSH remotes may set User and Port
+// (Port 0 means the ssh default of 22). HTTP remotes must set URL
+// and Token. A zero/empty Interval disables periodic remote
+// sync for this host.
 type RemoteHost struct {
-	Host string `toml:"host" json:"host"`
-	User string `toml:"user,omitempty" json:"user,omitempty"`
-	Port int    `toml:"port,omitempty" json:"port,omitempty"`
+	Host      string          `toml:"host" json:"host"`
+	Transport RemoteTransport `toml:"transport,omitempty" json:"transport,omitempty"`
+	User      string          `toml:"user,omitempty" json:"user,omitempty"`
+	Port      int             `toml:"port,omitempty" json:"port,omitempty"`
+	URL       string          `toml:"url,omitempty" json:"url,omitempty"`
+	Token     string          `toml:"token,omitempty" json:"-"`
+	Interval  time.Duration   `toml:"interval,omitempty" json:"interval,omitempty"`
 }
 
 // Config holds all application configuration.
@@ -117,6 +158,9 @@ type Config struct {
 	Proxy                ProxyConfig            `json:"proxy,omitempty" toml:"proxy"`
 	WatchExcludePatterns []string               `json:"watch_exclude_patterns,omitempty" toml:"watch_exclude_patterns"`
 	CursorSecret         string                 `json:"cursor_secret" toml:"cursor_secret"`
+	CursorAdminAPIKey    string                 `json:"cursor_admin_api_key,omitempty" toml:"cursor_admin_api_key"`
+	CursorAdminEmail     string                 `json:"cursor_admin_email,omitempty" toml:"cursor_admin_email"`
+	CursorAdminUserID    string                 `json:"cursor_admin_user_id,omitempty" toml:"cursor_admin_user_id"`
 	GithubToken          string                 `json:"github_token,omitempty" toml:"github_token"`
 	Terminal             TerminalConfig         `json:"terminal,omitempty" toml:"terminal"`
 	AuthToken            string                 `json:"auth_token,omitempty" toml:"auth_token"`
@@ -125,6 +169,8 @@ type Config struct {
 	DisableUpdateCheck   bool                   `json:"disable_update_check" toml:"disable_update_check"`
 	NoSync               bool                   `json:"-" toml:"-"`
 	PG                   PGConfig               `json:"pg,omitempty" toml:"pg"`
+	DefaultPG            string                 `json:"default_pg,omitempty" toml:"default_pg"`
+	PGTargets            map[string]PGConfig    `json:"-" toml:"-"`
 	DuckDB               DuckDBConfig           `json:"duckdb,omitempty" toml:"duckdb"`
 	Automated            AutomatedConfig        `json:"automated,omitempty" toml:"automated"`
 	Agent                map[string]AgentConfig `json:"agent,omitempty" toml:"agent"`
@@ -148,9 +194,11 @@ type Config struct {
 	// work during bursts of sync activity. Zero disables coalescing.
 	EventsCoalesceInterval time.Duration `json:"events_coalesce_interval,omitempty" toml:"events_coalesce_interval"`
 
+	DaemonIdleTimeout time.Duration `json:"daemon_idle_timeout,omitempty" toml:"daemon_idle_timeout"`
+
 	CustomModelPricing map[string]CustomModelRate `json:"custom_model_pricing,omitempty" toml:"custom_model_pricing"`
 
-	// RemoteHosts is the config-file list of SSH targets that
+	// RemoteHosts is the config-file list of remote targets that
 	// `agentsview sync` (with no --host) syncs after the local
 	// pass. CLI/config-file only; never serialized to the
 	// settings API, so there is no web-UI editing of this list.
@@ -160,6 +208,8 @@ type Config struct {
 	// Used to prevent auto-bind to 0.0.0.0 when the user
 	// explicitly requested a specific host.
 	HostExplicit bool `json:"-" toml:"-"`
+
+	pgEnvOverrides pgEnvOverrides
 }
 
 type dirSource int
@@ -187,15 +237,18 @@ func (c *Config) IsUserConfigured(
 }
 
 // ValidateRemoteHosts checks the configured remote_hosts entries
-// for semantic errors: a non-empty host and a port within 0..65535
-// (0 means the ssh default). It checks the trimmed values that
-// loadFile already normalized, so what is validated here is exactly
-// what is passed to ssh. Returns an aggregated error naming every
+// for semantic errors. It checks the trimmed values that loadFile
+// already normalized, so what is validated here is exactly what is
+// passed to remote sync. Returns an aggregated error naming every
 // offending entry, or nil when all entries are valid.
 func (c Config) ValidateRemoteHosts() error {
 	var problems []string
 	seen := make(map[string]int, len(c.RemoteHosts))
 	for i, h := range c.RemoteHosts {
+		transport := h.Transport
+		if transport == "" {
+			transport = RemoteTransportSSH
+		}
 		if h.Host == "" {
 			problems = append(problems,
 				fmt.Sprintf("entry %d: host is required", i+1))
@@ -214,6 +267,49 @@ func (c Config) ValidateRemoteHosts() error {
 			problems = append(problems,
 				fmt.Sprintf("entry %d (%q): invalid port %d",
 					i+1, h.Host, h.Port))
+		}
+		if h.Interval < 0 {
+			problems = append(problems,
+				fmt.Sprintf("entry %d (%q): invalid interval %s",
+					i+1, h.Host, h.Interval))
+		}
+		switch transport {
+		case RemoteTransportSSH:
+			if h.URL != "" {
+				problems = append(problems,
+					fmt.Sprintf("entry %d (%q): url is only valid for http",
+						i+1, h.Host))
+			}
+			if h.Token != "" {
+				problems = append(problems,
+					fmt.Sprintf("entry %d (%q): token is only valid for http",
+						i+1, h.Host))
+			}
+		case RemoteTransportHTTP:
+			if h.User != "" {
+				problems = append(problems,
+					fmt.Sprintf("entry %d (%q): user is only valid for ssh",
+						i+1, h.Host))
+			}
+			if h.Port != 0 {
+				problems = append(problems,
+					fmt.Sprintf("entry %d (%q): port is only valid for ssh",
+						i+1, h.Host))
+			}
+			if err := validateRemoteHTTPURL(h.URL); err != nil {
+				problems = append(problems,
+					fmt.Sprintf("entry %d (%q): %v",
+						i+1, h.Host, err))
+			}
+			if h.Token == "" {
+				problems = append(problems,
+					fmt.Sprintf("entry %d (%q): token is required for http",
+						i+1, h.Host))
+			}
+		default:
+			problems = append(problems,
+				fmt.Sprintf("entry %d (%q): invalid transport %q",
+					i+1, h.Host, h.Transport))
 		}
 		// Remote sync namespaces sessions and the skip cache by
 		// host alone (see ssh.RemoteSync), so two entries sharing a
@@ -236,6 +332,34 @@ func (c Config) ValidateRemoteHosts() error {
 	return nil
 }
 
+func validateRemoteHTTPURL(raw string) error {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return fmt.Errorf("url is required")
+	}
+	u, err := url.Parse(value)
+	if err != nil {
+		return fmt.Errorf("invalid url: %w", err)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return fmt.Errorf("url must use http or https")
+	}
+	if u.Hostname() == "" {
+		return fmt.Errorf("url must include a host")
+	}
+	if u.User != nil {
+		return fmt.Errorf("url must not include userinfo")
+	}
+	if u.RawQuery != "" || u.ForceQuery {
+		return fmt.Errorf("url must not include query")
+	}
+	if u.Fragment != "" || u.RawFragment != "" || strings.Contains(value, "#") {
+		return fmt.Errorf("url must not include fragment")
+	}
+	return nil
+}
+
 func isSSHOptionShaped(value string) bool {
 	return strings.HasPrefix(strings.TrimSpace(value), "-")
 }
@@ -254,7 +378,15 @@ func Default() (Config, error) {
 	agentDirSource := make(map[parser.AgentType]dirSource)
 	for _, def := range parser.Registry {
 		dirs := make([]string, len(def.DefaultDirs))
+		root := ""
+		if def.DefaultRootEnvVar != "" {
+			root = os.Getenv(def.DefaultRootEnvVar)
+		}
 		for i, rel := range def.DefaultDirs {
+			if root != "" {
+				dirs[i] = reRootDefaultDir(root, rel)
+				continue
+			}
 			dirs[i] = filepath.Join(home, rel)
 		}
 		agentDirs[def.Type] = dirs
@@ -272,8 +404,17 @@ func Default() (Config, error) {
 		WatchExcludePatterns:           []string{".git", "node_modules", "__pycache__", ".venv", "venv", "vendor", ".next"},
 		ResultContentBlockedCategories: []string{"Read", "Glob"},
 		EventsCoalesceInterval:         10 * time.Second,
+		DaemonIdleTimeout:              20 * time.Minute,
 		Agent:                          map[string]AgentConfig{},
 	}, nil
+}
+
+func reRootDefaultDir(root, rel string) string {
+	rel = filepath.Clean(rel)
+	if _, tail, ok := strings.Cut(rel, string(filepath.Separator)); ok && tail != "" {
+		return filepath.Join(root, tail)
+	}
+	return root
 }
 
 // Load builds a Config by layering: defaults < config file < env < flags.
@@ -522,6 +663,10 @@ func (c *Config) applyConfigTOML(data string) error {
 	var file struct {
 		GithubToken                    string                     `toml:"github_token"`
 		CursorSecret                   string                     `toml:"cursor_secret"`
+		CursorAdminAPIKey              string                     `toml:"cursor_admin_api_key"`
+		CursorAdminEmail               string                     `toml:"cursor_admin_email"`
+		CursorAdminUserID              string                     `toml:"cursor_admin_user_id"`
+		Host                           string                     `toml:"host"`
 		PublicURL                      string                     `toml:"public_url"`
 		PublicOrigins                  []string                   `toml:"public_origins"`
 		Proxy                          ProxyConfig                `toml:"proxy"`
@@ -532,11 +677,13 @@ func (c *Config) applyConfigTOML(data string) error {
 		RequireAuth                    bool                       `toml:"require_auth"`
 		RemoteAccess                   bool                       `toml:"remote_access"`
 		DisableUpdateCheck             bool                       `toml:"disable_update_check"`
+		DefaultPG                      string                     `toml:"default_pg"`
 		PG                             PGConfig                   `toml:"pg"`
 		DuckDB                         DuckDBConfig               `toml:"duckdb"`
 		Automated                      AutomatedConfig            `toml:"automated"`
 		Agent                          map[string]AgentConfig     `toml:"agent"`
 		EventsCoalesceInterval         time.Duration              `toml:"events_coalesce_interval"`
+		DaemonIdleTimeout              time.Duration              `toml:"daemon_idle_timeout"`
 		CustomModelPricing             map[string]CustomModelRate `toml:"custom_model_pricing"`
 		RemoteHosts                    []RemoteHost               `toml:"remote_hosts"`
 	}
@@ -544,11 +691,27 @@ func (c *Config) applyConfigTOML(data string) error {
 	if err != nil {
 		return fmt.Errorf("parsing config: %w", err)
 	}
+	var raw map[string]any
+	if _, err := toml.Decode(data, &raw); err != nil {
+		return fmt.Errorf("parsing config raw: %w", err)
+	}
 	if file.GithubToken != "" {
 		c.GithubToken = file.GithubToken
 	}
 	if file.CursorSecret != "" {
 		c.CursorSecret = file.CursorSecret
+	}
+	if file.CursorAdminAPIKey != "" && c.CursorAdminAPIKey == "" {
+		c.CursorAdminAPIKey = file.CursorAdminAPIKey
+	}
+	if file.CursorAdminEmail != "" && c.CursorAdminEmail == "" {
+		c.CursorAdminEmail = file.CursorAdminEmail
+	}
+	if file.CursorAdminUserID != "" && c.CursorAdminUserID == "" {
+		c.CursorAdminUserID = file.CursorAdminUserID
+	}
+	if file.Host != "" {
+		c.Host = file.Host
 	}
 	if file.PublicURL != "" {
 		c.PublicURL = file.PublicURL
@@ -571,30 +734,41 @@ func (c *Config) applyConfigTOML(data string) error {
 	if file.Terminal.Mode != "" {
 		c.Terminal = file.Terminal
 	}
-	if file.AuthToken != "" {
+	if file.AuthToken != "" && c.AuthToken == "" {
 		c.AuthToken = file.AuthToken
 	}
 	c.RequireAuth = file.RequireAuth || file.RemoteAccess
 	c.DisableUpdateCheck = file.DisableUpdateCheck
-	// Merge pg field-by-field so env vars override only
-	// the fields they set, preserving config-file settings.
-	if file.PG.URL != "" && c.PG.URL == "" {
-		c.PG.URL = file.PG.URL
+	if meta.IsDefined("default_pg") {
+		c.DefaultPG = normalizePGTargetName(file.DefaultPG)
 	}
-	if file.PG.Schema != "" && c.PG.Schema == "" {
-		c.PG.Schema = file.PG.Schema
+	legacyPG, namedPG, err := parsePGConfigSection(raw["pg"])
+	if err != nil {
+		return fmt.Errorf("pg: %w", err)
 	}
-	if file.PG.MachineName != "" && c.PG.MachineName == "" {
-		c.PG.MachineName = file.PG.MachineName
-	}
-	if file.PG.AllowInsecure {
-		c.PG.AllowInsecure = true
-	}
-	if file.PG.Projects != nil && c.PG.Projects == nil {
-		c.PG.Projects = file.PG.Projects
-	}
-	if file.PG.ExcludeProjects != nil && c.PG.ExcludeProjects == nil {
-		c.PG.ExcludeProjects = file.PG.ExcludeProjects
+	if len(namedPG) > 0 {
+		c.PG = PGConfig{}
+		c.PGTargets = namedPG
+	} else {
+		c.PGTargets = nil
+		if legacyPG.URL != "" {
+			c.PG.URL = legacyPG.URL
+		}
+		if legacyPG.Schema != "" {
+			c.PG.Schema = legacyPG.Schema
+		}
+		if legacyPG.MachineName != "" {
+			c.PG.MachineName = legacyPG.MachineName
+		}
+		if legacyPG.AllowInsecure {
+			c.PG.AllowInsecure = true
+		}
+		if legacyPG.Projects != nil {
+			c.PG.Projects = legacyPG.Projects
+		}
+		if legacyPG.ExcludeProjects != nil {
+			c.PG.ExcludeProjects = legacyPG.ExcludeProjects
+		}
 	}
 	// Merge duckdb field-by-field so env vars override only
 	// the fields they set, preserving config-file settings.
@@ -625,8 +799,17 @@ func (c *Config) applyConfigTOML(data string) error {
 	if meta.IsDefined("events_coalesce_interval") {
 		c.EventsCoalesceInterval = file.EventsCoalesceInterval
 	}
+	if meta.IsDefined("daemon_idle_timeout") {
+		c.DaemonIdleTimeout = file.DaemonIdleTimeout
+	}
 	if file.Automated.Prefixes != nil {
 		c.Automated.Prefixes = file.Automated.Prefixes
+	}
+	if file.Automated.Substrings != nil {
+		c.Automated.Substrings = file.Automated.Substrings
+	}
+	if file.Automated.ExactMatches != nil {
+		c.Automated.ExactMatches = file.Automated.ExactMatches
 	}
 	if len(file.Agent) > 0 {
 		if c.Agent == nil {
@@ -648,9 +831,13 @@ func (c *Config) applyConfigTOML(data string) error {
 		hosts := make([]RemoteHost, len(file.RemoteHosts))
 		for i, h := range file.RemoteHosts {
 			hosts[i] = RemoteHost{
-				Host: strings.TrimSpace(h.Host),
-				User: strings.TrimSpace(h.User),
-				Port: h.Port,
+				Host:      strings.TrimSpace(h.Host),
+				Transport: RemoteTransport(strings.TrimSpace(string(h.Transport))),
+				User:      strings.TrimSpace(h.User),
+				Port:      h.Port,
+				URL:       strings.TrimSpace(h.URL),
+				Token:     strings.TrimSpace(h.Token),
+				Interval:  h.Interval,
 			}
 		}
 		c.RemoteHosts = hosts
@@ -658,10 +845,6 @@ func (c *Config) applyConfigTOML(data string) error {
 
 	// Parse config-file dir arrays for agents that have a
 	// ConfigKey. Only apply when not already set by env var.
-	var raw map[string]any
-	if _, err := toml.Decode(data, &raw); err != nil {
-		return fmt.Errorf("parsing config raw: %w", err)
-	}
 	for _, def := range parser.Registry {
 		if def.ConfigKey == "" {
 			continue
@@ -794,14 +977,35 @@ func (c *Config) loadEnv() {
 	if v := dataDirFromEnv(); v != "" {
 		c.DataDir = v
 	}
+	if v := os.Getenv("AGENTSVIEW_AUTH_TOKEN"); v != "" {
+		c.AuthToken = v
+	}
 	if v := os.Getenv("AGENTSVIEW_PG_URL"); v != "" {
-		c.PG.URL = v
+		c.pgEnvOverrides.URL = v
 	}
 	if v := os.Getenv("AGENTSVIEW_PG_SCHEMA"); v != "" {
-		c.PG.Schema = v
+		c.pgEnvOverrides.Schema = v
 	}
 	if v := os.Getenv("AGENTSVIEW_PG_MACHINE"); v != "" {
-		c.PG.MachineName = v
+		c.pgEnvOverrides.MachineName = v
+	}
+	if v := firstEnv(
+		"AGENTSVIEW_CURSOR_ADMIN_API_KEY",
+		"CURSOR_ADMIN_API_KEY",
+	); v != "" {
+		c.CursorAdminAPIKey = v
+	}
+	if v := firstEnv(
+		"AGENTSVIEW_CURSOR_ADMIN_EMAIL",
+		"CURSOR_ADMIN_EMAIL",
+	); v != "" {
+		c.CursorAdminEmail = v
+	}
+	if v := firstEnv(
+		"AGENTSVIEW_CURSOR_ADMIN_USER_ID",
+		"CURSOR_ADMIN_USER_ID",
+	); v != "" {
+		c.CursorAdminUserID = v
 	}
 	if v := os.Getenv("AGENTSVIEW_DUCKDB_PATH"); v != "" {
 		c.DuckDB.Path = v
@@ -818,6 +1022,15 @@ func (c *Config) loadEnv() {
 	if v := os.Getenv("AGENTSVIEW_DISABLE_UPDATE_CHECK"); v != "" {
 		c.DisableUpdateCheck = v == "1" || v == "true"
 	}
+}
+
+func firstEnv(names ...string) string {
+	for _, name := range names {
+		if v := os.Getenv(name); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 type stringListFlag []string
@@ -1070,6 +1283,9 @@ func finalize(cfg *Config) error {
 			return fmt.Errorf("invalid public url: %w", err)
 		}
 	}
+	if cfg.DaemonIdleTimeout < 0 {
+		return fmt.Errorf("invalid daemon_idle_timeout: %s", cfg.DaemonIdleTimeout)
+	}
 	return nil
 }
 
@@ -1306,6 +1522,109 @@ func hostLiteral(host string) string {
 	return host
 }
 
+func normalizePGTargetName(name string) string {
+	return strings.TrimSpace(strings.ToLower(name))
+}
+
+func isReservedPGTargetName(name string) bool {
+	switch normalizePGTargetName(name) {
+	case "all", "local":
+		return true
+	default:
+		return false
+	}
+}
+
+func decodePGConfigMap(raw map[string]any) (PGConfig, error) {
+	var buf bytes.Buffer
+	if err := toml.NewEncoder(&buf).Encode(raw); err != nil {
+		return PGConfig{}, fmt.Errorf("encoding pg config: %w", err)
+	}
+	var cfg PGConfig
+	if _, err := toml.Decode(buf.String(), &cfg); err != nil {
+		return PGConfig{}, fmt.Errorf("decoding pg config: %w", err)
+	}
+	return cfg, nil
+}
+
+func parsePGConfigSection(value any) (PGConfig, map[string]PGConfig, error) {
+	if value == nil {
+		return PGConfig{}, nil, nil
+	}
+	section, ok := value.(map[string]any)
+	if !ok {
+		return PGConfig{}, nil, fmt.Errorf("expected [pg] to be a table")
+	}
+	hasLegacyFields := false
+	hasNamedTargets := false
+	legacyRaw := make(map[string]any)
+	namedTargets := make(map[string]PGConfig)
+	seenNames := make(map[string]string)
+	for rawName, rawValue := range section {
+		name := normalizePGTargetName(rawName)
+		if _, ok := pgConfigKeys[name]; ok {
+			if _, nested := rawValue.(map[string]any); nested {
+				return PGConfig{}, nil, fmt.Errorf(
+					"[pg].%s must be a scalar or array field, not a nested table",
+					rawName,
+				)
+			}
+			hasLegacyFields = true
+			legacyRaw[rawName] = rawValue
+			continue
+		}
+		targetRaw, ok := rawValue.(map[string]any)
+		if !ok {
+			return PGConfig{}, nil, fmt.Errorf(
+				"[pg].%s must be a named target table",
+				rawName,
+			)
+		}
+		hasNamedTargets = true
+		if name == "" {
+			return PGConfig{}, nil, fmt.Errorf(
+				"named PG targets must not be blank",
+			)
+		}
+		if isReservedPGTargetName(name) {
+			return PGConfig{}, nil, fmt.Errorf(
+				"named PG target %q is reserved",
+				name,
+			)
+		}
+		if prev, exists := seenNames[name]; exists {
+			return PGConfig{}, nil, fmt.Errorf(
+				"named PG targets %q and %q normalize to the same name %q",
+				prev, rawName, name,
+			)
+		}
+		seenNames[name] = rawName
+		targetCfg, err := decodePGConfigMap(targetRaw)
+		if err != nil {
+			return PGConfig{}, nil, fmt.Errorf(
+				"[pg].%s: %w", rawName, err,
+			)
+		}
+		namedTargets[name] = targetCfg
+	}
+	if hasLegacyFields && hasNamedTargets {
+		return PGConfig{}, nil, fmt.Errorf(
+			"cannot mix legacy [pg] fields with named [pg.NAME] targets",
+		)
+	}
+	if hasLegacyFields {
+		legacyCfg, err := decodePGConfigMap(legacyRaw)
+		if err != nil {
+			return PGConfig{}, nil, err
+		}
+		return legacyCfg, nil, nil
+	}
+	if hasNamedTargets {
+		return PGConfig{}, namedTargets, nil
+	}
+	return PGConfig{}, nil, nil
+}
+
 // ResolveDataDir returns the effective data directory by applying
 // defaults and environment overrides, without reading any files.
 // Use this to determine where migration should target before
@@ -1321,10 +1640,114 @@ func ResolveDataDir() (string, error) {
 	return cfg.DataDir, nil
 }
 
-// ResolvePG returns a copy of PG config with defaults applied
-// and environment variables expanded in URL.
-func (c *Config) ResolvePG() (PGConfig, error) {
-	pg := c.PG
+// DefaultPGTargetName returns the effective named PG target for this config.
+func (c *Config) DefaultPGTargetName() (string, error) {
+	if len(c.PGTargets) == 0 {
+		if c.DefaultPG != "" {
+			return "", fmt.Errorf(
+				"default_pg requires named [pg.NAME] targets",
+			)
+		}
+		return "", nil
+	}
+	if c.DefaultPG != "" {
+		if _, ok := c.PGTargets[c.DefaultPG]; !ok {
+			return "", fmt.Errorf(
+				"default_pg %q does not match any named [pg.NAME] target",
+				c.DefaultPG,
+			)
+		}
+		return c.DefaultPG, nil
+	}
+	if len(c.PGTargets) == 1 {
+		for name := range c.PGTargets {
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf(
+		"default_pg is required when more than one [pg.NAME] target is defined",
+	)
+}
+
+func (c *Config) validatePGTargets() error {
+	_, err := c.DefaultPGTargetName()
+	return err
+}
+
+func (c *Config) PGTargetNames() ([]string, string, error) {
+	if err := c.validatePGTargets(); err != nil {
+		return nil, "", err
+	}
+	if len(c.PGTargets) == 0 {
+		return nil, "", nil
+	}
+	defaultName, err := c.DefaultPGTargetName()
+	if err != nil {
+		return nil, "", err
+	}
+	names := make([]string, 0, len(c.PGTargets))
+	for name := range c.PGTargets {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		if names[i] == defaultName {
+			return true
+		}
+		if names[j] == defaultName {
+			return false
+		}
+		return names[i] < names[j]
+	})
+	return names, defaultName, nil
+}
+
+// RawPGTarget returns the configured PG target before env expansion and
+// default-field synthesis. An empty name selects the effective default target.
+func (c *Config) RawPGTarget(name string) (PGConfig, error) {
+	if err := c.validatePGTargets(); err != nil {
+		return PGConfig{}, err
+	}
+	targetName := normalizePGTargetName(name)
+	if len(c.PGTargets) == 0 {
+		if targetName != "" {
+			return PGConfig{}, fmt.Errorf(
+				"pg target %q is not configured; config uses a single legacy [pg] block",
+				name,
+			)
+		}
+		return c.PG, nil
+	}
+	if targetName == "" {
+		var err error
+		targetName, err = c.DefaultPGTargetName()
+		if err != nil {
+			return PGConfig{}, err
+		}
+	}
+	targetCfg, ok := c.PGTargets[targetName]
+	if !ok {
+		return PGConfig{}, fmt.Errorf(
+			"pg target %q is not configured",
+			targetName,
+		)
+	}
+	return targetCfg, nil
+}
+
+func (c *Config) resolvePGConfig(
+	pg PGConfig, applyDefaultEnv bool,
+) (PGConfig, error) {
+	if applyDefaultEnv {
+		if c.pgEnvOverrides.URL != "" {
+			pg.URL = c.pgEnvOverrides.URL
+		}
+		if c.pgEnvOverrides.Schema != "" {
+			pg.Schema = c.pgEnvOverrides.Schema
+		}
+		if c.pgEnvOverrides.MachineName != "" {
+			pg.MachineName = c.pgEnvOverrides.MachineName
+		}
+	}
 	if pg.URL != "" {
 		expanded, err := expandBracedEnv(pg.URL)
 		if err != nil {
@@ -1343,6 +1766,83 @@ func (c *Config) ResolvePG() (PGConfig, error) {
 		pg.MachineName = h
 	}
 	return pg, nil
+}
+
+// ResolvePG returns the effective default PG target with defaults applied
+// and environment variables expanded in URL.
+func (c *Config) ResolvePG() (PGConfig, error) {
+	return c.ResolvePGTarget("")
+}
+
+// ResolvePGTarget resolves one named PG target, or the effective default
+// target when name is empty. In legacy single-target mode, only the empty
+// name is valid.
+func (c *Config) ResolvePGTarget(name string) (PGConfig, error) {
+	if err := c.validatePGTargets(); err != nil {
+		return PGConfig{}, err
+	}
+	targetName := normalizePGTargetName(name)
+	if len(c.PGTargets) == 0 {
+		if targetName != "" {
+			return PGConfig{}, fmt.Errorf(
+				"pg target %q is not configured; config uses a single legacy [pg] block",
+				name,
+			)
+		}
+		return c.resolvePGConfig(c.PG, true)
+	}
+	defaultName, err := c.DefaultPGTargetName()
+	if err != nil {
+		return PGConfig{}, err
+	}
+	if targetName == "" {
+		targetName = defaultName
+	}
+	targetCfg, ok := c.PGTargets[targetName]
+	if !ok {
+		return PGConfig{}, fmt.Errorf(
+			"pg target %q is not configured",
+			targetName,
+		)
+	}
+	return c.resolvePGConfig(targetCfg, targetName == defaultName)
+}
+
+// ResolvePGTargets resolves every configured PG target. Legacy single-target
+// mode returns one unnamed default target.
+func (c *Config) ResolvePGTargets() ([]ResolvedPGTarget, error) {
+	if err := c.validatePGTargets(); err != nil {
+		return nil, err
+	}
+	if len(c.PGTargets) == 0 {
+		pg, err := c.resolvePGConfig(c.PG, true)
+		if err != nil {
+			return nil, err
+		}
+		return []ResolvedPGTarget{{
+			Config:    pg,
+			IsDefault: true,
+		}}, nil
+	}
+	names, defaultName, err := c.PGTargetNames()
+	if err != nil {
+		return nil, err
+	}
+	targets := make([]ResolvedPGTarget, 0, len(names))
+	for _, name := range names {
+		targetCfg, err := c.resolvePGConfig(
+			c.PGTargets[name], name == defaultName,
+		)
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, ResolvedPGTarget{
+			Name:      name,
+			Config:    targetCfg,
+			IsDefault: name == defaultName,
+		})
+	}
+	return targets, nil
 }
 
 // ResolveDuckDB returns a copy of DuckDB config with defaults applied

@@ -5,7 +5,6 @@ package duckdb
 import (
 	"context"
 	"encoding/json"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -43,9 +42,7 @@ func activityReportStore(
 	}
 	_, err := local.WriteSessionBatchAtomic(writes)
 	require.NoError(t, err)
-	syncer := newTestSync(t,
-		filepath.Join(t.TempDir(), "daily-report.duckdb"),
-		local, SyncOptions{})
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	return NewStoreFromDB(syncer.DB())
@@ -122,6 +119,102 @@ func TestDuckGetActivityReportUsageCostAndTokens(t *testing.T) {
 	assert.Equal(t, 500, r.Totals.OutputTokens)
 	// Cost = (1000*3 + 500*15) / 1e6 = 0.0105
 	assert.InDelta(t, 0.0105, r.Totals.Cost, 1e-9)
+}
+
+func TestDuckGetActivityReportPricingModelsOnlyIncludeDedupSurvivors(t *testing.T) {
+	ctx := context.Background()
+	earlier := syncSession("earlier", "proj1", "first", "2026-06-14T10:30:00.000Z", 1)
+	earlier.Agent = "claude"
+	earlierMsg := syncMessage("earlier", 0, "assistant", "x", "2026-06-14T10:30:00.000Z")
+	earlierMsg.Model = "kept-model"
+	earlierMsg.TokenUsage = json.RawMessage(
+		`{"input_tokens":1000,"output_tokens":500}`)
+	earlierMsg.OutputTokens = 500
+	earlierMsg.ClaudeMessageID = "m-dup"
+	earlierMsg.ClaudeRequestID = "r-dup"
+
+	later := syncSession("later", "proj1", "first", "2026-06-14T10:31:00.000Z", 1)
+	later.Agent = "claude"
+	laterMsg := syncMessage("later", 0, "assistant", "x", "2026-06-14T10:31:00.000Z")
+	laterMsg.Model = "discarded-model"
+	laterMsg.TokenUsage = json.RawMessage(
+		`{"input_tokens":2000,"output_tokens":900}`)
+	laterMsg.OutputTokens = 900
+	laterMsg.ClaudeMessageID = "m-dup"
+	laterMsg.ClaudeRequestID = "r-dup"
+
+	writes := []db.SessionBatchWrite{
+		{
+			Session:         earlier,
+			Messages:        []db.Message{earlierMsg},
+			DataVersion:     1,
+			ReplaceMessages: true,
+		},
+		{
+			Session:         later,
+			Messages:        []db.Message{laterMsg},
+			DataVersion:     1,
+			ReplaceMessages: true,
+		},
+	}
+	pricing := []db.ModelPricing{
+		{ModelPattern: "kept-model", InputPerMTok: 3.0, OutputPerMTok: 15.0},
+		{ModelPattern: "discarded-model", InputPerMTok: 3.0, OutputPerMTok: 15.0},
+	}
+	store := activityReportStore(t, writes, pricing)
+
+	r, err := store.GetActivityReport(
+		ctx, db.AnalyticsFilter{Timezone: "UTC"},
+		duckDayQuery(t, "2026-06-14", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, 500, r.Totals.OutputTokens)
+	require.NotNil(t, r.Pricing)
+	assert.Contains(t, r.Pricing.Models, "kept-model")
+	assert.NotContains(t, r.Pricing.Models, "discarded-model")
+}
+
+func TestDuckGetActivityReportPreservesSessionSummaryUsageEventTokens(t *testing.T) {
+	ctx := context.Background()
+	rawInput := db.MaxPlausibleTokens + 250_000
+	rawOutput := db.MaxPlausibleTokens + 500_000
+	sessionID := "summary-activity"
+	sess := syncSession(sessionID, "proj1", "first", "2026-06-14T10:30:00.000Z", 1)
+	sess.Agent = "hermes"
+	sess.TotalOutputTokens = rawOutput
+	sess.PeakContextTokens = rawInput
+	sess.HasTotalOutputTokens = true
+	sess.HasPeakContextTokens = true
+	msg := syncMessage(sessionID, 0, "user", "first", "2026-06-14T10:30:00.000Z")
+	msg.Model = ""
+	msg.TokenUsage = nil
+	writes := []db.SessionBatchWrite{{
+		Session:  sess,
+		Messages: []db.Message{msg},
+		UsageEvents: []db.UsageEvent{{
+			Source:       "session",
+			Model:        "summary-model",
+			InputTokens:  rawInput,
+			OutputTokens: rawOutput,
+			OccurredAt:   "2026-06-14T10:30:00.000Z",
+			DedupKey:     "summary",
+		}},
+		DataVersion:     1,
+		ReplaceMessages: true,
+	}}
+	pricing := []db.ModelPricing{{
+		ModelPattern:  "summary-model",
+		InputPerMTok:  1,
+		OutputPerMTok: 2,
+	}}
+	store := activityReportStore(t, writes, pricing)
+
+	r, err := store.GetActivityReport(
+		ctx, db.AnalyticsFilter{Timezone: "UTC"},
+		duckDayQuery(t, "2026-06-14", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, rawOutput, r.Totals.OutputTokens)
+	wantCost := (float64(rawInput)*1 + float64(rawOutput)*2) / 1_000_000
+	assert.InDelta(t, wantCost, r.Totals.Cost, 1e-9)
 }
 
 // TestDuckGetActivityReportExcludesIneligibleUsage confirms the DuckDB

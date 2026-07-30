@@ -110,6 +110,45 @@ func TestInsights_GetNonexistent(t *testing.T) {
 	assert.Nil(t, got, "expected nil")
 }
 
+func insertInsightFixtures(t *testing.T, d *DB, entries []Insight) []int64 {
+	t.Helper()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	tx, err := d.getWriter().Begin()
+	require.NoError(t, err, "begin insights seed tx")
+	defer func() { _ = tx.Rollback() }()
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO insights (
+			type, date_from, date_to, project,
+			agent, model, prompt, content,
+			kind, schema_version, template_id,
+			template_version, aggregate_hash, cache_key,
+			cache_status, provenance_json, structured_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	require.NoError(t, err, "prepare insights seed")
+	defer func() { _ = stmt.Close() }()
+
+	ids := make([]int64, 0, len(entries))
+	for i, s := range entries {
+		res, err := stmt.Exec(
+			s.Type, s.DateFrom, s.DateTo, s.Project,
+			s.Agent, s.Model, s.Prompt, s.Content,
+			s.Kind, s.SchemaVersion, s.TemplateID,
+			s.TemplateVersion, s.AggregateHash, s.CacheKey,
+			s.CacheStatus, s.ProvenanceJSON, s.StructuredJSON,
+		)
+		require.NoError(t, err, "insert insight fixture %d", i)
+		id, err := res.LastInsertId()
+		require.NoError(t, err, "fixture insight id %d", i)
+		ids = append(ids, id)
+	}
+
+	require.NoError(t, tx.Commit(), "commit insights seed")
+	return ids
+}
+
 func TestListInsights(t *testing.T) {
 	ctx := context.Background()
 
@@ -120,10 +159,10 @@ func TestListInsights(t *testing.T) {
 			{Type: "agent_analysis", DateFrom: "2025-01-15", DateTo: "2025-01-15", Agent: "claude", Content: "Analysis"},
 			{Type: "daily_activity", DateFrom: "2025-01-16", DateTo: "2025-01-16", Project: new("app-a"), Agent: "claude", Content: "Day 2 app-a"},
 		}
-		var ids []int64
-		for _, s := range entries {
-			id, err := d.InsertInsight(s)
-			require.NoError(t, err, "InsertInsight")
+		ids := make([]int64, 0, len(entries))
+		for i, insight := range entries {
+			id, err := d.InsertInsight(insight)
+			require.NoError(t, err, "InsertInsight %d", i)
 			ids = append(ids, id)
 		}
 		return ids
@@ -194,7 +233,7 @@ func TestListInsights(t *testing.T) {
 		{
 			name: "OrderByCreatedAtDesc",
 			seed: func(t *testing.T, d *DB) []int64 {
-				var ids []int64
+				ids := make([]int64, 0, 3)
 				for _, content := range []string{"first", "second", "third"} {
 					id, err := d.InsertInsight(Insight{
 						Type:     "daily_activity",
@@ -217,19 +256,17 @@ func TestListInsights(t *testing.T) {
 			name: "CappedAt500",
 			seed: func(t *testing.T, d *DB) []int64 {
 				const total = 502
-				var ids []int64
+				entries := make([]Insight, 0, total)
 				for i := range total {
-					id, err := d.InsertInsight(Insight{
+					entries = append(entries, Insight{
 						Type:     "daily_activity",
 						DateFrom: "2025-01-15",
 						DateTo:   "2025-01-15",
 						Agent:    "claude",
 						Content:  fmt.Sprintf("insight %d", i),
 					})
-					require.NoError(t, err, "InsertInsight %d", i)
-					ids = append(ids, id)
 				}
-				return ids
+				return insertInsightFixtures(t, d, entries)
 			},
 			filter: InsightFilter{},
 			verify: func(t *testing.T, got []Insight, ids []int64) {

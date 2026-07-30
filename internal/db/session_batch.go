@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+
+	"go.kenn.io/agentsview/internal/export"
 )
 
 // SessionBatchWrite is one full session rewrite for a bulk
@@ -11,13 +13,14 @@ import (
 // complete message set to store, the computed signal values,
 // and the data version to stamp after messages are written.
 type SessionBatchWrite struct {
-	Session         Session
-	Messages        []Message
-	UsageEvents     []UsageEvent
-	Signals         SessionSignalUpdate
-	Findings        []SecretFinding
-	DataVersion     int
-	ReplaceMessages bool
+	Session             Session
+	Messages            []Message
+	UsageEvents         []UsageEvent
+	IdentityObservation export.ProjectIdentityObservation
+	Signals             SessionSignalUpdate
+	Findings            []SecretFinding
+	DataVersion         int
+	ReplaceMessages     bool
 }
 
 // SessionBatchResult summarizes a WriteSessionBatch call.
@@ -59,6 +62,7 @@ func (db *DB) WriteSessionBatch(
 	defer func() { _ = tx.Rollback() }()
 
 	for i, write := range writes {
+		write = sanitizeSessionBatchWrite(write)
 		savepoint := fmt.Sprintf("session_batch_%d", i)
 		if _, err := tx.Exec("SAVEPOINT " + savepoint); err != nil {
 			return result, fmt.Errorf(
@@ -127,6 +131,7 @@ func (db *DB) WriteSessionBatchAtomic(
 	defer func() { _ = tx.Rollback() }()
 
 	for _, write := range writes {
+		write = sanitizeSessionBatchWrite(write)
 		messagesWritten, err := writeOneSessionBatchTx(tx, write)
 		if err != nil {
 			result.WrittenSessions = 0
@@ -161,6 +166,88 @@ func (db *DB) WriteSessionBatchAtomic(
 		return result, fmt.Errorf("committing batch tx: %w", err)
 	}
 	return result, nil
+}
+
+func sanitizeSessionBatchWrite(write SessionBatchWrite) SessionBatchWrite {
+	write.Messages = append([]Message(nil), write.Messages...)
+	write.UsageEvents = append([]UsageEvent(nil), write.UsageEvents...)
+
+	msgTotal, msgHasOut, msgPeak, msgHasCtx :=
+		batchMessageTokenTotals(write.Messages)
+	evtTotal, evtHasOut, evtPeak, evtHasCtx :=
+		batchUsageEventTokenTotals(write.UsageEvents)
+	totalFromMsgs := write.Session.HasTotalOutputTokens == msgHasOut &&
+		write.Session.TotalOutputTokens == msgTotal
+	totalFromEvts := write.Session.HasTotalOutputTokens == evtHasOut &&
+		write.Session.TotalOutputTokens == evtTotal
+	peakFromMsgs := write.Session.HasPeakContextTokens == msgHasCtx &&
+		write.Session.PeakContextTokens == msgPeak
+	peakFromEvts := write.Session.HasPeakContextTokens == evtHasCtx &&
+		write.Session.PeakContextTokens == evtPeak
+
+	_ = ValidateAndSanitize(&write.Session, write.Messages, write.UsageEvents)
+
+	if totalFromMsgs {
+		t, h, _, _ := batchMessageTokenTotals(write.Messages)
+		write.Session.TotalOutputTokens = t
+		write.Session.HasTotalOutputTokens = h
+	} else if totalFromEvts {
+		t, h, _, _ := batchUsageEventTokenTotals(write.UsageEvents)
+		write.Session.TotalOutputTokens = t
+		write.Session.HasTotalOutputTokens = h
+	}
+	if peakFromMsgs {
+		_, _, p, h := batchMessageTokenTotals(write.Messages)
+		write.Session.PeakContextTokens = p
+		write.Session.HasPeakContextTokens = h
+	} else if peakFromEvts {
+		_, _, p, h := batchUsageEventTokenTotals(write.UsageEvents)
+		write.Session.PeakContextTokens = p
+		write.Session.HasPeakContextTokens = h
+	}
+	return write
+}
+
+func batchMessageTokenTotals(
+	msgs []Message,
+) (totalOut int, hasOut bool, peakCtx int, hasCtx bool) {
+	for _, msg := range msgs {
+		if msg.HasOutputTokens {
+			hasOut = true
+			totalOut += msg.OutputTokens
+		}
+		if msg.HasContextTokens {
+			hasCtx = true
+			if msg.ContextTokens > peakCtx {
+				peakCtx = msg.ContextTokens
+			}
+		}
+	}
+	return totalOut, hasOut, peakCtx, hasCtx
+}
+
+func batchUsageEventTokenTotals(
+	events []UsageEvent,
+) (totalOut int, hasOut bool, peakCtx int, hasCtx bool) {
+	for _, ev := range events {
+		if ev.Source == "session" {
+			continue
+		}
+		if ev.OutputTokens > 0 {
+			hasOut = true
+			totalOut += ev.OutputTokens
+		}
+		context := ev.InputTokens +
+			ev.CacheCreationInputTokens +
+			ev.CacheReadInputTokens
+		if context > 0 {
+			hasCtx = true
+			if context > peakCtx {
+				peakCtx = context
+			}
+		}
+	}
+	return totalOut, hasOut, peakCtx, hasCtx
 }
 
 func rollbackSavepoint(tx *sql.Tx, savepoint string) error {
@@ -220,6 +307,13 @@ func writeOneSessionBatchTx(
 			write.Session.ID, err,
 		)
 	}
+	if write.IdentityObservation.Project != "" {
+		if err := upsertProjectIdentityObservationTx(
+			tx, write.IdentityObservation,
+		); err != nil {
+			return 0, err
+		}
+	}
 	if err := replaceSessionUsageEventsTx(
 		tx, write.Session.ID, write.UsageEvents,
 	); err != nil {
@@ -260,6 +354,13 @@ func writeOneSessionBatchTx(
 	}
 	if write.ReplaceMessages {
 		if err := restorePinsTx(tx, write.Session.ID, pins); err != nil {
+			return 0, err
+		}
+		// A full message replacement re-normalizes every row, so this row is
+		// no longer incremental-append skew. The append-only branch
+		// (ReplaceMessages=false) deliberately leaves the marker untouched so
+		// earlier incrementally written rows stay flagged for parse-diff.
+		if err := resetIncrementalMarkerTx(tx, write.Session.ID); err != nil {
 			return 0, err
 		}
 	}

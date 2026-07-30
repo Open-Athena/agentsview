@@ -67,46 +67,70 @@ func buildAiderResolveSnippet(envVar string) string {
 // "agentType:path\n" per agent target, plus "@file:path\n" lines for sibling
 // metadata files such as Codex's session_index.jsonl.
 //
-// Only includes agents where FileBased is true and DiscoverFunc
-// is non-nil. For each agent with an EnvVar, the script checks
-// the env var first and falls back to the default dir. Dirs (and
-// files) that don't exist on the remote are skipped.
+// Only includes file-backed agents whose local sources are resolved via their
+// provider facade. For each agent with an EnvVar, the script checks the env var
+// first and falls back to the default dir. Dirs (and files) that don't exist on
+// the remote are skipped.
 func buildResolveScript() string {
 	var b strings.Builder
 	for _, def := range parser.Registry {
-		if !def.FileBased || def.DiscoverFunc == nil {
+		if !resolveAgentHasOnDiskSource(def) {
+			continue
+		}
+		// Aider has no central store and no safe default root: it writes
+		// one .aider.chat.history.md per repository, so after the opt-in
+		// change it carries no DefaultDirs and the DefaultDirs loop below
+		// never runs for it. Handle it independently so an explicitly
+		// configured remote AIDER_DIR still resolves history files. Remote
+		// sync emits only discovered .aider.chat.history.md files as tar
+		// targets, never the configured code root or the remote $HOME. The
+		// shell guard in buildAiderResolveSnippet also drops AIDER_DIR set
+		// to literal "$HOME" (or "$HOME/"), so an unscoped override cannot
+		// reintroduce a whole-home scan or tar. Local sync is unaffected:
+		// it discovers via its provider facade, not this script.
+		if def.Type == parser.AgentAider {
+			if def.EnvVar != "" {
+				b.WriteString(buildAiderResolveSnippet(def.EnvVar))
+			}
 			continue
 		}
 		for _, rel := range def.DefaultDirs {
-			// Aider's only default dir is "" (the bare home directory):
-			// it has no central store and discovers history files by a
-			// bounded, depth-capped walk of $HOME. The remote resolver emits
-			// tar targets, so emitting the "" default would archive the
-			// entire remote $HOME. Skip aider's bare-home default. When
-			// AIDER_DIR explicitly scopes discovery to a code root, emit only
-			// discovered .aider.chat.history.md files as tar targets instead
-			// of the whole source tree. Local sync is unaffected: it walks
-			// DefaultDirs via DiscoverFunc, not this script. The shell guard
-			// below also drops AIDER_DIR if it is set to literal "$HOME" (or
-			// "$HOME/"), so an unscoped override cannot reintroduce a
-			// whole-home scan or tar.
-			if def.Type == parser.AgentAider && rel == "" {
-				if def.EnvVar != "" {
-					b.WriteString(buildAiderResolveSnippet(def.EnvVar))
-				}
-				continue
-			}
 			defaultDir := "$HOME/" + rel
-			dirExpr := defaultDir
-			if def.EnvVar != "" {
-				// env var overrides default
-				dirExpr = fmt.Sprintf("${%s:-%s}", def.EnvVar, defaultDir)
+			if def.DefaultRootEnvVar != "" {
+				rootTail := remoteDefaultRootTail(rel)
+				fmt.Fprintf(&b, "dir=\"")
+				if def.EnvVar != "" {
+					fmt.Fprintf(&b, "${%s:-}", def.EnvVar)
+				}
+				fmt.Fprintf(&b, "\"; ")
+				fmt.Fprintf(&b, "root=\"${%s:-}\"; ", def.DefaultRootEnvVar)
+				if rootTail != "" {
+					fmt.Fprintf(&b,
+						"[ -z \"$dir\" ] && [ -n \"$root\" ] && dir=\"$root/%s\"; ",
+						rootTail,
+					)
+				} else {
+					fmt.Fprintf(&b,
+						"[ -z \"$dir\" ] && [ -n \"$root\" ] && dir=\"$root\"; ",
+					)
+				}
+				fmt.Fprintf(&b,
+					"[ -n \"$dir\" ] || dir=\"%s\"; [ -d \"$dir\" ] && "+
+						"printf '%%s\\000' \"%s:$dir\"\n",
+					defaultDir, string(def.Type),
+				)
+			} else {
+				dirExpr := defaultDir
+				if def.EnvVar != "" {
+					// env var overrides default
+					dirExpr = fmt.Sprintf("${%s:-%s}", def.EnvVar, defaultDir)
+				}
+				fmt.Fprintf(&b,
+					"dir=\"%s\"; [ -d \"$dir\" ] && "+
+						"printf '%%s\\000' \"%s:$dir\"\n",
+					dirExpr, string(def.Type),
+				)
 			}
-			fmt.Fprintf(&b,
-				"dir=\"%s\"; [ -d \"$dir\" ] && "+
-					"printf '%%s\\000' \"%s:$dir\"\n",
-				dirExpr, string(def.Type),
-			)
 			// Codex stores renameable session titles in
 			// session_index.jsonl, which sits beside (not inside)
 			// sessions/ and archived_sessions/. Emit it so renames
@@ -126,6 +150,35 @@ func buildResolveScript() string {
 	// path doesn't exist, which would make sh exit non-zero.
 	b.WriteString("true\n")
 	return b.String()
+}
+
+// BuildResolveScriptForTest exposes the SSH resolver script to
+// internal/remotesync parity tests.
+func BuildResolveScriptForTest() string {
+	return buildResolveScript()
+}
+
+func remoteDefaultRootTail(rel string) string {
+	cleaned := path.Clean(rel)
+	if _, tail, ok := strings.Cut(cleaned, "/"); ok && tail != "" {
+		return tail
+	}
+	return ""
+}
+
+// resolveAgentHasOnDiskSource reports whether a file-backed agent has local
+// sources the resolve script should probe via the provider facade.
+func resolveAgentHasOnDiskSource(def parser.AgentDef) bool {
+	if !def.FileBased {
+		return false
+	}
+	switch parser.ProviderMigrationModes()[def.Type] {
+	case parser.ProviderMigrationProviderAuthoritative:
+		_, ok := parser.ProviderFactoryByType(def.Type)
+		return ok
+	default:
+		return false
+	}
 }
 
 // parseResolvedDirs parses script output into a map of agent type to transfer
@@ -167,6 +220,12 @@ func parseResolvedDirs(
 		dirs[at] = append(dirs[at], value)
 	}
 	return dirs, extraFiles
+}
+
+// ParseResolvedTargetsForTest exposes SSH resolver output parsing to
+// internal/remotesync parity tests.
+func ParseResolvedTargetsForTest(output string) (map[parser.AgentType][]string, []string) {
+	return parseResolvedDirs(output)
 }
 
 func resolveOutputRecords(output string) []string {

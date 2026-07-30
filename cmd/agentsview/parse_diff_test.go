@@ -4,16 +4,20 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/testjsonl"
@@ -54,20 +58,27 @@ func TestParseDiff_UnknownAgentListsSupported(t *testing.T) {
 		assert.Contains(t, err.Error(), want,
 			"error should list supported agent %q", want)
 	}
-	for _, unwanted := range []string{"forge", "piebald", "warp"} {
+	// The DB-backed provider-authoritative agents are re-parseable through
+	// their providers, so they appear in the supported list too.
+	for _, want := range []string{"forge", "devin", "piebald", "warp"} {
+		assert.Contains(t, err.Error(), want,
+			"error should list supported DB-backed agent %q", want)
+	}
+	// Import-only agents remain unsupported and must not be listed.
+	for _, unwanted := range []string{"claude-ai", "chatgpt"} {
 		assert.NotContains(t, err.Error(), unwanted,
-			"error should not list unsupported agent %q", unwanted)
+			"error should not list import-only agent %q", unwanted)
 	}
 }
 
 func TestParseDiff_RejectsAgentsWithoutOnDiskSource(t *testing.T) {
+	// Only import-only agents have no source to re-parse. The DB-backed
+	// provider-authoritative agents (Forge/Piebald/Warp) are re-parseable
+	// through their providers and are covered as supported elsewhere.
 	tests := []struct {
 		name  string
 		agent string
 	}{
-		{"database-backed forge", "forge"},
-		{"database-backed piebald", "piebald"},
-		{"database-backed warp", "warp"},
 		{"import-only claude-ai", "claude-ai"},
 		{"import-only chatgpt", "chatgpt"},
 	}
@@ -79,8 +90,7 @@ func TestParseDiff_RejectsAgentsWithoutOnDiskSource(t *testing.T) {
 				"parse-diff", "--agent", tc.agent)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), fmt.Sprintf(
-				"agent %q is not supported by parse-diff "+
-					"(no on-disk source to re-parse)", tc.agent))
+				"agent %q is not supported by parse-diff", tc.agent))
 		})
 	}
 }
@@ -108,6 +118,21 @@ func TestParseDiffAgentTypes(t *testing.T) {
 			want: []string{"claude"},
 		},
 		{
+			name: "provider authoritative agent",
+			in:   []string{"pi"},
+			want: []string{"pi"},
+		},
+		{
+			name: "provider authoritative shared provider family agent",
+			in:   []string{"omp"},
+			want: []string{"omp"},
+		},
+		{
+			name: "db-backed provider-authoritative agents",
+			in:   []string{"forge", "devin", "piebald", "warp"},
+			want: []string{"forge", "devin", "piebald", "warp"},
+		},
+		{
 			name: "trims and lowercases",
 			in:   []string{" Claude "},
 			want: []string{"claude"},
@@ -123,9 +148,9 @@ func TestParseDiffAgentTypes(t *testing.T) {
 			wantErr: `unknown agent "nope"`,
 		},
 		{
-			name:    "db-backed agent",
-			in:      []string{"forge"},
-			wantErr: "no on-disk source to re-parse",
+			name:    "import-only agent",
+			in:      []string{"claude-ai"},
+			wantErr: "is not supported by parse-diff",
 		},
 	}
 	for _, tc := range tests {
@@ -147,6 +172,53 @@ func TestParseDiffAgentTypes(t *testing.T) {
 			}
 			assert.Equal(t, tc.want, strs)
 		})
+	}
+}
+
+func TestParseDiffSupportedAgentsIncludesProviderAuthoritativeAgents(t *testing.T) {
+	supported := parseDiffSupportedAgents()
+	modes := parser.ProviderMigrationModes()
+	// Build the expected set from the registry so the contract covers every
+	// current provider-authoritative agent and stays correct as the migration
+	// manifest changes, rather than a hand-maintained subset. FileBased is not
+	// part of the gate: DB-backed provider-authoritative agents
+	// (Forge/Devin/Piebald/Warp) are re-parseable through their providers too.
+	checked := 0
+	for _, def := range parser.Registry {
+		if modes[def.Type] != parser.ProviderMigrationProviderAuthoritative {
+			continue
+		}
+		if _, ok := parser.ProviderFactoryByType(def.Type); !ok {
+			assert.False(t, parseDiffAgentSupported(def),
+				"parse-diff must exclude %s without a provider factory", def.Type)
+			assert.NotContains(t, supported, string(def.Type),
+				"parse-diff supported list must exclude %s without a provider factory", def.Type)
+			continue
+		}
+		checked++
+		assert.True(t, parseDiffAgentSupported(def),
+			"parse-diff support must include %s", def.Type)
+		assert.Contains(t, supported, string(def.Type),
+			"parse-diff supported list must include %s", def.Type)
+	}
+	require.Positive(t, checked,
+		"expected at least one provider-authoritative agent")
+
+	// Explicitly pin the DB-backed provider-authoritative agents so a
+	// regression that re-adds a FileBased gate to the parse-diff support
+	// check is caught by name, not just by the registry-wide sweep above.
+	for _, agent := range []parser.AgentType{
+		parser.AgentForge, parser.AgentDevin,
+		parser.AgentPiebald, parser.AgentWarp,
+	} {
+		def, ok := parser.AgentByType(agent)
+		require.True(t, ok, "agent %s", agent)
+		assert.False(t, def.FileBased,
+			"%s is expected to be DB-backed (FileBased=false)", agent)
+		assert.True(t, parseDiffAgentSupported(def),
+			"DB-backed %s must be supported by parse-diff", agent)
+		assert.Contains(t, supported, string(agent),
+			"parse-diff supported list must include DB-backed %s", agent)
 	}
 }
 
@@ -233,6 +305,21 @@ func TestParseDiffExitFailure(t *testing.T) {
 			wantFail:     true,
 		},
 		{
+			name: "raced sessions alone do not fail",
+			totals: sync.ParseDiffTotals{
+				Examined: 3, Identical: 2, Raced: 1,
+			},
+			failOnChange: true,
+		},
+		{
+			name: "a real change still fails alongside raced sessions",
+			totals: sync.ParseDiffTotals{
+				Examined: 4, Identical: 2, Changed: 1, Raced: 1,
+			},
+			failOnChange: true,
+			wantFail:     true,
+		},
+		{
 			name:         "vacuous run fails with stderr note",
 			totals:       sync.ParseDiffTotals{Examined: 5, PendingResync: 5},
 			failOnChange: true,
@@ -278,6 +365,18 @@ func changedSession(
 		SessionID: id,
 		Agent:     agent,
 		Class:     sync.DiffChanged,
+		Fields:    fields,
+	}
+}
+
+// skewSession builds a DiffIncrementalSkew SessionDiff fixture.
+func skewSession(
+	agent, id string, fields ...sync.FieldDiff,
+) sync.SessionDiff {
+	return sync.SessionDiff{
+		SessionID: id,
+		Agent:     agent,
+		Class:     sync.DiffIncrementalSkew,
 		Fields:    fields,
 	}
 }
@@ -432,6 +531,112 @@ func TestRenderParseDiffReport_CapAndVerbose(t *testing.T) {
 			"first_message: old -> new (lengths 3 vs 3)")
 		assert.Contains(t, out,
 			"termination_status: completed -> (null) [informational]")
+	})
+}
+
+func TestRenderParseDiffReport_IncrementalSkewCapAndVerbose(t *testing.T) {
+	var sessions []sync.SessionDiff
+	for i := range parseDiffChangedCap + 5 {
+		sessions = append(sessions, skewSession(
+			"claude",
+			fmt.Sprintf("skew-%02d", i),
+			sync.FieldDiff{
+				Field:  sync.FieldFirstMessage,
+				Stored: "old",
+				Parsed: "new",
+			},
+		))
+	}
+	r := &sync.ParseDiffReport{
+		Totals: sync.ParseDiffTotals{
+			Examined:        len(sessions),
+			IncrementalSkew: len(sessions),
+		},
+		Sessions: sessions,
+	}
+
+	t.Run("capped", func(t *testing.T) {
+		var buf bytes.Buffer
+		renderParseDiffReport(&buf, r, "db", "all agents", false)
+		out := buf.String()
+
+		assert.Contains(t, out, "Incremental-skew sessions",
+			"the skew drill-down section must be present")
+		assert.Contains(t, out,
+			"... (5 more; use --verbose or --json)")
+		assert.Contains(t, out, "skew-00")
+		assert.Contains(t, out,
+			fmt.Sprintf("skew-%02d", parseDiffChangedCap-1))
+		assert.NotContains(t, out,
+			fmt.Sprintf("skew-%02d", parseDiffChangedCap),
+			"sessions past the cap must be elided")
+		assert.Contains(t, out, "Incremental skew",
+			"the summary must include the incremental-skew line")
+	})
+
+	t.Run("verbose", func(t *testing.T) {
+		var buf bytes.Buffer
+		renderParseDiffReport(&buf, r, "db", "all agents", true)
+		out := buf.String()
+
+		assert.NotContains(t, out, "more; use --verbose",
+			"verbose output is never capped")
+		assert.Contains(t, out,
+			fmt.Sprintf("skew-%02d", parseDiffChangedCap+4),
+			"verbose lists every skew session")
+		assert.Contains(t, out, "first_message: old -> new")
+	})
+}
+
+// TestRenderParseDiffReport_ResyncNote pins the resync-baseline
+// recommendation: the note appears only when the report carries
+// incremental-skew sessions, and is absent otherwise.
+func TestRenderParseDiffReport_ResyncNote(t *testing.T) {
+	t.Run("note present when incremental skew > 0", func(t *testing.T) {
+		r := &sync.ParseDiffReport{
+			Totals: sync.ParseDiffTotals{
+				Examined:        2,
+				Identical:       1,
+				IncrementalSkew: 1,
+			},
+			Sessions: []sync.SessionDiff{
+				skewSession("claude", "skew-1", sync.FieldDiff{
+					Field:  sync.FieldFirstMessage,
+					Stored: "a", Parsed: "b",
+				}),
+			},
+		}
+		var buf bytes.Buffer
+		renderParseDiffReport(&buf, r, "db", "all agents", false)
+		out := buf.String()
+		assert.Contains(t, out,
+			"1 session(s) were last written through the "+
+				"incremental-append path",
+			"the resync note must report the skew count")
+		assert.Contains(t, out, "Run a full resync",
+			"the resync note must recommend a resync")
+	})
+
+	t.Run("note absent without incremental skew", func(t *testing.T) {
+		r := &sync.ParseDiffReport{
+			Totals: sync.ParseDiffTotals{
+				Examined:  2,
+				Identical: 1,
+				Changed:   1,
+			},
+			FieldCounts: map[string]int{sync.FieldFirstMessage: 1},
+			Sessions: []sync.SessionDiff{
+				changedSession("claude", "chg-1", sync.FieldDiff{
+					Field:  sync.FieldFirstMessage,
+					Stored: "a", Parsed: "b",
+				}),
+			},
+		}
+		var buf bytes.Buffer
+		renderParseDiffReport(&buf, r, "db", "all agents", false)
+		out := buf.String()
+		assert.NotContains(t, out, "incremental-append path",
+			"the resync note must not appear without skew sessions")
 	})
 }
 
@@ -665,8 +870,13 @@ func TestParseDiff_JSONSessionsAndDBPath(t *testing.T) {
 // phantom stored row keeps the test independent of the parser's session
 // ID derivation.
 func TestDoParseDiff_FailOnChangeDirections(t *testing.T) {
-	dataDir := testDataDir(t)
-	t.Setenv("HOME", t.TempDir())
+	// Isolate every other agent's directory env var to a temp path so an
+	// inherited dir from the developer or CI environment cannot be scanned and
+	// trip --fail-on-change with an unrelated parse error. The data dir and
+	// Claude dir are then overridden to the paths this test controls.
+	isolateParseDiffEnv(t)
+	dataDir := os.Getenv("AGENTSVIEW_DATA_DIR")
+	require.NotEmpty(t, dataDir)
 	claudeDir := t.TempDir()
 	t.Setenv("CLAUDE_PROJECTS_DIR", claudeDir)
 
@@ -683,8 +893,7 @@ func TestDoParseDiff_FailOnChangeDirections(t *testing.T) {
 	// A phantom stored row under that file at the current data version:
 	// the re-parse never emits this id, so it reports as a presence
 	// change (HasFailures() == true).
-	d, err := db.Open(filepath.Join(dataDir, "sessions.db"))
-	require.NoError(t, err)
+	d := dbtest.OpenTestDBAt(t, filepath.Join(dataDir, "sessions.db"))
 	require.NoError(t, d.UpsertSession(db.Session{
 		ID: "phantom-session", Project: "proj", Machine: "m",
 		Agent: "claude", MessageCount: 4, UserMessageCount: 2,
@@ -708,4 +917,136 @@ func TestDoParseDiff_FailOnChangeDirections(t *testing.T) {
 	})
 	assert.False(t, notFailed,
 		"without --fail-on-change the same drift must not fail")
+}
+
+// TestDoParseDiff_RacedSessionDoesNotFail is the end-to-end exit-code
+// proof of the live-write skew guard: a stored row whose source file
+// advanced past its snapshot file_mtime mid-run is reclassified raced,
+// so --fail-on-change exits clean even though the content diverged.
+// Staged through a real sync so the row's id, file_path, and file_mtime
+// are exactly what the parser derives, then drifted and the source mtime
+// pushed forward to simulate a daemon write after the snapshot.
+func TestDoParseDiff_RacedSessionDoesNotFail(t *testing.T) {
+	// Isolate every other agent's directory env var to a temp path so an
+	// inherited dir from the developer or CI environment cannot be scanned and
+	// trip --fail-on-change with an unrelated parse error. The data dir and
+	// Claude dir are then overridden to the paths this test controls.
+	isolateParseDiffEnv(t)
+	dataDir := t.TempDir()
+	t.Setenv("AGENTSVIEW_DATA_DIR", dataDir)
+	claudeDir := t.TempDir()
+	t.Setenv("CLAUDE_PROJECTS_DIR", claudeDir)
+
+	projDir := filepath.Join(claudeDir, "-home-proj")
+	require.NoError(t, os.MkdirAll(projDir, 0o755))
+	srcPath := filepath.Join(projDir, "raced-session.jsonl")
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUser("2026-01-01T00:00:00Z", "hello").
+		AddClaudeAssistant("2026-01-01T00:00:01Z", "hi").
+		String()
+	require.NoError(t, os.WriteFile(srcPath, []byte(content), 0o644))
+
+	dbPath := filepath.Join(dataDir, "sessions.db")
+	d := dbtest.OpenTestDBAt(t, dbPath)
+	engine := sync.NewEngine(d, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {claudeDir},
+		},
+		Machine: "local",
+	})
+	stats := engine.SyncAll(context.Background(), nil)
+	require.Equal(t, 1, stats.Synced, "one session synced")
+
+	// Find the synced session id so the drift targets the real row.
+	rows, err := d.ListSessionsModifiedBetween(
+		context.Background(), "", "", nil, nil,
+	)
+	require.NoError(t, err)
+	require.Len(t, rows, 1, "exactly one stored session")
+	sessionID := rows[0].ID
+
+	// Drift the stored row so a fresh parse reports a real change, then
+	// push the source mtime past the recorded snapshot file_mtime.
+	require.NoError(t, d.Update(func(tx *sql.Tx) error {
+		_, uerr := tx.Exec(
+			"UPDATE sessions SET first_message = ? WHERE id = ?",
+			"drifted first message", sessionID,
+		)
+		return uerr
+	}))
+	require.NoError(t, d.Close())
+
+	future := time.Now().Add(48 * time.Hour)
+	require.NoError(t, os.Chtimes(srcPath, future, future),
+		"advance source mtime past the snapshot")
+
+	var racedBuf bytes.Buffer
+	racedFailed := doParseDiff(ParseDiffConfig{
+		FailOnChange: true, Stdout: &racedBuf, Stderr: &racedBuf,
+	})
+	assert.False(t, racedFailed,
+		"a raced session must not trip --fail-on-change")
+	assert.Contains(t, racedBuf.String(), "Raced",
+		"the summary must surface the raced session")
+}
+
+// TestDoParseDiff_UntouchedDriftStillFails is the negative control for
+// the skew guard: the same staged drift WITHOUT advancing the source
+// mtime stays a genuine change and trips --fail-on-change, proving the
+// guard never masks a real regression on an untouched file.
+func TestDoParseDiff_UntouchedDriftStillFails(t *testing.T) {
+	// Isolate every other agent's directory env var to a temp path so an
+	// inherited dir from the developer or CI environment cannot be scanned and
+	// trip --fail-on-change with an unrelated parse error. The data dir and
+	// Claude dir are then overridden to the paths this test controls.
+	isolateParseDiffEnv(t)
+	dataDir := t.TempDir()
+	t.Setenv("AGENTSVIEW_DATA_DIR", dataDir)
+	claudeDir := t.TempDir()
+	t.Setenv("CLAUDE_PROJECTS_DIR", claudeDir)
+
+	projDir := filepath.Join(claudeDir, "-home-proj")
+	require.NoError(t, os.MkdirAll(projDir, 0o755))
+	srcPath := filepath.Join(projDir, "drift-session.jsonl")
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUser("2026-01-01T00:00:00Z", "hello").
+		AddClaudeAssistant("2026-01-01T00:00:01Z", "hi").
+		String()
+	require.NoError(t, os.WriteFile(srcPath, []byte(content), 0o644))
+
+	dbPath := filepath.Join(dataDir, "sessions.db")
+	d := dbtest.OpenTestDBAt(t, dbPath)
+	engine := sync.NewEngine(d, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {claudeDir},
+		},
+		Machine: "local",
+	})
+	stats := engine.SyncAll(context.Background(), nil)
+	require.Equal(t, 1, stats.Synced, "one session synced")
+
+	rows, err := d.ListSessionsModifiedBetween(
+		context.Background(), "", "", nil, nil,
+	)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	sessionID := rows[0].ID
+
+	require.NoError(t, d.Update(func(tx *sql.Tx) error {
+		_, uerr := tx.Exec(
+			"UPDATE sessions SET first_message = ? WHERE id = ?",
+			"drifted first message", sessionID,
+		)
+		return uerr
+	}))
+	require.NoError(t, d.Close())
+
+	// Source mtime is left untouched: the change is genuine drift.
+	var buf bytes.Buffer
+	failed := doParseDiff(ParseDiffConfig{
+		FailOnChange: true, Stdout: &buf, Stderr: &buf,
+	})
+	assert.True(t, failed,
+		"untouched-source drift must still trip --fail-on-change")
+	assert.Contains(t, buf.String(), "sessions changed")
 }

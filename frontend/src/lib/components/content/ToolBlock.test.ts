@@ -4,13 +4,26 @@
 import { describe, it, expect, vi, afterEach } from "vite-plus/test";
 import { mount, unmount, tick } from "svelte";
 import type { ToolCall } from "../../api/types.js";
+import { setLocale } from "../../i18n/index.js";
+
+const copyToClipboardMock = vi.hoisted(() =>
+  vi.fn().mockResolvedValue(true),
+);
 
 vi.mock("./SubagentInline.svelte", () => ({
   default: {},
 }));
 
+vi.mock("../../utils/clipboard.js", () => ({
+  copyToClipboard: copyToClipboardMock,
+}));
+
 // @ts-ignore
 import ToolBlock from "./ToolBlock.svelte";
+
+afterEach(() => {
+  vi.clearAllMocks();
+});
 
 describe("ToolBlock output section", () => {
   let component: ReturnType<typeof mount>;
@@ -18,6 +31,7 @@ describe("ToolBlock output section", () => {
   afterEach(() => {
     if (component) unmount(component);
     document.body.innerHTML = "";
+    setLocale("en");
   });
 
   it("does not render output-header when toolCall has no result_content", async () => {
@@ -134,6 +148,43 @@ describe("ToolBlock output section", () => {
     expect(preview!.textContent).toBe("first line");
   });
 
+  it("copies raw result_content without expanding output", async () => {
+    const resultText = "first output line\nsecond output line";
+    const toolCall: ToolCall = {
+      tool_name: "Read",
+      category: "file",
+      result_content: resultText,
+    };
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content: "some input", toolCall },
+    });
+    await tick();
+
+    document.querySelector<HTMLButtonElement>(".tool-header")!.click();
+    await tick();
+
+    const copyButton = document.querySelector<HTMLButtonElement>(
+      'button.kit-copy-btn[aria-label="Copy output"]',
+    );
+    expect(copyButton).not.toBeNull();
+    expect(document.querySelector(".output-content")).toBeNull();
+
+    copyButton!.click();
+    await Promise.resolve();
+    await tick();
+
+    expect(copyToClipboardMock).toHaveBeenCalledWith(resultText);
+    expect(document.querySelector(".output-content")).toBeNull();
+
+    document.querySelector<HTMLButtonElement>(".output-header")!.click();
+    await tick();
+
+    expect(document.querySelector(".output-content")?.textContent).toBe(
+      resultText,
+    );
+  });
+
   it("renders history after expanding the tool block when result_events are set", async () => {
     const toolCall: ToolCall = {
       tool_name: "wait",
@@ -162,6 +213,69 @@ describe("ToolBlock output section", () => {
     await tick();
 
     expect(document.querySelector(".history-header")).not.toBeNull();
+  });
+
+  it("localizes output, history, and result event metadata labels", async () => {
+    setLocale("zh-CN");
+    const toolCall: ToolCall = {
+      tool_name: "wait",
+      category: "Other",
+      result_content: "latest summary",
+      result_events: [
+        {
+          source: "wait_output",
+          status: "completed",
+          content: "Finished successfully",
+          content_length: 21,
+          agent_id: "agent-1",
+          event_index: 0,
+        },
+      ],
+    };
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content: "some input", toolCall },
+    });
+    await tick();
+
+    document.querySelector<HTMLButtonElement>(".tool-header")!.click();
+    await tick();
+    document.querySelector<HTMLButtonElement>(".history-header")!.click();
+    await tick();
+
+    expect(document.querySelector(".output-header .output-label")?.textContent)
+      .toBe("输出");
+    expect(document.querySelector(".history-header .output-label")?.textContent)
+      .toBe("历史");
+    expect(
+      Array.from(document.querySelectorAll(".meta-label"))
+        .map((node) => node.textContent),
+    ).toEqual(["状态：", "来源：", "agent："]);
+  });
+
+  it("localizes long content expansion controls", async () => {
+    setLocale("zh-CN");
+    const content = Array.from(
+      { length: 22 },
+      (_, i) => `line ${i + 1}`,
+    ).join("\n");
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content },
+    });
+    await tick();
+
+    document.querySelector<HTMLButtonElement>(".tool-header")!.click();
+    await tick();
+
+    const showMore = document.querySelector<HTMLButtonElement>(".show-more-btn");
+    expect(showMore?.textContent?.trim()).toBe("显示全部 22 行");
+
+    showMore!.click();
+    await tick();
+
+    expect(document.querySelector(".show-more-btn")?.textContent?.trim())
+      .toBe("收起");
   });
 
   it("expands event history and shows chronological event content", async () => {
@@ -203,6 +317,85 @@ describe("ToolBlock output section", () => {
     expect(historyEntries).toHaveLength(2);
     expect(historyEntries[0]!.textContent).toBe("First finished");
     expect(historyEntries[1]!.textContent).toBe("Second finished");
+  });
+});
+
+describe("ToolBlock copy affordances", () => {
+  let component: ReturnType<typeof mount>;
+
+  afterEach(() => {
+    if (component) unmount(component);
+    document.body.innerHTML = "";
+    setLocale("en");
+  });
+
+  it("copies raw task prompt without expanding the tool block", async () => {
+    const prompt = "Investigate target 54\nReturn exact findings.";
+    const toolCall: ToolCall = {
+      tool_name: "Task",
+      category: "Task",
+      input_json: JSON.stringify({
+        subagent_type: "Explore",
+        prompt,
+      }),
+    };
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content: "", label: "Task", toolCall },
+    });
+    await tick();
+
+    const copyButton = document.querySelector<HTMLButtonElement>(
+      'button.kit-copy-btn[aria-label="Copy input"]',
+    );
+    expect(copyButton).not.toBeNull();
+    expect(document.querySelector(".tool-content")).toBeNull();
+
+    copyButton!.click();
+    await Promise.resolve();
+    await tick();
+
+    expect(copyToClipboardMock).toHaveBeenCalledWith(prompt);
+    expect(document.querySelector(".tool-content")).toBeNull();
+  });
+
+  it("copies full raw Bash fallback before show-all expansion", async () => {
+    const longCommand = Array.from(
+      { length: 230 },
+      (_, i) => `echo hidden-line-${i}`,
+    ).join("\n");
+    const expectedCopy = `command: ${longCommand}`;
+    const toolCall: ToolCall = {
+      tool_name: "Bash",
+      category: "Bash",
+      input_json: JSON.stringify({ command: longCommand }),
+    };
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content: "", label: "Bash", toolCall },
+    });
+    await tick();
+
+    document.querySelector<HTMLButtonElement>(".tool-header")!.click();
+    await tick();
+
+    expect(document.querySelector(".tool-content")?.textContent).not.toContain(
+      "hidden-line-229",
+    );
+
+    const copyButton = document.querySelector<HTMLButtonElement>(
+      'button.kit-copy-btn[aria-label="Copy input"]',
+    );
+    expect(copyButton).not.toBeNull();
+
+    copyButton!.click();
+    await Promise.resolve();
+    await tick();
+
+    expect(copyToClipboardMock).toHaveBeenCalledWith(expectedCopy);
+    expect(document.querySelector(".tool-content")?.textContent).not.toContain(
+      "hidden-line-229",
+    );
   });
 });
 

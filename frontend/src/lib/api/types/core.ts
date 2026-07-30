@@ -3,6 +3,7 @@ export interface VersionInfo {
   version: string;
   commit: string;
   build_date: string;
+  insight_generation_available?: boolean;
   read_only?: boolean;
 }
 
@@ -64,6 +65,15 @@ export interface Session {
   // Detail-only fields (from enriched detail response)
   health_score_basis?: string[] | null;
   health_penalties?: Record<string, number> | null;
+  transcript_fidelity?: string;
+  parser_malformed_lines?: number;
+  /**
+   * Antigravity decode confidence, derived on read from agent +
+   * source_version (see internal/service SessionDetail.MarshalJSON).
+   * "low" means an unrecognized (newer) schema; "high" a known range;
+   * absent for other agents. Only present on the detail response.
+   */
+  decode_confidence?: string;
   created_at: string;
 }
 
@@ -195,6 +205,17 @@ export interface ProjectsResponse {
 
 export interface MachinesResponse {
   machines: string[];
+}
+
+/** Matches Go BranchInfo struct in internal/db/sessions.go */
+export interface BranchInfo {
+  project: string;
+  branch: string;
+  token: string;
+}
+
+export interface BranchesResponse {
+  branches: BranchInfo[];
 }
 
 /** Matches Go AgentInfo struct */

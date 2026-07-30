@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,24 +30,35 @@ import (
 // the initial SyncAll.
 func newParseDiffEngine(env *testEnv) *sync.Engine {
 	return sync.NewDiffEngine(env.db, sync.EngineConfig{
-		AgentDirs: map[parser.AgentType][]string{
-			parser.AgentClaude:         {env.claudeDir},
-			parser.AgentCodex:          {env.codexDir},
-			parser.AgentCursor:         {env.cursorDir},
-			parser.AgentGemini:         {env.geminiDir},
-			parser.AgentOpenCode:       {env.opencodeDir},
-			parser.AgentForge:          {env.forgeDir},
-			parser.AgentPiebald:        {env.piebaldDir},
-			parser.AgentIflow:          {env.iflowDir},
-			parser.AgentAmp:            {env.ampDir},
-			parser.AgentPi:             {env.piDir},
-			parser.AgentKiro:           {env.kiroDir},
-			parser.AgentKilo:           {env.kiloDir},
-			parser.AgentShelley:        {env.shelleyDir},
-			parser.AgentAntigravityCLI: {env.antigravityCLIDir},
-		},
-		Machine: "local",
+		AgentDirs: parseDiffAgentDirs(env),
+		Machine:   "local",
 	})
+}
+
+func parseDiffAgentDirs(env *testEnv) map[parser.AgentType][]string {
+	dirs := map[parser.AgentType][]string{}
+	add := func(agent parser.AgentType, dir string) {
+		if dir != "" {
+			dirs[agent] = []string{dir}
+		}
+	}
+	add(parser.AgentClaude, env.claudeDir)
+	add(parser.AgentCodex, env.codexDir)
+	add(parser.AgentCursor, env.cursorDir)
+	add(parser.AgentGemini, env.geminiDir)
+	add(parser.AgentOpenCode, env.opencodeDir)
+	add(parser.AgentForge, env.forgeDir)
+	add(parser.AgentPiebald, env.piebaldDir)
+	add(parser.AgentWarp, env.warpDir)
+	add(parser.AgentIflow, env.iflowDir)
+	add(parser.AgentAmp, env.ampDir)
+	add(parser.AgentPi, env.piDir)
+	add(parser.AgentOMP, env.ompDir)
+	add(parser.AgentKiro, env.kiroDir)
+	add(parser.AgentKilo, env.kiloDir)
+	add(parser.AgentShelley, env.shelleyDir)
+	add(parser.AgentAntigravityCLI, env.antigravityCLIDir)
+	return dirs
 }
 
 // runParseDiff runs ParseDiff with the given options and fails the
@@ -168,7 +180,7 @@ func parseDiffGeminiContent(sessionID, hash string) string {
 // back identical on every session, with no field counts and no
 // listed sessions.
 func TestParseDiffCleanArchiveIsIdentical(t *testing.T) {
-	env := setupTestEnv(t)
+	env := setupFocusedTestEnv(t, parser.AgentClaude, parser.AgentCodex)
 
 	// pd-alpha carries thinking, a tool_use/tool_result pair, and a
 	// system message so the run exercises the message-flag and tool-call
@@ -207,7 +219,7 @@ func TestParseDiffCleanArchiveIsIdentical(t *testing.T) {
 // with the expected field names while an untouched control session
 // stays identical.
 func TestParseDiffDetectsStoredDrift(t *testing.T) {
-	env := setupTestEnv(t)
+	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
 
 	ids := []string{
 		"pd-count", "pd-first", "pd-model", "pd-role", "pd-time",
@@ -345,7 +357,7 @@ func TestParseDiffDetectsStoredDrift(t *testing.T) {
 // producing a report. The run must complete and surface the now-empty
 // stored timestamp as ordinary message_metadata drift.
 func TestParseDiffToleratesNullStoredTimestamp(t *testing.T) {
-	env := setupTestEnv(t)
+	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
 
 	env.writeClaudeSession(t, "test-proj", "pd-nullts.jsonl",
 		parseDiffClaudeContent("nullts prompt", "nullts reply"))
@@ -395,7 +407,7 @@ func TestParseDiffToleratesNullStoredTimestamp(t *testing.T) {
 // per-message flag, a full-replace-agent session-metadata field, and the
 // informational-for-incremental rule on a Claude session.
 func TestParseDiffDetectsExtendedFieldDrift(t *testing.T) {
-	env := setupTestEnv(t)
+	env := setupFocusedTestEnv(t, parser.AgentClaude, parser.AgentGemini)
 
 	// Two rich Claude sessions (thinking + tool_use/result + system),
 	// one minimal Claude session, and a full-replace Gemini session.
@@ -485,7 +497,7 @@ func TestParseDiffDetectsExtendedFieldDrift(t *testing.T) {
 // stored drift is detected but not repaired, and nothing is persisted
 // (no skip cache entries, no row rewrites).
 func TestParseDiffWritesNothing(t *testing.T) {
-	env := setupTestEnv(t)
+	env := setupFocusedTestEnv(t, parser.AgentClaude, parser.AgentGemini)
 
 	env.writeClaudeSession(t, "test-proj", "pd-keep.jsonl",
 		parseDiffClaudeContent("keep prompt", "keep reply"))
@@ -534,7 +546,7 @@ func TestParseDiffWritesNothing(t *testing.T) {
 // file even when the sync engine's size/mtime/skip-cache layers
 // would skip it, by appending to a source file without re-syncing.
 func TestParseDiffBypassesSkipLayers(t *testing.T) {
-	env := setupTestEnv(t)
+	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
 
 	path := env.writeClaudeSession(t, "test-proj", "pd-skip.jsonl",
 		parseDiffClaudeContent("skip prompt", "skip reply"))
@@ -555,6 +567,15 @@ func TestParseDiffBypassesSkipLayers(t *testing.T) {
 		Examined: 1, Identical: 1,
 	}, report.Totals, "totals before append")
 
+	// Capture the original mtime so the append can be replayed without
+	// tripping the live-write skew guard: appending advances the file
+	// mtime past the stored snapshot, which would (correctly) classify
+	// the diff as raced. Restoring the mtime keeps this test focused on
+	// the skip-layer bypass and the message_count CHANGE detection; the
+	// raced path has dedicated coverage in TestParseDiffRacedSourceSkew.
+	origInfo, err := os.Stat(path)
+	require.NoError(t, err, "stat source before append")
+
 	// Append one more message without syncing. The incremental
 	// append path would normally absorb this; a full re-parse must
 	// surface it as a message count change instead.
@@ -566,6 +587,9 @@ func TestParseDiffBypassesSkipLayers(t *testing.T) {
 	) + "\n")
 	require.NoError(t, err, "append message line")
 	require.NoError(t, f.Close(), "close session file")
+	require.NoError(t,
+		os.Chtimes(path, origInfo.ModTime(), origInfo.ModTime()),
+		"restore source mtime so the change is not classified raced")
 
 	report = runParseDiff(t, env, sync.ParseDiffOptions{})
 	assert.Equal(t, 1, report.FilesExamined, "files examined")
@@ -585,8 +609,9 @@ func TestParseDiffBypassesSkipLayers(t *testing.T) {
 // buckets: skipped (source missing), new on disk, pending resync,
 // and parse error.
 func TestParseDiffBuckets(t *testing.T) {
+
 	t.Run("source missing", func(t *testing.T) {
-		env := setupTestEnv(t)
+		env := setupSingleAgentTestEnv(t, parser.AgentClaude)
 		path := env.writeClaudeSession(
 			t, "test-proj", "pd-gone.jsonl",
 			parseDiffClaudeContent("gone prompt", "gone reply"),
@@ -609,7 +634,7 @@ func TestParseDiffBuckets(t *testing.T) {
 	})
 
 	t.Run("new on disk", func(t *testing.T) {
-		env := setupTestEnv(t)
+		env := setupSingleAgentTestEnv(t, parser.AgentClaude)
 		env.writeClaudeSession(t, "test-proj", "pd-base.jsonl",
 			parseDiffClaudeContent("base prompt", "base reply"))
 		runSyncAndAssert(t, env.engine, sync.SyncStats{
@@ -631,7 +656,7 @@ func TestParseDiffBuckets(t *testing.T) {
 	})
 
 	t.Run("pending resync", func(t *testing.T) {
-		env := setupTestEnv(t)
+		env := setupSingleAgentTestEnv(t, parser.AgentClaude)
 		env.writeClaudeSession(t, "test-proj", "pd-stale.jsonl",
 			parseDiffClaudeContent("stale prompt", "stale reply"))
 		runSyncAndAssert(t, env.engine, sync.SyncStats{
@@ -668,7 +693,7 @@ func TestParseDiffBuckets(t *testing.T) {
 	})
 
 	t.Run("parse error", func(t *testing.T) {
-		env := setupTestEnv(t)
+		env := setupFocusedTestEnv(t, parser.AgentClaude, parser.AgentGemini)
 		env.writeClaudeSession(t, "test-proj", "pd-ok.jsonl",
 			parseDiffClaudeContent("ok prompt", "ok reply"))
 		geminiPath := env.writeGeminiSession(
@@ -699,7 +724,7 @@ func TestParseDiffBuckets(t *testing.T) {
 // TestParseDiffLimitNewestFirst verifies Limit samples files newest
 // mtime first and reports the unexamined sessions as skipped.
 func TestParseDiffLimitNewestFirst(t *testing.T) {
-	env := setupTestEnv(t)
+	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
 
 	base := time.Now()
 	files := []struct {
@@ -749,7 +774,7 @@ func TestParseDiffLimitNewestFirst(t *testing.T) {
 // requested agents and that agents without an on-disk source to
 // re-parse are rejected.
 func TestParseDiffAgentScope(t *testing.T) {
-	env := setupTestEnv(t)
+	env := setupFocusedTestEnv(t, parser.AgentClaude, parser.AgentCodex)
 
 	env.writeClaudeSession(t, "test-proj", "pd-claude.jsonl",
 		parseDiffClaudeContent("claude prompt", "claude reply"))
@@ -785,24 +810,53 @@ func TestParseDiffAgentScope(t *testing.T) {
 	assert.Equal(t, []string{"codex"}, report.Agents,
 		"report.Agents must reflect the scoped run")
 
-	// Database-backed agents have no on-disk source to re-parse.
+	// Import-only agents are outside parse-diff support.
 	_, err = engine.ParseDiff(
 		context.Background(), sync.ParseDiffOptions{
 			Agents: []parser.AgentType{parser.AgentClaudeAI},
 		},
 	)
 	require.Error(t, err,
-		"ParseDiff must reject database-backed agents")
+		"ParseDiff must reject import-only agents")
+	assert.ErrorContains(t, err, "is not supported by parse-diff")
+}
+
+func TestParseDiffCoversProviderAuthoritativePiFamily(t *testing.T) {
+	env := setupFocusedTestEnv(t, parser.AgentPi, parser.AgentOMP)
+	env.writeSession(
+		t,
+		env.piDir,
+		filepath.Join("encoded-cwd", "pd-pi.jsonl"),
+		piLikeProviderFixture("pd-pi", "/Users/alice/code/pi-app"),
+	)
+	env.writeSession(
+		t,
+		env.ompDir,
+		filepath.Join("encoded-cwd", "pd-omp.jsonl"),
+		piLikeProviderFixture("pd-omp", "/Users/alice/code/omp-app"),
+	)
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 2, Synced: 2,
+	})
+
+	report := runParseDiff(t, env, sync.ParseDiffOptions{
+		Agents: []parser.AgentType{parser.AgentPi, parser.AgentOMP},
+	})
+	assert.Equal(t, []string{"pi", "omp"}, report.Agents)
+	assert.Equal(t, 2, report.FilesExamined)
+	assert.Equal(t, sync.ParseDiffTotals{
+		Examined: 2, Identical: 2,
+	}, report.Totals)
 }
 
 // TestParseDiffCoversKiroSQLite proves that Kiro's shared data.sqlite3
-// store — which DiscoverFunc never emits and which normal sync reaches
-// through a dedicated phase — is actually re-parsed by parse-diff. A
+// store, which the provider discovers and fans out to one session per
+// row, is actually re-parsed by parse-diff. A
 // regressed force-parse guard or missing synthesized discovery would
 // surface here as the session being skipped/"not discovered" with
 // Examined 0 rather than compared.
 func TestParseDiffCoversKiroSQLite(t *testing.T) {
-	env := setupTestEnv(t)
+	env := setupSingleAgentTestEnv(t, parser.AgentKiro)
 	ks := createKiroSQLiteDB(t, env.kiroDir)
 	ks.addSession(
 		t, "/home/user/code/kiro-app", "sqlite-session",
@@ -835,7 +889,7 @@ func TestParseDiffCoversKiroSQLite(t *testing.T) {
 // discovery would leave the legacy session "not discovered" and let
 // --fail-on-change pass without vetting it.
 func TestParseDiffCoversMixedOpenCodeRoot(t *testing.T) {
-	env := setupTestEnv(t)
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
 
 	// File-backed storage session: this makes ResolveOpenCodeSource
 	// pick storage mode for the root.
@@ -898,7 +952,7 @@ func TestParseDiffCoversMixedOpenCodeRoot(t *testing.T) {
 // root that still carries DB-only sessions in kilo.db must have BOTH
 // sources re-parsed.
 func TestParseDiffCoversMixedKiloRoot(t *testing.T) {
-	env := setupTestEnv(t)
+	env := setupSingleAgentTestEnv(t, parser.AgentKilo)
 
 	// File-backed storage session: this makes ResolveKiloSource pick storage
 	// mode for the root.
@@ -954,12 +1008,12 @@ func TestParseDiffCoversMixedKiloRoot(t *testing.T) {
 }
 
 // TestParseDiffCoversShelley proves Shelley's shared shelley.db — which
-// DiscoverFunc emits as a single file and which normal sync fans out to
-// one session per conversation — is re-parsed and compared by parse-diff.
+// the provider discovers as a single source and which normal sync fans
+// out to one session per conversation — is re-parsed and compared by parse-diff.
 // Examined:1/Identical:1 means the stored conversation was matched and
 // vetted, not bucketed as skipped/"not discovered".
 func TestParseDiffCoversShelley(t *testing.T) {
-	env := setupTestEnv(t)
+	env := setupSingleAgentTestEnv(t, parser.AgentShelley)
 	dbPath := createShelleyDB(t, env.shelleyDir)
 	seedShelleyConvo(t, dbPath, "cMAIN1", "main", "/home/u/dev/app",
 		"claude-sonnet-4-6", "", true,
@@ -986,7 +1040,7 @@ func TestParseDiffCoversShelley(t *testing.T) {
 // stripVirtualSourceSuffix mapping shelley.db#id back to shelley.db so
 // the parse error keyed by the real DB path matches the stored rows.
 func TestParseDiffShelleyDBErrorAttributed(t *testing.T) {
-	env := setupTestEnv(t)
+	env := setupSingleAgentTestEnv(t, parser.AgentShelley)
 	dbPath := createShelleyDB(t, env.shelleyDir)
 	seedShelleyConvo(t, dbPath, "cMAIN1", "main", "/home/u/dev/app",
 		"claude-sonnet-4-6", "", true,
@@ -1023,75 +1077,56 @@ func TestParseDiffShelleyDBErrorAttributed(t *testing.T) {
 // being silently dropped (unstored) or misclassified as presence
 // drift (stored), so --fail-on-change stays trustworthy.
 func TestParseDiffKiroSQLitePerSessionError(t *testing.T) {
-	t.Run("stored session turned malformed", func(t *testing.T) {
-		env := setupTestEnv(t)
-		ks := createKiroSQLiteDB(t, env.kiroDir)
-		ks.addSession(
-			t, "/home/user/code/kiro-app", "sqlite-session",
-			readKiroSQLiteFixture(t, "standard_payload.json"),
-			1779012000000, 1779012030000,
-		)
-		runSyncAndAssert(t, env.engine, sync.SyncStats{
-			TotalSessions: 1, Synced: 1,
-		})
 
-		ks.updateSession(t, "sqlite-session", "{corrupt", 1779012060000)
-
-		report := runParseDiff(t, env, sync.ParseDiffOptions{
-			Agents: []parser.AgentType{parser.AgentKiro},
-		})
-		assert.Equal(t, sync.ParseDiffTotals{
-			ParseErrors: 1,
-		}, report.Totals,
-			"a malformed stored session is a parse error, not presence drift")
-		assert.Empty(t, report.FieldCounts,
-			"no presence diff for a session that failed to parse")
-
-		sd := findSessionDiff(report, "kiro:sqlite-session")
-		require.NotNil(t, sd, "stored session must be attributed by ID")
-		assert.Equal(t, sync.DiffParseError, sd.Class, "class")
-		assert.Contains(t, sd.Reason, "malformed payload", "reason")
-		assert.True(t, report.HasFailures(),
-			"per-session parse errors must trip --fail-on-change")
+	env := setupSingleAgentTestEnv(t, parser.AgentKiro)
+	ks := createKiroSQLiteDB(t, env.kiroDir)
+	standard := readKiroSQLiteFixture(t, "standard_payload.json")
+	ks.addSession(
+		t, "/home/user/code/kiro-app", "sqlite-session",
+		standard, 1779012000000, 1779012030000,
+	)
+	ks.addSession(
+		t, "/home/user/code/kiro-app", "good-session",
+		standard, 1779012100000, 1779012130000,
+	)
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 2, Synced: 2,
 	})
 
-	t.Run("unstored malformed session still reported", func(t *testing.T) {
-		env := setupTestEnv(t)
-		ks := createKiroSQLiteDB(t, env.kiroDir)
-		ks.addSession(
-			t, "/home/user/code/kiro-app", "good-session",
-			readKiroSQLiteFixture(t, "standard_payload.json"),
-			1779012000000, 1779012030000,
-		)
-		runSyncAndAssert(t, env.engine, sync.SyncStats{
-			TotalSessions: 1, Synced: 1,
-		})
+	ks.updateSession(t, "sqlite-session", "{corrupt", 1779012060000)
+	// Never synced: written to the store after the sync.
+	ks.addSession(
+		t, "/home/user/code/kiro-app", "bad-session",
+		"{corrupt", 1779012040000, 1779012050000,
+	)
 
-		// Never synced: written to the store after the sync.
-		ks.addSession(
-			t, "/home/user/code/kiro-app", "bad-session",
-			"{corrupt", 1779012040000, 1779012050000,
-		)
+	report := runParseDiff(t, env, sync.ParseDiffOptions{
+		Agents: []parser.AgentType{parser.AgentKiro},
+	})
+	assert.Equal(t, sync.ParseDiffTotals{
+		Examined: 1, Identical: 1, ParseErrors: 2,
+	}, report.Totals,
+		"good session compared; both malformed sessions are parse errors")
+	assert.Empty(t, report.FieldCounts,
+		"no presence diff for sessions that failed to parse")
 
-		report := runParseDiff(t, env, sync.ParseDiffOptions{
-			Agents: []parser.AgentType{parser.AgentKiro},
-		})
-		assert.Equal(t, sync.ParseDiffTotals{
-			Examined: 1, Identical: 1, ParseErrors: 1,
-		}, report.Totals,
-			"good session compared; bad session is a parse error")
+	stored := findSessionDiff(report, "kiro:sqlite-session")
+	require.NotNil(t, stored, "stored session must be attributed by ID")
+	assert.Equal(t, sync.DiffParseError, stored.Class, "stored class")
+	assert.Contains(t, stored.Reason, "malformed payload", "stored reason")
 
-		var errEntry *sync.SessionDiff
-		for i := range report.Sessions {
-			if report.Sessions[i].Class == sync.DiffParseError {
-				errEntry = &report.Sessions[i]
-			}
+	var unstored *sync.SessionDiff
+	for i := range report.Sessions {
+		if report.Sessions[i].Class == sync.DiffParseError &&
+			strings.Contains(report.Sessions[i].FilePath, "bad-session") {
+			unstored = &report.Sessions[i]
 		}
-		require.NotNil(t, errEntry, "parse error entry listed")
-		assert.Contains(t, errEntry.FilePath, "data.sqlite3#bad-session",
-			"error attributed to the per-session virtual path")
-		assert.True(t, report.HasFailures(), "HasFailures")
-	})
+	}
+	require.NotNil(t, unstored, "unstored parse error entry listed")
+	assert.Contains(t, unstored.FilePath, "data.sqlite3#bad-session",
+		"error attributed to the per-session virtual path")
+	assert.True(t, report.HasFailures(),
+		"per-session parse errors must trip --fail-on-change")
 }
 
 // TestParseDiffKiloSQLitePerSessionError proves a malformed session
@@ -1099,7 +1134,8 @@ func TestParseDiffKiroSQLitePerSessionError(t *testing.T) {
 // being silently dropped, so --fail-on-change stays trustworthy even
 // for a session that was never stored.
 func TestParseDiffKiloSQLitePerSessionError(t *testing.T) {
-	env := setupTestEnv(t)
+
+	env := setupSingleAgentTestEnv(t, parser.AgentKilo)
 	ks := createKiloDB(t, env.kiloDir)
 	ks.addProject(t, "proj-1", "/home/user/code/kilo-app")
 	const goodID = "good-session"
@@ -1143,9 +1179,1105 @@ func TestParseDiffKiloSQLitePerSessionError(t *testing.T) {
 	assert.True(t, report.HasFailures(), "HasFailures")
 }
 
+// TestParseDiffRacedSourceSkew is the end-to-end live-write skew guard:
+// a stored row that drifted from its source is normally DiffChanged, but
+// when the on-disk source advances past the snapshot file_mtime mid-run
+// (simulating a daemon or active session rewriting the file after the
+// snapshot) the change is inconclusive and must be reclassified DiffRaced
+// without tripping --fail-on-change. A control session whose source was
+// not touched stays a real DiffChanged so a genuine regression is never
+// masked.
+func TestParseDiffRacedSourceSkew(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
+
+	racedPath := env.writeClaudeSession(t, "test-proj", "pd-raced.jsonl",
+		parseDiffClaudeContent("raced prompt", "raced reply"))
+	env.writeClaudeSession(t, "test-proj", "pd-control.jsonl",
+		parseDiffClaudeContent("control prompt", "control reply"))
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 2, Synced: 2,
+	})
+
+	// Drift the stored rows so a re-parse of the unchanged source content
+	// would report a real first_message change for both.
+	mutateDB(t, env,
+		"UPDATE sessions SET first_message = ? WHERE id = ?",
+		"drifted first message", "pd-raced")
+	mutateDB(t, env,
+		"UPDATE sessions SET first_message = ? WHERE id = ?",
+		"drifted first message", "pd-control")
+
+	// Simulate a mid-run write to pd-raced's source only: push its mtime
+	// well past the stored snapshot file_mtime. The content is unchanged,
+	// so the comparison still detects the seeded drift, but the advanced
+	// mtime marks the comparison as a torn read. pd-control is left
+	// untouched, so its drift stays a genuine change.
+	future := time.Now().Add(48 * time.Hour)
+	require.NoError(t, os.Chtimes(racedPath, future, future),
+		"advance raced source mtime")
+
+	report := runParseDiff(t, env, sync.ParseDiffOptions{})
+
+	assert.Equal(t, sync.ParseDiffTotals{
+		Examined: 2, Changed: 1, Raced: 1,
+	}, report.Totals, "totals")
+	// Only the untouched-source change is counted as drift; the raced
+	// session's masked field diff is excluded from FieldCounts.
+	assert.Equal(t, map[string]int{sync.FieldFirstMessage: 1},
+		report.FieldCounts,
+		"only the genuine change contributes to FieldCounts")
+
+	raced := findSessionDiff(report, "pd-raced")
+	require.NotNil(t, raced, "raced session not listed")
+	assert.Equal(t, sync.DiffRaced, raced.Class, "raced class")
+	assert.NotEmpty(t, raced.Reason, "raced reason")
+	// The would-be change is attached for drill-down even though it is
+	// not counted, so an operator can see what the skew masked.
+	assert.Contains(t, sessionDiffFieldNames(raced, true),
+		sync.FieldFirstMessage,
+		"raced field diff attached for drill-down")
+
+	changed := findSessionDiff(report, "pd-control")
+	require.NotNil(t, changed, "control session not listed")
+	assert.Equal(t, sync.DiffChanged, changed.Class,
+		"untouched-source drift stays changed")
+	assert.Contains(t, sessionDiffFieldNames(changed, false),
+		sync.FieldFirstMessage, "control change field")
+
+	// The run fails because of the genuine change, not the raced one.
+	assert.True(t, report.HasFailures(),
+		"the untouched-source change must still trip --fail-on-change")
+}
+
+// TestParseDiffRacedAloneDoesNotFail isolates the gate contract: a run
+// whose only drift is masked by a live-write skew classifies raced and
+// must NOT trip --fail-on-change, so a concurrent daemon write can never
+// turn a vet run red on its own.
+func TestParseDiffRacedAloneDoesNotFail(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
+
+	racedPath := env.writeClaudeSession(t, "test-proj", "pd-solo.jsonl",
+		parseDiffClaudeContent("solo prompt", "solo reply"))
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 1, Synced: 1,
+	})
+
+	mutateDB(t, env,
+		"UPDATE sessions SET first_message = ? WHERE id = ?",
+		"drifted first message", "pd-solo")
+	future := time.Now().Add(48 * time.Hour)
+	require.NoError(t, os.Chtimes(racedPath, future, future),
+		"advance raced source mtime")
+
+	report := runParseDiff(t, env, sync.ParseDiffOptions{})
+	assert.Equal(t, sync.ParseDiffTotals{
+		Examined: 1, Raced: 1,
+	}, report.Totals, "totals")
+	assert.Empty(t, report.FieldCounts,
+		"raced field diffs must be excluded from FieldCounts")
+	assert.False(t, report.HasFailures(),
+		"a raced session alone must not trip --fail-on-change")
+}
+
+// TestParseDiffRacedDoesNotMaskCleanRun proves the skew guard never
+// invents a raced session out of an identical comparison: advancing the
+// source mtime of a session whose stored rows still match the parse
+// leaves it identical, not raced (the raced reclass only applies when
+// there is a real change to mask).
+func TestParseDiffRacedDoesNotMaskCleanRun(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
+
+	path := env.writeClaudeSession(t, "test-proj", "pd-clean.jsonl",
+		parseDiffClaudeContent("clean prompt", "clean reply"))
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 1, Synced: 1,
+	})
+
+	// Advance the mtime without changing content: the comparison is still
+	// identical, so the session must remain identical despite the skew.
+	future := time.Now().Add(72 * time.Hour)
+	require.NoError(t, os.Chtimes(path, future, future), "advance mtime")
+
+	report := runParseDiff(t, env, sync.ParseDiffOptions{})
+	assert.Equal(t, sync.ParseDiffTotals{
+		Examined: 1, Identical: 1,
+	}, report.Totals, "an unchanged session must stay identical, not raced")
+	assert.False(t, report.HasFailures(), "clean run")
+}
+
+// claudeAppendedAssistantLine renders one raw assistant JSONL line that
+// can be appended to a Claude session source and picked up by an
+// incremental sync.
+func claudeAppendedAssistantLine(text, ts string) string {
+	return testjsonl.ClaudeAssistantJSON(
+		[]map[string]any{{"type": "text", "text": text}}, ts,
+	) + "\n"
+}
+
+// appendClaudeLineAndSyncIncremental appends one raw JSONL line to a
+// Claude session source and drives a real incremental sync of it,
+// exercising the production incremental-append path (writeIncremental ->
+// WriteSessionIncremental) that sets last_write_incremental. Using the
+// real write path rather than a mutateDB-simulated flag is the point of
+// these tests: it proves the detection signal is wired end to end.
+func appendClaudeLineAndSyncIncremental(
+	t *testing.T, env *testEnv, path, line string,
+) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open for append")
+	_, err = f.WriteString(line)
+	require.NoError(t, err, "append line")
+	require.NoError(t, f.Close(), "close after append")
+	env.engine.SyncPaths([]string{path})
+}
+
+// TestParseDiffIncrementalAppendSkewNotCountedAsChange proves the core
+// contract: a session last written through the real incremental-append
+// path is classified DiffIncrementalSkew (not DiffChanged), excluded from
+// FieldCounts and HasFailures, but still counted in Examined and listed
+// for drill-down. A control session written only through the full path
+// still classifies as a genuine change, so the marker never masks drift
+// on a session that was not actually written incrementally.
+func TestParseDiffIncrementalAppendSkewNotCountedAsChange(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
+
+	skewPath := env.writeClaudeSession(t, "test-proj", "pd-skew.jsonl",
+		parseDiffClaudeContent("skew prompt", "skew reply"))
+	env.writeClaudeSession(t, "test-proj", "pd-full.jsonl",
+		parseDiffClaudeContent("full prompt", "full reply"))
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 2, Synced: 2,
+	})
+
+	appendClaudeLineAndSyncIncremental(t, env, skewPath,
+		claudeAppendedAssistantLine("appended reply", "2024-01-01T10:00:10Z"))
+
+	// Assert the marker was set by real production code, not simulated.
+	afterAppend, err := env.db.GetSessionFull(
+		context.Background(), "pd-skew",
+	)
+	require.NoError(t, err, "GetSessionFull after append")
+	require.NotNil(t, afterAppend, "session after append")
+	require.True(t, afterAppend.LastWriteIncremental,
+		"the incremental append must set the marker via real code")
+
+	// Seed drift on both sessions. The incrementally written pd-skew gets a
+	// per-message metadata (timestamp) diff -- the ordinal-shape surface a
+	// full re-parse can legitimately reshape, so the marker may suppress it.
+	// The full-write control pd-full gets a first_message diff so a re-parse
+	// detects a change there too.
+	mutateDB(t, env,
+		"UPDATE messages SET timestamp = ? WHERE session_id = ? AND ordinal = 0",
+		"2020-01-01T00:00:00Z", "pd-skew")
+	mutateDB(t, env,
+		"UPDATE sessions SET first_message = ? WHERE id = ?",
+		"drifted first message", "pd-full")
+
+	report := runParseDiff(t, env, sync.ParseDiffOptions{})
+
+	assert.Equal(t, sync.ParseDiffTotals{
+		Examined: 2, Changed: 1, IncrementalSkew: 1,
+	}, report.Totals, "totals")
+	// Only the full-write session's drift contributes to FieldCounts; the
+	// incrementally written session's metadata drift is suppressed.
+	assert.Equal(t, map[string]int{sync.FieldFirstMessage: 1},
+		report.FieldCounts,
+		"only the full-write change contributes to FieldCounts")
+
+	skew := findSessionDiff(report, "pd-skew")
+	require.NotNil(t, skew, "skew session not listed")
+	assert.Equal(t, sync.DiffIncrementalSkew, skew.Class, "skew class")
+	assert.NotEmpty(t, skew.Reason, "skew reason")
+	// The would-be change is attached for drill-down even though it is
+	// not counted, so an operator can see what the skew suppressed.
+	assert.Contains(t, sessionDiffFieldNames(skew, true),
+		sync.FieldMessageMetadata,
+		"skew field diff attached for drill-down")
+
+	changed := findSessionDiff(report, "pd-full")
+	require.NotNil(t, changed, "full session not listed")
+	assert.Equal(t, sync.DiffChanged, changed.Class,
+		"full-write drift stays changed, never masked as skew")
+	assert.Contains(t, sessionDiffFieldNames(changed, false),
+		sync.FieldFirstMessage, "control change field")
+
+	// The run fails because of the full-write change, not the skew one.
+	assert.True(t, report.HasFailures(),
+		"the full-write change must still trip --fail-on-change")
+}
+
+// TestParseDiffIncrementalAppendSkewAloneDoesNotFail isolates the gate
+// contract: a run whose only drift is on an incrementally written session
+// classifies incremental_skew and must NOT trip --fail-on-change.
+func TestParseDiffIncrementalAppendSkewAloneDoesNotFail(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
+
+	path := env.writeClaudeSession(t, "test-proj", "pd-solo-skew.jsonl",
+		parseDiffClaudeContent("solo prompt", "solo reply"))
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 1, Synced: 1,
+	})
+
+	appendClaudeLineAndSyncIncremental(t, env, path,
+		claudeAppendedAssistantLine("appended reply", "2024-01-01T10:00:10Z"))
+	// A per-message metadata (timestamp) diff is the incremental-artifact
+	// surface the marker may suppress.
+	mutateDB(t, env,
+		"UPDATE messages SET timestamp = ? WHERE session_id = ? AND ordinal = 0",
+		"2020-01-01T00:00:00Z", "pd-solo-skew")
+
+	report := runParseDiff(t, env, sync.ParseDiffOptions{})
+	assert.Equal(t, sync.ParseDiffTotals{
+		Examined: 1, IncrementalSkew: 1,
+	}, report.Totals, "totals")
+	assert.Empty(t, report.FieldCounts,
+		"skew field diffs must be excluded from FieldCounts")
+	assert.False(t, report.HasFailures(),
+		"a skew session alone must not trip --fail-on-change")
+}
+
+// TestParseDiffIncrementalMarkerDoesNotMaskNonArtifactDrift is the direct
+// regression guard for the narrowing: an incrementally written session
+// (marker set) whose drift lands on a field OUTSIDE the incremental-artifact
+// allow-list -- here first_message, which is head-derived and byte-stable
+// across appends -- must stay a genuine DiffChanged and trip
+// --fail-on-change. The marker is session-level; a regression is
+// field-level, so the marker alone must not suppress it.
+func TestParseDiffIncrementalMarkerDoesNotMaskNonArtifactDrift(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
+
+	path := env.writeClaudeSession(t, "test-proj", "pd-nomask.jsonl",
+		parseDiffClaudeContent("nomask prompt", "nomask reply"))
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 1, Synced: 1,
+	})
+	appendClaudeLineAndSyncIncremental(t, env, path,
+		claudeAppendedAssistantLine("appended reply", "2024-01-01T10:00:10Z"))
+
+	marked, err := env.db.GetSessionFull(context.Background(), "pd-nomask")
+	require.NoError(t, err, "GetSessionFull after append")
+	require.NotNil(t, marked, "session after append")
+	require.True(t, marked.LastWriteIncremental,
+		"the incremental append must set the marker via real code")
+
+	// first_message is not an incremental artifact: a diff there is genuine
+	// parser drift the marker must not mask.
+	mutateDB(t, env,
+		"UPDATE sessions SET first_message = ? WHERE id = ?",
+		"drifted first message", "pd-nomask")
+
+	report := runParseDiff(t, env, sync.ParseDiffOptions{})
+	assert.Equal(t, sync.ParseDiffTotals{
+		Examined: 1, Changed: 1,
+	}, report.Totals, "a non-artifact diff on a marked row must stay changed")
+	changed := findSessionDiff(report, "pd-nomask")
+	require.NotNil(t, changed, "session not listed")
+	assert.Equal(t, sync.DiffChanged, changed.Class,
+		"marker must not reclassify a first_message regression as skew")
+	assert.Equal(t, map[string]int{sync.FieldFirstMessage: 1},
+		report.FieldCounts, "the regression must contribute to FieldCounts")
+	assert.True(t, report.HasFailures(),
+		"a non-artifact regression on a marked row must trip --fail-on-change")
+}
+
+// TestParseDiffFullResyncClearsIncrementalSkew proves the resync-baseline
+// self-heal: an incrementally written session classifies incremental_skew,
+// but after a full resync rewrites it through normalization (clearing the
+// marker) the same seeded drift classifies as a genuine DiffChanged again.
+func TestParseDiffFullResyncClearsIncrementalSkew(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
+
+	path := env.writeClaudeSession(t, "test-proj", "pd-heal.jsonl",
+		parseDiffClaudeContent("heal prompt", "heal reply"))
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 1, Synced: 1,
+	})
+	appendClaudeLineAndSyncIncremental(t, env, path,
+		claudeAppendedAssistantLine("appended reply", "2024-01-01T10:00:10Z"))
+
+	// Precondition: the incrementally written session, drifting on the
+	// per-message metadata (timestamp) artifact surface, is classified skew.
+	mutateDB(t, env,
+		"UPDATE messages SET timestamp = ? WHERE session_id = ? AND ordinal = 0",
+		"2020-01-01T00:00:00Z", "pd-heal")
+	report := runParseDiff(t, env, sync.ParseDiffOptions{})
+	skew := findSessionDiff(report, "pd-heal")
+	require.NotNil(t, skew, "skew session not listed pre-resync")
+	require.Equal(t, sync.DiffIncrementalSkew, skew.Class,
+		"skew class pre-resync")
+
+	// A full resync rewrites every row through normalization, clearing the
+	// marker. Re-seed the same drift afterward (the resync overwrote it),
+	// then confirm the session is now a genuine DiffChanged: the skew
+	// suppression self-heals once the comparison basis is rebuilt.
+	stats := env.engine.ResyncAll(context.Background(), nil)
+	require.False(t, stats.Aborted, "resync aborted")
+	healed, err := env.db.GetSessionFull(context.Background(), "pd-heal")
+	require.NoError(t, err, "GetSessionFull after resync")
+	require.NotNil(t, healed, "session after resync")
+	require.False(t, healed.LastWriteIncremental,
+		"a full resync must clear the incremental marker")
+
+	mutateDB(t, env,
+		"UPDATE messages SET timestamp = ? WHERE session_id = ? AND ordinal = 0",
+		"2020-01-01T00:00:00Z", "pd-heal")
+	report = runParseDiff(t, env, sync.ParseDiffOptions{})
+	changed := findSessionDiff(report, "pd-heal")
+	require.NotNil(t, changed, "session not listed post-resync")
+	assert.Equal(t, sync.DiffChanged, changed.Class,
+		"a full resync clears the marker, restoring drift detection")
+	assert.True(t, report.HasFailures(),
+		"post-resync drift must trip --fail-on-change again")
+}
+
+// TestParseDiffIncrementalSkewNeverSetForDBBackedProviders proves the
+// marker is driven by the write path, not the agent: a DB-backed provider
+// (Kiro) always writes through the full path, so its rows never carry the
+// incremental marker and seeded drift stays a genuine DiffChanged.
+func TestParseDiffIncrementalSkewNeverSetForDBBackedProviders(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentKiro)
+	ks := createKiroSQLiteDB(t, env.kiroDir)
+	payload := readKiroSQLiteFixture(t, "standard_payload.json")
+	ks.addSession(
+		t, "/home/user/code/kiro-app", "kiro-db",
+		payload, 1779012000000, 1779012030000,
+	)
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 1, Synced: 1,
+	})
+
+	stored, err := env.db.GetSessionFull(
+		context.Background(), "kiro:kiro-db",
+	)
+	require.NoError(t, err, "GetSessionFull kiro")
+	require.NotNil(t, stored, "kiro session")
+	require.False(t, stored.LastWriteIncremental,
+		"DB-backed providers must never set the incremental marker")
+
+	mutateDB(t, env,
+		"UPDATE sessions SET first_message = ? WHERE id = ?",
+		"drifted first message", "kiro:kiro-db")
+
+	report := runParseDiff(t, env, sync.ParseDiffOptions{
+		Agents: []parser.AgentType{parser.AgentKiro},
+	})
+	assert.Zero(t, report.Totals.IncrementalSkew,
+		"DB-backed drift must never classify as incremental skew")
+	changed := findSessionDiff(report, "kiro:kiro-db")
+	require.NotNil(t, changed, "kiro session not listed")
+	assert.Equal(t, sync.DiffChanged, changed.Class,
+		"DB-backed drift stays changed, never skew")
+	assert.True(t, report.HasFailures(),
+		"DB-backed drift must trip --fail-on-change")
+}
+
+// TestParseDiffRacedWinsOverIncrementalSkew pins the precedence: when a
+// source both advanced past its snapshot mtime (raced) and was last
+// written incrementally (skew), raced wins because the advanced mtime is
+// the stronger, directly provable diagnosis.
+func TestParseDiffRacedWinsOverIncrementalSkew(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
+
+	path := env.writeClaudeSession(t, "test-proj", "pd-both.jsonl",
+		parseDiffClaudeContent("both prompt", "both reply"))
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 1, Synced: 1,
+	})
+	appendClaudeLineAndSyncIncremental(t, env, path,
+		claudeAppendedAssistantLine("appended reply", "2024-01-01T10:00:10Z"))
+
+	// Seed a per-message metadata (timestamp) diff -- an incremental-artifact
+	// field, so this session would otherwise classify skew; raced must win.
+	mutateDB(t, env,
+		"UPDATE messages SET timestamp = ? WHERE session_id = ? AND ordinal = 0",
+		"2020-01-01T00:00:00Z", "pd-both")
+
+	// Advance the source mtime past the snapshot so the session is BOTH
+	// raced and incrementally written.
+	future := time.Now().Add(48 * time.Hour)
+	require.NoError(t, os.Chtimes(path, future, future),
+		"advance source mtime")
+
+	report := runParseDiff(t, env, sync.ParseDiffOptions{})
+	assert.Equal(t, sync.ParseDiffTotals{
+		Examined: 1, Raced: 1,
+	}, report.Totals, "raced wins over incremental skew")
+	both := findSessionDiff(report, "pd-both")
+	require.NotNil(t, both, "session not listed")
+	assert.Equal(t, sync.DiffRaced, both.Class,
+		"raced takes precedence over incremental skew")
+	assert.False(t, report.HasFailures(),
+		"a raced/skew session must not trip --fail-on-change")
+}
+
+// TestParseDiffDBBackedSourceNotMaskedAsRaced pins the reliability gate for
+// composite, DB-backed sources. Many Kiro sessions share ONE data.sqlite3, and
+// the live mtime the skew guard could observe (a composite db stat or per-row
+// updated_at) is NOT a basis-matching stat of a literal file whose mtime
+// populated file_mtime. Because that comparison is unreliable, the raced
+// reclassification must NOT apply to these sources at all -- even when a
+// session's row updated_at advanced past its snapshot, a detected drift stays a
+// genuine DiffChanged rather than being masked as DiffRaced. This fails CLOSED:
+// real parser regressions on DB-backed agents are never hidden from
+// --fail-on-change.
+func TestParseDiffDBBackedSourceNotMaskedAsRaced(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentKiro)
+	ks := createKiroSQLiteDB(t, env.kiroDir)
+	const (
+		advancedID  = "kiro-advanced"
+		quiescentID = "kiro-quiescent"
+	)
+	// Both sessions share the same payload content and the same initial
+	// updated_at, so each is stored with the same per-session snapshot
+	// file_mtime (updated_at * 1e6).
+	payload := readKiroSQLiteFixture(t, "standard_payload.json")
+	const initialUpdatedAt = int64(1779012030000)
+	ks.addSession(
+		t, "/home/user/code/kiro-app", advancedID,
+		payload, 1779012000000, initialUpdatedAt,
+	)
+	ks.addSession(
+		t, "/home/user/code/kiro-app", quiescentID,
+		payload, 1779012000000, initialUpdatedAt,
+	)
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 2, Synced: 2,
+	})
+
+	// Seed real parser drift in the archive for BOTH sessions so a
+	// re-parse of the unchanged payload detects a first_message change.
+	mutateDB(t, env,
+		"UPDATE sessions SET first_message = ? WHERE id = ?",
+		"drifted first message", "kiro:"+advancedID)
+	mutateDB(t, env,
+		"UPDATE sessions SET first_message = ? WHERE id = ?",
+		"drifted first message", "kiro:"+quiescentID)
+
+	// Advance ONLY one session's row updated_at past its snapshot. Under the
+	// old per-session raced check this would have masked the advanced session
+	// as DiffRaced; the reliability gate now skips the raced check for this
+	// DB-backed (virtual-path) source entirely, so the drift stays genuine.
+	ks.updateSession(t, advancedID, payload, initialUpdatedAt+60000)
+
+	report := runParseDiff(t, env, sync.ParseDiffOptions{
+		Agents: []parser.AgentType{parser.AgentKiro},
+	})
+
+	// Neither session is masked as raced: a DB-backed source has no
+	// basis-matching live mtime, so both genuine drifts are reported as
+	// changes and --fail-on-change fires.
+	assert.Equal(t, sync.ParseDiffTotals{
+		Examined: 2, Changed: 2,
+	}, report.Totals, "DB-backed drift must not be masked as raced")
+	// Both seeded first_message drifts are counted; the advanced session's
+	// updated_at bump additionally surfaces its ended_at change. Under the old
+	// raced reclassification the advanced session (and all its field diffs)
+	// would have been masked, hiding genuine drift from --fail-on-change.
+	assert.Equal(t, map[string]int{
+		sync.FieldFirstMessage: 2,
+		sync.FieldEndedAt:      1,
+	}, report.FieldCounts,
+		"genuine drift on DB-backed sources is no longer masked")
+
+	advanced := findSessionDiff(report, "kiro:"+advancedID)
+	require.NotNil(t, advanced, "advanced session not listed")
+	assert.Equal(t, sync.DiffChanged, advanced.Class,
+		"advanced DB-backed drift stays changed, not raced")
+	assert.Contains(t, sessionDiffFieldNames(advanced, false),
+		sync.FieldFirstMessage, "advanced field")
+
+	quiescent := findSessionDiff(report, "kiro:"+quiescentID)
+	require.NotNil(t, quiescent, "quiescent session not listed")
+	assert.Equal(t, sync.DiffChanged, quiescent.Class,
+		"untouched-source drift stays changed")
+	assert.Contains(t, sessionDiffFieldNames(quiescent, false),
+		sync.FieldFirstMessage, "quiescent field")
+
+	assert.True(t, report.HasFailures(),
+		"genuine DB-backed drift must trip --fail-on-change")
+}
+
+// TestParseDiffCodexIndexSkewDoesNotMaskTranscriptDrift pins that Codex's
+// shared session_index.jsonl mtime is not a per-session raced signal for
+// transcript-derived diffs. Advancing ONLY the index past the snapshot leaves
+// the transcript untouched; seeded first_message drift must stay DiffChanged
+// so --fail-on-change cannot pass because some unrelated title/index write
+// advanced the global index.
+func TestParseDiffCodexIndexSkewDoesNotMaskTranscriptDrift(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	root := t.TempDir()
+	codexDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(codexDir, 0o755))
+	env := setupSingleAgentTestEnvWithDirs(
+		t, parser.AgentCodex, []string{codexDir},
+	)
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229e1"
+	content := testjsonl.NewSessionBuilder().
+		AddCodexMeta(tsEarly, uuid, "/home/user/code/api", "user").
+		AddCodexMessage(tsEarlyS1, "user", "Add tests").
+		AddCodexMessage(tsEarlyS5, "assistant", "Adding coverage.").
+		String()
+	sessionPath := env.writeCodexSession(
+		t, filepath.Join("2026", "06", "11"),
+		"rollout-2026-06-11T12-44-06-"+uuid+".jsonl", content,
+	)
+
+	indexPath := filepath.Join(root, "session_index.jsonl")
+	require.NoError(t, os.WriteFile(indexPath, []byte(
+		`{"id":"`+uuid+`","thread_name":"Codex title",`+
+			`"updated_at":"2026-06-11T17:34:20Z"}`+"\n",
+	), 0o644))
+	// Pin both files to one past instant so the stored snapshot file_mtime
+	// (max of transcript and index) is that instant for both.
+	base := time.Now().Add(-2 * time.Hour)
+	require.NoError(t, os.Chtimes(sessionPath, base, base), "chtimes session")
+	require.NoError(t, os.Chtimes(indexPath, base, base), "chtimes index")
+
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 1, Synced: 1,
+	})
+
+	// Seed real parser drift in the archive so a re-parse of the unchanged
+	// transcript reports a first_message change to reclassify.
+	mutateDB(t, env,
+		"UPDATE sessions SET first_message = ? WHERE id = ?",
+		"drifted first message", "codex:"+uuid)
+
+	// Advance ONLY the index past the snapshot; the transcript is untouched.
+	// CodexEffectiveMtime folds the index in, but that global index mtime is
+	// not evidence that this session's transcript-derived first_message diff
+	// raced with a live write.
+	future := time.Now().Add(48 * time.Hour)
+	require.NoError(t, os.Chtimes(indexPath, future, future),
+		"advance index mtime")
+
+	report := runParseDiff(t, env, sync.ParseDiffOptions{
+		Agents: []parser.AgentType{parser.AgentCodex},
+	})
+
+	assert.Equal(t, sync.ParseDiffTotals{Examined: 1, Changed: 1},
+		report.Totals, "index-only skew must not mask transcript drift")
+	assert.Equal(t, 1, report.FieldCounts[sync.FieldFirstMessage],
+		"first_message drift must remain counted")
+	changed := findSessionDiff(report, "codex:"+uuid)
+	require.NotNil(t, changed, "codex session not listed")
+	assert.Equal(t, sync.DiffChanged, changed.Class, "changed class")
+	assert.True(t, report.HasFailures(),
+		"transcript drift must trip --fail-on-change")
+}
+
+// TestParseDiffCodexTranscriptSkewUsesTranscriptStoredMtime pins the other
+// Codex mtime basis: the raced guard must compare the transcript-only live
+// mtime against the transcript-only stored mtime. Stored file_mtime still folds
+// in session_index.jsonl for normal sync invalidation, and that index mtime can
+// be newer than both transcript mtimes; it must not prevent a later transcript
+// write from being classified DiffRaced.
+func TestParseDiffCodexTranscriptSkewUsesTranscriptStoredMtime(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	root := t.TempDir()
+	codexDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(codexDir, 0o755))
+	env := setupSingleAgentTestEnvWithDirs(
+		t, parser.AgentCodex, []string{codexDir},
+	)
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229e2"
+	original := testjsonl.NewSessionBuilder().
+		AddCodexMeta(tsEarly, uuid, "/home/user/code/api", "user").
+		AddCodexMessage(tsEarlyS1, "user", "Add tests").
+		AddCodexMessage(tsEarlyS5, "assistant", "Adding coverage.").
+		String()
+	sessionPath := env.writeCodexSession(
+		t, filepath.Join("2026", "06", "11"),
+		"rollout-2026-06-11T12-44-06-"+uuid+".jsonl", original,
+	)
+
+	indexPath := filepath.Join(root, "session_index.jsonl")
+	require.NoError(t, os.WriteFile(indexPath, []byte(
+		`{"id":"`+uuid+`","thread_name":"Codex title",`+
+			`"updated_at":"2026-06-11T17:34:20Z"}`+"\n",
+	), 0o644))
+	transcriptSnapshot := time.Now().Add(-4 * time.Hour)
+	transcriptWrite := time.Now().Add(-3 * time.Hour)
+	indexSnapshot := time.Now().Add(-2 * time.Hour)
+	require.NoError(t, os.Chtimes(
+		sessionPath, transcriptSnapshot, transcriptSnapshot,
+	), "chtimes session snapshot")
+	require.NoError(t, os.Chtimes(indexPath, indexSnapshot, indexSnapshot),
+		"chtimes index snapshot")
+
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 1, Synced: 1,
+	})
+
+	stored, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	require.NoError(t, err, "GetSessionFull")
+	require.NotNil(t, stored, "stored Codex session")
+	require.NotNil(t, stored.FileMtime, "stored file_mtime")
+	assert.Equal(t, indexSnapshot.UnixNano(), *stored.FileMtime,
+		"stored file_mtime should be index-folded")
+
+	changed := testjsonl.NewSessionBuilder().
+		AddCodexMeta(tsEarly, uuid, "/home/user/code/api", "user").
+		AddCodexMessage(tsEarlyS1, "user", "Changed prompt").
+		AddCodexMessage(tsEarlyS5, "assistant", "Adding coverage.").
+		String()
+	require.NoError(t, os.WriteFile(sessionPath, []byte(changed), 0o644),
+		"rewrite transcript")
+	require.NoError(t, os.Chtimes(sessionPath, transcriptWrite, transcriptWrite),
+		"advance transcript below index-folded stored mtime")
+
+	report := runParseDiff(t, env, sync.ParseDiffOptions{
+		Agents: []parser.AgentType{parser.AgentCodex},
+	})
+
+	assert.Equal(t, sync.ParseDiffTotals{Examined: 1, Raced: 1},
+		report.Totals, "transcript write should be raced")
+	assert.Empty(t, report.FieldCounts,
+		"raced field diffs must not count as parser drift")
+	raced := findSessionDiff(report, "codex:"+uuid)
+	require.NotNil(t, raced, "codex session not listed")
+	assert.Equal(t, sync.DiffRaced, raced.Class, "raced class")
+	assert.False(t, report.HasFailures(),
+		"transcript write skew must not trip --fail-on-change")
+}
+
+// TestParseDiffCodexIncrementalAppendDoesNotLookRaced covers the stable-source
+// side of the Codex transcript fingerprint fallback. A Codex incremental append
+// advances the stored source snapshot, so later parser drift against that
+// unchanged transcript must remain DiffChanged rather than being hidden as a
+// stale-fingerprint race.
+func TestParseDiffCodexIncrementalAppendDoesNotLookRaced(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	env := setupSingleAgentTestEnv(t, parser.AgentCodex)
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229e3"
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+	)
+	path := env.writeCodexSession(
+		t, filepath.Join("2026", "06", "11"),
+		"rollout-2026-06-11T12-44-06-"+uuid+".jsonl", initial,
+	)
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 1, Synced: 1,
+	})
+
+	appended := testjsonl.JoinJSONL(
+		testjsonl.CodexMsgJSON("assistant", "world", tsEarlyS5),
+	)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open for append")
+	_, err = f.WriteString(appended)
+	require.NoError(t, f.Close(), "close after append")
+	require.NoError(t, err, "append")
+	env.engine.SyncPaths([]string{path})
+	assertSessionMessageCount(t, env.db, "codex:"+uuid, 2)
+
+	mutateDB(t, env,
+		"UPDATE sessions SET first_message = ? WHERE id = ?",
+		"drifted first message", "codex:"+uuid)
+
+	report := runParseDiff(t, env, sync.ParseDiffOptions{
+		Agents: []parser.AgentType{parser.AgentCodex},
+	})
+
+	assert.Equal(t, sync.ParseDiffTotals{Examined: 1, Changed: 1},
+		report.Totals, "unchanged-source drift must stay changed")
+	assert.Equal(t, 1, report.FieldCounts[sync.FieldFirstMessage],
+		"first_message drift must be counted")
+	changed := findSessionDiff(report, "codex:"+uuid)
+	require.NotNil(t, changed, "codex session not listed")
+	assert.Equal(t, sync.DiffChanged, changed.Class, "changed class")
+	assert.True(t, report.HasFailures(),
+		"stable-source parser drift must trip --fail-on-change")
+}
+
+func TestParseDiffCodexLegacyStaleIncrementalHashDoesNotLookRaced(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	env := setupSingleAgentTestEnv(t, parser.AgentCodex)
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229e5"
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+	)
+	path := env.writeCodexSession(
+		t, filepath.Join("2026", "06", "11"),
+		"rollout-2026-06-11T12-44-06-"+uuid+".jsonl", initial,
+	)
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 1, Synced: 1,
+	})
+	beforeAppend, err := env.db.GetSessionFull(
+		context.Background(), "codex:"+uuid,
+	)
+	require.NoError(t, err, "GetSessionFull before append")
+	require.NotNil(t, beforeAppend, "session before append")
+	require.NotNil(t, beforeAppend.FileHash, "file_hash before append")
+	staleHash := *beforeAppend.FileHash
+
+	appended := testjsonl.JoinJSONL(
+		testjsonl.CodexMsgJSON("assistant", "world", tsEarlyS5),
+	)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open for append")
+	_, err = f.WriteString(appended)
+	require.NoError(t, f.Close(), "close after append")
+	require.NoError(t, err, "append")
+	env.engine.SyncPaths([]string{path})
+	assertSessionMessageCount(t, env.db, "codex:"+uuid, 2)
+
+	// Simulate a current data-version archive written by the legacy
+	// incremental path: size/mtime advanced, but file_hash stayed on the
+	// previous full-parse snapshot.
+	mutateDB(t, env,
+		"UPDATE sessions SET file_hash = ? WHERE id = ?",
+		staleHash, "codex:"+uuid)
+	mutateDB(t, env,
+		"UPDATE sessions SET first_message = ? WHERE id = ?",
+		"drifted first message", "codex:"+uuid)
+
+	report := runParseDiff(t, env, sync.ParseDiffOptions{
+		Agents: []parser.AgentType{parser.AgentCodex},
+	})
+
+	assert.Equal(t, sync.ParseDiffTotals{Examined: 1, Changed: 1},
+		report.Totals, "legacy stale hash drift must stay changed")
+	assert.Equal(t, 1, report.FieldCounts[sync.FieldFirstMessage],
+		"first_message drift must be counted")
+	changed := findSessionDiff(report, "codex:"+uuid)
+	require.NotNil(t, changed, "codex session not listed")
+	assert.Equal(t, sync.DiffChanged, changed.Class, "changed class")
+	assert.True(t, report.HasFailures(),
+		"stable-source parser drift must trip --fail-on-change")
+}
+
+func TestParseDiffCodexFullParsePartialTailDoesNotLookRaced(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	env := setupSingleAgentTestEnv(t, parser.AgentCodex)
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229e6"
+	content := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+	) + `{"timestamp":"2024-01-01T10:00:10Z"`
+	path := env.writeCodexSession(
+		t, filepath.Join("2026", "06", "11"),
+		"rollout-2026-06-11T12-44-06-"+uuid+".jsonl", content,
+	)
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 1, Synced: 1,
+	})
+	assertSessionMessageCount(t, env.db, "codex:"+uuid, 1)
+
+	stored, err := env.db.GetSessionFull(
+		context.Background(), "codex:"+uuid,
+	)
+	require.NoError(t, err, "GetSessionFull after full parse")
+	require.NotNil(t, stored, "stored session after full parse")
+	require.NotNil(t, stored.FileSize, "stored file_size")
+	info, err := os.Stat(path)
+	require.NoError(t, err, "stat transcript")
+	assert.Equal(t, info.Size(), *stored.FileSize,
+		"full Codex parse stores raw file size including ignored tail")
+
+	mutateDB(t, env,
+		"UPDATE sessions SET first_message = ? WHERE id = ?",
+		"drifted first message", "codex:"+uuid)
+
+	report := runParseDiff(t, env, sync.ParseDiffOptions{
+		Agents: []parser.AgentType{parser.AgentCodex},
+	})
+
+	assert.Equal(t, sync.ParseDiffTotals{Examined: 1, Changed: 1},
+		report.Totals, "unchanged full-parse partial tail drift must stay changed")
+	assert.Equal(t, 1, report.FieldCounts[sync.FieldFirstMessage],
+		"first_message drift must be counted")
+	changed := findSessionDiff(report, "codex:"+uuid)
+	require.NotNil(t, changed, "codex session not listed")
+	assert.Equal(t, sync.DiffChanged, changed.Class, "changed class")
+	assert.True(t, report.HasFailures(),
+		"stable-source parser drift must trip --fail-on-change")
+}
+
+func TestParseDiffCodexIncrementalPartialTailDoesNotLookRaced(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	env := setupSingleAgentTestEnv(t, parser.AgentCodex)
+
+	const uuid = "019eb791-cf7d-75c1-8439-9ed74c1229e4"
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/tmp/proj", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+	)
+	path := env.writeCodexSession(
+		t, filepath.Join("2026", "06", "11"),
+		"rollout-2026-06-11T12-44-06-"+uuid+".jsonl", initial,
+	)
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 1, Synced: 1,
+	})
+
+	appended := testjsonl.JoinJSONL(
+		testjsonl.CodexMsgJSON("assistant", "world", tsEarlyS5),
+	)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err, "open for append")
+	_, err = f.WriteString(appended)
+	require.NoError(t, err, "append complete message")
+	_, err = f.WriteString(`{"timestamp":"2024-01-01T10:00:10Z"`)
+	require.NoError(t, err, "append partial trailing JSON")
+	require.NoError(t, f.Close(), "close after append")
+	env.engine.SyncPaths([]string{path})
+	assertSessionMessageCount(t, env.db, "codex:"+uuid, 2)
+
+	mutateDB(t, env,
+		"UPDATE sessions SET first_message = ? WHERE id = ?",
+		"drifted first message", "codex:"+uuid)
+
+	report := runParseDiff(t, env, sync.ParseDiffOptions{
+		Agents: []parser.AgentType{parser.AgentCodex},
+	})
+
+	assert.Equal(t, sync.ParseDiffTotals{Examined: 1, Changed: 1},
+		report.Totals, "unchanged consumed prefix drift must stay changed")
+	assert.Equal(t, 1, report.FieldCounts[sync.FieldFirstMessage],
+		"first_message drift must be counted")
+	changed := findSessionDiff(report, "codex:"+uuid)
+	require.NotNil(t, changed, "codex session not listed")
+	assert.Equal(t, sync.DiffChanged, changed.Class, "changed class")
+	assert.True(t, report.HasFailures(),
+		"stable-source parser drift must trip --fail-on-change")
+}
+
+// writeHermesFanoutStateDB writes a Hermes state.db at <root>/state.db holding
+// two sessions (each one user message) and no sibling transcripts, so both
+// sessions resolve to the SAME shared state.db File.Path -- the literal-path
+// fan-out shape.
+func writeHermesFanoutStateDB(t *testing.T, root string) {
+	t.Helper()
+	conn, err := sql.Open("sqlite3", filepath.Join(root, "state.db"))
+	require.NoError(t, err, "open hermes state.db")
+	defer conn.Close()
+	_, err = conn.Exec(`
+		CREATE TABLE sessions (
+			id TEXT PRIMARY KEY, source TEXT NOT NULL, user_id TEXT,
+			model TEXT, model_config TEXT, system_prompt TEXT,
+			parent_session_id TEXT, started_at REAL NOT NULL, ended_at REAL,
+			end_reason TEXT, message_count INTEGER DEFAULT 0,
+			tool_call_count INTEGER DEFAULT 0, input_tokens INTEGER DEFAULT 0,
+			output_tokens INTEGER DEFAULT 0, cache_read_tokens INTEGER DEFAULT 0,
+			cache_write_tokens INTEGER DEFAULT 0, reasoning_tokens INTEGER DEFAULT 0,
+			billing_provider TEXT, billing_base_url TEXT, billing_mode TEXT,
+			estimated_cost_usd REAL, actual_cost_usd REAL, cost_status TEXT,
+			cost_source TEXT, pricing_version TEXT, title TEXT,
+			api_call_count INTEGER DEFAULT 0
+		);
+		CREATE TABLE messages (
+			id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+			role TEXT NOT NULL, content TEXT, tool_call_id TEXT, tool_calls TEXT,
+			tool_name TEXT, timestamp REAL NOT NULL, token_count INTEGER,
+			finish_reason TEXT, reasoning TEXT, reasoning_content TEXT,
+			reasoning_details TEXT, codex_reasoning_items TEXT,
+			codex_message_items TEXT
+		);
+		INSERT INTO sessions (id, source, model, started_at, ended_at, message_count, title)
+			VALUES ('alpha', 'discord', 'gpt-5.5', 1778767200.0, 1778767800.0, 1, 'Alpha');
+		INSERT INTO sessions (id, source, model, started_at, ended_at, message_count, title)
+			VALUES ('beta', 'discord', 'gpt-5.5', 1778768200.0, 1778768800.0, 1, 'Beta');
+		INSERT INTO messages (session_id, role, content, timestamp)
+			VALUES ('alpha', 'user', 'alpha prompt', 1778767210.0);
+		INSERT INTO messages (session_id, role, content, timestamp)
+			VALUES ('beta', 'user', 'beta prompt', 1778768210.0);
+	`)
+	require.NoError(t, err, "seed hermes state.db")
+}
+
+// TestParseDiffHermesSharedStateDBNotMaskedAsRaced pins the literal-path
+// fan-out gate. Many Hermes sessions resolve to one shared state.db File.Path,
+// so its mtime is not a per-session signal: a write that advances state.db for
+// any session would, without the fan-out guard, race-mask genuine drift on
+// every sibling. Both sessions must therefore stay DiffChanged (fail closed),
+// not DiffRaced, even though the shared source mtime advanced past the snapshot.
+func TestParseDiffHermesSharedStateDBNotMaskedAsRaced(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	root := t.TempDir()
+	sessionsDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+	writeHermesFanoutStateDB(t, root)
+
+	database := dbtest.OpenTestDB(t)
+	cfg := sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentHermes: {sessionsDir},
+		},
+		Machine: "local",
+	}
+	engine := sync.NewEngine(database, cfg)
+	stats := engine.SyncAll(context.Background(), nil)
+	require.Equal(t, 2, stats.Synced, "expected both Hermes sessions synced")
+
+	// Seed real parser drift in the archive for BOTH sessions so a re-parse
+	// of the unchanged state.db reports a first_message change.
+	for _, id := range []string{"hermes:alpha", "hermes:beta"} {
+		require.NoError(t, database.Update(func(tx *sql.Tx) error {
+			_, err := tx.Exec(
+				"UPDATE sessions SET first_message = ? WHERE id = ?",
+				"drifted first message", id,
+			)
+			return err
+		}), "drift %s", id)
+	}
+
+	// Advance the shared state.db mtime well past the stored snapshot, as a
+	// concurrent write to any session would.
+	future := time.Now().Add(48 * time.Hour)
+	require.NoError(t, os.Chtimes(
+		filepath.Join(root, "state.db"), future, future,
+	), "advance state.db mtime")
+
+	report, err := sync.NewDiffEngine(database, cfg).ParseDiff(
+		context.Background(),
+		sync.ParseDiffOptions{Agents: []parser.AgentType{parser.AgentHermes}},
+	)
+	require.NoError(t, err, "ParseDiff")
+	require.NotNil(t, report)
+
+	assert.Equal(t, sync.ParseDiffTotals{Examined: 2, Changed: 2},
+		report.Totals, "shared-source drift must not be masked as raced")
+	for _, id := range []string{"hermes:alpha", "hermes:beta"} {
+		sd := findSessionDiff(report, id)
+		require.NotNil(t, sd, "%s not listed", id)
+		assert.Equal(t, sync.DiffChanged, sd.Class,
+			"%s stays changed, not raced", id)
+	}
+	assert.True(t, report.HasFailures(),
+		"genuine shared-source drift must trip --fail-on-change")
+}
+
+// TestParseDiffEngineRefusesWrites proves sub-item (4): the report-only
+// engine NewDiffEngine returns must refuse the write entrypoints
+// (SyncAll/ResyncAll and friends) so a forceParse engine can never be
+// driven into rewriting the archive. The refusal is a no-op (zero stats,
+// nil error) and persists nothing.
+func TestParseDiffEngineRefusesWrites(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
+
+	path := env.writeClaudeSession(t, "test-proj", "pd-guard.jsonl",
+		parseDiffClaudeContent(
+			"guard prompt with AKIA7QHWN2DKR4FYPLJM",
+			"guard reply",
+		))
+
+	diffEngine := newParseDiffEngine(env)
+	ctx := context.Background()
+
+	assert.Equal(t, sync.SyncStats{}, diffEngine.SyncAll(ctx, nil),
+		"SyncAll on a report-only engine must be a no-op")
+	assert.Equal(t, sync.SyncStats{}, diffEngine.ResyncAll(ctx, nil),
+		"ResyncAll on a report-only engine must be a no-op")
+	assert.Equal(t, sync.SyncStats{},
+		diffEngine.SyncAllSince(ctx, time.Time{}, nil),
+		"SyncAllSince on a report-only engine must be a no-op")
+	assert.Equal(t, sync.SyncStats{},
+		diffEngine.SyncRootsSince(ctx, nil, time.Time{}, nil),
+		"SyncRootsSince on a report-only engine must be a no-op")
+	stats, err := diffEngine.SyncThenRun(
+		ctx, false, nil, func(forceFull bool) error {
+			return env.db.UpsertSession(db.Session{
+				ID: "sync-then-run-wrote",
+			})
+		},
+	)
+	require.NoError(t, err,
+		"SyncThenRun on a report-only engine should refuse cleanly")
+	assert.Equal(t, sync.SyncStats{}, stats,
+		"SyncThenRun on a report-only engine must be a no-op")
+	require.Error(t, diffEngine.RunExclusive(func() error {
+		return env.db.UpsertSession(db.Session{
+			ID: "run-exclusive-wrote",
+		})
+	}), "RunExclusive on a report-only engine must error")
+	require.Error(t, diffEngine.SyncSingleSession("claude:pd-guard"),
+		"SyncSingleSession on a report-only engine must error")
+
+	// Nothing was written despite a discoverable source on disk.
+	require.FileExists(t, path)
+	all, err := env.db.ListSessionsModifiedBetween(ctx, "", "", nil, nil)
+	require.NoError(t, err, "list sessions")
+	assert.Empty(t, all,
+		"refused writes must not persist any session rows")
+
+	// The real sync engine (forceParse off) still syncs the same source,
+	// proving the guard is scoped to report-only engines only.
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 1, Synced: 1,
+	})
+
+	const sessionID = "pd-guard"
+	mutateDB(t, env,
+		"UPDATE sessions SET secret_leak_count = 0, "+
+			"secrets_rules_version = '', quality_signal_version = 0"+
+			" WHERE id = ?", sessionID)
+	mutateDB(t, env,
+		"DELETE FROM secret_findings WHERE session_id = ?", sessionID)
+	require.Error(t, diffEngine.RecomputeSignals(ctx, sessionID),
+		"RecomputeSignals on a report-only engine must error")
+	mutateDB(t, env,
+		"UPDATE sessions SET secret_leak_count = 0, "+
+			"secrets_rules_version = '', quality_signal_version = 0"+
+			" WHERE id = ?", sessionID)
+	mutateDB(t, env,
+		"DELETE FROM secret_findings WHERE session_id = ?", sessionID)
+	_, err = diffEngine.ScanSecrets(
+		ctx, sync.SecretScanInput{Backfill: true}, nil,
+	)
+	require.Error(t, err,
+		"ScanSecrets on a report-only engine must error")
+	stored, err := env.db.GetSessionFull(ctx, sessionID)
+	require.NoError(t, err, "GetSessionFull after refused scans")
+	require.NotNil(t, stored, "stored session after refused scans")
+	assert.Zero(t, stored.SecretLeakCount,
+		"refused scans must not update secret_leak_count")
+	assert.Empty(t, stored.SecretsRulesVersion,
+		"refused scans must not update secrets_rules_version")
+	assert.Nil(t, stored.StoredQualitySignals(),
+		"refused recompute must not update quality signals")
+	findings, err := env.db.SessionSecretFindings(ctx, sessionID)
+	require.NoError(t, err, "SessionSecretFindings after refused scans")
+	assert.Empty(t, findings,
+		"refused scans must not persist secret findings")
+}
+
 func TestParseDiffPresenceSweep(t *testing.T) {
+
 	t.Run("current-version row no longer emitted", func(t *testing.T) {
-		env := setupTestEnv(t)
+		env := setupSingleAgentTestEnv(t, parser.AgentClaude)
 		path := env.writeClaudeSession(t, "test-proj", "pd-real.jsonl",
 			parseDiffClaudeContent("real prompt", "real reply"))
 		runSyncAndAssert(t, env.engine, sync.SyncStats{
@@ -1180,7 +2312,7 @@ func TestParseDiffPresenceSweep(t *testing.T) {
 	})
 
 	t.Run("stale row no longer emitted is pending resync", func(t *testing.T) {
-		env := setupTestEnv(t)
+		env := setupSingleAgentTestEnv(t, parser.AgentClaude)
 		path := env.writeClaudeSession(t, "test-proj", "pd-real.jsonl",
 			parseDiffClaudeContent("real prompt", "real reply"))
 		runSyncAndAssert(t, env.engine, sync.SyncStats{

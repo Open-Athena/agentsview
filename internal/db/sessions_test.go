@@ -14,31 +14,24 @@ func TestDeleteSession_LargeSessionFTSDelete(t *testing.T) {
 		t.Skip("skipping perf test in -short mode")
 	}
 	t.Parallel()
-	d := testDB(t)
+	d := openLargeSessionFixtureDB(t, true)
 	requireFTS(t, d)
 
-	const targetID = "delete-large"
-	const blobToken = "ftsdeletezzz"
-	insertSession(t, d, targetID, "proj")
-	insertMessages(t, d, largeSessionMessages(targetID, blobToken)...)
-	seedCrossSessionFKGrowth(t, d, "delete-neighbor")
-	poisonMessagesDeleteTrigger(t, d)
-
 	start := time.Now()
-	require.NoError(t, d.DeleteSession(targetID), "DeleteSession")
+	require.NoError(t, d.DeleteSession(largeSessionFixtureID), "DeleteSession")
 	elapsed := time.Since(start)
 	require.LessOrEqual(t, elapsed, largeSessionPerfCeiling,
 		"DeleteSession took %s, want < 10s (per-row FTS trigger regression?)",
 		elapsed.Round(time.Millisecond))
 
-	requireSessionGone(t, d, targetID)
-	assertNoFTSLeak(t, d, blobToken)
+	requireSessionGone(t, d, largeSessionFixtureID)
+	assertNoFTSLeak(t, d, largeSessionFixtureToken)
 	requireMessagesDeleteTriggerRestored(t, d)
 
 	var neighborPins int
 	err := d.getReader().QueryRow(
 		"SELECT count(*) FROM pinned_messages WHERE session_id LIKE ?",
-		"delete-neighbor-%",
+		largeSessionNeighborPrefix+"-%",
 	).Scan(&neighborPins)
 	require.NoError(t, err, "neighbor pins count")
 	assert.Equal(t, crossSessionNeighborCount, neighborPins,
@@ -68,6 +61,29 @@ func TestFindSessionIDsByPartial(t *testing.T) {
 	got, err = d.FindSessionIDsByPartial(ctx, "", 5)
 	require.NoError(t, err, "FindSessionIDsByPartial")
 	assert.Nil(t, got, "empty input")
+}
+
+func TestFindSessionIDsByPartialLiteralCaseSensitive(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "abc_def", "proj")
+	insertSession(t, d, "abcXdef", "proj")
+	insertSession(t, d, "abc%def", "proj")
+	insertSession(t, d, "ABCdef", "proj")
+
+	ctx := context.Background()
+
+	got, err := d.FindSessionIDsByPartial(ctx, "c_d", 10)
+	require.NoError(t, err, "underscore lookup")
+	assert.Equal(t, []string{"abc_def"}, got)
+
+	got, err = d.FindSessionIDsByPartial(ctx, "c%d", 10)
+	require.NoError(t, err, "percent lookup")
+	assert.Equal(t, []string{"abc%def"}, got)
+
+	got, err = d.FindSessionIDsByPartial(ctx, "abc", 10)
+	require.NoError(t, err, "case-sensitive lookup")
+	assert.ElementsMatch(t, []string{"abc_def", "abcXdef", "abc%def"}, got)
+	assert.NotContains(t, got, "ABCdef")
 }
 
 func TestListSessions_OutcomeFilter(t *testing.T) {
@@ -304,6 +320,22 @@ func TestUpsertSessionDoesNotAdvanceDataVersion(t *testing.T) {
 	}), "UpsertSession (update)")
 	assert.Equal(t, CurrentDataVersion(), d.GetSessionDataVersion("dv-1"),
 		"after re-upsert, data_version (must be preserved across UpsertSession)")
+}
+
+func TestSessionTranscriptFidelityRoundTrips(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	s := Session{
+		ID:                 "antigravity-cli:fidelity-rt",
+		Agent:              "antigravity-cli",
+		TranscriptFidelity: "summary",
+	}
+	require.NoError(t, d.UpsertSession(s))
+
+	got, err := d.GetSession(ctx, s.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "summary", got.TranscriptFidelity)
 }
 
 func TestUpsertSessionTerminationStatus(t *testing.T) {

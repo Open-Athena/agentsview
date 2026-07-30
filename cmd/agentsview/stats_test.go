@@ -2,11 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -48,10 +53,12 @@ func assertContainsNone(t *testing.T, out string, banned ...string) {
 func setupGoldenStatsDataDir(t *testing.T) string {
 	t.Helper()
 	dataDir := newAgentDataDir(t)
+	t.Setenv("AGENTSVIEW_CURSOR_ATTRIBUTION_DB",
+		filepath.Join(dataDir, "missing-cursor-attribution.db"))
 	// TZ is normally pinned by --timezone=UTC, but the environment can
 	// still leak into date parsing on some platforms; pin it too.
 	t.Setenv("TZ", "UTC")
-	buildGoldenFixtureDB(t, sessionsDBPath(dataDir))
+	copyGoldenFixtureDB(t, sessionsDBPath(dataDir))
 	return dataDir
 }
 
@@ -60,6 +67,7 @@ func setupGoldenStatsDataDir(t *testing.T) string {
 // unmarshal into whichever shape they need.
 func runDefaultStatsJSON(t *testing.T) string {
 	t.Helper()
+	registerSQLiteDaemonRuntime(t, os.Getenv("AGENTSVIEW_DATA_DIR"))
 	out, err := executeCommand(newRootCommand(),
 		"stats",
 		"--format", "json",
@@ -215,6 +223,31 @@ func TestPrintStatsHuman_Populated(t *testing.T) {
 			CompactionsPerSession: 0.1,
 			AvgEditChurn:          1.2,
 		},
+		CodeAttribution: &db.CodeAttribution{
+			Sources: []db.CodeAttributionSource{{
+				Provider: "cursor",
+				Scope:    "machine_local",
+				Status:   "available",
+				Metrics: &db.CursorAttributionMetrics{
+					ScoredCommits:        2,
+					LinesAdded:           30,
+					LinesDeleted:         12,
+					TabLinesAdded:        8,
+					TabLinesDeleted:      2,
+					ComposerLinesAdded:   3,
+					ComposerLinesDeleted: 1,
+					HumanLinesAdded:      19,
+					HumanLinesDeleted:    9,
+					BlankLinesAdded:      4,
+					BlankLinesDeleted:    0,
+					AIAuthoredPct:        11.0 / 30.0,
+					ConversationCounts: []db.CursorConversationCount{
+						{Model: "claude-3.5-sonnet", Mode: "composer", Count: 2},
+						{Model: "claude-3.5-sonnet", Mode: "tab", Count: 1},
+					},
+				}},
+			},
+		},
 		GeneratedAt: "2026-04-18T00:00:00Z",
 	}
 
@@ -237,11 +270,14 @@ func TestPrintStatsHuman_Populated(t *testing.T) {
 		"Temporal",
 		"Outcome stats",
 		"Outcomes",
+		"Code attribution",
 	)
 
 	// Thousands separators must be applied to large counts.
 	assert.Contains(t, out, "11,905",
 		"expected thousands separator for 11,905")
+	assert.Contains(t, out, "claude-3.5-sonnet / composer",
+		"expected cursor conversation row")
 }
 
 // TestPrintStatsHuman_Empty guards the zero-session short
@@ -266,7 +302,8 @@ func TestPrintStatsHuman_Empty(t *testing.T) {
 		"expected zero-session placeholder in output")
 	// No optional section headers should appear.
 	assertContainsNone(t, out,
-		"Archetypes", "Velocity", "Cache economics", "Outcomes")
+		"Archetypes", "Velocity", "Cache economics", "Outcomes",
+		"Code attribution")
 }
 
 // TestFmtInt64 covers the thousands-separator helper.
@@ -299,6 +336,103 @@ func TestStatsCommand_OutcomeFlagsRegistered(t *testing.T) {
 		assert.NotNil(t, cmd.Flags().Lookup(name),
 			"missing --%s flag", name)
 	}
+}
+
+func TestStatsCommandUsesDiscoveredDaemon(t *testing.T) {
+	dataDir := newAgentDataDir(t)
+
+	var gotQuery url.Values
+	ts := daemonRouteTestServer(t, map[string]http.HandlerFunc{
+		"/api/v1/session-stats": func(w http.ResponseWriter, r *http.Request) {
+			gotQuery = r.URL.Query()
+			writeJSONResponse(w, `{
+				"schema_version": 1,
+				"window": {
+					"since": "2026-04-01T00:00:00Z",
+					"until": "2026-04-15T00:00:00Z",
+					"days": 14
+				},
+				"filters": {
+					"agent": "codex",
+					"projects_excluded": [],
+					"timezone": "UTC"
+				},
+				"totals": {"sessions_all": 5}
+			}`)
+		},
+	})
+	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
+
+	out, err := executeCommand(newRootCommand(),
+		"stats",
+		"--format", "json",
+		"--since", "2026-04-01",
+		"--until", "2026-04-15",
+		"--agent", "codex",
+		"--timezone", "UTC",
+	)
+
+	require.NoError(t, err, "stats output:\n%s", out)
+	assert.Equal(t, "2026-04-01", gotQuery.Get("since"))
+	assert.Equal(t, "2026-04-15", gotQuery.Get("until"))
+	assert.Equal(t, "codex", gotQuery.Get("agent"))
+	assert.Equal(t, "UTC", gotQuery.Get("timezone"))
+
+	var got db.SessionStats
+	require.NoError(t, json.Unmarshal([]byte(out), &got))
+	assert.Equal(t, 5, got.Totals.SessionsAll)
+}
+
+func TestStatsCommandReportsDaemonValidationError(t *testing.T) {
+	dataDir := newAgentDataDir(t)
+
+	var called bool
+	ts := daemonRouteTestServer(t, map[string]http.HandlerFunc{
+		"/api/v1/session-stats": func(w http.ResponseWriter, r *http.Request) {
+			called = true
+			w.WriteHeader(http.StatusBadRequest)
+			writeJSONResponse(w, `{"error":"invalid timezone: Fake/Zone"}`)
+		},
+	})
+	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
+
+	out, err := executeCommand(newRootCommand(),
+		"stats",
+		"--format", "json",
+		"--timezone", "Fake/Zone",
+	)
+
+	require.Error(t, err, "stats output:\n%s", out)
+	assert.True(t, called, "stats should use the discovered daemon")
+	assert.Contains(t, err.Error(), "HTTP 400")
+	assert.Contains(t, err.Error(), "invalid timezone: Fake/Zone")
+}
+
+func TestStatsCommandSkipsReadOnlyDaemon(t *testing.T) {
+	dataDir := setupGoldenStatsDataDir(t)
+
+	var called bool
+	ts := daemonRouteTestServer(t, map[string]http.HandlerFunc{
+		"/api/v1/session-stats": func(w http.ResponseWriter, r *http.Request) {
+			called = true
+			http.Error(w, "pg session stats unavailable", http.StatusNotImplemented)
+		},
+	})
+	registerTestRuntime(t, dataDir, ts.URL, true)
+
+	out, err := executeCommand(newRootCommand(),
+		"stats",
+		"--format", "json",
+		"--since", "2026-04-01",
+		"--until", "2026-04-15",
+		"--timezone", "UTC",
+	)
+
+	require.NoError(t, err, "stats output:\n%s", out)
+	assert.False(t, called, "read-only daemon stats endpoint should be skipped")
+	var got db.SessionStats
+	require.NoError(t, json.Unmarshal([]byte(out), &got))
+	assert.Equal(t, len(goldenFixtureSessions), got.Totals.SessionsAll)
 }
 
 // updateGolden toggles regeneration of stats_golden.json.
@@ -385,7 +519,80 @@ func TestStatsReadOnlyOpenAppliesCustomPricing(t *testing.T) {
 		"custom pricing should be applied to the read-only stats DB handle")
 }
 
-// buildGoldenFixtureDB seeds a deterministic session set into a fresh
+var (
+	goldenFixtureTemplateOnce  sync.Once
+	goldenFixtureTemplateFiles map[string][]byte
+	goldenFixtureTemplateErr   error
+)
+
+func copyGoldenFixtureDB(t *testing.T, dbPath string) {
+	t.Helper()
+	goldenFixtureTemplateOnce.Do(func() {
+		goldenFixtureTemplateFiles, goldenFixtureTemplateErr =
+			buildGoldenFixtureTemplateFiles(t)
+	})
+	require.NoError(t, goldenFixtureTemplateErr, "build golden fixture template")
+	require.NoError(t, os.MkdirAll(filepath.Dir(dbPath), 0o755),
+		"create golden fixture dir")
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		data, ok := goldenFixtureTemplateFiles[suffix]
+		if !ok {
+			continue
+		}
+		require.NoError(t, os.WriteFile(dbPath+suffix, data, 0o600),
+			"copy golden fixture db%s", suffix)
+	}
+}
+
+func buildGoldenFixtureTemplateFiles(t *testing.T) (map[string][]byte, error) {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "agentsview-golden-stats-*")
+	if err != nil {
+		return nil, fmt.Errorf("create golden fixture template dir: %w", err)
+	}
+	defer os.RemoveAll(dir)
+
+	dbPath := filepath.Join(dir, "sessions.db")
+	d, err := db.Open(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("open golden fixture template db: %w", err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = d.Close()
+		}
+	}()
+
+	seedGoldenFixtureDB(t, d)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := d.CheckpointWALTruncate(ctx); err != nil {
+		return nil, fmt.Errorf("checkpoint golden fixture template: %w", err)
+	}
+	if err := d.Close(); err != nil {
+		return nil, fmt.Errorf("close golden fixture template: %w", err)
+	}
+	closed = true
+
+	files := make(map[string][]byte, 3)
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		data, err := os.ReadFile(dbPath + suffix)
+		if err != nil {
+			if suffix != "" && errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, fmt.Errorf(
+				"read golden fixture template %s: %w",
+				dbPath+suffix, err,
+			)
+		}
+		files[suffix] = data
+	}
+	return files, nil
+}
+
+// seedGoldenFixtureDB seeds a deterministic session set into a fresh
 // SQLite database at dbPath. The fixture exercises the full v1 schema:
 //
 //   - Three agents (claude, codex, cursor) so agent_portfolio has variety.
@@ -403,12 +610,8 @@ func TestStatsReadOnlyOpenAppliesCustomPricing(t *testing.T) {
 // No cwd is set on any session so outcome_stats stays nil (git
 // integration is out of scope for this test). No GH_TOKEN env is
 // propagated, so PRsOpened/PRsMerged stay nil regardless.
-func buildGoldenFixtureDB(t *testing.T, dbPath string) {
+func seedGoldenFixtureDB(t *testing.T, d *db.DB) {
 	t.Helper()
-	d, err := db.Open(dbPath)
-	require.NoError(t, err, "open fixture db")
-	t.Cleanup(func() { d.Close() })
-
 	require.NoError(t, d.UpsertModelPricing([]db.ModelPricing{
 		{
 			ModelPattern:         "claude-sonnet-4-20250514",

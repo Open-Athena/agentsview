@@ -77,8 +77,7 @@ func newStatsCommand() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().String("format", "human",
-		"Output format: human or json")
+	registerFormatFlags(cmd.Flags())
 	registerStatsFlags(cmd,
 		&since, &until, &agent, &timezone,
 		&includeProjects, &excludeProjects,
@@ -139,10 +138,6 @@ func registerStatsFlags(
 		"Include GitHub PR outcome stats via gh (implies --include-git-outcomes)")
 }
 
-// openStatsService opens a read-only SessionService scoped to the local SQLite
-// archive. The stats command deliberately bypasses resolveService
-// (and the HTTP daemon transport) because the daemon does not yet
-// expose a /stats endpoint.
 func openStatsService(
 	cmd *cobra.Command,
 ) (service.SessionService, func(), error) {
@@ -150,14 +145,18 @@ func openStatsService(
 	if err != nil {
 		return nil, nil, fmt.Errorf("loading config: %w", err)
 	}
-	d, err := openReadOnlyDB(cfg)
+	tr, err := ensureTransport(&cfg, transportIntentRead, 0)
 	if err != nil {
-		return nil, nil, fmt.Errorf("opening db: %w", err)
+		return nil, nil, err
 	}
-	cleanup := func() { d.Close() }
-	// Pass a typed *db.DB so directBackend.Stats has the local handle
-	// it needs; engine is nil because the CLI never syncs.
-	return service.NewDirectBackend(d, nil), cleanup, nil
+	if tr.Mode == transportHTTP && tr.ReadOnly {
+		d, err := openReadOnlyDB(cfg)
+		if err != nil {
+			return nil, nil, fmt.Errorf("opening db: %w", err)
+		}
+		return service.NewDirectBackend(d, nil), func() { d.Close() }, nil
+	}
+	return newService(cfg, tr)
 }
 
 // printStatsHuman renders a human-readable summary of a SessionStats
@@ -174,6 +173,9 @@ func printStatsHuman(w io.Writer, stats *service.SessionStats) error {
 	if stats.Totals.SessionsAll == 0 {
 		fmt.Fprintln(ew, "Totals")
 		fmt.Fprintln(ew, "  (no sessions in window)")
+		if stats.CodeAttribution != nil {
+			printCodeAttribution(ew, stats.CodeAttribution)
+		}
 		return ew.err
 	}
 	printTotals(ew, stats)
@@ -195,6 +197,9 @@ func printStatsHuman(w io.Writer, stats *service.SessionStats) error {
 	}
 	if stats.Outcomes != nil {
 		printOutcomes(ew, stats.Outcomes)
+	}
+	if stats.CodeAttribution != nil {
+		printCodeAttribution(ew, stats.CodeAttribution)
 	}
 	return ew.err
 }
@@ -241,10 +246,12 @@ func printHeader(w io.Writer, s *service.SessionStats) {
 
 func printTotals(w io.Writer, s *service.SessionStats) {
 	fmt.Fprintln(w, "Totals")
-	fmt.Fprintf(w, "  Sessions:              %s (human %s, automation %s)\n",
+	fmt.Fprintf(w,
+		"  Sessions:              %s (human %s, automation %s, subagent %s)\n",
 		fmtInt(s.Totals.SessionsAll),
 		fmtInt(s.Totals.SessionsHuman),
-		fmtInt(s.Totals.SessionsAutomation))
+		fmtInt(s.Totals.SessionsAutomation),
+		fmtInt(s.Totals.SessionsSubagent))
 	fmt.Fprintf(w, "  Messages:              %s (user %s)\n",
 		fmtInt(s.Totals.MessagesTotal),
 		fmtInt(s.Totals.UserMessagesTotal))
@@ -448,6 +455,71 @@ func printOutcomes(w io.Writer, o *db.StatsOutcomes) {
 	fmt.Fprintf(w, "  Avg edit churn:      %s\n",
 		fmtFloat(o.AvgEditChurn))
 	fmt.Fprintln(w)
+}
+
+func printCodeAttribution(w io.Writer, c *db.CodeAttribution) {
+	fmt.Fprintln(w, "Code attribution")
+	for _, source := range c.Sources {
+		printCodeAttributionSource(w, source)
+	}
+	fmt.Fprintln(w)
+}
+
+func printCodeAttributionSource(w io.Writer, s db.CodeAttributionSource) {
+	fmt.Fprintf(w, "  Source:             %s\n", s.Provider)
+	if s.Status != "" {
+		fmt.Fprintf(w, "  Status:             %s\n", s.Status)
+	}
+	if s.Scope != "" {
+		fmt.Fprintf(w, "  Scope:              %s\n", s.Scope)
+	}
+	for _, warning := range s.Warnings {
+		fmt.Fprintf(w, "  Warning:            %s\n", warning)
+	}
+	switch s.Status {
+	case "unavailable", "error", "unsupported_filter":
+		return
+	case "empty":
+		fmt.Fprintln(w, "  Records:            none in window")
+		return
+	}
+	if s.Provider == "cursor" && s.Metrics != nil {
+		printCursorAttributionMetrics(w, s.Metrics)
+	}
+}
+
+func printCursorAttributionMetrics(w io.Writer, c *db.CursorAttributionMetrics) {
+	fmt.Fprintf(w, "  Scored commits:      %s\n",
+		fmtInt64(c.ScoredCommits))
+	fmt.Fprintf(w, "  Lines added/deleted: %s / %s\n",
+		fmtInt64(c.LinesAdded), fmtInt64(c.LinesDeleted))
+	fmt.Fprintf(w, "  Tab lines:           +%s / -%s\n",
+		fmtInt64(c.TabLinesAdded), fmtInt64(c.TabLinesDeleted))
+	fmt.Fprintf(w, "  Composer lines:      +%s / -%s\n",
+		fmtInt64(c.ComposerLinesAdded), fmtInt64(c.ComposerLinesDeleted))
+	fmt.Fprintf(w, "  Human lines:         +%s / -%s\n",
+		fmtInt64(c.HumanLinesAdded), fmtInt64(c.HumanLinesDeleted))
+	fmt.Fprintf(w, "  Blank lines:         +%s / -%s\n",
+		fmtInt64(c.BlankLinesAdded), fmtInt64(c.BlankLinesDeleted))
+	fmt.Fprintf(w, "  AI-authored pct:     %.1f%%\n",
+		c.AIAuthoredPct*100)
+	if len(c.ConversationCounts) > 0 {
+		fmt.Fprintln(w, "  Conversation counts")
+		tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+		for _, entry := range c.ConversationCounts {
+			model := entry.Model
+			if model == "" {
+				model = "(empty)"
+			}
+			mode := entry.Mode
+			if mode == "" {
+				mode = "(empty)"
+			}
+			fmt.Fprintf(tw, "    %s / %s\t%s\n",
+				model, mode, fmtInt64(entry.Count))
+		}
+		tw.Flush()
+	}
 }
 
 // formatGrades renders a grade histogram in canonical A..F order so

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -62,10 +63,22 @@ func (b *directBackend) Get(
 	return buildSessionDetail(s), nil
 }
 
+func (b *directBackend) FindSessionIDsByPartial(
+	ctx context.Context, partial string, limit int,
+) ([]string, error) {
+	return b.db.FindSessionIDsByPartial(ctx, partial, limit)
+}
+
 // buildSessionDetail wraps a db.Session with its computed health
 // breakdown. The same shape is returned by GET /api/v1/sessions/{id}.
 func buildSessionDetail(s *db.Session) *SessionDetail {
-	detail := &SessionDetail{Session: *s}
+	detail := &SessionDetail{
+		Session: *s,
+		// Derive-on-read: no persisted column. Computed once here from the
+		// session's agent and source_version so MarshalJSON just passes the
+		// field through and the HTTP backend round-trips it.
+		DecodeConfidence: parser.DecodeConfidence(s.Agent, s.SourceVersion),
+	}
 	if s.HealthScore != nil {
 		result := signals.ComputeHealthScore(signals.ScoreInput{
 			Outcome:                s.Outcome,
@@ -159,6 +172,7 @@ func listFilterToDB(f ListFilter) db.SessionFilter {
 		Project:              f.Project,
 		ExcludeProject:       f.ExcludeProject,
 		Machine:              f.Machine,
+		GitBranch:            f.GitBranch,
 		Agent:                f.Agent,
 		Date:                 f.Date,
 		DateFrom:             f.DateFrom,
@@ -311,7 +325,7 @@ func (b *directBackend) Sync(
 		// conversation lives on in a sibling. The single-session path keeps the
 		// conversation scope and follows it across sibling trace files.
 		if _, _, ok :=
-			parser.ParseVisualStudioCopilotVirtualPath(storedPath); ok {
+			parser.SplitVisualStudioCopilotVirtualPath(storedPath); ok {
 			if err := b.engine.SyncSingleSessionContext(
 				ctx, in.ID,
 			); err != nil {
@@ -385,10 +399,11 @@ func isVibeReplacement(requestedID string, detail *SessionDetail) bool {
 }
 
 // resolveSessionIDByPath returns the single session id whose
-// file_path equals the given absolute path. When a JSONL file
-// produces multiple sessions (e.g. Claude forked transcripts),
-// sync returns an ambiguity error instead of picking arbitrarily,
-// so the caller can disambiguate via `session sync <id>`.
+// file_path equals the given absolute path or a virtual key backed
+// by it. When a physical file produces multiple sessions (e.g.
+// Claude forked transcripts), sync returns an ambiguity error
+// instead of picking arbitrarily, so the caller can disambiguate via
+// `session sync <id>`.
 // Only called from Sync after it has verified b.local != nil.
 func (b *directBackend) resolveSessionIDByPath(
 	ctx context.Context, path string,
@@ -399,10 +414,10 @@ func (b *directBackend) resolveSessionIDByPath(
 	queryArgs := []any{path}
 	// Visual Studio Copilot stores file_path as a virtual sync key
 	// <traceFile>#<conversationID>, so an exact match on the physical
-	// trace path never resolves. Also match every conversation synced
-	// from that trace; multiple matches fall through to the ambiguity
-	// error below, exactly like a multi-session JSONL file.
-	if parser.IsVisualStudioCopilotTraceFile(path) {
+	// container path never resolves. Also match every conversation
+	// synced from that container; multiple matches fall through to the
+	// ambiguity error below, exactly like a multi-session JSONL file.
+	if isVisualStudioCopilotVirtualContainerPath(path) {
 		q = `SELECT id FROM sessions
 			WHERE file_path = ? OR file_path LIKE ? ESCAPE '\'
 			ORDER BY created_at DESC`
@@ -445,6 +460,16 @@ func (b *directBackend) resolveSessionIDByPath(
 			len(ids), path, ids,
 		)
 	}
+}
+
+func isVisualStudioCopilotVirtualContainerPath(path string) bool {
+	if parser.IsVisualStudioCopilotTraceFile(path) {
+		return true
+	}
+	_, _, ok := parser.SplitVisualStudioCopilotVirtualPath(
+		parser.VisualStudioCopilotVirtualPath(path, filepath.Base(path)),
+	)
+	return ok
 }
 
 // Watch returns a stream of events for the given session,
@@ -498,6 +523,115 @@ func (b *directBackend) Watch(
 	return out, nil
 }
 
+// Search runs a full-text session search, mirroring the logic in
+// internal/server.humaSearch so both transports return identical
+// results: the raw query is normalized via db.PrepareFTSQuery, the
+// limit is clamped to [1, db.MaxSearchLimit] (defaulting to
+// db.DefaultSearchLimit), and a store without an FTS index yields
+// ErrSearchUnavailable rather than an opaque failure.
+func (b *directBackend) Search(
+	ctx context.Context, req SearchRequest,
+) (*SessionSearchResult, error) {
+	query := strings.TrimSpace(req.Query)
+	if query == "" {
+		return nil, &db.SearchInputError{Msg: "search: query required"}
+	}
+	if !b.db.HasFTS() {
+		return nil, ErrSearchUnavailable
+	}
+	// Match the HTTP handler's clampLimit semantics: <=0 -> default,
+	// over-max -> max. (db.Search would otherwise snap an over-max
+	// value to the default; pre-clamping keeps parity with the REST
+	// path, which clamps before calling the store.)
+	limit := req.Limit
+	if limit <= 0 {
+		limit = db.DefaultSearchLimit
+	} else if limit > db.MaxSearchLimit {
+		limit = db.MaxSearchLimit
+	}
+	page, err := b.db.Search(ctx, db.SearchFilter{
+		Query:   db.PrepareFTSQuery(query),
+		Project: req.Project,
+		Sort:    req.Sort,
+		Cursor:  req.Cursor,
+		Limit:   limit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	results := page.Results
+	if results == nil {
+		results = []db.SearchResult{}
+	}
+	return &SessionSearchResult{
+		Results:    results,
+		NextCursor: page.NextCursor,
+	}, nil
+}
+
+// UsageSummary validates the request, runs the daily-usage query
+// through the store, and folds the per-day breakdowns into range-wide
+// totals. It works over SQLite and the PG read store because
+// db.GetDailyUsage is on db.Store; a read store that cannot serve usage
+// returns db.ErrReadOnly, which callers surface as 501.
+func (b *directBackend) UsageSummary(
+	ctx context.Context, req UsageRequest,
+) (*UsageSummaryResult, error) {
+	f, err := BuildUsageFilter(req)
+	if err != nil {
+		return nil, err
+	}
+	result, err := b.db.GetDailyUsage(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	summary := buildUsageSummary(f, result)
+	if parser.AgentFilterLacksPerMessageTokenData(f.Agent) &&
+		db.NoTokenData(result.Totals) {
+		matchingSessions, err := b.db.GetUsageMatchingSessionCount(ctx, f)
+		if err != nil {
+			return nil, err
+		}
+		if matchingSessions > 0 {
+			summary.UnsupportedUsage = &UnsupportedUsage{
+				Kind: UnsupportedUsageKindForAgentFilter(f.Agent),
+			}
+		}
+	}
+	return summary, nil
+}
+
+func (b *directBackend) UsagePairwiseComparison(
+	ctx context.Context, req UsagePairwiseComparisonRequest,
+) (*UsagePairwiseComparisonResponse, error) {
+	leftFilter, leftEmpty, rightFilter, rightEmpty, err := BuildUsagePairwiseFilters(req)
+	if err != nil {
+		return nil, err
+	}
+	leftFilter.Breakdowns = false
+	rightFilter.Breakdowns = false
+	leftFilter.SkipSessionCounts = false
+	rightFilter.SkipSessionCounts = false
+
+	var leftResult db.DailyUsageResult
+	if !leftEmpty {
+		leftResult, err = b.db.GetDailyUsage(ctx, leftFilter)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var rightResult db.DailyUsageResult
+	if !rightEmpty {
+		rightResult, err = b.db.GetDailyUsage(ctx, rightFilter)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	out := BuildUsagePairwiseComparisonResult(leftResult, rightResult)
+	return &out, nil
+}
+
 // SearchContent maps the transport-neutral request to a
 // db.ContentSearchFilter, calls the store, and redacts secret-shaped
 // spans from each snippet unless Reveal is set.
@@ -521,6 +655,7 @@ func (b *directBackend) SearchContent(
 		Project:          req.Project,
 		ExcludeProject:   req.ExcludeProject,
 		Machine:          req.Machine,
+		GitBranch:        req.GitBranch,
 		Agent:            req.Agent,
 		Date:             req.Date,
 		DateFrom:         req.DateFrom,
@@ -632,7 +767,8 @@ func (b *directBackend) Stats(
 	if b.local == nil {
 		return nil, db.ErrReadOnly
 	}
-	return b.local.GetSessionStats(ctx, db.StatsFilter{
+	f.Agent = normalizeStatsAgentFilter(f.Agent)
+	stats, err := b.local.GetSessionStats(ctx, db.StatsFilter{
 		Since:                 f.Since,
 		Until:                 f.Until,
 		Agent:                 f.Agent,
@@ -643,4 +779,178 @@ func (b *directBackend) Stats(
 		IncludeGitHubOutcomes: f.IncludeGitHubOutcomes,
 		GHToken:               f.GHToken,
 	})
+	if err != nil {
+		return nil, err
+	}
+	stats.CodeAttribution = collectCodeAttribution(f, stats)
+	return stats, nil
+}
+
+func collectCodeAttribution(
+	f StatsFilter,
+	stats *SessionStats,
+) *db.CodeAttribution {
+	if stats == nil {
+		return nil
+	}
+	sources := []db.CodeAttributionSource{}
+	if source, ok := collectCursorAttribution(f, stats); ok {
+		sources = append(sources, source)
+	}
+	if len(sources) == 0 {
+		return nil
+	}
+	slices.SortFunc(sources, func(a, b db.CodeAttributionSource) int {
+		if n := strings.Compare(a.Provider, b.Provider); n != 0 {
+			return n
+		}
+		if n := strings.Compare(a.Scope, b.Scope); n != 0 {
+			return n
+		}
+		return strings.Compare(a.Status, b.Status)
+	})
+	return &db.CodeAttribution{Sources: sources}
+}
+
+func collectCursorAttribution(
+	f StatsFilter,
+	stats *SessionStats,
+) (db.CodeAttributionSource, bool) {
+	switch cursorAttributionDecision(f) {
+	case cursorAttributionSkip:
+		return db.CodeAttributionSource{}, false
+	case cursorAttributionUnsupportedProjectFilter:
+		return cursorAttributionSource(
+			"unsupported_filter",
+			"Cursor attribution is machine-local and cannot be scoped by project filters",
+		), true
+	}
+	from, err := time.Parse(time.RFC3339, stats.Window.Since)
+	if err != nil {
+		return cursorAttributionSource(
+			"error",
+			"failed to parse stats window for Cursor attribution",
+		), true
+	}
+	to, err := time.Parse(time.RFC3339, stats.Window.Until)
+	if err != nil {
+		return cursorAttributionSource(
+			"error",
+			"failed to parse stats window for Cursor attribution",
+		), true
+	}
+	attr, status, err := parser.LoadCursorAttribution(from, to)
+	if err != nil {
+		return cursorAttributionSource(
+			"error",
+			"failed to load Cursor attribution: "+err.Error(),
+		), true
+	}
+	return mapCursorAttributionSource(attr, status), true
+}
+
+func normalizeStatsAgentFilter(raw string) string {
+	parts := strings.Split(raw, ",")
+	filtered := parts[:0]
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" || part == "all" {
+			continue
+		}
+		filtered = append(filtered, part)
+	}
+	return strings.Join(filtered, ",")
+}
+
+type cursorAttributionLoadDecision int
+
+const (
+	cursorAttributionLoad cursorAttributionLoadDecision = iota
+	cursorAttributionSkip
+	cursorAttributionUnsupportedProjectFilter
+	cursorAttributionScopeMachineLocal = "machine_local"
+)
+
+func cursorAttributionDecision(f StatsFilter) cursorAttributionLoadDecision {
+	agents := strings.Split(normalizeStatsAgentFilter(f.Agent), ",")
+	seen := 0
+	hasCursor := false
+	for _, agent := range agents {
+		agent = strings.TrimSpace(agent)
+		if agent == "" {
+			continue
+		}
+		seen++
+		if agent == "cursor" {
+			hasCursor = true
+		}
+	}
+	if seen > 0 && !hasCursor {
+		return cursorAttributionSkip
+	}
+	if len(f.IncludeProjects) > 0 || len(f.ExcludeProjects) > 0 {
+		return cursorAttributionUnsupportedProjectFilter
+	}
+	return cursorAttributionLoad
+}
+
+func mapCursorAttributionSource(
+	attr *parser.CursorAttribution,
+	status parser.CursorAttributionStatus,
+) db.CodeAttributionSource {
+	if attr == nil {
+		out := cursorAttributionSource(string(status), "")
+		if status == parser.CursorAttributionUnavailable {
+			out.Warnings = []string{
+				"Cursor attribution database is unavailable on this machine",
+			}
+		}
+		return out
+	}
+	out := cursorAttributionSource(string(status), "")
+	out.Metrics = &db.CursorAttributionMetrics{
+		ScoredCommits:        attr.ScoredCommits,
+		LinesAdded:           attr.LinesAdded,
+		LinesDeleted:         attr.LinesDeleted,
+		TabLinesAdded:        attr.TabLinesAdded,
+		TabLinesDeleted:      attr.TabLinesDeleted,
+		ComposerLinesAdded:   attr.ComposerLinesAdded,
+		ComposerLinesDeleted: attr.ComposerLinesDeleted,
+		HumanLinesAdded:      attr.HumanLinesAdded,
+		HumanLinesDeleted:    attr.HumanLinesDeleted,
+		BlankLinesAdded:      attr.BlankLinesAdded,
+		BlankLinesDeleted:    attr.BlankLinesDeleted,
+		AIAuthoredPct:        attr.AIAuthoredPct,
+	}
+	if len(attr.ConversationCounts) == 0 {
+		return out
+	}
+	out.Metrics.ConversationCounts = make(
+		[]db.CursorConversationCount,
+		0,
+		len(attr.ConversationCounts),
+	)
+	for _, entry := range attr.ConversationCounts {
+		out.Metrics.ConversationCounts = append(
+			out.Metrics.ConversationCounts,
+			db.CursorConversationCount{
+				Model: entry.Model,
+				Mode:  entry.Mode,
+				Count: entry.Count,
+			},
+		)
+	}
+	return out
+}
+
+func cursorAttributionSource(status, warning string) db.CodeAttributionSource {
+	out := db.CodeAttributionSource{
+		Provider: "cursor",
+		Status:   status,
+		Scope:    cursorAttributionScopeMachineLocal,
+	}
+	if warning != "" {
+		out.Warnings = []string{warning}
+	}
+	return out
 }

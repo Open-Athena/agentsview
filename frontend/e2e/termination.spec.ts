@@ -27,13 +27,11 @@ test.describe("session termination status", () => {
 
     // The fixture has exactly one unclean session.
     await expect(sp.sessionItems).toHaveCount(1);
-    await expect(sp.sessionListHeader).toContainText(
-      "1 sessions",
-    );
+    await expect(sp.sessionCount).toHaveText("1 session");
 
     // Surviving session renders the unclean StatusDot.
     await expect(
-      page.locator(".status-dot--unclean").first(),
+      page.locator(".kit-status-dot--unclean").first(),
     ).toBeVisible();
   });
 
@@ -44,7 +42,7 @@ test.describe("session termination status", () => {
     // when no session is selected.
     await page.goto("/");
     await expect(
-      page.locator(".status-dot--unclean").first(),
+      page.locator(".kit-status-dot--unclean").first(),
     ).toBeVisible();
   });
 

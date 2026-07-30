@@ -5,9 +5,12 @@ use std::fs;
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver as StdReceiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -24,14 +27,20 @@ use tauri_plugin_updater::UpdaterExt;
 
 const HOST: &str = "127.0.0.1";
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
-const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
+const DAEMON_STARTUP_LONG_NOTICE_AFTER: Duration = Duration::from_secs(300);
+const DAEMON_UNHEALTHY_GRACE: Duration = Duration::from_secs(15);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(125);
 const STATUS_POLL_MAX_INTERVAL: Duration = Duration::from_secs(1);
 const STATUS_PROBE_TIMEOUT: Duration = Duration::from_millis(1250);
 const STATUS_PROBE_FAILURE_NOTICE_AFTER: u32 = 10;
+const STATUS_PROBE_FAILURE_FAIL_AFTER: u32 = 30;
 const LOGIN_SHELL_ENV_TIMEOUT: Duration = Duration::from_secs(3);
 const UPDATE_SIDECAR_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const DATA_VERSION_TOO_NEW_EXIT_CODE: i32 = 3;
+const DESKTOP_LOG_FILE_NAME: &str = "agentsview-desktop.log";
+const DESKTOP_LOG_QUEUE_CAPACITY: usize = 64;
+const STARTUP_OUTPUT_MAX_CHARS: usize = 12_000;
+const OPEN_LOGS_FOLDER_MENU_ID: &str = "open_logs_folder";
 // Delay after navigating to the backend before probing whether the
 // Linux WebKitGTK web content process is actually alive. Gives the
 // process time to spawn so we don't false-positive on slow startup.
@@ -58,6 +67,41 @@ struct SidecarState {
 struct SidecarProcess {
     child: CommandChild,
     generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SidecarLogRecord {
+    label: &'static str,
+    record: String,
+}
+
+impl SidecarLogRecord {
+    fn new(label: &'static str, record: impl Into<String>) -> Self {
+        Self {
+            label,
+            record: record.into(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SidecarStdoutUpdate {
+    chunk: String,
+    redacted_chunk: String,
+    status: Option<String>,
+    port: Option<u16>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BackendStatusProbe {
+    Ready(u16),
+    Starting(String),
+    Unhealthy(String),
+    NotRunning(String),
+    Incompatible(String),
+    ReadOnly(String),
+    Unusable(String),
+    Unavailable,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -88,11 +132,23 @@ pub fn run() {
         .plugin(init_navigation_guard_plugin())
         .manage(SidecarState::default())
         .setup(|app| {
-            setup_menu(app)?;
+            if let Err(err) = setup_menu(app) {
+                eprintln!("[agentsview] failed to set up desktop menu: {err}");
+            }
             match tauri::async_runtime::block_on(run_data_version_preflight(app.handle())) {
                 Ok(()) => {
-                    launch_backend(app)?;
-                    schedule_auto_update_check(app.handle().clone());
+                    if let Err(err) = launch_backend(app) {
+                        eprintln!("[agentsview] backend launch failed: {err}");
+                        let window = main_window(app)?;
+                        spawn_startup_error_render(
+                            window,
+                            "AgentsView could not start",
+                            "The local backend failed to launch.",
+                            err.to_string().as_str(),
+                        );
+                    } else {
+                        schedule_auto_update_check(app.handle().clone());
+                    }
                 }
                 Err(DataVersionPreflightError::TooNew(message)) => {
                     eprintln!("[agentsview] data version preflight rejected archive: {message}");
@@ -110,14 +166,11 @@ pub fn run() {
                 }
                 Err(DataVersionPreflightError::Failed(message)) => {
                     let window = main_window(app)?;
-                    spawn_preflight_error_render(
+                    spawn_startup_error_render(
                         window,
                         "AgentsView could not verify the archive",
-                        format!(
-                            "Database compatibility check failed: {message}. The backend was not started."
-                        )
-                        .as_str(),
-                        "Close and reopen AgentsView after fixing the issue.",
+                        "The database compatibility check failed, so the backend was not started.",
+                        message.as_str(),
                     );
                 }
             }
@@ -131,6 +184,9 @@ pub fn run() {
                     if let Some(window) = app_handle.get_webview_window("main") {
                         let _ = window.eval("window.dispatchEvent(new CustomEvent('show-about'));");
                     }
+                }
+                if event.id().0 == OPEN_LOGS_FOLDER_MENU_ID {
+                    open_logs_folder(app_handle);
                 }
                 if event.id().0 == "check_updates" {
                     let handle = app_handle.clone();
@@ -355,6 +411,7 @@ fn sidecar_env() -> Vec<(OsString, OsString)> {
     let skip_login_shell = std::env::var_os("AGENTSVIEW_DESKTOP_SKIP_LOGIN_SHELL_ENV");
     let should_probe =
         should_probe_login_shell(skip_login_shell.as_ref(), cfg!(target_os = "windows"));
+    let is_windows = cfg!(target_os = "windows");
 
     build_sidecar_env(
         std::env::vars_os().collect(),
@@ -365,7 +422,8 @@ fn sidecar_env() -> Vec<(OsString, OsString)> {
         },
         read_desktop_env_file(),
         std::env::var_os("AGENTSVIEW_DESKTOP_PATH"),
-        cfg!(target_os = "windows"),
+        is_windows,
+        is_windows,
     )
 }
 
@@ -421,11 +479,12 @@ fn build_sidecar_env(
     desktop_file: Vec<(OsString, OsString)>,
     forced_path: Option<OsString>,
     case_insensitive_keys: bool,
+    is_windows: bool,
 ) -> Vec<(OsString, OsString)> {
     let mut merged = BTreeMap::new();
     merge_env_pairs(&mut merged, inherited, case_insensitive_keys);
     merge_env_pairs(&mut merged, login_shell, case_insensitive_keys);
-    merge_env_pairs(&mut merged, desktop_file, case_insensitive_keys);
+    merge_desktop_env_pairs(&mut merged, desktop_file, case_insensitive_keys, is_windows);
 
     if let Some(path) = forced_path {
         merged.insert(
@@ -435,6 +494,44 @@ fn build_sidecar_env(
     }
 
     merged.into_iter().collect()
+}
+
+fn merge_desktop_env_pairs(
+    dest: &mut BTreeMap<OsString, OsString>,
+    pairs: Vec<(OsString, OsString)>,
+    case_insensitive_keys: bool,
+    is_windows: bool,
+) {
+    for (k, v) in pairs {
+        let translated = translate_desktop_env_value(v, is_windows);
+        dest.insert(
+            normalize_env_key(k.as_os_str(), case_insensitive_keys),
+            translated,
+        );
+    }
+}
+
+fn translate_desktop_env_value(value: OsString, is_windows: bool) -> OsString {
+    if !is_windows {
+        return value;
+    }
+    let Some(v) = value.to_str() else {
+        return value;
+    };
+    let Some((distro, unix_path)) = v
+        .strip_prefix("wsl:")
+        .and_then(|value| value.split_once(":/"))
+    else {
+        return value;
+    };
+    if distro.is_empty()
+        || distro.contains(':')
+        || unix_path.is_empty()
+        || unix_path.starts_with('/')
+    {
+        return value;
+    }
+    OsString::from(format!(r"\\wsl.localhost\{distro}\{unix_path}").replace('/', "\\"))
 }
 
 fn merge_env_pairs(
@@ -890,23 +987,39 @@ fn wait_for_sidecar_termination(state: &SidecarState, generation: u64, timeout: 
 fn forward_sidecar_logs(mut rx: CommandRx, window: WebviewWindow, generation: u64) {
     let startup_handled = Arc::new(AtomicBool::new(false));
     let first_output = Arc::new(AtomicBool::new(false));
+    let startup_output = Arc::new(Mutex::new(String::new()));
+    let log_sender = spawn_sidecar_log_writer(window.app_handle().clone());
     let timeout_window = window.clone();
     let timeout_state = startup_handled.clone();
     thread::spawn(move || {
         thread::sleep(READY_TIMEOUT);
         if !timeout_state.load(Ordering::SeqCst) {
-            let _ = timeout_window
-                .eval("window.__setStatus('AgentsView backend did not become ready in time.');");
+            let _ = timeout_window.eval(
+                "window.__setStatus(\
+                 'AgentsView backend is still starting. Large migrations or initial syncs can take several minutes.');",
+            );
         }
     });
 
     tauri::async_runtime::spawn(async move {
         let mut stdout_buffer = String::new();
+        let mut stdout_log_buffer = String::new();
+        let mut stderr_log_buffer = String::new();
         while let Some(event) = rx.recv().await {
             match event {
                 CommandEvent::Stdout(chunk_bytes) => {
-                    let chunk = String::from_utf8_lossy(&chunk_bytes);
-                    eprintln!("[agentsview] {}", chunk.trim_end());
+                    let stdout_update = prepare_sidecar_stdout_update(
+                        &log_sender,
+                        &mut stdout_buffer,
+                        &mut stdout_log_buffer,
+                        &chunk_bytes,
+                    );
+                    emit_redacted_sidecar_stdout_chunk(stdout_update.redacted_chunk.as_str());
+                    push_startup_output(
+                        &startup_output,
+                        "stdout",
+                        stdout_update.redacted_chunk.as_str(),
+                    );
                     if !startup_handled.load(Ordering::SeqCst) {
                         if !first_output.swap(true, Ordering::SeqCst) {
                             let _ = window.eval(
@@ -914,15 +1027,12 @@ fn forward_sidecar_logs(mut rx: CommandRx, window: WebviewWindow, generation: u6
                                  window.__setStatus('Starting database and syncing sessions...');",
                             );
                         }
-                        if let Some(status) = extract_startup_status(chunk.as_ref()) {
+                        if let Some(status) = stdout_update.status {
                             let escaped = status.replace('\\', "\\\\").replace('\'', "\\'");
                             let _ =
                                 window.eval(format!("window.__setStatus('{escaped}');").as_str());
                         }
-                        if let Some(port) = parse_listening_port_from_stdout_buffer(
-                            &mut stdout_buffer,
-                            chunk.as_ref(),
-                        ) {
+                        if let Some(port) = stdout_update.port {
                             save_sidecar_port(window.app_handle(), port);
                             startup_handled.store(true, Ordering::SeqCst);
                             let _ = window.eval(
@@ -934,10 +1044,43 @@ fn forward_sidecar_logs(mut rx: CommandRx, window: WebviewWindow, generation: u6
                     }
                 }
                 CommandEvent::Stderr(line_bytes) => {
-                    let line = String::from_utf8_lossy(&line_bytes);
-                    eprintln!("[agentsview:stderr] {}", line.trim_end());
+                    let redacted_stderr = queue_redacted_sidecar_chunk(
+                        &log_sender,
+                        "stderr",
+                        &mut stderr_log_buffer,
+                        String::from_utf8_lossy(&line_bytes).as_ref(),
+                    );
+                    emit_redacted_sidecar_stderr_chunk(redacted_stderr.as_str());
+                    push_startup_output(&startup_output, "stderr", redacted_stderr.as_str());
                 }
                 CommandEvent::Terminated(payload) => {
+                    let flushed_stdout = flush_pending_sidecar_log_record(
+                        &log_sender,
+                        "stdout",
+                        &mut stdout_log_buffer,
+                    );
+                    emit_redacted_sidecar_stdout_chunk(flushed_stdout.as_str());
+                    push_startup_output(&startup_output, "stdout", flushed_stdout.as_str());
+                    let flushed_stderr = flush_pending_sidecar_log_record(
+                        &log_sender,
+                        "stderr",
+                        &mut stderr_log_buffer,
+                    );
+                    emit_redacted_sidecar_stderr_chunk(flushed_stderr.as_str());
+                    push_startup_output(&startup_output, "stderr", flushed_stderr.as_str());
+                    queue_sidecar_event_log_record(
+                        &log_sender,
+                        &CommandEvent::Terminated(payload.clone()),
+                    );
+                    push_startup_output(
+                        &startup_output,
+                        "terminated",
+                        format!(
+                            "sidecar terminated (code: {:?}, signal: {:?})",
+                            payload.code, payload.signal
+                        )
+                        .as_str(),
+                    );
                     eprintln!(
                         "[agentsview] sidecar terminated (code: {:?}, signal: {:?})",
                         payload.code, payload.signal
@@ -959,9 +1102,15 @@ fn forward_sidecar_logs(mut rx: CommandRx, window: WebviewWindow, generation: u6
                         break;
                     }
                     if handle_sidecar_terminated(&state, startup_handled.as_ref(), generation) {
-                        let _ = window.eval(
-                            "window.__setStatus(\
-                             'AgentsView backend exited before startup completed.');",
+                        spawn_startup_error_render(
+                            window.clone(),
+                            "AgentsView backend failed",
+                            "The local backend exited before startup completed.",
+                            startup_failure_detail(
+                                "The sidecar process ended before it reported a ready backend.",
+                                recent_startup_output(&startup_output).as_str(),
+                            )
+                            .as_str(),
                         );
                     }
                     let restart_after_stop_timeout =
@@ -972,11 +1121,38 @@ fn forward_sidecar_logs(mut rx: CommandRx, window: WebviewWindow, generation: u6
                     break;
                 }
                 CommandEvent::Error(err) => {
+                    queue_sidecar_event_log_record(&log_sender, &CommandEvent::Error(err.clone()));
+                    let redacted = redact_sidecar_log_line(err.as_str());
+                    push_startup_output(
+                        &startup_output,
+                        "error",
+                        format!("sidecar command error: {redacted}").as_str(),
+                    );
                     eprintln!("[agentsview:error] {err}");
+                    if !startup_handled.swap(true, Ordering::SeqCst) {
+                        spawn_startup_error_render(
+                            window.clone(),
+                            "AgentsView backend failed",
+                            "The desktop wrapper received an error from the backend process.",
+                            startup_failure_detail(
+                                redacted.as_str(),
+                                recent_startup_output(&startup_output).as_str(),
+                            )
+                            .as_str(),
+                        );
+                    }
                 }
                 _ => {}
             }
         }
+        let flushed_stdout =
+            flush_pending_sidecar_log_record(&log_sender, "stdout", &mut stdout_log_buffer);
+        emit_redacted_sidecar_stdout_chunk(flushed_stdout.as_str());
+        push_startup_output(&startup_output, "stdout", flushed_stdout.as_str());
+        let flushed_stderr =
+            flush_pending_sidecar_log_record(&log_sender, "stderr", &mut stderr_log_buffer);
+        emit_redacted_sidecar_stderr_chunk(flushed_stderr.as_str());
+        push_startup_output(&startup_output, "stderr", flushed_stderr.as_str());
     });
 }
 
@@ -989,6 +1165,65 @@ fn main_window_from_handle(handle: &AppHandle) -> Result<WebviewWindow, DynError
     handle
         .get_webview_window("main")
         .ok_or_else(|| io::Error::other("missing main window").into())
+}
+
+fn spawn_startup_error_render(window: WebviewWindow, title: &str, message: &str, detail: &str) {
+    let title = title.to_string();
+    let message = message.to_string();
+    let detail = detail.to_string();
+    let footer = startup_failure_footer(window.app_handle());
+    thread::spawn(move || {
+        let script = startup_error_script(
+            title.as_str(),
+            message.as_str(),
+            detail.as_str(),
+            footer.as_str(),
+        );
+        let deadline = Instant::now() + READY_TIMEOUT;
+        while Instant::now() < deadline {
+            if window.eval(script.as_str()).is_ok() {
+                return;
+            }
+            thread::sleep(READY_POLL_INTERVAL);
+        }
+        eprintln!("[agentsview] timed out waiting to render startup error");
+    });
+}
+
+fn startup_error_script(title: &str, message: &str, detail: &str, footer: &str) -> String {
+    let title = js_string_literal(title);
+    let message = js_string_literal(message);
+    let detail = js_string_literal(detail);
+    let footer = js_string_literal(footer);
+    let retry_ms = READY_POLL_INTERVAL.as_millis();
+    format!(
+        "(function renderStartupError() {{\
+            var h = document.querySelector('h1');\
+            var status = document.getElementById('status');\
+            if (!h || !status) {{\
+                window.setTimeout(renderStartupError, {retry_ms});\
+                return;\
+            }}\
+            var shell = document.querySelector('.shell');\
+            if (shell) shell.setAttribute('role', 'alert');\
+            if (h) h.textContent = {title};\
+            if (status) status.textContent = {message};\
+            var detail = document.getElementById('startup-error-detail');\
+            if (!detail) {{\
+                detail = document.createElement('pre');\
+                detail.id = 'startup-error-detail';\
+                status.insertAdjacentElement('afterend', detail);\
+            }}\
+            detail.textContent = {detail};\
+            detail.style.cssText = 'margin:14px 0 0;padding:12px;border:1px solid #f0b8b8;border-radius:8px;background:#fff7f7;color:#5f1f1f;font:12px/1.45 Consolas,Menlo,monospace;white-space:pre-wrap;max-height:280px;overflow:auto;';\
+            var meter = document.querySelector('.meter');\
+            if (meter) meter.style.display = 'none';\
+            var stages = document.querySelector('.stage-list');\
+            if (stages) stages.style.display = 'none';\
+            var foot = document.querySelector('.foot');\
+            if (foot) foot.textContent = {footer};\
+        }})()"
+    )
 }
 
 fn spawn_preflight_error_render(window: WebviewWindow, title: &str, message: &str, footer: &str) {
@@ -1045,6 +1280,75 @@ fn too_new_archive_footer_message() -> &'static str {
 
 fn js_string_literal(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+fn startup_failure_footer(handle: &AppHandle) -> String {
+    match desktop_log_file_path(handle) {
+        Ok(path) => format!(
+            "Attach this desktop log when reporting the failure: {}. If the details mention serve.log, attach that file too.",
+            path.display()
+        ),
+        Err(_) => {
+            "Use File > Open Logs Folder and attach agentsview-desktop.log when reporting this. If the details mention serve.log, attach that file too."
+                .to_string()
+        }
+    }
+}
+
+fn startup_failure_detail(summary: &str, recent_output: &str) -> String {
+    let recent_output = recent_output.trim();
+    if recent_output.is_empty() {
+        return format!("{summary}\n\nNo backend output was captured before startup stopped.");
+    }
+    format!("{summary}\n\nRecent backend output:\n{recent_output}")
+}
+
+fn push_startup_output(buffer: &Arc<Mutex<String>>, label: &str, chunk: &str) {
+    let chunk = chunk.trim();
+    if chunk.is_empty() {
+        return;
+    }
+    let Ok(mut guard) = buffer.lock() else {
+        return;
+    };
+    if !guard.is_empty() {
+        guard.push('\n');
+    }
+    guard.push('[');
+    guard.push_str(label);
+    guard.push_str("] ");
+    guard.push_str(chunk);
+    trim_startup_output(&mut guard);
+}
+
+fn recent_startup_output(buffer: &Arc<Mutex<String>>) -> String {
+    buffer
+        .lock()
+        .map(|guard| guard.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn trim_startup_output(output: &mut String) {
+    if output.len() <= STARTUP_OUTPUT_MAX_CHARS {
+        return;
+    }
+    let target = output.len() - STARTUP_OUTPUT_MAX_CHARS;
+    let mut drain_to = output.len();
+    for (idx, ch) in output.char_indices() {
+        if ch == '\n' && idx + ch.len_utf8() >= target {
+            drain_to = idx + ch.len_utf8();
+            break;
+        }
+        if idx >= target {
+            drain_to = idx;
+            break;
+        }
+    }
+    output.drain(..drain_to);
+    let prefix = "[earlier startup output truncated]\n";
+    if !output.starts_with(prefix) {
+        output.insert_str(0, prefix);
+    }
 }
 
 fn desktop_redirect_url(port: u16) -> String {
@@ -1117,9 +1421,11 @@ fn redirect_when_ready(window: WebviewWindow, port: u16) {
             return;
         }
 
-        let _ = window.eval(
-            "document.getElementById('status').textContent = \
-             'AgentsView backend did not start within 30 seconds.';",
+        spawn_startup_error_render(
+            window,
+            "AgentsView interface did not respond",
+            "The backend reported a port, but the desktop window could not connect to it.",
+            format!("Backend URL: {target_url}").as_str(),
         );
     });
 }
@@ -1131,39 +1437,146 @@ fn poll_background_status_after_launcher_exit(window: WebviewWindow, generation:
         .background_status_poll_generation
         .store(generation, Ordering::SeqCst);
     tauri::async_runtime::spawn(async move {
-        let deadline = Instant::now() + DAEMON_STARTUP_TIMEOUT;
+        let started = Instant::now();
         let mut failed_status_probes = 0;
-        while Instant::now() < deadline {
+        let mut status_poll_backoff_attempts = 0;
+        let mut long_startup_notice_shown = false;
+        let mut unhealthy_since: Option<Instant> = None;
+        loop {
             if !background_status_poll_is_current(&handle, generation) {
                 return;
             }
-            if let Some(port) = probe_backend_status(&handle).await {
-                if !background_status_poll_is_current(&handle, generation) {
+            let status = probe_backend_status(&handle).await;
+            status_poll_backoff_attempts =
+                next_background_status_poll_attempts(&status, status_poll_backoff_attempts);
+            match status {
+                BackendStatusProbe::Ready(port) => {
+                    if !background_status_poll_is_current(&handle, generation) {
+                        return;
+                    }
+                    save_sidecar_port(&handle, port);
+                    let _ = window.eval(
+                        "window.__setStage(2); \
+                         window.__setStatus('Connecting to interface...');",
+                    );
+                    redirect_when_ready(window.clone(), port);
                     return;
                 }
-                save_sidecar_port(&handle, port);
-                let _ = window.eval(
-                    "window.__setStage(2); \
-                     window.__setStatus('Connecting to interface...');",
-                );
-                redirect_when_ready(window.clone(), port);
-                return;
+                BackendStatusProbe::Starting(status) => {
+                    failed_status_probes = 0;
+                    unhealthy_since = None;
+                    if !long_startup_notice_shown && !status.trim().is_empty() {
+                        let escaped = status.replace('\\', "\\\\").replace('\'', "\\'");
+                        let _ = window.eval(format!("window.__setStatus('{escaped}');").as_str());
+                    }
+                }
+                BackendStatusProbe::Unhealthy(status) => {
+                    failed_status_probes = 0;
+                    let first_seen = unhealthy_since.get_or_insert_with(Instant::now);
+                    if first_seen.elapsed() >= DAEMON_UNHEALTHY_GRACE {
+                        spawn_startup_error_render(
+                            window,
+                            "AgentsView backend is not responding",
+                            "A backend process is running, but it is not answering health checks.",
+                            startup_failure_detail(
+                                "The daemon runtime record points to a live process, but repeated health checks did not get a usable response.",
+                                status.as_str(),
+                            )
+                            .as_str(),
+                        );
+                        return;
+                    }
+                    let _ = window.eval(
+                        "window.__setStatus(\
+                         'AgentsView found a backend process, but health checks are not responding yet.');",
+                    );
+                }
+                BackendStatusProbe::NotRunning(status) => {
+                    spawn_startup_error_render(
+                        window,
+                        "AgentsView backend stopped",
+                        "The background launcher exited, and no AgentsView server is running.",
+                        startup_failure_detail(
+                            "The background backend disappeared before it became ready.",
+                            status.as_str(),
+                        )
+                        .as_str(),
+                    );
+                    return;
+                }
+                BackendStatusProbe::Incompatible(status) => {
+                    spawn_startup_error_render(
+                        window,
+                        "AgentsView backend is incompatible",
+                        "AgentsView found a running backend that this desktop app cannot use.",
+                        status.as_str(),
+                    );
+                    return;
+                }
+                BackendStatusProbe::ReadOnly(status) => {
+                    spawn_startup_error_render(
+                        window,
+                        "AgentsView backend is read-only",
+                        "AgentsView Desktop needs a writable local backend to sync and migrate the archive.",
+                        startup_failure_detail(
+                            "A read-only backend is running for this archive, but desktop startup requires a writable daemon.",
+                            status.as_str(),
+                        )
+                        .as_str(),
+                    );
+                    return;
+                }
+                BackendStatusProbe::Unusable(status) => {
+                    spawn_startup_error_render(
+                        window,
+                        "AgentsView backend status is unusable",
+                        "The background launcher exited, but the backend did not report a usable writable server.",
+                        startup_failure_detail(
+                            "The status command returned output that is not a ready writable daemon or an active startup lock.",
+                            status.as_str(),
+                        )
+                        .as_str(),
+                    );
+                    return;
+                }
+                BackendStatusProbe::Unavailable => {
+                    failed_status_probes += 1;
+                    if status_probe_failures_should_stop(failed_status_probes) {
+                        spawn_startup_error_render(
+                            window,
+                            "AgentsView backend status is unavailable",
+                            "The background launcher exited, but the desktop app could not confirm backend status.",
+                            startup_failure_detail(
+                                format!(
+                                    "`agentsview serve status` failed, timed out, or returned no usable output after {failed_status_probes} attempts."
+                                )
+                                .as_str(),
+                                "",
+                            )
+                            .as_str(),
+                        );
+                        return;
+                    }
+                    if failed_status_probes == STATUS_PROBE_FAILURE_NOTICE_AFTER {
+                        let _ = window.eval(
+                            "window.__setStatus(\
+                             'Waiting for background daemon status. Check serve.log if this persists.');",
+                        );
+                    }
+                }
             }
-            failed_status_probes += 1;
-            if failed_status_probes == STATUS_PROBE_FAILURE_NOTICE_AFTER {
+            if !long_startup_notice_shown && started.elapsed() >= DAEMON_STARTUP_LONG_NOTICE_AFTER {
+                long_startup_notice_shown = true;
                 let _ = window.eval(
                     "window.__setStatus(\
-                     'Waiting for background daemon status. Check serve.log if this persists.');",
+                     'AgentsView is still preparing the local archive. Large migrations or full resyncs can take many minutes.');",
                 );
             }
-            tokio::time::sleep(background_status_poll_interval(failed_status_probes)).await;
+            tokio::time::sleep(background_status_poll_interval(
+                status_poll_backoff_attempts,
+            ))
+            .await;
         }
-        if !background_status_poll_is_current(&handle, generation) {
-            return;
-        }
-        let _ = window.eval(
-            "window.__setStatus('AgentsView backend did not become ready after several minutes.');",
-        );
     });
 }
 
@@ -1175,8 +1588,8 @@ fn background_status_poll_is_current(handle: &AppHandle, generation: u64) -> boo
         == generation
 }
 
-fn background_status_poll_interval(failed_status_probes: u32) -> Duration {
-    let multiplier = match failed_status_probes {
+fn background_status_poll_interval(backoff_attempts: u32) -> Duration {
+    let multiplier = match backoff_attempts {
         0..=8 => 1,
         9..=16 => 2,
         17..=24 => 4,
@@ -1187,21 +1600,49 @@ fn background_status_poll_interval(failed_status_probes: u32) -> Duration {
         .min(STATUS_POLL_MAX_INTERVAL)
 }
 
-async fn probe_backend_status(handle: &AppHandle) -> Option<u16> {
-    let mut command = handle.shell().sidecar("agentsview").ok()?;
+fn next_background_status_poll_attempts(status: &BackendStatusProbe, current: u32) -> u32 {
+    match status {
+        BackendStatusProbe::Starting(_)
+        | BackendStatusProbe::Unhealthy(_)
+        | BackendStatusProbe::Unavailable => current.saturating_add(1),
+        BackendStatusProbe::Ready(_)
+        | BackendStatusProbe::NotRunning(_)
+        | BackendStatusProbe::Incompatible(_)
+        | BackendStatusProbe::ReadOnly(_)
+        | BackendStatusProbe::Unusable(_) => current,
+    }
+}
+
+fn status_probe_failures_should_stop(failed_status_probes: u32) -> bool {
+    failed_status_probes >= STATUS_PROBE_FAILURE_FAIL_AFTER
+}
+
+async fn probe_backend_status(handle: &AppHandle) -> BackendStatusProbe {
+    let Ok(mut command) = handle.shell().sidecar("agentsview") else {
+        return BackendStatusProbe::Unavailable;
+    };
     for (key, value) in sidecar_env() {
         command = command.env(key, value);
     }
-    let (mut rx, child) = command.args(sidecar_status_args()).spawn().ok()?;
+    let Ok((mut rx, child)) = command.args(sidecar_status_args()).spawn() else {
+        return BackendStatusProbe::Unavailable;
+    };
     let mut stdout_buffer = String::new();
+    let mut stderr_buffer = String::new();
     let status = tokio::time::timeout(STATUS_PROBE_TIMEOUT, async {
         while let Some(event) = rx.recv().await {
             match event {
                 CommandEvent::Stdout(bytes) => {
                     stdout_buffer.push_str(String::from_utf8_lossy(&bytes).as_ref());
                 }
+                CommandEvent::Stderr(bytes) => {
+                    stderr_buffer.push_str(String::from_utf8_lossy(&bytes).as_ref());
+                }
                 CommandEvent::Terminated(_) => {
-                    return Ok(parse_writable_listening_port_from_status(&stdout_buffer));
+                    return Ok(classify_backend_status_output(
+                        stdout_buffer.as_str(),
+                        stderr_buffer.as_str(),
+                    ));
                 }
                 CommandEvent::Error(err) => {
                     eprintln!("[agentsview:error] {err}");
@@ -1210,15 +1651,64 @@ async fn probe_backend_status(handle: &AppHandle) -> Option<u16> {
                 _ => {}
             }
         }
-        Ok(None)
+        Ok(BackendStatusProbe::Unavailable)
     })
     .await;
     match status {
-        Ok(Ok(port)) => port,
+        Ok(Ok(status)) => status,
         Ok(Err(())) | Err(_) => {
             let _ = child.kill();
-            None
+            BackendStatusProbe::Unavailable
         }
+    }
+}
+
+fn classify_backend_status_output(stdout: &str, stderr: &str) -> BackendStatusProbe {
+    if let Some(port) = parse_writable_listening_port_from_status(stdout) {
+        return BackendStatusProbe::Ready(port);
+    }
+
+    let detail = combined_probe_output(stdout, stderr);
+    if detail.contains("No agentsview server is running.") {
+        return BackendStatusProbe::NotRunning(detail);
+    }
+    if detail.contains("incompatible running writable daemon") {
+        return BackendStatusProbe::Incompatible(detail);
+    }
+    if status_output_is_unhealthy(detail.as_str()) {
+        return BackendStatusProbe::Unhealthy(detail);
+    }
+    if detail.trim().is_empty() {
+        return BackendStatusProbe::Unavailable;
+    }
+    if status_output_is_read_only(detail.as_str()) {
+        return BackendStatusProbe::ReadOnly(detail);
+    }
+    if status_output_is_starting(detail.as_str()) {
+        return BackendStatusProbe::Starting(detail);
+    }
+    BackendStatusProbe::Unusable(detail)
+}
+
+fn status_output_is_unhealthy(output: &str) -> bool {
+    output.contains("agentsview process running")
+        && output.contains("not responding to health checks")
+}
+
+fn status_output_is_starting(output: &str) -> bool {
+    output
+        .lines()
+        .any(|line| line.trim() == "agentsview is starting up.")
+}
+
+fn combined_probe_output(stdout: &str, stderr: &str) -> String {
+    let stdout = stdout.trim();
+    let stderr = stderr.trim();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout.to_string(),
+        (true, false) => stderr.to_string(),
+        (false, false) => format!("{stdout}\n{stderr}"),
     }
 }
 
@@ -1378,12 +1868,15 @@ fn parse_writable_listening_port_from_status(buffer: &str) -> Option<u16> {
 
 fn setup_menu(app: &mut App) -> Result<(), DynError> {
     let about = MenuItemBuilder::with_id("about", "About AgentsView").build(app)?;
+    let open_logs_folder =
+        MenuItemBuilder::with_id(OPEN_LOGS_FOLDER_MENU_ID, "Open Logs Folder").build(app)?;
     let check_updates =
         MenuItemBuilder::with_id("check_updates", "Check for Updates...").build(app)?;
 
     let builder = SubmenuBuilder::new(app, "File")
         .item(&about)
         .separator()
+        .item(&open_logs_folder)
         .item(&check_updates)
         .separator();
 
@@ -1408,6 +1901,356 @@ fn setup_menu(app: &mut App) -> Result<(), DynError> {
         .build()?;
     app.set_menu(menu)?;
     Ok(())
+}
+
+fn open_logs_folder(handle: &AppHandle) {
+    let log_dir = match ensure_desktop_log_dir(handle) {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("[agentsview] failed to resolve logs folder: {err}");
+            return;
+        }
+    };
+
+    if let Err(err) = handle
+        .opener()
+        .open_path(log_dir.to_string_lossy().into_owned(), None::<&str>)
+    {
+        let log_path = desktop_log_file_path(handle).ok();
+        let err_text = err.to_string();
+        let message = open_logs_folder_failure_message(&log_dir, err_text.as_str());
+        if let Some(path) = log_path {
+            if let Err(log_err) =
+                append_open_logs_folder_failure_at_path(&path, &log_dir, err_text.as_str())
+            {
+                eprintln!("[agentsview] failed to append logs-folder failure log: {log_err}");
+            }
+        }
+        eprintln!("[agentsview] {message}");
+    }
+}
+
+fn desktop_log_file_path(handle: &AppHandle) -> io::Result<PathBuf> {
+    Ok(ensure_desktop_log_dir(handle)?.join(DESKTOP_LOG_FILE_NAME))
+}
+
+fn ensure_desktop_log_dir(handle: &AppHandle) -> io::Result<PathBuf> {
+    let log_dir = handle
+        .path()
+        .app_log_dir()
+        .map_err(|err| io::Error::other(err.to_string()))?;
+    fs::create_dir_all(&log_dir)?;
+    tighten_desktop_log_dir_permissions(&log_dir)?;
+    Ok(log_dir)
+}
+
+fn spawn_sidecar_log_writer(handle: AppHandle) -> SyncSender<SidecarLogRecord> {
+    let (log_sender, log_receiver) = sync_channel(DESKTOP_LOG_QUEUE_CAPACITY);
+    thread::spawn(move || drain_sidecar_log_records(handle, log_receiver));
+    log_sender
+}
+
+fn drain_sidecar_log_records(handle: AppHandle, log_receiver: StdReceiver<SidecarLogRecord>) {
+    while let Ok(record) = log_receiver.recv() {
+        let path = match desktop_log_file_path(&handle) {
+            Ok(path) => path,
+            Err(err) => {
+                eprintln!("[agentsview] failed to resolve sidecar event log path: {err}");
+                continue;
+            }
+        };
+        if let Err(err) =
+            append_sidecar_log_record_at_path(&path, record.label, record.record.as_str())
+        {
+            eprintln!("[agentsview] failed to append sidecar event log: {err}");
+        }
+    }
+}
+
+fn prepare_sidecar_stdout_update(
+    log_sender: &SyncSender<SidecarLogRecord>,
+    stdout_buffer: &mut String,
+    stdout_log_buffer: &mut String,
+    chunk_bytes: &[u8],
+) -> SidecarStdoutUpdate {
+    let chunk = String::from_utf8_lossy(chunk_bytes).into_owned();
+    let redacted_chunk =
+        queue_redacted_sidecar_chunk(log_sender, "stdout", stdout_log_buffer, chunk.as_str());
+    SidecarStdoutUpdate {
+        status: extract_startup_status(chunk.as_ref()),
+        port: parse_listening_port_from_stdout_buffer(stdout_buffer, chunk.as_ref()),
+        chunk,
+        redacted_chunk,
+    }
+}
+
+fn emit_redacted_sidecar_stdout_chunk(redacted_chunk: &str) {
+    emit_sidecar_console_chunk("agentsview", redacted_chunk);
+}
+
+fn emit_redacted_sidecar_stderr_chunk(redacted_chunk: &str) {
+    emit_sidecar_console_chunk("agentsview:stderr", redacted_chunk);
+}
+
+fn emit_sidecar_console_chunk(prefix: &str, redacted_chunk: &str) {
+    for line in redacted_chunk.lines().filter(|line| !line.is_empty()) {
+        eprintln!("[{prefix}] {line}");
+    }
+}
+
+fn queue_redacted_sidecar_chunk(
+    log_sender: &SyncSender<SidecarLogRecord>,
+    label: &'static str,
+    log_buffer: &mut String,
+    chunk: &str,
+) -> String {
+    let redacted_chunk = drain_redacted_sidecar_log_lines(log_buffer, chunk);
+    if !redacted_chunk.trim().is_empty() {
+        try_send_sidecar_log_record(
+            log_sender,
+            SidecarLogRecord::new(label, redacted_chunk.clone()),
+        );
+    }
+    redacted_chunk
+}
+
+fn drain_redacted_sidecar_log_lines(log_buffer: &mut String, chunk: &str) -> String {
+    log_buffer.push_str(chunk);
+
+    let mut redacted_lines = Vec::new();
+    let mut consumed = 0;
+    let mut chars = log_buffer.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if ch != '\r' && ch != '\n' {
+            continue;
+        }
+        let line = &log_buffer[consumed..idx];
+        if !line.is_empty() {
+            redacted_lines.push(redact_sidecar_log_line(line));
+        }
+        consumed = idx + ch.len_utf8();
+        if ch == '\r' && matches!(chars.peek(), Some((_, '\n'))) {
+            let (next_idx, next_ch) = chars.next().expect("peeked newline");
+            consumed = next_idx + next_ch.len_utf8();
+        }
+    }
+
+    if consumed > 0 {
+        log_buffer.drain(..consumed);
+    }
+
+    redacted_lines.join("\n")
+}
+
+fn flush_pending_sidecar_log_record(
+    log_sender: &SyncSender<SidecarLogRecord>,
+    label: &'static str,
+    log_buffer: &mut String,
+) -> String {
+    if log_buffer.trim().is_empty() {
+        log_buffer.clear();
+        return String::new();
+    }
+    let pending = std::mem::take(log_buffer);
+    let redacted = pending
+        .split(['\r', '\n'])
+        .filter(|line| !line.is_empty())
+        .map(redact_sidecar_log_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+    if !redacted.is_empty() {
+        try_send_sidecar_log_record(log_sender, SidecarLogRecord::new(label, redacted.clone()));
+    }
+    redacted
+}
+
+fn redact_sidecar_log_line(line: &str) -> String {
+    let mut redacted = line.to_string();
+    for prefix in [
+        "Authorization: Bearer ",
+        "authorization: Bearer ",
+        "Bearer ",
+        "bearer ",
+        "Token: ",
+        "token: ",
+        "--auth-token=",
+        "--auth-token ",
+        "auth_token=",
+        "token=",
+    ] {
+        redacted = redact_value_after_prefix(redacted, prefix);
+    }
+    redacted
+}
+
+fn redact_value_after_prefix(mut text: String, prefix: &str) -> String {
+    let mut search_from = 0;
+    while let Some(relative_start) = text[search_from..].find(prefix) {
+        let value_start = search_from + relative_start + prefix.len();
+        let value_end = value_start
+            + text[value_start..]
+                .find(is_sensitive_value_terminator)
+                .unwrap_or_else(|| text.len() - value_start);
+        if value_end > value_start {
+            text.replace_range(value_start..value_end, "<redacted>");
+            search_from = value_start + "<redacted>".len();
+        } else {
+            search_from = value_start;
+        }
+    }
+    text
+}
+
+fn is_sensitive_value_terminator(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | '&' | ')' | ']' | '}')
+}
+
+fn queue_sidecar_event_log_record(log_sender: &SyncSender<SidecarLogRecord>, event: &CommandEvent) {
+    if let Some(record) = sidecar_log_record_from_event(event) {
+        try_send_sidecar_log_record(log_sender, record);
+    }
+}
+
+fn sidecar_log_record_from_event(event: &CommandEvent) -> Option<SidecarLogRecord> {
+    match event {
+        CommandEvent::Stdout(_) => None,
+        CommandEvent::Stderr(line_bytes) => Some(SidecarLogRecord::new(
+            "stderr",
+            String::from_utf8_lossy(line_bytes)
+                .split(['\r', '\n'])
+                .filter(|line| !line.is_empty())
+                .map(redact_sidecar_log_line)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )),
+        CommandEvent::Terminated(payload) => Some(SidecarLogRecord::new(
+            "terminated",
+            format!(
+                "sidecar terminated (code: {:?}, signal: {:?})",
+                payload.code, payload.signal
+            ),
+        )),
+        CommandEvent::Error(err) => Some(SidecarLogRecord::new(
+            "error",
+            format!("sidecar command error: {err}"),
+        )),
+        _ => None,
+    }
+}
+
+fn try_send_sidecar_log_record(
+    log_sender: &SyncSender<SidecarLogRecord>,
+    record: SidecarLogRecord,
+) {
+    match log_sender.try_send(record) {
+        Ok(()) => {}
+        Err(TrySendError::Full(record)) => {
+            eprintln!(
+                "[agentsview] dropping sidecar {} log because the log queue is full",
+                record.label
+            );
+        }
+        Err(TrySendError::Disconnected(record)) => {
+            eprintln!(
+                "[agentsview] dropping sidecar {} log because the log worker is unavailable",
+                record.label
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+fn append_sidecar_event_record_at_path(path: &Path, event: &CommandEvent) -> io::Result<()> {
+    match event {
+        CommandEvent::Stdout(chunk_bytes) => append_sidecar_log_record_at_path(
+            path,
+            "stdout",
+            String::from_utf8_lossy(chunk_bytes).as_ref(),
+        ),
+        CommandEvent::Stderr(line_bytes) => append_sidecar_log_record_at_path(
+            path,
+            "stderr",
+            String::from_utf8_lossy(line_bytes).as_ref(),
+        ),
+        CommandEvent::Terminated(payload) => append_sidecar_log_record_at_path(
+            path,
+            "terminated",
+            format!(
+                "sidecar terminated (code: {:?}, signal: {:?})",
+                payload.code, payload.signal
+            )
+            .as_str(),
+        ),
+        CommandEvent::Error(err) => append_sidecar_log_record_at_path(
+            path,
+            "error",
+            format!("sidecar command error: {err}").as_str(),
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn append_sidecar_log_record_at_path(path: &Path, label: &str, record: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+        tighten_desktop_log_dir_permissions(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    tighten_desktop_log_file_permissions(&file)?;
+    write_labeled_log_record(&mut file, label, record)
+}
+
+#[cfg(unix)]
+fn tighten_desktop_log_dir_permissions(path: &Path) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn tighten_desktop_log_dir_permissions(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn tighten_desktop_log_file_permissions(file: &fs::File) -> io::Result<()> {
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn tighten_desktop_log_file_permissions(_file: &fs::File) -> io::Result<()> {
+    Ok(())
+}
+
+fn write_labeled_log_record(file: &mut fs::File, label: &str, record: &str) -> io::Result<()> {
+    let trimmed = record.trim_end_matches(['\r', '\n']);
+    if trimmed.is_empty() {
+        writeln!(file, "[{label}]")?;
+        return Ok(());
+    }
+    for line in trimmed.split(['\r', '\n']).filter(|line| !line.is_empty()) {
+        writeln!(file, "[{label}] {line}")?;
+    }
+    Ok(())
+}
+
+fn open_logs_folder_failure_message(log_dir: &Path, err: &str) -> String {
+    format!("failed to open logs folder {}: {err}", log_dir.display())
+}
+
+fn append_open_logs_folder_failure_at_path(
+    path: &Path,
+    log_dir: &Path,
+    err: &str,
+) -> io::Result<()> {
+    append_sidecar_log_record_at_path(
+        path,
+        "menu",
+        open_logs_folder_failure_message(log_dir, err).as_str(),
+    )
 }
 
 /// Restore input focus to the main webview after a native GTK dialog
@@ -1973,13 +2816,16 @@ fn version_response_looks_valid(response: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use std::collections::HashMap;
+    use std::fs;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::tempdir;
 
     #[test]
     fn sidecar_args_use_cobra_long_flags() {
@@ -2033,6 +2879,45 @@ mod tests {
             background_status_poll_interval(u32::MAX),
             Duration::from_secs(1)
         );
+    }
+
+    #[test]
+    fn status_poll_backoff_counts_non_ready_statuses() {
+        let mut attempts = 0;
+
+        attempts = next_background_status_poll_attempts(
+            &BackendStatusProbe::Starting("agentsview is starting up.".to_string()),
+            attempts,
+        );
+        assert_eq!(attempts, 1);
+
+        attempts = next_background_status_poll_attempts(
+            &BackendStatusProbe::Unhealthy("health checks are not responding".to_string()),
+            attempts,
+        );
+        assert_eq!(attempts, 2);
+
+        attempts = next_background_status_poll_attempts(&BackendStatusProbe::Unavailable, attempts);
+        assert_eq!(attempts, 3);
+
+        attempts = next_background_status_poll_attempts(&BackendStatusProbe::Ready(8080), attempts);
+        assert_eq!(attempts, 3);
+
+        assert_eq!(
+            next_background_status_poll_attempts(&BackendStatusProbe::Unavailable, u32::MAX),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn status_probe_failures_stop_after_bounded_threshold() {
+        assert!(!status_probe_failures_should_stop(
+            STATUS_PROBE_FAILURE_FAIL_AFTER - 1
+        ));
+        assert!(status_probe_failures_should_stop(
+            STATUS_PROBE_FAILURE_FAIL_AFTER
+        ));
+        assert!(status_probe_failures_should_stop(u32::MAX));
     }
 
     #[test]
@@ -2130,6 +3015,46 @@ mod tests {
     }
 
     #[test]
+    fn startup_error_script_renders_reportable_details() {
+        let script = startup_error_script(
+            "Backend failed",
+            "The local backend exited.",
+            "fatal: opening database",
+            "Attach logs",
+        );
+
+        assert!(script.contains("function renderStartupError"));
+        assert!(script.contains("startup-error-detail"));
+        assert!(script.contains("fatal: opening database"));
+        assert!(script.contains("role', 'alert'"));
+        assert!(script.contains("Attach logs"));
+    }
+
+    #[test]
+    fn startup_failure_detail_includes_recent_output() {
+        let detail = startup_failure_detail(
+            "The sidecar process ended before it was ready.",
+            "[stderr] fatal: opening database",
+        );
+
+        assert!(detail.contains("The sidecar process ended"));
+        assert!(detail.contains("Recent backend output"));
+        assert!(detail.contains("[stderr] fatal: opening database"));
+    }
+
+    #[test]
+    fn startup_output_buffer_labels_recent_chunks() {
+        let buffer = Arc::new(Mutex::new(String::new()));
+
+        push_startup_output(&buffer, "stdout", "Auth enabled. Token: secret-token");
+        push_startup_output(&buffer, "stderr", "fatal: bad config");
+
+        let output = recent_startup_output(&buffer);
+        assert!(output.contains("[stdout] Auth enabled. Token: secret-token"));
+        assert!(output.contains("[stderr] fatal: bad config"));
+    }
+
+    #[test]
     fn parse_listening_port_extracts_backend_port() {
         let line = "agentsview dev listening at http://127.0.0.1:18080 (started in 1.2s)";
         assert_eq!(parse_listening_port(line), Some(18080));
@@ -2167,6 +3092,357 @@ mod tests {
     }
 
     #[test]
+    fn append_sidecar_log_record_writes_labeled_stdout_and_stderr_lines() {
+        let tempdir = tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("logs").join(DESKTOP_LOG_FILE_NAME);
+
+        append_sidecar_log_record_at_path(&log_path, "stdout", "booting\nlistening\n")
+            .expect("stdout log write");
+        append_sidecar_log_record_at_path(&log_path, "stderr", "fatal line\n")
+            .expect("stderr log write");
+
+        let logged = fs::read_to_string(log_path).expect("read log");
+        assert!(logged.contains("[stdout] booting"));
+        assert!(logged.contains("[stdout] listening"));
+        assert!(logged.contains("[stderr] fatal line"));
+    }
+
+    #[test]
+    fn append_sidecar_log_record_splits_carriage_return_progress_updates() {
+        let tempdir = tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("logs").join(DESKTOP_LOG_FILE_NAME);
+
+        append_sidecar_log_record_at_path(&log_path, "stdout", "syncing\rindexing\r")
+            .expect("progress log write");
+
+        let logged = fs::read_to_string(log_path).expect("read progress log");
+        assert!(logged.contains("[stdout] syncing"));
+        assert!(logged.contains("[stdout] indexing"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_sidecar_log_record_tightens_log_permissions() {
+        let tempdir = tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("logs").join(DESKTOP_LOG_FILE_NAME);
+
+        append_sidecar_log_record_at_path(&log_path, "stdout", "booting\n")
+            .expect("stdout log write");
+
+        let log_dir_mode = fs::metadata(log_path.parent().expect("log dir"))
+            .expect("read log dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let log_file_mode = fs::metadata(&log_path)
+            .expect("read log file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(log_dir_mode, 0o700);
+        assert_eq!(log_file_mode, 0o600);
+    }
+
+    #[test]
+    fn append_sidecar_log_record_returns_error_when_log_dir_is_not_directory() {
+        let tempdir = tempdir().expect("tempdir");
+        let blocked_parent = tempdir.path().join("blocked");
+        fs::write(&blocked_parent, "not a directory").expect("write blocker");
+        let log_path = blocked_parent.join(DESKTOP_LOG_FILE_NAME);
+
+        let err = append_sidecar_log_record_at_path(&log_path, "stdout", "booting")
+            .expect_err("append should fail");
+
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn append_sidecar_event_record_writes_logged_event_variants() {
+        let tempdir = tempdir().expect("tempdir");
+        let log_path = tempdir.path().join("logs").join(DESKTOP_LOG_FILE_NAME);
+
+        append_sidecar_event_record_at_path(
+            &log_path,
+            &CommandEvent::Stdout(b"booting\n".to_vec()),
+        )
+        .expect("stdout event log write");
+        append_sidecar_event_record_at_path(
+            &log_path,
+            &CommandEvent::Stderr(b"fatal line\n".to_vec()),
+        )
+        .expect("stderr event log write");
+        append_sidecar_event_record_at_path(
+            &log_path,
+            &CommandEvent::Terminated(tauri_plugin_shell::process::TerminatedPayload {
+                code: Some(23),
+                signal: None,
+            }),
+        )
+        .expect("terminated event log write");
+        append_sidecar_event_record_at_path(
+            &log_path,
+            &CommandEvent::Error("spawn failed".to_string()),
+        )
+        .expect("error event log write");
+
+        let logged = fs::read_to_string(log_path).expect("read log");
+        assert!(logged.contains("[stdout] booting"));
+        assert!(logged.contains("[stderr] fatal line"));
+        assert!(logged.contains("[terminated] sidecar terminated (code: Some(23), signal: None)"));
+        assert!(logged.contains("[error] sidecar command error: spawn failed"));
+    }
+
+    #[test]
+    fn append_open_logs_folder_failure_writes_menu_log_entry() {
+        let tempdir = tempdir().expect("tempdir");
+        let log_dir = tempdir.path().join("logs");
+        let log_path = log_dir.join(DESKTOP_LOG_FILE_NAME);
+
+        append_open_logs_folder_failure_at_path(&log_path, &log_dir, "not allowed")
+            .expect("menu failure log write");
+
+        let logged = fs::read_to_string(log_path).expect("read menu log");
+        assert!(logged.contains("[menu] failed to open logs folder"));
+        assert!(logged.contains(log_dir.display().to_string().as_str()));
+        assert!(logged.contains("not allowed"));
+    }
+
+    #[test]
+    fn prepare_sidecar_stdout_update_enqueues_log_and_keeps_port_detection() {
+        let (log_sender, log_receiver) = sync_channel(1);
+        let mut stdout_buffer = String::new();
+        let mut stdout_log_buffer = String::new();
+
+        let stdout_update = prepare_sidecar_stdout_update(
+            &log_sender,
+            &mut stdout_buffer,
+            &mut stdout_log_buffer,
+            b"agentsview dev listening at http://127.0.0.1:18080 (started in 1.2s)\n",
+        );
+
+        assert_eq!(stdout_update.port, Some(18080));
+        let logged = log_receiver.try_recv().expect("stdout record");
+        assert_eq!(logged.label, "stdout");
+        assert!(logged
+            .record
+            .contains("agentsview dev listening at http://127.0.0.1:18080"));
+    }
+
+    #[test]
+    fn prepare_sidecar_stdout_update_redacts_token_bearing_lines() {
+        let (log_sender, log_receiver) = sync_channel(1);
+        let mut stdout_buffer = String::new();
+        let mut stdout_log_buffer = String::new();
+
+        let stdout_update = prepare_sidecar_stdout_update(
+            &log_sender,
+            &mut stdout_buffer,
+            &mut stdout_log_buffer,
+            b"Authorization: Bearer secret-token\nAuth enabled. Token: startup-secret\n--auth-token=another-secret\n",
+        );
+
+        let logged = log_receiver.try_recv().expect("stdout record");
+        assert_eq!(logged.label, "stdout");
+        assert!(stdout_update
+            .redacted_chunk
+            .contains("Authorization: Bearer <redacted>"));
+        assert!(stdout_update
+            .redacted_chunk
+            .contains("Auth enabled. Token: <redacted>"));
+        assert!(stdout_update
+            .redacted_chunk
+            .contains("--auth-token=<redacted>"));
+        assert!(!stdout_update.redacted_chunk.contains("secret-token"));
+        assert!(!stdout_update.redacted_chunk.contains("startup-secret"));
+        assert!(!stdout_update.redacted_chunk.contains("another-secret"));
+        assert!(logged.record.contains("Authorization: Bearer <redacted>"));
+        assert!(logged.record.contains("Auth enabled. Token: <redacted>"));
+        assert!(logged.record.contains("--auth-token=<redacted>"));
+        assert!(!logged.record.contains("secret-token"));
+        assert!(!logged.record.contains("startup-secret"));
+        assert!(!logged.record.contains("another-secret"));
+    }
+
+    #[test]
+    fn prepare_sidecar_stdout_update_redacts_split_token_lines_after_newline() {
+        let (log_sender, log_receiver) = sync_channel(1);
+        let mut stdout_buffer = String::new();
+        let mut stdout_log_buffer = String::new();
+
+        let first_update = prepare_sidecar_stdout_update(
+            &log_sender,
+            &mut stdout_buffer,
+            &mut stdout_log_buffer,
+            b"Auth enabled. Token: ",
+        );
+        assert!(first_update.redacted_chunk.is_empty());
+        assert!(log_receiver.try_recv().is_err());
+
+        let second_update = prepare_sidecar_stdout_update(
+            &log_sender,
+            &mut stdout_buffer,
+            &mut stdout_log_buffer,
+            b"split-secret\n",
+        );
+
+        let logged = log_receiver.try_recv().expect("stdout record");
+        assert_eq!(logged.label, "stdout");
+        assert!(second_update
+            .redacted_chunk
+            .contains("Auth enabled. Token: <redacted>"));
+        assert!(!second_update.redacted_chunk.contains("split-secret"));
+        assert!(logged.record.contains("Auth enabled. Token: <redacted>"));
+        assert!(!logged.record.contains("split-secret"));
+    }
+
+    #[test]
+    fn flush_pending_sidecar_stdout_log_record_redacts_split_token_tail() {
+        let (log_sender, log_receiver) = sync_channel(1);
+        let mut stdout_buffer = String::new();
+        let mut stdout_log_buffer = String::new();
+
+        prepare_sidecar_stdout_update(
+            &log_sender,
+            &mut stdout_buffer,
+            &mut stdout_log_buffer,
+            b"Auth enabled. Token: split-secret",
+        );
+        assert!(log_receiver.try_recv().is_err());
+
+        let flushed =
+            flush_pending_sidecar_log_record(&log_sender, "stdout", &mut stdout_log_buffer);
+
+        let logged = log_receiver.try_recv().expect("stdout record");
+        assert_eq!(logged.label, "stdout");
+        assert!(flushed.contains("Auth enabled. Token: <redacted>"));
+        assert!(!flushed.contains("split-secret"));
+        assert!(logged.record.contains("Auth enabled. Token: <redacted>"));
+        assert!(!logged.record.contains("split-secret"));
+    }
+
+    #[test]
+    fn queue_redacted_sidecar_stderr_chunk_redacts_split_token_lines_after_newline() {
+        let (log_sender, log_receiver) = sync_channel(1);
+        let mut stderr_log_buffer = String::new();
+
+        let first_chunk = queue_redacted_sidecar_chunk(
+            &log_sender,
+            "stderr",
+            &mut stderr_log_buffer,
+            "Authorization: Bearer ",
+        );
+        assert!(first_chunk.is_empty());
+        assert!(log_receiver.try_recv().is_err());
+
+        let second_chunk = queue_redacted_sidecar_chunk(
+            &log_sender,
+            "stderr",
+            &mut stderr_log_buffer,
+            "stderr-secret\n",
+        );
+
+        let logged = log_receiver.try_recv().expect("stderr record");
+        assert_eq!(logged.label, "stderr");
+        assert!(second_chunk.contains("Authorization: Bearer <redacted>"));
+        assert!(!second_chunk.contains("stderr-secret"));
+        assert!(logged.record.contains("Authorization: Bearer <redacted>"));
+        assert!(!logged.record.contains("stderr-secret"));
+    }
+
+    #[test]
+    fn flush_pending_sidecar_stderr_log_record_redacts_split_token_tail() {
+        let (log_sender, log_receiver) = sync_channel(1);
+        let mut stderr_log_buffer = String::new();
+
+        queue_redacted_sidecar_chunk(
+            &log_sender,
+            "stderr",
+            &mut stderr_log_buffer,
+            "Auth enabled. Token: stderr-tail",
+        );
+        assert!(log_receiver.try_recv().is_err());
+
+        let flushed =
+            flush_pending_sidecar_log_record(&log_sender, "stderr", &mut stderr_log_buffer);
+
+        let logged = log_receiver.try_recv().expect("stderr record");
+        assert_eq!(logged.label, "stderr");
+        assert!(flushed.contains("Auth enabled. Token: <redacted>"));
+        assert!(!flushed.contains("stderr-tail"));
+        assert!(logged.record.contains("Auth enabled. Token: <redacted>"));
+        assert!(!logged.record.contains("stderr-tail"));
+    }
+
+    #[test]
+    fn sidecar_log_record_from_event_redacts_stderr_token_lines() {
+        let record = sidecar_log_record_from_event(&CommandEvent::Stderr(
+            b"Authorization: Bearer stderr-secret\n".to_vec(),
+        ))
+        .expect("stderr record");
+
+        assert_eq!(record.label, "stderr");
+        assert!(record.record.contains("Authorization: Bearer <redacted>"));
+        assert!(!record.record.contains("stderr-secret"));
+    }
+
+    #[test]
+    fn prepare_sidecar_stdout_update_keeps_parsing_when_log_queue_is_full() {
+        let (log_sender, log_receiver) = sync_channel(1);
+        log_sender
+            .send(SidecarLogRecord::new("stdout", "already queued"))
+            .expect("fill queue");
+        let mut stdout_buffer = String::new();
+        let mut stdout_log_buffer = String::new();
+
+        let stdout_update = prepare_sidecar_stdout_update(
+            &log_sender,
+            &mut stdout_buffer,
+            &mut stdout_log_buffer,
+            b"Running initial sync...\n",
+        );
+
+        assert_eq!(
+            stdout_update.status,
+            Some("Running initial sync...".to_string())
+        );
+        let retained = log_receiver.try_recv().expect("queued record");
+        assert_eq!(retained.record, "already queued");
+    }
+
+    #[test]
+    fn forward_sidecar_logs_stdout_path_keeps_status_and_port_parsing() {
+        let source = include_str!("lib.rs");
+        let stdout_arm = source
+            .split("CommandEvent::Stdout(chunk_bytes) => {")
+            .nth(1)
+            .and_then(|segment| {
+                segment
+                    .split("CommandEvent::Stderr(line_bytes) => {")
+                    .next()
+            })
+            .expect("stdout arm");
+
+        assert!(stdout_arm.contains("prepare_sidecar_stdout_update("));
+        assert!(stdout_arm.contains("stdout_update.status"));
+        assert!(stdout_arm.contains("stdout_update.port"));
+        assert!(stdout_arm.contains("window.__setStage(2)"));
+        assert!(source.contains(
+            "flush_pending_sidecar_log_record(&log_sender, \"stdout\", &mut stdout_log_buffer)"
+        ));
+    }
+
+    #[test]
+    fn file_menu_includes_open_logs_folder_action() {
+        let source = include_str!("lib.rs");
+
+        assert!(source.contains("OPEN_LOGS_FOLDER_MENU_ID"));
+        assert!(source
+            .contains("MenuItemBuilder::with_id(OPEN_LOGS_FOLDER_MENU_ID, \"Open Logs Folder\")"));
+        assert!(source.contains(".open_path(log_dir.to_string_lossy().into_owned(), None::<&str>)"));
+    }
+
+    #[test]
     fn parse_listening_port_from_stdout_tail_handles_final_partial_line() {
         assert_eq!(
             parse_listening_port_from_stdout_tail("agentsview running at http://127.0.0.1:18081"),
@@ -2195,11 +3471,99 @@ mode:    read-only
     fn parse_writable_listening_port_from_status_accepts_writable_daemon() {
         let output = "\
 agentsview running at http://127.0.0.1:18082 (pid 123)
-mode:    writable
+  mode:    writable
 ";
         assert_eq!(
             parse_writable_listening_port_from_status(output),
             Some(18082)
+        );
+    }
+
+    #[test]
+    fn classify_backend_status_output_detects_ready_daemon() {
+        let output = "\
+agentsview running at http://127.0.0.1:18082 (pid 123)
+  mode:    writable
+";
+
+        assert_eq!(
+            classify_backend_status_output(output, ""),
+            BackendStatusProbe::Ready(18082)
+        );
+    }
+
+    #[test]
+    fn classify_backend_status_output_keeps_starting_state_open_ended() {
+        assert_eq!(
+            classify_backend_status_output("agentsview is starting up.", ""),
+            BackendStatusProbe::Starting("agentsview is starting up.".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_backend_status_output_keeps_starting_with_stderr_diagnostics() {
+        assert_eq!(
+            classify_backend_status_output(
+                "agentsview is starting up.\n",
+                "warning: using default config"
+            ),
+            BackendStatusProbe::Starting(
+                "agentsview is starting up.\nwarning: using default config".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn classify_backend_status_output_detects_unhealthy_daemon() {
+        assert_eq!(
+            classify_backend_status_output(
+                "agentsview process running (pid 123) but not responding to health checks.",
+                "",
+            ),
+            BackendStatusProbe::Unhealthy(
+                "agentsview process running (pid 123) but not responding to health checks."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn classify_backend_status_output_rejects_read_only_daemon() {
+        let output = "\
+agentsview running at http://127.0.0.1:18082
+  pid:     123
+  version: v0.35.0
+  mode:    read-only
+";
+
+        assert_eq!(
+            classify_backend_status_output(output, ""),
+            BackendStatusProbe::ReadOnly(output.trim().to_string())
+        );
+    }
+
+    #[test]
+    fn classify_backend_status_output_rejects_unknown_non_startup_status() {
+        assert_eq!(
+            classify_backend_status_output("agentsview status is unexpected.", ""),
+            BackendStatusProbe::Unusable("agentsview status is unexpected.".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_backend_status_output_reports_absent_or_incompatible_daemon() {
+        assert_eq!(
+            classify_backend_status_output("No agentsview server is running.", ""),
+            BackendStatusProbe::NotRunning("No agentsview server is running.".to_string())
+        );
+        assert_eq!(
+            classify_backend_status_output(
+                "agentsview found an incompatible running writable daemon.",
+                "",
+            ),
+            BackendStatusProbe::Incompatible(
+                "agentsview found an incompatible running writable daemon.".to_string()
+            )
         );
     }
 
@@ -2289,6 +3653,24 @@ mode:    writable
         let localhost_name =
             Url::parse("http://localhost:18080/").expect("valid localhost-name url");
         assert!(!is_allowed_navigation_url(&localhost_name, Some(18080)));
+    }
+
+    #[test]
+    fn default_capability_grants_zoom_to_the_sidecar_origin() {
+        let capability: Value = serde_json::from_str(include_str!("../capabilities/default.json"))
+            .expect("capability json parses");
+
+        assert_eq!(capability["windows"], serde_json::json!(["main"]));
+        assert_eq!(
+            capability["remote"]["urls"],
+            serde_json::json!(["http://127.0.0.1:*"])
+        );
+        assert!(capability["permissions"]
+            .as_array()
+            .expect("permissions array")
+            .contains(&Value::String(
+                "core:webview:allow-set-webview-zoom".to_string()
+            )));
     }
 
     #[test]
@@ -2567,6 +3949,7 @@ mode:    writable
             vec![(OsString::from("HOME"), OsString::from("/desktop"))],
             Some(OsString::from("/custom/path")),
             false,
+            false,
         );
         let map: HashMap<_, _> = merged.into_iter().collect();
         assert_eq!(
@@ -2587,6 +3970,7 @@ mode:    writable
             vec![],
             Some(OsString::from("C")),
             true,
+            false,
         );
         let map: HashMap<_, _> = merged.into_iter().collect();
         assert_eq!(map.len(), 1);
@@ -2614,6 +3998,105 @@ mode:    writable
             Some(&OsString::from("bar"))
         );
         assert!(!map.contains_key(&OsString::from("BADLINE")));
+    }
+
+    #[test]
+    fn merge_desktop_env_pairs_preserves_non_marker_windows_values() {
+        let merged = build_sidecar_env(
+            Vec::new(),
+            Vec::new(),
+            vec![(OsString::from("HOME"), OsString::from("/base"))],
+            None,
+            false,
+            true,
+        );
+        let map: HashMap<_, _> = merged.into_iter().collect();
+        assert_eq!(
+            map.get(&OsString::from("HOME")),
+            Some(&OsString::from("/base"))
+        );
+    }
+
+    #[test]
+    fn merge_desktop_env_pairs_translates_windows_wsl_marker() {
+        let merged = build_sidecar_env(
+            Vec::new(),
+            Vec::new(),
+            vec![(
+                OsString::from("CODEX_SESSIONS_DIR"),
+                OsString::from("wsl:Ubuntu:/home/me/.codex/sessions"),
+            )],
+            None,
+            false,
+            true,
+        );
+        let map: HashMap<_, _> = merged.into_iter().collect();
+        assert_eq!(
+            map.get(&OsString::from("CODEX_SESSIONS_DIR")),
+            Some(&OsString::from(
+                r"\\wsl.localhost\Ubuntu\home\me\.codex\sessions"
+            ))
+        );
+    }
+
+    #[test]
+    fn merge_desktop_env_pairs_preserves_malformed_wsl_marker() {
+        let merged = build_sidecar_env(
+            Vec::new(),
+            Vec::new(),
+            vec![(
+                OsString::from("CODEX_SESSIONS_DIR"),
+                OsString::from("wsl::/home/me/.codex/sessions"),
+            )],
+            None,
+            false,
+            true,
+        );
+        let map: HashMap<_, _> = merged.into_iter().collect();
+        assert_eq!(
+            map.get(&OsString::from("CODEX_SESSIONS_DIR")),
+            Some(&OsString::from("wsl::/home/me/.codex/sessions"))
+        );
+    }
+
+    #[test]
+    fn merge_desktop_env_pairs_preserves_extra_colon_in_wsl_marker() {
+        let merged = build_sidecar_env(
+            Vec::new(),
+            Vec::new(),
+            vec![(
+                OsString::from("CODEX_SESSIONS_DIR"),
+                OsString::from("wsl:Ubuntu:C:/tmp"),
+            )],
+            None,
+            false,
+            true,
+        );
+        let map: HashMap<_, _> = merged.into_iter().collect();
+        assert_eq!(
+            map.get(&OsString::from("CODEX_SESSIONS_DIR")),
+            Some(&OsString::from("wsl:Ubuntu:C:/tmp"))
+        );
+    }
+
+    #[test]
+    fn merge_desktop_env_pairs_preserves_url_like_wsl_marker() {
+        let merged = build_sidecar_env(
+            Vec::new(),
+            Vec::new(),
+            vec![(
+                OsString::from("CODEX_SESSIONS_DIR"),
+                OsString::from("wsl:http://example"),
+            )],
+            None,
+            false,
+            true,
+        );
+        let map: HashMap<_, _> = merged.into_iter().collect();
+        assert_eq!(
+            map.get(&OsString::from("CODEX_SESSIONS_DIR")),
+            Some(&OsString::from("wsl:http://example"))
+        );
     }
 
     #[test]

@@ -1,15 +1,22 @@
 package server_test
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 )
 
 const basePath = "/api/v1/analytics/"
@@ -35,13 +42,13 @@ func seedAnalyticsEnv(t *testing.T, te *testEnv) seedStats {
 	t.Helper()
 
 	type entry struct {
-		id, project, agent, started string
-		msgs                        int
+		id, project, agent, started, model string
+		msgs                               int
 	}
 	entries := []entry{
-		{"a1", "alpha", "claude", "2024-06-01T09:00:00Z", 10},
-		{"a2", "alpha", "codex", "2024-06-01T14:00:00Z", 20},
-		{"b1", "beta", "claude", "2024-06-02T10:00:00Z", 30},
+		{"a1", "alpha", "claude", "2024-06-01T09:00:00Z", "claude-3-5-sonnet", 10},
+		{"a2", "alpha", "codex", "2024-06-01T14:00:00Z", "gpt-4o", 20},
+		{"b1", "beta", "claude", "2024-06-02T10:00:00Z", "claude-3-5-sonnet", 30},
 	}
 
 	stats := seedStats{
@@ -51,6 +58,7 @@ func seedAnalyticsEnv(t *testing.T, te *testEnv) seedStats {
 	projects := make(map[string]bool)
 	agents := make(map[string]bool)
 	days := make(map[string]bool)
+	writes := make([]db.SessionBatchWrite, 0, len(entries))
 
 	for _, s := range entries {
 		projects[s.project] = true
@@ -61,19 +69,12 @@ func seedAnalyticsEnv(t *testing.T, te *testEnv) seedStats {
 
 		stats.TotalMessages += s.msgs
 		started := s.started
-		te.seedSession(t, s.id, s.project, s.msgs,
-			func(sess *db.Session) {
-				sess.Agent = s.agent
-				sess.StartedAt = &started
-				sess.EndedAt = &started
-				sess.FirstMessage = new("Hello")
-			},
-		)
-		te.seedMessages(t, s.id, s.msgs,
+		msgs := buildTestMessages(s.id, s.msgs,
 			func(i int, m *db.Message) {
 				// Skill analytics now buckets and filters by message
 				// timestamp, so align messages with the session window.
 				m.Timestamp = started
+				m.Model = s.model
 				// Add tool calls on every other assistant msg
 				if m.Role == "assistant" && i%4 == 1 {
 					m.HasToolUse = true
@@ -90,7 +91,25 @@ func seedAnalyticsEnv(t *testing.T, te *testEnv) seedStats {
 				}
 			},
 		)
+		writes = append(writes, db.SessionBatchWrite{
+			Session: db.Session{
+				ID:               s.id,
+				Project:          s.project,
+				Machine:          "test",
+				Agent:            s.agent,
+				MessageCount:     s.msgs,
+				UserMessageCount: max(s.msgs, 2),
+				StartedAt:        &started,
+				EndedAt:          &started,
+				FirstMessage:     new("Hello"),
+			},
+			Messages: msgs,
+		})
 	}
+	result, err := te.db.WriteSessionBatchAtomic(writes)
+	require.NoError(t, err)
+	require.Equal(t, len(entries), result.WrittenSessions)
+	require.Equal(t, stats.TotalMessages, result.WrittenMessages)
 
 	stats.ActiveProjects = len(projects)
 	stats.Agents = len(agents)
@@ -125,20 +144,27 @@ func seedAnalyticsTokenEnv(t *testing.T, te *testEnv) seedStats {
 	}
 
 	var stats seedStats
+	writes := make([]db.SessionBatchWrite, 0, len(entries))
 	for _, s := range entries {
 		stats.TotalSessions++
 		stats.TotalMessages += s.msgs
-		te.seedSession(t, s.id, s.project, s.msgs,
-			func(sess *db.Session) {
-				sess.Agent = s.agent
-				sess.StartedAt = &s.started
-				sess.EndedAt = &s.started
-				sess.FirstMessage = new("Token seeded")
-				sess.TotalOutputTokens = s.outputTokens
-				sess.HasTotalOutputTokens = s.hasTokens
+		started := s.started
+		writes = append(writes, db.SessionBatchWrite{
+			Session: db.Session{
+				ID:                   s.id,
+				Project:              s.project,
+				Machine:              "test",
+				Agent:                s.agent,
+				MessageCount:         s.msgs,
+				UserMessageCount:     max(s.msgs, 2),
+				StartedAt:            &started,
+				EndedAt:              &started,
+				FirstMessage:         new("Token seeded"),
+				TotalOutputTokens:    s.outputTokens,
+				HasTotalOutputTokens: s.hasTokens,
 			},
-		)
-		te.seedMessages(t, s.id, s.msgs)
+			Messages: buildTestMessages(s.id, s.msgs),
+		})
 		if s.hasTokens {
 			stats.TotalOutputTokens += s.outputTokens
 			stats.TokenReportingSessions++
@@ -147,8 +173,129 @@ func seedAnalyticsTokenEnv(t *testing.T, te *testEnv) seedStats {
 			}
 		}
 	}
+	result, err := te.db.WriteSessionBatchAtomic(writes)
+	require.NoError(t, err)
+	require.Equal(t, stats.TotalSessions, result.WrittenSessions)
+	require.Equal(t, stats.TotalMessages, result.WrittenMessages)
 
 	return stats
+}
+
+type analyticsDBFixture struct {
+	files map[string][]byte
+	stats seedStats
+}
+
+var (
+	analyticsFixtureOnce sync.Once
+	analyticsFixture     analyticsDBFixture
+	analyticsFixtureErr  error
+
+	analyticsTokenFixtureOnce sync.Once
+	analyticsTokenFixture     analyticsDBFixture
+	analyticsTokenFixtureErr  error
+)
+
+func setupAnalyticsEnv(t *testing.T) (*testEnv, seedStats) {
+	t.Helper()
+	fixture := analyticsFixtureFor(t,
+		&analyticsFixtureOnce,
+		&analyticsFixture,
+		&analyticsFixtureErr,
+		"analytics",
+		seedAnalyticsEnv,
+	)
+	return setupWithDBTemplate(t, fixture.files), fixture.stats
+}
+
+func setupAnalyticsTokenEnv(t *testing.T) (*testEnv, seedStats) {
+	t.Helper()
+	fixture := analyticsFixtureFor(t,
+		&analyticsTokenFixtureOnce,
+		&analyticsTokenFixture,
+		&analyticsTokenFixtureErr,
+		"analytics-token",
+		seedAnalyticsTokenEnv,
+	)
+	return setupWithDBTemplate(t, fixture.files), fixture.stats
+}
+
+func analyticsFixtureFor(
+	t *testing.T,
+	once *sync.Once,
+	fixture *analyticsDBFixture,
+	fixtureErr *error,
+	name string,
+	seed func(*testing.T, *testEnv) seedStats,
+) analyticsDBFixture {
+	t.Helper()
+	once.Do(func() {
+		*fixture, *fixtureErr = buildAnalyticsDBFixture(t, name, seed)
+	})
+	require.NoError(t, *fixtureErr)
+	return *fixture
+}
+
+func buildAnalyticsDBFixture(
+	t *testing.T,
+	name string,
+	seed func(*testing.T, *testEnv) seedStats,
+) (analyticsDBFixture, error) {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "agentsview-server-"+name+"-*")
+	if err != nil {
+		return analyticsDBFixture{}, fmt.Errorf(
+			"creating analytics fixture dir: %w", err,
+		)
+	}
+	defer os.RemoveAll(dir)
+
+	path := filepath.Join(dir, "test.db")
+	dbtest.EnsureTestDBAt(t, path)
+	database, err := db.Open(path)
+	if err != nil {
+		return analyticsDBFixture{}, fmt.Errorf(
+			"opening analytics fixture db: %w", err,
+		)
+	}
+	stats := seed(t, &testEnv{db: database})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	checkpointErr := database.CheckpointWALTruncate(ctx)
+	closeErr := database.Close()
+	if checkpointErr != nil {
+		return analyticsDBFixture{}, fmt.Errorf(
+			"checkpointing analytics fixture db: %w", checkpointErr,
+		)
+	}
+	if closeErr != nil {
+		return analyticsDBFixture{}, fmt.Errorf(
+			"closing analytics fixture db: %w", closeErr,
+		)
+	}
+	files, err := readClosedDBFiles(path)
+	if err != nil {
+		return analyticsDBFixture{}, err
+	}
+	return analyticsDBFixture{files: files, stats: stats}, nil
+}
+
+func readClosedDBFiles(path string) (map[string][]byte, error) {
+	files := make(map[string][]byte, 3)
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		data, err := os.ReadFile(path + suffix)
+		if err != nil {
+			if suffix != "" && errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, fmt.Errorf(
+				"reading analytics fixture db %s: %w",
+				path+suffix, err,
+			)
+		}
+		files[suffix] = data
+	}
+	return files, nil
 }
 
 // buildPathURL constructs an API URL for a given full path and parameters.
@@ -182,8 +329,7 @@ func buildURLWithRange(path string, params map[string]string) string {
 }
 
 func TestAnalyticsSummary(t *testing.T) {
-	te := setup(t)
-	stats := seedAnalyticsEnv(t, te)
+	te, stats := setupAnalyticsEnv(t)
 
 	t.Run("OK", func(t *testing.T) {
 		w := te.get(t, buildURLWithRange("summary", map[string]string{"timezone": "UTC"}))
@@ -194,6 +340,23 @@ func TestAnalyticsSummary(t *testing.T) {
 		assert.Equal(t, stats.TotalMessages, resp.TotalMessages)
 		assert.Equal(t, stats.ActiveProjects, resp.ActiveProjects)
 		assert.Equal(t, stats.ActiveDays, resp.ActiveDays)
+		assert.Equal(t,
+			[]string{"claude-3-5-sonnet", "gpt-4o"},
+			resp.Models,
+		)
+	})
+
+	t.Run("ModelFilter", func(t *testing.T) {
+		w := te.get(t, buildURLWithRange("summary", map[string]string{
+			"timezone": "UTC",
+			"model":    "gpt-4o",
+		}))
+		assertStatus(t, w, http.StatusOK)
+
+		resp := decode[db.AnalyticsSummary](t, w)
+		assert.Equal(t, 1, resp.TotalSessions)
+		assert.Equal(t, 20, resp.TotalMessages)
+		assert.Equal(t, []string{"gpt-4o"}, resp.Models)
 	})
 
 	t.Run("NonUTCTimezone", func(t *testing.T) {
@@ -208,8 +371,7 @@ func TestAnalyticsSummary(t *testing.T) {
 }
 
 func TestAnalyticsSummary_OutputTokenCoverage(t *testing.T) {
-	te := setup(t)
-	stats := seedAnalyticsTokenEnv(t, te)
+	te, stats := setupAnalyticsTokenEnv(t)
 
 	w := te.get(t, buildURLWithRange("summary", map[string]string{"timezone": "UTC"}))
 	assertStatus(t, w, http.StatusOK)
@@ -253,8 +415,7 @@ func TestAnalyticsSummary_DateValidation(t *testing.T) {
 }
 
 func TestAnalyticsErrorRedaction(t *testing.T) {
-	te := setup(t)
-	seedAnalyticsEnv(t, te)
+	te, _ := setupAnalyticsEnv(t)
 
 	// Valid request should succeed
 	w := te.get(t, buildURLWithRange("summary", nil))
@@ -287,8 +448,7 @@ func TestAnalyticsErrorRedaction(t *testing.T) {
 }
 
 func TestAnalyticsSignalSessionsRejectsUnsupportedSignal(t *testing.T) {
-	te := setup(t)
-	seedAnalyticsEnv(t, te)
+	te, _ := setupAnalyticsEnv(t)
 
 	w := te.get(t, buildURLWithRange("signal-sessions",
 		map[string]string{"signal": "not_a_signal"}))
@@ -296,8 +456,7 @@ func TestAnalyticsSignalSessionsRejectsUnsupportedSignal(t *testing.T) {
 }
 
 func TestAnalyticsEndpoints_DefaultParams(t *testing.T) {
-	te := setup(t)
-	seedAnalyticsEnv(t, te)
+	te, _ := setupAnalyticsEnv(t)
 
 	endpoints := []string{
 		"summary",
@@ -469,8 +628,7 @@ func TestDateFilterValidation(t *testing.T) {
 }
 
 func TestAnalyticsActivity(t *testing.T) {
-	te := setup(t)
-	stats := seedAnalyticsEnv(t, te)
+	te, stats := setupAnalyticsEnv(t)
 
 	tests := []struct {
 		name        string
@@ -515,8 +673,7 @@ func TestAnalyticsActivity(t *testing.T) {
 }
 
 func TestAnalyticsHeatmap(t *testing.T) {
-	te := setup(t)
-	stats := seedAnalyticsEnv(t, te)
+	te, stats := setupAnalyticsEnv(t)
 
 	tests := []struct {
 		name        string
@@ -628,8 +785,7 @@ func TestAnalyticsHeatmap(t *testing.T) {
 }
 
 func TestAnalyticsHeatmap_OutputTokens(t *testing.T) {
-	te := setup(t)
-	stats := seedAnalyticsTokenEnv(t, te)
+	te, stats := setupAnalyticsTokenEnv(t)
 
 	w := te.get(t, buildURLWithRange("heatmap", map[string]string{
 		"timezone": "UTC",
@@ -650,9 +806,7 @@ func TestAnalyticsHeatmap_OutputTokens(t *testing.T) {
 func TestAnalyticsHeatmap_OutputTokensNoReporting(
 	t *testing.T,
 ) {
-	te := setup(t)
-	// Seed standard analytics data (no token coverage).
-	seedAnalyticsEnv(t, te)
+	te, _ := setupAnalyticsEnv(t)
 
 	w := te.get(t, buildURLWithRange("heatmap", map[string]string{
 		"timezone": "UTC",
@@ -667,8 +821,7 @@ func TestAnalyticsHeatmap_OutputTokensNoReporting(
 }
 
 func TestAnalyticsProjects(t *testing.T) {
-	te := setup(t)
-	stats := seedAnalyticsEnv(t, te)
+	te, stats := setupAnalyticsEnv(t)
 
 	t.Run("OK", func(t *testing.T) {
 		w := te.get(t, buildURLWithRange("projects", nil))
@@ -694,8 +847,7 @@ func TestAnalyticsProjects(t *testing.T) {
 }
 
 func TestAnalyticsHourOfWeek(t *testing.T) {
-	te := setup(t)
-	seedAnalyticsEnv(t, te)
+	te, _ := setupAnalyticsEnv(t)
 
 	t.Run("OK", func(t *testing.T) {
 		w := te.get(t, buildURLWithRange("hour-of-week", map[string]string{"timezone": "UTC"}))
@@ -707,8 +859,7 @@ func TestAnalyticsHourOfWeek(t *testing.T) {
 }
 
 func TestAnalyticsSessionShape(t *testing.T) {
-	te := setup(t)
-	stats := seedAnalyticsEnv(t, te)
+	te, stats := setupAnalyticsEnv(t)
 
 	t.Run("OK", func(t *testing.T) {
 		w := te.get(t, buildURLWithRange("sessions", map[string]string{"timezone": "UTC"}))
@@ -720,8 +871,7 @@ func TestAnalyticsSessionShape(t *testing.T) {
 }
 
 func TestAnalyticsVelocity(t *testing.T) {
-	te := setup(t)
-	stats := seedAnalyticsEnv(t, te)
+	te, stats := setupAnalyticsEnv(t)
 
 	t.Run("OK", func(t *testing.T) {
 		w := te.get(t, buildURLWithRange("velocity", map[string]string{"timezone": "UTC"}))
@@ -733,8 +883,7 @@ func TestAnalyticsVelocity(t *testing.T) {
 }
 
 func TestAnalyticsTools(t *testing.T) {
-	te := setup(t)
-	stats := seedAnalyticsEnv(t, te)
+	te, stats := setupAnalyticsEnv(t)
 
 	t.Run("OK", func(t *testing.T) {
 		w := te.get(t, buildURLWithRange("tools", map[string]string{"timezone": "UTC"}))
@@ -761,8 +910,7 @@ func TestAnalyticsTools(t *testing.T) {
 }
 
 func TestAnalyticsSkills(t *testing.T) {
-	te := setup(t)
-	stats := seedAnalyticsEnv(t, te)
+	te, stats := setupAnalyticsEnv(t)
 
 	t.Run("OK", func(t *testing.T) {
 		w := te.get(t, buildURLWithRange("skills", map[string]string{"timezone": "UTC"}))
@@ -790,8 +938,7 @@ func TestAnalyticsSkills(t *testing.T) {
 }
 
 func TestAnalyticsTopSessions(t *testing.T) {
-	te := setup(t)
-	stats := seedAnalyticsEnv(t, te)
+	te, stats := setupAnalyticsEnv(t)
 
 	tests := []struct {
 		name       string
@@ -845,8 +992,7 @@ func TestAnalyticsTopSessions(t *testing.T) {
 }
 
 func TestAnalyticsTopSessions_OutputTokens(t *testing.T) {
-	te := setup(t)
-	stats := seedAnalyticsTokenEnv(t, te)
+	te, stats := setupAnalyticsTokenEnv(t)
 
 	w := te.get(t, buildURLWithRange("top-sessions", map[string]string{
 		"timezone": "UTC",
@@ -882,7 +1028,10 @@ func TestSessionCountConsistency(t *testing.T) {
 		te.seedMessages(t, id, 10)
 	}
 
-	// Seed sub-agent sessions (should NOT be counted).
+	// Seed sub-agent sessions. These are excluded from the session
+	// list and db-wide stats (navigation surfaces) but counted in the
+	// analytics summary (a token/session aggregate), so the two counts
+	// intentionally differ.
 	for i := range 3 {
 		id := fmt.Sprintf("subagent-%d", i)
 		te.seedSession(t, id, "proj-a", 8,
@@ -944,7 +1093,11 @@ func TestSessionCountConsistency(t *testing.T) {
 	)
 	te.seedMessages(t, "cont-0", 5)
 
-	wantCount := 6 // 5 root + 1 continuation
+	// Navigation surfaces (list, stats) exclude subagents: 5 root + 1
+	// continuation. The analytics summary additionally counts the 3
+	// subagents, since their messages and tokens are real spend.
+	wantNavCount := 6
+	wantAnalyticsCount := 9
 
 	// 1. Session list
 	w := te.get(t, "/api/v1/sessions")
@@ -963,17 +1116,17 @@ func TestSessionCountConsistency(t *testing.T) {
 	assertStatus(t, w, http.StatusOK)
 	summaryResp := decode[db.AnalyticsSummary](t, w)
 
-	assert.Equal(t, wantCount, listResp.Total, "session list total")
-	assert.Equal(t, wantCount, statsResp.SessionCount, "stats session_count")
-	assert.Equal(t, wantCount, summaryResp.TotalSessions, "analytics total_sessions")
+	assert.Equal(t, wantNavCount, listResp.Total, "session list total")
+	assert.Equal(t, wantNavCount, statsResp.SessionCount, "stats session_count")
+	assert.Equal(t, wantAnalyticsCount, summaryResp.TotalSessions,
+		"analytics total_sessions counts subagents")
 
-	// All three must be equal.
-	require.True(t,
-		listResp.Total == statsResp.SessionCount &&
-			statsResp.SessionCount == summaryResp.TotalSessions,
-		"session counts disagree: list=%d stats=%d analytics=%d",
-		listResp.Total,
-		statsResp.SessionCount,
-		summaryResp.TotalSessions,
-	)
+	// List and stats (navigation) agree; analytics counts subagents on
+	// top, so it is intentionally higher.
+	require.Equal(t, listResp.Total, statsResp.SessionCount,
+		"navigation session counts disagree: list=%d stats=%d",
+		listResp.Total, statsResp.SessionCount)
+	require.Greater(t, summaryResp.TotalSessions, listResp.Total,
+		"analytics should count more than navigation: analytics=%d list=%d",
+		summaryResp.TotalSessions, listResp.Total)
 }

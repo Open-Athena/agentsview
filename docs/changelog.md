@@ -3,6 +3,353 @@ title: Changelog
 description: Release history for AgentsView
 ---
 
+## 0.36.1
+<small>2026-07-03</small>
+
+**New features**
+
+- Add **Devin CLI session support**. AgentsView now discovers Devin CLI roots,
+  reads local session data from the `cli/` subtree, parses Devin messages and
+  tool activity, includes Devin in supported-agent metadata, and documents the
+  safe root to share when filing bug reports.
+- Extend **`parse-diff` diagnostics** for sessions last written through the
+  incremental-append path. These rows are now classified as
+  `incremental_skew`, excluded from `--fail-on-change`, and accompanied by
+  guidance to run a full resync for a clean parser-drift baseline.
+- Report **Antigravity `gen_metadata` without usage anomalies** in sync
+  summaries, so operators can spot Antigravity records that contain generation
+  metadata but did not produce normalized usage totals.
+
+**Improvements**
+
+- Show clearer **startup and resync state** while AgentsView initializes.
+  Background startup now publishes the daemon PID, elapsed time, current phase,
+  progress detail, and log path for `agentsview serve status`, while full
+  resyncs print durable phase and completion lines.
+- Improve **remote sync configuration and error reporting**. HTTP remote sync
+  now validates configured hosts more directly, keeps ad hoc HTTP remotes
+  unsupported, and maps common failures such as token rejection, missing remote
+  endpoints, connection refusal, DNS failures, and timeouts to actionable
+  messages.
+- Refresh **frontend controls and dialogs** by migrating the Svelte UI to the
+  shared `@kenn-io/kit-ui` components, making filters, range pickers, dialogs,
+  settings controls, copy buttons, refresh controls, and related interaction
+  states more consistent across pages.
+
+**Bug fixes**
+
+- Discover **OhMyPi sessions with a leading title slot**, matching the current
+  OMP/Pi-style transcript shape instead of skipping those files.
+- Reparse **in-place Claude rewrites** even when the source file size and mtime
+  are unchanged, so same-length edits no longer leave stale stored messages.
+- Fix **data-version resync completion** so preserved orphaned sessions and
+  sessions copied through an aborted-resync fallback still receive the
+  backfills they need instead of being treated as fully rewritten.
+- Scope **PostgreSQL session-alias backfill markers per push target**, so one
+  PostgreSQL destination cannot incorrectly satisfy or block the required full
+  alias backfill for another target.
+
+**Acknowledgements**
+
+- Thanks to [Aaron Florey](https://github.com/aaronflorey) for Devin CLI
+  session discovery and parsing.
+- Thanks to [Matthew Jacobs](https://github.com/mjacobs) for `parse-diff`
+  incremental-skew diagnostics, OMP leading-title discovery, Antigravity
+  `gen_metadata` anomaly reporting, and the same-size same-mtime Claude rewrite
+  fix.
+- Thanks to [Wes McKinney](https://github.com/wesm) for startup transparency,
+  resync consistency fixes, and remote sync configuration and error reporting.
+- Thanks to [Marius van Niekerk](https://github.com/mariusvniekerk) for the
+  frontend migration to shared UI controls and dialogs.
+- Thanks to [Rod Boev](https://github.com/rodboev) for scoping PostgreSQL
+  session-alias backfill markers by target.
+
+---
+
+## 0.36.0
+<small>2026-07-02</small>
+
+**New features**
+
+- Add **pairwise usage cost comparisons** to the Usage page and usage API. The
+  new comparison panel can compare any two project or model slices in the
+  current date/filter window and reports backend-computed cost, session count,
+  total tokens, cost per session, tokens per session, absolute deltas, and
+  percent deltas. The REST surface is
+  `GET /api/v1/usage/pairwise-comparison`.
+- Show **parser malformed-line badges** on session detail pages when a parser
+  preserved a session but skipped malformed source lines. The badge uses the
+  persisted `parser_malformed_lines` count already produced by parser/sync
+  validation, so users can spot partially recovered transcripts without opening
+  CLI sync logs.
+- Add **Traditional Chinese (`zh-TW`) localization** across the Svelte frontend
+  and register it as a supported locale alongside English and Simplified
+  Chinese.
+- Support **forking Claude sessions from a selected message**. Claude message
+  headers now expose a fork action that renders the transcript through the
+  selected ordinal into a temporary prompt and launches `claude` from the
+  session working directory, or returns a copyable command when launch is not
+  available.
+- Add **branch metadata and filter support** for session queries. The new
+  `GET /api/v1/branches` endpoint returns distinct `(project, branch)` pairs
+  with opaque filter tokens, and session, search, analytics, activity, and usage
+  endpoints accept those tokens as `git_branch`. Project-scoped tokens keep
+  same-named branches in different repositories distinct and preserve empty
+  branch values.
+- Flag **Antigravity sessions decoded from unrecognized schemas**. Antigravity
+  IDE and CLI parsers now fingerprint SQLite schemas into `source_version`;
+  unknown fingerprints get an `agy-schema:<prefix>` marker, session details
+  expose `decode_confidence: "low"`, sync summaries count the affected
+  sessions, `doctor sync` reports them, and the UI shows an **Unverified
+  schema** badge.
+
+**Improvements**
+
+- Improve **Cursor attribution in stats** so `agentsview stats` and the stats
+  service read the host-local Cursor attribution database with parity between
+  direct and daemon-backed execution. Cursor attribution remains machine-local
+  and reports unsupported project filters explicitly.
+- Extend **`parse-diff` coverage** to DB-backed Warp, Forge, and Piebald
+  sessions by allowing provider-authoritative sources, not only file-backed
+  parsers.
+- Reduce **daemon sync CPU usage while sessions are actively streaming** by
+  avoiding repeated skip-check work on hot files that are still being written.
+- Improve **unsupported usage reporting** from agent capabilities. Agents now
+  advertise whether they lack per-message token data and whether their costs are
+  denominated in AI credits (surfaced as "Copilot AI Credits" for Copilot
+  agents) as separate capabilities, so Copilot-family filters keep
+  Copilot-specific wording while other no-token agents get generic guidance.
+- Publish a **`stable` Docker image tag** on tagged releases. `stable` always
+  points at the most recent tagged release, while `latest` continues to track
+  `main` and exact version tags remain immutable.
+
+**Bug fixes**
+
+- Fix **DuckDB push schema setup through Quack** so remote Quack-backed pushes
+  initialize and validate the DuckDB schema correctly.
+- Fix **Visual Studio 2026 Copilot session parsing** for the current trace
+  layout while preserving the existing Visual Studio Copilot agent identity and
+  discovery paths.
+- Surface **unsupported Copilot usage filters** correctly in the Usage page and
+  API instead of showing an empty report without the Copilot no-token-data note.
+- Backfill **worktree mappings** for sessions that have empty working-directory
+  rows but can be matched from sibling sessions under the same mapping.
+- Prevent **OpenCode WAL watcher feedback loops** by reading OpenCode-family
+  SQLite databases through read-only file URIs, ignoring transient `-shm`
+  events, and only treating main database or data-bearing WAL changes as
+  meaningful.
+- Remove **outdated Copilot billing wording** from CLI usage output. The note
+  now says Copilot records do not include token or cost data AgentsView can
+  total, rather than referring to old billing terminology.
+
+**Acknowledgements**
+
+- Thanks to [Rod Boev](https://github.com/rodboev) for pairwise usage
+  comparisons, Cursor attribution parity, Claude message-point session forking,
+  worktree-mapping backfills, unsupported usage capability metadata, usage
+  filter fixes, Visual Studio 2026 Copilot session parsing, and the `stable`
+  Docker image tag.
+- Thanks to [Matthew Jacobs](https://github.com/mjacobs) for parser
+  malformed-line badges, Antigravity schema-confidence reporting,
+  provider-backed `parse-diff` coverage, the Copilot CLI wording fix, and MCP
+  schema documentation.
+- Thanks to [Linus](https://github.com/Playgrand-by-linus) for the Traditional
+  Chinese (`zh-TW`) localization.
+- Thanks to [Prateek Rungta](https://github.com/prateek) for the project-scoped
+  branch filter foundation.
+- Thanks to [Phillip Cloud](https://github.com/cpcloud) for the DuckDB/Quack
+  schema setup fix.
+- Thanks to [Trent Nelson](https://github.com/tpn) for preventing OpenCode WAL
+  watcher feedback loops.
+- Thanks to [Wes McKinney](https://github.com/wesm) for daemon sync CPU
+  reduction, Windows test-suite fixture reuse, and release documentation.
+
+---
+
+## 0.35.2
+<small>2026-06-30</small>
+
+**Bug fixes**
+
+- Fix **PostgreSQL push sync** so skipped ownership conflicts no longer block
+  the session-alias backfill marker.
+
+**Acknowledgements**
+
+- Thanks to [leejuhanKr](https://github.com/leejuhanKr) for fixing PostgreSQL
+  push sync behavior around skipped ownership conflicts.
+
+---
+
+## 0.35.1
+<small>2026-06-30</small>
+
+**New features**
+
+- Add **OpenClaude session support** so AgentsView can discover, import, and
+  display OpenClaude JSONL sessions alongside Claude Code and other local
+  agents.
+- Add **Copilot CLI usage guidance** for records that include aggregate usage
+  metadata but do not include per-message token counts.
+
+**Improvements**
+
+- Reuse the configured **DuckDB mirror path** for Quack sync so `duckdb push`,
+  `duckdb status`, `duckdb serve`, and `duckdb quack serve` stay pointed at the
+  same mirror by default.
+- Improve **DuckDB and Quack sync behavior and coverage**.
+
+**Bug fixes**
+
+- Require **daemon transport** for CLI read commands that depend on
+  daemon-backed data.
+- Surface **desktop backend startup failures** clearly instead of hiding the
+  underlying error.
+- Validate **desktop updater signatures** before applying updates.
+
+**Acknowledgements**
+
+- Thanks to [Rod Boev](https://github.com/rodboev) for OpenClaude session
+  support.
+- Thanks to [Matthew Jacobs](https://github.com/mjacobs) for Copilot CLI usage
+  guidance when usage records do not include per-message token counts.
+- Thanks to [Phillip Cloud](https://github.com/cpcloud) for reusing the
+  configured DuckDB path for Quack sync and improving DuckDB/Quack coverage.
+- Thanks to [Marius van Niekerk](https://github.com/mariusvniekerk) for the
+  daemon-transport requirement on CLI read commands.
+- Thanks to [Wes McKinney](https://github.com/wesm) for desktop backend error
+  surfacing, desktop updater signature validation, and release documentation.
+
+---
+
+## 0.35.0
+<small>2026-06-29</small>
+
+**New features**
+
+- Add **HTTP daemon remote sync** so configured remote hosts can sync through the
+  local daemon instead of requiring each CLI invocation to perform the work
+  directly.
+- Add **PostgreSQL serve support for curation and insights**. `agentsview pg
+  serve` can now back starred, trashed, renamed, and insight workflows from the
+  shared PostgreSQL store.
+- Add a read-only **`agentsview mcp` server** for MCP-capable assistants to
+  search sessions, inspect message windows, and summarize usage from the
+  AgentsView archive. See [MCP Server](/mcp/).
+- Add **Recent Edits**, a top-level feed for reviewing file edits across
+  sessions and jumping back to the exact message that made each change. See
+  [Recent Edits](/recent-edits/).
+- Add **batch session selection and deletion** in the sidebar.
+- Add **S3-compatible object storage discovery** for Claude and Codex session
+  roots, so a central AgentsView instance can sync raw session files from S3,
+  MinIO, R2, OSS, and similar stores. See
+  [S3-Compatible Session Sources](/configuration/#s3-compatible-session-sources).
+- Add **Chinese localization** plus language settings across the frontend.
+- Add **UI text-size scaling** and **high-contrast** appearance mode.
+- Add an **Analytics dashboard model filter** that scopes dashboard panels to
+  selected models. See [Model Filter](/usage/#model-filter).
+- Add **export and publish actions for generated insights**.
+- Add **IcodeMate** agent support.
+- Add **Cursor admin usage ingestion** to the Usage board.
+- Add **Kimi cost estimation** from aggregate token usage.
+- Add **per-remote sync intervals** for configured remote hosts.
+- Add **named PostgreSQL push targets** so separate destinations can keep their
+  own connection and watermark state.
+- Add **offline LiteLLM pricing fallback data** for usage and cost reporting.
+
+**Improvements**
+
+- Make **local CLI and desktop workflows daemon-first**, aligning commands with
+  the long-running local service used by the desktop app.
+- Standardize **`--format` and `--json` output flags** across commands.
+- Surface **parser anomaly signals** in sync summaries so malformed or
+  suspicious parser output is easier to notice.
+- Stream **remote sync progress through the daemon** with per-phase elapsed
+  time.
+- Improve **daemon replacement handling** for `agentsview serve`.
+- Preserve **Pi message tree lineage**.
+- Preserve **XML-style prompt tags** in rendered markdown.
+- Show **summary-mode Antigravity CLI sessions** and record Antigravity
+  producing-version metadata.
+- Enrich **tool summaries** and add a **skim layout** for session reading.
+- Add an **in-page help affordance** for Insights.
+- Add **right-side axis labels** to the concurrency timeline.
+- Require **opt-in Aider discovery** to avoid scanning large or sensitive
+  directory trees unexpectedly.
+- Add `substrings` and `exact_matches` to **automated session detection**
+  configuration.
+- Publish **raw markdown route companions** for docs pages.
+- Deprecate **Amp support documentation** now that current Amp releases may keep
+  complete threads server-side.
+
+**Bug fixes**
+
+- Include **Claude.ai export attachments** during import.
+- Honor **`CLAUDE_CONFIG_DIR`** for Claude session discovery.
+- Support **explicit WSL paths** in desktop environment settings.
+- Persist **desktop sidecar logs** for desktop builds.
+- Use **native webview zoom** in the desktop app, fixing Windows zoom rendering.
+- Repair the **AppImage DirIcon** after bundling.
+- Fix **remote daemon progress reporting** so each sync phase stays visible with
+  elapsed time.
+- Fix a **resync discovery performance regression** and correct its
+  mis-attributed phase timing.
+- Detect **Codex title-only renames** during full sync.
+- Repair **persisted Codex goal-context rows**.
+- Treat Codex **`/goal` continuation context** as system content.
+- Fix **Gemini per-turn context token** calculation.
+- Fix **Gemini insight generation** by no longer forcing a sandboxed Gemini CLI
+  run.
+- Count **subagent sessions** in analytics totals.
+- Clamp **analytics top-session active duration** by idle gaps.
+- Scope **filtered PostgreSQL push watermarks** correctly.
+- Reset **push watermarks** when PostgreSQL targets change.
+- Fail **blocked PostgreSQL pushes** and surface push errors.
+- Accept duration syntax for **`usage daily --since` and `--until`**.
+- Deduplicate **replayed continued-session usage rows**.
+- Suppress the **Local reporter timezone sentinel** in stats.
+- Fall back to `AGENTSVIEW_GITHUB_TOKEN` and the GitHub CLI auth token for local
+  **Gist publishing**.
+- Install the binary with an **atomic rename** in `make install`.
+- Skip compatible PostgreSQL push schema DDL where it is not needed.
+
+**Acknowledgements**
+
+- Thanks to [Wes McKinney](https://github.com/wesm) for HTTP daemon remote sync,
+  daemon-first CLI and desktop workflows, Recent Edits, UI text-size scaling and
+  high-contrast mode, remote sync progress fixes, daemon replacement handling,
+  raw markdown docs routes, Amp documentation deprecation, PostgreSQL push
+  watermark fixes, and installer hardening.
+- Thanks to [Rod Boev](https://github.com/rodboev) for PostgreSQL serve curation
+  and insight persistence, generated insight export and publishing, Cursor admin
+  usage ingestion, per-remote sync intervals, named PostgreSQL push targets,
+  offline LiteLLM pricing fallback data, Pi lineage preservation, Insights help,
+  desktop fixes, Claude import/config fixes, and usage/stat fixes.
+- Thanks to [Matthew Jacobs](https://github.com/mjacobs) for the MCP server,
+  parser anomaly signals, Codex rename and `/goal` handling fixes, Antigravity
+  summary-mode sessions, blocked PostgreSQL push error handling, and parser
+  validation work.
+- Thanks to [Marius van Niekerk](https://github.com/mariusvniekerk) for the
+  provider source-set migration work, frontend control chrome guard, localized
+  reading-control pluralization, and analytics active-duration correction.
+- Thanks to [icatw](https://github.com/icatw) for Chinese localization and
+  frontend localization coverage.
+- Thanks to [Prateek Rungta](https://github.com/prateek) for standardized CLI
+  output flags and duration syntax for `usage daily`.
+- Thanks to [DanielMao](https://github.com/DanielMao1) for S3-compatible session
+  discovery.
+- Thanks to [huaiyuWangh](https://github.com/huaiyuWangh) for batch sidebar
+  selection and deletion.
+- Thanks to Leonidas Lux for IcodeMate agent support.
+- Thanks to [Junt184](https://github.com/Junt184) for Kimi cost estimation.
+- Thanks to [Jesse Robbins](https://github.com/jesserobbins) for counting
+  subagent sessions in analytics totals.
+- Thanks to Trent Nelson for repairing persisted Codex goal-context rows.
+- Thanks to [Martin Wimpress](https://github.com/flexiondotorg) for compatible
+  PostgreSQL push schema handling.
+
+---
+
 ## 0.34.5
 <small>2026-06-23</small>
 
@@ -1320,11 +1667,12 @@ description: Release history for AgentsView
   via `[custom_model_pricing.<model>]` tables in
   `~/.agentsview/config.toml`, for models not in the LiteLLM
   catalog or when you want to override the catalog's rates.
-- Add configurable [automation prefixes](/configuration/#automated-session-detection)
-  via `[automated] prefixes = [...]` in `~/.agentsview/config.toml`,
-  so single-turn sessions with first-message patterns unique to
-  your own automation get filtered from session lists and analytics
-  alongside the built-in roborev patterns.
+- Add configurable [automation patterns](/configuration/#automated-session-detection)
+  via `[automated] prefixes`, `substrings`, and `exact_matches` in
+  `~/.agentsview/config.toml`, so single-turn sessions with
+  first-message patterns unique to your own automation get filtered
+  from session lists and analytics alongside the built-in roborev
+  patterns.
 
 **Improvements**
 
@@ -1333,9 +1681,10 @@ description: Release history for AgentsView
   review combiner prompts, and AgentsView's own changelog
   generator.
 - Refresh the `is_automated` classification at startup, using a
-  classifier hash that covers built-in patterns and `[automated]
-  prefixes`, so edits to automation rules and rows imported from
-  other archives get re-labeled without a manual resync.
+  classifier hash that covers built-in patterns and configured
+  `[automated]` patterns, so edits to automation rules and rows
+  imported from other archives get re-labeled without a manual
+  resync.
 - Improve Claude first-message selection in the sidebar by
   skipping leading `/clear` and `/effort` command envelopes so
   the session preview shows the next real user message instead.

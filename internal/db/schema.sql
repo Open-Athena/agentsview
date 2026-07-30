@@ -56,9 +56,16 @@ CREATE TABLE IF NOT EXISTS sessions (
     git_branch TEXT NOT NULL DEFAULT '',
     source_session_id TEXT NOT NULL DEFAULT '',
     source_version TEXT NOT NULL DEFAULT '',
+    transcript_fidelity TEXT NOT NULL DEFAULT '',
     parser_malformed_lines INTEGER NOT NULL DEFAULT 0,
     is_truncated INTEGER NOT NULL DEFAULT 0,
     private INTEGER NOT NULL DEFAULT 0,
+    -- SQLite-only sync bookkeeping (like next_ordinal): TRUE when the
+    -- last write to this row went through the incremental-append path
+    -- rather than a full re-normalization. Consumed only by parse-diff
+    -- to suppress benign incremental-vs-full skew; deliberately not
+    -- mirrored to PG/DuckDB.
+    last_write_incremental INTEGER NOT NULL DEFAULT 0,
     deleted_at  TEXT,
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     termination_status TEXT,
@@ -183,6 +190,31 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_session
 CREATE INDEX IF NOT EXISTS idx_usage_events_occurred
     ON usage_events(occurred_at);
 
+CREATE TABLE IF NOT EXISTS cursor_usage_events (
+    id INTEGER PRIMARY KEY,
+    occurred_at TEXT NOT NULL,
+    model TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT '',
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    charged_cents REAL NOT NULL DEFAULT 0,
+    cursor_token_fee REAL NOT NULL DEFAULT 0,
+    user_id TEXT NOT NULL DEFAULT '',
+    user_email TEXT NOT NULL DEFAULT '',
+    is_headless INTEGER NOT NULL DEFAULT 0,
+    dedup_key TEXT NOT NULL DEFAULT ''
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cursor_usage_events_dedup
+    ON cursor_usage_events(dedup_key)
+    WHERE dedup_key != '';
+CREATE INDEX IF NOT EXISTS idx_cursor_usage_events_occurred
+    ON cursor_usage_events(occurred_at);
+CREATE INDEX IF NOT EXISTS idx_cursor_usage_events_model
+    ON cursor_usage_events(model);
+
 -- Tool calls table
 CREATE TABLE IF NOT EXISTS tool_calls (
     id         INTEGER PRIMARY KEY,
@@ -197,7 +229,9 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     skill_name  TEXT,
     result_content_length INTEGER,
     result_content        TEXT,
-    subagent_session_id TEXT
+    subagent_session_id TEXT,
+    file_path  TEXT,
+    call_index INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_tool_calls_session
@@ -345,6 +379,31 @@ CREATE INDEX IF NOT EXISTS idx_worktree_project_mappings_match
 
 CREATE INDEX IF NOT EXISTS idx_worktree_project_mappings_project
     ON worktree_project_mappings(machine, project);
+
+CREATE TABLE IF NOT EXISTS archive_metadata (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE TABLE IF NOT EXISTS project_identity_observations (
+    project            TEXT NOT NULL,
+    machine            TEXT NOT NULL,
+    root_path          TEXT NOT NULL DEFAULT '',
+    git_remote         TEXT NOT NULL DEFAULT '',
+    git_remote_name    TEXT NOT NULL DEFAULT '',
+    worktree_name      TEXT NOT NULL DEFAULT '',
+    worktree_root_path TEXT NOT NULL DEFAULT '',
+    observed_at        TEXT NOT NULL,
+    normalized_remote  TEXT NOT NULL DEFAULT '',
+    key_source         TEXT NOT NULL DEFAULT '',
+    key                TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (project, machine, root_path, git_remote)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_identity_observations_project
+    ON project_identity_observations(project);
 
 -- PG sync state: stores watermarks for push sync
 CREATE TABLE IF NOT EXISTS pg_sync_state (

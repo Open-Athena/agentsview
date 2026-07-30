@@ -22,6 +22,7 @@
     type RangeSelection,
   } from "../shared/rangeSelection.js";
   import UsageSummaryCards from "./UsageSummaryCards.svelte";
+  import UsagePairwiseComparisonPanel from "./UsagePairwiseComparisonPanel.svelte";
   import CostTimeSeriesChart from "./CostTimeSeriesChart.svelte";
   import AttributionPanel from "./AttributionPanel.svelte";
   import TopSessionsTable from "./TopSessionsTable.svelte";
@@ -36,6 +37,7 @@
     panelDateState,
     type PanelDateState,
   } from "../../stores/yokedDates.svelte.js";
+  import { m } from "../../i18n/index.js";
 
   let mounted = false;
   let unsubEvents: (() => void) | undefined;
@@ -121,6 +123,16 @@
       ? usage.selectedModels.split(",").filter(Boolean)
       : [],
   );
+  const unsupportedUsageMessage = $derived.by(() => {
+    const kind = usage.summary?.unsupportedUsage?.kind;
+    if (kind === "copilot-no-token-data") {
+      return m.usage_summary_unsupported_copilot_no_token_data();
+    }
+    if (kind) {
+      return m.usage_summary_unsupported_generic();
+    }
+    return "";
+  });
   const sessionUrlParams = $derived(
     filtersToParams(sessions.filters),
   );
@@ -381,7 +393,7 @@
       />
 
       <FilterDropdown
-        label="Project"
+        label={m.analytics_col_project()}
         items={projectItems}
         excludedCsv={usage.excludedProjects}
         onToggle={(name) => usage.toggleProject(name)}
@@ -391,7 +403,7 @@
       />
 
       <FilterDropdown
-        label="Model"
+        label={m.usage_model()}
         items={modelItems}
         excludedCsv={usage.selectedModels}
         mode="include"
@@ -405,8 +417,8 @@
         lastUpdatedAt={usage.lastUpdatedAt}
         busy={usage.isQuerying}
         onRefresh={() => usage.fetchAll()}
-        label="Refresh usage data"
-        title="Refresh"
+        label={m.usage_refresh()}
+        title={m.shared_refresh()}
       />
 
     </div>
@@ -428,6 +440,12 @@
       <div class="query-progress" aria-hidden="true"></div>
     {/if}
 
+    {#if unsupportedUsageMessage}
+      <div class="usage-note" role="status">
+        {unsupportedUsageMessage}
+      </div>
+    {/if}
+
     <UsageSummaryCards />
 
     <div class="chart-panel wide">
@@ -439,15 +457,16 @@
     </div>
 
     <div class="bottom-grid">
-      <div class="chart-panel">
+      <div class="chart-panel bounded">
         <TopSessionsTable />
       </div>
-      <div class="chart-panel">
+      <div class="chart-panel bounded">
         <CacheEfficiencyPanel />
       </div>
     </div>
 
     <div class="chart-panel wide">
+      <UsagePairwiseComparisonPanel />
       <LongestPromptsPanel />
     </div>
   </div>
@@ -496,6 +515,15 @@
     transition: opacity 0.12s;
   }
 
+  .usage-note {
+    padding: 12px 14px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-muted);
+    border-left: 4px solid var(--accent-blue);
+    border-radius: var(--radius-md);
+    color: var(--text-secondary);
+  }
+
   .usage-content.querying {
     opacity: 0.88;
   }
@@ -541,9 +569,15 @@
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 12px;
+    align-items: start;
   }
 
-  @media (max-width: 800px) {
+  .chart-panel.bounded {
+    max-height: min(420px, 48vh);
+    overflow: auto;
+  }
+
+  @media (max-width: 760px) {
     .bottom-grid {
       grid-template-columns: 1fr;
     }

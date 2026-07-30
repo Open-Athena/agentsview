@@ -13,22 +13,23 @@ package db
 // reporter's agentsview_version, not schema_version, for non-bump
 // changes.
 type SessionStats struct {
-	SchemaVersion  int                  `json:"schema_version"`
-	Window         StatsWindow          `json:"window"`
-	Filters        StatsFilters         `json:"filters"`
-	Totals         StatsTotals          `json:"totals"`
-	Distributions  StatsDistributions   `json:"distributions"`
-	Archetypes     StatsArchetypes      `json:"archetypes"`
-	Velocity       StatsVelocity        `json:"velocity"`
-	ToolMix        StatsToolMix         `json:"tool_mix"`
-	ModelMix       StatsModelMix        `json:"model_mix"`
-	Adoption       *StatsAdoption       `json:"adoption,omitempty"`
-	AgentPortfolio StatsAgentPortfolio  `json:"agent_portfolio"`
-	CacheEconomics *StatsCacheEconomics `json:"cache_economics,omitempty"`
-	Temporal       StatsTemporal        `json:"temporal"`
-	OutcomeStats   *StatsOutcomeStats   `json:"outcome_stats,omitempty"`
-	Outcomes       *StatsOutcomes       `json:"outcomes,omitempty"`
-	GeneratedAt    string               `json:"generated_at"`
+	SchemaVersion   int                  `json:"schema_version"`
+	Window          StatsWindow          `json:"window"`
+	Filters         StatsFilters         `json:"filters"`
+	Totals          StatsTotals          `json:"totals"`
+	Distributions   StatsDistributions   `json:"distributions"`
+	Archetypes      StatsArchetypes      `json:"archetypes"`
+	Velocity        StatsVelocity        `json:"velocity"`
+	ToolMix         StatsToolMix         `json:"tool_mix"`
+	ModelMix        StatsModelMix        `json:"model_mix"`
+	Adoption        *StatsAdoption       `json:"adoption,omitempty"`
+	AgentPortfolio  StatsAgentPortfolio  `json:"agent_portfolio"`
+	CacheEconomics  *StatsCacheEconomics `json:"cache_economics,omitempty"`
+	Temporal        StatsTemporal        `json:"temporal"`
+	OutcomeStats    *StatsOutcomeStats   `json:"outcome_stats,omitempty"`
+	Outcomes        *StatsOutcomes       `json:"outcomes,omitempty"`
+	CodeAttribution *CodeAttribution     `json:"code_attribution,omitempty"`
+	GeneratedAt     string               `json:"generated_at"`
 }
 
 type StatsWindow struct {
@@ -48,8 +49,15 @@ type StatsTotals struct {
 	SessionsAll        int `json:"sessions_all"`
 	SessionsHuman      int `json:"sessions_human"`
 	SessionsAutomation int `json:"sessions_automation"`
-	MessagesTotal      int `json:"messages_total"`
-	UserMessagesTotal  int `json:"user_messages_total"`
+	// SessionsSubagent is the count of subagent sessions folded into
+	// SessionsAll. Human, automation, and subagent partition
+	// SessionsAll: sessions_all == sessions_human + sessions_automation
+	// + sessions_subagent. Subagents are kept out of the human and
+	// automation buckets (a subagent is neither) but counted in the
+	// total, so the breakdown stays decomposable.
+	SessionsSubagent  int `json:"sessions_subagent"`
+	MessagesTotal     int `json:"messages_total"`
+	UserMessagesTotal int `json:"user_messages_total"`
 }
 
 type DistributionBucketV1 struct {
@@ -182,4 +190,38 @@ type StatsOutcomes struct {
 	ToolRetryRate         float64        `json:"tool_retry_rate"`
 	CompactionsPerSession float64        `json:"compactions_per_session"`
 	AvgEditChurn          float64        `json:"avg_edit_churn"`
+}
+
+type CodeAttribution struct {
+	Sources []CodeAttributionSource `json:"sources,omitempty"`
+}
+
+type CodeAttributionSource struct {
+	Provider string                    `json:"provider"`
+	Scope    string                    `json:"scope"`
+	Status   string                    `json:"status"`
+	Warnings []string                  `json:"warnings,omitempty"`
+	Metrics  *CursorAttributionMetrics `json:"metrics,omitempty"`
+}
+
+type CursorAttributionMetrics struct {
+	ScoredCommits        int64                     `json:"scored_commits"`
+	LinesAdded           int64                     `json:"lines_added"`
+	LinesDeleted         int64                     `json:"lines_deleted"`
+	TabLinesAdded        int64                     `json:"tab_lines_added"`
+	TabLinesDeleted      int64                     `json:"tab_lines_deleted"`
+	ComposerLinesAdded   int64                     `json:"composer_lines_added"`
+	ComposerLinesDeleted int64                     `json:"composer_lines_deleted"`
+	HumanLinesAdded      int64                     `json:"human_lines_added"`
+	HumanLinesDeleted    int64                     `json:"human_lines_deleted"`
+	BlankLinesAdded      int64                     `json:"blank_lines_added"`
+	BlankLinesDeleted    int64                     `json:"blank_lines_deleted"`
+	AIAuthoredPct        float64                   `json:"ai_authored_pct"`
+	ConversationCounts   []CursorConversationCount `json:"conversation_counts,omitempty"`
+}
+
+type CursorConversationCount struct {
+	Model string `json:"model"`
+	Mode  string `json:"mode"`
+	Count int64  `json:"count"`
 }

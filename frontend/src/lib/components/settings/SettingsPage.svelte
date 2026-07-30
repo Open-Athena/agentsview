@@ -37,16 +37,15 @@
     <div class="settings-loading">{m.settings_loading()}</div>
   {:else if settings.needsAuth}
     <div class="auth-prompt">
-      <h3 class="auth-title">Authentication Required</h3>
+      <h3 class="auth-title">{m.app_auth_title()}</h3>
       <p class="auth-description">
-        This server requires an auth token. Enter the token displayed
-        on the server's console or settings page.
+        {m.app_auth_description()}
       </p>
       <div class="auth-field">
         <input
           class="auth-input"
           type="password"
-          placeholder="Paste auth token"
+          placeholder={m.app_auth_placeholder()}
           bind:value={authTokenInput}
           onkeydown={(e) => { if (e.key === "Enter") handleAuthSubmit(); }}
         />
@@ -55,7 +54,7 @@
           disabled={!authTokenInput.trim()}
           onclick={handleAuthSubmit}
         >
-          Authenticate
+          {m.app_auth_authenticate()}
         </button>
       </div>
       <button
@@ -67,7 +66,7 @@
           settings.load();
         }}
       >
-        Disconnect and reset
+        {m.app_auth_disconnect_reset()}
       </button>
     </div>
   {:else if settings.error}
@@ -80,9 +79,9 @@
             setAuthToken("");
             setServerUrl("");
             window.location.reload();
-          }}
-        >
-          Disconnect and reset
+        }}
+      >
+          {m.app_auth_disconnect_reset()}
         </button>
       {/if}
     </div>
@@ -104,15 +103,15 @@
           }}
           disabled={sync.readOnly}
           title={sync.readOnly
-            ? "Full resync unavailable in read-only mode"
-            : "Full resync"}
+            ? m.settings_resync_title_unavailable()
+            : m.resync_title()}
         >
-          Full Resync
+          {m.resync_title()}
         </button>
         <span class="settings-actions-hint">
           {sync.readOnly
-            ? "Unavailable while connected to a read-only backend"
-            : "Re-scan all session files from scratch"}
+            ? m.settings_resync_unavailable_hint()
+            : m.settings_resync_hint()}
         </span>
       </div>
     </div>
@@ -251,7 +250,7 @@
     border-radius: var(--radius-sm);
     font-size: 13px;
     font-weight: 500;
-    color: white;
+    color: var(--accent-blue-foreground);
     background: var(--accent-blue);
     border: none;
     cursor: pointer;

@@ -99,6 +99,51 @@ export interface UsageComparison {
   deltaPct: number;
 }
 
+export interface UnsupportedUsage {
+  kind: string;
+}
+
+export type UsagePairwiseDimension = "model" | "project";
+
+export interface UsagePairwiseComparisonSide {
+  totalCost: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+  totalTokens: number;
+  sessionCount: number;
+  costPerSession?: number;
+  tokensPerSession?: number;
+}
+
+export interface UsagePairwiseComparisonDelta {
+  totalCostDelta: number;
+  totalCostDeltaRatio: number | null;
+  inputTokensDelta: number;
+  inputTokensDeltaRatio: number | null;
+  outputTokensDelta: number;
+  outputTokensDeltaRatio: number | null;
+  cacheCreationDelta: number;
+  cacheCreationDeltaRatio: number | null;
+  cacheReadDelta: number;
+  cacheReadDeltaRatio: number | null;
+  totalTokensDelta: number;
+  totalTokensDeltaRatio: number | null;
+  sessionCountDelta: number;
+  sessionCountDeltaRatio: number | null;
+  costPerSessionDelta: number | null;
+  costPerSessionRatio: number | null;
+  tokensPerSessionDelta: number | null;
+  tokensPerSessionRatio: number | null;
+}
+
+export interface UsagePairwiseComparisonResponse {
+  left: UsagePairwiseComparisonSide;
+  right: UsagePairwiseComparisonSide;
+  deltas: UsagePairwiseComparisonDelta;
+}
+
 export interface UsageSummaryResponse {
   from: string;
   to: string;
@@ -109,6 +154,7 @@ export interface UsageSummaryResponse {
   agentTotals: AgentTotal[];
   sessionCounts: UsageSessionCounts;
   cacheStats: CacheStats;
+  unsupportedUsage?: UnsupportedUsage;
   comparison?: UsageComparison;
 }
 

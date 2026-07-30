@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { m } from "../../i18n/index.js";
   import { onMount, untrack } from "svelte";
   import {
     activity,
@@ -14,9 +15,9 @@
     rangeToActivityParams,
     type PanelDateState,
   } from "../../stores/yokedDates.svelte.js";
-  import RefreshControl from "../shared/RefreshControl.svelte";
   import ProjectTypeahead from "../layout/ProjectTypeahead.svelte";
-  import { ChevronDownIcon } from "../../icons.js";
+  import { Typeahead, type TypeaheadOption } from "@kenn-io/kit-ui";
+  import RefreshControl from "../shared/RefreshControl.svelte";
   import {
     addDays,
     endOfMonth,
@@ -71,6 +72,48 @@
 
   const earliestSession = $derived(sync.stats?.earliest_session ?? null);
   const today = $derived(localDateStr(new Date()));
+  const agentOptions = $derived.by((): TypeaheadOption[] => [
+    {
+      name: "",
+      label: m.activity_all_agents(),
+      displayLabel: m.activity_all_agents(),
+    },
+    ...activity.agents.map((agent) => ({
+      name: agent.name,
+      label: `${agent.name} (${agent.session_count})`,
+      displayLabel: agent.name,
+      count: agent.session_count,
+    })),
+  ]);
+  const machineOptions = $derived.by((): TypeaheadOption[] => [
+    {
+      name: "",
+      label: m.activity_all_machines(),
+      displayLabel: m.activity_all_machines(),
+    },
+    ...activity.machines.map((machine) => ({
+      name: machine,
+      label: machine,
+      displayLabel: machine,
+    })),
+  ]);
+  const automationOptions: TypeaheadOption[] = $derived([
+    {
+      name: "all",
+      label: m.activity_all_sessions(),
+      displayLabel: m.activity_all_sessions(),
+    },
+    {
+      name: "interactive",
+      label: m.activity_interactive(),
+      displayLabel: m.activity_interactive(),
+    },
+    {
+      name: "automated",
+      label: m.activity_automated(),
+      displayLabel: m.activity_automated(),
+    },
+  ]);
 
   // The activity store is the source of truth: day/week/month map to a calendar
   // period anchored on `date`; custom maps to from/to. Relative windows have no
@@ -200,20 +243,18 @@
     activity.load();
   }
 
-  function onAgentChange(e: Event) {
-    activity.setAgent((e.currentTarget as HTMLSelectElement).value);
+  function onAgentChange(value: string) {
+    activity.setAgent(value);
     activity.load();
   }
 
-  function onMachineChange(e: Event) {
-    activity.setMachine((e.currentTarget as HTMLSelectElement).value);
+  function onMachineChange(value: string) {
+    activity.setMachine(value);
     activity.load();
   }
 
-  function onAutomationChange(e: Event) {
-    activity.setAutomation(
-      (e.currentTarget as HTMLSelectElement).value as Automation,
-    );
+  function onAutomationChange(value: string) {
+    activity.setAutomation(value as Automation);
     activity.load();
   }
 
@@ -270,62 +311,39 @@
       onselect={onProjectSelect}
     />
 
-    <div class="filter-select-wrap">
-      <select
-        class="filter-select"
+    <div class="toolbar-typeahead">
+      <Typeahead
+        options={agentOptions}
         value={activity.agent}
-        onchange={onAgentChange}
-        aria-label="Filter by agent"
-      >
-        <option value="">All Agents</option>
-        {#each activity.agents as a}
-          <option value={a.name}>{a.name}</option>
-        {/each}
-      </select>
-      <ChevronDownIcon
-        class="filter-select-chevron"
-        size="12"
-        strokeWidth="2.2"
-        aria-hidden="true"
+        fallbackLabel={m.activity_all_agents()}
+        placeholder={m.activity_filter_agents_placeholder()}
+        title={m.activity_filter_by_agent()}
+        emptyLabel={m.activity_no_matching_agents()}
+        onselect={onAgentChange}
       />
     </div>
 
-    <div class="filter-select-wrap">
-      <select
-        class="filter-select"
+    <div class="toolbar-typeahead">
+      <Typeahead
+        options={machineOptions}
         value={activity.machine}
-        onchange={onMachineChange}
-        aria-label="Filter by machine"
-      >
-        <option value="">All Machines</option>
-        {#each activity.machines as m}
-          <option value={m}>{m}</option>
-        {/each}
-      </select>
-      <ChevronDownIcon
-        class="filter-select-chevron"
-        size="12"
-        strokeWidth="2.2"
-        aria-hidden="true"
+        fallbackLabel={m.activity_all_machines()}
+        placeholder={m.activity_filter_machines_placeholder()}
+        title={m.activity_filter_by_machine()}
+        emptyLabel={m.activity_no_matching_machines()}
+        onselect={onMachineChange}
       />
     </div>
 
-    <div class="filter-select-wrap">
-      <select
-        class="filter-select"
+    <div class="toolbar-typeahead compact">
+      <Typeahead
+        options={automationOptions}
         value={activity.automation}
-        onchange={onAutomationChange}
-        aria-label="Filter by automation"
-      >
-        <option value="all">All Sessions</option>
-        <option value="interactive">Interactive</option>
-        <option value="automated">Automated</option>
-      </select>
-      <ChevronDownIcon
-        class="filter-select-chevron"
-        size="12"
-        strokeWidth="2.2"
-        aria-hidden="true"
+        fallbackLabel={m.activity_all_sessions()}
+        placeholder={m.activity_filter_automation_placeholder()}
+        title={m.activity_filter_by_automation()}
+        emptyLabel={m.activity_no_automation_filters()}
+        onselect={onAutomationChange}
       />
     </div>
 
@@ -333,7 +351,7 @@
       lastUpdatedAt={activity.lastUpdatedAt}
       busy={activity.loading}
       onRefresh={() => activity.load({ background: true })}
-      label="Refresh activity"
+      label={m.activity_refresh()}
     />
   </div>
 
@@ -364,16 +382,16 @@
         <Breakdowns report={activity.report} />
       </div>
     {:else if activity.loading}
-      <div class="status">Loading activity report...</div>
+      <div class="status">{m.activity_loading_report()}</div>
     {:else if activity.error}
       <div class="status error">
         <span>{activity.error}</span>
         <button class="retry-btn" onclick={() => activity.load()}>
-          Retry
+          {m.shared_retry()}
         </button>
       </div>
     {:else}
-      <div class="status">No data for this period.</div>
+      <div class="status">{m.shared_no_data_for_period()}</div>
     {/if}
 
     <!-- Range-scoped, not report-filter-scoped: kept outside the loading/error
@@ -413,45 +431,14 @@
     flex-shrink: 0;
   }
 
-  .filter-select-wrap {
-    position: relative;
-    display: inline-flex;
-    align-items: center;
-    color: var(--text-secondary);
+  .toolbar-typeahead {
+    --typeahead-min-width: 132px;
+    --typeahead-max-width: 184px;
   }
 
-  .filter-select {
-    appearance: none;
-    -webkit-appearance: none;
-    height: 26px;
-    padding: 0 28px 0 8px;
-    background: var(--bg-inset);
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
-    font-size: 11px;
-    color: inherit;
-    cursor: pointer;
-  }
-
-  .filter-select:hover {
-    border-color: var(--border-default);
-  }
-
-  .filter-select:focus {
-    outline: none;
-    border-color: var(--accent-blue);
-  }
-
-  :global(.filter-select-chevron) {
-    position: absolute;
-    top: 50%;
-    right: 8px;
-    width: 12px;
-    height: 12px;
-    color: currentColor;
-    opacity: 0.72;
-    pointer-events: none;
-    transform: translateY(-50%);
+  .toolbar-typeahead.compact {
+    --typeahead-min-width: 118px;
+    --typeahead-max-width: 150px;
   }
 
   .activity-content {
@@ -497,6 +484,6 @@
 
   .retry-btn:hover {
     background: var(--accent-red);
-    color: #fff;
+    color: var(--accent-red-foreground);
   }
 </style>

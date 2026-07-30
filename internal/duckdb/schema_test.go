@@ -11,6 +11,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/export"
 )
 
 func TestOpenCreatesLocalDuckDBFile(t *testing.T) {
@@ -44,6 +46,7 @@ func TestEnsureSchemaCreatesRequiredMirrorTables(t *testing.T) {
 		"sessions",
 		"messages",
 		"usage_events",
+		"cursor_usage_events",
 		"model_pricing",
 		"tool_calls",
 		"tool_result_events",
@@ -72,6 +75,12 @@ func TestEnsureSchemaCreatesRequiredMirrorTables(t *testing.T) {
 		usageDedupIndexMetadataKey,
 	).Scan(&dedupIndex))
 	assert.Equal(t, "1", dedupIndex)
+	var remoteScrubbed string
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT value FROM sync_metadata WHERE key = ?`,
+		projectIdentityRemoteScrubMetadataKey,
+	).Scan(&remoteScrubbed))
+	assert.Equal(t, "1", remoteScrubbed)
 }
 
 func TestUsageEventsDedupIndexAllowsRepeatedKeys(t *testing.T) {
@@ -179,6 +188,138 @@ func TestEnsureSchemaMigratesMessagesIDPrimaryKey(t *testing.T) {
 	assertDuckDBCountWhere(t, db, "messages", "id = ?", int64(1), 2)
 }
 
+func TestCheckSchemaCompatRejectsPendingNonIndexRepairs(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("messages id primary key", func(t *testing.T) {
+		db := openTestDuckDB(t)
+		require.NoError(t, EnsureSchema(ctx, db), "EnsureSchema")
+		recreateMessagesWithIDPrimaryKey(t, ctx, db)
+
+		err := CheckSchemaCompat(ctx, db)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "messages.id primary key")
+	})
+
+	t.Run("missing default repair metadata", func(t *testing.T) {
+		db := openTestDuckDB(t)
+		require.NoError(t, EnsureSchema(ctx, db), "EnsureSchema")
+		_, err := db.ExecContext(ctx,
+			`DELETE FROM sync_metadata WHERE key = ?`,
+			defaultRepairMetadataKey,
+		)
+		require.NoError(t, err)
+
+		err = CheckSchemaCompat(ctx, db)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), defaultRepairMetadataKey)
+	})
+
+	t.Run("missing usage repair metadata", func(t *testing.T) {
+		db := openTestDuckDB(t)
+		require.NoError(t, EnsureSchema(ctx, db), "EnsureSchema")
+		_, err := db.ExecContext(ctx,
+			`DELETE FROM sync_metadata WHERE key = ?`,
+			usageDedupIndexMetadataKey,
+		)
+		require.NoError(t, err)
+
+		err = CheckSchemaCompat(ctx, db)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), usageDedupIndexMetadataKey)
+	})
+
+	t.Run("missing project identity remote scrub metadata", func(t *testing.T) {
+		db := openTestDuckDB(t)
+		require.NoError(t, EnsureSchema(ctx, db), "EnsureSchema")
+		_, err := db.ExecContext(ctx,
+			`DELETE FROM sync_metadata WHERE key = ?`,
+			projectIdentityRemoteScrubMetadataKey,
+		)
+		require.NoError(t, err)
+
+		err = CheckSchemaCompat(ctx, db)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), projectIdentityRemoteScrubMetadataKey)
+	})
+
+	t.Run("quack incompatible timestamp default", func(t *testing.T) {
+		db := openTestDuckDB(t)
+		require.NoError(t, EnsureSchema(ctx, db), "EnsureSchema")
+		_, err := db.ExecContext(ctx,
+			`ALTER TABLE starred_sessions ALTER COLUMN created_at SET DEFAULT current_timestamp`,
+		)
+		require.NoError(t, err)
+
+		err = CheckSchemaCompat(ctx, db)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "starred_sessions.created_at")
+	})
+}
+
+func TestEnsureSchemaScrubsProjectIdentityGitRemoteCredentials(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDuckDB(t)
+	require.NoError(t, EnsureSchema(ctx, db), "initial EnsureSchema")
+	_, err := db.ExecContext(ctx,
+		`DELETE FROM sync_metadata WHERE key = ?`,
+		projectIdentityRemoteScrubMetadataKey,
+	)
+	require.NoError(t, err)
+	rawRemote := "https://" + "user:token@" + "github.com/acme/app.git"
+	storedRemote := "https://github.com/acme/app.git"
+	_, err = db.ExecContext(ctx, `
+		INSERT INTO project_identity_observations (
+			project, machine, root_path, git_remote, git_remote_name,
+			worktree_name, worktree_root_path, observed_at,
+			normalized_remote, key_source, key
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"app", "laptop", "/tmp/app", rawRemote, "origin",
+		"", "", "2026-07-03T12:00:00Z", "", "", "",
+	)
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, `
+		INSERT INTO project_identity_observations (
+			project, machine, root_path, git_remote, git_remote_name,
+			worktree_name, worktree_root_path, observed_at,
+			normalized_remote, key_source, key
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"app", "laptop", "/tmp/app", "", "",
+		"app", "/tmp/app", "2026-07-03T11:00:00Z", "", "", "",
+	)
+	require.NoError(t, err)
+
+	require.NoError(t, EnsureSchema(ctx, db), "repair EnsureSchema")
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT git_remote, normalized_remote, key_source, key
+		FROM project_identity_observations
+		WHERE project = ? AND machine = ? AND root_path = ?
+		ORDER BY git_remote`,
+		"app", "laptop", "/tmp/app",
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rows.Close()) })
+
+	var got []export.ProjectIdentityObservation
+	for rows.Next() {
+		var obs export.ProjectIdentityObservation
+		require.NoError(t, rows.Scan(
+			&obs.GitRemote,
+			&obs.NormalizedRemote,
+			&obs.KeySource,
+			&obs.Key,
+		))
+		got = append(got, obs)
+	}
+	require.NoError(t, rows.Err())
+	require.Len(t, got, 1)
+	assert.Equal(t, storedRemote, got[0].GitRemote)
+	assert.Equal(t, "github.com/acme/app", got[0].NormalizedRemote)
+	assert.Equal(t, export.ProjectIdentityKeySourceGitRemote, got[0].KeySource)
+	assert.NotEmpty(t, got[0].Key)
+}
+
 func TestEnsureSchemaDropsQuackIncompatibleTimestampDefaults(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDuckDB(t)
@@ -236,26 +377,55 @@ func TestCheckSchemaCompatPassesAfterEnsureSchema(t *testing.T) {
 	require.NoError(t, CheckSchemaCompat(ctx, db), "CheckSchemaCompat")
 }
 
-func TestSchemaDocumentsDuckDBDifferences(t *testing.T) {
-	for _, want := range []string{
-		"DuckDB stores timestamps as TIMESTAMP",
-		"DuckDB BOOLEAN columns scan into Go bools",
-		"SQLite INTEGER PRIMARY KEY rowids are mirrored as BIGINT",
-		"DuckDB does not support SQLite FTS5 or PostgreSQL GIN indexes here",
-		"DuckDB Quack rejects TIMESTAMP DEFAULT current_timestamp columns",
-	} {
-		assert.Contains(t, duckDBSchemaNotes, want)
-	}
+// TestEnsureSchemaCreatesToolCallsFilePathIndex verifies the DuckDB mirror
+// builds idx_tool_calls_file_path, the parity counterpart to SQLite's
+// Recent Edits index. DuckDB has no partial indexes, so it omits the
+// WHERE file_path IS NOT NULL clause but indexes the same column.
+func TestEnsureSchemaCreatesToolCallsFilePathIndex(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDuckDB(t)
+	require.NoError(t, EnsureSchema(ctx, db), "EnsureSchema")
+
+	var count int
+	require.NoError(t, db.QueryRowContext(ctx, `
+		SELECT count(*) FROM duckdb_indexes()
+		WHERE table_name = 'tool_calls'
+		  AND index_name = 'idx_tool_calls_file_path'`).Scan(&count),
+		"query duckdb_indexes")
+	assert.Equal(t, 1, count,
+		"idx_tool_calls_file_path must exist for Recent Edits parity")
 }
 
 func openTestDuckDB(t *testing.T) *sql.DB {
 	t.Helper()
-	db, err := Open(filepath.Join(t.TempDir(), "agentsview.duckdb"))
-	require.NoError(t, err, "Open")
+	db, err := openDuckDB("")
+	require.NoError(t, err, "open in-memory DuckDB")
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	require.NoError(t, configureDuckDBThreads(db))
 	t.Cleanup(func() {
 		require.NoError(t, db.Close(), "close DuckDB")
 	})
 	return db
+}
+
+func recreateMessagesWithIDPrimaryKey(t *testing.T, ctx context.Context, db *sql.DB) {
+	t.Helper()
+	_, err := db.ExecContext(ctx, `DROP TABLE messages`)
+	require.NoError(t, err)
+	create := strings.Replace(
+		mirrorTableCreate("messages"),
+		"id BIGINT,",
+		"id BIGINT PRIMARY KEY,",
+		1,
+	)
+	require.NotEqual(t, mirrorTableCreate("messages"), create)
+	_, err = db.ExecContext(ctx, create)
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, `
+		INSERT INTO messages (id, session_id, ordinal, role, content)
+		VALUES (1, 'from-other-machine', 0, 'user', 'kept')`)
+	require.NoError(t, err)
 }
 
 func tableExists(t *testing.T, db *sql.DB, table string) bool {

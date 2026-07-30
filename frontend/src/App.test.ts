@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vite-plus/test";
-import source from "./App.svelte?raw";
+import sourceRaw from "./App.svelte?raw";
 import { SESSION_FILTER_KEYS } from "./lib/stores/sessionRouteParams.js";
+
+const source = sourceRaw.replace(/\r\n/g, "\n");
 
 function appSourceSlice(startMarker: string, endMarker: string): string {
   const start = source.indexOf(startMarker);
@@ -75,7 +77,7 @@ describe("App session URL date state", () => {
   it("updates detail URL params after explicit filter changes", () => {
     const syncUrlBlock = appSourceSlice(
       "// Sync active session to URL.",
-      "\n\n  // URL write-back",
+      "// URL write-back",
     );
 
     expect(source).toContain(
@@ -94,7 +96,7 @@ describe("App session URL date state", () => {
   it("does not preserve stale detail params after filter changes", () => {
     const syncUrlBlock = appSourceSlice(
       "// Sync active session to URL.",
-      "\n\n  // URL write-back",
+      "// URL write-back",
     );
 
     expect(syncUrlBlock).toContain("const filterChangedOnDetail =");
@@ -109,11 +111,11 @@ describe("App session URL date state", () => {
   it("clears stored yoke when session date params are removed while analytics is unmounted", () => {
     const syncUrlBlock = appSourceSlice(
       "// Sync active session to URL.",
-      "\n\n  // URL write-back",
+      "// URL write-back",
     );
     const writeBackBlock = appSourceSlice(
       "// URL write-back",
-      "\n\n  function showAbout",
+      "function showAbout",
     );
 
     expect(source).toContain("import { yokedDates");
@@ -131,7 +133,7 @@ describe("App session URL date state", () => {
   it("clears detail filter signatures outside session detail routes", () => {
     const syncUrlBlock = appSourceSlice(
       "// Sync active session to URL.",
-      "\n\n  // URL write-back",
+      "// URL write-back",
     );
 
     expect(syncUrlBlock).toContain(
@@ -140,5 +142,17 @@ describe("App session URL date state", () => {
     expect(syncUrlBlock).toContain(
       "if (currentUrlSessionId === null) {\n          lastDetailFilterParamsSignature = null;",
     );
+  });
+
+  it("restores the full recently deleted batch from the undo toast", () => {
+    const undoBlock = appSourceSlice(
+      "{#if sessions.recentlyDeleted.length > 0}",
+      "</div>\n{/if}",
+    );
+
+    expect(undoBlock).toContain(
+      "await sessions.restoreRecentlyDeleted(last);",
+    );
+    expect(undoBlock).not.toContain("await sessions.restoreSession(last.id);");
   });
 });

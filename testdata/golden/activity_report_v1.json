@@ -1,0 +1,244 @@
+{
+  "schema_version": 1,
+  "pricing": {
+    "source": "fetched",
+    "table_version": "2026-07-03T12:00:00Z",
+    "latest_row_updated_at": "2026-07-03T12:00:00Z",
+    "custom_override_count": 0,
+    "effective_row_count": 2428,
+    "digest": "sha256:8d815a1737bce68fa1a19ba977bf33c8c8efcc74deb954fcf62ce80e46e75f2c",
+    "cost_source": "mixed",
+    "fallback": {
+      "used": false,
+      "models": []
+    },
+    "models": {
+      "fixture-model-computed": {
+        "matched_pattern": "fixture-model-computed",
+        "input_cost_per_mtok": 2,
+        "output_cost_per_mtok": 8,
+        "cache_write_cost_per_mtok": 3,
+        "cache_read_cost_per_mtok": 0.5,
+        "cost_source": "computed"
+      },
+      "fixture-model-reported": {
+        "matched_pattern": "fixture-model-reported",
+        "input_cost_per_mtok": 1,
+        "output_cost_per_mtok": 4,
+        "cache_write_cost_per_mtok": 2,
+        "cache_read_cost_per_mtok": 0.25,
+        "cost_source": "reported"
+      }
+    }
+  },
+  "projects": {
+    "path-project": {
+      "resolution": "resolved",
+      "identity": {
+        "key": "sha256:ae326f252aaa4ab91664d4f43245d8e7f3e3fd073da5bd36a3f72eb72f44526d",
+        "key_source": "root_path",
+        "root_path": "/fixtures/path-project",
+        "machine_local": true
+      }
+    },
+    "remote-project": {
+      "resolution": "resolved",
+      "identity": {
+        "key": "sha256:97879729c8ab311e9d4b28941e3a04830b28c527f00af53f2270212eccdbbd39",
+        "key_source": "git_remote",
+        "normalized_remote": "github.com/acme/remote-project"
+      }
+    }
+  },
+  "timezone": "UTC",
+  "range_start": "2026-07-03T10:00:00Z",
+  "range_end": "2026-07-03T13:00:00Z",
+  "bucket_unit": "hour",
+  "bucket_seconds": 3600,
+  "bucket_count": 3,
+  "partial": true,
+  "as_of": "2026-07-03T12:00:00Z",
+  "effective_end": "2026-07-03T12:00:00Z",
+  "elapsed_bucket_count": 2,
+  "buckets": [
+    {
+      "start": "2026-07-03T10:00:00Z",
+      "end": "2026-07-03T11:00:00Z",
+      "max_agents": 1,
+      "agent_minutes": 3,
+      "output_tokens": 240,
+      "cost": 0.00476,
+      "automated_at_peak": 0,
+      "interactive_at_peak": 1
+    },
+    {
+      "start": "2026-07-03T11:00:00Z",
+      "end": "2026-07-03T12:00:00Z",
+      "max_agents": 1,
+      "agent_minutes": 3,
+      "output_tokens": 60,
+      "cost": 0.0125,
+      "automated_at_peak": 0,
+      "interactive_at_peak": 1
+    },
+    {
+      "start": "2026-07-03T12:00:00Z",
+      "end": "2026-07-03T13:00:00Z",
+      "max_agents": 0,
+      "agent_minutes": 0,
+      "output_tokens": 0,
+      "cost": 0,
+      "automated_at_peak": 0,
+      "interactive_at_peak": 0
+    }
+  ],
+  "peak": {
+    "agents": 1,
+    "at": "2026-07-03T10:00:00Z"
+  },
+  "totals": {
+    "active_minutes": 6,
+    "idle_minutes": 114,
+    "agent_minutes": 6,
+    "sessions": 2,
+    "untimed_sessions": 0,
+    "distinct_projects": 2,
+    "distinct_models": 2,
+    "output_tokens": 300,
+    "cost": 0.01726,
+    "automated_agent_minutes": 0,
+    "interactive_agent_minutes": 6,
+    "automated_cost": 0,
+    "interactive_cost": 0.01726,
+    "automated_sessions": 0,
+    "interactive_sessions": 2
+  },
+  "by_project": [
+    {
+      "key": "path-project",
+      "agent_minutes": 3,
+      "cost": 0.0125,
+      "automated_agent_minutes": 0,
+      "interactive_agent_minutes": 3,
+      "automated_cost": 0,
+      "interactive_cost": 0.0125
+    },
+    {
+      "key": "remote-project",
+      "agent_minutes": 3,
+      "cost": 0.00476,
+      "automated_agent_minutes": 0,
+      "interactive_agent_minutes": 3,
+      "automated_cost": 0,
+      "interactive_cost": 0.00476
+    }
+  ],
+  "by_model": [
+    {
+      "key": "fixture-model-computed",
+      "agent_minutes": 3,
+      "cost": 0.00476,
+      "automated_agent_minutes": 0,
+      "interactive_agent_minutes": 3,
+      "automated_cost": 0,
+      "interactive_cost": 0.00476
+    },
+    {
+      "key": "fixture-model-reported",
+      "agent_minutes": 3,
+      "cost": 0.0125,
+      "automated_agent_minutes": 0,
+      "interactive_agent_minutes": 3,
+      "automated_cost": 0,
+      "interactive_cost": 0.0125
+    }
+  ],
+  "by_agent": [
+    {
+      "key": "claude",
+      "agent_minutes": 3,
+      "cost": 0.0125,
+      "automated_agent_minutes": 0,
+      "interactive_agent_minutes": 3,
+      "automated_cost": 0,
+      "interactive_cost": 0.0125
+    },
+    {
+      "key": "codex",
+      "agent_minutes": 3,
+      "cost": 0.00476,
+      "automated_agent_minutes": 0,
+      "interactive_agent_minutes": 3,
+      "automated_cost": 0,
+      "interactive_cost": 0.00476
+    }
+  ],
+  "by_session": [
+    {
+      "session_id": "path-current",
+      "title": "path-project",
+      "project": "path-project",
+      "agent": "claude",
+      "primary_model": "fixture-model-reported",
+      "models": [
+        "fixture-model-reported"
+      ],
+      "agent_minutes": 3,
+      "cost": 0.0125,
+      "output_tokens": 60,
+      "first_active": "2026-07-03T11:00:00Z",
+      "last_active": "2026-07-03T11:03:00Z",
+      "timing_quality": "timed",
+      "is_automated": false
+    },
+    {
+      "session_id": "remote-current",
+      "title": "remote-project",
+      "project": "remote-project",
+      "agent": "codex",
+      "primary_model": "fixture-model-computed",
+      "models": [
+        "fixture-model-computed"
+      ],
+      "agent_minutes": 3,
+      "cost": 0.00476,
+      "output_tokens": 240,
+      "first_active": "2026-07-03T10:00:00Z",
+      "last_active": "2026-07-03T10:03:00Z",
+      "timing_quality": "timed",
+      "is_automated": false
+    }
+  ],
+  "intervals": [
+    {
+      "session_id": "remote-current",
+      "start": "2026-07-03T10:00:00Z",
+      "end": "2026-07-03T10:00:30Z"
+    },
+    {
+      "session_id": "remote-current",
+      "start": "2026-07-03T10:00:30Z",
+      "end": "2026-07-03T10:02:00Z"
+    },
+    {
+      "session_id": "remote-current",
+      "start": "2026-07-03T10:02:00Z",
+      "end": "2026-07-03T10:03:00Z"
+    },
+    {
+      "session_id": "path-current",
+      "start": "2026-07-03T11:00:00Z",
+      "end": "2026-07-03T11:00:30Z"
+    },
+    {
+      "session_id": "path-current",
+      "start": "2026-07-03T11:00:30Z",
+      "end": "2026-07-03T11:02:00Z"
+    },
+    {
+      "session_id": "path-current",
+      "start": "2026-07-03T11:02:00Z",
+      "end": "2026-07-03T11:03:00Z"
+    }
+  ]
+}

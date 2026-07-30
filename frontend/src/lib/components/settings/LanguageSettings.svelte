@@ -6,9 +6,7 @@
     setLocale,
     type SupportedLocale,
   } from "../../i18n/index.js";
-  import OptionTypeahead, {
-    type TypeaheadOption,
-  } from "../layout/OptionTypeahead.svelte";
+  import { Typeahead, type TypeaheadOption } from "@kenn-io/kit-ui";
   import SettingsSection from "./SettingsSection.svelte";
 
   function currentLocale(): SupportedLocale {
@@ -26,6 +24,10 @@
       name: "zh-CN",
       label: m.settings_language_simplified_chinese(),
     },
+    {
+      name: "zh-TW",
+      label: m.settings_language_traditional_chinese(),
+    },
   ]);
 
   function handleLocaleSelect(value: string) {
@@ -42,7 +44,7 @@
 >
   <div class="setting-row">
     <span class="setting-label">{m.settings_language_label()}</span>
-    <OptionTypeahead
+    <Typeahead
       options={localeOptions}
       value={selectedLocale}
       fallbackLabel={m.settings_language_english()}

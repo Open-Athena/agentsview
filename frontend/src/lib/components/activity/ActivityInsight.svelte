@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { EmptyState, Spinner, Typeahead, type TypeaheadOption } from "@kenn-io/kit-ui";
+  import { m } from "../../i18n/index.js";
   import { InsightsService } from "../../api/generated/index";
   import { configureGeneratedClient } from "../../api/runtime.js";
   import {
@@ -51,17 +53,27 @@
     router.navigate("insights");
   }
 
-  const readOnly = $derived(sync.serverVersion?.read_only === true);
+  const insightGenerationAvailable = $derived(
+    sync.serverVersion?.insight_generation_available === true ||
+      sync.serverVersion?.read_only !== true,
+  );
   const generationUnavailable = $derived(
-    sync.serverVersion === null || readOnly,
+    sync.serverVersion === null || !insightGenerationAvailable,
   );
   const unavailableTitle = $derived(
-    readOnly
-      ? "Unavailable in read-only remote mode"
+    sync.serverVersion !== null && !insightGenerationAvailable
+      ? m.activity_insight_unavailable_read_only()
       : sync.serverVersion === null
-        ? "Waiting for server version"
-        : "Generate insight",
+        ? m.activity_insight_waiting_server()
+        : m.activity_insight_generate_insight(),
   );
+  const agentOptions: TypeaheadOption[] = [
+    { name: "claude", label: "Claude", displayLabel: "Claude" },
+    { name: "codex", label: "Codex", displayLabel: "Codex" },
+    { name: "copilot", label: "Copilot", displayLabel: "Copilot" },
+    { name: "gemini", label: "Gemini", displayLabel: "Gemini" },
+    { name: "kiro", label: "Kiro", displayLabel: "Kiro" },
+  ];
 
   function abortGeneration() {
     handle?.abort();
@@ -111,8 +123,8 @@
 
   // The agent choice is shared with the standalone Insights page via the
   // insights store, so picking one here and there stays in sync.
-  function onAgentChange(e: Event) {
-    insights.setAgent((e.currentTarget as HTMLSelectElement).value as AgentName);
+  function onAgentChange(value: string) {
+    insights.setAgent(value as AgentName);
   }
 
   function handleGenerate() {
@@ -150,7 +162,7 @@
         if (e instanceof DOMException && e.name === "AbortError") {
           return;
         }
-        error = e instanceof Error ? e.message : "Generation failed";
+        error = e instanceof Error ? e.message : m.activity_insight_generation_failed();
         generating = false;
       });
   }
@@ -160,7 +172,7 @@
   <header class="panel-header">
     <span class="panel-title">
       <LightbulbIcon size="13" strokeWidth="1.8" aria-hidden="true" />
-      <span>Activity Insight</span>
+      <span>{m.activity_insight_title()}</span>
       {#if !loading && insight?.model}
         <span class="insight-model">{insight.model}</span>
       {/if}
@@ -170,33 +182,31 @@
       href={getBasePath() + "/insights"}
       onclick={openInsightsPage}
     >
-      Open in Insights page
+      {m.activity_insight_open_insights_page()}
     </a>
   </header>
 
   {#snippet agentPicker()}
-    <select
-      class="agent-select"
-      value={insights.agent}
-      onchange={onAgentChange}
-      disabled={generationUnavailable}
-      title="Agent CLI used to generate the insight"
-      aria-label="Insight agent"
-    >
-      <option value="claude">Claude</option>
-      <option value="codex">Codex</option>
-      <option value="copilot">Copilot</option>
-      <option value="gemini">Gemini</option>
-      <option value="kiro">Kiro</option>
-    </select>
+    <div class="agent-typeahead">
+      <Typeahead
+        options={agentOptions}
+        value={insights.agent}
+        disabled={generationUnavailable}
+        title={m.activity_insight_agent_cli_title()}
+        fallbackLabel={insights.agent}
+        placeholder={m.activity_insight_insight_agent()}
+        emptyLabel={m.activity_insight_no_matching_agents()}
+        onselect={onAgentChange}
+      />
+    </div>
   {/snippet}
 
   {#if loading}
-    <div class="state muted">Loading insight…</div>
+    <div class="state muted">{m.activity_insight_loading()}</div>
   {:else if generating}
     <div class="state generating">
-      <span class="spinner"></span>
-      <span>Generating… {phase}</span>
+      <span aria-hidden="true"><Spinner size={12} /></span>
+      <span>{m.activity_insight_generating_phase({ phase })}</span>
     </div>
   {:else if error}
     <div class="state error">
@@ -209,7 +219,7 @@
           disabled={generationUnavailable}
           title={unavailableTitle}
         >
-          Retry
+          {m.activity_insight_retry()}
         </button>
       </div>
     </div>
@@ -221,24 +231,18 @@
       {@html renderMarkdown(insight.content)}
     </article>
   {:else}
-    <div class="empty-state">
-      <span class="empty-text">
-        No insight yet for this range. Generate one to summarize this
-        period's activity.
-      </span>
-      <div class="gen-row">
-        {@render agentPicker()}
-        <button
-          class="generate-btn"
-          onclick={handleGenerate}
-          disabled={generationUnavailable}
-          title={unavailableTitle}
-        >
-          <PlusIcon size="12" strokeWidth="2.2" aria-hidden="true" />
-          Generate
-        </button>
-      </div>
-    </div>
+    <EmptyState title={m.activity_insight_empty_text()}>
+      {@render agentPicker()}
+      <button
+        class="generate-btn"
+        onclick={handleGenerate}
+        disabled={generationUnavailable}
+        title={unavailableTitle}
+      >
+        <PlusIcon size="12" strokeWidth="2.2" aria-hidden="true" />
+        {m.activity_insight_generate()}
+      </button>
+    </EmptyState>
   {/if}
 </section>
 
@@ -291,7 +295,7 @@
   .state {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: var(--space-4);
     font-size: 12px;
     color: var(--text-muted);
   }
@@ -300,78 +304,38 @@
     color: var(--accent-red);
   }
 
-  .spinner {
-    width: 12px;
-    height: 12px;
-    border: 1.5px solid var(--accent-blue);
-    border-top-color: transparent;
-    border-radius: 50%;
-    animation: spin 0.7s linear infinite;
-    flex-shrink: 0;
-  }
-
-  .empty-state {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 12px;
-    padding: 8px 0;
-  }
-
-  .empty-text {
-    font-size: 12px;
-    color: var(--text-muted);
-    line-height: 1.5;
-    max-width: 420px;
-  }
-
   .gen-row {
     display: flex;
     align-items: center;
     gap: 8px;
   }
 
-  .agent-select {
-    height: 28px;
-    padding: 0 6px;
-    background: var(--bg-inset);
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
-    font-size: 11px;
-    color: var(--text-secondary);
-    cursor: pointer;
-    transition: border-color 0.15s;
-  }
-
-  .agent-select:focus {
-    outline: none;
-    border-color: var(--accent-blue);
-  }
-
-  .agent-select:disabled {
-    opacity: 0.45;
-    cursor: default;
+  .agent-typeahead {
+    --typeahead-min-width: 96px;
+    --typeahead-max-width: 112px;
+    --typeahead-control-height: 28px;
+    --typeahead-control-padding: 0 6px;
   }
 
   .generate-btn {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
+    gap: var(--space-2);
     height: 28px;
     padding: 0 12px;
     border-radius: var(--radius-sm);
     font-size: 11px;
     font-weight: 600;
     background: var(--accent-blue);
-    color: white;
+    color: var(--accent-blue-foreground);
     letter-spacing: 0.01em;
     transition: opacity 0.12s, transform 0.1s, box-shadow 0.12s;
-    box-shadow: 0 1px 2px rgba(37, 99, 235, 0.2);
+    box-shadow: 0 1px 2px color-mix(in srgb, var(--accent-blue) 20%, transparent);
   }
 
   .generate-btn:hover:not(:disabled) {
     opacity: 0.92;
-    box-shadow: 0 2px 6px rgba(37, 99, 235, 0.3);
+    box-shadow: 0 2px 6px color-mix(in srgb, var(--accent-blue) 30%, transparent);
   }
 
   .generate-btn:active:not(:disabled) {
@@ -383,15 +347,6 @@
     opacity: 0.45;
     box-shadow: none;
     cursor: default;
-  }
-
-  @keyframes spin {
-    from {
-      transform: rotate(0deg);
-    }
-    to {
-      transform: rotate(360deg);
-    }
   }
 
   /* ── Markdown Content ── */

@@ -18,7 +18,7 @@ func TestLocalArchiveWriteBackendPGPushStopsAfterCanceledLocalSync(t *testing.T)
 	testLocalArchivePushStopsAfterCanceledSync(t,
 		func(backend *localArchiveWriteBackend, ctx context.Context) error {
 			_, err := backend.PGPush(
-				ctx, config.PGConfig{}, PGPushConfig{}, nil, nil,
+				ctx, pgTargetSelection{}, PGPushConfig{}, nil, nil,
 			)
 			return err
 		})
@@ -32,6 +32,48 @@ func TestLocalArchiveWriteBackendDuckDBPushStopsAfterCanceledLocalSync(t *testin
 			)
 			return err
 		})
+}
+
+func TestLocalArchiveWriteBackendDuckDBPushUsesConfiguredRemoteURL(t *testing.T) {
+	backend := testLocalArchiveWriteBackend(t)
+
+	captureStdout(t, func() {
+		_, err := backend.DuckDBPush(
+			context.Background(),
+			config.DuckDBConfig{
+				URL:         "quack:https://duck.example.test",
+				MachineName: "workstation",
+			},
+			DuckDBPushConfig{},
+			nil,
+			nil,
+		)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "duckdb quack token is required")
+	})
+}
+
+func TestLocalArchiveWriteBackendDuckDBPushValidatesRemoteBeforeLocalSync(t *testing.T) {
+	backend := testLocalArchiveWriteBackend(t)
+
+	var err error
+	out := captureStdout(t, func() {
+		_, err = backend.DuckDBPush(
+			context.Background(),
+			config.DuckDBConfig{
+				URL:         "quack:https://duck.example.test",
+				MachineName: "workstation",
+			},
+			DuckDBPushConfig{Full: true},
+			nil,
+			nil,
+		)
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "duckdb quack token is required")
+	assert.NotContains(t, out, "Database:")
+	assert.NotContains(t, out, "Opening DuckDB mirror")
 }
 
 func TestRunPGWatchStartupSyncFallsBackAfterAbortedResync(t *testing.T) {
@@ -58,7 +100,7 @@ func TestLocalArchiveWriteBackendPGPushWatchCanceledStartupIsClean(t *testing.T)
 
 	err := backend.PGPushWatch(
 		canceledContext(),
-		config.PGConfig{},
+		pgTargetSelection{},
 		PGPushConfig{},
 		nil,
 		nil,
@@ -118,9 +160,7 @@ func testLocalArchiveWriteBackend(t *testing.T) *localArchiveWriteBackend {
 	t.Helper()
 	dataDir := t.TempDir()
 	dbPath := filepath.Join(dataDir, "sessions.db")
-	database, err := db.Open(dbPath)
-	require.NoError(t, err)
-	t.Cleanup(func() { database.Close() })
+	database := dbtest.OpenTestDBAt(t, dbPath)
 
 	return &localArchiveWriteBackend{
 		appCfg: config.Config{

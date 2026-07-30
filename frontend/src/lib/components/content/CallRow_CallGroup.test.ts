@@ -13,6 +13,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 // @ts-ignore -- @types/node is not in devDependencies; harmless at runtime.
 import { resolve } from "node:path";
 import type { CallTiming } from "../../api/types/timing.js";
+import { m } from "../../i18n/index.js";
 // @ts-ignore
 import CallRow from "./CallRow.svelte";
 // @ts-ignore
@@ -132,7 +133,7 @@ describe("CallRow", () => {
 
     expect(html).toMatch(hasClasses("cbar", "live"));
     expect(html).toMatch(hasClasses("cd", "live"));
-    expect(html).toContain("running 4.0s+");
+    expect(html).toContain(m.call_row_running_duration({ duration: "4.0s" }));
 
     unmount(c);
   });
@@ -162,7 +163,7 @@ describe("CallRow", () => {
     expect(html).not.toMatch(hasClasses("chev", "spacer"));
     expect(html).toContain("var(--cat-task)");
     // a11y: chevron carries aria-label and aria-expanded.
-    expect(html).toContain('aria-label="Toggle sub-agent calls"');
+    expect(html).toContain(`aria-label="${m.call_row_toggle_subagent_calls()}"`);
     expect(html).toContain('aria-expanded="true"');
 
     unmount(c);
@@ -263,7 +264,10 @@ describe("CallGroup", () => {
     expect(html).toMatch(hasClasses("cg-members"));
     expect(html).toMatch(hasClasses("cg-header"));
     expect(html).toMatch(hasClasses("cg-h-label"));
-    expect(html).toContain("parallel · 3 calls");
+    expect(html).toContain(`${m.call_group_parallel_label()} · ${m.call_group_parallel_call_count({
+      count: 3,
+      countLabel: "3",
+    })}`);
     expect(html).toMatch(hasClasses("cg-h-bar-wrap"));
     expect(html).toMatch(hasClasses("cg-h-bar"));
     expect(html).toContain("width: 70%");

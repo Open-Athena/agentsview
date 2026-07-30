@@ -206,11 +206,12 @@ agentsview serve --background  # Run as a managed background server
     `/api/v1/settings` returns `401`. See
     [Remote Access](/remote-access/#forwarded-dev-environments).
 
-Point to custom session directories with environment variables:
+Point to custom session directories with environment variables. Aider has no
+default discovery root, so set `AIDER_DIR` to opt into scanning Aider logs:
 
 ```bash
 export AIDER_DIR=~/code
-export AMP_DIR=~/custom/amp/threads
+export AMP_DIR=~/custom/amp/threads # historical local Amp threads only
 export ANTIGRAVITY_DIR=~/custom/antigravity
 export ANTIGRAVITY_CLI_DIR=~/custom/antigravity-cli
 export CLAUDE_PROJECTS_DIR=~/custom/claude/projects
@@ -252,6 +253,18 @@ export ZED_DIR=~/custom/zed
 export ZENCODER_DIR=~/custom/zencoder/sessions
 agentsview serve
 ```
+
+For Claude and Codex, custom roots may also be `s3://` URIs:
+
+```toml
+claude_project_dirs = ["s3://agent-archive/laptop/raw/claude"]
+codex_sessions_dirs = ["s3://agent-archive/laptop/raw/codex"]
+```
+
+Set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, and
+optionally `AWS_S3_ENDPOINT` before starting AgentsView. See
+[S3-compatible session sources](/configuration/#s3-compatible-session-sources)
+for the expected object layout and sync behavior.
 
 ## What You'll See
 

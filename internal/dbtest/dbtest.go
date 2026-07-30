@@ -3,10 +3,13 @@
 package dbtest
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -70,13 +73,128 @@ func MkdirTempWithCleanup(t *testing.T, pattern string) string {
 func OpenTestDB(t *testing.T) *db.DB {
 	t.Helper()
 	dir := MkdirTempWithCleanup(t, "agentsview-dbtest-*")
-	path := filepath.Join(dir, "test.db")
+	return OpenTestDBAt(t, filepath.Join(dir, "test.db"))
+}
+
+// OpenTestDBAt opens a temporary SQLite database at path for testing, creating
+// it from the shared current-schema template when it does not exist. The
+// database is automatically closed when the test completes.
+func OpenTestDBAt(t *testing.T, path string) *db.DB {
+	t.Helper()
+	EnsureTestDBAt(t, path)
 	d, err := db.Open(path)
 	if err != nil {
 		t.Fatalf("opening test db: %v", err)
 	}
 	t.Cleanup(func() { d.Close() })
 	return d
+}
+
+// EnsureTestDBAt creates a current-schema SQLite test database at path when it
+// does not already exist. Existing files are left intact so callers can reopen
+// and add more fixture rows without losing earlier writes.
+func EnsureTestDBAt(t *testing.T, path string) {
+	t.Helper()
+	ensureTestDBAtWith(t, path, copyTestDBTemplate)
+}
+
+func ensureTestDBAtWith(
+	t *testing.T, path string, copyTemplate func(string) error,
+) {
+	t.Helper()
+	_, err := os.Stat(path)
+	if err == nil {
+		return
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("checking test db %s: %v", path, err)
+	}
+	if err := copyTemplate(path); err != nil {
+		// The shared template is only a setup-cost optimization.
+		// Never let a template failure poison every test in the
+		// binary; build this database from scratch instead.
+		t.Logf("test db template unavailable, creating %s from scratch: %v",
+			path, err)
+		for _, suffix := range []string{"", "-wal", "-shm"} {
+			_ = os.Remove(path + suffix)
+		}
+		d, openErr := db.Open(path)
+		if openErr != nil {
+			t.Fatalf("creating test db from scratch: %v", openErr)
+		}
+		if closeErr := d.Close(); closeErr != nil {
+			t.Fatalf("closing scratch test db: %v", closeErr)
+		}
+	}
+}
+
+var (
+	testDBTemplateOnce  sync.Once
+	testDBTemplateFiles map[string][]byte
+	testDBTemplateErr   error
+)
+
+func copyTestDBTemplate(dst string) error {
+	testDBTemplateOnce.Do(func() {
+		testDBTemplateFiles, testDBTemplateErr = buildTestDBTemplate()
+	})
+	if testDBTemplateErr != nil {
+		return testDBTemplateErr
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return fmt.Errorf("creating test db dir: %w", err)
+	}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		data, ok := testDBTemplateFiles[suffix]
+		if !ok {
+			continue
+		}
+		if err := os.WriteFile(dst+suffix, data, 0o600); err != nil {
+			return fmt.Errorf("writing test db copy %s: %w", dst+suffix, err)
+		}
+	}
+	return nil
+}
+
+func buildTestDBTemplate() (map[string][]byte, error) {
+	dir, err := os.MkdirTemp("", "agentsview-dbtest-template-*")
+	if err != nil {
+		return nil, fmt.Errorf("creating db template dir: %w", err)
+	}
+	defer os.RemoveAll(dir)
+
+	path := filepath.Join(dir, "test.db")
+	template, err := db.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("opening db template: %w", err)
+	}
+	// Checkpointing keeps the copied template compact, but it is best-effort:
+	// the copy below carries the -wal/-shm files along, so a checkpoint that
+	// cannot finish in time must not fail the build. The generous deadline only
+	// guards against a hung checkpoint on slow Windows CI disks.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := template.CheckpointWALTruncate(ctx); err != nil {
+		fmt.Fprintf(os.Stderr,
+			"dbtest: template wal checkpoint failed, copying wal as-is: %v\n",
+			err)
+	}
+	if err := template.Close(); err != nil {
+		return nil, fmt.Errorf("closing db template: %w", err)
+	}
+
+	files := make(map[string][]byte, 3)
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		data, err := os.ReadFile(path + suffix)
+		if err != nil {
+			if suffix != "" && errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, fmt.Errorf("reading db template %s: %w", path+suffix, err)
+		}
+		files[suffix] = data
+	}
+	return files, nil
 }
 
 // SeedMessages inserts messages into the database, failing the

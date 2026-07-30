@@ -325,6 +325,90 @@ describe("renderMarkdown", () => {
     );
   });
 
+  describe("custom XML-style prompt tags", () => {
+    it("preserves non-HTML prompt tags as literal text", () => {
+      const dom = parseHTML(
+        renderMarkdown(
+          "<policy><rule importance=\"high\">keep tags</rule></policy>",
+        ),
+      );
+      const p = dom.querySelector("p");
+      expect(p).not.toBeNull();
+      expect(p!.innerHTML).toContain("&lt;policy&gt;");
+      expect(p!.innerHTML).toContain("&lt;rule importance=\"high\"&gt;");
+      expect(p!.innerHTML).toContain("&lt;/rule&gt;");
+      expect(p!.innerHTML).toContain("&lt;/policy&gt;");
+      expect(p!.textContent).toContain(
+        "<policy><rule importance=\"high\">keep tags</rule></policy>",
+      );
+    });
+
+    it("keeps standard HTML on the sanitize path", () => {
+      const dom = parseHTML(renderMarkdown("<img src=x onerror=\"alert(1)\">"));
+      const img = dom.querySelector("img");
+      expect(img).not.toBeNull();
+      expect(img!.hasAttribute("onerror")).toBe(false);
+    });
+
+    it("does not escape custom tags inside inline code spans", () => {
+      const dom = parseHTML(
+        renderMarkdown("`<policy>keep tags</policy>`"),
+      );
+      const code = dom.querySelector("p > code");
+      expect(code).not.toBeNull();
+      expect(code!.textContent).toBe("<policy>keep tags</policy>");
+    });
+
+    it("does not escape custom tags inside fenced code blocks", () => {
+      const dom = parseHTML(
+        renderMarkdown("```\n<policy>keep tags</policy>\n```"),
+      );
+      const code = dom.querySelector("pre > code");
+      expect(code).not.toBeNull();
+      expect(code!.textContent).toBe("<policy>keep tags</policy>\n");
+    });
+
+    it("keeps markdown angle autolinks intact", () => {
+      const dom = parseHTML(renderMarkdown("<https://example.com>"));
+      const link = dom.querySelector("p > a");
+      expect(link).not.toBeNull();
+      expect(link!.textContent).toBe("https://example.com");
+      expect(link!.getAttribute("href")).toBe("https://example.com");
+    });
+
+    it("preserves namespaced prompt tags as literal text", () => {
+      const dom = parseHTML(
+        renderMarkdown("<foo:bar>keep tags</foo:bar>"),
+      );
+      const p = dom.querySelector("p");
+      expect(p).not.toBeNull();
+      expect(p!.innerHTML).toContain("&lt;foo:bar&gt;");
+      expect(p!.innerHTML).toContain("&lt;/foo:bar&gt;");
+      expect(p!.textContent).toContain("<foo:bar>keep tags</foo:bar>");
+    });
+
+    it("keeps markdown links with custom-tag labels clickable", () => {
+      const dom = parseHTML(
+        renderMarkdown("[<policy>read</policy>](https://example.com)"),
+      );
+      const link = dom.querySelector("p > a");
+      expect(link).not.toBeNull();
+      expect(link!.getAttribute("href")).toBe("https://example.com");
+      expect(link!.textContent).toBe("<policy>read</policy>");
+    });
+
+    it("preserves custom tags inside GFM table cells", () => {
+      const dom = parseHTML(
+        renderMarkdown("| A |\n| --- |\n| <policy>keep tags</policy> |"),
+      );
+      const cell = dom.querySelector("tbody td");
+      expect(cell).not.toBeNull();
+      expect(cell!.innerHTML).toContain("&lt;policy&gt;");
+      expect(cell!.innerHTML).toContain("&lt;/policy&gt;");
+      expect(cell!.textContent).toBe("<policy>keep tags</policy>");
+    });
+  });
+
   describe("Claude Code shell shortcuts", () => {
     it("renders <bash-input> as a shell code block with ! prefix", () => {
       const dom = parseHTML(
@@ -424,6 +508,35 @@ describe("renderMarkdown", () => {
       );
     });
 
+    it("leaves wrappers inside indented code blocks alone", () => {
+      const dom = parseHTML(
+        renderMarkdown(
+          "    <bash-input>echo hi</bash-input>",
+        ),
+      );
+      const code = dom.querySelector("pre > code");
+      expect(code).not.toBeNull();
+      expect(code!.textContent).toBe("<bash-input>echo hi</bash-input>\n");
+    });
+
+    it("leaves custom tags inside longer-closing fences alone", () => {
+      const dom = parseHTML(
+        renderMarkdown("~~~\n<policy>keep tags</policy>\n~~~~"),
+      );
+      const code = dom.querySelector("pre > code");
+      expect(code).not.toBeNull();
+      expect(code!.textContent).toBe("<policy>keep tags</policy>\n");
+    });
+
+    it("leaves custom tags inside unclosed fences alone", () => {
+      const dom = parseHTML(
+        renderMarkdown("~~~\n<policy>keep tags</policy>"),
+      );
+      const code = dom.querySelector("pre > code");
+      expect(code).not.toBeNull();
+      expect(code!.textContent).toBe("<policy>keep tags</policy>\n");
+    });
+
     it("tags the input block with language-shell", () => {
       const html = renderMarkdown(
         "<bash-input>echo hi</bash-input>",
@@ -462,6 +575,17 @@ describe("renderMarkdown", () => {
       expect(code!.textContent).toMatch(
         /^\n\nbody\n/,
       );
+    });
+
+    it("leaves custom tags inside bash output literal", () => {
+      const dom = parseHTML(
+        renderMarkdown(
+          "<bash-stdout><policy>keep tags</policy></bash-stdout>",
+        ),
+      );
+      const code = dom.querySelector("pre > code");
+      expect(code).not.toBeNull();
+      expect(code!.textContent).toBe("<policy>keep tags</policy>\n");
     });
   });
 

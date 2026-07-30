@@ -18,7 +18,9 @@ export class TrendsService {
     timezone,
     machine,
     project,
+    gitBranch,
     agent,
+    model,
     dow,
     hour,
     minUserMessages,
@@ -51,9 +53,17 @@ export class TrendsService {
      */
     project?: string,
     /**
+     * Filter by git branch; opaque (project, branch) tokens from the /branches endpoint
+     */
+    gitBranch?: string,
+    /**
      * Filter by agent
      */
     agent?: string,
+    /**
+     * Comma-separated model filter
+     */
+    model?: string,
     /**
      * Day of week, Monday=0 through Sunday=6
      */
@@ -104,7 +114,9 @@ export class TrendsService {
         'timezone': timezone,
         'machine': machine,
         'project': project,
+        'git_branch': gitBranch,
         'agent': agent,
+        'model': model,
         'dow': dow,
         'hour': hour,
         'min_user_messages': minUserMessages,

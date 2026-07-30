@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { EmptyState } from "@kenn-io/kit-ui";
+  import { m } from "../../i18n/index.js";
   import { TrashIcon } from "../../icons.js";
   import { onMount } from "svelte";
   import type { Session } from "../../api/types.js";
@@ -81,24 +83,24 @@
 
 <div class="trash-page">
   {#if loading}
-    <div class="loading-state">Loading trash...</div>
+    <div class="loading-state">{m.trash_loading()}</div>
   {:else if trashedSessions.length === 0}
-    <div class="empty-state">
-      <TrashIcon size="40" strokeWidth="1.6" class="empty-icon" aria-hidden="true" />
-      <p class="empty-title">Trash is empty</p>
-      <p class="empty-desc-text">Deleted sessions will appear here.</p>
-    </div>
+    <EmptyState title={m.trash_empty()} description={m.trash_empty_desc()}>
+      {#snippet icon()}
+        <TrashIcon size="40" strokeWidth="1.6" aria-hidden="true" />
+      {/snippet}
+    </EmptyState>
   {:else}
     <div class="trash-header">
       <TrashIcon size="18" strokeWidth="2" class="trash-icon" aria-hidden="true" />
-      <h2>Trash</h2>
+      <h2>{m.trash_title()}</h2>
       <span class="trash-count">{trashedSessions.length}</span>
       <button
         class="empty-all-btn"
         onclick={emptyAll}
         disabled={emptying}
       >
-        {emptying ? "Emptying..." : "Empty Trash"}
+        {emptying ? m.trash_emptying() : m.trash_empty_trash()}
       </button>
     </div>
 
@@ -110,9 +112,12 @@
             <div class="trash-card-meta">
               <span class="trash-agent">{session.agent}</span>
               <span class="trash-project">{session.project}</span>
-              <span class="trash-msgs">{session.user_message_count} msgs</span>
+              <span class="trash-msgs">{m.trash_msgs({
+                count: session.user_message_count,
+                countLabel: session.user_message_count.toLocaleString(),
+              })}</span>
               {#if session.deleted_at}
-                <span class="trash-deleted">deleted {formatRelativeTime(session.deleted_at)}</span>
+                <span class="trash-deleted">{m.trash_deleted_ago({ time: formatRelativeTime(session.deleted_at) })}</span>
               {/if}
             </div>
           </div>
@@ -120,16 +125,16 @@
             <button
               class="restore-btn"
               onclick={() => restoreSession(session.id)}
-              title="Restore session"
+              title={m.trash_restore_session()}
             >
-              Restore
+              {m.trash_restore()}
             </button>
             <button
               class="perm-delete-btn"
               onclick={() => permanentDelete(session.id)}
-              title="Permanently delete"
+              title={m.trash_permanently_delete()}
             >
-              Delete Forever
+              {m.trash_delete_forever()}
             </button>
           </div>
         </div>
@@ -148,7 +153,7 @@
   .trash-header {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: var(--space-4);
     margin-bottom: 8px;
   }
 
@@ -194,29 +199,6 @@
     color: var(--text-muted);
     padding: 40px 0;
     font-size: 13px;
-  }
-
-  .empty-state {
-    text-align: center;
-    padding: 60px 20px;
-    color: var(--text-muted);
-  }
-
-  :global(.empty-icon) {
-    opacity: 0.15;
-    margin-bottom: 16px;
-  }
-
-  .empty-title {
-    font-size: 16px;
-    font-weight: 500;
-    color: var(--text-secondary);
-    margin: 0 0 6px;
-  }
-
-  .empty-desc-text {
-    font-size: 13px;
-    margin: 0;
   }
 
   .trash-list {

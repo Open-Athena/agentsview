@@ -18,6 +18,92 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// newAntigravityTestProvider builds a concrete antigravityProvider for the given
+// roots so package tests can exercise the folded discovery, source-lookup, and
+// parse behavior directly through provider methods.
+func newAntigravityTestProvider(t *testing.T, roots ...string) *antigravityProvider {
+	t.Helper()
+	provider, ok := NewProvider(AgentAntigravity, ProviderConfig{Roots: roots})
+	require.True(t, ok)
+	ap, ok := provider.(*antigravityProvider)
+	require.True(t, ok)
+	return ap
+}
+
+// newAntigravityCLITestProvider builds a concrete antigravityCLIProvider for the
+// given roots.
+func newAntigravityCLITestProvider(t *testing.T, roots ...string) *antigravityCLIProvider {
+	t.Helper()
+	provider, ok := NewProvider(AgentAntigravityCLI, ProviderConfig{Roots: roots})
+	require.True(t, ok)
+	cp, ok := provider.(*antigravityCLIProvider)
+	require.True(t, ok)
+	return cp
+}
+
+// discoverAntigravityTestSessions discovers IDE sessions under root through the
+// provider, returning the legacy DiscoveredFile shape the tests assert against.
+// It replaces the removed package-level DiscoverAntigravitySessions entrypoint.
+func discoverAntigravityTestSessions(t *testing.T, root string) []DiscoveredFile {
+	t.Helper()
+	paths := newAntigravityTestProvider(t, root).sources.discoverSessionPaths(root)
+	files := make([]DiscoveredFile, 0, len(paths))
+	for _, path := range paths {
+		files = append(files, DiscoveredFile{Path: path, Agent: AgentAntigravity})
+	}
+	return files
+}
+
+// findAntigravityTestSourceFile resolves an IDE session id to a DB path through
+// the provider, replacing the removed FindAntigravitySourceFile.
+func findAntigravityTestSourceFile(t *testing.T, root, id string) string {
+	t.Helper()
+	return newAntigravityTestProvider(t, root).sources.findSourceFile(root, id)
+}
+
+// parseAntigravityTestSession parses an IDE session DB through the provider-owned
+// parse method, replacing the removed package-level ParseAntigravitySession.
+func parseAntigravityTestSession(
+	t *testing.T, path, project, machine string,
+) (*ParsedSession, []ParsedMessage, []ParsedUsageEvent, error) {
+	t.Helper()
+	return newAntigravityTestProvider(t).parseSession(path, project, machine)
+}
+
+// discoverAntigravityCLITestSessions discovers CLI sessions under root through
+// the provider, replacing the removed DiscoverAntigravityCLISessions.
+func discoverAntigravityCLITestSessions(t *testing.T, root string) []DiscoveredFile {
+	t.Helper()
+	return newAntigravityCLITestProvider(t, root).sources.discoverSessions(root)
+}
+
+// findAntigravityCLITestSourceFile resolves a CLI session id to a source path
+// through the provider, replacing the removed FindAntigravityCLISourceFile.
+func findAntigravityCLITestSourceFile(t *testing.T, root, id string) string {
+	t.Helper()
+	return newAntigravityCLITestProvider(t, root).sources.findSourceFile(root, id)
+}
+
+// parseAntigravityCLITestSessionWithStatus parses a CLI session through the
+// provider-owned parse method, replacing the removed package-level
+// ParseAntigravityCLISessionWithStatus.
+func parseAntigravityCLITestSessionWithStatus(
+	t *testing.T, path, project, machine string,
+) (*ParsedSession, []ParsedMessage, []ParsedUsageEvent, AntigravityCLIParseStatus, error) {
+	t.Helper()
+	return newAntigravityCLITestProvider(t).parseSessionWithStatus(path, project, machine)
+}
+
+// parseAntigravityCLITestSession is the no-status convenience wrapper the tests
+// use, replacing the removed package-level ParseAntigravityCLISession.
+func parseAntigravityCLITestSession(
+	t *testing.T, path, project, machine string,
+) (*ParsedSession, []ParsedMessage, error) {
+	t.Helper()
+	sess, msgs, _, _, err := parseAntigravityCLITestSessionWithStatus(t, path, project, machine)
+	return sess, msgs, err
+}
+
 // ---- protobuf wire walker -------------------------------------
 
 // agProtoEncode is a tiny test-only encoder used to hand-craft
@@ -157,6 +243,7 @@ func TestAgProtoLengthOverflow(t *testing.T) {
 // truncates instead of failing, so a payload past the budget keeps
 // its decoded prefix rather than losing all content.
 func TestAgProtoFieldBudget(t *testing.T) {
+
 	// One field per two bytes: tag 0x08 (field 1, varint), value 0.
 	dense := func(fields int) []byte {
 		return bytes.Repeat([]byte{0x08, 0x00}, fields)
@@ -264,14 +351,14 @@ func TestAntigravityCLIDiscoverAndParse(t *testing.T) {
 {"display":"other","timestamp":1779000001000,"workspace":"/tmp/x","conversationId":"other-id"}`))
 
 	// Discovery should return the .pb with the right project.
-	files := DiscoverAntigravityCLISessions(root)
+	files := discoverAntigravityCLITestSessions(t, root)
 	require.Len(t, files, 1, "discover")
 	assert.Equal(t, "/tmp/proj", files[0].Project, "project")
 
 	// Find by id should locate the same .pb.
-	assert.Equal(t, files[0].Path, FindAntigravityCLISourceFile(root, id), "find")
+	assert.Equal(t, files[0].Path, findAntigravityCLITestSourceFile(t, root, id), "find")
 
-	sess, msgs, err := ParseAntigravityCLISession(
+	sess, msgs, err := parseAntigravityCLITestSession(t,
 		files[0].Path, files[0].Project, "test-machine",
 	)
 	require.NoError(t, err, "parse")
@@ -305,13 +392,13 @@ func TestAntigravityCLIDiscoverAndParseDB(t *testing.T) {
 		[]byte(`{"display":"db prompt fallback","timestamp":1779000000000,`+
 			`"workspace":"/tmp/db-proj","conversationId":"`+id+`"}`))
 
-	files := DiscoverAntigravityCLISessions(root)
+	files := discoverAntigravityCLITestSessions(t, root)
 	require.Len(t, files, 1, "discover")
 	assert.Equal(t, dbPath, files[0].Path, "prefer db over pb")
 	assert.Equal(t, "/tmp/db-proj", files[0].Project, "project")
-	assert.Equal(t, dbPath, FindAntigravityCLISourceFile(root, id), "find")
+	assert.Equal(t, dbPath, findAntigravityCLITestSourceFile(t, root, id), "find")
 
-	sess, msgs, err := ParseAntigravityCLISession(
+	sess, msgs, err := parseAntigravityCLITestSession(t,
 		files[0].Path, files[0].Project, "test-machine",
 	)
 	require.NoError(t, err, "parse")
@@ -343,7 +430,7 @@ func TestAntigravityCLIProjectFallbackPromptAndProximity(t *testing.T) {
 	mustWrite(t, filepath.Join(root, "history.jsonl"),
 		[]byte(`{"display":"  user prompt text goes here  ","timestamp":1779000010000,"workspace":"/tmp/fallback-proj"}`))
 
-	sess, msgs, err := ParseAntigravityCLISession(dbPath, "", "m")
+	sess, msgs, err := parseAntigravityCLITestSession(t, dbPath, "", "m")
 	require.NoError(t, err)
 	require.Len(t, msgs, 2)
 	assert.Equal(t, "/tmp/fallback-proj", sess.Project, "should successfully fallback infer project")
@@ -363,7 +450,7 @@ func TestAntigravityCLIProjectFallbackStrictWindow(t *testing.T) {
 	mustWrite(t, filepath.Join(root, "history.jsonl"),
 		[]byte(`{"display":"user prompt text goes here","timestamp":1779000065000,"workspace":"/tmp/too-late-proj"}`))
 
-	sess, _, err := ParseAntigravityCLISession(dbPath, "", "m")
+	sess, _, err := parseAntigravityCLITestSession(t, dbPath, "", "m")
 	require.NoError(t, err)
 	assert.Empty(t, sess.Project, "should reject match outside 1-minute window")
 }
@@ -383,7 +470,7 @@ func TestAntigravityCLIProjectFallbackAmbiguous(t *testing.T) {
 		[]byte(`{"display":"user prompt text goes here","timestamp":1779000005000,"workspace":"/tmp/proj-a"}
 {"display":"user prompt text goes here","timestamp":1779000005000,"workspace":"/tmp/proj-b"}`))
 
-	sess, _, err := ParseAntigravityCLISession(dbPath, "", "m")
+	sess, _, err := parseAntigravityCLITestSession(t, dbPath, "", "m")
 	require.NoError(t, err)
 	assert.Empty(t, sess.Project, "should reject ambiguous match with different workspaces at same time closeness")
 }
@@ -402,7 +489,7 @@ func TestAntigravityCLIProjectFallbackShortPrompt(t *testing.T) {
 	mustWrite(t, filepath.Join(root, "history.jsonl"),
 		[]byte(`{"display":"hi","timestamp":1779000005000,"workspace":"/tmp/short-proj"}`))
 
-	sess, _, err := ParseAntigravityCLISession(dbPath, "", "m")
+	sess, _, err := parseAntigravityCLITestSession(t, dbPath, "", "m")
 	require.NoError(t, err)
 	assert.Empty(t, sess.Project, "should reject matching short prompts")
 }
@@ -451,6 +538,47 @@ func TestAntigravityCLIDBFileInfoIncludesSQLiteSidecars(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(len("dbwalshm")), info.Size())
 	assert.Equal(t, late.UnixNano(), info.ModTime().UnixNano())
+}
+
+func TestAntigravityCLIFileInfoIncludesHistoryForLegacySync(t *testing.T) {
+	early := time.Unix(1779000000, 0)
+	late := time.Unix(1779000300, 0)
+	history := []byte(`{"display":"history prompt","timestamp":1779000000000,` +
+		`"workspace":"/tmp/proj","conversationId":"id"}` + "\n")
+
+	t.Run("db session", func(t *testing.T) {
+		root := t.TempDir()
+		id := "14141414-2525-3636-4747-585858585858"
+		mustMkdir(t, filepath.Join(root, "conversations"))
+		dbPath := filepath.Join(root, "conversations", id+".db")
+		historyPath := filepath.Join(root, "history.jsonl")
+		mustWrite(t, dbPath, []byte("db"))
+		mustWrite(t, historyPath, history)
+		require.NoError(t, os.Chtimes(dbPath, early, early))
+		require.NoError(t, os.Chtimes(historyPath, late, late))
+
+		info, err := AntigravityCLIFileInfo(dbPath)
+		require.NoError(t, err)
+		assert.Equal(t, int64(len("db")+len(history)), info.Size())
+		assert.Equal(t, late.UnixNano(), info.ModTime().UnixNano())
+	})
+
+	t.Run("pb session", func(t *testing.T) {
+		root := t.TempDir()
+		id := "15151515-2626-3737-4848-595959595959"
+		mustMkdir(t, filepath.Join(root, "implicit"))
+		pbPath := filepath.Join(root, "implicit", id+".pb")
+		historyPath := filepath.Join(root, "history.jsonl")
+		mustWrite(t, pbPath, []byte("pb"))
+		mustWrite(t, historyPath, history)
+		require.NoError(t, os.Chtimes(pbPath, early, early))
+		require.NoError(t, os.Chtimes(historyPath, late, late))
+
+		info, err := AntigravityCLIFileInfo(pbPath)
+		require.NoError(t, err)
+		assert.Equal(t, int64(len("pb")+len(history)), info.Size())
+		assert.Equal(t, late.UnixNano(), info.ModTime().UnixNano())
+	})
 }
 
 // TestAntigravityCLIFileInfoIncludesBrainArtifacts pins brain
@@ -515,7 +643,7 @@ func TestAntigravityCLIDBInsertsShortHistoryPrompt(t *testing.T) {
 		[]byte(`{"display":"fix lint","timestamp":1779000000000,`+
 			`"workspace":"/tmp/db-proj","conversationId":"`+id+`"}`))
 
-	sess, msgs, err := ParseAntigravityCLISession(
+	sess, msgs, err := parseAntigravityCLITestSession(t,
 		dbPath, "", "test-machine",
 	)
 	require.NoError(t, err)
@@ -540,7 +668,7 @@ func TestAntigravityCLIDiscoverIgnoresJunk(t *testing.T) {
 	mustWrite(t,
 		filepath.Join(root, "conversations", "bad.name.pb"),
 		[]byte("x"))
-	assert.Empty(t, DiscoverAntigravityCLISessions(root))
+	assert.Empty(t, discoverAntigravityCLITestSessions(t, root))
 }
 
 // ---- IDE parser -----------------------------------------------
@@ -566,12 +694,12 @@ func TestAntigravityIDEDiscoverAndParse(t *testing.T) {
 		filepath.Join(root, "brain", id, "plan.md.metadata.json"),
 		[]byte(`{"summary":"Plan summary","updatedAt":"2026-05-20T22:47:27Z"}`))
 
-	files := DiscoverAntigravitySessions(root)
+	files := discoverAntigravityTestSessions(t, root)
 	require.Len(t, files, 1)
 	assert.Equal(t, dbPath, files[0].Path)
-	assert.Equal(t, dbPath, FindAntigravitySourceFile(root, id))
+	assert.Equal(t, dbPath, findAntigravityTestSourceFile(t, root, id))
 
-	sess, msgs, _, err := ParseAntigravitySession(
+	sess, msgs, _, err := parseAntigravityTestSession(t,
 		dbPath, "", "test-machine",
 	)
 	require.NoError(t, err, "parse")
@@ -972,7 +1100,7 @@ func TestAntigravityCLIDiscoverImplicit(t *testing.T) {
 		filepath.Join(root, "implicit", implID+".pb"),
 		[]byte("x"))
 
-	files := DiscoverAntigravityCLISessions(root)
+	files := discoverAntigravityCLITestSessions(t, root)
 	require.Len(t, files, 2, "got files, want 2 (one per subdir)")
 	var sawConv, sawImpl bool
 	for _, f := range files {
@@ -986,18 +1114,18 @@ func TestAntigravityCLIDiscoverImplicit(t *testing.T) {
 	assert.True(t, sawConv, "missing conv subdir")
 	assert.True(t, sawImpl, "missing impl subdir")
 
-	// FindAntigravityCLISourceFile routes implicit-tagged ids to
-	// the implicit/ subdir; bare ids resolve under conversations/.
+	// The provider source lookup routes implicit-tagged ids to the
+	// implicit/ subdir; bare ids resolve under conversations/.
 	wantImpl := filepath.Join("implicit", implID+".pb")
-	gotImpl := FindAntigravityCLISourceFile(root, "implicit-"+implID)
+	gotImpl := findAntigravityCLITestSourceFile(t, root, "implicit-"+implID)
 	require.NotEmpty(t, gotImpl)
 	assert.True(t, strings.HasSuffix(gotImpl, wantImpl), "find implicit: %q", gotImpl)
 	wantConv := filepath.Join("conversations", convID+".pb")
-	gotConv := FindAntigravityCLISourceFile(root, convID)
+	gotConv := findAntigravityCLITestSourceFile(t, root, convID)
 	require.NotEmpty(t, gotConv)
 	assert.True(t, strings.HasSuffix(gotConv, wantConv), "find conv: %q", gotConv)
 	// A bare implicit-only UUID must NOT resolve under conversations/.
-	assert.Empty(t, FindAntigravityCLISourceFile(root, implID),
+	assert.Empty(t, findAntigravityCLITestSourceFile(t, root, implID),
 		"bare implicit id should not resolve")
 }
 
@@ -1015,17 +1143,17 @@ func TestAntigravityCLIImplicitSessionIDDistinct(t *testing.T) {
 	mustWrite(t, convPath, []byte("x"))
 	mustWrite(t, implPath, []byte("x"))
 
-	convSess, _, err := ParseAntigravityCLISession(convPath, "", "m")
+	convSess, _, err := parseAntigravityCLITestSession(t, convPath, "", "m")
 	require.NoError(t, err, "parse conv")
-	implSess, _, err := ParseAntigravityCLISession(implPath, "", "m")
+	implSess, _, err := parseAntigravityCLITestSession(t, implPath, "", "m")
 	require.NoError(t, err, "parse impl")
 	assert.NotEqual(t, implSess.ID, convSess.ID, "session ids collide")
 	assert.Equal(t, "antigravity-cli:"+id, convSess.ID, "conv id")
 	assert.Equal(t, "antigravity-cli:implicit-"+id, implSess.ID, "impl id")
 
 	// Round-trip: each storage id resolves back to its own file.
-	assert.Equal(t, convPath, FindAntigravityCLISourceFile(root, id), "round-trip conv")
-	assert.Equal(t, implPath, FindAntigravityCLISourceFile(root, "implicit-"+id), "round-trip impl")
+	assert.Equal(t, convPath, findAntigravityCLITestSourceFile(t, root, id), "round-trip conv")
+	assert.Equal(t, implPath, findAntigravityCLITestSourceFile(t, root, "implicit-"+id), "round-trip impl")
 }
 
 func TestBuildAntigravityProjectMapRobust(t *testing.T) {
@@ -1228,7 +1356,7 @@ func TestDecodeAntigravityStepToolCall(t *testing.T) {
 	dbPath := filepath.Join(root, "conversations", id+".db")
 	createAntigravityToolCallDB(t, dbPath)
 
-	sess, msgs, _, err := ParseAntigravitySession(dbPath, "/tmp/proj", "m")
+	sess, msgs, _, err := parseAntigravityTestSession(t, dbPath, "/tmp/proj", "m")
 	require.NoError(t, err)
 	require.NotNil(t, sess)
 
@@ -1278,7 +1406,7 @@ func TestDecodeAntigravityStepUserNoToolCalls(t *testing.T) {
 	mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)`,
 		0, 14, userPayload)
 
-	sess, msgs, _, err := ParseAntigravitySession(dbPath, "/tmp/proj", "m")
+	sess, msgs, _, err := parseAntigravityTestSession(t, dbPath, "/tmp/proj", "m")
 	require.NoError(t, err)
 	require.NotNil(t, sess)
 
@@ -1311,7 +1439,7 @@ func TestDecodeAntigravityStepNoFalsePositives(t *testing.T) {
 	mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)`,
 		0, 17, asstPayload)
 
-	sess, msgs, _, err := ParseAntigravitySession(dbPath, "/tmp/proj", "m")
+	sess, msgs, _, err := parseAntigravityTestSession(t, dbPath, "/tmp/proj", "m")
 	require.NoError(t, err)
 	require.NotNil(t, sess)
 
@@ -1354,7 +1482,7 @@ func TestDecodeAntigravityStepMultipleToolCalls(t *testing.T) {
 	mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)`,
 		0, 17, asstPayload)
 
-	sess, msgs, _, err := ParseAntigravitySession(dbPath, "/tmp/proj", "m")
+	sess, msgs, _, err := parseAntigravityTestSession(t, dbPath, "/tmp/proj", "m")
 	require.NoError(t, err)
 	require.NotNil(t, sess)
 
@@ -1458,7 +1586,7 @@ func TestAntigravityCLITrajectoryParse(t *testing.T) {
 	sidecarPath := filepath.Join(root, "conversations", id+".trajectory.json")
 	mustWrite(t, sidecarPath, []byte(trajectoryJSON))
 
-	sess, msgs, err := ParseAntigravityCLISession(pbPath, "", "test-machine")
+	sess, msgs, err := parseAntigravityCLITestSession(t, pbPath, "", "test-machine")
 	require.NoError(t, err)
 
 	assert.Equal(t, "antigravity-cli:"+id, sess.ID)
@@ -1564,7 +1692,7 @@ func TestAntigravityCLITrajectoryWithoutSupportedMessagesFallsBack(t *testing.T)
 				[]byte(`{"display":"history fallback","timestamp":1779000000000,`+
 					`"workspace":"/tmp/proj","conversationId":"`+id+`"}`))
 
-			sess, msgs, err := ParseAntigravityCLISession(pbPath, "", "test-machine")
+			sess, msgs, err := parseAntigravityCLITestSession(t, pbPath, "", "test-machine")
 			require.NoError(t, err)
 
 			require.Len(t, msgs, 1)
@@ -1652,7 +1780,7 @@ func TestAntigravityCLIDBPrefersSidecarWithEqualCoverage(t *testing.T) {
 		[]byte(`{"display":"history prompt","timestamp":1779000000000,`+
 			`"workspace":"/tmp/db-proj","conversationId":"`+id+`"}`))
 
-	sess, msgs, _, status, err := ParseAntigravityCLISessionWithStatus(
+	sess, msgs, _, status, err := parseAntigravityCLITestSessionWithStatus(t,
 		dbPath, "", "test-machine",
 	)
 	require.NoError(t, err)
@@ -1685,7 +1813,7 @@ func TestAntigravityCLIDBKeepsDBDecodeWhenSidecarLags(t *testing.T) {
 		[]byte(`{"display":"history prompt","timestamp":1779000000000,`+
 			`"workspace":"/tmp/db-proj","conversationId":"`+id+`"}`))
 
-	_, msgs, _, status, err := ParseAntigravityCLISessionWithStatus(
+	_, msgs, _, status, err := parseAntigravityCLITestSessionWithStatus(t,
 		dbPath, "", "test-machine",
 	)
 	require.NoError(t, err)
@@ -1707,7 +1835,7 @@ func TestAntigravityCLIDBSidecarUsedWhenDBDecodeEmpty(t *testing.T) {
 	require.NoError(t, db.Close())
 	writeAntigravityTestSidecar(t, root, id, 2)
 
-	_, msgs, _, status, err := ParseAntigravityCLISessionWithStatus(
+	_, msgs, _, status, err := parseAntigravityCLITestSessionWithStatus(t,
 		dbPath, "", "test-machine",
 	)
 	require.NoError(t, err)
@@ -1763,7 +1891,7 @@ func TestAntigravityCLIPBUsesSidecarDespiteOlderMtime(t *testing.T) {
 		[]byte(`{"display":"history prompt","timestamp":1779000000000,`+
 			`"workspace":"/tmp/pb-proj","conversationId":"`+id+`"}`))
 
-	sess, msgs, err := ParseAntigravityCLISession(pbPath, "", "test-machine")
+	sess, msgs, err := parseAntigravityCLITestSession(t, pbPath, "", "test-machine")
 	require.NoError(t, err)
 	require.Len(t, msgs, 2)
 	assert.Equal(t, "sidecar prompt", msgs[0].Content)
@@ -1799,7 +1927,7 @@ func TestAntigravityCLIDBPartialSidecarNotPersistedAsCurrent(t *testing.T) {
 	// the row must stay retryable rather than persist as current.
 	writeAntigravityTestSidecar(t, root, id, 2)
 
-	_, msgs, _, status, err := ParseAntigravityCLISessionWithStatus(
+	_, msgs, _, status, err := parseAntigravityCLITestSessionWithStatus(t,
 		dbPath, "", "test-machine",
 	)
 	require.NoError(t, err)
@@ -1818,7 +1946,7 @@ func TestAntigravityCLIDBCoveringSidecarRescuesUndecodableRows(t *testing.T) {
 	createAntigravityUndecodableDB(t, dbPath, 3)
 	writeAntigravityTestSidecar(t, root, id, 3)
 
-	_, msgs, _, status, err := ParseAntigravityCLISessionWithStatus(
+	_, msgs, _, status, err := parseAntigravityCLITestSessionWithStatus(t,
 		dbPath, "", "test-machine",
 	)
 	require.NoError(t, err)
@@ -1862,7 +1990,7 @@ func TestAntigravityCLISidecarWinsKeepsTokenUsage(t *testing.T) {
 	// gen_metadata events.
 	writeAntigravityTestSidecar(t, root, id, 2)
 
-	sess, msgs, usageEvents, status, err := ParseAntigravityCLISessionWithStatus(
+	sess, msgs, usageEvents, status, err := parseAntigravityCLITestSessionWithStatus(t,
 		dbPath, "", "test-machine",
 	)
 	require.NoError(t, err)
@@ -1905,7 +2033,7 @@ func TestAntigravityCLISidecarRescueKeepsGenMetadataUsage(t *testing.T) {
 	// Covering sidecar rescues the undecodable rows.
 	writeAntigravityTestSidecar(t, root, id, 2)
 
-	sess, msgs, usageEvents, status, err := ParseAntigravityCLISessionWithStatus(
+	sess, msgs, usageEvents, status, err := parseAntigravityCLITestSessionWithStatus(t,
 		dbPath, "", "test-machine",
 	)
 	require.NoError(t, err)
@@ -1968,7 +2096,7 @@ func TestAntigravityCLIPBSidecarEmitsUsageEvents(t *testing.T) {
 	]`
 	writeAntigravityTestSidecarWithGenMetadata(t, root, id, 3, genJSON)
 
-	sess, msgs, usageEvents, status, err := ParseAntigravityCLISessionWithStatus(
+	sess, msgs, usageEvents, status, err := parseAntigravityCLITestSessionWithStatus(t,
 		pbPath, "", "test-machine",
 	)
 	require.NoError(t, err)
@@ -2067,7 +2195,7 @@ func TestAntigravityCLIDBGenMetadataWinsOverSidecarUsage(t *testing.T) {
 	}]`
 	writeAntigravityTestSidecarWithGenMetadata(t, root, id, 2, genJSON)
 
-	sess, msgs, usageEvents, status, err := ParseAntigravityCLISessionWithStatus(
+	sess, msgs, usageEvents, status, err := parseAntigravityCLITestSessionWithStatus(t,
 		dbPath, "", "test-machine",
 	)
 	require.NoError(t, err)
@@ -2118,7 +2246,7 @@ func TestAntigravityCLIDBWithoutGenMetadataGetsSidecarUsage(t *testing.T) {
 	}]`
 	writeAntigravityTestSidecarWithGenMetadata(t, root, id, 2, genJSON)
 
-	sess, msgs, usageEvents, status, err := ParseAntigravityCLISessionWithStatus(
+	sess, msgs, usageEvents, status, err := parseAntigravityCLITestSessionWithStatus(t,
 		dbPath, "", "test-machine",
 	)
 	require.NoError(t, err)
@@ -2166,7 +2294,7 @@ func TestAntigravityCLINonCoveringSidecarUsageRejected(t *testing.T) {
 	}]`
 	writeAntigravityTestSidecarWithGenMetadata(t, root, id, 1, genJSON)
 
-	sess, msgs, usageEvents, status, err := ParseAntigravityCLISessionWithStatus(
+	sess, msgs, usageEvents, status, err := parseAntigravityCLITestSessionWithStatus(t,
 		dbPath, "", "test-machine",
 	)
 	require.NoError(t, err)
@@ -2272,7 +2400,7 @@ func TestAntigravityCLISidecarUsageStepIndexEdgeCases(t *testing.T) {
 				t, root, id, 3, tc.gens,
 			)
 
-			_, msgs, usageEvents, _, err := ParseAntigravityCLISessionWithStatus(
+			_, msgs, usageEvents, _, err := parseAntigravityCLITestSessionWithStatus(t,
 				pbPath, "", "test-machine",
 			)
 			require.NoError(t, err)
@@ -2322,7 +2450,7 @@ func TestAntigravitySessionFileMetadataIncludesWAL(t *testing.T) {
 	walTime := mainInfo.ModTime().Add(5 * time.Second)
 	require.NoError(t, os.Chtimes(walPath, walTime, walTime))
 
-	sess, _, _, err := ParseAntigravitySession(dbPath, "p", "m")
+	sess, _, _, err := parseAntigravityTestSession(t, dbPath, "p", "m")
 	require.NoError(t, err)
 
 	// The parse's own read-only open can create or touch -shm/-wal
@@ -2345,7 +2473,7 @@ func TestAntigravitySessionFileMetadataIncludesWAL(t *testing.T) {
 }
 
 // TestAntigravityFileInfoIncludesBrainArtifacts pins brain artifacts
-// into the IDE composite fingerprint: ParseAntigravitySession renders
+// into the IDE composite fingerprint: the provider parse renders
 // brain/<id>/*.md (+ .metadata.json) as messages, so a brain-only
 // add/edit/delete must change the effective file info or skip checks
 // keep stale brain messages.
@@ -2420,7 +2548,7 @@ func TestAntigravityTokenUsage(t *testing.T) {
 	genData := createAntigravityMockGenMetadata(t, 2400, 180, 0, "Test Gemini 3.5")
 	mustExec(t, db, `INSERT INTO gen_metadata (idx, data, size) VALUES (1, ?, ?)`, genData, len(genData))
 
-	sess, msgs, usageEvents, err := ParseAntigravitySession(dbPath, "test-project", "test-machine")
+	sess, msgs, usageEvents, err := parseAntigravityTestSession(t, dbPath, "test-project", "test-machine")
 	require.NoError(t, err)
 
 	// 1. Verify model and message token counts
@@ -2484,7 +2612,7 @@ func TestAntigravityTokenUsageCachedTokens(t *testing.T) {
 	genData := createAntigravityMockGenMetadata(t, 2200, 180, 200, "Test Gemini 3.5")
 	mustExec(t, db, `INSERT INTO gen_metadata (idx, data, size) VALUES (1, ?, ?)`, genData, len(genData))
 
-	sess, msgs, usageEvents, err := ParseAntigravitySession(dbPath, "test-project", "test-machine")
+	sess, msgs, usageEvents, err := parseAntigravityTestSession(t, dbPath, "test-project", "test-machine")
 	require.NoError(t, err)
 
 	// Message token counts: context = uncached + cache-read.
@@ -2545,7 +2673,7 @@ func TestAntigravityTokenUsageCachedTokensAllInputs(t *testing.T) {
 	genData := createAntigravityMockGenMetadata(t, 50, 100, 200, "Test Gemini 3.5")
 	mustExec(t, db, `INSERT INTO gen_metadata (idx, data, size) VALUES (1, ?, ?)`, genData, len(genData))
 
-	sess, msgs, usageEvents, err := ParseAntigravitySession(dbPath, "test-project", "test-machine")
+	sess, msgs, usageEvents, err := parseAntigravityTestSession(t, dbPath, "test-project", "test-machine")
 	require.NoError(t, err)
 
 	require.Len(t, msgs, 2)
@@ -2603,7 +2731,7 @@ func TestAntigravityTokenUsageMixedDecode(t *testing.T) {
 	genUndecoded := createAntigravityMockGenMetadata(t, 3000, 220, 0, "Test Gemini 3.5")
 	mustExec(t, db, `INSERT INTO gen_metadata (idx, data, size) VALUES (2, ?, ?)`, genUndecoded, len(genUndecoded))
 
-	sess, msgs, usageEvents, err := ParseAntigravitySession(dbPath, "test-project", "test-machine")
+	sess, msgs, usageEvents, err := parseAntigravityTestSession(t, dbPath, "test-project", "test-machine")
 	require.NoError(t, err)
 	require.Len(t, msgs, 2, "undecodable step contributes no message")
 	require.Len(t, usageEvents, 2, "both gen rows emit usage events")
@@ -2642,7 +2770,7 @@ func TestAntigravityCLITokenUsageMixedDecode(t *testing.T) {
 	mustExec(t, db, `INSERT INTO gen_metadata (idx, data, size) VALUES (1, ?, ?)`, genUndecoded, len(genUndecoded))
 	require.NoError(t, db.Close())
 
-	sess, msgs, usageEvents, _, err := ParseAntigravityCLISessionWithStatus(
+	sess, msgs, usageEvents, _, err := parseAntigravityCLITestSessionWithStatus(t,
 		dbPath, "", "test-machine",
 	)
 	require.NoError(t, err)
@@ -2672,7 +2800,7 @@ func TestAntigravityZeroMessageKeepsUsageEvents(t *testing.T) {
 	genData := createAntigravityMockGenMetadata(t, 2400, 180, 0, "Test Gemini 3.5")
 	mustExec(t, db, `INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?, ?)`, genData, len(genData))
 
-	sess, msgs, usageEvents, err := ParseAntigravitySession(dbPath, "test-project", "test-machine")
+	sess, msgs, usageEvents, err := parseAntigravityTestSession(t, dbPath, "test-project", "test-machine")
 	require.NoError(t, err)
 	assert.Empty(t, msgs)
 	require.Len(t, usageEvents, 1, "usage events must survive zero-message parses")
@@ -2699,7 +2827,7 @@ func TestAntigravityCLIZeroMessageKeepsUsageEvents(t *testing.T) {
 	mustExec(t, db, `INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?, ?)`, genData, len(genData))
 	require.NoError(t, db.Close())
 
-	sess, msgs, usageEvents, status, err := ParseAntigravityCLISessionWithStatus(
+	sess, msgs, usageEvents, status, err := parseAntigravityCLITestSessionWithStatus(t,
 		dbPath, "", "test-machine",
 	)
 	require.NoError(t, err)
@@ -2709,6 +2837,184 @@ func TestAntigravityCLIZeroMessageKeepsUsageEvents(t *testing.T) {
 	assert.Equal(t, 220, usageEvents[0].OutputTokens)
 	assert.Equal(t, 220, sess.TotalOutputTokens)
 	assert.Equal(t, 3000, sess.PeakContextTokens)
+}
+
+// undecodableAntigravityGenMetadata builds a gen_metadata blob whose token
+// block is rejected by the heuristic (field 2 exceeds the plausibility cap),
+// so it decodes into no usage event even though the row is present.
+func undecodableAntigravityGenMetadata() []byte {
+	return encodePB([]pbField{
+		{num: 1, wire: pbWireVarint, varint: 1371},
+		{num: 2, wire: pbWireVarint, varint: 679261000}, // implausible input
+		{num: 3, wire: pbWireVarint, varint: 100},
+	})
+}
+
+// TestAntigravityGenMetadataWithoutUsageFlag exercises the IDE parser's
+// GenMetadataWithoutUsage flag: it is set only when the steps DB carried
+// gen_metadata rows that decoded into zero usage events. An absent or empty
+// gen_metadata table, or rows that decode into usage, leave it false.
+func TestAntigravityGenMetadataWithoutUsageFlag(t *testing.T) {
+	decodableStep := func(t *testing.T, db *sql.DB) {
+		t.Helper()
+		ts := encodePB([]pbField{{num: 1, wire: pbWireVarint, varint: 1779000100}})
+		asstPayload := encodePB([]pbField{
+			{num: 5, wire: pbWireBytes, bytes: ts},
+			{num: 17, wire: pbWireBytes, bytes: []byte("assistant response body goes here and is long")},
+		})
+		mustExec(t, db,
+			`INSERT INTO steps (idx, step_type, step_payload) VALUES (0, 17, ?)`,
+			asstPayload)
+	}
+	tests := []struct {
+		name     string
+		setupDB  func(t *testing.T, db *sql.DB)
+		wantFlag bool
+	}{
+		{
+			name: "no gen_metadata table",
+			setupDB: func(t *testing.T, db *sql.DB) {
+				createAntigravityStepTables(t, db)
+				decodableStep(t, db)
+			},
+			wantFlag: false,
+		},
+		{
+			name: "empty gen_metadata table",
+			setupDB: func(t *testing.T, db *sql.DB) {
+				createAntigravityStepTables(t, db)
+				mustExec(t, db, `CREATE TABLE gen_metadata (idx integer, data blob, size integer, PRIMARY KEY (idx))`)
+				decodableStep(t, db)
+			},
+			wantFlag: false,
+		},
+		{
+			name: "gen_metadata rows decode to usage",
+			setupDB: func(t *testing.T, db *sql.DB) {
+				createAntigravityStepTables(t, db)
+				mustExec(t, db, `CREATE TABLE gen_metadata (idx integer, data blob, size integer, PRIMARY KEY (idx))`)
+				decodableStep(t, db)
+				genData := createAntigravityMockGenMetadata(t, 2400, 180, 0, "Test Gemini 3.5")
+				mustExec(t, db, `INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?, ?)`, genData, len(genData))
+			},
+			wantFlag: false,
+		},
+		{
+			name: "gen_metadata rows all undecodable",
+			setupDB: func(t *testing.T, db *sql.DB) {
+				createAntigravityStepTables(t, db)
+				mustExec(t, db, `CREATE TABLE gen_metadata (idx integer, data blob, size integer, PRIMARY KEY (idx))`)
+				decodableStep(t, db)
+				blob := undecodableAntigravityGenMetadata()
+				mustExec(t, db, `INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?, ?)`, blob, len(blob))
+			},
+			wantFlag: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			id := "55555555-6666-7777-8888-abababababab"
+			mustMkdir(t, filepath.Join(root, "conversations"))
+			dbPath := filepath.Join(root, "conversations", id+".db")
+			db, err := sql.Open("sqlite3", dbPath)
+			require.NoError(t, err)
+			tt.setupDB(t, db)
+			require.NoError(t, db.Close())
+
+			sess, _, usageEvents, err := parseAntigravityTestSession(t,
+				dbPath, "test-project", "test-machine")
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantFlag, sess.GenMetadataWithoutUsage)
+			if tt.wantFlag {
+				assert.Empty(t, usageEvents,
+					"flag implies zero decoded usage events")
+			}
+		})
+	}
+}
+
+// TestAntigravityCLIGenMetadataWithoutUsageFlag covers the CLI parser's
+// critical timing: the flag is computed from the FINAL usageEvents, after the
+// trajectory-sidecar gap-fill. A session whose gen_metadata failed to decode
+// but whose sidecar supplied usage is NOT flagged; a session with neither
+// source of usage is.
+func TestAntigravityCLIGenMetadataWithoutUsageFlag(t *testing.T) {
+	tests := []struct {
+		name     string
+		setup    func(t *testing.T, root, id, dbPath string)
+		wantFlag bool
+		wantUsed bool // usage events expected on the parse result
+	}{
+		{
+			name: "undecodable gen_metadata rescued by sidecar usage",
+			setup: func(t *testing.T, root, id, dbPath string) {
+				db, err := sql.Open("sqlite3", dbPath)
+				require.NoError(t, err)
+				createAntigravityStepTables(t, db)
+				mustExec(t, db, `CREATE TABLE gen_metadata (idx integer, data blob, size integer, PRIMARY KEY (idx))`)
+				for i := range 2 {
+					mustExec(t, db,
+						`INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)`,
+						i, 99, []byte{0xff, 0xff, 0xff})
+				}
+				blob := undecodableAntigravityGenMetadata()
+				mustExec(t, db, `INSERT INTO gen_metadata (idx, data, size) VALUES (1, ?, ?)`, blob, len(blob))
+				require.NoError(t, db.Close())
+				// Covering sidecar carries generatorMetadata usage that fills
+				// the gap left by the undecodable gen_metadata.
+				genJSON := `[{
+					"stepIndices": [1],
+					"chatModel": {
+						"model": "MODEL_PLACEHOLDER_M20",
+						"usage": {"inputTokens": "1500", "outputTokens": "77"}
+					}
+				}]`
+				writeAntigravityTestSidecarWithGenMetadata(t, root, id, 2, genJSON)
+			},
+			wantFlag: false,
+			wantUsed: true,
+		},
+		{
+			name: "undecodable gen_metadata and no sidecar usage",
+			setup: func(t *testing.T, root, id, dbPath string) {
+				db, err := sql.Open("sqlite3", dbPath)
+				require.NoError(t, err)
+				createAntigravityStepTables(t, db)
+				mustExec(t, db, `CREATE TABLE gen_metadata (idx integer, data blob, size integer, PRIMARY KEY (idx))`)
+				mustExec(t, db,
+					`INSERT INTO steps (idx, step_type, step_payload) VALUES (0, 99, ?)`,
+					[]byte{0xff, 0xff, 0xff})
+				blob := undecodableAntigravityGenMetadata()
+				mustExec(t, db, `INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?, ?)`, blob, len(blob))
+				require.NoError(t, db.Close())
+				// No sidecar written: nothing fills the usage gap.
+			},
+			wantFlag: true,
+			wantUsed: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			id := "00000000-1111-2222-3333-cdcdcdcdcdcd"
+			mustMkdir(t, filepath.Join(root, "conversations"))
+			dbPath := filepath.Join(root, "conversations", id+".db")
+			tt.setup(t, root, id, dbPath)
+
+			sess, _, usageEvents, _, err := parseAntigravityCLITestSessionWithStatus(t,
+				dbPath, "", "test-machine")
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantFlag, sess.GenMetadataWithoutUsage)
+			if tt.wantUsed {
+				assert.NotEmpty(t, usageEvents,
+					"sidecar gap-fill should supply usage events")
+			} else {
+				assert.Empty(t, usageEvents,
+					"flag implies zero decoded usage events")
+			}
+		})
+	}
 }
 
 func TestAntigravityTokenUsageDynamicField(t *testing.T) {
@@ -2746,7 +3052,7 @@ func TestAntigravityTokenUsageDynamicField(t *testing.T) {
 	genData := createAntigravityMockGenMetadataWithField(t, 1187, 5000, 400, 0, "Test Gemini 3.5 Flash")
 	mustExec(t, db, `INSERT INTO gen_metadata (idx, data, size) VALUES (1, ?, ?)`, genData, len(genData))
 
-	sess, msgs, usageEvents, err := ParseAntigravitySession(dbPath, "test-project", "test-machine")
+	sess, msgs, usageEvents, err := parseAntigravityTestSession(t, dbPath, "test-project", "test-machine")
 	require.NoError(t, err)
 
 	require.Len(t, msgs, 2)
@@ -3240,4 +3546,85 @@ func TestDecodeAntigravityStepToolOnlyAssistantStep(t *testing.T) {
 	assert.True(t, msg.HasToolUse, "HasToolUse should be true")
 	require.Len(t, msg.ToolCalls, 1)
 	assert.Equal(t, "view_file", msg.ToolCalls[0].ToolName)
+}
+
+func TestAntigravityCLITranscriptFidelity(t *testing.T) {
+	t.Run("covering sidecar is full", func(t *testing.T) {
+		root := t.TempDir()
+		id := "11111111-2222-3333-4444-555555555555"
+		mustMkdir(t, filepath.Join(root, "conversations"))
+		dbPath := filepath.Join(root, "conversations", id+".db")
+		createAntigravityTestDB(t, dbPath) // 2 raw steps
+		writeAntigravityTestSidecar(t, root, id, 2)
+
+		sess, _, _, status, err := parseAntigravityCLITestSessionWithStatus(
+			t, dbPath, "", "test-machine",
+		)
+		require.NoError(t, err)
+		assert.False(t, status.NeedsRetry)
+		assert.Equal(t, TranscriptFidelityFull, sess.TranscriptFidelity)
+	})
+
+	t.Run("heuristic db decode (no covering sidecar) is summary", func(t *testing.T) {
+		root := t.TempDir()
+		id := "22222222-3333-4444-5555-666666666666"
+		mustMkdir(t, filepath.Join(root, "conversations"))
+		dbPath := filepath.Join(root, "conversations", id+".db")
+		createAntigravityTestDB(t, dbPath)          // 2 raw steps
+		writeAntigravityTestSidecar(t, root, id, 1) // lags -> db decode wins
+		mustWrite(t, filepath.Join(root, "history.jsonl"),
+			[]byte(`{"display":"history prompt","timestamp":1779000000000,`+
+				`"workspace":"/tmp/db-proj","conversationId":"`+id+`"}`))
+
+		sess, _, _, status, err := parseAntigravityCLITestSessionWithStatus(
+			t, dbPath, "", "test-machine",
+		)
+		require.NoError(t, err)
+		assert.False(t, status.NeedsRetry)
+		assert.Equal(t, TranscriptFidelitySummary, sess.TranscriptFidelity)
+	})
+
+	t.Run("partial sidecar over undecodable db is summary", func(t *testing.T) {
+		root := t.TempDir()
+		id := "33333333-4444-5555-6666-777777777777"
+		mustMkdir(t, filepath.Join(root, "conversations"))
+		dbPath := filepath.Join(root, "conversations", id+".db")
+		createAntigravityUndecodableDB(t, dbPath, 3)
+		writeAntigravityTestSidecar(t, root, id, 2) // partial
+
+		sess, _, _, status, err := parseAntigravityCLITestSessionWithStatus(
+			t, dbPath, "", "test-machine",
+		)
+		require.NoError(t, err)
+		assert.True(t, status.NeedsRetry)
+		assert.Equal(t, TranscriptFidelitySummary, sess.TranscriptFidelity)
+	})
+
+	t.Run("legacy .pb sidecar is full", func(t *testing.T) {
+		root := t.TempDir()
+		id := "44444444-5555-6666-7777-888888888888"
+		mustMkdir(t, filepath.Join(root, "conversations"))
+		pbPath := filepath.Join(root, "conversations", id+".pb")
+		mustWrite(t, pbPath, []byte("pb-stub"))
+		writeAntigravityTestSidecar(t, root, id, 2)
+
+		sess, _, err := parseAntigravityCLITestSession(t, pbPath, "", "test-machine")
+		require.NoError(t, err)
+		assert.Equal(t, TranscriptFidelityFull, sess.TranscriptFidelity)
+	})
+
+	t.Run("history+brain only is summary", func(t *testing.T) {
+		root := t.TempDir()
+		id := "55555555-6666-7777-8888-999999999999"
+		mustMkdir(t, filepath.Join(root, "conversations"))
+		pbPath := filepath.Join(root, "conversations", id+".pb")
+		mustWrite(t, pbPath, []byte("pb-stub")) // no sidecar, no key
+		mustWrite(t, filepath.Join(root, "history.jsonl"),
+			[]byte(`{"display":"hi","timestamp":1779000000000,`+
+				`"workspace":"/tmp/p","conversationId":"`+id+`"}`))
+
+		sess, _, err := parseAntigravityCLITestSession(t, pbPath, "", "test-machine")
+		require.NoError(t, err)
+		assert.Equal(t, TranscriptFidelitySummary, sess.TranscriptFidelity)
+	})
 }

@@ -19,6 +19,7 @@
     Grid2x2Icon,
     LayoutGridIcon,
     LogsIcon,
+    PencilIcon,
     PinIcon,
     TrashIcon,
   } from "../../icons.js";
@@ -359,6 +360,14 @@
         <TrashIcon size="12" strokeWidth="2" aria-hidden="true" />
         {m.nav_trash()}
       </button>
+      <button
+        class="mobile-nav-btn"
+        class:active={router.route === "recent-edits"}
+        onclick={() => mobileNav("recent-edits")}
+      >
+        <PencilIcon size="12" strokeWidth="2" aria-hidden="true" />
+        {m.nav_recent_edits()}
+      </button>
     </nav>
     {@render sidebar()}
   </aside>
@@ -417,6 +426,7 @@
   .resize-handle {
     position: relative;
     flex-shrink: 0;
+    /* kit-ui-check-ignore: pointer-capture resizer with persisted width and test contract predates kit-ui SplitResizeHandle; swapping (and gaining keyboard resize) is tracked as a follow-up */
     cursor: col-resize;
     touch-action: none;
     transition: background-color 120ms ease;
@@ -490,12 +500,13 @@
   }
 
   :global(body.sidebar-resizing) {
+    /* kit-ui-check-ignore: body-level drag cursor for the sidebar resizer above */
     cursor: col-resize;
     user-select: none;
     -webkit-user-select: none;
   }
 
-  @media (max-width: 767px) {
+  @media (max-width: 760px) {
     .sidebar {
       position: fixed;
       top: var(--header-height, 40px);
@@ -514,6 +525,7 @@
     .sidebar-backdrop {
       display: block;
       position: fixed;
+      /* kit-ui-check-ignore: scrim behind the mobile sidebar drawer, not a dialog — Modal's centered panel/focus-trap chrome does not apply */
       inset: 0;
       background: var(--overlay-bg);
       z-index: 49;
