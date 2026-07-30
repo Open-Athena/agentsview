@@ -94,9 +94,24 @@ git commit                              # merge commit banks the resolution
   generated models under `frontend/src/lib/api/generated/`); prefer regenerating
   over hand-merging generated files.
 
+## Progress
+
+- **Waypoint A — DONE** (`f520e3d0`, merges `fe5f6a93`). Huma migration +
+  generated-client frontend re-port. Backend: Huma registration adopted;
+  private-toggle + longest-prompts re-homed as Huma routes; `session_mgmt.go`
+  deleted; `BuildUsageSummary` kept as shared builder (`humaUsageSummary`
+  DRY'd onto it). Frontend: regenerated OpenAPI client (now emits
+  `MessagesService.getApiV1MessagesLongest`,
+  `SessionsService.patchApiV1SessionsIdPrivate`); usage/sessions stores +
+  App.svelte deltas re-applied; fork-local `api/view.ts` for the snapshot-only
+  `/view/meta`. Added `vitest.setup.ts` localStorage polyfill (Node 26 native
+  `localStorage` shadows jsdom). All green: go build/vet/test, svelte-check,
+  1171 vitest tests, `make build`.
+
 ## Acceptance
 
-- [ ] Waypoints A-E each merged with `make build && make test` green
+- [x] Waypoint A merged with `make build && make test` green
+- [ ] Waypoints B-E each merged with `make build && make test` green
 - [ ] Private-view toggle works post-Huma (PATCH route re-homed, e2e passes)
 - [ ] Snapshot export still produces a working hosted dashboard (browser-verified)
 - [ ] Snapshot usage/cost reconciled onto microdollars (no float pricing left in
