@@ -1024,7 +1024,8 @@ func (e *Engine) classifyOnePath(
 		}
 	}
 
-	// Antigravity CLI: <root>/conversations|implicit/<uuid>.pb (+ trajectory.json sidecars)
+	// Antigravity CLI: <root>/conversations/<uuid>.db or
+	// <root>/conversations|implicit/<uuid>.pb (+ trajectory.json sidecars)
 	for _, agDir := range e.agentDirs[parser.AgentAntigravityCLI] {
 		if agDir == "" {
 			continue
@@ -1037,13 +1038,20 @@ func (e *Engine) classifyOnePath(
 				continue
 			}
 			name := parts[1]
-			var pbPath string
+			var sourcePath string
 			var id string
 			if strings.HasSuffix(name, ".pb") {
-				pbPath = path
+				sourcePath = path
 				id = strings.TrimSuffix(name, ".pb")
+			} else if strings.HasSuffix(name, ".db") ||
+				strings.HasSuffix(name, ".db-wal") ||
+				strings.HasSuffix(name, ".db-shm") {
+				name = strings.TrimSuffix(name, "-wal")
+				name = strings.TrimSuffix(name, "-shm")
+				sourcePath = filepath.Join(agDir, parts[0], name)
+				id = strings.TrimSuffix(name, ".db")
 			} else if strings.HasSuffix(name, ".trajectory.json") {
-				pbPath = strings.TrimSuffix(path, ".trajectory.json") + ".pb"
+				sourcePath = strings.TrimSuffix(path, ".trajectory.json") + ".pb"
 				id = strings.TrimSuffix(name, ".trajectory.json")
 			} else {
 				continue
@@ -1051,11 +1059,18 @@ func (e *Engine) classifyOnePath(
 			if !parser.IsValidSessionID(id) {
 				continue
 			}
-			if _, err := os.Stat(pbPath); err != nil {
+			if parts[0] == "conversations" &&
+				strings.HasSuffix(sourcePath, ".pb") {
+				dbPath := filepath.Join(agDir, parts[0], id+".db")
+				if _, err := os.Stat(dbPath); err == nil {
+					sourcePath = dbPath
+				}
+			}
+			if _, err := os.Stat(sourcePath); err != nil {
 				continue
 			}
 			return parser.DiscoveredFile{
-				Path:  pbPath,
+				Path:  sourcePath,
 				Agent: parser.AgentAntigravityCLI,
 			}, true
 		}
@@ -1391,11 +1406,17 @@ func (e *Engine) ResyncAll(
 		stats.TotalSessions > 0 &&
 		stats.Failed == 0 &&
 		(oldFileSessions == 0 || trashedCopied > 0)
+	excludedOnly := stats.Synced == 0 &&
+		stats.TotalSessions > 0 &&
+		stats.Failed == 0 &&
+		stats.parserExcludedFiles > 0 &&
+		stats.filesOK == stats.parserExcludedFiles
 	abortSwap := stats.Aborted ||
 		emptyDiscovery ||
 		(stats.Synced == 0 &&
 			stats.TotalSessions > 0 &&
-			!preservedOnly) ||
+			!preservedOnly &&
+			!excludedOnly) ||
 		(stats.Failed > 0 && stats.Failed > stats.filesOK)
 	if abortSwap {
 		log.Printf(
@@ -1481,7 +1502,9 @@ func (e *Engine) ResyncAll(
 	// Copy orphaned sessions (source files gone) from the
 	// old DB so archived data is preserved. Failure aborts
 	// the swap to avoid losing archived sessions.
-	orphaned, err := newDB.CopyOrphanedDataFrom(origPath)
+	orphaned, err := newDB.CopyOrphanedDataFromExcluding(
+		origPath, stats.parserExcludedIDs,
+	)
 	if err != nil {
 		log.Printf("resync: copy orphaned sessions: %v", err)
 		stats.Aborted = true
@@ -2561,7 +2584,7 @@ func (e *Engine) startWorkers(
 					continue
 				}
 				results <- syncJob{
-					processResult: e.processFile(file),
+					processResult: e.processFile(ctx, file),
 					path:          file.Path,
 				}
 			}
@@ -2637,7 +2660,27 @@ func (e *Engine) collectAndBatch(
 			}
 			continue
 		}
+		excludedSessionIDs := e.applyIDPrefixToSessionIDs(
+			r.excludedSessionIDs,
+		)
+		if len(excludedSessionIDs) > 0 {
+			if _, err := e.db.DeleteParserExcludedSessions(
+				excludedSessionIDs,
+			); err != nil {
+				log.Printf("delete parser-excluded sessions: %v", err)
+				stats.RecordFailed()
+				continue
+			}
+			stats.parserExcludedIDs = append(
+				stats.parserExcludedIDs,
+				excludedSessionIDs...,
+			)
+		}
 		if len(r.results) == 0 && r.incremental == nil {
+			if len(r.excludedSessionIDs) > 0 {
+				stats.filesOK++
+				stats.parserExcludedFiles++
+			}
 			if r.cacheSkip {
 				e.cacheSkip(r.path, r.mtime)
 			}
@@ -2669,6 +2712,7 @@ func (e *Engine) collectAndBatch(
 					sess:         pr.Session,
 					msgs:         pr.Messages,
 					usageEvents:  pr.UsageEvents,
+					needsRetry:   r.needsRetry,
 					forceReplace: r.forceReplace,
 				})
 			}
@@ -2742,12 +2786,14 @@ type incrementalUpdate struct {
 }
 
 type processResult struct {
-	results     []parser.ParseResult
-	skip        bool
-	mtime       int64
-	err         error
-	incremental *incrementalUpdate
-	cacheSkip   bool
+	results            []parser.ParseResult
+	excludedSessionIDs []string
+	skip               bool
+	mtime              int64
+	err                error
+	incremental        *incrementalUpdate
+	cacheSkip          bool
+	needsRetry         bool
 	// forceReplace requests full message replacement on write,
 	// even when the existing rows would otherwise be left in
 	// place. Set when a fall-through to full parse is recovering
@@ -2758,6 +2804,7 @@ type processResult struct {
 }
 
 func (e *Engine) processFile(
+	ctx context.Context,
 	file parser.DiscoveredFile,
 ) processResult {
 
@@ -2813,7 +2860,7 @@ func (e *Engine) processFile(
 	var res processResult
 	switch file.Agent {
 	case parser.AgentClaude:
-		res = e.processClaude(file, info)
+		res = e.processClaude(ctx, file, info)
 	case parser.AgentCodex:
 		res = e.processCodex(file, info)
 	case parser.AgentCopilot:
@@ -2827,7 +2874,7 @@ func (e *Engine) processFile(
 	case parser.AgentCursor:
 		res = e.processCursor(file, info)
 	case parser.AgentIflow:
-		res = e.processIflow(file, info)
+		res = e.processIflow(ctx, file, info)
 	case parser.AgentAmp:
 		res = e.processAmp(file, info)
 	case parser.AgentZencoder:
@@ -3036,6 +3083,7 @@ func (f fakeSnapshotInfo) IsDir() bool { return false }
 func (f fakeSnapshotInfo) Sys() any    { return nil }
 
 func (e *Engine) processClaude(
+	ctx context.Context,
 	file parser.DiscoveredFile, info os.FileInfo,
 ) processResult {
 
@@ -3043,7 +3091,7 @@ func (e *Engine) processClaude(
 
 	if e.shouldSkipFile(sessionID, info) {
 		sess, _ := e.db.GetSession(
-			context.Background(), e.idPrefix+sessionID,
+			ctx, e.idPrefix+sessionID,
 		)
 		if sess != nil &&
 			sess.Project != "" &&
@@ -3072,14 +3120,14 @@ func (e *Engine) processClaude(
 		file.Path,
 	)
 	if cwd != "" {
-		if p := parser.ExtractProjectFromCwdWithBranch(
-			cwd, gitBranch,
+		if p := parser.ExtractProjectFromCwdWithBranchContext(
+			ctx, cwd, gitBranch,
 		); p != "" {
 			project = p
 		}
 	}
 
-	results, err := parser.ParseClaudeSession(
+	results, excludedIDs, err := parser.ParseClaudeSessionWithExclusions(
 		file.Path, project, e.machine,
 	)
 	if err != nil {
@@ -3101,7 +3149,11 @@ func (e *Engine) processClaude(
 
 	parser.InferRelationshipTypes(results)
 
-	return processResult{results: results, forceReplace: forceReplace}
+	return processResult{
+		results:            results,
+		excludedSessionIDs: excludedIDs,
+		forceReplace:       forceReplace,
+	}
 }
 
 // incrementalParseFunc reads new JSONL lines from a file
@@ -3480,7 +3532,7 @@ func (e *Engine) processCopilot(
 		return processResult{skip: true}
 	}
 
-	sess, msgs, err := parser.ParseCopilotSession(
+	sess, msgs, usageEvents, err := parser.ParseCopilotSession(
 		file.Path, e.machine,
 	)
 	if err != nil {
@@ -3501,7 +3553,7 @@ func (e *Engine) processCopilot(
 
 	return processResult{
 		results: []parser.ParseResult{
-			{Session: *sess, Messages: msgs},
+			{Session: *sess, Messages: msgs, UsageEvents: usageEvents},
 		},
 	}
 }
@@ -4029,13 +4081,15 @@ func (e *Engine) processAntigravity(
 }
 
 func (e *Engine) processAntigravityCLI(
-	file parser.DiscoveredFile, info os.FileInfo,
+	file parser.DiscoveredFile, effectiveInfo os.FileInfo,
 ) processResult {
-	if e.shouldSkipByPath(file.Path, info) {
+	// processFile supplies AntigravityCLIFileInfo here, so .db WAL/SHM
+	// sidecars and .pb trajectory sidecars participate in skip checks.
+	if e.shouldSkipByPath(file.Path, effectiveInfo) {
 		return processResult{skip: true}
 	}
 
-	sess, msgs, err := parser.ParseAntigravityCLISession(
+	sess, msgs, parseStatus, err := parser.ParseAntigravityCLISessionWithStatus(
 		file.Path, file.Project, e.machine,
 	)
 	if err != nil {
@@ -4051,8 +4105,12 @@ func (e *Engine) processAntigravityCLI(
 	}
 
 	return processResult{
+		needsRetry: parseStatus.NeedsRetry,
 		results: []parser.ParseResult{
-			{Session: *sess, Messages: msgs},
+			{
+				Session:  *sess,
+				Messages: msgs,
+			},
 		},
 	}
 }
@@ -4232,6 +4290,7 @@ func validateCursorContainment(
 }
 
 func (e *Engine) processIflow(
+	ctx context.Context,
 	file parser.DiscoveredFile, info os.FileInfo,
 ) processResult {
 	// Extract session ID from filename: session-<uuid>.jsonl
@@ -4239,7 +4298,7 @@ func (e *Engine) processIflow(
 
 	if e.shouldSkipFile(sessionID, info) {
 		sess, _ := e.db.GetSession(
-			context.Background(), e.idPrefix+sessionID,
+			ctx, e.idPrefix+sessionID,
 		)
 		if sess != nil &&
 			sess.Project != "" &&
@@ -4254,8 +4313,8 @@ func (e *Engine) processIflow(
 		file.Path,
 	)
 	if cwd != "" {
-		if p := parser.ExtractProjectFromCwdWithBranch(
-			cwd, gitBranch,
+		if p := parser.ExtractProjectFromCwdWithBranchContext(
+			ctx, cwd, gitBranch,
 		); p != "" {
 			project = p
 		}
@@ -4368,7 +4427,21 @@ type pendingWrite struct {
 	sess         parser.ParsedSession
 	msgs         []parser.ParsedMessage
 	usageEvents  []parser.ParsedUsageEvent
+	needsRetry   bool
 	forceReplace bool
+}
+
+func dataVersionForWrite(pw pendingWrite) int {
+	if !pw.needsRetry {
+		return db.CurrentDataVersion()
+	}
+	// Keep successfully written fallback content visible while
+	// forcing the next sync to retry the higher-resolution source.
+	v := db.CurrentDataVersion() - 1
+	if v < 0 {
+		return 0
+	}
+	return v
 }
 
 type worktreeProjectResolver func(
@@ -4462,7 +4535,7 @@ func (e *Engine) writeBatch(
 			continue
 		}
 
-		replaceMessages := forceReplace || pw.forceReplace ||
+		replaceMessages := forceReplace || pw.forceReplace || pw.needsRetry ||
 			stale || pw.sess.Agent == parser.AgentOpenCode ||
 			pw.sess.Agent == parser.AgentAntigravityCLI
 
@@ -4499,7 +4572,7 @@ func (e *Engine) writeBatch(
 		// won't leave the session marked at the current
 		// parser version with stale messages.
 		if err := e.db.SetSessionDataVersion(
-			s.ID, db.CurrentDataVersion(),
+			s.ID, dataVersionForWrite(pw),
 		); err != nil {
 			log.Printf(
 				"set data_version for %s: %v", s.ID, err,
@@ -4570,7 +4643,7 @@ func (e *Engine) writeBatchBulk(
 		if !ok {
 			continue
 		}
-		replaceMessages := forceReplace || pw.forceReplace ||
+		replaceMessages := forceReplace || pw.forceReplace || pw.needsRetry ||
 			pw.sess.Agent == parser.AgentOpenCode ||
 			pw.sess.Agent == parser.AgentAntigravityCLI
 		tScan := time.Now()
@@ -4582,7 +4655,7 @@ func (e *Engine) writeBatchBulk(
 			UsageEvents:     toDBUsageEvents(s.ID, pw.usageEvents),
 			Signals:         update,
 			Findings:        findings,
-			DataVersion:     db.CurrentDataVersion(),
+			DataVersion:     dataVersionForWrite(pw),
 			ReplaceMessages: replaceMessages,
 		})
 		if pw.sess.File.Path != "" {
@@ -4784,7 +4857,7 @@ func (e *Engine) writeSessionFullWithResolver(
 	// See writeBatch for why data_version is bumped here
 	// rather than inside UpsertSession.
 	if err := e.db.SetSessionDataVersion(
-		s.ID, db.CurrentDataVersion(),
+		s.ID, dataVersionForWrite(pw),
 	); err != nil {
 		log.Printf(
 			"set data_version for %s: %v", s.ID, err,
@@ -4951,6 +5024,21 @@ func countToolResultEvents(calls []db.ToolCall) int {
 		total += len(call.ResultEvents)
 	}
 	return total
+}
+
+func (e *Engine) applyIDPrefixToSessionIDs(ids []string) []string {
+	if e.idPrefix == "" || len(ids) == 0 {
+		return ids
+	}
+	prefixed := make([]string, len(ids))
+	for i, id := range ids {
+		if id == "" || strings.HasPrefix(id, e.idPrefix) {
+			prefixed[i] = id
+			continue
+		}
+		prefixed[i] = e.idPrefix + id
+	}
+	return prefixed
 }
 
 // applyRemoteRewrites prefixes session IDs and rewrites
@@ -5342,6 +5430,14 @@ func (e *Engine) SourceMtime(sessionID string) int64 {
 // SyncSingleSession re-syncs a single session by its ID and
 // uses the existing DB project as fallback where applicable.
 func (e *Engine) SyncSingleSession(sessionID string) (err error) {
+	return e.SyncSingleSessionContext(context.Background(), sessionID)
+}
+
+// SyncSingleSessionContext re-syncs a single session by its ID using ctx for
+// cancellable git-backed project resolution and database reads on this path.
+func (e *Engine) SyncSingleSessionContext(
+	ctx context.Context, sessionID string,
+) (err error) {
 	e.syncMu.Lock()
 	preserved := false
 	// Defers run LIFO: unlock runs first (releasing syncMu), then
@@ -5409,7 +5505,7 @@ func (e *Engine) SyncSingleSession(sessionID string) (err error) {
 	}
 	if def.Type == parser.AgentHermes {
 		hermesProject := ""
-		if sess, _ := e.db.GetSession(context.Background(), sessionID); sess != nil &&
+		if sess, _ := e.db.GetSession(ctx, sessionID); sess != nil &&
 			sess.Project != "" && !parser.NeedsProjectReparse(sess.Project) {
 			hermesProject = sess.Project
 		}
@@ -5441,7 +5537,7 @@ func (e *Engine) SyncSingleSession(sessionID string) (err error) {
 	switch agent {
 	case parser.AgentClaude:
 		// Try to preserve existing project from DB first
-		if sess, _ := e.db.GetSession(context.Background(), sessionID); sess != nil &&
+		if sess, _ := e.db.GetSession(ctx, sessionID); sess != nil &&
 			sess.Project != "" &&
 			!parser.NeedsProjectReparse(sess.Project) {
 			file.Project = sess.Project
@@ -5468,7 +5564,7 @@ func (e *Engine) SyncSingleSession(sessionID string) (err error) {
 	case parser.AgentIflow:
 		// path is <iflowDir>/<project>/session-<uuid>.jsonl
 		// Extract project dir name from parent directory
-		if sess, _ := e.db.GetSession(context.Background(), sessionID); sess != nil &&
+		if sess, _ := e.db.GetSession(ctx, sessionID); sess != nil &&
 			sess.Project != "" &&
 			!parser.NeedsProjectReparse(sess.Project) {
 			file.Project = sess.Project
@@ -5498,7 +5594,7 @@ func (e *Engine) SyncSingleSession(sessionID string) (err error) {
 		}
 	}
 
-	res := e.processFile(file)
+	res := e.processFile(ctx, file)
 	if res.err != nil {
 		if res.cacheSkip && res.mtime != 0 {
 			e.cacheSkip(path, res.mtime)
@@ -5528,6 +5624,7 @@ func (e *Engine) SyncSingleSession(sessionID string) (err error) {
 				sess:        pr.Session,
 				msgs:        pr.Messages,
 				usageEvents: pr.UsageEvents,
+				needsRetry:  res.needsRetry,
 			},
 		); err != nil &&
 			!isIntentionalSessionSkip(err) &&

@@ -2,14 +2,12 @@ import type {
   UsageSummaryResponse,
   TopUsageSessionsResponse,
   LongestUserPromptsResponse,
-  UsageParams,
 } from "../api/types/usage.js";
-import {
-  getUsageSummary,
-  getUsageTopSessions,
-  getLongestUserPrompts,
-} from "../api/client.js";
+import { UsageService, MessagesService } from "../api/generated/index";
+import { callGenerated } from "../api/runtime.js";
 import { sessions } from "./sessions.svelte.js";
+
+type UsageParams = Parameters<typeof UsageService.getApiV1UsageSummary>[0];
 
 export type GroupBy = "project" | "model" | "agent";
 export type TimeSeriesView = "stacked-area" | "bars" | "lines";
@@ -214,14 +212,14 @@ class UsageStore {
       project: sessionFilters.project || undefined,
       machine: sessionFilters.machine || undefined,
       agent: sessionFilters.agent || undefined,
-      min_user_messages:
+      minUserMessages:
         sessionFilters.minUserMessages > 0
           ? sessionFilters.minUserMessages
           : undefined,
-      include_one_shot: sessionFilters.includeOneShot,
-      include_automated:
+      includeOneShot: sessionFilters.includeOneShot,
+      includeAutomated:
         sessionFilters.includeAutomated || undefined,
-      active_since: sessionFilters.recentlyActive
+      activeSince: sessionFilters.recentlyActive
         ? new Date(
             Date.now() - 24 * 60 * 60 * 1000,
           ).toISOString()
@@ -231,12 +229,12 @@ class UsageStore {
       sessionFilters.hideUnknownProject &&
       sessionFilters.project !== "unknown"
     ) {
-      p.exclude_project = joinCsvParts(
+      p.excludeProject = joinCsvParts(
         this.excludedProjects,
         "unknown",
       );
     } else if (this.excludedProjects) {
-      p.exclude_project = this.excludedProjects;
+      p.excludeProject = this.excludedProjects;
     }
     if (this.selectedModels) {
       p.model = this.selectedModels;
@@ -408,7 +406,9 @@ class UsageStore {
     // error state in place until we have a definitive result.
     if (isFirstLoad) this.errors.summary = null;
     try {
-      const data = await getUsageSummary(this.baseParams());
+      const data = await callGenerated(() =>
+        UsageService.getApiV1UsageSummary(this.baseParams()),
+      ) as unknown as UsageSummaryResponse;
       if (this.versions.summary === v) {
         this.summary = data;
         this.errors.summary = null;
@@ -438,7 +438,9 @@ class UsageStore {
     if (isFirstLoad) this.loading.topSessions = true;
     if (isFirstLoad) this.errors.topSessions = null;
     try {
-      const data = await getUsageTopSessions(this.baseParams());
+      const data = await callGenerated(() =>
+        UsageService.getApiV1UsageTopSessions(this.baseParams()),
+      ) as unknown as TopUsageSessionsResponse;
       if (this.versions.topSessions === v) {
         this.topSessions = data;
         this.errors.topSessions = null;
@@ -465,13 +467,15 @@ class UsageStore {
     if (isFirstLoad) this.loading.longestPrompts = true;
     if (isFirstLoad) this.errors.longestPrompts = null;
     try {
-      // Only project + limit are honored server-side, but we
-      // pass the full baseParams() so the project filter from
-      // the session filter dropdown flows through naturally.
-      const data = await getLongestUserPrompts({
-        ...this.baseParams(),
-        limit: 10,
-      });
+      // Only project + limit are honored server-side, but we pass
+      // the full baseParams() so the project filter from the session
+      // filter dropdown flows through naturally.
+      const data = await callGenerated(() =>
+        MessagesService.getApiV1MessagesLongest({
+          ...this.baseParams(),
+          limit: 10,
+        }),
+      ) as unknown as LongestUserPromptsResponse;
       if (this.versions.longestPrompts === v) {
         this.longestPrompts = data ?? [];
         this.errors.longestPrompts = null;

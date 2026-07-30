@@ -7,8 +7,8 @@ import {
   vi,
 } from "vitest";
 
-vi.mock("../api/client.js", () => ({
-  getUsageSummary: vi.fn().mockResolvedValue({
+const usageServiceMocks = vi.hoisted(() => ({
+  getApiV1UsageSummary: vi.fn().mockResolvedValue({
     from: "2024-01-01",
     to: "2024-01-31",
     totals: {
@@ -36,7 +36,19 @@ vi.mock("../api/client.js", () => ({
       savingsVsUncached: 0,
     },
   }),
-  getUsageTopSessions: vi.fn().mockResolvedValue([]),
+  getApiV1UsageTopSessions: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock("../api/runtime.js", () => ({
+  configureGeneratedClient: vi.fn(),
+  callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
+}));
+
+vi.mock("../api/generated/index", () => ({
+  UsageService: {
+    getApiV1UsageSummary: usageServiceMocks.getApiV1UsageSummary,
+    getApiV1UsageTopSessions: usageServiceMocks.getApiV1UsageTopSessions,
+  },
 }));
 
 const TOGGLES_KEY = "usage-toggles";
@@ -173,7 +185,6 @@ describe("UsageStore session filter params", () => {
   it("passes shared session filters to usage endpoints", async () => {
     const { usage } = await loadStore();
     const { sessions } = await import("./sessions.svelte.js");
-    const api = await import("../api/client.js");
 
     sessions.filters.project = "proj-a";
     sessions.filters.machine = "host-a,host-b";
@@ -185,27 +196,27 @@ describe("UsageStore session filter params", () => {
 
     await usage.fetchAll();
 
-    expect(api.getUsageSummary).toHaveBeenLastCalledWith(
+    expect(usageServiceMocks.getApiV1UsageSummary).toHaveBeenLastCalledWith(
       expect.objectContaining({
         project: "proj-a",
         machine: "host-a,host-b",
         agent: "claude,codex",
-        min_user_messages: 5,
-        include_one_shot: false,
-        include_automated: true,
+        minUserMessages: 5,
+        includeOneShot: false,
+        includeAutomated: true,
       }),
     );
-    const params = vi.mocked(api.getUsageSummary).mock.lastCall?.[0];
-    expect(params?.active_since).toEqual(expect.any(String));
+    const params = usageServiceMocks.getApiV1UsageSummary.mock.lastCall?.[0];
+    expect(params?.activeSince).toEqual(expect.any(String));
 
-    expect(api.getUsageTopSessions).toHaveBeenLastCalledWith(
+    expect(usageServiceMocks.getApiV1UsageTopSessions).toHaveBeenLastCalledWith(
       expect.objectContaining({
         project: "proj-a",
         machine: "host-a,host-b",
         agent: "claude,codex",
-        min_user_messages: 5,
-        include_one_shot: false,
-        include_automated: true,
+        minUserMessages: 5,
+        includeOneShot: false,
+        includeAutomated: true,
       }),
     );
   });

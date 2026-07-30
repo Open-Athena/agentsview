@@ -1,4 +1,4 @@
-import { getViewMeta, type ViewMeta } from "../api/client.js";
+import { getViewMeta, type ViewMeta } from "../api/view.js";
 import { SNAPSHOT } from "../utils/snapshot.js";
 import { setOrgTheme } from "../utils/projectColor.js";
 

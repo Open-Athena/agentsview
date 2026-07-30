@@ -204,8 +204,6 @@ func testDB(t *testing.T) *DB {
 }
 
 // Ptr returns a pointer to v.
-//
-//go:fix inline
 func Ptr[T any](v T) *T { return new(v) }
 
 // insertSession creates and upserts a session with sensible

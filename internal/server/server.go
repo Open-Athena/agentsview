@@ -15,12 +15,16 @@ import (
 	gosync "sync"
 	"time"
 
+	"github.com/danielgtaylor/huma/v2"
+	"github.com/danielgtaylor/huma/v2/adapters/humago"
+
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/insight"
 	"go.kenn.io/agentsview/internal/service"
 	"go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/web"
+	"go.kenn.io/kit/daemon"
 )
 
 // VersionInfo holds build-time version metadata.
@@ -31,6 +35,8 @@ type VersionInfo struct {
 	ReadOnly  bool   `json:"read_only,omitempty"`
 }
 
+const daemonService = "agentsview"
+
 // Server is the HTTP server that serves the SPA and REST API.
 type Server struct {
 	mu          gosync.RWMutex
@@ -40,6 +46,7 @@ type Server struct {
 	sessions    service.SessionService
 	broadcaster *Broadcaster
 	mux         *http.ServeMux
+	api         huma.API
 	httpSrv     *http.Server
 	version     VersionInfo
 	dataDir     string
@@ -201,158 +208,38 @@ func WithGenerateStreamFunc(f insight.GenerateStreamFunc) Option {
 	}
 }
 
+func (s *Server) humaConfig() huma.Config {
+	version := s.version.Version
+	if version == "" {
+		version = "dev"
+	}
+	cfg := huma.DefaultConfig("AgentsView API", version)
+	cfg.Info.Description = "HTTP API for browsing, searching, syncing, and managing local agent sessions."
+	cfg.OpenAPIPath = "/api/openapi"
+	cfg.DocsPath = ""
+	cfg.SchemasPath = ""
+	cfg.CreateHooks = nil
+	cfg.Components.Schemas = huma.NewMapRegistry(
+		"#/components/schemas/",
+		agentsViewSchemaNamer,
+	)
+	if s.basePath != "" {
+		cfg.Servers = []*huma.Server{{
+			URL:         s.basePath,
+			Description: "Configured reverse-proxy base path",
+		}}
+	}
+	return cfg
+}
+
 func (s *Server) routes() {
-	// API v1 routes
-	s.mux.Handle("GET /api/v1/sessions", s.withTimeout(s.handleListSessions))
-	s.mux.Handle(
-		"GET /api/v1/sessions/sidebar-index",
-		s.withTimeout(s.handleSidebarSessionIndex),
-	)
-	s.mux.Handle("GET /api/v1/sessions/{id}", s.withTimeout(s.handleGetSession))
-	s.mux.Handle(
-		"GET /api/v1/sessions/{id}/messages", s.withTimeout(s.handleGetMessages),
-	)
-	s.mux.Handle(
-		"GET /api/v1/sessions/{id}/tool-calls", s.withTimeout(s.handleToolCalls),
-	)
-	s.mux.Handle(
-		"GET /api/v1/sessions/{id}/children", s.withTimeout(s.handleGetChildSessions),
-	)
-	s.mux.Handle(
-		"GET /api/v1/sessions/{id}/activity", s.withTimeout(s.handleGetSessionActivity),
-	)
-	s.mux.Handle(
-		"GET /api/v1/sessions/{id}/timing", s.withTimeout(s.handleSessionTiming),
-	)
-	// SSE: Do not use timeout, as this is a long-lived connection.
-	s.mux.HandleFunc(
-		"GET /api/v1/sessions/{id}/watch", s.handleWatchSession,
-	)
-	// SSE: Do not use timeout, as this is a long-lived connection.
-	s.mux.HandleFunc(
-		"GET /api/v1/events", s.handleEvents,
-	)
-	// Export: Do not use timeout handler to support large downloads and avoid buffering.
-	s.mux.Handle(
-		"GET /api/v1/sessions/{id}/export", http.HandlerFunc(s.handleExportSession),
-	)
-	s.mux.Handle(
-		"GET /api/v1/sessions/{id}/md", http.HandlerFunc(s.handleMarkdownSession),
-	)
-	s.mux.Handle(
-		"POST /api/v1/sessions/{id}/publish", s.withTimeout(s.handlePublishSession),
-	)
-	s.mux.Handle(
-		"POST /api/v1/sessions/{id}/resume", s.withTimeout(s.handleResumeSession),
-	)
-	s.mux.Handle("GET /api/v1/openers", s.withTimeout(s.handleListOpeners))
-	s.mux.Handle("GET /api/v1/sessions/{id}/directory", s.withTimeout(s.handleGetSessionDir))
-	s.mux.Handle("GET /api/v1/sessions/{id}/search", s.withTimeout(s.handleSearchSession))
-	s.mux.Handle("POST /api/v1/sessions/{id}/open", s.withTimeout(s.handleOpenSession))
-	s.mux.Handle(
-		"POST /api/v1/sessions/sync", s.withTimeout(s.handleSyncSession),
-	)
-	s.mux.Handle(
-		"POST /api/v1/sessions/upload", s.withTimeout(s.handleUploadSession),
-	)
-	s.mux.Handle("GET /api/v1/analytics/summary", s.withTimeout(s.handleAnalyticsSummary))
-	s.mux.Handle("GET /api/v1/analytics/activity", s.withTimeout(s.handleAnalyticsActivity))
-	s.mux.Handle("GET /api/v1/analytics/heatmap", s.withTimeout(s.handleAnalyticsHeatmap))
-	s.mux.Handle("GET /api/v1/analytics/projects", s.withTimeout(s.handleAnalyticsProjects))
-	s.mux.Handle("GET /api/v1/analytics/hour-of-week", s.withTimeout(s.handleAnalyticsHourOfWeek))
-	s.mux.Handle("GET /api/v1/analytics/sessions", s.withTimeout(s.handleAnalyticsSessionShape))
-	s.mux.Handle("GET /api/v1/analytics/velocity", s.withTimeout(s.handleAnalyticsVelocity))
-	s.mux.Handle("GET /api/v1/analytics/tools", s.withTimeout(s.handleAnalyticsTools))
-	s.mux.Handle("GET /api/v1/analytics/top-sessions", s.withTimeout(s.handleAnalyticsTopSessions))
-	s.mux.Handle("GET /api/v1/analytics/signals", s.withTimeout(s.handleAnalyticsSignals))
-	s.mux.Handle("GET /api/v1/trends/terms", s.withTimeout(s.handleTrendsTerms))
-
-	s.mux.Handle("GET /api/v1/usage/summary",
-		s.withTimeout(s.handleUsageSummary))
-	s.mux.Handle("GET /api/v1/usage/top-sessions",
-		s.withTimeout(s.handleUsageTopSessions))
-	s.mux.Handle("GET /api/v1/messages/longest",
-		s.withTimeout(s.handleLongestPrompts))
-
-	s.mux.Handle("GET /api/v1/insights", s.withTimeout(s.handleListInsights))
-	s.mux.Handle("GET /api/v1/insights/{id}", s.withTimeout(s.handleGetInsight))
-	s.mux.Handle("DELETE /api/v1/insights/{id}", s.withTimeout(s.handleDeleteInsight))
-	s.mux.HandleFunc("POST /api/v1/insights/generate", s.handleGenerateInsight)
-
-	s.mux.Handle("GET /api/v1/search", s.withTimeout(s.handleSearch))
-	s.mux.Handle("GET /api/v1/search/content", s.withTimeout(s.handleSearchContent))
-	s.mux.Handle("GET /api/v1/secrets", s.withTimeout(s.handleListSecrets))
-	s.mux.Handle("GET /api/v1/projects", s.withTimeout(s.handleListProjects))
-	s.mux.Handle("GET /api/v1/machines", s.withTimeout(s.handleListMachines))
-	s.mux.Handle("GET /api/v1/agents", s.withTimeout(s.handleListAgents))
-	s.mux.Handle("GET /api/v1/stats", s.withTimeout(s.handleGetStats))
-	s.mux.Handle("GET /api/v1/version", s.withTimeout(s.handleGetVersion))
-	s.mux.HandleFunc("POST /api/v1/secrets/scan", s.handleScanSecrets)
-	s.mux.HandleFunc("POST /api/v1/sync", s.handleTriggerSync)
-	s.mux.HandleFunc("POST /api/v1/resync", s.handleTriggerResync)
-	s.mux.Handle("GET /api/v1/sync/status", s.withTimeout(s.handleSyncStatus))
-	s.mux.Handle("GET /api/v1/config/github", s.withTimeout(s.handleGetGithubConfig))
-	s.mux.Handle(
-		"POST /api/v1/config/github", s.withTimeout(s.handleSetGithubConfig),
-	)
-	s.mux.Handle("GET /api/v1/config/terminal", s.withTimeout(s.handleGetTerminalConfig))
-	s.mux.Handle(
-		"POST /api/v1/config/terminal", s.withTimeout(s.handleSetTerminalConfig),
-	)
-	s.mux.Handle("GET /api/v1/update/check", s.withTimeout(s.handleCheckUpdate))
-
-	s.mux.Handle("GET /api/v1/settings", s.withTimeout(s.handleGetSettings))
-	s.mux.Handle("PUT /api/v1/settings", s.withTimeout(s.handleUpdateSettings))
-	s.mux.Handle("GET /api/v1/settings/worktree-mappings", s.withTimeout(s.handleListWorktreeMappings))
-	s.mux.Handle("POST /api/v1/settings/worktree-mappings", s.withTimeout(s.handleCreateWorktreeMapping))
-	s.mux.Handle("PUT /api/v1/settings/worktree-mappings/{id}", s.withTimeout(s.handleUpdateWorktreeMapping))
-	s.mux.Handle("DELETE /api/v1/settings/worktree-mappings/{id}", s.withTimeout(s.handleDeleteWorktreeMapping))
-	s.mux.Handle("POST /api/v1/settings/worktree-mappings/apply", s.withTimeout(s.handleApplyWorktreeMappings))
-
-	s.mux.Handle("GET /api/v1/starred", s.withTimeout(s.handleListStarred))
-	s.mux.Handle("PUT /api/v1/sessions/{id}/star", s.withTimeout(s.handleStarSession))
-	s.mux.Handle("DELETE /api/v1/sessions/{id}/star", s.withTimeout(s.handleUnstarSession))
-	s.mux.Handle("POST /api/v1/starred/bulk", s.withTimeout(s.handleBulkStar))
-
-	// Session management
-	s.mux.Handle("PATCH /api/v1/sessions/{id}/rename", s.withTimeout(s.handleRenameSession))
-	s.mux.Handle("PATCH /api/v1/sessions/{id}/private", s.withTimeout(s.handleSetSessionPrivate))
-	s.mux.Handle("DELETE /api/v1/sessions/{id}", s.withTimeout(s.handleDeleteSession))
-	s.mux.Handle("POST /api/v1/sessions/{id}/restore", s.withTimeout(s.handleRestoreSession))
-	s.mux.Handle("DELETE /api/v1/sessions/{id}/permanent", s.withTimeout(s.handlePermanentDeleteSession))
-	s.mux.Handle("GET /api/v1/trash", s.withTimeout(s.handleListTrash))
-	s.mux.Handle("DELETE /api/v1/trash", s.withTimeout(s.handleEmptyTrash))
-
-	// Pinned messages
-	s.mux.Handle("GET /api/v1/pins", s.withTimeout(s.handleListPins))
-	s.mux.Handle("GET /api/v1/sessions/{id}/pins", s.withTimeout(s.handleListSessionPins))
-	s.mux.Handle("POST /api/v1/sessions/{id}/messages/{messageId}/pin", s.withTimeout(s.handlePinMessage))
-	s.mux.Handle("DELETE /api/v1/sessions/{id}/messages/{messageId}/pin", s.withTimeout(s.handleUnpinMessage))
-	// Import: no timeout wrapper (large files may take longer).
-	s.mux.HandleFunc(
-		"POST /api/v1/import/claude-ai",
-		s.handleImportClaudeAI,
-	)
-	// ChatGPT import: no timeout wrapper.
-	s.mux.HandleFunc(
-		"POST /api/v1/import/chatgpt",
-		s.handleImportChatGPT,
-	)
-	// Assets: no timeout wrapper (static files).
-	s.mux.HandleFunc(
-		"GET /api/v1/assets/{filename}",
-		s.handleGetAsset,
-	)
+	configureHumaErrors()
+	s.api = humago.New(s.mux, s.humaConfig())
+	s.registerTypedAPIRoutes()
 
 	// SPA fallback: serve embedded frontend
 	// Do not use timeout handler for static assets to avoid buffering.
 	s.mux.Handle("/", http.HandlerFunc(s.handleSPA))
-}
-
-func (s *Server) handleGetVersion(
-	w http.ResponseWriter, _ *http.Request,
-) {
-	writeJSON(w, http.StatusOK, s.version)
 }
 
 func (s *Server) handleSPA(w http.ResponseWriter, r *http.Request) {
@@ -842,7 +729,23 @@ func (s *Server) ListenAndServe() error {
 	s.httpSrv = srv
 	s.mu.Unlock()
 	log.Printf("Starting server at http://%s", addr)
-	return srv.ListenAndServe()
+
+	listenCtx := context.Background()
+	if s.baseCtx != nil {
+		listenCtx = s.baseCtx
+	}
+	ln, err := daemon.Listen(
+		listenCtx,
+		daemon.Endpoint{
+			Network: daemon.NetworkTCP,
+			Address: addr,
+		},
+		daemon.WithRuntimeStore(daemon.RuntimeStore{Dir: s.dataDir}),
+	)
+	if err != nil {
+		return err
+	}
+	return srv.Serve(ln)
 }
 
 // Shutdown gracefully shuts down the HTTP server.

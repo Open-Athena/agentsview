@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"testing"
 
@@ -50,6 +51,22 @@ func TestRootHelpShowsKeySectionsAndCommands(t *testing.T) {
 		assert.NotContains(t, help, unwanted,
 			"root help should not include serve flag %q", unwanted)
 	}
+}
+
+func TestOpenAPICommandEmitsSpec(t *testing.T) {
+	out, err := executeCommand(newRootCommand(), "openapi")
+	require.NoError(t, err, "Execute")
+
+	var spec struct {
+		OpenAPI string                    `json:"openapi"`
+		Paths   map[string]map[string]any `json:"paths"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(out), &spec))
+	assert.Equal(t, "3.1.0", spec.OpenAPI)
+	require.Contains(t, spec.Paths, "/api/v1/sessions")
+	assert.Contains(t, spec.Paths["/api/v1/sessions"], "get")
+	require.Contains(t, spec.Paths, "/api/v1/sessions/{id}/rename")
+	assert.Contains(t, spec.Paths["/api/v1/sessions/{id}/rename"], "patch")
 }
 
 func TestRootNoArgsShowsHelp(t *testing.T) {

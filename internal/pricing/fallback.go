@@ -27,6 +27,13 @@ func FallbackPricing() []ModelPricing {
 			CacheReadPerMTok:       0.50,
 		},
 		{
+			ModelPattern:         "claude-opus-4-7",
+			InputPerMTok:         5.0,
+			OutputPerMTok:        25.0,
+			CacheCreationPerMTok: 6.25,
+			CacheReadPerMTok:     0.50,
+		},
+		{
 			// Opus 4.8 launched at the Opus 4.6/4.7 rates and is
 			// not yet in the LiteLLM catalog, so it ships here so
 			// usage is priced until LiteLLM adds it.
@@ -46,6 +53,12 @@ func FallbackPricing() []ModelPricing {
 			CacheReadPerMTok:       0.10,
 		},
 		// Codex / OpenAI models
+		{
+			ModelPattern:     "gpt-5.5",
+			InputPerMTok:     5.0,
+			OutputPerMTok:    30.0,
+			CacheReadPerMTok: 0.50,
+		},
 		{
 			ModelPattern:  "gpt-5.4",
 			InputPerMTok:  2.50,
@@ -108,6 +121,12 @@ func FallbackPricing() []ModelPricing {
 			CacheCreationPerMTok:   1.0,
 			CacheCreation1hPerMTok: 1.60,
 			CacheReadPerMTok:       0.08,
+		},
+		// Free OpenRouter model
+		{
+			ModelPattern:  "openrouter/owl-alpha",
+			InputPerMTok:  0,
+			OutputPerMTok: 0,
 		},
 	}
 }

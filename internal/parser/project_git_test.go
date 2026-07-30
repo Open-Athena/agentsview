@@ -1,9 +1,12 @@
 package parser
 
 import (
+	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -75,6 +78,124 @@ func TestExtractProjectFromCwd_Git(t *testing.T) {
 				"ExtractProjectFromCwd(%q)", cwd)
 		})
 	}
+}
+
+func TestExtractProjectFromCwdWithBranchContext_GitWorktreeMainRoot(t *testing.T) {
+	skipIfNoGit(t)
+
+	root := t.TempDir()
+	mainRepo := filepath.Join(root, "agentsview")
+	mustMkdirAll(t, mainRepo)
+	gitRun(t, mainRepo, "init", "-q", "-b", "main")
+	gitRun(t, mainRepo, "config", "user.email", "test@example.com")
+	gitRun(t, mainRepo, "config", "user.name", "Test User")
+	gitRun(t, mainRepo, "config", "commit.gpgsign", "false")
+	mustWriteFile(t, filepath.Join(mainRepo, "README.md"), "seed\n")
+	gitRun(t, mainRepo, "add", "-A")
+	gitRun(t, mainRepo, "commit", "-q", "-m", "seed")
+
+	worktree := filepath.Join(root, "agentsview-feature")
+	gitRun(t, mainRepo, "worktree", "add", "-q", "-b", "feature", worktree)
+	subdir := filepath.Join(worktree, "internal", "parser")
+	mustMkdirAll(t, subdir)
+
+	got := ExtractProjectFromCwdWithBranchContext(
+		context.Background(), subdir, "feature",
+	)
+	assert.Equal(t, "agentsview", got,
+		"kit-backed worktree resolution should use the main repo name")
+}
+
+func TestExtractProjectFromCwdPlainRepoDoesNotInvokeGit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a POSIX shell git shim")
+	}
+
+	root := t.TempDir()
+	binDir := filepath.Join(root, "bin")
+	mustMkdirAll(t, binDir)
+	marker := filepath.Join(root, "git-invoked")
+	fakeGit := filepath.Join(binDir, "git")
+	mustWriteFile(t, fakeGit, "#!/bin/sh\n: > "+shellQuote(marker)+"\nexit 1\n")
+	require.NoError(t, os.Chmod(fakeGit, 0o755), "chmod fake git")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	repo := filepath.Join(root, "plain-repo")
+	subdir := filepath.Join(repo, "internal", "parser")
+	mustMkdirAll(t, filepath.Join(repo, ".git"))
+	mustMkdirAll(t, subdir)
+
+	assert.Equal(t, "plain_repo", ExtractProjectFromCwd(subdir))
+	assert.NoFileExists(t, marker, "plain .git directory should resolve without invoking git")
+}
+
+func TestExtractProjectFromCwdFallsBackToGitWhenLocalWalkMisses(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a POSIX shell git shim")
+	}
+
+	root := t.TempDir()
+	binDir := filepath.Join(root, "bin")
+	mustMkdirAll(t, binDir)
+	gitLog := filepath.Join(root, "git-log")
+	repo := filepath.Join(root, "virtual-repo")
+	cwd := filepath.Join(repo, "internal", "parser")
+	mustMkdirAll(t, cwd)
+
+	fakeGit := filepath.Join(binDir, "git")
+	mustWriteFile(t, fakeGit, "#!/bin/sh\n"+
+		"echo \"$*\" >> "+shellQuote(gitLog)+"\n"+
+		"case \"$*\" in\n"+
+		"  'rev-parse --git-dir') echo .git ;;\n"+
+		"  'rev-parse --git-common-dir') echo .git ;;\n"+
+		"  'rev-parse --show-toplevel') echo "+shellQuote(repo)+" ;;\n"+
+		"  *) exit 1 ;;\n"+
+		"esac\n")
+	require.NoError(t, os.Chmod(fakeGit, 0o755), "chmod fake git")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	assert.Equal(t, "virtual_repo",
+		ExtractProjectFromCwdWithBranchContext(context.Background(), cwd, ""))
+	assert.FileExists(t, gitLog, "git fallback should be used when local walk misses")
+}
+
+func TestExtractProjectFromCwdTriesGitBeforeConservativeGitFileFallback(
+	t *testing.T,
+) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a POSIX shell git shim")
+	}
+
+	root := t.TempDir()
+	binDir := filepath.Join(root, "bin")
+	mustMkdirAll(t, binDir)
+	gitLog := filepath.Join(root, "git-log")
+	mainRepo := filepath.Join(root, "main-repo")
+	worktree := filepath.Join(root, "feature-worktree")
+	cwd := filepath.Join(worktree, "internal", "parser")
+	commonDir := filepath.Join(mainRepo, ".git")
+	externalGitDir := filepath.Join(root, "bare-common", "worktrees", "feature")
+	mustMkdirAll(t, commonDir)
+	mustMkdirAll(t, externalGitDir)
+	mustMkdirAll(t, cwd)
+	mustWriteFile(t, filepath.Join(worktree, ".git"),
+		"gitdir: "+externalGitDir+"\n")
+
+	fakeGit := filepath.Join(binDir, "git")
+	mustWriteFile(t, fakeGit, "#!/bin/sh\n"+
+		"echo \"$*\" >> "+shellQuote(gitLog)+"\n"+
+		"case \"$*\" in\n"+
+		"  'rev-parse --git-dir') echo "+shellQuote(externalGitDir)+" ;;\n"+
+		"  'rev-parse --git-common-dir') echo "+shellQuote(commonDir)+" ;;\n"+
+		"  *) exit 1 ;;\n"+
+		"esac\n")
+	require.NoError(t, os.Chmod(fakeGit, 0o755), "chmod fake git")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	assert.Equal(t, "main_repo",
+		ExtractProjectFromCwdWithBranchContext(context.Background(), cwd, ""))
+	assert.FileExists(t, gitLog,
+		"git fallback should run before accepting conservative gitfile root")
 }
 
 func TestExtractProjectFromCwd_DeletedNestedWorktree(t *testing.T) {
@@ -560,4 +681,23 @@ func mustWriteFile(t *testing.T, path, content string) {
 	t.Helper()
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o644),
 		"WriteFile(%q)", path)
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+func skipIfNoGit(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git not available on PATH: %v", err)
+	}
+}
+
+func gitRun(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "git %s: %s", strings.Join(args, " "), out)
 }

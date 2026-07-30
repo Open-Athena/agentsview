@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/server"
 	"golang.org/x/term"
 )
 
@@ -70,6 +71,7 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(newClassifierCommand())
 	root.AddCommand(newSecretsCommand())
 	root.AddCommand(newVersionCommand())
+	root.AddCommand(newOpenAPICommand())
 
 	defaultHelp := root.HelpFunc()
 	root.SetHelpFunc(func(cmd *cobra.Command, args []string) {
@@ -96,6 +98,28 @@ func newServeCommand() *cobra.Command {
 	}
 	config.RegisterServePFlags(cmd.Flags())
 	return cmd
+}
+
+func newOpenAPICommand() *cobra.Command {
+	return &cobra.Command{
+		Use:          "openapi",
+		Short:        "Print OpenAPI 3.1 schema",
+		GroupID:      groupMeta,
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			spec, err := server.OpenAPIJSON(server.VersionInfo{
+				Version:   version,
+				Commit:    commit,
+				BuildDate: buildDate,
+			})
+			if err != nil {
+				return err
+			}
+			_, err = cmd.OutOrStdout().Write(append(spec, '\n'))
+			return err
+		},
+	}
 }
 
 func newSyncCommand() *cobra.Command {
@@ -437,6 +461,7 @@ func newPGCommand() *cobra.Command {
 	cmd.AddCommand(newPGPushCommand())
 	cmd.AddCommand(newPGStatusCommand())
 	cmd.AddCommand(newPGServeCommand())
+	cmd.AddCommand(newPGServiceCommand())
 	return cmd
 }
 
@@ -448,6 +473,14 @@ func newPGPushCommand() *cobra.Command {
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
+			if cfg.Watch {
+				runPGPushWatch(cfg)
+				return
+			}
+			if cmd.Flags().Changed("debounce") || cmd.Flags().Changed("interval") {
+				fmt.Fprintln(os.Stderr,
+					"warning: --debounce and --interval have no effect without --watch")
+			}
 			runPGPush(cfg)
 		},
 	}
@@ -455,6 +488,9 @@ func newPGPushCommand() *cobra.Command {
 	cmd.Flags().StringVar(&cfg.ProjectsFlag, "projects", "", "Comma-separated list of projects to push (inclusive)")
 	cmd.Flags().StringVar(&cfg.ExcludeProjects, "exclude-projects", "", "Comma-separated list of projects to exclude from push")
 	cmd.Flags().BoolVar(&cfg.AllProjects, "all-projects", false, "Ignore configured project filters for this run")
+	cmd.Flags().BoolVar(&cfg.Watch, "watch", false, "Run continuously, pushing on change plus a periodic floor")
+	cmd.Flags().DurationVar(&cfg.Debounce, "debounce", defaultWatchDebounce, "Coalesce window after a change before pushing (--watch only)")
+	cmd.Flags().DurationVar(&cfg.Interval, "interval", defaultWatchInterval, "Periodic floor push interval (--watch only)")
 	return cmd
 }
 

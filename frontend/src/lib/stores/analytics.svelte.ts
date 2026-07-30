@@ -8,27 +8,27 @@ import type {
   VelocityResponse,
   ToolsAnalyticsResponse,
   TopSessionsResponse,
-  Granularity,
-  HeatmapMetric,
-  TopSessionsMetric,
   SignalsAnalyticsResponse,
 } from "../api/types.js";
-import {
-  getAnalyticsSummary,
-  getAnalyticsActivity,
-  getAnalyticsHeatmap,
-  getAnalyticsProjects,
-  getAnalyticsHourOfWeek,
-  getAnalyticsSessionShape,
-  getAnalyticsVelocity,
-  getAnalyticsTools,
-  getAnalyticsTopSessions,
-  getAnalyticsSignals,
-  type AnalyticsParams,
-} from "../api/client.js";
+import { AnalyticsService } from "../api/generated/index";
+import { callGenerated } from "../api/runtime.js";
 import { sessions } from "./sessions.svelte.js";
 
-export type { Granularity, HeatmapMetric, TopSessionsMetric };
+type AnalyticsParams = Parameters<
+  typeof AnalyticsService.getApiV1AnalyticsSummary
+>[0];
+type ActivityParams = Parameters<
+  typeof AnalyticsService.getApiV1AnalyticsActivity
+>[0];
+type HeatmapParams = Parameters<
+  typeof AnalyticsService.getApiV1AnalyticsHeatmap
+>[0];
+type TopSessionsParams = Parameters<
+  typeof AnalyticsService.getApiV1AnalyticsTopSessions
+>[0];
+export type Granularity = NonNullable<ActivityParams["granularity"]>;
+export type HeatmapMetric = NonNullable<HeatmapParams["metric"]>;
+export type TopSessionsMetric = NonNullable<TopSessionsParams["metric"]>;
 
 function localDateStr(d: Date): string {
   const y = d.getFullYear();
@@ -324,16 +324,16 @@ class AnalyticsStore {
     if (this.agent) p.agent = this.agent;
     if (this.termination) p.termination = this.termination;
     if (this.minUserMessages > 0) {
-      p.min_user_messages = this.minUserMessages;
+      p.minUserMessages = this.minUserMessages;
     }
     if (this.includeOneShot) {
-      p.include_one_shot = true;
+      p.includeOneShot = true;
     }
     if (this.includeAutomated) {
-      p.include_automated = true;
+      p.includeAutomated = true;
     }
     if (this.recentlyActive) {
-      p.active_since = new Date(
+      p.activeSince = new Date(
         Date.now() - 24 * 60 * 60 * 1000,
       ).toISOString();
     }
@@ -367,16 +367,16 @@ class AnalyticsStore {
       if (this.agent) p.agent = this.agent;
       if (this.termination) p.termination = this.termination;
       if (this.minUserMessages > 0) {
-        p.min_user_messages = this.minUserMessages;
+        p.minUserMessages = this.minUserMessages;
       }
       if (this.includeOneShot) {
-        p.include_one_shot = true;
+        p.includeOneShot = true;
       }
       if (this.includeAutomated) {
-        p.include_automated = true;
+        p.includeAutomated = true;
       }
       if (this.recentlyActive) {
-        p.active_since = new Date(
+        p.activeSince = new Date(
           Date.now() - 24 * 60 * 60 * 1000,
         ).toISOString();
       }
@@ -410,7 +410,7 @@ class AnalyticsStore {
     // fresh.
     if (isFirstLoad) this.errors[panel] = null;
     try {
-      const data = await fetchRequest();
+      const data = await callGenerated(fetchRequest);
       if (this.versions[panel] === v) {
         onSuccess(data);
         this.errors[panel] = null;
@@ -459,7 +459,10 @@ class AnalyticsStore {
   async fetchSummary() {
     await this.executeFetch(
       "summary",
-      () => getAnalyticsSummary(this.filterParams()),
+      () =>
+        AnalyticsService.getApiV1AnalyticsSummary(
+          this.filterParams(),
+        ) as unknown as Promise<AnalyticsSummary>,
       (data) => {
         this.summary = data;
       },
@@ -474,10 +477,10 @@ class AnalyticsStore {
     await this.executeFetch(
       "activity",
       () =>
-        getAnalyticsActivity({
+        AnalyticsService.getApiV1AnalyticsActivity({
           ...this.baseParams(),
           granularity: this.granularity,
-        }),
+        }) as unknown as Promise<ActivityResponse>,
       (data) => {
         this.activity = data;
       },
@@ -489,10 +492,10 @@ class AnalyticsStore {
     await this.executeFetch(
       "heatmap",
       () =>
-        getAnalyticsHeatmap({
+        AnalyticsService.getApiV1AnalyticsHeatmap({
           ...this.baseParams(),
           metric: this.metric,
-        }),
+        }) as unknown as Promise<HeatmapResponse>,
       (data) => {
         this.heatmap = data;
       },
@@ -506,7 +509,10 @@ class AnalyticsStore {
   async fetchProjects() {
     await this.executeFetch(
       "projects",
-      () => getAnalyticsProjects(this.filterParams({ includeProject: false })),
+      () =>
+        AnalyticsService.getApiV1AnalyticsProjects(
+          this.filterParams({ includeProject: false }),
+        ) as unknown as Promise<ProjectsAnalyticsResponse>,
       (data) => {
         this.projects = data;
       },
@@ -517,7 +523,10 @@ class AnalyticsStore {
   async fetchHourOfWeek() {
     await this.executeFetch(
       "hourOfWeek",
-      () => getAnalyticsHourOfWeek(this.baseParams({ includeTime: false })),
+      () =>
+        AnalyticsService.getApiV1AnalyticsHourOfWeek(
+          this.baseParams({ includeTime: false }),
+        ) as unknown as Promise<HourOfWeekResponse>,
       (data) => {
         this.hourOfWeek = data;
       },
@@ -528,7 +537,10 @@ class AnalyticsStore {
   async fetchSessionShape() {
     await this.executeFetch(
       "sessionShape",
-      () => getAnalyticsSessionShape(this.filterParams()),
+      () =>
+        AnalyticsService.getApiV1AnalyticsSessions(
+          this.filterParams(),
+        ) as unknown as Promise<SessionShapeResponse>,
       (data) => {
         this.sessionShape = data;
       },
@@ -539,7 +551,10 @@ class AnalyticsStore {
   async fetchVelocity() {
     await this.executeFetch(
       "velocity",
-      () => getAnalyticsVelocity(this.filterParams()),
+      () =>
+        AnalyticsService.getApiV1AnalyticsVelocity(
+          this.filterParams(),
+        ) as unknown as Promise<VelocityResponse>,
       (data) => {
         this.velocity = data;
       },
@@ -550,7 +565,10 @@ class AnalyticsStore {
   async fetchTools() {
     await this.executeFetch(
       "tools",
-      () => getAnalyticsTools(this.filterParams()),
+      () =>
+        AnalyticsService.getApiV1AnalyticsTools(
+          this.filterParams(),
+        ) as unknown as Promise<ToolsAnalyticsResponse>,
       (data) => {
         this.tools = data;
       },
@@ -562,10 +580,10 @@ class AnalyticsStore {
     await this.executeFetch(
       "topSessions",
       () =>
-        getAnalyticsTopSessions({
+        AnalyticsService.getApiV1AnalyticsTopSessions({
           ...this.filterParams(),
           metric: this.topMetric,
-        }),
+        }) as unknown as Promise<TopSessionsResponse>,
       (data) => {
         this.topSessions = data;
       },
@@ -576,7 +594,10 @@ class AnalyticsStore {
   async fetchSignals() {
     await this.executeFetch(
       "signals",
-      () => getAnalyticsSignals(this.filterParams()),
+      () =>
+        AnalyticsService.getApiV1AnalyticsSignals(
+          this.filterParams(),
+        ) as unknown as Promise<SignalsAnalyticsResponse>,
       (data) => {
         this.signals = data;
       },

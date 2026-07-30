@@ -177,6 +177,18 @@ agentsview session usage <id>
 agentsview session usage <id> --format json
 ```
 
+The same per-session usage data is available from the REST API:
+
+```bash
+GET /api/v1/sessions/{id}/usage
+```
+
+The response includes the `session_id`, `agent`, `project`,
+`total_output_tokens`, `peak_context_tokens`, `has_token_data`, `cost_usd`,
+`has_cost`, `models`, and `unpriced_models` fields from the CLI JSON schema.
+HTTP responses also include `server_running: true`. Existing sessions return
+`200` even when token or cost data is absent; missing sessions return `404`.
+
 The deprecated alias `agentsview token-use <id>` remains available for
 compatibility and now also reports cost estimates.
 
@@ -268,12 +280,14 @@ Each directory can be overridden with an environment variable. See the
 
 ### Antigravity CLI: high-resolution transcripts
 
-By default, agentsview indexes Antigravity CLI sessions in **summary mode**:
-your prompts from `history.jsonl` plus any plain-text artifacts under `brain/`
-(plans, walkthroughs, checkpoints). Assistant turns and tool calls live in
-AES-GCM-encrypted `.pb` files and are not visible in this mode.
+Antigravity CLI sessions now appear in two on-disk formats. Newer releases
+store conversation trajectories as SQLite `.db` files, which agentsview indexes
+directly. Older releases stored assistant turns and tool calls in
+AES-GCM-encrypted `.pb` files; for those sessions, agentsview falls back to
+**summary mode** using your prompts from `history.jsonl` plus any plain-text
+artifacts under `brain/` (plans, walkthroughs, checkpoints).
 
-To unlock full transcripts, run
+To unlock full transcripts for older `.pb` sessions, run
 [agy-reader](https://github.com/mjacobs/agy-reader) alongside agentsview.
 agy-reader talks to the local Antigravity daemon, decrypts each conversation,
 and writes a `<uuid>.trajectory.json` sidecar next to the encrypted `.pb` file.
@@ -306,6 +320,45 @@ Push session data to a shared PostgreSQL instance for team dashboards:
 ```bash
 agentsview pg push       # push local data to PG
 agentsview pg serve      # serve web UI from PG (read-only)
+```
+
+### Automatic push (background service)
+
+To keep a shared PostgreSQL database current without running `pg push` by
+hand, run the auto-push daemon. It watches your session directories and
+pushes shortly after new sessions are recorded, with a periodic floor as a
+safety net:
+
+```bash
+agentsview pg push --watch                 # foreground, Ctrl-C to stop
+agentsview pg push --watch --debounce 1m   # custom coalesce window
+agentsview pg push --watch --interval 5m   # custom floor interval
+```
+
+The daemon reads the same `[pg]` config as `pg push`, so the PostgreSQL
+DSN must be set in your config file (or an environment variable it
+expands). Protect the config file, since it holds credentials:
+
+```bash
+chmod 600 ~/.agentsview/config.toml
+```
+
+To run it unattended as an OS service (launchd on macOS,
+`systemd --user` on Linux):
+
+```bash
+agentsview pg service install     # generate the unit, enable + start it
+agentsview pg service status      # show manager status
+agentsview pg service logs -f     # follow the service log
+agentsview pg service uninstall   # stop and remove
+```
+
+**Linux headless machines:** systemd `--user` services stop at logout and
+do not start at boot unless lingering is enabled for your user. `install`
+detects this and prints the command; you can also run it yourself:
+
+```bash
+loginctl enable-linger "$USER"
 ```
 
 See [PostgreSQL docs](https://agentsview.io/postgresql/) for setup and

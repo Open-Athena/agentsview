@@ -1,5 +1,16 @@
-import * as api from "../api/client.js";
-import type { Message } from "../api/types.js";
+import {
+  SessionsService,
+} from "../api/generated/index";
+import type {
+  Message,
+  MessagesResponse,
+  Session,
+} from "../api/types.js";
+import {
+  configureGeneratedClient,
+  isAbortError,
+  withAbort,
+} from "../api/runtime.js";
 import { clearContentCaches } from "../utils/content-parser.js";
 import { computeMainModel } from "../utils/model.js";
 
@@ -52,9 +63,11 @@ class MessagesStore {
     try {
       let countHint: number | null = null;
       try {
-        const sess = await api.getSession(id, {
-          signal: ac.signal,
-        });
+        configureGeneratedClient();
+        const sess = await withAbort(
+          SessionsService.getApiV1SessionsId({ id }) as unknown as Promise<Session>,
+          ac.signal,
+        );
         countHint = sess.message_count ?? 0;
       } catch (err) {
         if (isAbortError(err)) return;
@@ -143,10 +156,15 @@ class MessagesStore {
     let from = opts.from;
 
     for (;;) {
-      const res = await api.getMessages(
-        id,
-        { from, limit: opts.limit, direction: opts.direction },
-        { signal: opts.signal },
+      configureGeneratedClient();
+      const res = await withAbort(
+        SessionsService.getApiV1SessionsIdMessages({
+          id,
+          from,
+          limit: opts.limit,
+          direction: opts.direction,
+        }) as unknown as Promise<MessagesResponse>,
+        opts.signal,
       );
       if (res.messages.length === 0) break;
 
@@ -182,10 +200,15 @@ class MessagesStore {
     let loaded: Message[] = [];
 
     for (;;) {
-      const res = await api.getMessages(
-        id,
-        { from, limit: MESSAGE_PAGE_SIZE, direction: "asc" },
-        { signal },
+      configureGeneratedClient();
+      const res = await withAbort(
+        SessionsService.getApiV1SessionsIdMessages({
+          id,
+          from,
+          limit: MESSAGE_PAGE_SIZE,
+          direction: "asc",
+        }) as unknown as Promise<MessagesResponse>,
+        signal,
       );
       if (res.messages.length === 0) break;
 
@@ -217,10 +240,14 @@ class MessagesStore {
     id: string,
     signal: AbortSignal,
   ) {
-    const firstRes = await api.getMessages(
-      id,
-      { limit: MESSAGE_PAGE_SIZE, direction: "desc" },
-      { signal },
+    configureGeneratedClient();
+    const firstRes = await withAbort(
+      SessionsService.getApiV1SessionsIdMessages({
+        id,
+        limit: MESSAGE_PAGE_SIZE,
+        direction: "desc",
+      }) as unknown as Promise<MessagesResponse>,
+      signal,
     );
 
     this.messages = [...firstRes.messages].reverse();
@@ -294,14 +321,15 @@ class MessagesStore {
 
     this.loadingOlder = true;
     try {
-      const res = await api.getMessages(
-        id,
-        {
+      configureGeneratedClient();
+      const res = await withAbort(
+        SessionsService.getApiV1SessionsIdMessages({
+          id,
           from: oldest - 1,
           limit: MESSAGE_PAGE_SIZE,
           direction: "desc",
-        },
-        { signal },
+        }) as unknown as Promise<MessagesResponse>,
+        signal,
       );
       if (this.sessionId !== id) return;
       if (res.messages.length === 0) {
@@ -362,14 +390,15 @@ class MessagesStore {
       const chunks: Message[][] = [];
 
       while (from >= 0) {
-        const res = await api.getMessages(
-          id,
-          {
+        configureGeneratedClient();
+        const res = await withAbort(
+          SessionsService.getApiV1SessionsIdMessages({
+            id,
             from,
             limit: MESSAGE_PAGE_SIZE,
             direction: "desc",
-          },
-          { signal },
+          }) as unknown as Promise<MessagesResponse>,
+          signal,
         );
         if (this.sessionId !== id) return;
         if (res.messages.length === 0) {
@@ -416,7 +445,11 @@ class MessagesStore {
     if (!signal || signal.aborted) return;
 
     try {
-      const sess = await api.getSession(id, { signal });
+      configureGeneratedClient();
+      const sess = await withAbort(
+        SessionsService.getApiV1SessionsId({ id }) as unknown as Promise<Session>,
+        signal,
+      );
       if (this.sessionId !== id) return;
 
       const newCount = sess.message_count ?? 0;
@@ -512,12 +545,6 @@ class MessagesStore {
       }
     }
   }
-}
-
-function isAbortError(err: unknown): boolean {
-  return (
-    err instanceof DOMException && err.name === "AbortError"
-  );
 }
 
 export const messages = new MessagesStore();

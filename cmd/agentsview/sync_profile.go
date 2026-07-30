@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"runtime/trace"
+	"slices"
 )
 
 // startSyncProfile starts whichever of the hidden --cpuprofile,
@@ -75,8 +76,8 @@ func startSyncProfile(cfg SyncConfig) func() {
 	return func() {
 		// Stop in reverse order so trace.Stop runs before file
 		// close.
-		for i := len(stoppers) - 1; i >= 0; i-- {
-			stoppers[i]()
+		for _, stop := range slices.Backward(stoppers) {
+			stop()
 		}
 	}
 }

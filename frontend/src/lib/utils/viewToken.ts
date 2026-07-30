@@ -1,4 +1,4 @@
-import { setAuthToken } from "../api/client.js";
+import { setAuthToken } from "../api/runtime.js";
 import { SNAPSHOT } from "./snapshot.js";
 
 // Snapshot views pass a grant token as ?t=<token>. Move it into the

@@ -842,6 +842,48 @@ func TestShouldSkipFileWithIDPrefix(t *testing.T) {
 	assert.False(t, got2, "shouldSkipFile without prefix should return false")
 }
 
+func TestCollectAndBatchPrefixesParserExcludedIDs(t *testing.T) {
+	database := openTestDB(t)
+	ctx := context.Background()
+
+	raw := db.Session{
+		ID:      "probe",
+		Project: "local",
+		Machine: "local",
+		Agent:   "claude",
+	}
+	prefixed := db.Session{
+		ID:      "host~probe",
+		Project: "remote",
+		Machine: "host",
+		Agent:   "claude",
+	}
+	require.NoError(t, database.UpsertSession(raw))
+	require.NoError(t, database.UpsertSession(prefixed))
+
+	results := make(chan syncJob, 1)
+	results <- syncJob{
+		processResult: processResult{
+			excludedSessionIDs: []string{"probe"},
+		},
+		path: "/remote/probe.jsonl",
+	}
+	close(results)
+
+	e := &Engine{db: database, idPrefix: "host~"}
+	stats := e.collectAndBatch(
+		ctx, results, 1, 1, nil, syncWriteDefault,
+	)
+
+	assert.Equal(t, []string{"host~probe"}, stats.parserExcludedIDs)
+	gotRaw, err := database.GetSession(ctx, "probe")
+	require.NoError(t, err, "raw local session lookup")
+	assert.NotNil(t, gotRaw, "raw local session must not be deleted")
+	gotPrefixed, err := database.GetSession(ctx, "host~probe")
+	require.NoError(t, err, "prefixed remote session lookup")
+	assert.Nil(t, gotPrefixed, "prefixed remote session should be deleted")
+}
+
 func TestShouldSkipByPathWithRewriter(t *testing.T) {
 	database := openTestDB(t)
 

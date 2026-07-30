@@ -28,11 +28,36 @@ import (
 // trigger a non-destructive re-sync (mtime reset + skip cache
 // clear) so existing session data is preserved.
 //
-// Bumped to 29: secret findings now record tool_result_event
+// Bumped to 33: Claude parser now skips content-free /usage probe
+// sessions (the only user turn is the /usage command), and the Codex
+// parser drops the initial user prompt when Codex re-emits it verbatim
+// while continuing a task across turns. Existing rows need re-parsing
+// so /usage probe sessions are dropped from the archive and Codex
+// code-review sessions are recounted to a single user turn and
+// re-flagged as automated.
+//
+// (32: Antigravity DB parsers now filter internal protocol strings
+// from visible message content, remove raw step headers, prefer
+// prompt-like user text, and merge matching Antigravity CLI history
+// prompts when DB decoding drops short user turns. Existing Antigravity
+// DB rows need re-parsing so previously indexed noisy or assistant-only
+// transcripts are rewritten.)
+//
+// (31: Copilot shutdown usage events use positional DedupKey to
+// handle multi-segment sessions correctly.)
+//
+// (30: Hermes parser no longer treats cost_status
+// "included" as a confident $0 when cost_source is "none"/empty (its
+// default for models it does not price, e.g. gpt-5.5). Such rows now
+// leave cost_usd nil so they are catalog-priced. Existing Hermes rows
+// need re-parsing so their usage cost reflects the catalog instead of a
+// baked-in $0.)
+//
+// (29: secret findings now record tool_result_event
 // coordinates by the persisted slice position (matching
 // tool_result_events.event_index) instead of the parser's raw event
 // index. Existing rows need re-scanning so stored findings normalize
-// and `secrets list --reveal` can re-read the source.
+// and `secrets list --reveal` can re-read the source.)
 //
 // (28: Gemini parser now persists normalized
 // (Anthropic-style) per-message token_usage JSON instead of the raw
@@ -95,7 +120,7 @@ import (
 //
 // (17: Codex <skill> template filtering.)
 // (16: <turn_aborted> system messages.)
-const dataVersion = 29
+const dataVersion = 33
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 

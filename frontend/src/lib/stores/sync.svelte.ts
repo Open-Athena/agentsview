@@ -1,4 +1,17 @@
-import * as api from "../api/client.js";
+import {
+  triggerResync,
+  triggerSync,
+  watchSession,
+  type SyncHandle,
+} from "../api/client.js";
+import {
+  MetadataService,
+  SyncService,
+} from "../api/generated/index";
+import {
+  configureGeneratedClient,
+  isRemoteConnection,
+} from "../api/runtime.js";
 import type {
   SyncProgress,
   SyncStats,
@@ -55,9 +68,9 @@ class SyncStore {
   private pollTimer: ReturnType<typeof setInterval> | null =
     null;
   private lastStatsParams: {
-    include_one_shot?: boolean;
-    include_automated?: boolean;
-  } = { include_one_shot: true };
+    includeOneShot?: boolean;
+    includeAutomated?: boolean;
+  } = { includeOneShot: true };
   private statsVersion = 0;
   private syncCompleteListeners: SyncCompleteListener[] = [];
   private statusHydrated = false;
@@ -80,14 +93,15 @@ class SyncStore {
   private markRemoteReachable(reachable: boolean) {
     if (reachable) {
       this.remoteUnreachable = false;
-    } else if (api.isRemoteConnection()) {
+    } else if (isRemoteConnection()) {
       this.remoteUnreachable = true;
     }
   }
 
   async loadStatus() {
     try {
-      const status = await api.getSyncStatus();
+      configureGeneratedClient();
+      const status = await SyncService.getApiV1SyncStatus();
       this.markRemoteReachable(true);
       const newLastSync = status.last_sync || null;
       const isInitial = !this.statusHydrated;
@@ -95,7 +109,7 @@ class SyncStore {
       const changed =
         newLastSync !== null && newLastSync !== this.lastSync;
       this.lastSync = newLastSync;
-      this.lastSyncStats = status.stats;
+      this.lastSyncStats = status.stats as unknown as SyncStats | null;
       // Suppress notifications on initial hydration and
       // when a local sync just completed (pendingHydration).
       if (this.pendingHydration) {
@@ -128,8 +142,8 @@ class SyncStore {
 
   async loadStats(
     params?: {
-      include_one_shot?: boolean;
-      include_automated?: boolean;
+      includeOneShot?: boolean;
+      includeAutomated?: boolean;
     },
   ) {
     if (params !== undefined) {
@@ -137,9 +151,10 @@ class SyncStore {
     }
     const version = ++this.statsVersion;
     try {
-      const result = await api.getStats(
+      configureGeneratedClient();
+      const result = await MetadataService.getApiV1Stats(
         this.lastStatsParams,
-      );
+      ) as unknown as Stats;
       if (this.statsVersion === version) {
         this.stats = result;
       }
@@ -150,7 +165,9 @@ class SyncStore {
 
   async loadVersion() {
     try {
-      this.serverVersion = await api.getVersion();
+      configureGeneratedClient();
+      this.serverVersion =
+        await MetadataService.getApiV1Version() as VersionInfo;
       this.markRemoteReachable(true);
       // A snapshot's version stub never matches the baked FE commit;
       // there's no backend to reload against, so don't warn.
@@ -169,8 +186,9 @@ class SyncStore {
     // is irrelevant and potentially wrong for forks.
     if (this.isDesktop) return;
     try {
-      const result: UpdateCheck =
-        await api.checkForUpdate();
+      configureGeneratedClient();
+      const result =
+        await MetadataService.getApiV1UpdateCheck() as UpdateCheck;
       this.updateAvailable = result.update_available;
       this.latestVersion = result.latest_version ?? null;
     } catch (error) {
@@ -179,7 +197,7 @@ class SyncStore {
   }
 
   triggerSync(onComplete?: () => void) {
-    this.runSync(api.triggerSync, onComplete);
+    this.runSync(triggerSync, onComplete);
   }
 
   triggerResync(
@@ -187,7 +205,7 @@ class SyncStore {
     onError?: (err: Error) => void,
   ): boolean {
     return this.runSync(
-      api.triggerResync,
+      triggerResync,
       onComplete,
       onError,
     );
@@ -196,7 +214,7 @@ class SyncStore {
   private runSync(
     syncFn: (
       onProgress?: (p: SyncProgress) => void,
-    ) => api.SyncHandle,
+    ) => SyncHandle,
     onComplete?: () => void,
     onError?: (err: Error) => void,
   ): boolean {
@@ -250,7 +268,7 @@ class SyncStore {
     onTiming?: (t: SessionTiming) => void,
   ) {
     this.unwatchSession();
-    this.watchEventSource = api.watchSession(
+    this.watchEventSource = watchSession(
       sessionId,
       onUpdate,
       onTiming,

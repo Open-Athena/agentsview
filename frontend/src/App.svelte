@@ -33,7 +33,7 @@
   import { settings } from "./lib/stores/settings.svelte.js";
   import { viewMeta } from "./lib/stores/viewMeta.svelte.js";
   import { SNAPSHOT } from "./lib/utils/snapshot.js";
-  import { setAuthToken, getAuthToken, setServerUrl, getBase } from "./lib/api/client.js";
+  import { setAuthToken, getAuthToken, setServerUrl, getBase } from "./lib/api/runtime.js";
   import { setupVisibilityHealthCheck } from "./lib/utils/health.js";
   import { registerShortcuts } from "./lib/utils/keyboard.js";
   import { shouldAutoSwitchTranscriptModeToNormal } from "./lib/utils/transcript-mode.js";
@@ -582,8 +582,6 @@
     line-height: 1.5;
     color: var(--text-muted);
   }
-
-
 
   .undo-toast {
     position: fixed;

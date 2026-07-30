@@ -32,6 +32,30 @@ func TestFallbackPricing_Opus46Rates(t *testing.T) {
 	assert.Equal(t, want, *got)
 }
 
+func TestFallbackPricing_Opus47Rates(t *testing.T) {
+	prices := FallbackPricing()
+	var got *ModelPricing
+	for i := range prices {
+		if prices[i].ModelPattern == "claude-opus-4-7" {
+			got = &prices[i]
+			break
+		}
+	}
+	require.NotNil(t, got, "claude-opus-4-7 entry missing from FallbackPricing")
+
+	// Opus 4.7 shares the Opus 4.6/4.8 tier. LiteLLM already lists
+	// it, but the fallback ships it too so offline and fresh-seed
+	// pricing covers the whole current Opus generation.
+	want := ModelPricing{
+		ModelPattern:         "claude-opus-4-7",
+		InputPerMTok:         5.0,
+		OutputPerMTok:        25.0,
+		CacheCreationPerMTok: 6.25,
+		CacheReadPerMTok:     0.50,
+	}
+	assert.Equal(t, want, *got)
+}
+
 func TestFallbackPricing_Opus48Rates(t *testing.T) {
 	prices := FallbackPricing()
 	var got *ModelPricing
@@ -55,4 +79,26 @@ func TestFallbackPricing_Opus48Rates(t *testing.T) {
 		CacheReadPerMTok:       0.50,
 	}
 	assert.Equal(t, want, *got)
+}
+
+func TestFallbackPricing_HermesModels(t *testing.T) {
+	byPattern := make(map[string]ModelPricing)
+	for _, p := range FallbackPricing() {
+		byPattern[p.ModelPattern] = p
+	}
+
+	// gpt-5.5 (Hermes). Source: https://developers.openai.com/api/docs/pricing
+	// standard tier — input $5.00, cached input $0.50, output $30.00 per MTok.
+	gpt, ok := byPattern["gpt-5.5"]
+	require.True(t, ok, "gpt-5.5 entry missing from FallbackPricing")
+	assert.Equal(t, 5.0, gpt.InputPerMTok)
+	assert.Equal(t, 30.0, gpt.OutputPerMTok)
+	assert.Equal(t, 0.50, gpt.CacheReadPerMTok)
+
+	// openrouter/owl-alpha is a free model: a known $0 (present with
+	// zero rates) rather than an unpriced/unknown model.
+	owl, ok := byPattern["openrouter/owl-alpha"]
+	require.True(t, ok, "openrouter/owl-alpha entry missing from FallbackPricing")
+	assert.Zero(t, owl.InputPerMTok)
+	assert.Zero(t, owl.OutputPerMTok)
 }

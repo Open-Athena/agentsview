@@ -1,6 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { messages } from './messages.svelte.js';
-import * as api from '../api/client.js';
 import { parseContent } from '../utils/content-parser.js';
 import type {
   Message,
@@ -8,10 +7,46 @@ import type {
   Session,
 } from '../api/types.js';
 
-// Mock the API client
-vi.mock('../api/client.js', () => ({
+const api = vi.hoisted(() => ({
   getMessages: vi.fn(),
   getSession: vi.fn(),
+}));
+
+vi.mock('../api/runtime.js', () => ({
+  configureGeneratedClient: vi.fn(),
+  callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
+  isAbortError: (err: unknown) => {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      return true;
+    }
+    if (err === null || typeof err !== 'object') {
+      return false;
+    }
+    const candidate = err as {
+      isCancelled?: unknown;
+      name?: unknown;
+    };
+    return candidate.isCancelled === true ||
+      candidate.name === 'CancelError';
+  },
+  withAbort: <T>(promise: Promise<T>) => promise,
+}));
+
+vi.mock('../api/generated/index', () => ({
+  SessionsService: {
+    getApiV1SessionsId: vi.fn(({ id }) => api.getSession(id)),
+    getApiV1SessionsIdMessages: vi.fn((params) =>
+      api.getMessages(
+        params.id,
+        {
+          from: params.from,
+          limit: params.limit,
+          direction: params.direction,
+        },
+        { signal: new AbortController().signal },
+      )
+    ),
+  },
 }));
 
 function createDeferred<T>() {
@@ -22,6 +57,15 @@ function createDeferred<T>() {
     reject = rej;
   });
   return { promise, resolve, reject };
+}
+
+function generatedCancelError(): Error & { isCancelled: true } {
+  const err = new Error('Request aborted') as Error & {
+    isCancelled: true;
+  };
+  err.name = 'CancelError';
+  err.isCancelled = true;
+  return err;
 }
 
 function makeSession(
@@ -674,9 +718,7 @@ describe('MessagesStore', () => {
       expect(messages.loadingOlder).toBe(true);
 
       // Simulate session switch which aborts in-flight requests
-      rejectHang(
-        new DOMException('The operation was aborted.', 'AbortError'),
-      );
+      rejectHang(generatedCancelError());
       messages.clear();
 
       // Should resolve without throwing
@@ -875,9 +917,7 @@ describe('MessagesStore', () => {
 
       const p = messages.ensureOrdinalLoaded(0);
 
-      rejectHang(
-        new DOMException('The operation was aborted.', 'AbortError'),
-      );
+      rejectHang(generatedCancelError());
       messages.clear();
 
       await expect(p).resolves.toBeUndefined();
