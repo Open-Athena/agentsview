@@ -147,12 +147,33 @@ git commit                              # merge commit banks the resolution
   waypoint A** (1h threading is cost-neutral/correct); pairwise + longest-prompts
   both render.
 
+- **Waypoint D — DONE** (`aed2538f`, merges `8dc6adc6`, 173 commits). The
+  money->microdollars rewrite (`internal/money`; all cost/rate fields become
+  `money.Money` int64 microdollars). Converted the fork's 1h cache-write rate to
+  `money.Money` (still internal to `export.ModelRates`, contract-preserving);
+  `model_pricing` column is `cache_creation_1h_microdollars_per_mtok INTEGER`;
+  `Fill1hCacheRate` derives 1h from 5m as exactly 8/5 via `money.Divide`; the two
+  cost paths use `money.CostPerMillion`/`SignedCostPerMillion` for the split
+  cost+savings; re-fetched the money-format snapshot (SHA-pinned). Artifact
+  `manifestSession` gained `private` (golden updated). Frontend adopted upstream's
+  kit-ui CSS-var palette + `seriesColorMap` (supersedes the fork's 24-color
+  palette / `disambiguateColors`), keeping the fork's org-theming; costs read
+  `.microdollars`; forced a kit-ui refetch to the pinned SHA. CIC-verified on a
+  cloned+resynced archive: **usage total $7543.14 — identical to waypoints A/C**
+  (microdollars rewrite is cost-neutral); 1h rates stored correctly (6.25->10.00);
+  the data-version resync rebuilds an old DB to the new schema; pairwise +
+  longest-prompts panels render money as dollars.
+  - **Note (existing-DB upgrade):** old archives (pre-money columns) are rebuilt
+    by the automatic `dataVersion=74` full resync on normal serve; `--no-sync`
+    against an old DB 500s on the usage routes until that resync runs.
+
 ## Acceptance
 
 - [x] Waypoint A merged with `make build && make test` green
 - [x] Waypoint B merged (green except the `origin`-remote snapshot test)
 - [x] Waypoint C merged (same green status)
-- [ ] Waypoints D-E each merged with `make build && make test` green
+- [x] Waypoint D merged (money->microdollars; same green status + 2 flaky/env)
+- [ ] Waypoint E merged with `make build && make test` green
 - [ ] Private-view toggle works post-Huma (PATCH route re-homed, e2e passes)
 - [ ] Snapshot export still produces a working hosted dashboard (browser-verified)
 - [ ] Snapshot usage/cost reconciled onto microdollars (no float pricing left in
