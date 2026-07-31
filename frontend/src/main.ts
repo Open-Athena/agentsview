@@ -20,6 +20,11 @@ if (
   typeof localStorage !== "undefined" &&
   !localStorage.getItem("theme")
 ) {
+  // Non-persisted pre-mount dark default for snapshot embeds: setThemeMode
+  // would writeStored() a preference and initTheme has no default-mode hook,
+  // so the theme store can't express "default dark unless the user chose
+  // otherwise" without clobbering that choice.
+  // kit-ui-check-ignore: intentional non-persisted snapshot dark default
   document.documentElement.classList.add("dark");
 }
 
