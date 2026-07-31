@@ -147,6 +147,54 @@ describe("session route params", () => {
     });
   });
 
+  it("preserves a numeric msg target across a rolling window rewrite", () => {
+    const params = sessionRouteParamsForFilters(
+      {
+        date_from: "2026-05-22",
+        date_to: "2026-06-20",
+      },
+      {
+        date_from: "2026-05-21",
+        date_to: "2026-06-19",
+        window_days: "30",
+        msg: "42",
+      },
+      new Date(2026, 5, 20, 12),
+    );
+
+    expect(params).toEqual({
+      date_from: "2026-05-22",
+      date_to: "2026-06-20",
+      window_days: "30",
+      msg: "42",
+    });
+  });
+
+  it("preserves a symbolic msg=last target across a filter rewrite", () => {
+    const params = sessionRouteParamsForFilters(
+      { project: "agentsview" },
+      { project: "agentsview", msg: "last" },
+      new Date(2026, 5, 20, 12),
+    );
+
+    expect(params).toEqual({
+      project: "agentsview",
+      msg: "last",
+    });
+  });
+
+  it("drops the msg target when exiting a detail with filter params", () => {
+    const params = sessionRouteParamsForDetailExit(
+      { project: "saved" },
+      { project: "direct", window_days: "14", msg: "last" },
+    );
+
+    expect(params).toEqual({
+      project: "direct",
+      window_days: "14",
+    });
+  });
+
   it("tracks rolling window and termination as session route params", () => {
     expect(SESSION_FILTER_KEYS.has("window_days")).toBe(true);
     expect(SESSION_FILTER_KEYS.has("termination")).toBe(true);

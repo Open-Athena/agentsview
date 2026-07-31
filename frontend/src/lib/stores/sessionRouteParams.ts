@@ -117,6 +117,15 @@ export function sessionRouteParamsForFilters(
   if (shouldPreserveSessionWindowDays(next, currentParams, now)) {
     next[SESSION_ANALYTICS_WINDOW_PARAM] = windowDays!;
   }
+  // A ?msg target is orthogonal to the date-window filters: it identifies
+  // which message to scroll to within a session detail. Carry it through
+  // filter/window URL rewrites so rolling-bound refreshes don't drop it.
+  // Leaving a session for the list view strips it separately, in
+  // router.navigateFromSession.
+  const msg = currentParams["msg"];
+  if (msg !== undefined) {
+    next["msg"] = msg;
+  }
   return next;
 }
 

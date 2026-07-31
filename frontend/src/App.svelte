@@ -569,10 +569,22 @@
   // URL -> scrollToOrdinal -> selectedOrdinal -> URL feedback loop.
   $effect(() => {
     const selected = ui.selectedOrdinal;
+    // Tracked so the effect re-runs once a pending deep-link scroll
+    // resolves; read inside the guard below.
+    const pending = ui.pendingScrollOrdinal;
     const sid = router.sessionId;
     untrack(() => {
       if (router.route !== "sessions" || !sid) return;
+      // A deep-link scroll is still resolving (e.g. msg=last before
+      // messages load, when selectedOrdinal is still null). Don't
+      // rewrite ?msg from the transient selection yet.
+      if (pending !== null) return;
       const currentMsg = router.params["msg"] ?? null;
+      // Leave a symbolic last-message target alone. Once it resolves,
+      // selectedOrdinal is the concrete last ordinal, and the mirror
+      // would otherwise rewrite ?msg=last to that number; keep the
+      // shareable "always last" intent in the URL instead.
+      if (currentMsg === "last") return;
       const wantMsg = selected === null ? null : String(selected);
       if (currentMsg === wantMsg) return;
       const next: Record<string, string> = {};

@@ -300,6 +300,15 @@ describe("RouterStore", () => {
     expect(window.location.search).toBe("?project=myproj");
   });
 
+  it("navigateFromSession drops the msg target", () => {
+    setURL("/sessions/abc-123?msg=last");
+    store = new RouterStore();
+    store.navigateFromSession({ project: "myproj", msg: "last" });
+    expect(window.location.pathname).toBe("/sessions");
+    expect(window.location.search).toBe("?project=myproj");
+    expect(store.params).toEqual({ project: "myproj" });
+  });
+
   it("responds to popstate events", () => {
     setURL("/sessions");
     store = new RouterStore();

@@ -240,10 +240,15 @@ export class RouterStore {
   navigateFromSession(
     params: Record<string, string> = {},
   ) {
-    const url = this.#buildUrl("/sessions", params);
-    this.#updateSticky(params);
+    // A ?msg target only makes sense inside a session detail; strip it on
+    // exit so preserving it across in-session filter rewrites can never
+    // leak the scroll target into the list view.
+    const next = { ...params };
+    delete next["msg"];
+    const url = this.#buildUrl("/sessions", next);
+    this.#updateSticky(next);
     this.route = "sessions";
-    this.params = { ...this.#stickyParams, ...params };
+    this.params = { ...this.#stickyParams, ...next };
     this.sessionId = null;
     window.history.pushState(null, "", url);
   }
