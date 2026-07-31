@@ -17,8 +17,6 @@ import (
 	"go.kenn.io/agentsview/internal/money"
 )
 
-func ptr(s string) *string { return &s }
-
 // seedSource builds a source DB with three sessions:
 //   - s-main (project alpha)         -> included
 //   - s-sub  (project beta, subagent of s-main) -> included via rollup
@@ -36,7 +34,7 @@ func seedSource(t *testing.T) string {
 	}), "upsert s-main")
 	require.NoError(t, d.UpsertSession(db.Session{
 		ID: "s-sub", Project: "beta", Machine: "local", Agent: "claude",
-		ParentSessionID: ptr("s-main"), RelationshipType: "subagent",
+		ParentSessionID: new("s-main"), RelationshipType: "subagent",
 	}), "upsert s-sub")
 	require.NoError(t, d.UpsertSession(db.Session{
 		ID: "s-other", Project: "gamma", Machine: "local", Agent: "claude",

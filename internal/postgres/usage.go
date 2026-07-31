@@ -2191,7 +2191,7 @@ func (s *Store) GetLongestUserPrompts(
 
 	if project != "" {
 		var projects []string
-		for _, p := range strings.Split(project, ",") {
+		for p := range strings.SplitSeq(project, ",") {
 			if p = strings.TrimSpace(p); p != "" {
 				projects = append(projects, p)
 			}

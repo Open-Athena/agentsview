@@ -20,6 +20,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -587,12 +588,7 @@ func writeManifest(path string, m *Manifest) error {
 }
 
 func isBaseTable(name string) bool {
-	for _, t := range baseTables {
-		if t == name {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(baseTables, name)
 }
 
 func placeholders(n int) string {
@@ -606,10 +602,7 @@ func placeholders(n int) string {
 func chunks[T any](s []T, n int) func(func([]T) bool) {
 	return func(yield func([]T) bool) {
 		for i := 0; i < len(s); i += n {
-			end := i + n
-			if end > len(s) {
-				end = len(s)
-			}
+			end := min(i+n, len(s))
 			if !yield(s[i:end]) {
 				return
 			}
