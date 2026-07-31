@@ -86,7 +86,7 @@ func TestUsageDailyGolden(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(stdout), &report))
 	assert.Equal(t, export.UsageDailySchemaVersion, report.SchemaVersion)
 
-	assertGoldenBytes(t, "usage_daily_v3.json", []byte(stdout))
+	assertGoldenBytes(t, "usage_daily_v4.json", []byte(stdout))
 }
 
 func TestUsageDailyBreakdownGolden(t *testing.T) {
@@ -116,7 +116,7 @@ func TestUsageDailyBreakdownGolden(t *testing.T) {
 		assert.Equal(t, "golden-host", daily.MachineBreakdowns[0].MachineName)
 	}
 
-	assertGoldenBytes(t, "usage_daily_breakdown_v3.json", []byte(stdout))
+	assertGoldenBytes(t, "usage_daily_breakdown_v4.json", []byte(stdout))
 }
 
 func setupExportGoldenDataDir(t *testing.T) string {
@@ -853,6 +853,38 @@ func TestRunUsageDailyOfflineUsesReadOnlyDBWhenWriteLockHeld(t *testing.T) {
 		"offline read-only usage must preserve custom pricing")
 }
 
+func TestApplyFallbackPricingPreservesReadOnlyLongContextBands(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sessions.db")
+	writable := dbtest.OpenTestDBAt(t, dbPath)
+	startedAt := "2026-07-03T12:00:00Z"
+	require.NoError(t, writable.UpsertSession(db.Session{
+		ID: "long-context", Project: "pricing", Machine: "local", Agent: "codex",
+		StartedAt: &startedAt,
+	}))
+	ordinal := 1
+	require.NoError(t, writable.ReplaceSessionUsageEvents("long-context", []db.UsageEvent{{
+		MessageOrdinal: &ordinal,
+		Source:         "codex",
+		Model:          "gpt-5.5",
+		InputTokens:    272_001,
+		OccurredAt:     startedAt,
+		DedupKey:       "request-1",
+	}}))
+	require.NoError(t, writable.Close())
+
+	readonly, err := db.OpenReadOnly(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, readonly.Close()) })
+	applyFallbackPricing(readonly, nil)
+
+	got, err := readonly.GetDailyUsage(context.Background(), db.UsageFilter{
+		From: "2026-07-03", To: "2026-07-03", Timezone: "UTC",
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, money.Money{Microdollars: 2_720_010}, got.Totals.TotalCost)
+}
+
 func TestArchiveQueryBackendNoSyncStartsNoSyncDaemonForDailyUsage(t *testing.T) {
 	newAgentDataDir(t)
 	var started bool
@@ -1418,7 +1450,7 @@ func TestNewUsageCursorCommandExplicitMemberFilterDoesNotReuseConfigSibling(t *t
 // sampleDailyUsageJSON is a full usage summary body with a single day and
 // non-zero totals, shared by the HTTP and daemon usage tests.
 const sampleDailyUsageJSON = `{
-	"schema_version": 3,
+	"schema_version": 4,
 	"from": "2026-06-01",
 	"to": "2026-06-02",
 	"pricing": {
@@ -1432,12 +1464,16 @@ const sampleDailyUsageJSON = `{
 		"fallback": {"used": false, "models": []},
 		"models": {
 			"gpt-5.1": {
-				"matched_pattern": "gpt-5.1",
-				"input_cost_per_mtok": {"microdollars": 1000000},
-				"output_cost_per_mtok": {"microdollars": 2000000},
-				"cache_write_cost_per_mtok": {"microdollars": 3000000},
-				"cache_read_cost_per_mtok": {"microdollars": 4000000},
-				"cost_source": "reported"
+				"cost_source": "reported",
+				"resolutions": [{
+					"priced_model": "gpt-5.1",
+					"matched_pattern": "gpt-5.1",
+					"input_cost_per_mtok": {"microdollars": 1000000},
+					"output_cost_per_mtok": {"microdollars": 2000000},
+					"cache_write_cost_per_mtok": {"microdollars": 3000000},
+					"cache_read_cost_per_mtok": {"microdollars": 4000000},
+					"cost_source": "reported"
+				}]
 			}
 		}
 	},

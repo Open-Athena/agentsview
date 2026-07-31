@@ -12,7 +12,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/activity"
+	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/money"
+	pricingpkg "go.kenn.io/agentsview/internal/pricing"
 )
 
 func reportSessionIDs(sessions []activity.SessionRow) map[string]struct{} {
@@ -124,6 +126,114 @@ func TestGetActivityReport_UsageCostAndTokens(t *testing.T) {
 	assert.Equal(t, 500, r.Totals.OutputTokens)
 	// Cost = (1000*3 + 500*15) / 1e6 = 0.0105
 	assert.Equal(t, money.MustParseDollars("0.0105"), r.Totals.Cost)
+	require.NotNil(t, r.Pricing)
+	provenance := r.Pricing.Models["claude-sonnet-4-20250514"]
+	require.Len(t, provenance.Resolutions, 1)
+	assert.Equal(t, 1,
+		provenance.Resolutions[0].Application.BaseRequestCount)
+}
+
+func TestSQLiteActivityReportRowStatusCanonicalizesKimiAliasByTimestamp(t *testing.T) {
+	tests := []struct {
+		name         string
+		timestamp    string
+		canonical    string
+		expectedCost money.Money
+	}{
+		{
+			name:         "before cutoff",
+			timestamp:    "2026-07-18T23:59:59Z",
+			canonical:    pricingpkg.KimiK26Canonical,
+			expectedCost: money.MustParseDollars("1"),
+		},
+		{
+			name:         "at cutoff",
+			timestamp:    "2026-07-19T00:00:00Z",
+			canonical:    pricingpkg.KimiK3Canonical,
+			expectedCost: money.MustParseDollars("2"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolver := export.NewPricingResolver([]export.EffectivePricingRow{
+				{
+					ModelPattern: pricingpkg.KimiK26Canonical,
+					Rates: export.ModelRates{
+						InputPerMTok: money.MustParseDollars("1"),
+					},
+				},
+				{
+					ModelPattern: pricingpkg.KimiK3Canonical,
+					Rates: export.ModelRates{
+						InputPerMTok: money.MustParseDollars("2"),
+					},
+				},
+			})
+
+			cost, priced, contributes, err := sqliteActivityReportRowStatus(
+				dailyUsageScanRow{
+					usageSource: "provider",
+					model:       "daimon-kimi-code",
+					ts:          tt.timestamp,
+					inputTokens: 1_000_000,
+				},
+				resolver,
+			)
+
+			require.NoError(t, err)
+			assert.True(t, priced)
+			assert.True(t, contributes)
+			assert.Equal(t, tt.expectedCost, cost)
+			block, err := resolver.BuildBlock()
+			require.NoError(t, err)
+			require.Contains(t, block.Models, "daimon-kimi-code")
+			resolutions := block.Models["daimon-kimi-code"].Resolutions
+			require.Len(t, resolutions, 1)
+			assert.Equal(t, tt.canonical, resolutions[0].PricedModel)
+			assert.NotContains(t, block.Models, tt.canonical)
+		})
+	}
+}
+
+func TestSQLiteActivityReportRowStatusPrefersExactCustomKimiAlias(t *testing.T) {
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{
+		{
+			ModelPattern: "daimon-kimi-code",
+			Rates: export.ModelRates{
+				InputPerMTok: money.MustParseDollars("7"),
+				Source:       export.PricingRowSourceCustom,
+			},
+		},
+		{
+			ModelPattern: pricingpkg.KimiK3Canonical,
+			Rates: export.ModelRates{
+				InputPerMTok: money.MustParseDollars("2"),
+				Source:       export.PricingRowSourceFetched,
+			},
+		},
+	})
+
+	cost, priced, contributes, err := sqliteActivityReportRowStatus(
+		dailyUsageScanRow{
+			usageSource: "provider",
+			model:       "daimon-kimi-code",
+			ts:          "2026-07-19T00:00:00Z",
+			inputTokens: 1_000_000,
+		},
+		resolver,
+	)
+
+	require.NoError(t, err)
+	assert.True(t, priced)
+	assert.True(t, contributes)
+	assert.Equal(t, money.MustParseDollars("7"), cost)
+	block, err := resolver.BuildBlock()
+	require.NoError(t, err)
+	require.Contains(t, block.Models, "daimon-kimi-code")
+	resolutions := block.Models["daimon-kimi-code"].Resolutions
+	require.Len(t, resolutions, 1)
+	assert.Equal(t, "daimon-kimi-code", resolutions[0].PricedModel)
 }
 
 func TestGetActivityReport_CopilotReportedCostReplacesSessionEstimates(t *testing.T) {
@@ -563,6 +673,47 @@ func TestGetActivityReport_UsageDedupSubSecondOrder(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 500, r.Totals.OutputTokens,
 		"first-seen dedup keeps the chronologically earlier whole-second row")
+}
+
+func TestGetActivityReport_UsageDedupEqualInstantUsesSessionOrder(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
+		ModelPattern:  "claude-sonnet-4-20250514",
+		InputPerMTok:  money.MustParseDollars("3.0"),
+		OutputPerMTok: money.MustParseDollars("15.0"),
+	}}), "UpsertModelPricing")
+
+	insertSession(t, d, "a-session", "project a", func(s *Session) {
+		s.Agent = "claude"
+		s.StartedAt = Ptr("2026-06-16T10:30:00Z")
+		s.EndedAt = Ptr("2026-06-16T10:30:00Z")
+	})
+	insertMessages(t, d, Message{
+		SessionID: "a-session", Ordinal: 0, Role: "assistant", Content: "x",
+		Timestamp:       "2026-06-16T10:30:00Z",
+		Model:           "claude-sonnet-4-20250514",
+		ClaudeMessageID: "m-equal", ClaudeRequestID: "r-equal",
+		TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":500}`),
+	})
+	insertSession(t, d, "z-session", "project z", func(s *Session) {
+		s.Agent = "claude"
+		s.StartedAt = Ptr("2026-06-16T10:30:00Z")
+		s.EndedAt = Ptr("2026-06-16T10:30:00Z")
+	})
+	insertMessages(t, d, Message{
+		SessionID: "z-session", Ordinal: 0, Role: "assistant", Content: "x",
+		Timestamp:       "2026-06-16T05:30:00-05:00",
+		Model:           "claude-sonnet-4-20250514",
+		ClaudeMessageID: "m-equal", ClaudeRequestID: "r-equal",
+		TokenUsage: json.RawMessage(`{"input_tokens":1000,"output_tokens":9000}`),
+	})
+
+	r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},
+		dayQuery(t, "2026-06-16", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, 500, r.Totals.OutputTokens,
+		"equal parsed instants fall through to session ID ordering")
 }
 
 func TestGetActivityReport_UsageDedupFallsBackToSourceUUID(t *testing.T) {

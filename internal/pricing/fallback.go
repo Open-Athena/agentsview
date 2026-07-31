@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -23,14 +24,17 @@ const maxFallbackSnapshotCompressedBytes = 1 << 20
 const maxFallbackSnapshotJSONBytes = 8 << 20
 const maxFallbackSnapshotModels = 100_000
 
+var immutableFallbackSourceRefPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
 //go:generate go run ./cmd/litellm-snapshot -out snapshot/litellm_snapshot.json.gz
 
 //go:embed snapshot/litellm_snapshot.json.gz
 var litellmSnapshotFS embed.FS
 
 type litellmFallbackSnapshot struct {
-	Version string         `json:"version"`
-	Models  []ModelPricing `json:"models"`
+	Version   string         `json:"version"`
+	SourceRef string         `json:"source_ref"`
+	Models    []ModelPricing `json:"models"`
 }
 
 var (
@@ -42,21 +46,32 @@ var (
 // FallbackVersion is derived from the embedded snapshot; regenerate litellm_snapshot.json.gz to change it.
 var FallbackVersion = fallbackVersionUnknown
 
+// SeedVersion identifies the full seeded pricing set: the embedded
+// snapshot version plus the curated supplemental alias version. The
+// version-gated seed compares against this (not FallbackVersion) so
+// existing databases pick up supplemental additions on binary upgrade
+// even when the snapshot itself is unchanged.
+var SeedVersion = fallbackVersionUnknown
+
+// FallbackSourceRef is the immutable LiteLLM commit used to generate the
+// embedded fallback catalog.
+var FallbackSourceRef string
+
 func init() {
 	fallbackPricingOnce.Do(initFallbackPricing)
 }
 
-// FallbackPricing returns offline pricing from the embedded LiteLLM snapshot.
-// Data is copied for caller safety and deterministic DB seeding.
+// FallbackPricing returns offline pricing from the embedded LiteLLM
+// snapshot plus the curated supplemental aliases (see supplemental.go),
+// sorted by model pattern. Data is copied for caller safety and
+// deterministic DB seeding.
 func FallbackPricing() []ModelPricing {
 	fallbackPricingOnce.Do(initFallbackPricing)
 	if fallbackPricingErr != nil {
 		panic(fallbackPricingErr)
 	}
 
-	pricing := make([]ModelPricing, len(fallbackPricing))
-	copy(pricing, fallbackPricing)
-	return pricing
+	return cloneModelPricing(fallbackPricing)
 }
 
 func initFallbackPricing() {
@@ -64,18 +79,30 @@ func initFallbackPricing() {
 	if err != nil {
 		fallbackPricingErr = fmt.Errorf("loading liteLLM snapshot: %w", err)
 		FallbackVersion = fallbackVersionUnknown
+		SeedVersion = fallbackVersionUnknown
+		FallbackSourceRef = ""
 		log.Panicf("pricing: %v", fallbackPricingErr)
 	}
 
-	fallbackPricing = slices.Clone(snapshot.Models)
-	// The bundled snapshot ships only the 5m cache-write rate (LiteLLM
-	// exposes no 1h rate, and the pinned artifact predates the fork's 1h
-	// column). Derive the 1h rate at load so the offline fallback prices
-	// 1h ephemeral cache writes correctly, matching the live LiteLLM path.
-	for i := range fallbackPricing {
-		catalog.Fill1hCacheRate(&fallbackPricing[i])
+	merged := append(
+		cloneModelPricing(snapshot.Models),
+		cloneModelPricing(supplementalPricing)...,
+	)
+	slices.SortFunc(merged, func(a, b ModelPricing) int {
+		return strings.Compare(a.ModelPattern, b.ModelPattern)
+	})
+	// The bundled snapshot (and the curated supplemental aliases) ship only
+	// the 5m cache-write rate (LiteLLM exposes no 1h rate, and the pinned
+	// artifact predates the fork's 1h column). Derive the 1h rate at load so
+	// the offline fallback prices 1h ephemeral cache writes correctly,
+	// matching the live LiteLLM path.
+	for i := range merged {
+		catalog.Fill1hCacheRate(&merged[i])
 	}
+	fallbackPricing = merged
 	FallbackVersion = snapshot.Version
+	SeedVersion = snapshot.Version + "+supplemental-" + supplementalVersion
+	FallbackSourceRef = snapshot.SourceRef
 }
 
 func decodeFallbackSnapshot() (litellmFallbackSnapshot, error) {
@@ -130,6 +157,11 @@ func decodeFallbackSnapshotFromFS(fsys fs.FS) (litellmFallbackSnapshot, error) {
 			"missing snapshot version",
 		)
 	}
+	if !immutableFallbackSourceRefPattern.MatchString(snapshot.SourceRef) {
+		return litellmFallbackSnapshot{}, fmt.Errorf(
+			"missing immutable LiteLLM source ref",
+		)
+	}
 	if len(snapshot.Models) == 0 {
 		return litellmFallbackSnapshot{}, fmt.Errorf(
 			"missing snapshot models",
@@ -147,6 +179,9 @@ func decodeFallbackSnapshotFromFS(fsys fs.FS) (litellmFallbackSnapshot, error) {
 				"snapshot contains model with empty pattern",
 			)
 		}
+		if err := catalog.NormalizePricingBands(model.ModelPattern, model.Bands); err != nil {
+			return litellmFallbackSnapshot{}, err
+		}
 	}
 
 	slices.SortFunc(snapshot.Models, func(a, b ModelPricing) int {
@@ -154,6 +189,14 @@ func decodeFallbackSnapshotFromFS(fsys fs.FS) (litellmFallbackSnapshot, error) {
 	})
 
 	return snapshot, nil
+}
+
+func cloneModelPricing(models []ModelPricing) []ModelPricing {
+	cloned := slices.Clone(models)
+	for i := range cloned {
+		cloned[i].Bands = slices.Clone(cloned[i].Bands)
+	}
+	return cloned
 }
 
 func readLimitedSnapshot(reader io.Reader, limit int64) ([]byte, error) {

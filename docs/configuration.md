@@ -254,6 +254,7 @@ can still be parsed.
 | iFlow                 | `~/.iflow/projects/`                                                             | JSONL per session                                                                                                               |
 | Kilo                  | `~/.local/share/kilo/`                                                           | SQLite DB or `storage/` JSON files                                                                                              |
 | Kimi                  | `~/.kimi/sessions/` and `~/.kimi-code/sessions/`                                 | JSONL per session                                                                                                               |
+| Kimi Work             | (platform-specific, see below)                                                   | JSONL per session (kimi-code kernel wire logs)                                                                                  |
 | Kiro CLI              | `~/.kiro/sessions/cli/` and `~/.local/share/kiro-cli/`                           | JSONL per session and SQLite database                                                                                           |
 | Kiro IDE              | (platform-specific, see below)                                                   | JSON / chat files                                                                                                               |
 | Kilo (legacy)         | (platform-specific, see below)                                                   | `tasks/<uuid>/{task_metadata.json,ui_messages.json,api_conversation_history.json}`                                              |
@@ -348,6 +349,19 @@ resolution is still disabled. A Trae root is a full user profile, and AgentsView
 archive or ship that profile wholesale. The follow-up path is Windsurf-style
 curated file targets only: `state.vscdb`, `state.vscdb-wal`, and
 `workspace.json` for each supported workspace store.
+
+**Kimi Work default directories** vary by platform. Kimi Work is the
+kimi-desktop app (the "daimon" runtime); it stores conversations as kimi-code
+kernel wire logs under `<root>/wd_<workspace>_<hash>/<session>/agents/<agent>/wire.jsonl`:
+
+- **macOS:** `~/Library/Application Support/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions/`
+- **Linux:** `~/.config/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions/`
+  (or `~/.local/share/...` on some installs)
+- **Windows:** `%APPDATA%/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions/`
+
+Only `conv-*` session directories are user conversations; auxiliary internal
+sessions (`ctitle-*`, `sklsum-*`, `dvlt-*`) are excluded from discovery. Set
+`KIMI_WORK_DIR` or `kimi_work_dirs` if your installation stores them elsewhere.
 
 **Positron Assistant default directory** (macOS only):
 
@@ -573,6 +587,7 @@ export HERMES_SESSIONS_DIR=~/custom/hermes
 export IFLOW_DIR=~/custom/iflow
 export KILO_DIR=~/custom/kilo
 export KIMI_DIR=~/custom/kimi
+export KIMI_WORK_DIR=~/custom/kimi-work
 export KIRO_SESSIONS_DIR=~/custom/kiro
 export KIRO_IDE_DIR=~/custom/kiro-ide
 export KILO_LEGACY_DIR=~/custom/kilo-legacy
@@ -626,10 +641,12 @@ The corresponding fields are `aider_dirs`, `amp_dirs`, `antigravity_dirs`,
 `cowork_dirs`, `devin_dirs`, `codex_sessions_dirs`, `commandcode_project_dirs`,
 `copilot_dirs`, `cortex_dirs`, `cursor_project_dirs`,
 `deepseek_tui_sessions_dirs`, `forge_dirs`, `gemini_dirs`, `gptme_dirs`,
-`grok_dirs`, `hermes_sessions_dirs`, `iflow_dirs`, `kilo_dirs`, `kilo_legacy_dirs`, `kimi_dirs`, `kiro_dirs`, `kiro_ide_dirs`, `mimocode_dirs`, `vibe_session_dirs`,
-`omp_dirs`, `openclaw_dirs`, `opencode_dirs`, `openhands_dirs`, `pi_dirs`,
-`piebald_dirs`, `posit_assistant_dirs`, `positron_dirs`, `qclaw_dirs`,
-`qoder_project_dirs`, `qwen_project_dirs`, `qwenpaw_dirs`, `reasonix_dirs`, `roocode_dirs`,
+`grok_dirs`, `hermes_sessions_dirs`, `iflow_dirs`, `kilo_dirs`,
+`kilo_legacy_dirs`, `kimi_dirs`, `kimi_work_dirs`, `kiro_dirs`, `kiro_ide_dirs`,
+`mimocode_dirs`, `vibe_session_dirs`, `omp_dirs`, `openclaw_dirs`,
+`opencode_dirs`, `openhands_dirs`, `pi_dirs`, `piebald_dirs`,
+`posit_assistant_dirs`, `positron_dirs`, `qclaw_dirs`, `qoder_project_dirs`,
+`qwen_project_dirs`, `qwenpaw_dirs`, `reasonix_dirs`, `roocode_dirs`,
 `shelley_dirs`, `visualstudio_copilot_dirs`, `vscode_copilot_dirs`,
 `windsurf_dirs`, `warp_dirs`, `workbuddy_project_dirs`, `zcode_dirs`,
 `zed_dirs`, and `zencoder_dirs`. Each accepts an array of paths. When set,
@@ -805,7 +822,8 @@ full rewrite.
 
 ## Sync Behavior
 
-AgentsView keeps the database in sync with session files through two mechanisms:
+AgentsView keeps the database in sync with session files through three
+mechanisms:
 
 1. **File watcher** — uses fsnotify to detect file changes. An isolated edit is
    batched for 500ms; watcher-driven sync start times remain at least five
@@ -813,10 +831,34 @@ AgentsView keeps the database in sync with session files through two mechanisms:
    `__pycache__`, `.git`, `vendor`, `dist`, etc.) are automatically skipped to
    reduce noise and overhead.
 1. **Periodic sync** — full directory scan every 15 minutes as a safety net
+1. **Codex live-activity hints** — every 30 seconds, the daemon checks the
+   provider-declared `history.jsonl` append stream and file metadata for a
+   bounded set of recently active rollouts. This is a freshness backstop for
+   already indexed sessions, not a session source: normal discovery and sync
+   still own ingestion, deletion, and canonical-path selection.
 
 Change detection uses file size, mtime, inode, and device tracking to validate
 incremental parses more reliably. A pool of 8 workers processes files in
 parallel during sync.
+
+Codex history hints are available when the producing frontend writes
+`history.jsonl`. In Codex configuration, `[history] persistence = "none"`
+disables those writes; frontends that do not produce history entries retain the
+native watcher and periodic-sync freshness behavior. AgentsView reads only
+session identity and timestamp metadata from accepted hint records and neither
+stores nor logs submitted prompt text.
+
+For each configured local Codex session root, AgentsView probes
+`history.jsonl` in the cleaned root's parent. For example, a custom
+`/data/custom/sessions` root probes `/data/custom/history.jsonl`. It does not
+search ancestors or the rollout archive for another history file. Missing hint
+files remain cheap probes.
+
+The initial daemon poll bootstraps at most the newest 4 MiB of each history file
+and accepts records at most 24 hours old. If AgentsView restarts during a long
+autonomous run whose last persisted prompt is outside either bound, that rollout
+uses native-watcher freshness until another persisted prompt makes it hot
+again.
 
 For `s3://` Claude and Codex roots, change detection uses object size,
 `LastModified`, and available object fingerprints such as ETag, version ID, and

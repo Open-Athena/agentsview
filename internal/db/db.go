@@ -339,7 +339,10 @@ const projectIdentityRemoteScrubCompletedKey = "project_identity_remote_scrub_v1
 // instead of the generated checkout leaf, and generic hosting fragments defer
 // to an enclosing live repository. Existing rows need re-parsing so activity
 // is neither fragmented by worktree names nor claimed by nested fixture paths.)
-const dataVersion = 75
+// (76: Copilot CLI tool execution boundaries. Re-parsing persists
+// tool.execution_start and tool.execution_complete timestamps as result events
+// so Session Analysis excludes resumed-session idle time from completed calls.)
+const dataVersion = 76
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
@@ -546,8 +549,9 @@ type DB struct {
 	cursorMu     sync.RWMutex
 	cursorSecret []byte
 
-	customPricing        map[string]config.CustomModelRate
-	customPricingSources map[string]export.PricingRowSource
+	customPricing       map[string]config.CustomModelRate
+	effectivePricing    map[string]export.ModelRates
+	emptyCatalogPricing map[string]export.ModelRates
 
 	checkpointMu   sync.Mutex
 	checkpointStop chan struct{}
@@ -792,17 +796,32 @@ func (db *DB) requireWritable() error {
 
 func (db *DB) SetCustomPricing(p map[string]config.CustomModelRate) {
 	db.customPricing = p
-	db.customPricingSources = nil
+	db.effectivePricing = nil
 }
 
 // SetEffectivePricing installs in-memory pricing rows with explicit provenance
 // sources for read-only fallback paths that cannot seed model_pricing.
 func (db *DB) SetEffectivePricing(
-	p map[string]config.CustomModelRate,
-	sources map[string]export.PricingRowSource,
+	p map[string]export.ModelRates,
 ) {
-	db.customPricing = p
-	db.customPricingSources = sources
+	db.customPricing = nil
+	db.effectivePricing = make(map[string]export.ModelRates, len(p))
+	for model, rates := range p {
+		rates.Bands = append([]export.PricingBand(nil), rates.Bands...)
+		db.effectivePricing[model] = rates
+	}
+}
+
+// SetEmptyCatalogPricing installs in-memory rates that are used only when the
+// query source loading pricing sees no stored catalog rows.
+func (db *DB) SetEmptyCatalogPricing(
+	p map[string]export.ModelRates,
+) {
+	db.emptyCatalogPricing = make(map[string]export.ModelRates, len(p))
+	for model, rates := range p {
+		rates.Bands = append([]export.PricingBand(nil), rates.Bands...)
+		db.emptyCatalogPricing[model] = rates
+	}
 }
 
 // SetCursorSecret updates the secret key used for cursor signing.
@@ -1367,6 +1386,7 @@ var readOnlyRequiredTables = []string{
 	"session_project_identity_snapshots",
 	"pg_sync_state",
 	"model_pricing",
+	"model_pricing_bands",
 	"secret_findings",
 	"recall_entries",
 	"recall_evidence",
@@ -1379,6 +1399,14 @@ var readOnlyRequiredTables = []string{
 	"artifact_publication_revisions",
 	"artifact_checkpoint_heads",
 	"artifact_checkpoint_floors",
+	"artifact_import_queue",
+	"artifact_import_attempt_generations",
+	"artifact_peer_checkpoint_heads",
+	"artifact_checkpoint_landings",
+	"artifact_checkpoint_landing_sessions",
+	"artifact_checkpoint_stages",
+	"artifact_checkpoint_stage_sessions",
+	"artifact_imported_sessions",
 }
 
 var (
@@ -1668,6 +1696,40 @@ func legacySchemaColumnMigrations() []schemaColumnMigration {
 
 func schemaColumnMigrations() []schemaColumnMigration {
 	return []schemaColumnMigration{
+		{
+			// Fork-local 1-hour ephemeral cache-write rate. Databases created
+			// by upstream (or an older fork binary), and legacy money-schema
+			// DBs whose model_pricing was just rebuilt by the microdollar
+			// migration, lack this column; add it so the pricing loaders can
+			// select it. Existing rows default to 0 and re-seed on startup
+			// (derived 8/5 of the 5m rate).
+			"model_pricing", "cache_creation_1h_microdollars_per_mtok",
+			"ALTER TABLE model_pricing ADD COLUMN cache_creation_1h_microdollars_per_mtok INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"artifact_import_queue", "quarantine_pending",
+			"ALTER TABLE artifact_import_queue ADD COLUMN quarantine_pending INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"artifact_checkpoint_stages", "pending_count",
+			"ALTER TABLE artifact_checkpoint_stages ADD COLUMN pending_count INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"artifact_checkpoint_stages", "decoded_count",
+			"ALTER TABLE artifact_checkpoint_stages ADD COLUMN decoded_count INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"artifact_checkpoint_stages", "decode_offset",
+			"ALTER TABLE artifact_checkpoint_stages ADD COLUMN decode_offset INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"artifact_checkpoint_stages", "decoder_version",
+			"ALTER TABLE artifact_checkpoint_stages ADD COLUMN decoder_version INTEGER NOT NULL DEFAULT 1",
+		},
+		{
+			"artifact_checkpoint_stage_sessions", "satisfied",
+			"ALTER TABLE artifact_checkpoint_stage_sessions ADD COLUMN satisfied INTEGER NOT NULL DEFAULT 0",
+		},
 		{
 			"artifact_export_queue", "rejected_generation",
 			"ALTER TABLE artifact_export_queue ADD COLUMN rejected_generation INTEGER",
@@ -2317,6 +2379,9 @@ func (db *DB) migrateColumns() error {
 	if err := migrateMoneyColumnsLocked(w); err != nil {
 		return err
 	}
+	if _, err := w.Exec(modelPricingBandsSchemaSQL); err != nil {
+		return fmt.Errorf("creating model pricing bands: %w", err)
+	}
 	if _, err := w.Exec(artifactSessionQueueTriggerDropsSQL); err != nil {
 		return fmt.Errorf("dropping artifact session queue triggers: %w", err)
 	}
@@ -2487,6 +2552,9 @@ func (db *DB) migrateColumns() error {
 	if err := db.ensureCursorUsageEventsSchemaLocked(w); err != nil {
 		return err
 	}
+	if err := requeueInvalidArtifactPublicationsLocked(w); err != nil {
+		return err
+	}
 
 	runRepair, err := db.shouldRunTokenCoverageRepairLocked(w)
 	if err != nil {
@@ -2503,6 +2571,20 @@ func (db *DB) migrateColumns() error {
 	}
 	return nil
 }
+
+const modelPricingBandsSchemaSQL = `
+CREATE TABLE IF NOT EXISTS model_pricing_bands (
+    model_pattern TEXT NOT NULL
+        REFERENCES model_pricing(model_pattern) ON DELETE CASCADE,
+    above_input_tokens INTEGER NOT NULL CHECK (above_input_tokens > 0),
+    input_microdollars_per_mtok INTEGER NOT NULL,
+    output_microdollars_per_mtok INTEGER NOT NULL,
+    cache_creation_microdollars_per_mtok INTEGER NOT NULL,
+    cache_read_microdollars_per_mtok INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (model_pattern, above_input_tokens)
+);`
 
 const (
 	bootstrapArtifactExportQueueSQL = `
@@ -2552,6 +2634,28 @@ const (
 			last_error = '',
 			rejected_at = NULL`
 )
+
+func requeueInvalidArtifactPublicationsLocked(w *writerHandle) error {
+	_, err := w.Exec(`
+		INSERT INTO artifact_export_queue(session_id)
+		SELECT session_id
+		FROM artifact_publications
+		WHERE origin = (
+			SELECT value FROM pg_sync_state WHERE key = 'artifact_origin_id'
+		) AND (session_id = '' OR instr(session_id, '~') > 0)
+		ON CONFLICT(session_id) DO UPDATE SET
+			enqueued_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+			generation = artifact_export_queue.generation + 1,
+			pending = 1,
+			rejected_generation = NULL,
+			last_error = '',
+			rejected_at = NULL
+		WHERE artifact_export_queue.pending = 0`)
+	if err != nil {
+		return fmt.Errorf("requeueing invalid artifact publications: %w", err)
+	}
+	return nil
+}
 
 var populateArtifactOriginQueueTx = func(tx *sql.Tx, origin string, requeue bool) error {
 	statement := bootstrapArtifactExportQueueSQL
@@ -2900,6 +3004,11 @@ func (db *DB) createPartialIndexesLocked(w *writerHandle) error {
 		`DROP INDEX IF EXISTS idx_messages_usage_timestamp`,
 	); err != nil {
 		return fmt.Errorf("dropping legacy usage index: %w", err)
+	}
+	if _, err := w.Exec(
+		`DROP INDEX IF EXISTS idx_artifact_checkpoint_stage_pending`,
+	); err != nil {
+		return fmt.Errorf("dropping superseded artifact stage index: %w", err)
 	}
 	// Superseded by idx_recall_extract_progress_retry (schema.sql), whose
 	// trailing updated_at column serves the same prefix.

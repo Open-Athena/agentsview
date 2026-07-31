@@ -37,7 +37,8 @@ func TestPricingResolverBuildBlockUsesRecordedLookup(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Contains(t, block.Models, "claude-test-20260703")
-	model := block.Models["claude-test-20260703"]
+	model := onlyPricingResolution(
+		t, block.Models["claude-test-20260703"])
 	require.NotNil(t, model.MatchedPattern)
 	assert.Equal(t, lookup.Pattern, *model.MatchedPattern)
 	assert.Equal(t, lookup.Rates.InputPerMTok, model.InputCostPerMTok)
@@ -45,6 +46,110 @@ func TestPricingResolverBuildBlockUsesRecordedLookup(t *testing.T) {
 	assert.Equal(t, lookup.Rates.CacheWritePerMTok, model.CacheWriteCostPerMTok)
 	assert.Equal(t, lookup.Rates.CacheReadPerMTok, model.CacheReadCostPerMTok)
 	assert.Equal(t, money.MustParseDollars("45.45"), cost)
+}
+
+func TestPricingResolverResolvePrefersExactCustomReportedModel(t *testing.T) {
+	resolver := NewPricingResolver([]EffectivePricingRow{
+		{
+			ModelPattern: "kimi-for-coding",
+			Rates: ModelRates{
+				InputPerMTok: money.MustParseDollars("7"),
+				Source:       PricingRowSourceCustom,
+			},
+		},
+		{
+			ModelPattern: "moonshot/kimi-k3",
+			Rates: ModelRates{
+				InputPerMTok: money.MustParseDollars("2"),
+				Source:       PricingRowSourceFetched,
+			},
+		},
+	})
+
+	pricedModel, lookup := resolver.Resolve(
+		"kimi-for-coding", "moonshot/kimi-k3")
+
+	assert.Equal(t, "kimi-for-coding", pricedModel)
+	require.True(t, lookup.OK)
+	assert.Equal(t, "kimi-for-coding", lookup.Pattern)
+	assert.Equal(t, money.MustParseDollars("7"), lookup.Rates.InputPerMTok)
+}
+
+func TestPricingResolverResolveUsesCanonicalWithoutExactCustom(t *testing.T) {
+	resolver := NewPricingResolver([]EffectivePricingRow{
+		{
+			ModelPattern: "kimi-for-coding",
+			Rates: ModelRates{
+				InputPerMTok: money.MustParseDollars("9"),
+				Source:       PricingRowSourceFetched,
+			},
+		},
+		{
+			ModelPattern: "moonshot/kimi-k3",
+			Rates: ModelRates{
+				InputPerMTok: money.MustParseDollars("2"),
+				Source:       PricingRowSourceFetched,
+			},
+		},
+	})
+
+	pricedModel, lookup := resolver.Resolve(
+		"kimi-for-coding", "moonshot/kimi-k3")
+
+	assert.Equal(t, "moonshot/kimi-k3", pricedModel)
+	require.True(t, lookup.OK)
+	assert.Equal(t, "moonshot/kimi-k3", lookup.Pattern)
+	assert.Equal(t, money.MustParseDollars("2"), lookup.Rates.InputPerMTok)
+}
+
+func TestPricingResolverBuildBlockKeepsReportedModelResolutions(t *testing.T) {
+	resolver := NewPricingResolver([]EffectivePricingRow{
+		{
+			ModelPattern: "moonshot/kimi-k2.6",
+			Rates: ModelRates{
+				InputPerMTok: money.MustParseDollars("1"),
+				Source:       PricingRowSourceFetched,
+			},
+		},
+		{
+			ModelPattern: "moonshot/kimi-k3",
+			Rates: ModelRates{
+				InputPerMTok: money.MustParseDollars("2"),
+				Source:       PricingRowSourceFetched,
+			},
+		},
+	})
+
+	k26 := resolver.Lookup("moonshot/kimi-k2.6")
+	k3 := resolver.Lookup("moonshot/kimi-k3")
+	require.True(t, k26.OK)
+	require.True(t, k3.OK)
+	resolver.RecordResolvedComputed(
+		"kimi-for-coding", "moonshot/kimi-k3", k3)
+	resolver.RecordResolvedReported(
+		"kimi-for-coding", "moonshot/kimi-k2.6", k26)
+
+	block, err := resolver.BuildBlock()
+	require.NoError(t, err)
+
+	require.Contains(t, block.Models, "kimi-for-coding")
+	provenance := block.Models["kimi-for-coding"]
+	assert.Equal(t, CostSourceMixed, provenance.CostSource)
+	require.Len(t, provenance.Resolutions, 2)
+	assert.Equal(t, "moonshot/kimi-k2.6",
+		provenance.Resolutions[0].PricedModel)
+	assert.Equal(t, CostSourceReported,
+		provenance.Resolutions[0].CostSource)
+	assert.Equal(t, money.MustParseDollars("1"),
+		provenance.Resolutions[0].InputCostPerMTok)
+	assert.Equal(t, "moonshot/kimi-k3",
+		provenance.Resolutions[1].PricedModel)
+	assert.Equal(t, CostSourceComputed,
+		provenance.Resolutions[1].CostSource)
+	assert.Equal(t, money.MustParseDollars("2"),
+		provenance.Resolutions[1].InputCostPerMTok)
+	assert.NotContains(t, block.Models, "moonshot/kimi-k2.6")
+	assert.NotContains(t, block.Models, "moonshot/kimi-k3")
 }
 
 func TestModelRatesCostForTokensTreatsReasoningAsOutputBreakdown(t *testing.T) {
@@ -105,6 +210,171 @@ func TestModelRatesCostForTokensReturnsOverflow(t *testing.T) {
 	require.ErrorIs(t, err, money.ErrOverflow)
 }
 
+func TestModelRatesCostForTokensPricingBandBoundary(t *testing.T) {
+	rates := ModelRates{
+		InputPerMTok:      money.MustParseDollars("1"),
+		OutputPerMTok:     money.MustParseDollars("2"),
+		CacheWritePerMTok: money.MustParseDollars("0.50"),
+		CacheReadPerMTok:  money.MustParseDollars("0.10"),
+		Bands: []PricingBand{{
+			AboveInputTokens:  200_000,
+			InputPerMTok:      money.MustParseDollars("2"),
+			OutputPerMTok:     money.MustParseDollars("3"),
+			CacheWritePerMTok: money.MustParseDollars("1"),
+			CacheReadPerMTok:  money.MustParseDollars("0.20"),
+		}},
+	}
+
+	atBoundary, err := rates.CostForTokens(100_000, 10_000, 0, 50_000, 0, 50_000)
+	require.NoError(t, err)
+	aboveBoundary, err := rates.CostForTokens(100_001, 10_000, 0, 50_000, 0, 50_000)
+	require.NoError(t, err)
+
+	assert.Equal(t, money.Money{Microdollars: 150_000}, atBoundary)
+	assert.Equal(t, money.Money{Microdollars: 290_002}, aboveBoundary)
+}
+
+func TestModelRatesRatesForTokensUsesHighestPricingBand(t *testing.T) {
+	rates := ModelRates{
+		InputPerMTok: money.MustParseDollars("1"),
+		Bands: []PricingBand{
+			{AboveInputTokens: 200_000, InputPerMTok: money.MustParseDollars("2")},
+			{AboveInputTokens: 272_000, InputPerMTok: money.MustParseDollars("4")},
+		},
+	}
+
+	selected := rates.RatesForTokens(272_001, 0, 0)
+
+	assert.Equal(t, money.MustParseDollars("4"), selected.InputPerMTok)
+}
+
+func TestModelRatesPricesRequestsBeforeAggregation(t *testing.T) {
+	rates := ModelRates{
+		InputPerMTok: money.MustParseDollars("1"),
+		Bands: []PricingBand{{
+			AboveInputTokens: 200_000,
+			InputPerMTok:     money.MustParseDollars("2"),
+		}},
+	}
+
+	first, err := rates.CostForTokens(150_000, 0, 0, 0, 0, 0)
+	require.NoError(t, err)
+	second, err := rates.CostForTokens(150_000, 0, 0, 0, 0, 0)
+	require.NoError(t, err)
+
+	assert.Equal(t, money.Money{Microdollars: 300_000}, money.MustAdd(first, second))
+}
+
+func TestModelRatesCostForTokensScopedAggregateUsesBaseRate(t *testing.T) {
+	rates := ModelRates{
+		InputPerMTok: money.MustParseDollars("1"),
+		Bands: []PricingBand{{
+			AboveInputTokens: 200_000,
+			InputPerMTok:     money.MustParseDollars("2"),
+		}},
+	}
+
+	cost, err := rates.CostForTokensScoped(false, 300_000, 0, 0, 0, 0, 0)
+	require.NoError(t, err)
+
+	assert.Equal(t, money.Money{Microdollars: 300_000}, cost)
+}
+
+func TestPricingResolverBuildBlockPricingBandsAndApplicationCounts(t *testing.T) {
+	baseUpdatedAt := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	bandUpdatedAt := time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC)
+	resolver := NewPricingResolver([]EffectivePricingRow{{
+		ModelPattern: "banded-model",
+		Rates: ModelRates{
+			InputPerMTok: money.MustParseDollars("1"),
+			UpdatedAt:    &baseUpdatedAt,
+			Source:       PricingRowSourceFetched,
+			Bands: []PricingBand{{
+				AboveInputTokens: 200_000,
+				InputPerMTok:     money.MustParseDollars("2"),
+				UpdatedAt:        &bandUpdatedAt,
+			}},
+		},
+	}})
+	lookup := resolver.Lookup("banded-model")
+	require.True(t, lookup.OK)
+
+	resolver.RecordComputedRequest("banded-model", lookup, 150_000, 0, 0)
+	resolver.RecordComputedRequest("banded-model", lookup, 200_001, 0, 0)
+	resolver.RecordComputedAggregate("banded-model", lookup)
+	resolver.RecordReported("banded-model", lookup)
+	block, err := resolver.BuildBlock()
+	require.NoError(t, err)
+
+	require.NotNil(t, block.LatestRowUpdatedAt)
+	assert.Equal(t, bandUpdatedAt, *block.LatestRowUpdatedAt)
+	model := onlyPricingResolution(t, block.Models["banded-model"])
+	assert.Equal(t, []PricingBand{{
+		AboveInputTokens: 200_000,
+		InputPerMTok:     money.MustParseDollars("2"),
+		UpdatedAt:        &bandUpdatedAt,
+	}}, model.Bands)
+	assert.Equal(t, PricingApplication{
+		BaseRequestCount:  1,
+		AggregateRowCount: 1,
+		Bands: []AppliedPricingBand{{
+			AboveInputTokens: 200_000,
+			RequestCount:     1,
+		}},
+	}, model.Application)
+}
+
+func TestPricingResolverReportedOnlyRowDoesNotCountPricingApplication(t *testing.T) {
+	resolver := NewPricingResolver([]EffectivePricingRow{{
+		ModelPattern: "reported-model",
+		Rates: ModelRates{
+			InputPerMTok: money.MustParseDollars("1"),
+			Bands: []PricingBand{{
+				AboveInputTokens: 200_000,
+				InputPerMTok:     money.MustParseDollars("2"),
+			}},
+		},
+	}})
+	lookup := resolver.Lookup("reported-model")
+	resolver.RecordReported("reported-model", lookup)
+
+	block, err := resolver.BuildBlock()
+	require.NoError(t, err)
+
+	model := onlyPricingResolution(t, block.Models["reported-model"])
+	assert.Equal(t, PricingApplication{}, model.Application)
+}
+
+func TestPricingResolverUnresolvedRequestPreservesComputedProvenanceWithoutApplication(t *testing.T) {
+	resolver := NewPricingResolver(nil)
+	lookup := resolver.Lookup("unpriced-request-model")
+	require.False(t, lookup.OK)
+
+	resolver.RecordComputedRequest("unpriced-request-model", lookup, 150_000, 0, 0)
+	block, err := resolver.BuildBlock()
+	require.NoError(t, err)
+
+	model := onlyPricingResolution(t, block.Models["unpriced-request-model"])
+	assert.Equal(t, CostSourceComputed, model.CostSource)
+	assert.Nil(t, model.MatchedPattern)
+	assert.Equal(t, PricingApplication{}, model.Application)
+}
+
+func TestPricingResolverUnresolvedAggregatePreservesComputedProvenanceWithoutApplication(t *testing.T) {
+	resolver := NewPricingResolver(nil)
+	lookup := resolver.Lookup("unpriced-aggregate-model")
+	require.False(t, lookup.OK)
+
+	resolver.RecordComputedAggregate("unpriced-aggregate-model", lookup)
+	block, err := resolver.BuildBlock()
+	require.NoError(t, err)
+
+	model := onlyPricingResolution(t, block.Models["unpriced-aggregate-model"])
+	assert.Equal(t, CostSourceComputed, model.CostSource)
+	assert.Nil(t, model.MatchedPattern)
+	assert.Equal(t, PricingApplication{}, model.Application)
+}
+
 func TestPricingResolverBuildBlockModelsAndFallback(t *testing.T) {
 	resolver := NewPricingResolver([]EffectivePricingRow{
 		{
@@ -140,7 +410,8 @@ func TestPricingResolverBuildBlockModelsAndFallback(t *testing.T) {
 	assert.NotContains(t, block.Fallback.Models, "unpriced-model")
 	assert.NotContains(t, block.Models, "unused-model")
 
-	unpriced := block.Models["unpriced-model"]
+	unpriced := onlyPricingResolution(
+		t, block.Models["unpriced-model"])
 	assert.Nil(t, unpriced.MatchedPattern)
 	assert.Zero(t, unpriced.InputCostPerMTok)
 	assert.Zero(t, unpriced.OutputCostPerMTok)
@@ -157,7 +428,9 @@ func TestPricingResolverReportedCostWithoutMatchingRateIsExplicit(t *testing.T) 
 	block, err := resolver.BuildBlock()
 	require.NoError(t, err)
 	require.Contains(t, block.Models, "provider-opaque-model")
-	model := block.Models["provider-opaque-model"]
+	provenance := block.Models["provider-opaque-model"]
+	assert.Equal(t, CostSourceReported, provenance.CostSource)
+	model := onlyPricingResolution(t, provenance)
 	assert.Equal(t, CostSourceReported, model.CostSource)
 	assert.Nil(t, model.MatchedPattern)
 	assert.Zero(t, model.InputCostPerMTok)
@@ -265,6 +538,25 @@ func TestPricingResolverLookupCachesByReportedModel(t *testing.T) {
 
 	assert.Equal(t, first, second)
 	assert.Len(t, resolver.lookupCache, 1)
+}
+
+func TestPricingResolverDeepClonesPricingBands(t *testing.T) {
+	rows := []EffectivePricingRow{{
+		ModelPattern: "banded-model",
+		Rates: ModelRates{Bands: []PricingBand{{
+			AboveInputTokens: 200_000,
+			InputPerMTok:     money.MustParseDollars("2"),
+		}}},
+	}}
+	resolver := NewPricingResolver(rows)
+	rows[0].Rates.Bands[0].InputPerMTok = money.MustParseDollars("99")
+
+	lookup := resolver.Lookup("banded-model")
+	require.True(t, lookup.OK)
+	lookup.Rates.Bands[0].InputPerMTok = money.MustParseDollars("88")
+	second := resolver.Lookup("banded-model")
+
+	assert.Equal(t, money.MustParseDollars("2"), second.Rates.Bands[0].InputPerMTok)
 }
 
 func TestPricingResolverSourceCanonicalOrder(t *testing.T) {
@@ -421,4 +713,12 @@ func mapKeys[V any](m map[string]V) []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+func onlyPricingResolution(
+	t *testing.T, provenance ModelPricingProvenance,
+) EffectiveModelRate {
+	t.Helper()
+	require.Len(t, provenance.Resolutions, 1)
+	return provenance.Resolutions[0]
 }

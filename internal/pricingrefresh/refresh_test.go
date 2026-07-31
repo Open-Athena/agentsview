@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -52,6 +53,37 @@ func TestEnsureSeedsFallbackAndFetchedModel(t *testing.T) {
 	assert.Equal(t, money.MustParseDollars("8"), fetched.OutputPerMTok)
 }
 
+func TestSeedFallbackReseedsBandsWhenStorageVersionIsMissing(t *testing.T) {
+	database := testDB(t)
+	fallback := pricing.FallbackPricing()
+	var gpt pricing.ModelPricing
+	for _, model := range fallback {
+		if model.ModelPattern == "gpt-5.5" {
+			gpt = model
+			break
+		}
+	}
+	require.NotEmpty(t, gpt.Bands)
+	require.NoError(t, database.UpsertModelPricing([]db.ModelPricing{{
+		ModelPattern:         gpt.ModelPattern,
+		InputPerMTok:         gpt.InputPerMTok,
+		OutputPerMTok:        gpt.OutputPerMTok,
+		CacheCreationPerMTok: gpt.CacheCreationPerMTok,
+		CacheReadPerMTok:     gpt.CacheReadPerMTok,
+	}}))
+	require.NoError(t, database.SetPricingMeta(
+		fallbackVersionMetaKey,
+		pricing.FallbackVersion,
+	))
+
+	require.NoError(t, SeedFallback(database))
+	got, err := database.GetModelPricing("gpt-5.5")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	assert.NotEmpty(t, got.Bands)
+}
+
 func TestRefreshIfStaleFreshAttemptSkipsFetch(t *testing.T) {
 	database := testDB(t)
 	now := pricingTestNow()
@@ -76,6 +108,13 @@ func TestRefreshIfStaleStaleTriggersFetch(t *testing.T) {
 		ModelPattern:  "new-model",
 		InputPerMTok:  money.MustParseDollars("1.25"),
 		OutputPerMTok: money.MustParseDollars("10"),
+		Bands: []pricing.PricingBand{{
+			AboveInputTokens:     200_000,
+			InputPerMTok:         money.MustParseDollars("2.50"),
+			OutputPerMTok:        money.MustParseDollars("15"),
+			CacheCreationPerMTok: money.MustParseDollars("3.125"),
+			CacheReadPerMTok:     money.MustParseDollars("0.25"),
+		}},
 	}}}
 
 	refreshed, err := RefreshIfStale(
@@ -88,6 +127,9 @@ func TestRefreshIfStaleStaleTriggersFetch(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, price)
 	assert.Equal(t, money.MustParseDollars("10"), price.OutputPerMTok)
+	require.Len(t, price.Bands, 1)
+	assert.Equal(t, 200_000, price.Bands[0].AboveInputTokens)
+	assert.Equal(t, money.MustParseDollars("15"), price.Bands[0].OutputPerMTok)
 	assertPricingAttemptMeta(t, database, now.Format(time.RFC3339))
 }
 
@@ -206,6 +248,103 @@ func TestEnsureCurrentCancellationAllowsImmediateRetry(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, 1, retryCalls)
+}
+
+func TestRefreshCurrentFetchesDespiteRecentAttempt(t *testing.T) {
+	database := testDB(t)
+	now := pricingTestNow()
+	seedPricingAttempt(t, database, now, 10*time.Minute)
+
+	err := refreshCurrent(context.Background(), database, func(
+		context.Context,
+	) ([]pricing.ModelPricing, error) {
+		return []pricing.ModelPricing{{
+			ModelPattern: "scheduled-model",
+		}}, nil
+	}, now)
+
+	require.NoError(t, err)
+	price, err := database.GetModelPricing("scheduled-model")
+	require.NoError(t, err)
+	require.NotNil(t, price)
+	assertPricingAttemptMeta(t, database, now.Format(time.RFC3339))
+}
+
+func TestRefreshCurrentSkipsWhileEnsureCurrentInFlight(t *testing.T) {
+	database := testDB(t)
+	now := pricingTestNow()
+	ensureFetchStarted := make(chan struct{})
+	releaseEnsureFetch := make(chan struct{}, 1)
+	ensureDone := make(chan error, 1)
+
+	go func() {
+		ensureDone <- ensureCurrent(context.Background(), database, func(
+			context.Context,
+		) ([]pricing.ModelPricing, error) {
+			close(ensureFetchStarted)
+			<-releaseEnsureFetch
+			return []pricing.ModelPricing{{
+				ModelPattern: "ensure-model",
+			}}, nil
+		}, now)
+	}()
+	defer func() {
+		releaseEnsureFetch <- struct{}{}
+	}()
+
+	require.Eventually(t, func() bool {
+		select {
+		case <-ensureFetchStarted:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, time.Millisecond)
+
+	var refreshFetchCalls atomic.Int32
+	refreshDone := make(chan error, 1)
+	go func() {
+		refreshDone <- refreshCurrent(
+			context.Background(), database, func(
+				context.Context,
+			) ([]pricing.ModelPricing, error) {
+				refreshFetchCalls.Add(1)
+				return []pricing.ModelPricing{{
+					ModelPattern: "scheduled-model",
+				}}, nil
+			}, now.Add(time.Minute),
+		)
+	}()
+
+	var refreshErr error
+	require.Eventually(t, func() bool {
+		select {
+		case refreshErr = <-refreshDone:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, time.Millisecond)
+	require.NoError(t, refreshErr)
+	assert.Zero(t, refreshFetchCalls.Load())
+	scheduledPrice, err := database.GetModelPricing("scheduled-model")
+	require.NoError(t, err)
+	assert.Nil(t, scheduledPrice)
+
+	releaseEnsureFetch <- struct{}{}
+	var ensureErr error
+	require.Eventually(t, func() bool {
+		select {
+		case ensureErr = <-ensureDone:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, time.Millisecond)
+	require.NoError(t, ensureErr)
+	ensuredPrice, err := database.GetModelPricing("ensure-model")
+	require.NoError(t, err)
+	require.NotNil(t, ensuredPrice)
 }
 
 func testDB(t *testing.T) *db.DB {

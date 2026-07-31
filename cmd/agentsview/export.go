@@ -90,6 +90,10 @@ type exportSessionsCursorResetError struct {
 }
 
 func newExportCommand() *cobra.Command {
+	return newExportCommandWithDeps(defaultExportReportingDeps())
+}
+
+func newExportCommandWithDeps(deps exportReportingDeps) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "export",
 		Short:        "Export local archive data",
@@ -102,6 +106,9 @@ func newExportCommand() *cobra.Command {
 	}
 	cmd.AddCommand(newExportSessionsCommand())
 	cmd.AddCommand(newExportStatusCommand())
+	cmd.AddCommand(newExportHourCommand(deps))
+	cmd.AddCommand(newExportDayCommand(deps))
+	cmd.AddCommand(newExportDigestCommand(deps))
 	return cmd
 }
 
@@ -476,15 +483,16 @@ func mergeExportSessionsPricing(
 
 	merged := cloneExportSessionsPricing(base)
 	if merged.Models == nil {
-		merged.Models = map[string]export.EffectiveModelRate{}
+		merged.Models = map[string]export.ModelPricingProvenance{}
 	}
-	for model, rate := range next.Models {
+	for model, provenance := range next.Models {
 		if existing, ok := merged.Models[model]; ok {
-			rate = mergeExportSessionsModelRate(existing, rate)
+			provenance = mergeExportSessionsModelProvenance(
+				existing, provenance)
 		} else {
-			rate = cloneExportSessionsModelRate(rate)
+			provenance = cloneExportSessionsModelProvenance(provenance)
 		}
-		merged.Models[model] = rate
+		merged.Models[model] = provenance
 	}
 	merged.Fallback.Models = mergeExportSessionsStringSets(
 		merged.Fallback.Models, next.Fallback.Models)
@@ -524,12 +532,25 @@ func cloneExportSessionsPricing(
 	clone := *block
 	clone.Fallback.Models = append([]string{}, block.Fallback.Models...)
 	clone.Fallback.Used = len(clone.Fallback.Models) > 0
-	clone.Models = make(map[string]export.EffectiveModelRate,
+	clone.Models = make(map[string]export.ModelPricingProvenance,
 		len(block.Models))
-	for model, rate := range block.Models {
-		clone.Models[model] = cloneExportSessionsModelRate(rate)
+	for model, provenance := range block.Models {
+		clone.Models[model] =
+			cloneExportSessionsModelProvenance(provenance)
 	}
 	return &clone
+}
+
+func cloneExportSessionsModelProvenance(
+	provenance export.ModelPricingProvenance,
+) export.ModelPricingProvenance {
+	clone := provenance
+	clone.Resolutions = make([]export.EffectiveModelRate,
+		len(provenance.Resolutions))
+	for i, rate := range provenance.Resolutions {
+		clone.Resolutions[i] = cloneExportSessionsModelRate(rate)
+	}
+	return clone
 }
 
 func cloneExportSessionsModelRate(
@@ -539,7 +560,54 @@ func cloneExportSessionsModelRate(
 		pattern := *rate.MatchedPattern
 		rate.MatchedPattern = &pattern
 	}
+	rate.Bands = append([]export.PricingBand(nil), rate.Bands...)
+	rate.Application.Bands = append(
+		[]export.AppliedPricingBand(nil),
+		rate.Application.Bands...,
+	)
 	return rate
+}
+
+type exportSessionsModelResolutionKey struct {
+	pricedModel       string
+	matchedPattern    string
+	hasMatchedPattern bool
+}
+
+func mergeExportSessionsModelProvenance(
+	base, next export.ModelPricingProvenance,
+) export.ModelPricingProvenance {
+	merged := cloneExportSessionsModelProvenance(base)
+	merged.CostSource = mergeExportSessionsCostSource(
+		merged.CostSource, next.CostSource)
+	positions := make(map[exportSessionsModelResolutionKey]int,
+		len(merged.Resolutions))
+	for i, rate := range merged.Resolutions {
+		positions[exportSessionsModelRateKey(rate)] = i
+	}
+	for _, rate := range next.Resolutions {
+		key := exportSessionsModelRateKey(rate)
+		if i, ok := positions[key]; ok {
+			merged.Resolutions[i] = mergeExportSessionsModelRate(
+				merged.Resolutions[i], rate)
+			continue
+		}
+		positions[key] = len(merged.Resolutions)
+		merged.Resolutions = append(merged.Resolutions,
+			cloneExportSessionsModelRate(rate))
+	}
+	sort.Slice(merged.Resolutions, func(i, j int) bool {
+		left := exportSessionsModelRateKey(merged.Resolutions[i])
+		right := exportSessionsModelRateKey(merged.Resolutions[j])
+		if left.pricedModel != right.pricedModel {
+			return left.pricedModel < right.pricedModel
+		}
+		if left.hasMatchedPattern != right.hasMatchedPattern {
+			return !left.hasMatchedPattern
+		}
+		return left.matchedPattern < right.matchedPattern
+	})
+	return merged
 }
 
 func mergeExportSessionsModelRate(
@@ -550,8 +618,56 @@ func mergeExportSessionsModelRate(
 		pattern := *next.MatchedPattern
 		merged.MatchedPattern = &pattern
 	}
+	if len(merged.Bands) == 0 && len(next.Bands) > 0 {
+		merged.Bands = append([]export.PricingBand(nil), next.Bands...)
+	}
+	merged.Application = mergeExportSessionsPricingApplication(
+		merged.Application,
+		next.Application,
+	)
 	merged.CostSource = mergeExportSessionsCostSource(
 		merged.CostSource, next.CostSource)
+	return merged
+}
+
+func exportSessionsModelRateKey(
+	rate export.EffectiveModelRate,
+) exportSessionsModelResolutionKey {
+	key := exportSessionsModelResolutionKey{
+		pricedModel: rate.PricedModel,
+	}
+	if rate.MatchedPattern != nil {
+		key.matchedPattern = *rate.MatchedPattern
+		key.hasMatchedPattern = true
+	}
+	return key
+}
+
+func mergeExportSessionsPricingApplication(
+	base, next export.PricingApplication,
+) export.PricingApplication {
+	merged := export.PricingApplication{
+		BaseRequestCount:  base.BaseRequestCount + next.BaseRequestCount,
+		AggregateRowCount: base.AggregateRowCount + next.AggregateRowCount,
+	}
+	counts := make(map[int]int, len(base.Bands)+len(next.Bands))
+	for _, band := range base.Bands {
+		counts[band.AboveInputTokens] += band.RequestCount
+	}
+	for _, band := range next.Bands {
+		counts[band.AboveInputTokens] += band.RequestCount
+	}
+	thresholds := make([]int, 0, len(counts))
+	for threshold := range counts {
+		thresholds = append(thresholds, threshold)
+	}
+	sort.Ints(thresholds)
+	for _, threshold := range thresholds {
+		merged.Bands = append(merged.Bands, export.AppliedPricingBand{
+			AboveInputTokens: threshold,
+			RequestCount:     counts[threshold],
+		})
+	}
 	return merged
 }
 

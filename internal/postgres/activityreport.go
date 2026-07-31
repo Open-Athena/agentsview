@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/tidwall/gjson"
+
 	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
@@ -161,8 +162,9 @@ func (s *Store) GetSessionUsageRows(
 			}
 			seen[key] = struct{}{}
 		}
-		_, outputTok, _, _, _, _, priceErr := pgDailyUsageAmounts(
+		_, outputTok, _, _, _ := pgDailyUsageRowTokens(
 			pgDailyUsageScanRow{
+				messageOrdinal:           r.messageOrdinal,
 				usageSource:              r.usageSource,
 				tokenJSON:                r.tokenJSON,
 				inputTokens:              r.inputTokens,
@@ -170,15 +172,8 @@ func (s *Store) GetSessionUsageRows(
 				cacheCreationInputTokens: r.cacheCreationInputTokens,
 				cacheReadInputTokens:     r.cacheReadInputTokens,
 				reasoningTokens:          r.reasoningTokens,
-				cost:                     r.cost,
-				costSource:               r.costSource,
-				model:                    r.model,
 			},
-			rateResolver,
 		)
-		if priceErr != nil {
-			return nil, priceErr
-		}
 		costRow := r
 		var sessionCost *money.Money
 		if r.costSource == db.CopilotReportedCostSource && r.cost.Valid {
@@ -486,11 +481,7 @@ func (s *Store) activityReportUsage(
 		if !mask[i] {
 			continue
 		}
-		_, outputTok, _, _, _, _, priceErr :=
-			pgDailyUsageAmounts(o.scan, rateResolver)
-		if priceErr != nil {
-			return nil, nil, priceErr
-		}
+		_, outputTok, _, _, _ := pgDailyUsageRowTokens(o.scan)
 		costRow := o.scan
 		var sessionCost *money.Money
 		if o.scan.costSource == db.CopilotReportedCostSource && o.scan.cost.Valid {
@@ -527,44 +518,41 @@ func (s *Store) activityReportUsage(
 func pgActivityReportRowStatus(
 	r pgDailyUsageScanRow, pricing *export.PricingResolver,
 ) (cost money.Money, priced, contributes bool, err error) {
-	var inTok, outTok, crTok, rdTok int
-	reasoningTok := r.reasoningTokens
+	pricedModel, lookup := pricing.Resolve(
+		r.model, pgUsageLookupModel(r.model, r.ts))
+	inTok, outTok, crTok, rdTok, reasoningTok := pgDailyUsageRowTokens(r)
+	// Split the cache-creation total by ephemeral TTL so the two are priced
+	// at their separate rates. Message sources carry the breakdown; others
+	// keep everything in the 5m bucket (the legacy rate).
 	var cr5mTok, cr1hTok int
 	if r.usageSource == "message" {
-		usage := gjson.Parse(r.tokenJSON)
-		inTok = pgTokenJSONCount(usage, "input_tokens")
-		outTok = pgTokenJSONCount(usage, "output_tokens")
-		crTok = pgTokenJSONCount(usage, "cache_creation_input_tokens")
-		rdTok = pgTokenJSONCount(usage, "cache_read_input_tokens")
-		reasoningTok = pgTokenJSONCount(usage, "reasoning_tokens")
-		cr5mTok, cr1hTok = pgCacheWriteSplit(usage, crTok)
+		cr5mTok, cr1hTok = pgCacheWriteSplit(gjson.Parse(r.tokenJSON), crTok)
 	} else {
-		inTok, outTok, crTok, rdTok = pgUsageEventRowTokens(
-			r.usageSource,
-			r.inputTokens, r.outputTokens,
-			r.cacheCreationInputTokens, r.cacheReadInputTokens)
-		cr5mTok, cr1hTok = crTok, 0
+		cr5mTok = crTok
 	}
 
 	if r.cost.Valid {
-		pricing.RecordReported(r.model, pricing.Lookup(r.model))
+		pricing.RecordResolvedReported(r.model, pricedModel, lookup)
 		return money.Money{Microdollars: r.cost.Int64}, true, true, nil
 	}
 	if inTok == 0 && outTok == 0 && reasoningTok == 0 &&
 		crTok == 0 && rdTok == 0 {
 		return money.Money{}, true, false, nil
 	}
-	lookup := pricing.Lookup(r.model)
 	if !lookup.OK {
-		pricing.RecordComputed(r.model, lookup)
+		pricing.RecordResolvedComputed(r.model, pricedModel, lookup)
 		return money.Money{}, false, true, nil
 	}
-	cost, err = lookup.Rates.CostForTokens(
+	requestScoped := pgUsageRowIsRequestScoped(r.usageSource, r.messageOrdinal)
+	cost, err = lookup.Rates.CostForTokensScoped(
+		requestScoped,
 		inTok, outTok, reasoningTok, cr5mTok, cr1hTok, rdTok)
 	if err != nil {
 		return money.Money{}, false, false,
 			fmt.Errorf("pricing pg activity usage for model %q: %w", r.model, err)
 	}
-	pricing.RecordComputed(r.model, lookup)
+	pgRecordComputedUsagePricing(
+		pricing, r.model, pricedModel, lookup,
+		requestScoped, inTok, crTok, rdTok)
 	return cost, true, true, nil
 }

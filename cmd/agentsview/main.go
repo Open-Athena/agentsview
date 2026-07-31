@@ -418,6 +418,10 @@ func runServe(cfg config.Config, opts serveOptions) {
 			log.Printf("warning: remote_hosts config invalid, skipping periodic remote sync: %v", err)
 			validRemotes = false
 		}
+		stopLiveActivity := startLiveActivityPoller(
+			ctx, cfg, database, engine, idleTracker,
+		)
+		defer stopLiveActivity()
 		go startPeriodicSync(
 			ctx, cfg, engine, database, writeLock, idleTracker, validRemotes, emitter,
 		)
@@ -444,9 +448,14 @@ func runServe(cfg config.Config, opts serveOptions) {
 	// copy pricing across the swap themselves, since this seed
 	// only runs once per daemon lifetime. Synchronous fallback
 	// upsert so the first usage page load does not observe an
-	// empty table; background LiteLLM refresh follows
-	// immediately.
-	seedPricing(database)
+	// empty table; the scheduler's background LiteLLM refresh
+	// follows immediately.
+	var pricingRefreshRunner pricingRefreshExclusiveRunner
+	if engine != nil {
+		pricingRefreshRunner = engine
+	}
+	seedPricing(database, pricingRefreshRunner)
+	go startPeriodicPricingRefresh(ctx, database, pricingRefreshRunner)
 
 	rtOpts := serveRuntimeOptions{
 		Mode:          "serve",

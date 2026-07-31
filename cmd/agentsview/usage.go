@@ -613,30 +613,25 @@ func printSyncSummaryStderr(stats sync.SyncStats, t time.Time) {
 	}
 }
 
-// seedPricing ensures fallback rates are present in
-// model_pricing, then kicks off a background LiteLLM refresh.
+// seedPricing ensures fallback rates are present in model_pricing.
 //
 // Fallback rates are only upserted when the stored seed
-// version differs from pricing.FallbackVersion (or is
+// version differs from pricing.SeedVersion (or is
 // absent). This avoids overwriting live LiteLLM rates on
 // every restart while still propagating corrected fallback
-// rates when the binary is upgraded.
-func seedPricing(database *db.DB) {
-	if err := pricingrefresh.SeedFallback(database); err != nil {
+// rates when the binary is upgraded. SeedVersion folds in
+// the supplemental alias version, so curated alias additions
+// (see internal/pricing/supplemental.go) also reach existing
+// databases without a resync.
+func seedPricing(
+	database *db.DB,
+	runner pricingRefreshExclusiveRunner,
+) {
+	err := runPricingExclusive(runner, func() error {
+		return pricingrefresh.SeedFallback(database)
+	})
+	if err != nil {
 		log.Printf("pricing seed: %v", err)
-	}
-	go refreshPricingFromLiteLLM(database)
-}
-
-// refreshPricingFromLiteLLM fetches the upstream LiteLLM
-// catalog and upserts it over whatever is in the table. Called
-// from a goroutine after the synchronous fallback seed so a
-// slow or failing fetch never blocks server startup.
-func refreshPricingFromLiteLLM(database *db.DB) {
-	if err := pricingrefresh.Refresh(
-		database, pricing.FetchLiteLLMPricing,
-	); err != nil {
-		log.Printf("pricing refresh: %v", err)
 	}
 }
 
@@ -663,26 +658,61 @@ func ensureUsagePricing(
 func applyFallbackPricing(
 	database *db.DB, custom map[string]config.CustomModelRate,
 ) {
-	rates := make(map[string]config.CustomModelRate)
-	sources := make(map[string]export.PricingRowSource)
+	database.SetEffectivePricing(fallbackPricingRates(custom))
+}
+
+func applyEmptyCatalogPricing(
+	database *db.DB, custom map[string]config.CustomModelRate,
+) {
+	database.SetEmptyCatalogPricing(fallbackPricingRates(custom))
+}
+
+func fallbackPricingRates(
+	custom map[string]config.CustomModelRate,
+) map[string]export.ModelRates {
+	rates := make(map[string]export.ModelRates)
 	for _, p := range pricing.FallbackPricing() {
 		// These keys are the same concrete model-pattern keys that the
 		// model_pricing table stores. SQLite usage lookups run the merged map
 		// through pricing.Resolve, so normalized/canonical aliases still match
 		// when this read-only path cannot seed model_pricing rows.
-		rates[p.ModelPattern] = config.CustomModelRate{
-			InputMicrodollarsPerMTok:         p.InputPerMTok.Microdollars,
-			OutputMicrodollarsPerMTok:        p.OutputPerMTok.Microdollars,
-			CacheCreationMicrodollarsPerMTok: p.CacheCreationPerMTok.Microdollars,
-			CacheReadMicrodollarsPerMTok:     p.CacheReadPerMTok.Microdollars,
+		bands := make([]export.PricingBand, len(p.Bands))
+		for i, band := range p.Bands {
+			bands[i] = export.PricingBand{
+				AboveInputTokens:  band.AboveInputTokens,
+				InputPerMTok:      band.InputPerMTok,
+				OutputPerMTok:     band.OutputPerMTok,
+				CacheWritePerMTok: band.CacheCreationPerMTok,
+				CacheReadPerMTok:  band.CacheReadPerMTok,
+			}
 		}
-		sources[p.ModelPattern] = export.PricingRowSourceEmbedded
+		rates[p.ModelPattern] = export.ModelRates{
+			InputPerMTok:      p.InputPerMTok,
+			OutputPerMTok:     p.OutputPerMTok,
+			CacheWritePerMTok: p.CacheCreationPerMTok,
+			CacheReadPerMTok:  p.CacheReadPerMTok,
+			Source:            export.PricingRowSourceEmbedded,
+			Bands:             bands,
+		}
 	}
 	for model, rate := range custom {
-		rates[model] = rate
-		sources[model] = export.PricingRowSourceCustom
+		rates[model] = export.ModelRates{
+			InputPerMTok: money.Money{
+				Microdollars: rate.InputMicrodollarsPerMTok,
+			},
+			OutputPerMTok: money.Money{
+				Microdollars: rate.OutputMicrodollarsPerMTok,
+			},
+			CacheWritePerMTok: money.Money{
+				Microdollars: rate.CacheCreationMicrodollarsPerMTok,
+			},
+			CacheReadPerMTok: money.Money{
+				Microdollars: rate.CacheReadMicrodollarsPerMTok,
+			},
+			Source: export.PricingRowSourceCustom,
+		}
 	}
-	database.SetEffectivePricing(rates, sources)
+	return rates
 }
 
 func fetchHTTPDailyUsage(

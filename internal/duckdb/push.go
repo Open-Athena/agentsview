@@ -13,8 +13,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ccoveille/go-safecast/v2"
+
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
 )
 
@@ -58,10 +61,88 @@ func (s *Sync) syncModelPricing(ctx context.Context) error {
 			)
 		}
 	}
+	for i := 0; i < len(prices); i += duckPricingUpsertBatch {
+		end := min(i+duckPricingUpsertBatch, len(prices))
+		query, args := duckPricingBandDeleteStatement(prices[i:end])
+		if err := s.execMutation(ctx, tx, query, args...); err != nil {
+			return fmt.Errorf(
+				"deleting duckdb pricing bands batch starting at %d: %w",
+				i, err,
+			)
+		}
+	}
+	var bands []duckModelPricingBand
+	for _, price := range prices {
+		for _, band := range price.Bands {
+			bands = append(bands, duckModelPricingBand{
+				modelPattern: price.ModelPattern,
+				updatedAt:    price.UpdatedAt,
+				band:         band,
+			})
+		}
+	}
+	for i := 0; i < len(bands); i += duckPricingUpsertBatch {
+		end := min(i+duckPricingUpsertBatch, len(bands))
+		query, args := duckPricingBandInsertStatement(bands[i:end])
+		if err := s.execMutation(ctx, tx, query, args...); err != nil {
+			return fmt.Errorf(
+				"inserting duckdb pricing bands batch starting at %d: %w",
+				i, err,
+			)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing duckdb pricing sync: %w", err)
 	}
 	return nil
+}
+
+func duckPricingBandDeleteStatement(prices []db.ModelPricing) (string, []any) {
+	placeholders := make([]string, len(prices))
+	args := make([]any, len(prices))
+	for i, price := range prices {
+		placeholders[i] = "?"
+		args[i] = price.ModelPattern
+	}
+	return `DELETE FROM model_pricing_bands WHERE model_pattern IN (` +
+		strings.Join(placeholders, ", ") + `)`, args
+}
+
+type duckModelPricingBand struct {
+	modelPattern string
+	updatedAt    string
+	band         db.PricingBand
+}
+
+func duckPricingBandInsertStatement(bands []duckModelPricingBand) (string, []any) {
+	var b strings.Builder
+	b.WriteString(`INSERT INTO model_pricing_bands (
+		model_pattern, above_input_tokens,
+		input_microdollars_per_mtok, output_microdollars_per_mtok,
+		cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok,
+		updated_at
+	) VALUES `)
+	args := make([]any, 0, len(bands)*7)
+	for i, item := range bands {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString("(?, ?, ?, ?, ?, ?, ?)")
+		updatedAt := item.band.UpdatedAt
+		if updatedAt == "" {
+			updatedAt = item.updatedAt
+		}
+		args = append(args,
+			item.modelPattern,
+			item.band.AboveInputTokens,
+			item.band.InputPerMTok.Microdollars,
+			item.band.OutputPerMTok.Microdollars,
+			item.band.CacheCreationPerMTok.Microdollars,
+			item.band.CacheReadPerMTok.Microdollars,
+			updatedAt,
+		)
+	}
+	return b.String(), args
 }
 
 const duckPricingUpsertBatch = 100
@@ -103,20 +184,29 @@ func duckPricingUpsertStatement(prices []db.ModelPricing) (string, []any) {
 func (s *Sync) listDuckModelPricing(ctx context.Context) ([]db.ModelPricing, error) {
 	rows, err := s.duck.QueryContext(
 		ctx,
-		`SELECT model_pattern, input_microdollars_per_mtok,
-			output_microdollars_per_mtok, cache_creation_microdollars_per_mtok,
-			cache_creation_1h_microdollars_per_mtok,
-			cache_read_microdollars_per_mtok, updated_at
-		 FROM model_pricing`,
+		`SELECT p.model_pattern, p.input_microdollars_per_mtok,
+			p.output_microdollars_per_mtok, p.cache_creation_microdollars_per_mtok,
+			p.cache_creation_1h_microdollars_per_mtok,
+			p.cache_read_microdollars_per_mtok, p.updated_at,
+			b.above_input_tokens, b.input_microdollars_per_mtok,
+			b.output_microdollars_per_mtok,
+			b.cache_creation_microdollars_per_mtok,
+			b.cache_read_microdollars_per_mtok, b.updated_at
+		 FROM model_pricing p
+		 LEFT JOIN model_pricing_bands b ON b.model_pattern = p.model_pattern
+		 ORDER BY p.model_pattern, b.above_input_tokens`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("listing duckdb pricing: %w", err)
 	}
 	defer rows.Close()
 
-	var out []db.ModelPricing
+	out := make([]db.ModelPricing, 0)
+	byPattern := make(map[string]int)
 	for rows.Next() {
 		var p db.ModelPricing
+		var threshold, input, output, cacheCreation, cacheRead sql.NullInt64
+		var bandUpdatedAt sql.NullString
 		if err := rows.Scan(
 			&p.ModelPattern,
 			&p.InputPerMTok,
@@ -125,10 +215,38 @@ func (s *Sync) listDuckModelPricing(ctx context.Context) ([]db.ModelPricing, err
 			&p.CacheCreation1hPerMTok,
 			&p.CacheReadPerMTok,
 			&p.UpdatedAt,
+			&threshold,
+			&input,
+			&output,
+			&cacheCreation,
+			&cacheRead,
+			&bandUpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scanning duckdb pricing: %w", err)
 		}
-		out = append(out, p)
+		i, exists := byPattern[p.ModelPattern]
+		if !exists {
+			i = len(out)
+			byPattern[p.ModelPattern] = i
+			out = append(out, p)
+		}
+		if threshold.Valid {
+			aboveInputTokens, err := safecast.Convert[int](threshold.Int64)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"converting duckdb pricing threshold for %q: %w",
+					p.ModelPattern, err,
+				)
+			}
+			out[i].Bands = append(out[i].Bands, db.PricingBand{
+				AboveInputTokens:     aboveInputTokens,
+				InputPerMTok:         money.Money{Microdollars: input.Int64},
+				OutputPerMTok:        money.Money{Microdollars: output.Int64},
+				CacheCreationPerMTok: money.Money{Microdollars: cacheCreation.Int64},
+				CacheReadPerMTok:     money.Money{Microdollars: cacheRead.Int64},
+				UpdatedAt:            bandUpdatedAt.String,
+			})
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterating duckdb pricing: %w", err)
@@ -402,6 +520,17 @@ func duckFallbackPricingRows() []db.ModelPricing {
 	out := make([]db.ModelPricing, len(src))
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	for i, p := range src {
+		bands := make([]db.PricingBand, len(p.Bands))
+		for j, band := range p.Bands {
+			bands[j] = db.PricingBand{
+				AboveInputTokens:     band.AboveInputTokens,
+				InputPerMTok:         band.InputPerMTok,
+				OutputPerMTok:        band.OutputPerMTok,
+				CacheCreationPerMTok: band.CacheCreationPerMTok,
+				CacheReadPerMTok:     band.CacheReadPerMTok,
+				UpdatedAt:            now,
+			}
+		}
 		out[i] = db.ModelPricing{
 			ModelPattern:           p.ModelPattern,
 			InputPerMTok:           p.InputPerMTok,
@@ -410,6 +539,7 @@ func duckFallbackPricingRows() []db.ModelPricing {
 			CacheCreation1hPerMTok: p.CacheCreation1hPerMTok,
 			CacheReadPerMTok:       p.CacheReadPerMTok,
 			UpdatedAt:              now,
+			Bands:                  bands,
 		}
 	}
 	return out
@@ -606,7 +736,7 @@ func (snap curationSnapshot) fingerprint() (string, error) {
 // All work is bounded by curation size, not mirror size: mirror membership
 // is validated for exactly the snapshot's session IDs (one batched lookup,
 // see mirrorResidentSessionIDs), pin notes are preserved, and the delete
-// side stays the machine-scoped clear of both tables, so removed
+// side clears both tables for sessions in this source archive, so removed
 // stars/pins disappear without enumerating them.
 func (s *Sync) replaceCuration(
 	ctx context.Context, snap curationSnapshot,
@@ -647,8 +777,8 @@ func (s *Sync) replaceCuration(
 			if err := s.execMutation(ctx, tx, `
 				DELETE FROM `+table+`
 				WHERE session_id IN (
-					SELECT id FROM sessions WHERE machine = ?
-				)`, s.machine); err != nil {
+					SELECT id FROM sessions
+				)`); err != nil {
 				return fmt.Errorf("clearing duckdb %s: %w", table, err)
 			}
 		}
@@ -905,7 +1035,9 @@ func (s *Sync) upsertSession(
 			secrets_rules_version = excluded.secrets_rules_version,
 			agentsview_push_fingerprint = excluded.agentsview_push_fingerprint`
 
-	args := sessionInsertArgs(sess, s.machine, fingerprint)
+	args := sessionInsertArgs(
+		sess, mirroredSessionMachine(sess, s.machine), fingerprint,
+	)
 	if err := s.execMutation(ctx, exec, query, args...); err != nil {
 		return fmt.Errorf("writing duckdb session %s: %w", sess.ID, err)
 	}
@@ -948,6 +1080,13 @@ func sessionInsertArgs(sess db.Session, machine, fingerprint string) []any {
 		sess.SecretLeakCount, sess.SecretsRulesVersion,
 		nilEmpty(fingerprint),
 	}
+}
+
+func mirroredSessionMachine(sess db.Session, pushMachine string) string {
+	if sess.Machine == "" || sess.Machine == "local" {
+		return pushMachine
+	}
+	return sess.Machine
 }
 
 func insertMessages(

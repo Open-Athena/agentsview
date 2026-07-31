@@ -78,6 +78,12 @@ type UsageFilter struct {
 	Termination       string // "", "clean", "unclean", "active", or "stale"
 	Breakdowns        bool   // populate Project/AgentBreakdowns per day
 	SkipSessionCounts bool   // skip distinct session counts when callers do not need them
+	// TopSessionsSort ranks GetTopSessionsByCost results: ""/"cost"
+	// (default) or "tokens". Ignored by other usage queries.
+	TopSessionsSort string
+	// TopSessionsTokenTypes selects the counters used for token ranking.
+	// The zero value means all token types.
+	TopSessionsTokenTypes UsageTokenTypes
 }
 
 // ProjectFilterLabels returns exact include labels when present, otherwise it
@@ -1501,6 +1507,16 @@ func clampedUsageTokenCountersWithReasoning(
 		ClampPlausibleTokens(int64(reasoningTok))
 }
 
+// usageLookupModel returns the canonical model used to price a usage row.
+// Date-ambiguous Kimi aliases resolve according to the row timestamp; all
+// other model names pass through unchanged.
+func usageLookupModel(model, ts string) string {
+	if canonical := pricingpkg.CanonicalModelForTimestamp(model, ts); canonical != "" {
+		return canonical
+	}
+	return model
+}
+
 func dailyUsageAmounts(
 	r dailyUsageScanRow, pricing *export.PricingResolver,
 ) (
@@ -1508,51 +1524,66 @@ func dailyUsageAmounts(
 	cost, savings money.Money,
 	err error,
 ) {
-	reasoningTok := r.reasoningTokens
-	// cacheCr5m/cacheCr1h split the cache-creation total so the two
-	// ephemeral TTLs are priced at their separate rates. Sources with no
-	// breakdown keep everything in the 5m bucket (the legacy rate).
+	inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok :=
+		dailyUsageRowTokens(r)
+	// cacheCr5m/cacheCr1h split the cache-creation total so the two ephemeral
+	// TTLs are priced at their separate rates. Message sources carry the TTL
+	// breakdown; others keep everything in the 5m bucket (the legacy rate).
 	var cacheCr5m, cacheCr1h int
 	if r.usageSource == "message" {
-		inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok =
-			clampedUsageTokenCountersWithReasoning(r.tokenJSON)
 		cacheCr5m, cacheCr1h = cacheWriteSplit(r.tokenJSON, cacheCrTok)
 	} else {
-		inputTok, outputTok, cacheCrTok, cacheRdTok =
-			usageEventRowTokens(
-				r.usageSource,
-				r.inputTokens, r.outputTokens,
-				r.cacheCreationInputTokens, r.cacheReadInputTokens)
-		// usage_events sources (Codex, etc.) lack the TTL split.
 		cacheCr5m = cacheCrTok
 	}
 
-	lookup := pricing.Lookup(r.model)
+	pricedModel, lookup := pricing.Resolve(
+		r.model, usageLookupModel(r.model, r.ts))
 	rates := lookup.Rates
+	requestScoped := usageRowIsRequestScoped(r.usageSource, r.messageOrdinal)
 	if r.cost.Valid && r.costSource != CopilotReportedCostSource {
 		cost = money.Money{Microdollars: r.cost.Int64}
-		pricing.RecordReported(r.model, lookup)
+		pricing.RecordResolvedReported(r.model, pricedModel, lookup)
 	} else {
-		cost, err = rates.CostForTokens(
+		cost, err = rates.CostForTokensScoped(
+			requestScoped,
 			inputTok, outputTok, reasoningTok, cacheCr5m, cacheCr1h, cacheRdTok)
 		if err != nil {
 			return 0, 0, 0, 0, money.Money{}, money.Money{},
 				fmt.Errorf("pricing usage row for model %q: %w", r.model, err)
 		}
-		pricing.RecordComputed(r.model, lookup)
+		recordComputedUsagePricing(
+			pricing,
+			r.model,
+			pricedModel,
+			lookup,
+			requestScoped,
+			inputTok,
+			cacheCrTok,
+			cacheRdTok,
+		)
 	}
 
-	readRate, err := money.Sub(rates.InputPerMTok, rates.CacheReadPerMTok)
+	selectedRates := rates
+	if requestScoped {
+		selectedRates = rates.RatesForTokens(inputTok, cacheCrTok, cacheRdTok)
+	}
+	readRate, err := money.Sub(
+		selectedRates.InputPerMTok,
+		selectedRates.CacheReadPerMTok,
+	)
 	if err != nil {
 		return 0, 0, 0, 0, money.Money{}, money.Money{},
 			fmt.Errorf("deriving cache read rate for model %q: %w", r.model, err)
 	}
-	cr5mRate, err := money.Sub(rates.InputPerMTok, rates.CacheWritePerMTok)
+	cr5mRate, err := money.Sub(
+		selectedRates.InputPerMTok,
+		selectedRates.CacheWritePerMTok,
+	)
 	if err != nil {
 		return 0, 0, 0, 0, money.Money{}, money.Money{},
 			fmt.Errorf("deriving 5m cache creation rate for model %q: %w", r.model, err)
 	}
-	cr1hRate, err := money.Sub(rates.InputPerMTok, rates.CacheWrite1hPerMTok)
+	cr1hRate, err := money.Sub(selectedRates.InputPerMTok, selectedRates.CacheWrite1hPerMTok)
 	if err != nil {
 		return 0, 0, 0, 0, money.Money{}, money.Money{},
 			fmt.Errorf("deriving 1h cache creation rate for model %q: %w", r.model, err)
@@ -1567,6 +1598,51 @@ func dailyUsageAmounts(
 			fmt.Errorf("pricing cache savings for model %q: %w", r.model, err)
 	}
 	return
+}
+
+func dailyUsageRowTokens(
+	r dailyUsageScanRow,
+) (inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok int) {
+	reasoningTok = r.reasoningTokens
+	if r.usageSource == "message" {
+		inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok =
+			clampedUsageTokenCountersWithReasoning(r.tokenJSON)
+	} else {
+		inputTok, outputTok, cacheCrTok, cacheRdTok =
+			usageEventRowTokens(
+				r.usageSource,
+				r.inputTokens, r.outputTokens,
+				r.cacheCreationInputTokens, r.cacheReadInputTokens)
+	}
+	return
+}
+
+func usageRowIsRequestScoped(
+	usageSource string, messageOrdinal sql.NullInt64,
+) bool {
+	return usageSource == "message" || messageOrdinal.Valid
+}
+
+func recordComputedUsagePricing(
+	pricing *export.PricingResolver,
+	reportedModel, pricedModel string,
+	lookup export.PricingLookup,
+	requestScoped bool,
+	inputTokens, cacheWriteTokens, cacheReadTokens int,
+) {
+	if requestScoped {
+		pricing.RecordResolvedComputedRequest(
+			reportedModel,
+			pricedModel,
+			lookup,
+			inputTokens,
+			cacheWriteTokens,
+			cacheReadTokens,
+		)
+		return
+	}
+	pricing.RecordResolvedComputedAggregate(
+		reportedModel, pricedModel, lookup)
 }
 
 type usageDedupToken struct {
@@ -1791,42 +1867,28 @@ func (db *DB) loadPricingMap(
 func (db *DB) loadPricingMapFrom(
 	ctx context.Context, q sessionExportQuerier,
 ) ([]export.EffectivePricingRow, error) {
-	rows, err := q.QueryContext(ctx,
-		`SELECT model_pattern,
-			input_microdollars_per_mtok, output_microdollars_per_mtok,
-			cache_creation_microdollars_per_mtok,
-			cache_creation_1h_microdollars_per_mtok,
-			cache_read_microdollars_per_mtok,
-			updated_at
-		 FROM model_pricing
-		 WHERE model_pattern NOT LIKE '\_%' ESCAPE '\'`)
+	prices, err := listModelPricingFrom(ctx, q)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
 	fallback := fallbackRateMap()
 	out := make(map[string]export.ModelRates)
-	for rows.Next() {
-		var p ModelPricing
-		if err := rows.Scan(
-			&p.ModelPattern,
-			&p.InputPerMTok, &p.OutputPerMTok,
-			&p.CacheCreationPerMTok,
-			&p.CacheCreation1hPerMTok,
-			&p.CacheReadPerMTok,
-			&p.UpdatedAt,
-		); err != nil {
-			return nil, err
+	for _, p := range prices {
+		if strings.HasPrefix(p.ModelPattern, "_") {
+			continue
 		}
 		rates := modelPricingRates(p)
 		rates.Source = modelPricingSource(p, fallback)
 		out[p.ModelPattern] = rates
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
 
+	if len(out) == 0 {
+		for model, rates := range db.emptyCatalogPricing {
+			rates.Bands = append([]export.PricingBand(nil), rates.Bands...)
+			out[model] = rates
+		}
+	}
 	for model, cp := range db.customPricing {
 		rates := export.ModelRates{
 			InputPerMTok: money.Money{
@@ -1848,9 +1910,10 @@ func (db *DB) loadPricingMapFrom(
 			},
 		}
 		rates.Source = customPricingSource()
-		if source, ok := db.customPricingSources[model]; ok {
-			rates.Source = source
-		}
+		out[model] = rates
+	}
+	for model, rates := range db.effectivePricing {
+		rates.Bands = append([]export.PricingBand(nil), rates.Bands...)
 		out[model] = rates
 	}
 
@@ -1876,6 +1939,7 @@ func fallbackRateMap() map[string]export.ModelRates {
 			CacheWrite1hPerMTok: cacheWrite1h,
 			CacheReadPerMTok:    p.CacheReadPerMTok,
 			Source:              export.PricingRowSourceEmbedded,
+			Bands:               catalogPricingBands(p.Bands),
 		}
 		out[p.ModelPattern] = rates
 	}
@@ -1905,7 +1969,42 @@ func modelPricingRates(p ModelPricing) export.ModelRates {
 		CacheWrite1hPerMTok: cacheWrite1h,
 		CacheReadPerMTok:    p.CacheReadPerMTok,
 		UpdatedAt:           updatedAt,
+		Bands:               storedPricingBands(p.Bands),
 	}
+}
+
+func catalogPricingBands(bands []pricingpkg.PricingBand) []export.PricingBand {
+	out := make([]export.PricingBand, len(bands))
+	for i, band := range bands {
+		out[i] = export.PricingBand{
+			AboveInputTokens:  band.AboveInputTokens,
+			InputPerMTok:      band.InputPerMTok,
+			OutputPerMTok:     band.OutputPerMTok,
+			CacheWritePerMTok: band.CacheCreationPerMTok,
+			CacheReadPerMTok:  band.CacheReadPerMTok,
+		}
+	}
+	return out
+}
+
+func storedPricingBands(bands []PricingBand) []export.PricingBand {
+	out := make([]export.PricingBand, len(bands))
+	for i, band := range bands {
+		var updatedAt *time.Time
+		if parsed, err := time.Parse(time.RFC3339Nano, band.UpdatedAt); err == nil {
+			t := parsed.UTC()
+			updatedAt = &t
+		}
+		out[i] = export.PricingBand{
+			AboveInputTokens:  band.AboveInputTokens,
+			InputPerMTok:      band.InputPerMTok,
+			OutputPerMTok:     band.OutputPerMTok,
+			CacheWritePerMTok: band.CacheCreationPerMTok,
+			CacheReadPerMTok:  band.CacheReadPerMTok,
+			UpdatedAt:         updatedAt,
+		}
+	}
+	return out
 }
 
 func modelPricingSource(
@@ -1915,10 +2014,27 @@ func modelPricingSource(
 		rates.InputPerMTok == p.InputPerMTok &&
 		rates.OutputPerMTok == p.OutputPerMTok &&
 		rates.CacheWritePerMTok == p.CacheCreationPerMTok &&
-		rates.CacheReadPerMTok == p.CacheReadPerMTok {
+		rates.CacheReadPerMTok == p.CacheReadPerMTok &&
+		exportPricingBandsEqual(rates.Bands, storedPricingBands(p.Bands)) {
 		return export.PricingRowSourceEmbedded
 	}
 	return export.PricingRowSourceFetched
+}
+
+func exportPricingBandsEqual(a, b []export.PricingBand) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].AboveInputTokens != b[i].AboveInputTokens ||
+			a[i].InputPerMTok != b[i].InputPerMTok ||
+			a[i].OutputPerMTok != b[i].OutputPerMTok ||
+			a[i].CacheWritePerMTok != b[i].CacheWritePerMTok ||
+			a[i].CacheReadPerMTok != b[i].CacheReadPerMTok {
+			return false
+		}
+	}
+	return true
 }
 
 func pricingMapRows(
@@ -1977,14 +2093,6 @@ func (db *DB) GetDailyUsage(
 	}
 	defer rows.Close()
 
-	// 4-tuple key for per-(date, project, agent, model) accumulation.
-	type accumKey struct {
-		date    string
-		project string
-		agent   string
-		machine string
-		model   string
-	}
 	type bucket struct {
 		inputTok  int
 		outputTok int
@@ -1993,11 +2101,11 @@ func (db *DB) GetDailyUsage(
 		cost      money.Money
 	}
 	type sessionCost struct {
-		estimated     map[accumKey]money.Money
+		estimated     map[usageCostAllocationKey]money.Money
 		authoritative *money.Money
 	}
 
-	accum := make(map[accumKey]*bucket)
+	accum := make(map[usageCostAllocationKey]*bucket)
 	sessionCosts := make(map[string]sessionCost)
 	useAuthoritativeCost := f.Model == "" && f.ExcludeModel == ""
 
@@ -2066,7 +2174,7 @@ func (db *DB) GetDailyUsage(
 				"summing daily usage cache savings: %w", priceErr)
 		}
 
-		key := accumKey{
+		key := usageCostAllocationKey{
 			date: date, project: r.project,
 			agent: r.agent, machine: r.machine, model: r.model,
 		}
@@ -2082,7 +2190,7 @@ func (db *DB) GetDailyUsage(
 
 		sc := sessionCosts[r.sessionID]
 		if sc.estimated == nil {
-			sc.estimated = make(map[accumKey]money.Money)
+			sc.estimated = make(map[usageCostAllocationKey]money.Money)
 		}
 		sc.estimated[key], priceErr = money.Add(sc.estimated[key], cost)
 		if priceErr != nil {
@@ -2110,38 +2218,14 @@ func (db *DB) GetDailyUsage(
 	for _, sessionID := range sessionIDs {
 		sc := sessionCosts[sessionID]
 		if sc.authoritative != nil {
-			keys := make([]accumKey, 0, len(sc.estimated))
-			for key := range sc.estimated {
-				keys = append(keys, key)
-			}
-			sort.Slice(keys, func(i, j int) bool {
-				a, b := keys[i], keys[j]
-				if a.date != b.date {
-					return a.date < b.date
-				}
-				if a.project != b.project {
-					return a.project < b.project
-				}
-				if a.agent != b.agent {
-					return a.agent < b.agent
-				}
-				if a.machine != b.machine {
-					return a.machine < b.machine
-				}
-				return a.model < b.model
-			})
-			weights := make([]money.Money, len(keys))
-			for i, key := range keys {
-				weights[i] = sc.estimated[key]
-			}
-			costs := export.AllocateCostByWeight(*sc.authoritative, weights)
-			for i, key := range keys {
+			costs := allocateUsageCostByKey(*sc.authoritative, sc.estimated)
+			for key, cost := range costs {
 				b := accum[key]
 				if b == nil {
 					b = &bucket{}
 					accum[key] = b
 				}
-				b.cost, err = money.Add(b.cost, costs[i])
+				b.cost, err = money.Add(b.cost, cost)
 				if err != nil {
 					return DailyUsageResult{}, fmt.Errorf(
 						"summing allocated daily usage cost: %w", err)
@@ -2579,27 +2663,72 @@ func (db *DB) GetDailyUsage(
 
 // TopSessionEntry is one row in the "top sessions by cost" result.
 type TopSessionEntry struct {
-	SessionID   string      `json:"sessionId"`
-	DisplayName string      `json:"displayName"`
-	Agent       string      `json:"agent"`
-	Project     string      `json:"project"`
-	StartedAt   string      `json:"startedAt"`
-	TotalTokens int         `json:"totalTokens"`
-	Cost        money.Money `json:"cost"`
+	SessionID           string      `json:"sessionId"`
+	DisplayName         string      `json:"displayName"`
+	Agent               string      `json:"agent"`
+	Project             string      `json:"project"`
+	StartedAt           string      `json:"startedAt"`
+	InputTokens         int         `json:"inputTokens"`
+	OutputTokens        int         `json:"outputTokens"`
+	CacheCreationTokens int         `json:"cacheCreationTokens"`
+	CacheReadTokens     int         `json:"cacheReadTokens"`
+	TotalTokens         int         `json:"totalTokens"`
+	Cost                money.Money `json:"cost"`
 }
 
-// GetTopSessionsByCost returns sessions ranked by total cost
-// over the filter range. Default limit 20, max 100.
-func (db *DB) GetTopSessionsByCost(
-	ctx context.Context, f UsageFilter, limit int,
-) ([]TopSessionEntry, error) {
+// TopSessionsSortCost and TopSessionsSortTokens select top-session ranking.
+const (
+	TopSessionsSortCost   = "cost"
+	TopSessionsSortTokens = "tokens"
+)
+
+// SortAndLimitTopSessions ranks entries by cost (default) or tokens, then
+// applies the bounded limit. Ties break by session ID for stable results.
+func SortAndLimitTopSessions(
+	result []TopSessionEntry, limit int, sortBy string,
+	tokenTypes UsageTokenTypes,
+) []TopSessionEntry {
 	if limit <= 0 {
 		limit = 20
 	}
 	if limit > 100 {
 		limit = 100
 	}
+	byTokens := strings.EqualFold(sortBy, TopSessionsSortTokens)
+	sort.Slice(result, func(i, j int) bool {
+		if byTokens {
+			left := tokenTypes.Total(
+				result[i].InputTokens,
+				result[i].OutputTokens,
+				result[i].CacheCreationTokens,
+				result[i].CacheReadTokens,
+			)
+			right := tokenTypes.Total(
+				result[j].InputTokens,
+				result[j].OutputTokens,
+				result[j].CacheCreationTokens,
+				result[j].CacheReadTokens,
+			)
+			if left != right {
+				return left > right
+			}
+		} else if result[i].Cost.Microdollars != result[j].Cost.Microdollars {
+			return result[i].Cost.Microdollars > result[j].Cost.Microdollars
+		}
+		return result[i].SessionID < result[j].SessionID
+	})
+	if len(result) > limit {
+		return result[:limit]
+	}
+	return result
+}
 
+// GetTopSessionsByCost returns sessions ranked by total cost, or by total
+// tokens when f.TopSessionsSort is "tokens",
+// over the filter range. Default limit 20, max 100.
+func (db *DB) GetTopSessionsByCost(
+	ctx context.Context, f UsageFilter, limit int,
+) ([]TopSessionEntry, error) {
 	pricing, err := db.loadPricingMap(ctx)
 	if err != nil {
 		return nil,
@@ -2625,6 +2754,10 @@ func (db *DB) GetTopSessionsByCost(
 	loc := f.location()
 
 	type sessAccum struct {
+		inputTokens       int
+		outputTokens      int
+		cacheCreateTokens int
+		cacheReadTokens   int
 		totalTokens       int
 		cost              money.Money
 		authoritativeCost *money.Money
@@ -2680,8 +2813,11 @@ func (db *DB) GetTopSessionsByCost(
 			accum[r.sessionID] = sa
 			order = append(order, r.sessionID)
 		}
-		sa.totalTokens += inputTok + outputTok +
-			cacheCrTok + cacheRdTok
+		sa.inputTokens += inputTok
+		sa.outputTokens += outputTok
+		sa.cacheCreateTokens += cacheCrTok
+		sa.cacheReadTokens += cacheRdTok
+		sa.totalTokens += inputTok + outputTok + cacheCrTok + cacheRdTok
 		sa.cost, priceErr = money.Add(sa.cost, cost)
 		if priceErr != nil {
 			return nil, fmt.Errorf("summing top-session cost: %w", priceErr)
@@ -2704,9 +2840,13 @@ func (db *DB) GetTopSessionsByCost(
 			continue
 		}
 		result = append(result, TopSessionEntry{
-			SessionID:   id,
-			DisplayName: id,
-			TotalTokens: sa.totalTokens,
+			SessionID:           id,
+			DisplayName:         id,
+			InputTokens:         sa.inputTokens,
+			OutputTokens:        sa.outputTokens,
+			CacheCreationTokens: sa.cacheCreateTokens,
+			CacheReadTokens:     sa.cacheReadTokens,
+			TotalTokens:         sa.totalTokens,
 			Cost: func() money.Money {
 				if sa.authoritativeCost != nil {
 					return *sa.authoritativeCost
@@ -2716,16 +2856,9 @@ func (db *DB) GetTopSessionsByCost(
 		})
 	}
 
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].Cost.Microdollars != result[j].Cost.Microdollars {
-			return result[i].Cost.Microdollars > result[j].Cost.Microdollars
-		}
-		return result[i].SessionID < result[j].SessionID
-	})
-
-	if len(result) > limit {
-		result = result[:limit]
-	}
+	result = SortAndLimitTopSessions(
+		result, limit, f.TopSessionsSort, f.TopSessionsTokenTypes,
+	)
 
 	sessionIDs := make([]string, len(result))
 	for i := range result {
@@ -2809,27 +2942,38 @@ func sessionRowCost(
 		cr5m = crTok
 	}
 
+	pricedModel, lookup := pricing.Resolve(
+		r.model, usageLookupModel(r.model, r.ts))
 	if r.cost.Valid {
-		pricing.RecordReported(r.model, pricing.Lookup(r.model))
+		pricing.RecordResolvedReported(r.model, pricedModel, lookup)
 		return money.Money{Microdollars: r.cost.Int64}, true, true, nil
 	}
 	if inTok == 0 && outTok == 0 && reasoningTok == 0 &&
 		crTok == 0 && rdTok == 0 {
 		return money.Money{}, true, false, nil
 	}
-	lookup := pricing.Lookup(r.model)
 	if !lookup.OK {
-		pricing.RecordComputed(r.model, lookup)
+		pricing.RecordResolvedComputed(r.model, pricedModel, lookup)
 		return money.Money{}, false, true, nil
 	}
-	rates := lookup.Rates
-	cost, err = rates.CostForTokens(
+	requestScoped := usageRowIsRequestScoped(r.usageSource, r.messageOrdinal)
+	cost, err = lookup.Rates.CostForTokensScoped(
+		requestScoped,
 		inTok, outTok, reasoningTok, cr5m, cr1h, rdTok)
 	if err != nil {
 		return money.Money{}, false, false,
 			fmt.Errorf("pricing session usage for model %q: %w", r.model, err)
 	}
-	pricing.RecordComputed(r.model, lookup)
+	recordComputedUsagePricing(
+		pricing,
+		r.model,
+		pricedModel,
+		lookup,
+		requestScoped,
+		inTok,
+		crTok,
+		rdTok,
+	)
 	return cost, true, true, nil
 }
 

@@ -319,21 +319,26 @@
   ariaLabel={m.nav_primary()}
 >
   {#snippet left()}
-    <button
-      class="hamburger"
-      onclick={() => {
-        if (ui.isMobileViewport && router.route !== "sessions") {
-          router.navigate("sessions");
-          ui.sidebarOpen = true;
-        } else {
-          ui.toggleSidebar();
-        }
-      }}
-      title={m.nav_toggle_sidebar_shortcut()}
-      aria-label={m.nav_toggle_sidebar()}
-    >
-      <MenuIcon size="16" strokeWidth="2" aria-hidden="true" />
-    </button>
+    {#if ui.isMobileViewport}
+      <button
+        class="hamburger"
+        onclick={() => {
+          if (router.route !== "sessions") {
+            router.navigate("sessions");
+            ui.sidebarOpen = true;
+          } else {
+            ui.toggleSidebar();
+          }
+        }}
+        title={m.nav_toggle_sidebar_shortcut()}
+        aria-label={m.nav_toggle_sidebar()}
+        aria-expanded={ui.sidebarOpen}
+        aria-controls="session-sidebar"
+        data-sidebar-focus-target="mobile"
+      >
+        <MenuIcon size="16" strokeWidth="2" aria-hidden="true" />
+      </button>
+    {/if}
     <button
       class="header-home"
       onclick={() => router.navigate("sessions")}

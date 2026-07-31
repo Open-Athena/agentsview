@@ -13,6 +13,7 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/money"
+	pricingpkg "go.kenn.io/agentsview/internal/pricing"
 )
 
 // TestDuckBuildAnalyticsWhereSubagents verifies that the DuckDB
@@ -245,6 +246,7 @@ func TestDuckUsageAggregateCostRecordsMixedReportedAndComputed(t *testing.T) {
 		100, 200, 300, 400, 0, 500,
 		250_000,
 		true,
+		false,
 		resolver,
 	)
 	require.NoError(t, err)
@@ -258,6 +260,108 @@ func TestDuckUsageAggregateCostRecordsMixedReportedAndComputed(t *testing.T) {
 	assert.Equal(t, export.CostSourceMixed, block.Models["mixed-model"].CostSource)
 }
 
+func TestDuckUsageAggregateCostPricingBandRequestScope(t *testing.T) {
+	tests := []struct {
+		name          string
+		requestScoped bool
+		wantCost      int64
+		wantSavings   int64
+		wantAggregate int
+		wantBand      int
+	}{
+		{
+			name:          "request uses selected band for cost and savings",
+			requestScoped: true,
+			wantCost:      220_002,
+			wantSavings:   180_000,
+			wantBand:      1,
+		},
+		{
+			name:          "aggregate uses base for cost and savings",
+			wantCost:      110_001,
+			wantSavings:   90_000,
+			wantAggregate: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+				ModelPattern: "banded-model",
+				Rates: export.ModelRates{
+					InputPerMTok:     money.MustParseDollars("1"),
+					CacheReadPerMTok: money.MustParseDollars("0.1"),
+					Bands: []export.PricingBand{{
+						AboveInputTokens: 200_000,
+						InputPerMTok:     money.MustParseDollars("2"),
+						CacheReadPerMTok: money.MustParseDollars("0.2"),
+					}},
+				},
+			}})
+
+			cost, savings, priced, contributes, err := duckUsageAggregateCost(
+				"banded-model",
+				100_001, 0, 0, 100_000,
+				100_001, 0, 0, 0, 0, 100_000,
+				0,
+				false,
+				tt.requestScoped,
+				resolver,
+			)
+			require.NoError(t, err)
+			assert.True(t, priced)
+			assert.True(t, contributes)
+			assert.Equal(t, money.Money{Microdollars: tt.wantCost}, cost)
+			assert.Equal(t, money.Money{Microdollars: tt.wantSavings}, savings)
+			block, err := resolver.BuildBlock()
+			require.NoError(t, err)
+			provenance := block.Models["banded-model"]
+			require.Len(t, provenance.Resolutions, 1)
+			application := provenance.Resolutions[0].Application
+			assert.Equal(t, tt.wantAggregate, application.AggregateRowCount)
+			if tt.wantBand > 0 {
+				require.Len(t, application.Bands, 1)
+				assert.Equal(t, tt.wantBand, application.Bands[0].RequestCount)
+			}
+		})
+	}
+}
+
+func TestDuckUsageAggregateCostReportedRowUsesBandForSavingsOnly(t *testing.T) {
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+		ModelPattern: "banded-model",
+		Rates: export.ModelRates{
+			InputPerMTok:     money.MustParseDollars("1"),
+			CacheReadPerMTok: money.MustParseDollars("0.1"),
+			Bands: []export.PricingBand{{
+				AboveInputTokens: 200_000,
+				InputPerMTok:     money.MustParseDollars("2"),
+				CacheReadPerMTok: money.MustParseDollars("0.2"),
+			}},
+		},
+	}})
+
+	cost, savings, priced, contributes, err := duckUsageAggregateCost(
+		"banded-model",
+		100_001, 0, 0, 100_000,
+		0, 0, 0, 0, 0, 0,
+		75_000,
+		true,
+		true,
+		resolver,
+	)
+	require.NoError(t, err)
+	assert.True(t, priced)
+	assert.True(t, contributes)
+	assert.Equal(t, money.Money{Microdollars: 75_000}, cost)
+	assert.Equal(t, money.Money{Microdollars: 180_000}, savings)
+	block, err := resolver.BuildBlock()
+	require.NoError(t, err)
+	provenance := block.Models["banded-model"]
+	require.Len(t, provenance.Resolutions, 1)
+	assert.Equal(t, export.PricingApplication{},
+		provenance.Resolutions[0].Application)
+}
+
 func TestDuckUsageAggregateCostKeepsMixedUnpricedComputedTokensUnpriced(t *testing.T) {
 	resolver := export.NewPricingResolver(nil)
 
@@ -267,6 +371,7 @@ func TestDuckUsageAggregateCostKeepsMixedUnpricedComputedTokensUnpriced(t *testi
 		1000, 2000, 0, 0, 0, 0,
 		250_000,
 		true,
+		false,
 		resolver,
 	)
 
@@ -280,7 +385,9 @@ func TestDuckUsageAggregateCostKeepsMixedUnpricedComputedTokensUnpriced(t *testi
 	assert.Equal(t, export.CostSourceMixed, block.CostSource)
 	require.Contains(t, block.Models, "unknown-model")
 	assert.Equal(t, export.CostSourceMixed, block.Models["unknown-model"].CostSource)
-	assert.Nil(t, block.Models["unknown-model"].MatchedPattern)
+	require.Len(t, block.Models["unknown-model"].Resolutions, 1)
+	assert.Nil(t,
+		block.Models["unknown-model"].Resolutions[0].MatchedPattern)
 	assert.Empty(t, block.Fallback.Models)
 }
 
@@ -298,6 +405,7 @@ func TestDuckUsageAggregateCostIncludesReasoningOnlyRows(t *testing.T) {
 		0, 0, 0, 0,
 		0, 0, 300, 0, 0, 0,
 		0,
+		false,
 		false,
 		resolver,
 	)
@@ -328,6 +436,7 @@ func TestDuckUsageAggregateCostRecordsZeroTokenModelProvenance(t *testing.T) {
 		0, 0, 0, 0,
 		0, 0, 0, 0, 0, 0,
 		0,
+		false,
 		false,
 		resolver,
 	)
@@ -403,6 +512,7 @@ func TestDuckUsageAggregateCostSplitsEphemeralCacheWrites(t *testing.T) {
 				100, 200, 0, tt.cacheCr, tt.cacheCr1h, 500,
 				0,
 				false,
+				false,
 				resolver,
 			)
 			require.NoError(t, err)
@@ -433,6 +543,43 @@ func TestDuckCacheWrite1hRateFallsBackToFiveMinute(t *testing.T) {
 				duckCacheWrite1hRate(tt.fiveMinute, tt.oneHour))
 		})
 	}
+}
+
+func TestDuckUsageAggregateCostPrefersExactCustomKimiAlias(t *testing.T) {
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{
+		{
+			ModelPattern: "kimi-for-coding",
+			Rates: export.ModelRates{
+				InputPerMTok: money.MustParseDollars("7"),
+				Source:       export.PricingRowSourceCustom,
+			},
+		},
+		{
+			ModelPattern: pricingpkg.KimiK3Canonical,
+			Rates: export.ModelRates{
+				InputPerMTok: money.MustParseDollars("2"),
+				Source:       export.PricingRowSourceFetched,
+			},
+		},
+	})
+
+	cost, _, priced, contributes, err := duckUsageAggregateResolvedCost(
+		"kimi-for-coding", pricingpkg.KimiK3Canonical,
+		1_000_000, 0, 0, 0,
+		1_000_000, 0, 0, 0, 0, 0,
+		0, false, true, resolver,
+	)
+
+	require.NoError(t, err)
+	assert.True(t, priced)
+	assert.True(t, contributes)
+	assert.Equal(t, money.MustParseDollars("7"), cost)
+	block, err := resolver.BuildBlock()
+	require.NoError(t, err)
+	require.Contains(t, block.Models, "kimi-for-coding")
+	resolutions := block.Models["kimi-for-coding"].Resolutions
+	require.Len(t, resolutions, 1)
+	assert.Equal(t, "kimi-for-coding", resolutions[0].PricedModel)
 }
 
 func TestDuckUsageAutomatedScopeOneShotExemption(t *testing.T) {

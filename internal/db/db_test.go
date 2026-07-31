@@ -1008,9 +1008,9 @@ func TestMigration_ToolResultEventsTable(t *testing.T) {
 		"expected tool_result_events table after reopen")
 }
 
-func TestCurrentDataVersionGitWorktreeProjectAttribution(t *testing.T) {
-	assert.Equal(t, 75, CurrentDataVersion(),
-		"final git worktree project attribution requires a data version bump")
+func TestCurrentDataVersionCopilotToolTiming(t *testing.T) {
+	assert.Equal(t, 76, CurrentDataVersion(),
+		"Copilot tool execution timing requires a data version bump")
 }
 
 func TestInsertMessages_PreservesToolResultEvents(t *testing.T) {
@@ -4431,6 +4431,10 @@ func TestCopyModelPricingFrom(t *testing.T) {
 			OutputPerMTok:        money.MustParseDollars("75"),
 			CacheCreationPerMTok: money.MustParseDollars("18.75"),
 			CacheReadPerMTok:     money.MustParseDollars("1.5"),
+			Bands: []PricingBand{{
+				AboveInputTokens: 200_000,
+				InputPerMTok:     money.MustParseDollars("30"),
+			}},
 		},
 	}), "UpsertModelPricing")
 	require.NoError(t,
@@ -4455,10 +4459,40 @@ func TestCopyModelPricingFrom(t *testing.T) {
 	assert.Equal(t, money.MustParseDollars("15.0"), copied.InputPerMTok,
 		"source row replaces stale destination row")
 	assert.Equal(t, money.MustParseDollars("75.0"), copied.OutputPerMTok, "output rate")
+	require.Len(t, copied.Bands, 1)
+	assert.Equal(t, 200_000, copied.Bands[0].AboveInputTokens)
+	assert.Equal(t, money.MustParseDollars("30"), copied.Bands[0].InputPerMTok)
 
 	meta, err := dstDB.GetPricingMeta("_fallback_version")
 	require.NoError(t, err, "GetPricingMeta")
 	assert.Equal(t, "v42", meta, "sentinel meta row copied")
+}
+
+func TestCopyModelPricingFromRollsBackParentWhenBandCopyFails(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "legacy.db")
+	src := testDBAtPath(t, srcPath, "src")
+	require.NoError(t, src.UpsertModelPricing([]ModelPricing{{
+		ModelPattern: "model",
+		InputPerMTok: money.MustParseDollars("1"),
+	}}))
+	require.NoError(t, src.Close())
+	execRawSQLite(t, srcPath, `DROP TABLE model_pricing_bands`)
+
+	dst := testDBAtPath(t, filepath.Join(dir, "destination.db"), "dst")
+	defer dst.Close()
+	require.NoError(t, dst.UpsertModelPricing([]ModelPricing{{
+		ModelPattern: "model",
+		InputPerMTok: money.MustParseDollars("9"),
+	}}))
+
+	err := dst.CopyModelPricingFrom(srcPath)
+	require.Error(t, err)
+	got, getErr := dst.GetModelPricing("model")
+	require.NoError(t, getErr)
+	require.NotNil(t, got)
+
+	assert.Equal(t, money.MustParseDollars("9"), got.InputPerMTok)
 }
 
 func TestCopySessionMetadataFrom_PreservesCursorUsageEvents(t *testing.T) {

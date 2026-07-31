@@ -26,12 +26,46 @@ type ModelRates struct {
 	// rate (Anthropic: 2x input vs 1.25x for the 5m rate CacheWritePerMTok
 	// holds). It is deliberately NOT part of the frozen export v1 wire
 	// contract: no canonical-JSON key, no EffectiveModelRate field. It is
-	// consumed only by the SQLite daily/session cost functions, which price
-	// the 5m and 1h cache-write buckets separately.
+	// consumed only by the daily/session cost functions, which price the 5m
+	// and 1h cache-write buckets separately.
 	CacheWrite1hPerMTok money.Money
 	CacheReadPerMTok    money.Money
 	UpdatedAt           *time.Time
 	Source              PricingRowSource
+	Bands               []PricingBand
+}
+
+func (r ModelRates) RatesForTokens(
+	inputTokens, cacheWriteTokens, cacheReadTokens int,
+) ModelRates {
+	band, ok := r.pricingBandForTokens(inputTokens, cacheWriteTokens, cacheReadTokens)
+	if !ok {
+		return r
+	}
+	updatedAt := r.UpdatedAt
+	if band.UpdatedAt != nil {
+		updatedAt = band.UpdatedAt
+	}
+	// Bands carry no explicit 1h cache-write rate. Derive it from the band's
+	// 5m rate using the fixed Anthropic 8/5 ratio (1h = 2x input, 5m = 1.25x)
+	// so that a band which retiers the 5m cache-write cost keeps 1h correctly
+	// above it, rather than dropping to the band's 5m rate via CostForTokens'
+	// zero-rate fallback.
+	cacheWrite1h := r.CacheWrite1hPerMTok
+	if band.CacheWritePerMTok.Microdollars > 0 {
+		eightX := money.Money{Microdollars: band.CacheWritePerMTok.Microdollars * 8}
+		cacheWrite1h, _ = money.Divide(eightX, 5)
+	}
+	return ModelRates{
+		InputPerMTok:        band.InputPerMTok,
+		OutputPerMTok:       band.OutputPerMTok,
+		CacheWritePerMTok:   band.CacheWritePerMTok,
+		CacheWrite1hPerMTok: cacheWrite1h,
+		CacheReadPerMTok:    band.CacheReadPerMTok,
+		UpdatedAt:           updatedAt,
+		Source:              r.Source,
+		Bands:               r.Bands,
+	}
 }
 
 // CostForTokens prices a token breakdown. Ephemeral cache writes are split into
@@ -45,6 +79,26 @@ type ModelRates struct {
 func (r ModelRates) CostForTokens(
 	inputTokens, outputTokens, reasoningTokens, cacheWrite5mTokens, cacheWrite1hTokens, cacheReadTokens int,
 ) (money.Money, error) {
+	return r.CostForTokensScoped(
+		true,
+		inputTokens,
+		outputTokens,
+		reasoningTokens,
+		cacheWrite5mTokens,
+		cacheWrite1hTokens,
+		cacheReadTokens,
+	)
+}
+
+func (r ModelRates) CostForTokensScoped(
+	requestScoped bool,
+	inputTokens, outputTokens, reasoningTokens, cacheWrite5mTokens, cacheWrite1hTokens, cacheReadTokens int,
+) (money.Money, error) {
+	if requestScoped {
+		// Bands tier by total request input; select on the combined
+		// cache-write count before splitting it back into 5m/1h buckets.
+		r = r.RatesForTokens(inputTokens, cacheWrite5mTokens+cacheWrite1hTokens, cacheReadTokens)
+	}
 	// reasoningTokens is a breakdown of outputTokens for current sources, not
 	// additional billable output. Reasoning-only rows still bill at output rate.
 	billableOutputTokens := outputTokens
@@ -64,6 +118,22 @@ func (r ModelRates) CostForTokens(
 	})
 }
 
+func (r ModelRates) pricingBandForTokens(
+	inputTokens, cacheWriteTokens, cacheReadTokens int,
+) (PricingBand, bool) {
+	totalInput := int64(inputTokens) + int64(cacheWriteTokens) + int64(cacheReadTokens)
+	var selected PricingBand
+	var ok bool
+	for _, band := range r.Bands {
+		if totalInput > int64(band.AboveInputTokens) &&
+			(!ok || band.AboveInputTokens > selected.AboveInputTokens) {
+			selected = band
+			ok = true
+		}
+	}
+	return selected, ok
+}
+
 type EffectivePricingRow struct {
 	ModelPattern string
 	Rates        ModelRates
@@ -79,21 +149,25 @@ type PricingResolver struct {
 	rows                 []EffectivePricingRow
 	byModel              map[string]ModelRates
 	lookupCache          map[string]PricingLookup
-	recorded             map[string]*pricingRecord
+	recorded             map[string]map[string]*pricingRecord
 	unattributedReported bool
 }
 
 type pricingRecord struct {
-	lookup   PricingLookup
-	computed bool
-	reported bool
+	lookup            PricingLookup
+	computed          bool
+	reported          bool
+	baseRequestCount  int
+	aggregateRowCount int
+	bandRequestCounts map[int]int
 }
 
 func NewPricingResolver(rows []EffectivePricingRow) *PricingResolver {
 	copied := make([]EffectivePricingRow, len(rows))
-	copy(copied, rows)
 	byModel := make(map[string]ModelRates, len(rows))
-	for _, row := range rows {
+	for i, row := range rows {
+		row.Rates.Bands = append([]PricingBand(nil), row.Rates.Bands...)
+		copied[i] = row
 		if row.ModelPattern == "" {
 			continue
 		}
@@ -103,7 +177,7 @@ func NewPricingResolver(rows []EffectivePricingRow) *PricingResolver {
 		rows:        copied,
 		byModel:     byModel,
 		lookupCache: make(map[string]PricingLookup),
-		recorded:    make(map[string]*pricingRecord),
+		recorded:    make(map[string]map[string]*pricingRecord),
 	}
 }
 
@@ -112,7 +186,7 @@ func (r *PricingResolver) Lookup(model string) PricingLookup {
 		return PricingLookup{}
 	}
 	if lookup, ok := r.lookupCache[model]; ok {
-		return lookup
+		return clonePricingLookup(lookup)
 	}
 	match := pricingpkg.ResolveMatch(model, r.byModel)
 	lookup := PricingLookup{
@@ -120,23 +194,125 @@ func (r *PricingResolver) Lookup(model string) PricingLookup {
 		Pattern: match.Pattern,
 		OK:      match.OK,
 	}
-	r.lookupCache[model] = lookup
+	r.lookupCache[model] = clonePricingLookup(lookup)
+	return clonePricingLookup(lookup)
+}
+
+func clonePricingLookup(lookup PricingLookup) PricingLookup {
+	lookup.Rates.Bands = append([]PricingBand(nil), lookup.Rates.Bands...)
 	return lookup
 }
 
+// Resolve selects the effective priced model while preserving the model name
+// reported by the source. An exact custom rate for the reported name takes
+// precedence over caller-supplied canonicalization.
+func (r *PricingResolver) Resolve(
+	reportedModel, canonicalModel string,
+) (string, PricingLookup) {
+	if r == nil {
+		return reportedModel, PricingLookup{}
+	}
+	if rates, ok := r.byModel[reportedModel]; ok &&
+		rates.Source == PricingRowSourceCustom {
+		return reportedModel, PricingLookup{
+			Rates:   rates,
+			Pattern: reportedModel,
+			OK:      true,
+		}
+	}
+	pricedModel := canonicalModel
+	if pricedModel == "" {
+		pricedModel = reportedModel
+	}
+	return pricedModel, r.Lookup(pricedModel)
+}
+
 func (r *PricingResolver) RecordComputed(model string, lookup PricingLookup) {
-	if r == nil || model == "" {
+	r.RecordResolvedComputed(model, model, lookup)
+}
+
+func (r *PricingResolver) RecordComputedRequest(
+	model string,
+	lookup PricingLookup,
+	inputTokens, cacheWriteTokens, cacheReadTokens int,
+) {
+	r.RecordResolvedComputedRequest(
+		model,
+		model,
+		lookup,
+		inputTokens,
+		cacheWriteTokens,
+		cacheReadTokens,
+	)
+}
+
+func (r *PricingResolver) RecordResolvedComputedRequest(
+	reportedModel, pricedModel string,
+	lookup PricingLookup,
+	inputTokens, cacheWriteTokens, cacheReadTokens int,
+) {
+	if r == nil || reportedModel == "" || pricedModel == "" {
 		return
 	}
-	rec := r.record(model, lookup)
+	rec := r.record(reportedModel, pricedModel, lookup)
 	rec.computed = true
+	if !lookup.OK {
+		return
+	}
+	band, ok := lookup.Rates.pricingBandForTokens(
+		inputTokens,
+		cacheWriteTokens,
+		cacheReadTokens,
+	)
+	if !ok {
+		rec.baseRequestCount++
+		return
+	}
+	if rec.bandRequestCounts == nil {
+		rec.bandRequestCounts = make(map[int]int)
+	}
+	rec.bandRequestCounts[band.AboveInputTokens]++
+}
+
+func (r *PricingResolver) RecordComputedAggregate(model string, lookup PricingLookup) {
+	r.RecordResolvedComputedAggregate(model, model, lookup)
+}
+
+func (r *PricingResolver) RecordResolvedComputedAggregate(
+	reportedModel, pricedModel string, lookup PricingLookup,
+) {
+	if r == nil || reportedModel == "" || pricedModel == "" {
+		return
+	}
+	rec := r.record(reportedModel, pricedModel, lookup)
+	rec.computed = true
+	if !lookup.OK {
+		return
+	}
+	rec.aggregateRowCount++
 }
 
 func (r *PricingResolver) RecordReported(model string, lookup PricingLookup) {
-	if r == nil || model == "" {
+	r.RecordResolvedReported(model, model, lookup)
+}
+
+func (r *PricingResolver) RecordResolvedComputed(
+	reportedModel, pricedModel string, lookup PricingLookup,
+) {
+	if r == nil || reportedModel == "" || pricedModel == "" {
 		return
 	}
-	rec := r.record(model, lookup)
+	rec := r.record(reportedModel, pricedModel, lookup)
+	rec.computed = true
+}
+
+func (r *PricingResolver) RecordResolvedReported(
+	reportedModel, pricedModel string, lookup PricingLookup,
+) {
+	if r == nil || reportedModel == "" || pricedModel == "" {
+		return
+	}
+	rec := r.record(reportedModel, pricedModel, lookup)
 	rec.reported = true
 }
 
@@ -148,13 +324,20 @@ func (r *PricingResolver) RecordUnattributedReported() {
 	}
 }
 
-func (r *PricingResolver) record(model string, lookup PricingLookup) *pricingRecord {
-	rec := r.recorded[model]
+func (r *PricingResolver) record(
+	reportedModel, pricedModel string, lookup PricingLookup,
+) *pricingRecord {
+	byPricedModel := r.recorded[reportedModel]
+	if byPricedModel == nil {
+		byPricedModel = make(map[string]*pricingRecord)
+		r.recorded[reportedModel] = byPricedModel
+	}
+	rec := byPricedModel[pricedModel]
 	if rec == nil {
 		rec = &pricingRecord{}
-		r.recorded[model] = rec
+		byPricedModel[pricedModel] = rec
 	}
-	rec.lookup = lookup
+	rec.lookup = clonePricingLookup(lookup)
 	return rec
 }
 
@@ -162,7 +345,7 @@ func (r *PricingResolver) BuildBlock() (PricingBlock, error) {
 	if r == nil {
 		return PricingBlock{}, nil
 	}
-	models := make(map[string]EffectiveModelRate, len(r.recorded))
+	models := make(map[string]ModelPricingProvenance, len(r.recorded))
 	fallbackSet := make(map[string]struct{})
 	var hasComputed bool
 	hasReported := r.unattributedReported
@@ -171,29 +354,54 @@ func (r *PricingResolver) BuildBlock() (PricingBlock, error) {
 		modelNames = append(modelNames, model)
 	}
 	sort.Strings(modelNames)
-	for _, model := range modelNames {
-		rec := r.recorded[model]
-		if rec == nil {
+	for _, reportedModel := range modelNames {
+		byPricedModel := r.recorded[reportedModel]
+		if len(byPricedModel) == 0 {
 			continue
 		}
-		source := recordCostSource(rec)
-		hasComputed = hasComputed || rec.computed
-		hasReported = hasReported || rec.reported
-		rate := EffectiveModelRate{
-			InputCostPerMTok:      rec.lookup.Rates.InputPerMTok,
-			OutputCostPerMTok:     rec.lookup.Rates.OutputPerMTok,
-			CacheWriteCostPerMTok: rec.lookup.Rates.CacheWritePerMTok,
-			CacheReadCostPerMTok:  rec.lookup.Rates.CacheReadPerMTok,
-			CostSource:            source,
+		pricedModels := make([]string, 0, len(byPricedModel))
+		for pricedModel := range byPricedModel {
+			pricedModels = append(pricedModels, pricedModel)
 		}
-		if rec.lookup.OK {
-			pattern := rec.lookup.Pattern
-			rate.MatchedPattern = &pattern
-			if rec.lookup.Rates.Source == PricingRowSourceEmbedded {
-				fallbackSet[model] = struct{}{}
+		sort.Strings(pricedModels)
+
+		provenance := ModelPricingProvenance{
+			Resolutions: make([]EffectiveModelRate, 0, len(pricedModels)),
+		}
+		var modelComputed, modelReported bool
+		for _, pricedModel := range pricedModels {
+			rec := byPricedModel[pricedModel]
+			if rec == nil {
+				continue
 			}
+			source := recordCostSource(rec)
+			modelComputed = modelComputed || rec.computed
+			modelReported = modelReported || rec.reported
+			rate := EffectiveModelRate{
+				PricedModel:           pricedModel,
+				InputCostPerMTok:      rec.lookup.Rates.InputPerMTok,
+				OutputCostPerMTok:     rec.lookup.Rates.OutputPerMTok,
+				CacheWriteCostPerMTok: rec.lookup.Rates.CacheWritePerMTok,
+				CacheReadCostPerMTok:  rec.lookup.Rates.CacheReadPerMTok,
+				CostSource:            source,
+				Bands: append(
+					[]PricingBand(nil), rec.lookup.Rates.Bands...),
+				Application: pricingApplicationForRecord(rec),
+			}
+			if rec.lookup.OK {
+				pattern := rec.lookup.Pattern
+				rate.MatchedPattern = &pattern
+				if rec.lookup.Rates.Source == PricingRowSourceEmbedded {
+					fallbackSet[reportedModel] = struct{}{}
+				}
+			}
+			provenance.Resolutions = append(provenance.Resolutions, rate)
 		}
-		models[model] = rate
+		provenance.CostSource = CombinedCostSource(
+			modelComputed, modelReported)
+		hasComputed = hasComputed || modelComputed
+		hasReported = hasReported || modelReported
+		models[reportedModel] = provenance
 	}
 
 	fallbackModels := make([]string, 0, len(fallbackSet))
@@ -221,6 +429,27 @@ func (r *PricingResolver) BuildBlock() (PricingBlock, error) {
 		},
 		Models: models,
 	}, nil
+}
+
+func pricingApplicationForRecord(rec *pricingRecord) PricingApplication {
+	application := PricingApplication{
+		BaseRequestCount:  rec.baseRequestCount,
+		AggregateRowCount: rec.aggregateRowCount,
+	}
+	thresholds := make([]int, 0, len(rec.bandRequestCounts))
+	for threshold, count := range rec.bandRequestCounts {
+		if count > 0 {
+			thresholds = append(thresholds, threshold)
+		}
+	}
+	sort.Ints(thresholds)
+	for _, threshold := range thresholds {
+		application.Bands = append(application.Bands, AppliedPricingBand{
+			AboveInputTokens: threshold,
+			RequestCount:     rec.bandRequestCounts[threshold],
+		})
+	}
+	return application
 }
 
 func pricingTableVersion(rows []EffectivePricingRow) string {
@@ -346,12 +575,20 @@ func customPricingRowCount(rows []EffectivePricingRow) int {
 func latestPricingRowUpdate(rows []EffectivePricingRow) *time.Time {
 	var latest *time.Time
 	for _, row := range rows {
-		if row.Rates.UpdatedAt == nil {
-			continue
+		if row.Rates.UpdatedAt != nil {
+			t := row.Rates.UpdatedAt.UTC()
+			if latest == nil || t.After(*latest) {
+				latest = &t
+			}
 		}
-		t := row.Rates.UpdatedAt.UTC()
-		if latest == nil || t.After(*latest) {
-			latest = &t
+		for _, band := range row.Rates.Bands {
+			if band.UpdatedAt == nil {
+				continue
+			}
+			t := band.UpdatedAt.UTC()
+			if latest == nil || t.After(*latest) {
+				latest = &t
+			}
 		}
 	}
 	return latest

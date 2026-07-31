@@ -681,6 +681,7 @@ func duckActivityReportUsageQuery(inClause string) string {
 func duckActivityReportRowStatus(
 	r duckActivityReportUsageRow, pricing *export.PricingResolver,
 ) (savings, cost money.Money, priced, contributes bool, err error) {
+	canonicalModel := duckUsageLookupModel(r.model, r.ts)
 	var explicitCost int64
 	var billableInput, billableOutput, billableReasoning, billableCacheCr, billableCacheRd int
 	if r.cost != nil {
@@ -690,7 +691,7 @@ func duckActivityReportRowStatus(
 	} else if r.inputTok != 0 || r.outputTok != 0 || r.reasoningTok != 0 ||
 		r.cacheCr != 0 || r.cacheRd != 0 {
 		contributes = true
-		lookup := pricing.Lookup(r.model)
+		_, lookup := pricing.Resolve(r.model, canonicalModel)
 		priced = lookup.OK
 		billableInput = r.inputTok
 		billableOutput = r.outputTok
@@ -708,16 +709,22 @@ func duckActivityReportRowStatus(
 	// The raw 1h count feeds both the cost split (reconciled against
 	// billableCacheCr) and the savings split (reconciled against raw cacheCr),
 	// so it is passed ungated regardless of the explicit-cost branch above.
-	cost, savings, _, _, err = duckUsageAggregateCost(
-		r.model,
+	cost, savings, _, _, err = duckUsageAggregateResolvedCost(
+		r.model, canonicalModel,
 		r.inputTok, r.outputTok, r.cacheCr, r.cacheRd,
 		billableInput, billableOutput, billableReasoning,
 		billableCacheCr, r.cacheCr1h, billableCacheRd,
 		explicitCost,
 		r.cost != nil,
+		r.source == "message" || duckActivityUsageHasOrdinal(r.messageOrdinal),
 		pricing,
 	)
 	return savings, cost, priced, contributes, err
+}
+
+func duckActivityUsageHasOrdinal(v any) bool {
+	_, ok := duckUsageOrdinal(v)
+	return ok
 }
 
 func duckActivityUsageCost(
