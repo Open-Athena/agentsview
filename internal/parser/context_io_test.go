@@ -104,14 +104,16 @@ func TestClaudeDAGPostProcessingStopsAfterContextCancellation(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 }
 
-func TestCodexPostReadNormalizationStopsAfterContextCancellation(t *testing.T) {
-	builder := newCodexSessionBuilder(context.Background(), false, nil)
-	for i := 1024; i > 0; i-- {
-		builder.messages = append(builder.messages, ParsedMessage{Ordinal: i})
+func TestCodexPostReadUsageAccumulationStopsAfterContextCancellation(t *testing.T) {
+	// Ordinal normalization now lives in the sink's Finalize; the post-read
+	// work the parser still owns is the per-message usage accumulation.
+	messages := make([]ParsedMessage, 1024)
+	for i := range messages {
+		messages[i] = ParsedMessage{Ordinal: i, HasOutputTokens: true, OutputTokens: 1}
 	}
 	ctx := newCancelOnErrCheckContext(t, 3)
 
-	err := builder.normalizeOrdinalsContext(ctx)
+	err := accumulateMessageTokenUsageContext(ctx, &ParsedSession{}, messages)
 
 	require.ErrorIs(t, err, context.Canceled)
 }
@@ -165,7 +167,7 @@ func TestUsageEventTokenAggregateStopsAfterContextCancellation(t *testing.T) {
 func TestTokenCoverageStopsAfterContextCancellation(t *testing.T) {
 	messages := make([]ParsedMessage, 1024)
 
-	_, _, err := (ParsedSession{}).TokenCoverageContext(
+	_, _, err := (&ParsedSession{}).TokenCoverageContext(
 		newCancelOnErrCheckContext(t, 2), messages,
 	)
 

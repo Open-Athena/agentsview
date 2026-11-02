@@ -11,15 +11,16 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/danielgtaylor/huma/v2"
+
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/remotesync"
 )
 
 func (s *Server) registerRemoteSyncRoutes() {
-	group := newRouteGroup(s.api, "/api/v1/remote-sync", "RemoteSync")
+	group := huma.NewGroup(s.api, "/api/v1/remote-sync")
+	configureRouteGroup(group, "RemoteSync")
 	s.get(group, "/targets", "Resolve remote sync targets", s.humaRemoteSyncTargets)
-	s.mux.HandleFunc("/api/v1/remote-sync/archive", s.remoteSyncArchiveHTTP)
-	s.mux.HandleFunc("/api/v1/remote-sync/manifest", s.remoteSyncManifestHTTP)
 }
 
 type remoteSyncTargetsInput struct {
@@ -32,7 +33,7 @@ type remoteSyncTargetsOutput struct {
 }
 
 func (s *Server) humaRemoteSyncTargets(
-	_ context.Context,
+	ctx context.Context,
 	in *remoteSyncTargetsInput,
 ) (*remoteSyncTargetsOutput, error) {
 	requestHeader := make(http.Header)
@@ -43,9 +44,13 @@ func (s *Server) humaRemoteSyncTargets(
 	if _, ok := s.db.(*db.DB); !ok {
 		return nil, apiError(http.StatusNotImplemented, "not available in remote mode")
 	}
+	targets, err := remotesync.ResolveTargets(s.ingestionConfig())
+	if err != nil {
+		return nil, apiError(http.StatusInternalServerError, err.Error())
+	}
 	return &remoteSyncTargetsOutput{
 		ProtocolVersion: strconv.Itoa(remotesync.ProtocolVersion),
-		Body:            remotesync.ResolveTargets(s.ingestionConfig()),
+		Body:            targets,
 	}, nil
 }
 
@@ -75,7 +80,11 @@ func (s *Server) remoteSyncManifestHTTP(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "invalid manifest request", http.StatusBadRequest)
 		return
 	}
-	allowed := remotesync.ResolveTargets(s.ingestionConfig())
+	allowed, err := remotesync.ResolveTargets(s.ingestionConfig())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	manifestTargets, ok := remotesync.SelectAllowedTargets(allowed, req)
 	if !ok {
 		http.Error(w, "remote sync target is not allowed", http.StatusForbidden)
@@ -95,7 +104,7 @@ func (s *Server) remoteSyncManifestHTTP(w http.ResponseWriter, r *http.Request) 
 			http.StatusNotImplemented)
 		return
 	}
-	manifest, err := remotesync.BuildManifest(manifestTargets)
+	manifest, err := remotesync.BuildManifest(r.Context(), manifestTargets)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -130,7 +139,11 @@ func (s *Server) remoteSyncArchiveHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid archive request", http.StatusBadRequest)
 		return
 	}
-	allowed := remotesync.ResolveTargets(s.ingestionConfig())
+	allowed, err := remotesync.ResolveTargets(s.ingestionConfig())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	archiveTargets, ok := remotesync.SelectAllowedTargets(allowed, req.TargetSet)
 	if !ok {
 		http.Error(w, "remote sync target is not allowed", http.StatusForbidden)
@@ -156,11 +169,10 @@ func (s *Server) remoteSyncArchiveHTTP(w http.ResponseWriter, r *http.Request) {
 		gz = gzip.NewWriter(archiveWriter)
 		out = gz
 	}
-	var err error
 	if deltaMode {
-		err = remotesync.WriteArchiveFiles(out, allowed, files)
+		err = remotesync.WriteArchiveFiles(r.Context(), out, allowed, files)
 	} else {
-		err = remotesync.WriteArchive(out, archiveTargets)
+		err = remotesync.WriteArchive(r.Context(), out, archiveTargets)
 	}
 	if err == nil && gz != nil {
 		err = gz.Close()

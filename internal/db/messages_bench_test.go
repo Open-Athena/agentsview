@@ -3,9 +3,9 @@ package db
 import (
 	"encoding/json/jsontext"
 	"fmt"
-	"io"
-	"log"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // Hot-path benchmarks for the message write and usage aggregation
@@ -66,17 +66,17 @@ func seedBenchSession(
 	b *testing.B, d *DB, sessionID string, n int,
 ) []Message {
 	b.Helper()
-	if err := d.UpsertSession(Session{
+	if err := d.UpsertSession(b.Context(), Session{
 		ID:      sessionID,
 		Project: "bench",
 		Machine: "local",
 		Agent:   "claude",
 	}); err != nil {
-		b.Fatalf("seed session %s: %v", sessionID, err)
+		require.NoErrorf(b, err, "seed session %s", sessionID)
 	}
 	msgs := benchSessionMessages(sessionID, n)
-	if err := d.InsertMessages(msgs); err != nil {
-		b.Fatalf("seed messages for %s: %v", sessionID, err)
+	if err := d.InsertMessages(b.Context(), msgs); err != nil {
+		require.NoErrorf(b, err, "seed messages for %s", sessionID)
 	}
 	return msgs
 }
@@ -87,7 +87,6 @@ func seedBenchSession(
 // single in-place UPDATE; cost must not scale with the number of
 // unchanged stored rows being rewritten.
 func BenchmarkReplaceSessionMessagesStreamingMerge(b *testing.B) {
-	silenceBenchmarkLogs(b)
 	const stored = 1000
 	d := testDB(b)
 	msgs := seedBenchSession(b, d, "bench-replace", stored)
@@ -102,8 +101,8 @@ func BenchmarkReplaceSessionMessagesStreamingMerge(b *testing.B) {
 		)
 		msgs[last].Content = content
 		msgs[last].ContentLength = len(content)
-		if err := d.ReplaceSessionMessages("bench-replace", msgs); err != nil {
-			b.Fatalf("replace: %v", err)
+		if err := d.ReplaceSessionMessages(b.Context(), "bench-replace", msgs); err != nil {
+			require.NoError(b, err, "replace")
 		}
 	}
 }
@@ -118,7 +117,6 @@ func BenchmarkReplaceSessionMessagesStreamingMerge(b *testing.B) {
 // -benchtime=Nx (see bench.yml and the Makefile) so baseline and
 // candidate insert into identically sized databases.
 func BenchmarkInsertMessagesBatch(b *testing.B) {
-	silenceBenchmarkLogs(b)
 	const batch = 200
 	d := testDB(b)
 
@@ -132,28 +130,19 @@ func BenchmarkInsertMessagesBatch(b *testing.B) {
 	b.ResetTimer()
 	for i := range b.N {
 		sid := fmt.Sprintf("bench-insert-%06d", i)
-		if err := d.UpsertSession(Session{
+		if err := d.UpsertSession(b.Context(), Session{
 			ID:      sid,
 			Project: "bench",
 			Machine: "local",
 			Agent:   "claude",
 		}); err != nil {
-			b.Fatalf("upsert session: %v", err)
+			require.NoError(b, err, "upsert session")
 		}
 		for j := range msgs {
 			msgs[j].SessionID = sid
 		}
-		if err := d.InsertMessages(msgs); err != nil {
-			b.Fatalf("insert messages: %v", err)
+		if err := d.InsertMessages(b.Context(), msgs); err != nil {
+			require.NoError(b, err, "insert messages")
 		}
 	}
-}
-
-func silenceBenchmarkLogs(b *testing.B) {
-	b.Helper()
-	origLog := log.Writer()
-	log.SetOutput(io.Discard)
-	b.Cleanup(func() {
-		log.SetOutput(origLog)
-	})
 }

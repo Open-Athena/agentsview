@@ -6,8 +6,6 @@
   import type { Session } from "../../api/types.js";
   import { SessionsService } from "../../api/generated/index";
   import {
-    callGenerated,
-    configureGeneratedClient,
     isAbortError,
   } from "../../api/runtime.js";
   import { sessions } from "../../stores/sessions.svelte.js";
@@ -19,10 +17,6 @@
   let emptying = $state(false);
   const trashRead = new LatestRead();
 
-  interface TrashResponse {
-    sessions: Session[];
-  }
-
   onMount(() => {
     loadTrash();
   });
@@ -31,11 +25,7 @@
     const signal = trashRead.begin();
     loading = true;
     try {
-      configureGeneratedClient();
-      const res = await callGenerated(
-        () => SessionsService.getApiV1Trash(),
-        signal,
-      ) as unknown as TrashResponse;
+      const res = await SessionsService.getApiV1Trash({ signal });
       if (!trashRead.isCurrent(signal)) return;
       trashedSessions = res.sessions ?? [];
     } catch (e) {
@@ -50,8 +40,7 @@
 
   async function restoreSession(id: string) {
     try {
-      configureGeneratedClient();
-      await SessionsService.postApiV1SessionsIdRestore({ id });
+      await SessionsService.postApiV1SessionsByIdRestore({ id });
       trashedSessions = trashedSessions.filter((s) => s.id !== id);
       sessions.clearRecentlyDeleted(id);
       sessions.invalidateFilterCaches();
@@ -63,8 +52,7 @@
 
   async function permanentDelete(id: string) {
     try {
-      configureGeneratedClient();
-      await SessionsService.deleteApiV1SessionsIdPermanent({ id });
+      await SessionsService.deleteApiV1SessionsByIdPermanent({ id });
       trashedSessions = trashedSessions.filter((s) => s.id !== id);
       sessions.clearRecentlyDeleted(id);
       sessions.invalidateFilterCaches();
@@ -76,7 +64,6 @@
   async function emptyAll() {
     emptying = true;
     try {
-      configureGeneratedClient();
       await SessionsService.deleteApiV1Trash();
       trashedSessions = [];
       sessions.clearRecentlyDeleted();

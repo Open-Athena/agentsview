@@ -91,16 +91,20 @@ func TestClassifyUsageRollupFactsKeepsIrreducibleGroups(t *testing.T) {
 		cross      usageDedupIdentitySet
 		exceptions int
 	}{
-		{"cross-session snapshot identity",
+		{
+			"cross-session snapshot identity",
 			[]usageRollupFact{rollupSnapshotFact(1, 0, "session-a", "2026-08-01", "model-a", 10)},
-			crossSnapshot, 1},
+			crossSnapshot, 1,
+		},
 		{"snapshot group spanning days", []usageRollupFact{
 			rollupSnapshotFact(1, 0, "session-a", "2026-08-01", "model-a", 10),
 			rollupSnapshotFact(1, 1, "session-a", "2026-08-02", "model-a", 20),
 		}, newUsageDedupIdentitySet(), 2},
-		{"cross-session source identity",
+		{
+			"cross-session source identity",
 			[]usageRollupFact{sourceFact(1, 0, "2026-08-01", "model-a")},
-			crossSource, 1},
+			crossSource, 1,
+		},
 		{"general group spanning models", []usageRollupFact{
 			rollupGeneralFact(1, 0, "session-a", "2026-08-01", "model-a", "shared", 10),
 			rollupGeneralFact(1, 1, "session-a", "2026-08-01", "model-b", "shared", 20),
@@ -109,11 +113,16 @@ func TestClassifyUsageRollupFactsKeepsIrreducibleGroups(t *testing.T) {
 			rollupGeneralFact(1, 0, "session-a", "2026-08-01", "model-a", "shared", 10),
 			rollupGeneralFact(1, 1, "session-a", "2026-08-02", "model-a", "shared", 20),
 		}, newUsageDedupIdentitySet(), 2},
-		{"cross usage key",
+		{
+			"cross usage key",
 			[]usageRollupFact{rollupGeneralFact(1, 0, "session-a", "2026-08-01", "model-a", "shared-key", 10)},
-			crossUsage, 1},
-		{"authoritative copilot cost",
-			[]usageRollupFact{copilot}, newUsageDedupIdentitySet(), 1},
+			crossUsage, 1,
+		},
+		{
+			"authoritative copilot cost",
+			[]usageRollupFact{copilot},
+			newUsageDedupIdentitySet(), 1,
+		},
 		{"general group with mixed empty dates", []usageRollupFact{
 			undated,
 			rollupGeneralFact(1, 1, "session-a", "2026-08-01", "model-a", "shared", 20),
@@ -255,6 +264,58 @@ func TestPriceUsageFactPreservesReportedAndAuthoritativeCosts(t *testing.T) {
 	assert.Equal(t, 1, authoritative.ComputedAggregate)
 }
 
+func TestPriceUsageFactRateHashFollowsChargedRates(t *testing.T) {
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+		ModelPattern: "model-a",
+		Rates:        export.ModelRates{OutputPerMTok: money.Money{Microdollars: 1_000_000}},
+	}})
+	reported := int64(77)
+	rateHash := func(providerID string, reportedCost *int64) string {
+		t.Helper()
+		priced, err := priceUsageFact(usagePriceInput{
+			ProviderID: providerID, ReportedModel: "model-a",
+			Fact: usagefacts.Fact{
+				Model: "model-a", OutputTokens: 1_000,
+				ReportedCostMicrodollars: reportedCost,
+				CostSource:               "provider-reported",
+			},
+		}, resolver)
+		require.NoError(t, err)
+		return priced.rateHash()
+	}
+
+	assert.Equal(t, rateHash("", nil), rateHash("", &reported),
+		"unadjusted provider charges both rows at catalog rates")
+	assert.NotEqual(t, rateHash("positai", nil), rateHash("positai", &reported),
+		"computed row is charged at billed rates, reported row is not")
+	assert.Equal(t, rateHash("", &reported), rateHash("positai", &reported),
+		"reported rows ignore provider billing adjustments")
+}
+
+func TestPriceUsageFactUsesBilledRatesForReportedCacheSavings(t *testing.T) {
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+		ModelPattern: "model-a",
+		Rates: export.ModelRates{
+			InputPerMTok:     money.MustParseDollars("1"),
+			CacheReadPerMTok: money.MustParseDollars("0.1"),
+		},
+	}})
+	reported := int64(77)
+
+	got, err := priceUsageFact(usagePriceInput{
+		ProviderID:    "positai",
+		ReportedModel: "model-a",
+		Fact: usagefacts.Fact{
+			Model: "model-a", CacheReadTokens: 1_000_000,
+			ReportedCostMicrodollars: &reported,
+			CostSource:               "provider-reported",
+		},
+	}, resolver)
+	require.NoError(t, err)
+	assert.Equal(t, int64(77), got.Cost.Microdollars)
+	assert.Equal(t, int64(990_000), got.Savings.Microdollars)
+}
+
 func TestPriceUsageFactPricesReasoningAsOutputWhenOutputIsZero(t *testing.T) {
 	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
 		ModelPattern: "model-a",
@@ -368,5 +429,40 @@ func rollupGeneralFact(
 			RawTimestamp: "2026-08-01T00:00:00Z", Model: model,
 			OutputTokens: output, UsageDedupKey: dedup, TokenEligible: true,
 		},
+	}
+}
+
+func TestPriceCopilotStoreRequestsWithoutMessageOrdinal(t *testing.T) {
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+		ModelPattern: "gpt-5.4",
+		Rates: export.ModelRates{
+			InputPerMTok: money.MustParseDollars("2.50"),
+			Bands: []export.PricingBand{{
+				AboveInputTokens: 272_000,
+				InputPerMTok:     money.MustParseDollars("5"),
+			}},
+		},
+	}})
+	for _, tc := range []struct {
+		name             string
+		inputs           []int64
+		wantMicrodollars int64
+	}{
+		{"one large call", []int64{300_000}, 1_500_000},
+		{"two smaller calls", []int64{150_000, 150_000}, 750_000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var total int64
+			for _, input := range tc.inputs {
+				fact, ok := usagefacts.FromEvent(usagefacts.EventInput{
+					Source: "session-store", Model: "gpt-5.4", InputTokens: input,
+				})
+				require.True(t, ok)
+				got, err := priceUsageFact(usagePriceInput{ReportedModel: fact.Model, Fact: fact}, resolver)
+				require.NoError(t, err)
+				total += got.Cost.Microdollars
+			}
+			assert.Equal(t, tc.wantMicrodollars, total)
+		})
 	}
 }

@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-const schemaVersion = 5
+const schemaVersion = 8
 
 func (s *Store) init(ctx context.Context) error {
 	var version int
@@ -25,9 +25,16 @@ func (s *Store) init(ctx context.Context) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	for _, statement := range versionOneSchemaStatements {
-		if _, err := tx.ExecContext(ctx, statement); err != nil {
-			return fmt.Errorf("rawcheckpoint: create base schema: %w", err)
+	if version == 0 {
+		if _, err := tx.ExecContext(ctx, currentSchema); err != nil {
+			return fmt.Errorf("rawcheckpoint: create current schema: %w", err)
+		}
+		version = schemaVersion
+	} else {
+		for _, statement := range versionOneSchemaStatements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("rawcheckpoint: create base schema: %w", err)
+			}
 		}
 	}
 	if version < 2 {
@@ -58,6 +65,27 @@ func (s *Store) init(ctx context.Context) error {
 			}
 		}
 	}
+	if version < 6 {
+		for _, statement := range versionSixMigrationStatements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("rawcheckpoint: migrate schema to version 6: %w", err)
+			}
+		}
+	}
+	if version < 7 {
+		for _, statement := range versionSevenMigrationStatements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("rawcheckpoint: migrate schema to version 7: %w", err)
+			}
+		}
+	}
+	if version < 8 {
+		for _, statement := range versionEightMigrationStatements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("rawcheckpoint: migrate schema to version 8: %w", err)
+			}
+		}
+	}
 	if _, err := tx.ExecContext(ctx,
 		fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
 		return fmt.Errorf("rawcheckpoint: set schema version: %w", err)
@@ -68,6 +96,7 @@ func (s *Store) init(ctx context.Context) error {
 	return nil
 }
 
+//nolint:kennlint // Shipped migration constraints must remain unchanged for historical upgrades.
 var versionOneSchemaStatements = []string{
 	`CREATE TABLE IF NOT EXISTS device_config (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -86,6 +115,7 @@ var versionOneSchemaStatements = []string{
 	)`,
 }
 
+//nolint:kennlint // Shipped migration constraints must remain unchanged for historical upgrades.
 var versionTwoMigrationStatements = []string{
 	`ALTER TABLE raw_sources ADD COLUMN latest_capture_id TEXT NOT NULL DEFAULT ''`,
 	`CREATE TABLE outbox_config (
@@ -212,6 +242,7 @@ var versionTwoMigrationStatements = []string{
 	`CREATE INDEX outbox_objects_state_idx ON outbox_objects(state)`,
 }
 
+//nolint:kennlint // Shipped migration constraints must remain unchanged for historical upgrades.
 var versionThreeMigrationStatements = []string{
 	`ALTER TABLE outbox_generations
 		ADD COLUMN retry_at TEXT NOT NULL DEFAULT ''`,
@@ -289,4 +320,28 @@ var versionFiveMigrationStatements = []string{
 		SELECT provider, configured_root_id, '', reason,
 			COALESCE(degraded_at, updated_at), updated_at
 		FROM raw_coverage WHERE state = 'degraded'`,
+}
+
+//nolint:kennlint // Shipped migration constraints must remain unchanged for historical upgrades.
+var versionSixMigrationStatements = []string{
+	`ALTER TABLE outbox_config
+		ADD COLUMN max_outbox_bytes INTEGER NOT NULL DEFAULT 1073741824
+		CHECK (max_outbox_bytes > 0)`,
+}
+
+//nolint:kennlint // Shipped migration constraints must remain unchanged for historical upgrades.
+var versionSevenMigrationStatements = []string{
+	`ALTER TABLE outbox_generations
+		ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0
+		CHECK (attempt_count >= 0)`,
+}
+
+//nolint:kennlint // Shipped migration constraints must remain unchanged for historical upgrades.
+var versionEightMigrationStatements = []string{
+	`ALTER TABLE raw_sources
+		ADD COLUMN observation_revision INTEGER NOT NULL DEFAULT 0
+		CHECK (observation_revision >= 0)`,
+	`UPDATE outbox_generations SET manifest_id = ''
+		WHERE state = 'finalized' AND manifest_id != ''
+			AND ack_receipt = '' AND ack_generation = 0`,
 }

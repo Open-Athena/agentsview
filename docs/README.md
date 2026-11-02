@@ -1,19 +1,46 @@
 # AgentsView docs maintainer guide
 
-This directory contains the Zensical source for <https://agentsview.io>. The
-docs source lives on `main`; image media lives on orphan asset branches so
-normal clones do not pull screenshots and PNGs into the main history.
+Edit this directory to update <https://agentsview.io>. The homepage and guide
+are HTML pages under `website/`. Zensical turns the public Markdown guides into
+pages under `/docs/`.
+
+Follow the [documentation style](../AGENTS.md#documentation). Check claims
+against source, and use release tags to distinguish shipped behavior from newer
+`main` changes. Update each website page's Markdown companion when changing its
+copy. Keep plans and historical decisions in the unpublished maintainer
+directories below.
+
+Text lives on `main`. Images live on separate asset branches so normal clones do
+not download screenshots and other large media.
+
+## Site structure
+
+- `/` and `/guide/`: static marketing pages from `website/`.
+- `/docs/**`: Zensical-rendered documentation from the top-level `*.md` pages.
+- Every published page has a raw Markdown twin: `/index.md`, `/guide.md`,
+  `/docs/index.md`, and `/docs/<page>.md` beside each `/docs/<page>/` route.
+- `/llms.txt`: hand-maintained machine-readable index of the Markdown twins. Add
+  every new public page to `zensical.toml`, `llms.txt`, and
+  `scripts/check_built_site.py` (`DOCS_PAGES`), plus the redirect tables if it
+  replaces an old URL.
+- Legacy root docs URLs (`/quickstart/`, `/usage.md`, `/assets/...`) redirect
+  permanently to their `/docs/` equivalents via `vercel.json`.
 
 ## Layout
 
-- `*.md` and related public subdirectories: public docs source.
-- `internal/` and `superpowers/`: maintainer references excluded from the
-  published site.
+- `*.md`: public docs source, rendered under `/docs/`.
+- `website/`: marketing tier (HTML, CSS, fonts, Markdown twins) copied to the
+  site root at build time.
+- `llms.txt`: machine-readable page index published at the site root.
+- `agents/`, `internal/`, and `superpowers/`: maintainer references excluded
+  from the published site.
 - `zensical.toml`: Zensical site configuration and navigation.
 - `pyproject.toml` and `uv.lock`: pinned docs toolchain.
-- `vercel.json` and `vercel-build.sh`: Vercel project configuration.
+- `vercel.json` and `vercel-build.sh`: Vercel project configuration, including
+  the legacy-URL redirect table.
 - `zensical-docs.sh`: builds from a temporary public-docs copy so maintainer
-  files are excluded from the published site.
+  files are excluded, then assembles the website tier, Markdown twins,
+  `llms.txt`, and root sitemap into `site/`.
 - `assets/hydrate-assets.sh`: hydrates ignored local assets from orphan
   branches.
 - `assets/update-static-assets-branch.sh`: updates curated static assets.
@@ -52,10 +79,19 @@ Hydrate assets and build:
 AGENTSVIEW_DOCS_USE_LOCAL_ASSET_BRANCHES=1 make docs-build
 ```
 
-Preview locally:
+Preview the docs tier with live reload (absolute `/docs/` and marketing links do
+not resolve in this mode):
 
 ```bash
 AGENTSVIEW_DOCS_USE_LOCAL_ASSET_BRANCHES=1 make docs-serve
+```
+
+Preview the full assembled site (marketing tier, `/docs/`, Markdown twins) after
+a build:
+
+```bash
+AGENTSVIEW_DOCS_USE_LOCAL_ASSET_BRANCHES=1 make docs-build
+make docs-preview
 ```
 
 Run docs validation:

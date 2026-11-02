@@ -1,4 +1,5 @@
-import { getAuthToken, isRemoteConnection } from "../api/runtime.js";
+import { MetadataService } from "../api/generated/index.js";
+import { ApiError, isRemoteConnection } from "../api/runtime.js";
 
 const DEBOUNCE_MS = 5_000;
 const TIMEOUT_MS = 3_000;
@@ -27,17 +28,12 @@ interface VisibilityHealthCheckOptions {
  *
  * Returns a cleanup function that removes the listener.
  */
-export function setupVisibilityHealthCheck(
-  getBaseUrl: () => string,
-  opts: VisibilityHealthCheckOptions = {},
-): () => void {
+export function setupVisibilityHealthCheck(opts: VisibilityHealthCheckOptions = {}): () => void {
   // In desktop mode with a local sidecar, Tauri owns recovery via
   // on_window_event focus. Skip the frontend handler to avoid racing
   // with Rust's navigate. Keep it enabled when a remote server is
   // configured since Tauri only probes the local sidecar.
-  const isDesktop = new URLSearchParams(window.location.search).has(
-    "desktop",
-  );
+  const isDesktop = new URLSearchParams(window.location.search).has("desktop");
   if (isDesktop && !isRemoteConnection()) return () => {};
 
   let lastCheck = 0;
@@ -50,30 +46,17 @@ export function setupVisibilityHealthCheck(
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-    const init: RequestInit = { signal: controller.signal };
-    const token = getAuthToken();
-    if (token) {
-      init.headers = { Authorization: `Bearer ${token}` };
-    }
-
-    fetch(`${getBaseUrl()}/version`, init)
-      .then((res) => {
-        clearTimeout(timer);
-        if (res.status >= 500) {
-          opts.onBackendDegraded?.(res.status);
+    MetadataService.getApiV1Version({ signal: controller.signal })
+      .catch((error: unknown) => {
+        if (error instanceof ApiError) {
+          if (error.status >= 500) opts.onBackendDegraded?.(error.status);
           return;
         }
-      })
-      .catch(() => {
-        clearTimeout(timer);
         window.location.reload();
-      });
+      })
+      .finally(() => clearTimeout(timer));
   }
 
   document.addEventListener("visibilitychange", onVisibilityChange);
-  return () =>
-    document.removeEventListener(
-      "visibilitychange",
-      onVisibilityChange,
-    );
+  return () => document.removeEventListener("visibilitychange", onVisibilityChange);
 }

@@ -12,14 +12,44 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/gofrs/flock"
 )
 
 const (
-	// Version 4 adds cache_creation_1h_tokens to version 3's historical-rate
-	// facts and prices the 1h-TTL cache-write subset at the catalog's 1h rate.
-	usageCacheFormatVersion = 4
-	usageCacheApplicationID = 0x41565543
-	usageCacheKind          = "agentsview-usage-facts"
+	// Version 5 rebuilds version 4 facts and rollups so Posit Assistant
+	// sidecar events use request-scoped pricing semantics.
+	// Version 6 rebuilds version 5 facts and rollups because
+	// the pricing resolver now strips reasoning-effort/speed tiers (Devin's
+	// "-thinking"/"-high"/"-medium-fast"/... suffixes) to the base model, so
+	// the same facts and catalog produce costs that the EffectivePricingDigest
+	// (which hashes only catalog rows) cannot detect. A new generation forces
+	// cached rollups to rebuild with the corrected resolution.
+	// Version 7 rebuilds version 6 facts and rollups so provider-specific
+	// billing identity survives cache generation and rollup aggregation.
+	// Version 8 introduces a cross-process generation lease. Older binaries
+	// select version 7 and therefore cannot open a leased generation without
+	// participating in its retirement protocol.
+	// Version 9 rebuilds version 8 rollups because Codex Luna Reserve
+	// turns stored as gpt-reserve now resolve to gpt-5.6-luna catalog
+	// rates. EffectivePricingDigest hashes only catalog rows, so the
+	// same facts and catalog would otherwise keep the unpriced costs.
+	// Version 10 rebuilds rollups with Bedrock pricing for namespaced Codex
+	// models, including historical AWS rates for timestamped usage.
+	// Version 11 rebuilds Copilot store usage with request-scoped pricing.
+	// Version 12 rebuilds version 11 rollups because models carrying an
+	// Ollama Cloud tag (kimi-k2.7-code:cloud, gpt-oss:120b-cloud) now price
+	// at the untagged model's catalog rate. EffectivePricingDigest hashes
+	// only catalog rows, so the same facts and catalog would otherwise keep
+	// the unpriced costs.
+	// Version 13 rebuilds facts and rollups with session-scoped Devin
+	// message source identities: bare node_id/step_id values collide
+	// across sessions, so previously deduplicated Devin usage was dropped.
+	usageCacheFormatVersion             = 13
+	usageCacheApplicationID             = 0x41565543
+	usageCacheKind                      = "agentsview-usage-facts"
+	usageCacheRetirementProtocolVersion = 1
+	usageCacheRetirementProtocolFormat  = 8
 
 	usageCacheMetadataKind                = "cache_kind"
 	usageCacheMetadataFormatVersion       = "format_version"
@@ -29,6 +59,7 @@ const (
 	usageCacheMetadataDeletionRevision    = "deletion_revision"
 	usageCacheMetadataCursorHighWaterMark = "cursor_high_water_mark"
 	usageCacheMetadataBackfillCompletedAt = "backfill_completed_at"
+	usageCacheMetadataRetirementProtocol  = "retirement_protocol_version"
 )
 
 const usageCacheSchemaSQL = `
@@ -53,8 +84,9 @@ CREATE TABLE usage_facts (
     timestamp_ms INTEGER,
     timestamp_ns INTEGER,
     raw_timestamp TEXT NOT NULL DEFAULT '',
-    uses_session_start INTEGER NOT NULL CHECK (uses_session_start IN (0, 1)),
+    uses_session_start INTEGER NOT NULL,
     model TEXT NOT NULL,
+    provider_id TEXT NOT NULL DEFAULT '',
     input_tokens INTEGER NOT NULL,
     output_tokens INTEGER NOT NULL,
     reasoning_tokens INTEGER NOT NULL,
@@ -64,13 +96,13 @@ CREATE TABLE usage_facts (
     web_search_requests INTEGER NOT NULL,
     reported_cost_microdollars INTEGER,
     cost_source TEXT NOT NULL DEFAULT '',
-    request_scoped INTEGER NOT NULL CHECK (request_scoped IN (0, 1)),
+    request_scoped INTEGER NOT NULL,
     claude_message_id TEXT NOT NULL DEFAULT '',
     claude_request_id TEXT NOT NULL DEFAULT '',
     source_uuid TEXT NOT NULL DEFAULT '',
     usage_dedup_key TEXT NOT NULL DEFAULT '',
-    token_eligible INTEGER NOT NULL CHECK (token_eligible IN (0, 1)),
-    activity_eligible INTEGER NOT NULL CHECK (activity_eligible IN (0, 1)),
+    token_eligible INTEGER NOT NULL,
+    activity_eligible INTEGER NOT NULL,
     PRIMARY KEY (cached_session_id, fact_index)
 ) WITHOUT ROWID;
 CREATE INDEX usage_facts_claude_identity
@@ -90,7 +122,7 @@ CREATE TABLE cursor_usage_facts (
     cache_creation_tokens INTEGER NOT NULL,
     cache_read_tokens INTEGER NOT NULL,
     charged_microdollars INTEGER NOT NULL,
-    is_headless INTEGER NOT NULL CHECK (is_headless IN (0, 1)),
+    is_headless INTEGER NOT NULL,
     dedup_key TEXT NOT NULL
 );
 CREATE INDEX cursor_usage_facts_dedup_key
@@ -131,9 +163,10 @@ CREATE TABLE usage_daily_rollups (
         ON DELETE CASCADE,
     local_date TEXT NOT NULL,
     reported_model TEXT NOT NULL,
+    provider_id TEXT NOT NULL DEFAULT '',
     priced_model TEXT NOT NULL,
     matched_pattern TEXT NOT NULL,
-    rate_ok INTEGER NOT NULL CHECK (rate_ok IN (0, 1)),
+    rate_ok INTEGER NOT NULL,
     rate_hash TEXT NOT NULL,
 	pricing_timestamp TEXT NOT NULL,
     band_threshold INTEGER NOT NULL DEFAULT -1,
@@ -153,7 +186,7 @@ CREATE TABLE usage_daily_rollups (
     discarded_snapshot_output_tokens INTEGER NOT NULL,
     PRIMARY KEY (
         rollup_install_id, local_date, reported_model,
-        rate_hash, band_threshold
+        provider_id, rate_hash, band_threshold
     )
 ) WITHOUT ROWID;
 CREATE INDEX usage_daily_rollups_window
@@ -169,7 +202,7 @@ CREATE TABLE usage_activity_rollups (
 CREATE TABLE usage_rollup_exceptions (
     rollup_install_id INTEGER NOT NULL REFERENCES usage_rollup_installs(id)
         ON DELETE CASCADE,
-    group_kind TEXT NOT NULL CHECK (group_kind IN ('snapshot', 'general')),
+    group_kind TEXT NOT NULL,
     group_key TEXT NOT NULL,
     cached_session_id INTEGER NOT NULL,
     fact_index INTEGER NOT NULL,
@@ -180,8 +213,9 @@ CREATE TABLE usage_rollup_exceptions (
     timestamp_ms INTEGER,
     timestamp_ns INTEGER,
     raw_timestamp TEXT NOT NULL,
-    uses_session_start INTEGER NOT NULL CHECK (uses_session_start IN (0, 1)),
+    uses_session_start INTEGER NOT NULL,
     model TEXT NOT NULL,
+    provider_id TEXT NOT NULL DEFAULT '',
     input_tokens INTEGER NOT NULL,
     output_tokens INTEGER NOT NULL,
     reasoning_tokens INTEGER NOT NULL,
@@ -191,8 +225,8 @@ CREATE TABLE usage_rollup_exceptions (
     web_search_requests INTEGER NOT NULL,
     reported_cost_microdollars INTEGER,
     cost_source TEXT NOT NULL,
-    request_scoped INTEGER NOT NULL CHECK (request_scoped IN (0, 1)),
-    is_headless INTEGER NOT NULL CHECK (is_headless IN (0, 1)),
+    request_scoped INTEGER NOT NULL,
+    is_headless INTEGER NOT NULL,
     claude_message_id TEXT NOT NULL,
     claude_request_id TEXT NOT NULL,
     source_uuid TEXT NOT NULL,
@@ -214,6 +248,7 @@ type usageCache struct {
 	fill       *usageFillCoordinator
 	rollup     *usageRollupCoordinator
 	cancel     context.CancelFunc
+	lease      *flock.Flock
 
 	lifecycleMu sync.Mutex
 	users       int
@@ -222,12 +257,13 @@ type usageCache struct {
 }
 
 type usageCacheProbe struct {
-	Exists           bool
-	Recognized       bool
-	Compatible       bool
-	FormatVersion    int
-	SourceDatabaseID string
-	Err              error
+	Exists                    bool
+	Recognized                bool
+	Compatible                bool
+	FormatVersion             int
+	SourceDatabaseID          string
+	RetirementProtocolVersion int
+	Err                       error
 }
 
 type usageCacheManager struct {
@@ -276,13 +312,13 @@ func (m *usageCacheManager) Generation(
 	}
 	databaseID = strings.TrimSpace(databaseID)
 	if databaseID == "" {
-		return nil, fmt.Errorf("usage cache source database id is required")
+		return nil, errors.New("usage cache source database id is required")
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
-		return nil, fmt.Errorf("usage cache manager is closed")
+		return nil, errors.New("usage cache manager is closed")
 	}
 	if m.currentID != "" && databaseID != m.currentID {
 		return nil, fmt.Errorf("%w before opening generation %s",
@@ -304,7 +340,7 @@ func (m *usageCacheManager) Generation(
 		}
 	}
 	if cache == nil {
-		return nil, fmt.Errorf("opening usage cache returned no database")
+		return nil, errors.New("opening usage cache returned no database")
 	}
 	cacheContext, cancel := context.WithCancel(m.ctx)
 	cache.cancel = cancel
@@ -312,7 +348,14 @@ func (m *usageCacheManager) Generation(
 	m.generations[databaseID] = cache
 	if m.archive != nil {
 		cache.fill = newUsageFillCoordinator(cacheContext, m.archive, cache)
-		cache.rollup = newUsageRollupCoordinator(cacheContext, m.archive, cache)
+		cache.rollup = newUsageRollupCoordinator(cacheContext, cache)
+	}
+	if !cache.temporary {
+		if err := retireStaleUsageCacheGenerations(
+			ctx, m.archivePath, cache.path,
+		); err != nil {
+			log.Printf("warning: retiring stale usage cache generations: %v", err)
+		}
 	}
 	return cache, nil
 }
@@ -387,6 +430,16 @@ func (m *usageCacheManager) openPersistentGeneration(
 	path := usageCacheGenerationPath(
 		m.archivePath, usageCacheFormatVersion, databaseID,
 	)
+	lease, err := acquireUsageCacheLease(path)
+	if err != nil {
+		return nil, err
+	}
+	releaseLease := true
+	defer func() {
+		if releaseLease {
+			_ = lease.Close()
+		}
+	}()
 	probe := probeUsageCache(ctx, path)
 	if probe.Err != nil {
 		return nil, probe.Err
@@ -397,6 +450,13 @@ func (m *usageCacheManager) openPersistentGeneration(
 			return nil, err
 		}
 		if published {
+			if cache == nil {
+				return nil, fmt.Errorf(
+					"published usage cache is unavailable: %s", path,
+				)
+			}
+			cache.lease = lease
+			releaseLease = false
 			return cache, nil
 		}
 		probe = probeUsageCacheWithBusyTimeout(ctx, path, 5000)
@@ -411,9 +471,29 @@ func (m *usageCacheManager) openPersistentGeneration(
 		return nil, fmt.Errorf("usage cache source database id mismatch at %s", path)
 	}
 	if probe.Compatible {
-		return openUsageCache(ctx, path, databaseID, false)
+		cache, err := openUsageCache(ctx, path, databaseID, false)
+		if err != nil {
+			return nil, err
+		}
+		cache.lease = lease
+		releaseLease = false
+		return cache, nil
 	}
 	return nil, fmt.Errorf("usage cache generation is incompatible: %s", path)
+}
+
+func usageCacheLeasePath(path string) string {
+	return path + ".lease"
+}
+
+func acquireUsageCacheLease(path string) (*flock.Flock, error) {
+	lease := flock.New(
+		usageCacheLeasePath(path), flock.SetPermissions(0o600),
+	)
+	if err := lease.RLock(); err != nil {
+		return nil, fmt.Errorf("acquiring usage cache lease for %s: %w", path, err)
+	}
+	return lease, nil
 }
 
 func publishUsageCache(
@@ -479,7 +559,7 @@ func openTemporaryUsageCache(
 func initializeUsageCache(
 	ctx context.Context, path, databaseID string, temporary bool,
 ) (*usageCache, error) {
-	database, err := openUsageCacheDatabase(path)
+	database, err := openUsageCacheDatabase(ctx, path)
 	if err != nil {
 		return nil, err
 	}
@@ -515,6 +595,10 @@ func initializeUsageCache(
 		{usageCacheMetadataDeletionRevision, "0"},
 		{usageCacheMetadataCursorHighWaterMark, "0"},
 		{usageCacheMetadataBackfillCompletedAt, ""},
+		{
+			usageCacheMetadataRetirementProtocol,
+			strconv.Itoa(usageCacheRetirementProtocolVersion),
+		},
 	}
 	for _, item := range metadata {
 		if _, err := tx.ExecContext(ctx,
@@ -539,7 +623,7 @@ func initializeUsageCache(
 func openUsageCache(
 	ctx context.Context, path, databaseID string, temporary bool,
 ) (*usageCache, error) {
-	database, err := openUsageCacheDatabase(path)
+	database, err := openUsageCacheDatabase(ctx, path)
 	if err != nil {
 		return nil, err
 	}
@@ -552,14 +636,14 @@ func openUsageCache(
 	}, nil
 }
 
-func openUsageCacheDatabase(path string) (*sql.DB, error) {
+func openUsageCacheDatabase(ctx context.Context, path string) (*sql.DB, error) {
 	database, err := sql.Open(sqliteUsageDriverName, makeDSN(path, false))
 	if err != nil {
 		return nil, fmt.Errorf("opening usage cache %s: %w", path, err)
 	}
 	database.SetMaxOpenConns(readerMaxOpenConns)
 	database.SetMaxIdleConns(readerMaxOpenConns)
-	if err := database.Ping(); err != nil {
+	if err := database.PingContext(ctx); err != nil {
 		_ = database.Close()
 		return nil, fmt.Errorf("opening usage cache %s: %w", path, err)
 	}
@@ -606,12 +690,22 @@ func probeUsageCacheWithBusyTimeout(
 	if applicationID != usageCacheApplicationID {
 		return probe
 	}
+	var hasMetadata bool
+	if err := database.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'usage_cache_metadata')`,
+	).Scan(&hasMetadata); err != nil {
+		probe.Err = fmt.Errorf("checking usage cache metadata table: %w", err)
+		return probe
+	}
+	if !hasMetadata {
+		return probe
+	}
 	var kind string
 	if err := database.QueryRowContext(ctx,
 		`SELECT value FROM usage_cache_metadata WHERE key = ?`,
 		usageCacheMetadataKind,
 	).Scan(&kind); err != nil {
-		if errors.Is(err, sql.ErrNoRows) || strings.Contains(err.Error(), "no such table") {
+		if errors.Is(err, sql.ErrNoRows) {
 			return probe
 		}
 		probe.Err = fmt.Errorf("reading usage cache kind: %w", err)
@@ -639,8 +733,21 @@ func probeUsageCacheWithBusyTimeout(
 		probe.Err = fmt.Errorf("reading usage cache source database id: %w", sourceErr)
 		return probe
 	}
+	var retirementProtocolText string
+	retirementProtocolErr := database.QueryRowContext(ctx,
+		`SELECT value FROM usage_cache_metadata WHERE key = ?`,
+		usageCacheMetadataRetirementProtocol,
+	).Scan(&retirementProtocolText)
+	if retirementProtocolErr != nil && !errors.Is(retirementProtocolErr, sql.ErrNoRows) {
+		probe.Err = fmt.Errorf(
+			"reading usage cache retirement protocol: %w", retirementProtocolErr)
+		return probe
+	}
+	probe.RetirementProtocolVersion, _ = strconv.Atoi(retirementProtocolText)
 	probe.Compatible = probe.FormatVersion == usageCacheFormatVersion &&
-		probe.SourceDatabaseID != "" && usageCacheSchemaComplete(ctx, database)
+		probe.SourceDatabaseID != "" &&
+		probe.RetirementProtocolVersion == usageCacheRetirementProtocolVersion &&
+		usageCacheSchemaComplete(ctx, database)
 	return probe
 }
 
@@ -653,8 +760,8 @@ func usageCacheSchemaComplete(ctx context.Context, database *sql.DB) bool {
 			'source_database_id', 'next_install_revision',
 			'next_rollup_install_revision',
 			'deletion_revision', 'cursor_high_water_mark',
-			'backfill_completed_at'
-		)`).Scan(&metadataCount); err != nil || metadataCount != 8 {
+			'backfill_completed_at', 'retirement_protocol_version'
+		)`).Scan(&metadataCount); err != nil || metadataCount != 9 {
 		return false
 	}
 	queries := []string{
@@ -709,11 +816,7 @@ func usageCacheSchemaComplete(ctx context.Context, database *sql.DB) bool {
 		 FROM usage_rollup_exceptions LIMIT 0`,
 	}
 	for _, query := range queries {
-		rows, err := database.QueryContext(ctx, query)
-		if err != nil {
-			return false
-		}
-		if err := rows.Close(); err != nil {
+		if _, err := database.ExecContext(ctx, query); err != nil {
 			return false
 		}
 	}
@@ -743,7 +846,99 @@ func removeUsageCacheFiles(path string) error {
 	return errors.Join(errs...)
 }
 
-func retireUsageCaches(caches []*usageCache) error {
+func isUsageCacheGenerationFilename(name string) bool {
+	const prefix = "usage-cache-v"
+	const suffix = ".db"
+	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
+		return false
+	}
+	identity := strings.TrimSuffix(strings.TrimPrefix(name, prefix), suffix)
+	separator := strings.LastIndexByte(identity, '-')
+	if separator <= 0 || separator == len(identity)-1 {
+		return false
+	}
+	version, err := strconv.Atoi(identity[:separator])
+	if err != nil || version <= 0 {
+		return false
+	}
+	digest := identity[separator+1:]
+	if len(digest) != 32 {
+		return false
+	}
+	for _, character := range digest {
+		if (character < '0' || character > '9') &&
+			(character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func retireStaleUsageCacheGenerations(
+	ctx context.Context, archivePath, currentPath string,
+) error {
+	entries, err := os.ReadDir(filepath.Dir(archivePath))
+	if err != nil {
+		return err
+	}
+	currentPath = filepath.Clean(currentPath)
+	var errs []error
+	for _, entry := range entries {
+		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 ||
+			!isUsageCacheGenerationFilename(entry.Name()) {
+			continue
+		}
+		path := filepath.Join(filepath.Dir(archivePath), entry.Name())
+		if filepath.Clean(path) == currentPath {
+			continue
+		}
+		if _, err := retireUsageCacheGeneration(ctx, archivePath, path); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func retireUsageCacheGeneration(
+	ctx context.Context, archivePath, path string,
+) (bool, error) {
+	lease := flock.New(
+		usageCacheLeasePath(path), flock.SetPermissions(0o600),
+	)
+	defer func() { _ = lease.Close() }()
+	locked, err := lease.TryLock()
+	if err != nil {
+		return false, fmt.Errorf("acquiring usage cache retirement lease for %s: %w",
+			path, err)
+	}
+	if !locked {
+		return false, nil
+	}
+	probe := probeUsageCache(ctx, path)
+	if probe.Err != nil {
+		return false, probe.Err
+	}
+	if !probe.Recognized || probe.SourceDatabaseID == "" ||
+		probe.FormatVersion < usageCacheRetirementProtocolFormat ||
+		probe.FormatVersion > usageCacheFormatVersion ||
+		probe.RetirementProtocolVersion != usageCacheRetirementProtocolVersion {
+		return false, nil
+	}
+	expectedPath := usageCacheGenerationPath(
+		archivePath, probe.FormatVersion, probe.SourceDatabaseID,
+	)
+	if filepath.Clean(expectedPath) != filepath.Clean(path) {
+		return false, nil
+	}
+	if err := removeUsageCacheFiles(path); err != nil {
+		return false, fmt.Errorf("removing retired usage cache %s: %w", path, err)
+	}
+	return true, nil
+}
+
+func retireUsageCaches(
+	caches []*usageCache, archivePath string, removePersistent bool,
+) error {
 	retired := make([]<-chan struct{}, len(caches))
 	for index, cache := range caches {
 		retired[index] = cache.beginRetirement()
@@ -754,11 +949,23 @@ func retireUsageCaches(caches []*usageCache) error {
 		if cache.fill != nil {
 			cache.fill.Close()
 		}
+		var closeErr error
 		if cache.db != nil {
-			errs = append(errs, cache.db.Close())
+			closeErr = cache.db.Close()
+			errs = append(errs, closeErr)
+		}
+		var leaseErr error
+		if cache.lease != nil {
+			leaseErr = cache.lease.Close()
+			errs = append(errs, leaseErr)
 		}
 		if cache.temporary {
 			errs = append(errs, removeUsageCacheFiles(cache.path))
+		} else if removePersistent && closeErr == nil && leaseErr == nil {
+			_, err := retireUsageCacheGeneration(
+				context.Background(), archivePath, cache.path,
+			)
+			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
@@ -771,18 +978,6 @@ func (m *usageCacheManager) detachAllLocked() []*usageCache {
 		delete(m.generations, databaseID)
 	}
 	return caches
-}
-
-func (m *usageCacheManager) Reset() error {
-	m.mu.Lock()
-	if m.closed {
-		m.mu.Unlock()
-		return nil
-	}
-	m.currentID = ""
-	caches := m.detachAllLocked()
-	m.mu.Unlock()
-	return retireUsageCaches(caches)
 }
 
 func (m *usageCacheManager) RetireExcept(databaseID string) error {
@@ -801,7 +996,7 @@ func (m *usageCacheManager) RetireExcept(databaseID string) error {
 		delete(m.generations, cachedID)
 	}
 	m.mu.Unlock()
-	return retireUsageCaches(caches)
+	return retireUsageCaches(caches, m.archivePath, true)
 }
 
 func (m *usageCacheManager) Close() error {
@@ -814,5 +1009,5 @@ func (m *usageCacheManager) Close() error {
 	m.cancel()
 	caches := m.detachAllLocked()
 	m.mu.Unlock()
-	return retireUsageCaches(caches)
+	return retireUsageCaches(caches, m.archivePath, false)
 }

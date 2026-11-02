@@ -107,7 +107,7 @@ state. Changing only `url` is fine when the same logical machine moves.
 The daemon on the remote machine must bind a non-loopback interface (set
 `host = "0.0.0.0"` with `require_auth = true` in its config.toml) or every sync
 fails with a connection-refused error. See
-[Remote Hosts](/configuration/#remote-hosts) for the full remote-side setup,
+[Remote Hosts](/docs/configuration/#remote-hosts) for the full remote-side setup,
 including keeping detached daemons alive.
 
 Use `require_auth = true` on remote nodes when practical, or at minimum keep
@@ -149,7 +149,7 @@ alive until their supervisor stops them.
 Run `agentsview sync` on the collector to sync local sessions and every
 configured host. Set `interval` on a `[[remote_hosts]]` entry when a running
 collector daemon should sync that host periodically; omit it or set it to `0s`
-for manual sync only. See [`agentsview sync`](/commands/#agentsview-sync) for
+for manual sync only. See [`agentsview sync`](/docs/commands/#agentsview-sync) for
 single-host selection and failure behavior.
 
 ## Incremental Sync
@@ -231,6 +231,39 @@ each sync while the rest of the host remains eligible for delta transfer. The
 Windsurf content in the mirror is the sanitized export, not a byte-for-byte copy
 of the remote state database.
 
+### Curated Provider Exports
+
+Most providers export their configured directories as-is. Providers whose
+configured root is a broad application-data directory export a curated file
+list instead, so caches, extension state, and credential files stored near the
+sessions never enter the manifest, the archive, or the mirror:
+
+- **Cursor** exports only the transcript files its parser discovers under each
+  project's `agent-transcripts/` directory.
+- **VS Code Copilot** exports only chat session files under
+  `workspaceStorage/<hash>/chatSessions/` and
+  `globalStorage/{emptyWindowChatSessions,transferredChatSessions}/`, plus each
+  exporting workspace's `workspace.json` for project attribution.
+- **Zed** exports `threads/threads.db` as a consistent SQLite snapshot taken
+  with the online backup API, so committed write-ahead-log data arrives as one
+  standalone database without `-wal` or `-shm` sidecars. Hermes state databases
+  use the same snapshot mechanism.
+- **RooCode** and **Kilo Legacy** export only their discovered per-task session
+  files, **Poolside** narrows its root to `trajectories/`, and **Windsurf**
+  exports the sanitized copy described above.
+
+Budget mirror disk for the curated session files only, not for the full
+application-data directories those editors keep around them. When the last
+session under a curated Cursor or VS Code Copilot root disappears, the root
+stays advertised with an empty file list so the next sync empties the mirror
+instead of failing.
+
+An unreadable snapshot database is treated as missing: the sync continues, the
+mirror drops its cached copy, and the file transfers again once the remote
+application repairs it. Sessions already imported into the AgentsView database
+remain available throughout. Any other read failure during target resolution
+fails that host's sync without touching the mirror.
+
 ### When AgentsView Downloads A Full Archive
 
 A full HTTP transfer occurs in these cases:
@@ -297,14 +330,39 @@ Use header-based auth for normal API calls whenever possible.
 
 ## Public URL And Trusted Origins
 
-When you access AgentsView through a hostname or reverse proxy, tell the server
-about the public URL:
+The bind address, browser URL, and trusted origins serve different purposes:
+
+| Setting | Purpose |
+| --- | --- |
+| `--host` / `--port` | Choose the backend HTTP listener (default `127.0.0.1:8080`). |
+| `--proxy-bind-host` / `--public-port` | Choose the managed Caddy listener when `--proxy caddy` is enabled. |
+| `--public-url` | Choose the browser URL and add it to the trusted origins. Managed Caddy also uses it as its site address. |
+| `--public-origin` | Add trusted origins for request `Host` and `Origin` checks without selecting a browser URL. |
+
+For a hostname or reverse proxy you already operate, set the URL you intend to
+open in the browser:
 
 ```bash
 agentsview serve --public-url https://agents.example.com
 ```
 
-For additional trusted origins, use `--public-origin`:
+This setting does not configure DNS, port forwarding, certificates, or an
+external reverse proxy. The startup message labels it **browser URL**, separately
+from the backend's listening address; it does not confirm that the URL is
+reachable. Here, "public" means the client-facing address, which may be local
+or private.
+
+Opening that URL locally is useful when you want to use the same HTTPS hostname
+and proxy route as other clients. Direct backend access uses a different browser
+origin, with separate browser storage. On a headless server, use `--no-browser`;
+the URL still contributes to origin validation and managed Caddy configuration.
+
+Use a concrete hostname or IP in `--public-url`. Wildcard addresses such as
+`0.0.0.0` and `::` select listening interfaces, so they belong in `--host` or
+`--proxy-bind-host`, not the browser URL.
+
+For trust-only configuration, use `--public-origin`. It works on its own or
+alongside `--public-url`:
 
 ```bash
 agentsview serve \
@@ -323,10 +381,47 @@ These can also be persisted:
 ```toml
 public_url = "https://agents.example.com"
 public_origins = [
-  "https://agents.example.com",
   "https://internal.example.com",
 ]
 ```
+
+You do not need to repeat `public_url` in `public_origins`. Neither setting
+enables bearer-token authentication; that is controlled by `--require-auth`.
+
+### Reverse Proxy Subpaths
+
+Use `--base-path` when an external reverse proxy mounts AgentsView below a URL
+prefix. Keep `--public-url` origin-only; the server adds the mount path to the
+browser URL and uses it for assets, API requests, live event streams, and
+client-side navigation.
+
+```bash
+agentsview serve \
+  --base-path /av \
+  --public-url http://agents.example.com
+```
+
+The proxy must preserve `/av` in the upstream request. For nginx, omit the
+trailing slash from `proxy_pass` so nginx does not strip the location prefix:
+
+```nginx
+location = /av {
+    return 301 /av/;
+}
+
+location /av/ {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_http_version 1.1;
+    proxy_buffering off;
+}
+```
+
+The same flag works with `serve --background`. The configuration-only
+`daemon start` and `daemon restart` commands do not accept serve-specific flags,
+so start a subpath-mounted background server with `agentsview serve --background
+--base-path /av`.
 
 ### Forwarded Dev Environments
 
@@ -428,13 +523,39 @@ agentsview serve \
 | `--proxy`           |             | Proxy mode — currently `caddy`                        |
 | `--caddy-bin`       | `caddy`     | Path to the Caddy binary                              |
 | `--proxy-bind-host` | `127.0.0.1` | Interface for Caddy to bind                           |
-| `--public-port`     | `8443`      | External port for the public URL                      |
+| `--public-port`     | URL port or `8443`      | Managed Caddy HTTP/HTTPS listener and URL port                      |
 | `--tls-cert`        |             | TLS certificate file path                             |
 | `--tls-key`         |             | TLS key file path                                     |
 | `--allowed-subnet`  |             | Client CIDR allowlist (repeatable or comma-separated) |
 
 Caddy must already be installed and available on `PATH` unless you override it
 with `--caddy-bin`.
+
+### Listener And URL Ports
+
+`--public-port` applies only to managed Caddy. It controls Caddy's listening
+port and the port in the resolved `--public-url`; it does not change the backend
+`--port`. It works with both HTTP and HTTPS, as selected by the URL scheme.
+HTTPS requires `--tls-cert` and `--tls-key`; HTTP must omit them.
+
+- If the URL has an explicit port, Caddy uses that port.
+- If the URL omits a port, Caddy uses `--public-port`, or `8443` when the flag is
+  unset. Thus `--proxy caddy --public-url https://agents.example.com` resolves to
+  `https://agents.example.com:8443`, not port 443.
+- If both the URL and `--public-port` specify ports, they must match. For HTTPS
+  on port 443, use `--public-port 443` or put `:443` in the URL.
+
+Caddy binds to `127.0.0.1` by default, even when the URL contains a remote
+hostname. To accept LAN connections, set `--proxy-bind-host` and an
+`--allowed-subnet` as shown below. DNS and routing remain your responsibility.
+
+With an external proxy, leave `--proxy` unset and put its browser-facing port
+directly in `--public-url`. `--public-port` has no effect in that mode. For
+example, if an existing proxy listens on 443 and forwards to backend port 8080:
+
+```bash
+agentsview serve --port 8080 --public-url https://agents.example.com --no-browser
+```
 
 ### Subnet Allowlists
 
@@ -462,7 +583,7 @@ Access** section lets you:
 - view the auto-generated auth token
 - connect the frontend to another AgentsView server by URL and token
 
-![Settings remote access](/assets/generated/screenshots/settings-remote.png)
+![Settings remote access](/docs/assets/generated/screenshots/settings-remote.png)
 
 Changes that affect bind or auth behavior may require a server restart.
 
@@ -472,13 +593,13 @@ Changes that affect bind or auth behavior may require a server restart.
 | ------------------- | ----------- | --------------------------------------------------- |
 | `--host`            | `127.0.0.1` | Interface to bind                                   |
 | `--require-auth`    | `false`     | Require a bearer token for API requests             |
-| `--public-url`      |             | Public URL for hostname or proxy access             |
+| `--public-url`      |             | Browser URL, also added to trusted origins             |
 | `--public-origin`   |             | Trusted browser origin (repeatable/comma-separated) |
 | `--write-timeout`   | `30s`       | API response write deadline; `0` disables it        |
 | `--proxy`           |             | Managed proxy mode (`caddy`)                        |
 | `--caddy-bin`       | `caddy`     | Caddy binary path                                   |
 | `--proxy-bind-host` | `127.0.0.1` | Interface for managed proxy                         |
-| `--public-port`     | `8443`      | External port for managed proxy                     |
+| `--public-port`     | URL port or `8443`      | Managed Caddy HTTP/HTTPS listener and URL port                     |
 | `--tls-cert`        |             | TLS certificate path                                |
 | `--tls-key`         |             | TLS key path                                        |
 | `--allowed-subnet`  |             | Client CIDR allowlist (repeatable/comma-separated)  |
@@ -508,12 +629,12 @@ allowed_subnets = ["192.168.1.0/24"]
 | `host`                  | Server bind interface; non-loopback values require `require_auth = true`   |
 | `require_auth`          | Require bearer-token authentication for API access                         |
 | `auth_token`            | Auto-generated 256-bit bearer token; overridden by `AGENTSVIEW_AUTH_TOKEN` |
-| `public_url`            | Public URL for host/origin validation                                      |
-| `public_origins`        | Additional trusted CORS origins                                            |
+| `public_url`            | Browser URL, trusted origin, and managed Caddy site address                                      |
+| `public_origins`        | Additional trusted origins for request Host/Origin checks                                            |
 | `proxy.mode`            | Managed proxy mode (`caddy`)                                               |
 | `proxy.bin`             | Path to proxy binary                                                       |
 | `proxy.bind_host`       | Interface for proxy to bind                                                |
-| `proxy.public_port`     | External port for proxy                                                    |
+| `proxy.public_port`     | Managed Caddy HTTP/HTTPS listener and URL port                                                    |
 | `proxy.tls_cert`        | TLS certificate path                                                       |
 | `proxy.tls_key`         | TLS key path                                                               |
 | `proxy.allowed_subnets` | CIDR allowlist for proxy connections                                       |

@@ -3,7 +3,7 @@ package parser
 import (
 	"bytes"
 	"database/sql"
-	"fmt"
+	"errors"
 	"io"
 	"log"
 	"os"
@@ -27,6 +27,7 @@ CREATE TABLE sessions (
 	last_activity_at INTEGER,
 	workspace_json TEXT,
 	metadata_json TEXT,
+	main_chain_id INTEGER,
 	hidden INTEGER NOT NULL DEFAULT 0
 );
 `
@@ -52,6 +53,7 @@ type devinSessionRow struct {
 	LastActivityAt   *int64
 	WorkspaceJSON    string
 	MetadataJSON     string
+	MainChainID      *int64
 	Hidden           bool
 }
 
@@ -110,7 +112,7 @@ func insertDevinSessionRow(t *testing.T, dbPath string, row devinSessionRow) {
 	require.NoError(t, err)
 	defer db.Close()
 
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO sessions (
 			id,
 			title,
@@ -120,8 +122,9 @@ func insertDevinSessionRow(t *testing.T, dbPath string, row devinSessionRow) {
 			last_activity_at,
 			workspace_json,
 			metadata_json,
+			main_chain_id,
 			hidden
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		row.ID,
 		row.Title,
@@ -131,6 +134,7 @@ func insertDevinSessionRow(t *testing.T, dbPath string, row devinSessionRow) {
 		devinNullableTimestamp(row.LastActivityAt),
 		devinNullableString(row.WorkspaceJSON),
 		devinNullableString(row.MetadataJSON),
+		devinNullableInt64(row.MainChainID),
 		row.Hidden,
 	)
 	require.NoError(t, err)
@@ -179,7 +183,7 @@ func execDevinTestSQL(t *testing.T, dbPath, query string) {
 	db, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err)
 	defer db.Close()
-	_, err = db.Exec(query)
+	_, err = db.ExecContext(t.Context(), query)
 	require.NoError(t, err)
 }
 
@@ -190,7 +194,7 @@ func insertDevinMessageNodeRow(t *testing.T, dbPath string, row devinSyntheticMe
 	require.NoError(t, err)
 	defer db.Close()
 
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO message_nodes (
 			session_id,
 			node_id,
@@ -235,11 +239,11 @@ func parseChatGPTExport(
 ) error {
 	p, ok := NewProvider(AgentChatGPT, ProviderConfig{})
 	if !ok {
-		return fmt.Errorf("chatgpt provider unavailable")
+		return errors.New("chatgpt provider unavailable")
 	}
 	exporter, ok := p.(ChatGPTExportParser)
 	if !ok {
-		return fmt.Errorf("chatgpt provider does not support exports")
+		return errors.New("chatgpt provider does not support exports")
 	}
 	return exporter.ParseChatGPTExport(dir, assets, onConversation)
 }
@@ -253,11 +257,11 @@ func parseClaudeAIExport(
 ) error {
 	p, ok := NewProvider(AgentClaudeAI, ProviderConfig{})
 	if !ok {
-		return fmt.Errorf("claude.ai provider unavailable")
+		return errors.New("claude.ai provider unavailable")
 	}
 	exporter, ok := p.(ClaudeAIExportParser)
 	if !ok {
-		return fmt.Errorf("claude.ai provider does not support exports")
+		return errors.New("claude.ai provider does not support exports")
 	}
 	return exporter.ParseClaudeAIExport(r, onConversation)
 }
@@ -290,6 +294,7 @@ func generateLargeString(size int) string {
 
 func assertSessionMeta(t *testing.T, s *ParsedSession, wantID, wantProject string, wantAgent AgentType) {
 	t.Helper()
+
 	require.NotNil(t, s, "session is nil")
 	assert.Equal(t, wantID, s.ID, "session ID")
 	assert.Equal(t, wantProject, s.Project, "project")
@@ -359,7 +364,7 @@ func assertLogEmpty(t *testing.T, buf *bytes.Buffer) {
 
 func assertToolCallField(t *testing.T, i int, field, got, want string) {
 	t.Helper()
-	assert.Equal(t, want, got, fmt.Sprintf("tool_calls[%d].%s", i, field))
+	assert.Equal(t, want, got, "tool_calls[%d].%s", i, field)
 }
 
 func assertToolCall(t *testing.T, i int, got, want ParsedToolCall) {
@@ -382,7 +387,7 @@ func assertToolCalls(
 	t *testing.T, got, want []ParsedToolCall,
 ) {
 	t.Helper()
-	if !assert.Equal(t, len(want), len(got), "tool calls count") {
+	if !assert.Len(t, got, len(want), "tool calls count") {
 		return
 	}
 	for i := range want {
@@ -412,11 +417,11 @@ func parseClaudeSession(
 ) ([]ParseResult, error) {
 	provider, ok := NewProvider(AgentClaude, ProviderConfig{Machine: machine})
 	if !ok {
-		return nil, fmt.Errorf("claude provider unavailable")
+		return nil, errors.New("claude provider unavailable")
 	}
 	uploader, ok := provider.(ClaudeUploadParser)
 	if !ok {
-		return nil, fmt.Errorf("claude provider does not support upload parsing")
+		return nil, errors.New("claude provider does not support upload parsing")
 	}
 	return uploader.ParseUploadedTranscript(path, project, machine)
 }

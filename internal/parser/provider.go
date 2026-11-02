@@ -52,8 +52,11 @@ type ProviderFactory interface {
 
 // ProviderConfig is copied into a provider instance at construction time.
 type ProviderConfig struct {
-	Roots   []string
-	Machine string
+	// MetadataDirs maps absolute transcript roots to their resolved metadata
+	// directories. Each provider interprets its own native files there.
+	MetadataDirs map[string][]string
+	Roots        []string
+	Machine      string
 	// StableSourceSnapshots reports that source files cannot change during
 	// parsing. Bounded capture enables it after copying quiescent transcripts
 	// so providers can classify an invalid end-of-file record as durable.
@@ -68,22 +71,18 @@ type ProviderConfig struct {
 	// path (Aider) use it to seed those IDs from the canonical remote path
 	// rather than the changing temp path. Most providers ignore it.
 	PathRewriter func(string) string
-	// SQLiteContainerUnchangedSinceTrust reports that the shared SQLite
-	// container at dbPath is byte-identical to the last pass that verified
-	// every one of its sessions, as captured before this discovery began.
-	// Providers that fan such a container out to per-session sources may
-	// answer discovery for it with the bounded watermark-only listing: the
-	// caller's container gate will skip every member before fingerprinting,
-	// so computing the full child digest would be archive-sized work for
-	// values nothing reads. Nil (the default, and every non-discovery
-	// construction) means no container is trusted and listings stay
-	// full-fidelity.
-	SQLiteContainerUnchangedSinceTrust func(dbPath string) bool
+	// SQLiteContainerListsWatermarkOnly authorizes a shared SQLite container
+	// at dbPath to use its complete-membership, session/project-watermark
+	// listing for this discovery pass. The caller's container gate decides
+	// when that listing is safe; nil (the default, and every non-discovery
+	// construction) means listings stay full-fidelity.
+	SQLiteContainerListsWatermarkOnly func(dbPath string) bool
 }
 
 // Clone returns an independent config snapshot.
 func (cfg ProviderConfig) Clone() ProviderConfig {
 	cfg.Roots = cfg.RootsCopy()
+	cfg.MetadataDirs = cloneMetadataDirs(cfg.MetadataDirs)
 	cfg.SourceMachines = maps.Clone(cfg.SourceMachines)
 	return cfg
 }
@@ -95,6 +94,17 @@ func (cfg ProviderConfig) RootsCopy() []string {
 
 // Provider is the target parser/source facade. Providers own source shape,
 // source identity, freshness, and lookup; the engine consumes SourceRefs,
+// StoredFingerprintLookup reads the archive's last successful source fingerprint.
+// It is lazy: providers invoke it only when their in-memory cache needs a seed.
+type StoredFingerprintLookup func(path string) (string, bool)
+
+// StoredFingerprintProvider can reuse independently verified parts of a persisted
+// fingerprint. It must still check every other input before returning freshness.
+// Providers without this optional capability receive no archive lookup.
+type StoredFingerprintProvider interface {
+	FingerprintWithStored(context.Context, SourceRef, StoredFingerprintLookup) (SourceFingerprint, error)
+}
+
 // SourceFingerprints, and normalized ParseResults without knowing whether the
 // backing data is a file, virtual DB row, sidecar set, remote canonical path, or
 // multi-session container.
@@ -175,6 +185,34 @@ type ReconciliationSourceResolver interface {
 	SourceForReconciliation(
 		context.Context, string, string,
 	) (SourceRef, bool, error)
+}
+
+// ReconciliationSourceStateResolver is the fast source resolver for candidates
+// that carry provider-owned discovery state. It may use that state to avoid
+// reopening a shared container while still resolving storage shadows.
+type ReconciliationSourceStateResolver interface {
+	SourceForReconciliationWithState(
+		context.Context, string, string, ReconciliationSourceState,
+	) (SourceRef, bool, error)
+}
+
+// ReconciliationSourceState is a bounded provider-owned payload carried with
+// a streamed reconciliation candidate. It preserves discovery metadata across
+// the temporary sync spool without retaining provider sources in memory.
+type ReconciliationSourceState struct {
+	Version uint8
+	Payload []byte
+}
+
+// ReconciliationSourceStateProvider serializes and reapplies the bounded
+// discovery state needed after a candidate crosses the reconciliation spool.
+// A provider may ignore state when source resolution promotes a candidate to a
+// different representation, such as a storage shadow.
+type ReconciliationSourceStateProvider interface {
+	ReconciliationSourceState(context.Context, SourceRef) (ReconciliationSourceState, bool)
+	ApplyReconciliationSourceState(
+		context.Context, *SourceRef, ReconciliationSourceState,
+	) error
 }
 
 // ReconciliationSourceRank is compared lexicographically after configured-root
@@ -1003,6 +1041,12 @@ type IncrementalRequest struct {
 	Offset       int64
 	StartOrdinal int
 	Machine      string
+	// Seed is opaque provider continuation state persisted by the sync
+	// engine (a parser checkpoint). A provider that recognizes the format
+	// resumes from it instead of rescanning the committed prefix; empty
+	// means cold-start reconstruction. A seed the provider cannot decode
+	// must be treated as IncrementalNeedsFullParse.
+	Seed []byte
 	// LastEntryUUID is the UUID of the last entry stored for this
 	// session, used by DAG-aware parsers (Claude) to detect when an
 	// appended tail forks away from the stored tip and must trigger a
@@ -1033,13 +1077,31 @@ type IncrementalRequest struct {
 	// the appended assistant head continues exactly this message id.
 	// nil keeps the conservative fallback.
 	StoredLastClaudeMessageID *string
+	// StoredSessionName is the session_name already persisted for this
+	// session ("" when the row carries none), or nil when the call site
+	// cannot supply it. Claude adopts a generated ai-title only when no
+	// /rename is present, and the producer repeats the same record many
+	// times per transcript, so the incremental parser escalates on an
+	// appended title only when it could fill a still-empty stored name.
+	// nil keeps the append incremental.
+	StoredSessionName *string
+	// StoredPendingUsageOrdinal is the last assistant message without token
+	// usage in the current turn, as resolved from the committed transcript.
+	// Codex uses it to attach a token_count that follows a late tool result
+	// without re-reading or rebuilding the committed prefix.
+	StoredPendingUsageOrdinal *int
 }
 
 // IncrementalOutcome is the append-only parse output.
 type IncrementalOutcome struct {
-	SessionID            string
-	Messages             []ParsedMessage
-	SubagentLinks        []ClaudeSubagentLink
+	SessionID                string
+	Messages                 []ParsedMessage
+	SubagentLinks            []ClaudeSubagentLink
+	ToolCallUpdates          []ParsedToolCallUpdate
+	MessageTokenUsageUpdates []ParsedMessageTokenUsageUpdate
+	// NextCursor is the provider's continuation state after consuming the
+	// appended tail, for persistence alongside the committed offset.
+	NextCursor           []byte
 	EndedAt              time.Time
 	ConsumedBytes        int64
 	MessageCount         int
@@ -1066,9 +1128,7 @@ const (
 // appended tail and the caller must fall back to a full parse that
 // replaces stored rows. It is provider-agnostic; parser-internal
 // fallbacks (Claude, Codex) are mapped to it at the provider seam.
-var ErrIncrementalNeedsFullParse = fmt.Errorf(
-	"incremental parse: appended lines require a replacing full parse",
-)
+var ErrIncrementalNeedsFullParse = errors.New("incremental parse: appended lines require a replacing full parse")
 
 // ProviderFactories returns one provider factory for every registered agent.
 func ProviderFactories() []ProviderFactory {
@@ -1098,10 +1158,14 @@ func providerFactoryForDef(def AgentDef) ProviderFactory {
 		return newImportOnlyProviderFactory(def)
 	case AgentCommandCode:
 		return newCommandCodeProviderFactory(def)
+	case AgentCrush:
+		return newCrushProviderFactory(def)
 	case AgentCodex:
 		return newCodexProviderFactory(def)
 	case AgentTraeX:
 		return newTraeXProviderFactory(def)
+	case AgentAugureCode:
+		return newAugureCodeProviderFactory(def)
 	case AgentCopilot:
 		return newCopilotProviderFactory(def)
 	case AgentCowork:
@@ -1110,6 +1174,8 @@ func providerFactoryForDef(def AgentDef) ProviderFactory {
 		return newCortexProviderFactory(def)
 	case AgentCursor:
 		return newCursorProviderFactory(def)
+	case AgentCursorIDE:
+		return newCursorIDEProviderFactory(def)
 	case AgentChatGPT:
 		return newImportOnlyProviderFactory(def)
 	case AgentDeepSeekTUI:
@@ -1122,6 +1188,8 @@ func providerFactoryForDef(def AgentDef) ProviderFactory {
 		return newDevinProviderFactory(def)
 	case AgentHermes:
 		return newHermesProviderFactory(def)
+	case AgentAugureDesktop:
+		return newAugureDesktopProviderFactory(def)
 	case AgentGrok:
 		return newGrokProviderFactory(def)
 	case AgentGoose:
@@ -1154,6 +1222,8 @@ func providerFactoryForDef(def AgentDef) ProviderFactory {
 		return newOpenHandsProviderFactory(def)
 	case AgentOpenCode:
 		return newOpenCodeProviderFactory(def)
+	case AgentOpenCodeReview:
+		return newOpenCodeReviewProviderFactory(def)
 	case AgentOMP:
 		return newPiProviderFactory(def)
 	case AgentOpenClaw:
@@ -1164,6 +1234,8 @@ func providerFactoryForDef(def AgentDef) ProviderFactory {
 		return newPoolsideProviderFactory(def)
 	case AgentPi:
 		return newPiProviderFactory(def)
+	case AgentTau:
+		return newTauProviderFactory(def)
 	case AgentPrimeAgent:
 		return newPiProviderFactory(def)
 	case AgentPositron:
@@ -1178,6 +1250,8 @@ func providerFactoryForDef(def AgentDef) ProviderFactory {
 		return newQwenPawProviderFactory(def)
 	case AgentQoder:
 		return newQoderProviderFactory(def)
+	case AgentEvener:
+		return newEvenerProviderFactory(def)
 	case AgentReasonix:
 		return newReasonixProviderFactory(def)
 	case AgentOmnigent:
@@ -1200,12 +1274,16 @@ func providerFactoryForDef(def AgentDef) ProviderFactory {
 		return newWarpProviderFactory(def)
 	case AgentWorkBuddy:
 		return newWorkBuddyProviderFactory(def)
+	case AgentCodeBuddy:
+		return newCodeBuddyProviderFactory(def)
 	case AgentZencoder:
 		return newZencoderProviderFactory(def)
 	case AgentZed:
 		return newZedProviderFactory(def)
 	case AgentRooCode:
 		return newRooCodeProviderFactory(def)
+	case AgentCline:
+		return newClineProviderFactory(def)
 	case AgentCodebuff:
 		return newCodebuffProviderFactory(def)
 	default:

@@ -17,18 +17,30 @@ import (
 )
 
 type usagePriceInput struct {
-	Fact                     usagefacts.Fact
-	Timestamp, ReportedModel string
+	Fact                                 usagefacts.Fact
+	Timestamp, ReportedModel, ProviderID string
 }
 
 type usagePriceResult struct {
-	PricedModel, MatchedPattern, RateHash string
-	RateOK                                bool
-	Cost, Savings                         money.Money
-	AuthoritativeCost                     *money.Money
-	BandThreshold                         *int
-	ComputedRequest, ComputedAggregate    int
-	Reported, BaseRequest                 int
+	PricedModel, MatchedPattern        string
+	RateOK                             bool
+	Cost, Savings                      money.Money
+	AuthoritativeCost                  *money.Money
+	BandThreshold                      *int
+	ComputedRequest, ComputedAggregate int
+	Reported, BaseRequest              int
+	// model and lookup are the exact pricing inputs behind Cost: the plain
+	// resolution for reported rows and the billed resolution otherwise.
+	// Provenance recording reuses lookup instead of resolving the row again.
+	model  string
+	lookup export.PricingLookup
+}
+
+// rateHash fingerprints the rates behind Cost. Rollup grouping and
+// persistence compute it on demand; provenance-only callers skip it.
+func (p usagePriceResult) rateHash() string {
+	return usageRateHash(
+		p.model, p.PricedModel, p.MatchedPattern, p.RateOK, p.lookup.Rates)
 }
 
 type usageRollupFact struct {
@@ -62,6 +74,7 @@ type usageDailyContribution struct {
 	ComputedAggregateCount                     int
 	ReportedCount, BaseRequestCount            int
 	DiscardedSnapshotOutputTokens              int64
+	ProviderID                                 string
 }
 
 type usageActivityContribution struct {
@@ -90,26 +103,56 @@ func priceUsageFact(
 	if model == "" {
 		model = input.Fact.Model
 	}
-	pricedModel, lookup := resolver.ResolveAt(
-		model, usageLookupModel(model, input.Timestamp),
-		usagePricingTimestamp(input.Timestamp),
-	)
+	canonicalModel := usageLookupModel(model, input.Timestamp)
+	timestamp := usagePricingTimestamp(input.Timestamp)
+	reported := input.Fact.ReportedCostMicrodollars
+	// Reported rows keep the unadjusted lookup; computed rows are charged at
+	// billed rates. Resolve only the one each row uses.
+	var pricedModel string
+	var lookup export.PricingLookup
+	if reported != nil && input.Fact.CostSource != CopilotReportedCostSource {
+		pricedModel, lookup = resolver.ResolveAt(model, canonicalModel, timestamp)
+	} else {
+		var err error
+		pricedModel, lookup, err = resolver.ResolveBilledAt(
+			input.ProviderID, model, canonicalModel, timestamp)
+		if err != nil {
+			return usagePriceResult{}, fmt.Errorf("pricing usage row for model %q: %w", model, err)
+		}
+	}
 	if err := validateNonnegativeUsageRates(lookup.Rates); err != nil {
 		return usagePriceResult{}, fmt.Errorf("pricing usage row for model %q: %w", model, err)
 	}
 	result := usagePriceResult{
 		PricedModel: pricedModel, MatchedPattern: lookup.Pattern,
-		RateHash: usageRateHash(
-			model, pricedModel, lookup.Pattern, lookup.OK, lookup.Rates),
 		RateOK: lookup.OK,
+		model:  model, lookup: lookup,
 	}
 	selectedRates := lookup.Rates
 	if input.Fact.RequestScoped {
 		selectedRates, result.BandThreshold = usageRatesAndBandForFact(
 			lookup.Rates, input.Fact)
 	}
+	savingsRates := selectedRates
+	if reported != nil && input.Fact.CostSource != CopilotReportedCostSource &&
+		(input.Fact.CacheReadTokens != 0 || input.Fact.CacheCreationTokens != 0) {
+		_, savingsLookup, err := resolver.ResolveBilledAt(
+			input.ProviderID, model, canonicalModel, timestamp)
+		if err != nil {
+			return usagePriceResult{}, fmt.Errorf(
+				"pricing reported usage cache savings for model %q: %w", model, err)
+		}
+		if err := validateNonnegativeUsageRates(savingsLookup.Rates); err != nil {
+			return usagePriceResult{}, fmt.Errorf(
+				"pricing reported usage cache savings for model %q: %w", model, err)
+		}
+		savingsRates = savingsLookup.Rates
+		if input.Fact.RequestScoped {
+			savingsRates, _ = usageRatesAndBandForFact(
+				savingsLookup.Rates, input.Fact)
+		}
+	}
 	var err error
-	reported := input.Fact.ReportedCostMicrodollars
 	if reported != nil && input.Fact.CostSource != CopilotReportedCostSource {
 		result.Cost = money.Money{Microdollars: *reported}
 		result.Reported = 1
@@ -139,16 +182,16 @@ func priceUsageFact(
 			result.AuthoritativeCost = &value
 		}
 	}
-	readRate, err := money.Sub(selectedRates.InputPerMTok, selectedRates.CacheReadPerMTok)
+	readRate, err := money.Sub(savingsRates.InputPerMTok, savingsRates.CacheReadPerMTok)
 	if err != nil {
 		return usagePriceResult{}, fmt.Errorf("deriving cache read rate for model %q: %w", model, err)
 	}
-	writeRate, err := money.Sub(selectedRates.InputPerMTok, selectedRates.CacheWritePerMTok)
+	writeRate, err := money.Sub(savingsRates.InputPerMTok, savingsRates.CacheWritePerMTok)
 	if err != nil {
 		return usagePriceResult{}, fmt.Errorf("deriving cache creation rate for model %q: %w", model, err)
 	}
 	write1hRate, err := money.Sub(
-		selectedRates.InputPerMTok, selectedRates.EffectiveCacheWrite1hPerMTok())
+		savingsRates.InputPerMTok, savingsRates.EffectiveCacheWrite1hPerMTok())
 	if err != nil {
 		return usagePriceResult{}, fmt.Errorf("deriving 1h cache creation rate for model %q: %w", model, err)
 	}
@@ -189,9 +232,9 @@ func buildUsageDailyContributions(
 	survivors []usageRollupSurvivor, resolver *export.PricingResolver,
 ) ([]usageDailyContribution, error) {
 	type key struct {
-		session, date, model, priced, pattern, rateHash string
-		rateOK                                          bool
-		band                                            int
+		session, date, model, providerID, priced, pattern, rateHash string
+		rateOK                                                      bool
+		band                                                        int
 	}
 	rows := make(map[key]*usageDailyContribution)
 	for _, survivor := range survivors {
@@ -199,18 +242,21 @@ func buildUsageDailyContributions(
 		timestamp := fact.Fact.RawTimestamp
 		priced, err := priceUsageFact(usagePriceInput{
 			Fact: fact.Fact, Timestamp: timestamp, ReportedModel: fact.Model,
+			ProviderID: fact.Fact.ProviderID,
 		}, resolver)
 		if err != nil {
 			return nil, err
 		}
+		rateHash := priced.rateHash()
 		band := -1
 		if priced.BandThreshold != nil {
 			band = *priced.BandThreshold
 		}
 		itemKey := key{
 			session: fact.AttributionSessionID, date: fact.LocalDate,
-			model: fact.Model, priced: priced.PricedModel,
-			pattern: priced.MatchedPattern, rateHash: priced.RateHash,
+			model: fact.Model, providerID: fact.Fact.ProviderID,
+			priced:  priced.PricedModel,
+			pattern: priced.MatchedPattern, rateHash: rateHash,
 			rateOK: priced.RateOK, band: band,
 		}
 		row := rows[itemKey]
@@ -218,9 +264,10 @@ func buildUsageDailyContributions(
 			row = &usageDailyContribution{
 				AttributedSessionID: fact.AttributionSessionID,
 				LocalDate:           fact.LocalDate, ReportedModel: fact.Model,
+				ProviderID:  fact.Fact.ProviderID,
 				PricedModel: priced.PricedModel, MatchedPattern: priced.MatchedPattern,
 				PricingTimestamp: timestamp,
-				RateOK:           priced.RateOK, RateHash: priced.RateHash,
+				RateOK:           priced.RateOK, RateHash: rateHash,
 				BandThreshold: priced.BandThreshold,
 			}
 			rows[itemKey] = row
@@ -309,15 +356,15 @@ func loadUsageRollupFacts(
 	}
 	rows, err := conn.QueryContext(ctx, `SELECT f.cached_session_id, f.fact_index,
 		cs.session_id, f.source, f.message_ordinal, f.timestamp_ms, f.timestamp_ns,
-		f.raw_timestamp, f.uses_session_start, f.model, f.input_tokens,
+		f.raw_timestamp, f.uses_session_start, f.model, f.provider_id, f.input_tokens,
 		f.output_tokens, f.reasoning_tokens, f.cache_creation_tokens,
 		f.cache_creation_1h_tokens,
 		f.cache_read_tokens, f.web_search_requests, f.reported_cost_microdollars,
 		f.cost_source, f.request_scoped, f.claude_message_id, f.claude_request_id,
 		f.source_uuid, f.usage_dedup_key, f.token_eligible, f.activity_eligible
 		FROM usage_rollup_build_sessions selected
-		JOIN usage_cached_sessions cs ON cs.session_id = selected.session_id
-		JOIN usage_facts f ON f.cached_session_id = cs.id
+		CROSS JOIN usage_cached_sessions cs ON cs.session_id = selected.session_id
+		CROSS JOIN usage_facts f ON f.cached_session_id = cs.id
 		ORDER BY cs.session_id, f.fact_index`)
 	if err != nil {
 		return nil, fmt.Errorf("loading rollup facts: %w", err)
@@ -331,7 +378,7 @@ func loadUsageRollupFacts(
 		if err := rows.Scan(
 			&item.CachedSessionID, &item.FactIndex, &item.SourceSessionID,
 			&item.Fact.Source, &ordinal, &millis, &nanos, &item.Fact.RawTimestamp,
-			&usesStart, &item.Fact.Model, &item.Fact.InputTokens,
+			&usesStart, &item.Fact.Model, &item.Fact.ProviderID, &item.Fact.InputTokens,
 			&item.Fact.OutputTokens, &item.Fact.ReasoningTokens,
 			&item.Fact.CacheCreationTokens, &item.Fact.CacheCreation1hTokens,
 			&item.Fact.CacheReadTokens,
@@ -450,7 +497,7 @@ func buildUsageRollupSessions(
 	cross usageDedupIdentitySet,
 ) ([]usageRollupBuild, error) {
 	if location == nil {
-		location = time.Local
+		location = time.Local //nolint:forbidigo // Report date buckets use the local calendar timezone; source timestamps remain UTC.
 	}
 	for index := range facts {
 		facts[index].LocalDate = usageRollupLocalDate(facts[index], location)
@@ -512,7 +559,8 @@ func usageRollupExceptionRows(facts []usageRollupFact) []usageExceptionRow {
 		} {
 			if group.key != "" {
 				rows = append(rows, usageExceptionRow{
-					GroupKind: group.kind, GroupKey: group.key, Fact: fact})
+					GroupKind: group.kind, GroupKey: group.key, Fact: fact,
+				})
 			}
 		}
 	}
@@ -544,7 +592,8 @@ func usageRollupActivityContributions(
 		result = append(result, usageActivityContribution{
 			AttributedSessionID: sessionID,
 			LocalDate:           item.date, Model: item.model,
-			UserMessageCount: counts[item]})
+			UserMessageCount: counts[item],
+		})
 	}
 	return result
 }
@@ -580,7 +629,9 @@ func compareUsageRollupFactIdentity(left, right usageRollupFact) int {
 func compareUsageDailyContribution(left, right usageDailyContribution) int {
 	for _, values := range [][2]string{
 		{left.AttributedSessionID, right.AttributedSessionID},
-		{left.LocalDate, right.LocalDate}, {left.ReportedModel, right.ReportedModel},
+		{left.LocalDate, right.LocalDate},
+		{left.ReportedModel, right.ReportedModel},
+		{left.ProviderID, right.ProviderID},
 		{left.RateHash, right.RateHash},
 	} {
 		if order := cmp.Compare(values[0], values[1]); order != 0 {

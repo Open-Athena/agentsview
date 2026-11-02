@@ -3,34 +3,36 @@ title: Session Intelligence
 description: Health scores, outcomes, and session-quality analytics in AgentsView
 ---
 
-AgentsView 0.23.0 adds a session-intelligence layer on top of the
-raw transcript archive. Instead of only showing message history,
-AgentsView now computes per-session health signals, outcome
-classifications, and aggregate health analytics so you can quickly
-spot sessions that went well, sessions that stalled out, and
-patterns that keep recurring across projects.
+Use session health scores to find stalled sessions, repeated tool failures, and
+patterns across projects. AgentsView reads the recorded transcript to estimate
+each session's outcome and show the evidence behind its score.
 
 !!! note
-    These signals are heuristics, not ground truth. They are meant to
-    help with triage and pattern-finding, not to replace your own
-    judgment about whether a session was actually successful.
+
+    These signals are heuristics, not ground truth. They are meant to help with
+    triage and pattern-finding, not to replace your own judgment about whether a
+    session was actually successful.
 
 ## Where It Appears
 
 Session intelligence shows up in four places:
 
-- **Session detail UI** — the session header now includes a health
-  grade badge. Click it to open the in-session signal panel.
-- **Analytics dashboard** — the dashboard includes a **Session
-  Health** section with score, outcome, tool-failure, compaction,
-  trend, agent, and project breakdowns.
+- **Session detail UI** — the session header includes a health grade badge.
+    Click it to open the in-session signal panel.
+- **Analytics dashboard** — the dashboard includes a **Session Health** section
+    with score, outcome, tool-failure, compaction, trend, agent, and project
+    breakdowns.
 - **Programmatic session surface** — `agentsview session get` and
-  `agentsview session list` expose health and outcome fields, plus
-  filters such as `--health-grade`, `--outcome`, and
-  `--min-tool-failures`.
-- **CLI health view** — `agentsview health` shows either a recent
-  session list with grade and outcome columns, or detailed signals
-  for a single session.
+    `agentsview session list` expose health and outcome fields, plus filters
+    such as `--health-grade`, `--outcome`, and `--min-tool-failures`.
+- **CLI health view** — `agentsview health` shows either a recent session list
+    with grade and outcome columns, or detailed signals for a single session.
+
+For elapsed turn time and measured tool execution, open **Analysis** in a
+session. Its [Session Vitals view](/docs/usage/#session-vital-signs) separates
+measured tool time from unattributed time and links activity rows to the
+transcript. Timing and health scores answer different questions: where time
+went, and what patterns deserve attention.
 
 ## Health Score
 
@@ -146,7 +148,7 @@ working context and had to recover.
 When a session has intelligence data, the session header shows a
 grade badge:
 
-![Grade badge in the session header](/assets/generated/screenshots/grade-badge.png)
+![Grade badge in the session header](/docs/assets/generated/screenshots/grade-badge.png)
 
 Clicking it opens the signal panel, which includes:
 
@@ -156,7 +158,7 @@ Clicking it opens the signal panel, which includes:
 - compaction chip with a mid-task indicator when applicable
 - penalty chips for the exact deductions applied
 
-![Signal panel with basis tags, compaction chip, and penalty chips](/assets/generated/screenshots/signal-panel.png)
+![Signal panel with basis tags, compaction chip, and penalty chips](/docs/assets/generated/screenshots/signal-panel.png)
 
 If a session does not have enough usable data, the panel renders a
 small empty-state message instead of a score.
@@ -173,7 +175,7 @@ same per-session signals into:
 - score trend over time
 - by-agent and by-project tables
 
-![Session Health section on the analytics dashboard](/assets/generated/screenshots/session-health.png)
+![Session Health section on the analytics dashboard](/docs/assets/generated/screenshots/session-health.png)
 
 This section is only shown when the current filter window contains
 scored or unscored signal-bearing sessions.
@@ -198,7 +200,7 @@ churn, failure streaks, compactions, and context pressure.
 
 ### `agentsview session`
 
-Use the [Session API](/session-api/) docs for the full programmatic
+Use the [Session API](/docs/session-api/) docs for the full programmatic
 surface. The most relevant commands for session intelligence are:
 
 ```bash
@@ -216,7 +218,7 @@ exposes health and outcome filters for automation-friendly scans.
 Session intelligence is **per-session** and powers the session UI,
 the session API, and the dashboard health section.
 
-[`agentsview stats`](/stats/) is different: it is an
+[`agentsview stats`](/docs/stats/) is different: it is an
 **aggregate reporting** command that summarizes windows of session
 activity, git activity, tool mix, model mix, and outcome metrics
 across the whole workspace.

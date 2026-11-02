@@ -12,7 +12,6 @@
     AgentName,
     AutomatedScope,
     CannedInsightKind,
-    InsightType,
   } from "../../api/types.js";
   import { m } from "../../i18n/index.js";
   import { router, getBasePath } from "../../stores/router.svelte.js";
@@ -22,7 +21,7 @@
   import { ui } from "../../stores/ui.svelte.js";
   import { agentLabel } from "../../utils/agents.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
-  import { renderMarkdown } from "../../utils/markdown.js";
+  import { loadAssetImages, renderMarkdown } from "../../utils/markdown.js";
   import ProjectTypeahead from "../layout/ProjectTypeahead.svelte";
   import RangePicker from "../shared/RangePicker.svelte";
   import {
@@ -43,8 +42,8 @@
     ),
   );
   const insightGenerationAvailable = $derived(
-    sync.serverVersion?.insight_generation_available === true ||
-      sync.serverVersion?.read_only !== true,
+    sync.serverVersion?.insight_generation_available ??
+      (sync.serverVersion?.read_only !== true),
   );
   const generationUnavailable = $derived(
     sync.serverVersion === null || !insightGenerationAvailable,
@@ -221,7 +220,7 @@
   }
 
   function cannedKindLabel(
-    kind: CannedInsightKind | "" | undefined,
+    kind: string | undefined,
   ): string {
     switch (kind) {
       case "prompt_maturity_review":
@@ -242,8 +241,8 @@
   }
 
   function insightTypeLabel(
-    type: InsightType,
-    kind: CannedInsightKind | "" | undefined,
+    type: string,
+    kind: string | undefined,
   ): string {
     if (type === "llm_canned") return cannedKindLabel(kind);
     if (type === "agent_analysis") return m.insights_page_agent_analysis();
@@ -503,8 +502,10 @@
                 >×</IconButton>
               </div>
             </div>
-            <div class="markdown-body">
-              {@html renderMarkdown(insights.selectedItem.content)}
+            <div class="markdown-body" use:loadAssetImages={insights.selectedItem.content}>
+              {@html renderMarkdown(insights.selectedItem.content, {
+                renderUnknownXmlBlocksAsPreformatted: ui.renderUnknownXmlBlocksAsPreformatted,
+              })}
             </div>
           {:else}
             <p>{m.insights_page_select_to_read()}</p>

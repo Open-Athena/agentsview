@@ -7,6 +7,7 @@ import (
 	"context"
 	"log"
 	"os"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -32,7 +33,12 @@ const (
 var (
 	pollIntervalNanos      int64 = int64(PollInterval)
 	syncFallbackDelayNanos int64 = int64(SyncFallbackDelay)
+	sourceMissingObserver  atomic.Value
 )
+
+func init() {
+	sourceMissingObserver.Store(func(string) {})
+}
 
 func pollInterval() time.Duration {
 	return time.Duration(atomic.LoadInt64(&pollIntervalNanos))
@@ -59,6 +65,14 @@ func SetTimingsForTest(
 		atomic.StoreInt64(&pollIntervalNanos, oldPoll)
 		atomic.StoreInt64(&syncFallbackDelayNanos, oldFallback)
 	}
+}
+
+// SetSourceMissingObserverForTest installs a callback for tests that need to
+// coordinate with source disappearance processing.
+func SetSourceMissingObserverForTest(observer func(string)) func() {
+	previous := sourceMissingObserver.Load().(func(string))
+	sourceMissingObserver.Store(observer)
+	return func() { sourceMissingObserver.Store(previous) }
 }
 
 // Watcher emits a tick on Events() each time the session's DB state
@@ -89,8 +103,52 @@ func (w *Watcher) Events(
 	ctx context.Context, sessionID string,
 ) <-chan struct{} {
 	ch := make(chan struct{})
+	if identity, ok := w.db.(db.SessionWatchStateStore); ok {
+		initial, err := identity.GetSessionWatchState(sessionID)
+		go func() {
+			defer close(ch)
+			if err != nil {
+				return
+			}
+			if initial.State != db.SessionWatchResolved {
+				select {
+				case ch <- struct{}{}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			ticker := time.NewTicker(pollInterval())
+			defer ticker.Stop()
+			lastCount, lastVersion, _ := w.db.GetSessionVersion(ctx, sessionID)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					current, e := identity.GetSessionWatchState(sessionID)
+					if e != nil {
+						continue
+					}
+					transition := current.State != initial.State || current.PublicID != initial.PublicID || current.ContentRevision != initial.ContentRevision || !slices.Equal(current.Variants, initial.Variants)
+					count, version, ok := w.db.GetSessionVersion(ctx, sessionID)
+					if transition || ok && (count != lastCount || version != lastVersion) {
+						select {
+						case ch <- struct{}{}:
+						case <-ctx.Done():
+							return
+						}
+						if transition {
+							return
+						}
+						lastCount, lastVersion = count, version
+					}
+				}
+			}
+		}()
+		return ch
+	}
 	lastCount, lastDBVersion, _ := w.db.GetSessionVersion(
-		sessionID,
+		ctx, sessionID,
 	)
 	go func() {
 		defer close(ch)
@@ -104,11 +162,11 @@ func (w *Watcher) Events(
 		}
 
 		// Track file mtime for fallback sync.
-		sourcePath := w.engine.FindSourceFile(sessionID)
+		sourcePath := w.engine.FindSourceFile(ctx, sessionID)
 		var lastFileMtime int64
 		var fileMtimeChangedAt time.Time
 		if sourcePath != "" {
-			lastFileMtime = w.engine.SourceMtime(sessionID)
+			lastFileMtime = w.engine.SourceMtime(ctx, sessionID)
 		}
 
 		ticker := time.NewTicker(pollInterval())
@@ -119,7 +177,7 @@ func (w *Watcher) Events(
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				changed := w.checkDBForChanges(
+				changed := w.checkDBForChanges(ctx,
 					sessionID,
 					&lastCount,
 					&lastDBVersion,
@@ -155,7 +213,7 @@ func (w *Watcher) pollDBOnly(
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			count, dbVersion, ok := w.db.GetSessionVersion(sessionID)
+			count, dbVersion, ok := w.db.GetSessionVersion(ctx, sessionID)
 			if ok && (count != lastCount || dbVersion != lastDBVersion) {
 				lastCount = count
 				lastDBVersion = dbVersion
@@ -172,7 +230,7 @@ func (w *Watcher) pollDBOnly(
 // checkDBForChanges polls the database for a session version change.
 // As a fallback, it monitors source file mtime and triggers a direct
 // sync when the watcher hasn't updated the DB.
-func (w *Watcher) checkDBForChanges(
+func (w *Watcher) checkDBForChanges(ctx context.Context,
 	sessionID string,
 	lastCount *int,
 	lastDBVersion *int64,
@@ -182,7 +240,7 @@ func (w *Watcher) checkDBForChanges(
 ) bool {
 	// Primary: check if the DB has new data. The version marker covers
 	// message appends and metadata/content-only updates.
-	if count, dbVersion, ok := w.db.GetSessionVersion(
+	if count, dbVersion, ok := w.db.GetSessionVersion(ctx,
 		sessionID,
 	); ok && (count != *lastCount ||
 		dbVersion != *lastDBVersion) {
@@ -195,23 +253,25 @@ func (w *Watcher) checkDBForChanges(
 
 	// Track file mtime for the fallback path.
 	if *sourcePath == "" {
-		*sourcePath = w.engine.FindSourceFile(sessionID)
+		*sourcePath = w.engine.FindSourceFile(ctx, sessionID)
 		if *sourcePath == "" {
+			sourceMissingObserver.Load().(func(string))(sessionID)
 			return false
 		}
-		*lastFileMtime = w.engine.SourceMtime(sessionID)
+		*lastFileMtime = w.engine.SourceMtime(ctx, sessionID)
 		// Source file (re-)resolved — trigger fallback sync
 		// immediately since content likely differs from DB.
 		past := time.Now().Add(-syncFallbackDelay())
 		*fileMtimeChangedAt = past
 	}
 
-	mtime := w.engine.SourceMtime(sessionID)
+	mtime := w.engine.SourceMtime(ctx, sessionID)
 	if mtime == 0 {
 		// File disappeared; try to re-resolve later.
 		*sourcePath = ""
 		*lastFileMtime = 0
 		*fileMtimeChangedAt = time.Time{}
+		sourceMissingObserver.Load().(func(string))(sessionID)
 		return false
 	}
 
@@ -236,7 +296,7 @@ func (w *Watcher) checkDBForChanges(
 			return false
 		}
 		// Re-check the DB after syncing.
-		if count, dbVersion, ok := w.db.GetSessionVersion(
+		if count, dbVersion, ok := w.db.GetSessionVersion(ctx,
 			sessionID,
 		); ok && (count != *lastCount ||
 			dbVersion != *lastDBVersion) {

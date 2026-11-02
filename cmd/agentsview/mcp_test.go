@@ -101,10 +101,62 @@ func TestNewMCPCommand_Wiring(t *testing.T) {
 	assert.True(t, cmd.SilenceUsage)
 
 	for _, name := range []string{
-		"http", "http-allow-insecure", "server", "server-token-file", "pg",
+		"http", "http-allow-insecure", "server", "server-token-file", "pg", "profile",
 	} {
 		assert.NotNil(t, cmd.Flags().Lookup(name), "missing flag --%s", name)
 	}
+}
+
+func TestMCPMemoryProfileUsesPluginEnvironment(t *testing.T) {
+	t.Setenv("AGENTSVIEW_MEMORY_SERVER", "https://memory.example")
+	t.Setenv("AGENTSVIEW_MEMORY_SERVER_TOKEN_FILE", "/tmp/token")
+	cmd := newMCPCommand()
+	require.NoError(t, cmd.ParseFlags([]string{"--profile", "memory"}))
+	require.NoError(t, applyMemoryTargetEnv(cmd, "memory"))
+
+	server, err := cmd.Flags().GetString("server")
+	require.NoError(t, err)
+	tokenFile, err := cmd.Flags().GetString("server-token-file")
+	require.NoError(t, err)
+	assert.Equal(t, "https://memory.example", server)
+	assert.Equal(t, "/tmp/token", tokenFile)
+}
+
+func TestMCPFullProfileIgnoresPluginEnvironment(t *testing.T) {
+	t.Setenv("AGENTSVIEW_MEMORY_SERVER", "https://memory.example")
+	cmd := newMCPCommand()
+	require.NoError(t, applyMemoryTargetEnv(cmd, "full"))
+
+	server, err := cmd.Flags().GetString("server")
+	require.NoError(t, err)
+	assert.Empty(t, server)
+}
+
+func TestMCPMemoryProfileRejectsTokenFileWithoutServer(t *testing.T) {
+	t.Setenv("AGENTSVIEW_MEMORY_SERVER_TOKEN_FILE", "/tmp/token")
+	cmd := newMCPCommand()
+	require.NoError(t, cmd.ParseFlags([]string{"--profile", "memory"}))
+	err := applyMemoryTargetEnv(cmd, "memory")
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "requires --server")
+}
+
+func TestMCPMemoryProfileRejectsExplicitTokenFileWithoutServer(t *testing.T) {
+	cmd := newMCPCommand()
+	require.NoError(t, cmd.ParseFlags([]string{
+		"--profile", "memory", "--server-token-file", "/tmp/token",
+	}))
+	err := applyMemoryTargetEnv(cmd, "memory")
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "requires --server")
+}
+
+func TestMCPCommandRejectsUnknownProfileBeforeResolvingBackend(t *testing.T) {
+	t.Parallel()
+
+	_, err := executeCommand(newRootCommand(), "mcp", "--profile", "analytics")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown MCP profile")
 }
 
 func TestRootCommand_RegistersMCP(t *testing.T) {
@@ -141,7 +193,7 @@ func TestResolveMCPServicePGFlagUsesPGReadStore(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
 
-	res, err := svc.List(context.Background(), service.ListFilter{Limit: 10})
+	res, err := svc.List(t.Context(), service.ListFilter{Limit: 10})
 	require.NoError(t, err)
 	require.Len(t, res.Sessions, 1)
 	assert.Equal(t, "pg-session", res.Sessions[0].ID)
@@ -181,12 +233,11 @@ func TestResolveMCPServiceExplicitServerUsesReportedCapabilities(
 					"read_only":   tt.readOnly,
 					"api_version": tt.apiVersion,
 				})
-
 			}))
 			t.Cleanup(srv.Close)
 
 			cmd := newMCPCommand()
-			cmd.SetContext(context.Background())
+			cmd.SetContext(t.Context())
 			require.NoError(t, cmd.ParseFlags([]string{
 				"--server", srv.URL,
 				"--server-token-file", tokenFile,
@@ -217,7 +268,6 @@ func TestMCPDaemonServiceStartsDaemonForEachOperation(t *testing.T) {
 			Sessions: []db.Session{{ID: "from-daemon", Agent: "codex"}},
 			Total:    1,
 		})
-
 	}))
 	t.Cleanup(ts.Close)
 	host, port := splitTestServerURL(t, ts.URL)
@@ -230,13 +280,73 @@ func TestMCPDaemonServiceStartsDaemonForEachOperation(t *testing.T) {
 
 	svc := newMCPDaemonService(cfg)
 	for range 2 {
-		res, err := svc.List(context.Background(), service.ListFilter{Limit: 7})
+		res, err := svc.List(t.Context(), service.ListFilter{Limit: 7})
 		require.NoError(t, err)
 		require.Len(t, res.Sessions, 1)
 		assert.Equal(t, "from-daemon", res.Sessions[0].ID)
 	}
 	assert.Equal(t, 2, starts)
 	assert.NoFileExists(t, cfg.DBPath)
+}
+
+func TestMCPDaemonServiceForwardsMemoryStatus(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := config.Config{DataDir: dataDir, DBPath: filepath.Join(dataDir, "sessions.db")}
+	expected := service.MemoryStatus{
+		Status: service.MemoryReady,
+		Archive: service.MemoryArchiveStatus{
+			Backend: "postgres", ReadOnly: true,
+		},
+		Lexical:  service.MemoryCapabilityStatus{Status: service.MemoryReady},
+		Semantic: service.MemoryVectorStatus{Status: service.MemoryReady},
+		Sources:  service.MemorySourceStatus{Status: service.MemoryUnknown},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/memory/status", r.URL.Path)
+		assert.NoError(t, json.MarshalWrite(w, expected))
+	}))
+	t.Cleanup(server.Close)
+	host, port := splitTestServerURL(t, server.URL)
+	stubStartBackgroundServeForTransport(t, func(
+		context.Context, *config.Config, time.Duration,
+	) (*DaemonRuntime, error) {
+		return &DaemonRuntime{Host: host, Port: port}, nil
+	})
+
+	status, err := service.GetMemoryStatus(t.Context(), newMCPDaemonService(cfg))
+	require.NoError(t, err)
+	assert.Equal(t, expected, status)
+	assert.NoFileExists(t, cfg.DBPath)
+}
+
+func TestMCPDaemonServiceRawSuffixResolvesDaemonPerCall(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := config.Config{DataDir: dataDir, DBPath: filepath.Join(dataDir, "sessions.db")}
+	var starts, requests int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/session-ids/resolve", r.URL.Path)
+		assert.Equal(t, fmt.Sprintf("uuid-%d", requests), r.URL.Query().Get("partial"))
+		assert.Equal(t, "2", r.URL.Query().Get("limit"))
+		assert.Equal(t, "true", r.URL.Query().Get("raw_suffix"))
+		requests++
+		_ = json.MarshalWrite(w, map[string]any{"ids": []string{"codex:from-daemon"}, "raw_suffix": true})
+	}))
+	t.Cleanup(srv.Close)
+	host, port := splitTestServerURL(t, srv.URL)
+	stubStartBackgroundServeForTransport(t, func(context.Context, *config.Config, time.Duration) (*DaemonRuntime, error) {
+		starts++
+		return &DaemonRuntime{Host: host, Port: port}, nil
+	})
+	svc := newMCPDaemonService(cfg)
+	for i := range 2 {
+		ids, err := svc.FindSessionIDsByRawSuffix(t.Context(), fmt.Sprintf("uuid-%d", i), 2)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"codex:from-daemon"}, ids)
+	}
+	assert.Equal(t, 2, starts)
+	assert.Equal(t, 2, requests)
+	assert.NoFileExists(t, cfg.DBPath)
+	t.Logf("daemon_starts=%d requests=%d ids=[codex:from-daemon] archive_opened=false", starts, requests)
 }
 
 func TestMCPDaemonServiceRecallCapabilityFollowsResolvedRuntime(t *testing.T) {
@@ -312,7 +422,7 @@ func TestMCPDaemonService_UsagePairwiseComparisonForwardsToDaemon(t *testing.T) 
 
 	svc := newMCPDaemonService(cfg)
 	res, err := svc.UsagePairwiseComparison(
-		context.Background(),
+		t.Context(),
 		service.UsagePairwiseComparisonRequest{
 			From:            "2024-06-01",
 			To:              "2024-06-07",
@@ -335,7 +445,8 @@ func TestMCPDaemonService_UsagePairwiseComparisonForwardsToDaemon(t *testing.T) 
 
 func splitTestServerURL(t *testing.T, raw string) (string, int) {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodGet, raw, nil)
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, raw, nil)
 	require.NoError(t, err)
 	host, portText, err := net.SplitHostPort(req.URL.Host)
 	require.NoError(t, err)

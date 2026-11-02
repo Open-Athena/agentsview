@@ -61,7 +61,7 @@ func threeDocSearchSource() *fakeUnitSource {
 
 func TestSearchReturnsBestMatchFirstWithSnippet(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	src := threeDocSearchSource()
 	gen := fakeGeneration("fake-model")
 
@@ -81,7 +81,7 @@ func TestSearchReturnsBestMatchFirstWithSnippet(t *testing.T) {
 
 func TestSearchLimitCapsResults(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	src := threeDocSearchSource()
 	gen := fakeGeneration("fake-model")
 
@@ -96,7 +96,7 @@ func TestSearchLimitCapsResults(t *testing.T) {
 func TestSearchPageExhaustionUsesChunkCandidatesBeforeDocumentRollup(t *testing.T) {
 	ix := openTestIndex(t)
 	ix.split = kitvec.SplitOptions{MaxRunes: 10, Overlap: 0}
-	ctx := context.Background()
+	ctx := t.Context()
 	src := &fakeUnitSource{rows: []fakeUnit{{
 		unit: userDoc(
 			"s1", "u1", 0,
@@ -121,9 +121,29 @@ func TestSearchPageExhaustionUsesChunkCandidatesBeforeDocumentRollup(t *testing.
 	assert.True(t, exhausted)
 }
 
+func TestSearchRejectsCandidateCountAboveEngineKMax(t *testing.T) {
+	ix := openTestIndex(t)
+	ctx := t.Context()
+
+	_, err := ix.Build(ctx, threeDocSearchSource(), fakeSearchEncoder(),
+		fakeGeneration("fake-model"), BuildOptions{})
+	require.NoError(t, err)
+
+	_, _, err = ix.SearchPage(
+		ctx, fakeSearchEncoder(), "alpha", MaxKNNCandidates,
+	)
+	require.NoError(t, err)
+
+	_, _, err = ix.SearchPage(
+		ctx, fakeSearchEncoder(), "alpha", MaxKNNCandidates+1,
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "k value in knn query too large")
+}
+
 func TestSearchNoGenerationsReturnsErrNoActiveGeneration(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	_, err := ix.Search(ctx, fakeSearchEncoder(), "alpha", 10)
 	assert.ErrorIs(t, err, ErrNoActiveGeneration)
@@ -131,7 +151,7 @@ func TestSearchNoGenerationsReturnsErrNoActiveGeneration(t *testing.T) {
 
 func TestSearchBuildingOnlyReturnsBuildingError(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	src := threeDocSearchSource()
 
 	_, err := ix.Refresh(ctx, src, true, true)
@@ -159,7 +179,7 @@ func TestSearchBuildingOnlyReturnsBuildingError(t *testing.T) {
 // matters and only active-generation hits come back.
 func TestSearchIgnoresBuildingGenerationOfDifferentDimension(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	src := threeDocSearchSource()
 	activeGen := fakeGeneration("active-model")
 
@@ -180,7 +200,7 @@ func TestSearchIgnoresBuildingGenerationOfDifferentDimension(t *testing.T) {
 
 func TestStaleActiveTrueWhenFingerprintsDiffer(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	src := threeDocSearchSource()
 	gen := fakeGeneration("fake-model")
 
@@ -198,7 +218,7 @@ func TestStaleActiveTrueWhenFingerprintsDiffer(t *testing.T) {
 
 func TestStaleActiveRejectsNewerCorpusRevision(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	gen := fakeGeneration("fake-model")
 
 	_, err := ix.Build(
@@ -218,7 +238,7 @@ func TestStaleActiveRejectsNewerCorpusRevision(t *testing.T) {
 
 func TestStaleActiveFalseWhenNoActiveGeneration(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	stale, err := ix.StaleActive(ctx, "anything", "")
 	require.NoError(t, err)
@@ -317,18 +337,30 @@ func TestChunkWindowMatchesKitSplit(t *testing.T) {
 		content string
 		opts    kitvec.SplitOptions
 	}{
-		{"ascii multi chunk", strings.Repeat("abcde", 9),
-			kitvec.SplitOptions{MaxRunes: 10, Overlap: 2}},
-		{"multi byte multi chunk", strings.Repeat("é", 25),
-			kitvec.SplitOptions{MaxRunes: 7, Overlap: 1}},
-		{"single chunk", "short",
-			kitvec.SplitOptions{MaxRunes: 10, Overlap: 2}},
-		{"short final chunk", strings.Repeat("x", 23),
-			kitvec.SplitOptions{MaxRunes: 10, Overlap: 1}},
-		{"overlap exceeding max runes is clamped", strings.Repeat("y", 25),
-			kitvec.SplitOptions{MaxRunes: 10, Overlap: 50}},
-		{"production overlap shape", strings.Repeat("word ", 100),
-			kitvec.SplitOptions{MaxRunes: 40, Overlap: ChunkOverlap(40)}},
+		{
+			"ascii multi chunk", strings.Repeat("abcde", 9),
+			kitvec.SplitOptions{MaxRunes: 10, Overlap: 2},
+		},
+		{
+			"multi byte multi chunk", strings.Repeat("é", 25),
+			kitvec.SplitOptions{MaxRunes: 7, Overlap: 1},
+		},
+		{
+			"single chunk", "short",
+			kitvec.SplitOptions{MaxRunes: 10, Overlap: 2},
+		},
+		{
+			"short final chunk", strings.Repeat("x", 23),
+			kitvec.SplitOptions{MaxRunes: 10, Overlap: 1},
+		},
+		{
+			"overlap exceeding max runes is clamped", strings.Repeat("y", 25),
+			kitvec.SplitOptions{MaxRunes: 10, Overlap: 50},
+		},
+		{
+			"production overlap shape", strings.Repeat("word ", 100),
+			kitvec.SplitOptions{MaxRunes: 40, Overlap: ChunkOverlap(40)},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -351,7 +383,7 @@ func TestChunkWindowMatchesKitSplit(t *testing.T) {
 // Overlap = ChunkOverlap(maxInputChars)).
 func openSmallChunkIndex(t *testing.T, maxInputChars int) *Index {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "vectors.db")
 	ix, err := Open(ctx, path, false, maxInputChars)
 	require.NoError(t, err)
@@ -366,7 +398,7 @@ func seedMirrorRow(t *testing.T, ix *Index, docKey string, u db.EmbeddableUnit) 
 	t.Helper()
 	offsets, err := marshalOffsets(u.Offsets)
 	require.NoError(t, err)
-	_, err = ix.db.Exec(`
+	_, err = ix.db.ExecContext(t.Context(), `
 INSERT INTO vector_messages (doc_key, session_id, ordinal, ordinal_end,
     subordinate, offsets, content, content_hash)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -384,7 +416,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 // locate it inside the anchor message's content.
 func TestHydrateHitsAnchorsRunChunks(t *testing.T) {
 	ix := openSmallChunkIndex(t, 10) // stride 10-1=9
-	ctx := context.Background()
+	ctx := t.Context()
 
 	content := "aaaaa\n\nbbbbb\n\nccccc" // 19 runes, chunks [0,10) and [9,19)
 	seedMirrorRow(t, ix, "r1", db.EmbeddableUnit{
@@ -434,7 +466,7 @@ func TestHydrateHitsAnchorsRunChunks(t *testing.T) {
 // from a different member.
 func TestHydrateHitsDegenerateChunkIndexFallsBackToAnchorSpan(t *testing.T) {
 	ix := openSmallChunkIndex(t, 10)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	content := "aaaaa\n\nbbbbb\n\nccccc"
 	seedMirrorRow(t, ix, "r1", db.EmbeddableUnit{
@@ -463,9 +495,9 @@ func TestHydrateHitsDegenerateChunkIndexFallsBackToAnchorSpan(t *testing.T) {
 // hit.
 func TestHydrateHitsCorruptOffsetsFailsWithDocKey(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
-	_, err := ix.db.Exec(`
+	_, err := ix.db.ExecContext(ctx, `
 INSERT INTO vector_messages (doc_key, session_id, ordinal, ordinal_end,
     subordinate, offsets, content, content_hash)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -486,7 +518,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 // never consulted.
 func TestHydrateHitsUserDocPassthrough(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	seedMirrorRow(t, ix, "u1", db.EmbeddableUnit{
 		SessionID: "s1", Kind: "user", Ordinal: 3, OrdinalEnd: 3,
 		Content: "a plain user question",
@@ -509,7 +541,7 @@ func TestHydrateHitsUserDocPassthrough(t *testing.T) {
 // tear characters apart or select the wrong window.
 func TestHydrateHitsMultiByteSnippet(t *testing.T) {
 	ix := openSmallChunkIndex(t, 10) // stride 9
-	ctx := context.Background()
+	ctx := t.Context()
 
 	content := strings.Repeat("é", 5) + "\n\n" + strings.Repeat("ü", 5) // 12 runes
 	seedMirrorRow(t, ix, "r1", db.EmbeddableUnit{
@@ -540,7 +572,7 @@ func TestHydrateHitsMultiByteSnippet(t *testing.T) {
 // a user document's hit passes its own ordinal through.
 func TestSearchRunDocReturnsAnchoredHit(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// "run first message" is 17 runes; member 2 starts at rune 19 after the
 	// "\n\n" separator. The whole run fits one chunk, whose center rune
@@ -555,8 +587,10 @@ func TestSearchRunDocReturnsAnchoredHit(t *testing.T) {
 		},
 	}
 	src := &fakeUnitSource{rows: []fakeUnit{
-		{unit: userDoc("s1", "u1", 0, "this message mentions beta topic"),
-			endedAt: "2024-01-01T00:00:00Z"},
+		{
+			unit:    userDoc("s1", "u1", 0, "this message mentions beta topic"),
+			endedAt: "2024-01-01T00:00:00Z",
+		},
 		{unit: run, endedAt: "2024-01-01T00:00:01Z"},
 	}}
 	gen := fakeGeneration("fake-model")
@@ -591,7 +625,7 @@ func seedUnitRow(
 	t *testing.T, ix *Index, docKey, sessionID string, start, end int, subordinate bool,
 ) {
 	t.Helper()
-	_, err := ix.db.Exec(`
+	_, err := ix.db.ExecContext(t.Context(), `
 INSERT INTO vector_messages
     (doc_key, session_id, ordinal, ordinal_end, subordinate, content, content_hash)
 VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -604,7 +638,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`,
 // non-embeddable ordinals, and a subordinate run.
 func TestResolveMessageUnitsPointLookup(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	seedUnitRow(t, ix, "u:s:0", "s", 0, 0, false)
 	seedUnitRow(t, ix, "r:s:a", "s", 1, 3, false)
 	// Ordinals 4-5 are a gap: no unit covers them.
@@ -621,8 +655,11 @@ func TestResolveMessageUnitsPointLookup(t *testing.T) {
 		ref  db.MessageRef
 		want db.UnitRef
 	}{
-		{"user unit own ordinal", db.MessageRef{SessionID: "s", Ordinal: 0},
-			db.UnitRef{DocKey: "u:s:0", SessionID: "s"}},
+		{
+			"user unit own ordinal",
+			db.MessageRef{SessionID: "s", Ordinal: 0},
+			db.UnitRef{DocKey: "u:s:0", SessionID: "s"},
+		},
 		{"run first ordinal", db.MessageRef{SessionID: "s", Ordinal: 1}, runA},
 		{"run interior ordinal", db.MessageRef{SessionID: "s", Ordinal: 2}, runA},
 		{"run last ordinal", db.MessageRef{SessionID: "s", Ordinal: 3}, runA},
@@ -656,7 +693,7 @@ func TestResolveMessageUnitsIgnoresParkedRows(t *testing.T) {
 	seedUnitRow(t, ix, "r:s:parked", "s", -2, 3, false)
 	seedUnitRow(t, ix, "r:s:valid", "s", 5, 6, false)
 
-	got, err := ix.ResolveMessageUnits(context.Background(), []db.MessageRef{
+	got, err := ix.ResolveMessageUnits(t.Context(), []db.MessageRef{
 		{SessionID: "s", Ordinal: 2},
 		{SessionID: "s", Ordinal: 5},
 	})
@@ -675,7 +712,7 @@ func TestResolveMessageUnitsIgnoresParkedRows(t *testing.T) {
 // hit with a negative ordinal.
 func TestHydrateHitsIgnoresParkedRows(t *testing.T) {
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	seedMirrorRow(t, ix, "u-parked", db.EmbeddableUnit{
 		SessionID: "s1", Kind: "user", Ordinal: -1, OrdinalEnd: 4,
 		Content: "parked mid-refresh",
@@ -702,7 +739,7 @@ func TestResolveMessageUnitsResultParallelToRefs(t *testing.T) {
 	ix := openTestIndex(t)
 	seedUnitRow(t, ix, "r:s:a", "s", 1, 3, true)
 
-	got, err := ix.ResolveMessageUnits(context.Background(), []db.MessageRef{
+	got, err := ix.ResolveMessageUnits(t.Context(), []db.MessageRef{
 		{SessionID: "s", Ordinal: 4},
 		{SessionID: "s", Ordinal: 2},
 		{SessionID: "missing", Ordinal: 2},
@@ -720,7 +757,7 @@ func TestResolveMessageUnitsResultParallelToRefs(t *testing.T) {
 // non-nil result and no query error.
 func TestResolveMessageUnitsEmptyRefs(t *testing.T) {
 	ix := openTestIndex(t)
-	got, err := ix.ResolveMessageUnits(context.Background(), nil)
+	got, err := ix.ResolveMessageUnits(t.Context(), nil)
 	require.NoError(t, err)
 	assert.Empty(t, got)
 }
@@ -738,7 +775,7 @@ func TestResolveMessageUnitsManyRefs(t *testing.T) {
 	for i := range refs {
 		refs[i] = db.MessageRef{SessionID: "s", Ordinal: i}
 	}
-	got, err := ix.ResolveMessageUnits(context.Background(), refs)
+	got, err := ix.ResolveMessageUnits(t.Context(), refs)
 	require.NoError(t, err)
 	require.Len(t, got, n)
 	for i, u := range got {
@@ -751,7 +788,7 @@ func TestResolveMessageUnitsManyRefs(t *testing.T) {
 // fail closed with ErrMirrorVersionMismatch before touching any table, the
 // same contract Search and StaleActive already honor.
 func TestResolveMessageUnitsVersionMismatchGate(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "vectors.db")
 	seedV2Mirror(t, path)
 
@@ -852,7 +889,9 @@ func TestSearchReducedDimensionsEndToEnd(t *testing.T) {
 			Input      []string `json:"input"`
 			Dimensions int      `json:"dimensions"`
 		}
-		require.NoError(t, json.UnmarshalRead(r.Body, &req))
+		if !assert.NoError(t, json.UnmarshalRead(r.Body, &req)) {
+			return
+		}
 		mu.Lock()
 		requestedDims = append(requestedDims, req.Dimensions)
 		mu.Unlock()
@@ -876,7 +915,7 @@ func TestSearchReducedDimensionsEndToEnd(t *testing.T) {
 			data[i] = map[string]any{"index": i, "embedding": vec}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.MarshalWrite(w, map[string]any{"data": data}))
+		assert.NoError(t, json.MarshalWrite(w, map[string]any{"data": data}))
 	}))
 	defer srv.Close()
 
@@ -890,7 +929,7 @@ func TestSearchReducedDimensionsEndToEnd(t *testing.T) {
 	})
 
 	ix := openTestIndex(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	gen := kitvec.Generation{
 		Model:      "matryoshka-model",
 		Dimensions: reducedDim,

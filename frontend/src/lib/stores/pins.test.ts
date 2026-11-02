@@ -2,55 +2,64 @@ import { describe, it, expect, beforeEach, vi } from "vite-plus/test";
 import { PinsService } from "../api/generated/index";
 import { createPinsStore } from "./pins.svelte.js";
 
-const apiRuntimeMocks = vi.hoisted(() => ({
-  callGenerated: vi.fn(
-    (request: () => Promise<unknown>, _signal?: AbortSignal) => request(),
-  ),
-}));
-
 vi.mock("../api/runtime.js", () => ({
-  configureGeneratedClient: vi.fn(),
-  callGenerated: apiRuntimeMocks.callGenerated,
   isAbortError: vi.fn(() => false),
 }));
 
 vi.mock("../api/generated/index", () => ({
   PinsService: {
     getApiV1Pins: vi.fn().mockResolvedValue({ pins: [] }),
-    getApiV1SessionsIdPins: vi.fn().mockResolvedValue({ pins: [] }),
-    postApiV1SessionsIdMessagesMessageidPin: vi.fn().mockResolvedValue({ id: 1 }),
-    deleteApiV1SessionsIdMessagesMessageidPin: vi.fn().mockResolvedValue(undefined),
+    getApiV1SessionsByIdPins: vi.fn().mockResolvedValue({ pins: [] }),
+    postApiV1SessionsByIdMessagesByMessageIdPin: vi.fn().mockResolvedValue({ id: 1 }),
+    deleteApiV1SessionsByIdMessagesByMessageIdPin: vi.fn().mockResolvedValue(undefined),
+    deleteApiV1SessionsByIdPinReferencesByMessageKey: vi.fn().mockResolvedValue(undefined),
   },
 }));
 
 const pinsService = PinsService as unknown as {
   getApiV1Pins: ReturnType<typeof vi.fn>;
-  getApiV1SessionsIdPins: ReturnType<typeof vi.fn>;
-  postApiV1SessionsIdMessagesMessageidPin: ReturnType<typeof vi.fn>;
-  deleteApiV1SessionsIdMessagesMessageidPin: ReturnType<typeof vi.fn>;
+  getApiV1SessionsByIdPins: ReturnType<typeof vi.fn>;
+  postApiV1SessionsByIdMessagesByMessageIdPin: ReturnType<typeof vi.fn>;
+  deleteApiV1SessionsByIdMessagesByMessageIdPin: ReturnType<typeof vi.fn>;
 };
 
-const PIN_ALPHA = { id: 1, session_id: "s1", message_id: 10, ordinal: 1, content: "alpha pin", role: "user", created_at: "", session_project: "alpha", session_title: "alpha session" };
-const PIN_BETA  = { id: 2, session_id: "s2", message_id: 20, ordinal: 1, content: "beta pin",  role: "user", created_at: "", session_project: "beta",  session_title: "beta session"  };
+const PIN_ALPHA = {
+  has_context_tokens: false,
+  has_output_tokens: false,
+  id: 1,
+  session_id: "s1",
+  message_id: 10,
+  ordinal: 1,
+  content: "alpha pin",
+  role: "user",
+  created_at: "",
+  session_project: "alpha",
+  session_title: "alpha session",
+};
+const PIN_BETA = {
+  has_context_tokens: false,
+  has_output_tokens: false,
+  id: 2,
+  session_id: "s2",
+  message_id: 20,
+  ordinal: 1,
+  content: "beta pin",
+  role: "user",
+  created_at: "",
+  session_project: "beta",
+  session_title: "beta session",
+};
 
 describe("PinsStore.loadAll project filtering", () => {
   let store: ReturnType<typeof createPinsStore>;
 
   beforeEach(() => {
     store = createPinsStore();
-    apiRuntimeMocks.callGenerated.mockReset();
-    apiRuntimeMocks.callGenerated.mockImplementation(
-      (request: () => Promise<unknown>, _signal?: AbortSignal) => request(),
-    );
+
     pinsService.getApiV1Pins.mockResolvedValue({ pins: [] });
   });
 
   it("aborts an obsolete all-pins read when the project changes", async () => {
-    const signals: AbortSignal[] = [];
-    apiRuntimeMocks.callGenerated.mockImplementation((request, signal) => {
-      signals.push(signal as AbortSignal);
-      return request();
-    });
     pinsService.getApiV1Pins
       .mockImplementationOnce(() => new Promise(() => {}))
       .mockResolvedValueOnce({ pins: [PIN_BETA] });
@@ -59,27 +68,22 @@ describe("PinsStore.loadAll project filtering", () => {
     await Promise.resolve();
     await store.loadAll("beta");
 
-    expect(signals[0]?.aborted).toBe(true);
+    expect(vi.mocked(PinsService.getApiV1Pins).mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
   });
 
   it("keeps all-pins and session-pins cancellation independent", async () => {
-    const signals: AbortSignal[] = [];
-    apiRuntimeMocks.callGenerated.mockImplementation((request, signal) => {
-      signals.push(signal as AbortSignal);
-      return request();
-    });
     pinsService.getApiV1Pins.mockImplementationOnce(() => new Promise(() => {}));
-    pinsService.getApiV1SessionsIdPins.mockImplementationOnce(
-      () => new Promise(() => {}),
-    );
+    pinsService.getApiV1SessionsByIdPins.mockImplementationOnce(() => new Promise(() => {}));
 
     void store.loadAll();
     void store.loadForSession("s1");
     await Promise.resolve();
     store.cancelSessionPinsRead();
 
-    expect(signals[0]?.aborted).toBe(false);
-    expect(signals[1]?.aborted).toBe(true);
+    expect(vi.mocked(PinsService.getApiV1Pins).mock.lastCall?.[1]?.signal?.aborted).toBe(false);
+    expect(
+      vi.mocked(PinsService.getApiV1SessionsByIdPins).mock.lastCall?.[1]?.signal?.aborted,
+    ).toBe(true);
   });
 
   it("populates pins on successful load", async () => {
@@ -95,9 +99,11 @@ describe("PinsStore.loadAll project filtering", () => {
     expect(store.pins).toEqual([PIN_ALPHA]);
 
     // Switch to project beta — the fetch hangs; capture the in-flight call.
-    let resolveBeta!: (v: { pins: typeof PIN_BETA[] }) => void;
+    let resolveBeta!: (v: { pins: (typeof PIN_BETA)[] }) => void;
     pinsService.getApiV1Pins.mockReturnValue(
-      new Promise((r) => { resolveBeta = r; })
+      new Promise((r) => {
+        resolveBeta = r;
+      }),
     );
     const betaLoad = store.loadAll("beta");
 
@@ -130,9 +136,11 @@ describe("PinsStore.loadAll project filtering", () => {
     await store.loadAll("alpha");
 
     // Re-fetch the same project — fetch hangs.
-    let resolve!: (v: { pins: typeof PIN_ALPHA[] }) => void;
+    let resolve!: (v: { pins: (typeof PIN_ALPHA)[] }) => void;
     pinsService.getApiV1Pins.mockReturnValue(
-      new Promise((r) => { resolve = r; })
+      new Promise((r) => {
+        resolve = r;
+      }),
     );
     const refetch = store.loadAll("alpha");
 
@@ -161,9 +169,11 @@ describe("PinsStore.loadAll project filtering", () => {
 
   it("does not apply a superseded load response after project changes", async () => {
     // Start a slow alpha load.
-    let resolveAlpha!: (v: { pins: typeof PIN_ALPHA[] }) => void;
+    let resolveAlpha!: (v: { pins: (typeof PIN_ALPHA)[] }) => void;
     pinsService.getApiV1Pins.mockReturnValueOnce(
-      new Promise((r) => { resolveAlpha = r; })
+      new Promise((r) => {
+        resolveAlpha = r;
+      }),
     );
     const alphaLoad = store.loadAll("alpha");
 
@@ -176,5 +186,37 @@ describe("PinsStore.loadAll project filtering", () => {
     resolveAlpha({ pins: [PIN_ALPHA] });
     await alphaLoad;
     expect(store.pins).toEqual([PIN_BETA]);
+  });
+});
+
+describe("retained pin references", () => {
+  it("does not mark a reused ordinal pinned and removes the retained message key", async () => {
+    const store = createPinsStore();
+    const oldPin = {
+      ...PIN_ALPHA,
+      message_id: 1,
+      ordinal: 1,
+      message_key: "old-message",
+      unresolved: true,
+    };
+    const currentPin = {
+      ...PIN_ALPHA,
+      id: 2,
+      message_id: 2,
+      ordinal: 2,
+      message_key: "current-message",
+    };
+    pinsService.getApiV1SessionsByIdPins.mockResolvedValue({ pins: [oldPin, currentPin] });
+    await store.loadForSession("s1");
+    expect(store.isPinned(1)).toBe(false);
+    expect(store.isPinned(2)).toBe(true);
+    store.pins = [oldPin, currentPin];
+    pinsService.getApiV1Pins.mockResolvedValue({ pins: [currentPin] });
+    await store.removeReference(oldPin);
+    expect(PinsService.deleteApiV1SessionsByIdPinReferencesByMessageKey).toHaveBeenCalledWith({
+      id: "s1",
+      messageKey: "old-message",
+    });
+    expect(store.pins.map((p) => p.message_key)).toEqual(["current-message"]);
   });
 });

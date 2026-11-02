@@ -2,9 +2,11 @@ package parser
 
 import (
 	"bufio"
+	"context"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -87,24 +89,19 @@ func parsePiLikeSession(
 		project = ExtractProjectFromCwd(cwd)
 	}
 
-	// Branch lineage. Upstream pi records the parent as branchedFrom, a
-	// file path whose basename without extension is the parent's session
-	// ID. OMP (Oh My Pi) headers instead record the parent's session ID
-	// directly in parentSession, while Prime Agent records its file path there.
-	// branchedFrom wins when present so upstream pi is unchanged.
-	// Both paths reuse this session's own idPrefix, so the mapped value
-	// matches the parent's stored ID (idPrefix + its session id) and
-	// lineage resolves.
+	// Branch lineage. Pi records persisted parents as file paths in
+	// branchedFrom or parentSession. OMP records a raw ID in parentSession,
+	// while Prime Agent and native Pi may need to resolve a persisted path
+	// against a sibling. branchedFrom wins when present.
 	var parentSessionID string
 	if branchedFrom := gjson.Get(headerLine, "branchedFrom").Str; branchedFrom != "" {
 		parentSessionID = idPrefix + piPersistedPathSessionID(branchedFrom)
-	} else if agent == AgentOMP || agent == AgentPrimeAgent {
-		if parentSession := gjson.Get(headerLine, "parentSession").Str; parentSession != "" {
-			if agent == AgentPrimeAgent {
-				parentSession = primeParentSessionID(path, parentSession)
-			}
-			parentSessionID = idPrefix + parentSession
+	} else if parentSession := gjson.Get(headerLine, "parentSession").Str; parentSession != "" &&
+		(agent == AgentPi || agent == AgentOMP || agent == AgentPrimeAgent) {
+		if agent == AgentPrimeAgent || agent == AgentPi {
+			parentSession = primeParentSessionID(path, parentSession)
 		}
+		parentSessionID = idPrefix + parentSession
 	}
 
 	// OMP writes subagent transcripts inside a directory named after the
@@ -117,6 +114,17 @@ func parsePiLikeSession(
 		if parentID := ompParentHeaderSessionID(path); parentID != "" {
 			parentSessionID = idPrefix + parentID
 			isOMPSubagent = true
+		}
+	}
+
+	// The pi-subagents extension writes a fresh child to
+	// <project>/<parent>/<runId>/run-N/session.jsonl with no parentSession in
+	// its header, so lineage comes from the parent transcript three levels up.
+	var isPiSubagent bool
+	if agent == AgentPi && parentSessionID == "" {
+		if parentID := piSubagentParentSessionID(path); parentID != "" {
+			parentSessionID = idPrefix + parentID
+			isPiSubagent = true
 		}
 	}
 
@@ -195,7 +203,7 @@ func parsePiLikeSession(
 				sourceParentUUID := resolveVisibleAncestor(parentID)
 				msg := parsePiAssistantMessage(
 					line, ordinal, currentModel, entryID,
-					sourceParentUUID,
+					sourceParentUUID, cwd,
 				)
 				if msg == nil {
 					continue
@@ -352,10 +360,10 @@ func parsePiLikeSession(
 			Mtime: info.ModTime().UnixNano(),
 		},
 	}
-	if agent == AgentPrimeAgent && parentSessionID != "" {
+	if (agent == AgentPrimeAgent || agent == AgentPi) && parentSessionID != "" {
 		sess.RelationshipType = RelFork
 	}
-	if isOMPSubagent {
+	if isOMPSubagent || isPiSubagent {
 		sess.RelationshipType = RelSubagent
 	}
 
@@ -431,7 +439,7 @@ func parsePiUserMessage(
 // model_change entry), used when this message has no inline model.
 func parsePiAssistantMessage(
 	line string, ordinal int, fallbackModel, sourceUUID,
-	sourceParentUUID string,
+	sourceParentUUID, sessionCwd string,
 ) *ParsedMessage {
 	var (
 		parts       []string
@@ -470,15 +478,18 @@ func parsePiAssistantMessage(
 				// "description" so the frontend can use a single
 				// params.description check across all agents.
 				argsRaw = normalizePiIntent(argsRaw)
+				rendering := formatPiToolUse(name, argsRaw)
 				toolCalls = append(toolCalls, ParsedToolCall{
 					ToolUseID: id,
 					ToolName:  name,
 					Category:  NormalizeToolCategory(name),
 					InputJSON: argsRaw,
+					SkillName: inferPiSkillName(
+						name, argsRaw, sessionCwd,
+					),
+					Rendering: rendering,
 				})
-				parts = append(parts, formatPiToolUse(
-					name, argsRaw,
-				))
+				parts = append(parts, rendering)
 			}
 			return true
 		})
@@ -502,6 +513,61 @@ func parsePiAssistantMessage(
 	}
 	applyPiTokenUsage(pm, line, fallbackModel)
 	return pm
+}
+
+// inferPiSkillName attributes a Pi tool call to a skill when the call
+// is a skill load. Pi has no dedicated skill tool: a native skill load
+// is emitted as an ordinary `read` tool call whose path argument points
+// at the skill's SKILL.md (Pi resolves skills from many roots:
+// ~/.pi/agent/skills, project .pi/skills, .agents/skills, package
+// skills/, --skill <path>), or, in newer OMP builds, at a
+// skill://<name> URI in that read path. Without attribution these calls
+// inflate the Read tool count and leave the Skills dimension empty.
+// Relative SKILL.md paths resolve against the session working directory
+// (sessionCwd).
+func inferPiSkillName(toolName, inputJSON, sessionCwd string) string {
+	if isCursorSkillReadTool(toolName) {
+		// Pi's read input carries no cwd/workdir key, so
+		// inferSkillNameFromJSONPaths can't resolve relative SKILL.md
+		// paths; try the path keys directly against the session working
+		// directory first, mirroring the OpenCode parser.
+		for _, key := range []string{"path", "file_path"} {
+			fp := gjson.Get(inputJSON, key).Str
+			if skill, ok := piSkillURISkillName(fp); ok {
+				return skill
+			}
+			if fp != "" && sessionCwd != "" {
+				if name := skillNameFromPath(context.Background(), fp, sessionCwd); name != "" {
+					return name
+				}
+			}
+		}
+		return inferSkillNameFromJSONPaths(context.Background(), inputJSON)
+	}
+	return inferCodexSkillNameWithBase(context.Background(), toolName, inputJSON, sessionCwd)
+}
+
+// piSkillURISkillName extracts the decoded skill name from the
+// skill://<name> URI used as a Pi-family read path. ok is false when
+// path is not a valid skill URI, leaving attribution to the SKILL.md
+// path heuristic.
+func piSkillURISkillName(path string) (string, bool) {
+	path = strings.TrimSpace(path)
+	if !strings.HasPrefix(path, "skill://") {
+		return "", false
+	}
+	rest := path[len("skill://"):]
+	if end := strings.IndexAny(rest, "/?# \t\n\r"); end >= 0 {
+		rest = rest[:end]
+	}
+	if rest == "" {
+		return "", false
+	}
+	name, err := url.PathUnescape(rest)
+	if err != nil || name == "" {
+		return "", false
+	}
+	return name, true
 }
 
 // applyPiTokenUsage extracts the assistant message's model and
@@ -706,7 +772,43 @@ func piTimestamp(line string) time.Time {
 // plus ".jsonl". The ID resolution mirrors parent parsing: prefer the header
 // id, but support V1 parent transcripts by falling back to the parent filename.
 func ompParentHeaderSessionID(childPath string) string {
-	parent := filepath.Dir(childPath) + ".jsonl"
+	return parentTranscriptSessionID(filepath.Dir(childPath) + ".jsonl")
+}
+
+// piSubagentParentSessionID returns the parent Pi session's stored raw ID for a
+// pi-subagents child at <parent>/<runId>/run-N/session.jsonl, or "" when
+// childPath does not have that shape or no Pi transcript sits at
+// <parent>.jsonl. A delegated child's own children resolve to that child,
+// because the extension nests them below its session.jsonl stem.
+func piSubagentParentSessionID(childPath string) string {
+	if filepath.Base(childPath) != "session.jsonl" {
+		return ""
+	}
+	runDir := filepath.Dir(childPath)
+	if !isPiSubagentRunDir(filepath.Base(runDir)) {
+		return ""
+	}
+	return parentTranscriptSessionID(filepath.Dir(filepath.Dir(runDir)) + ".jsonl")
+}
+
+// isPiSubagentRunDir reports whether name is a pi-subagents attempt directory
+// (run-0, run-1, ...).
+func isPiSubagentRunDir(name string) bool {
+	n, ok := strings.CutPrefix(name, "run-")
+	if !ok || n == "" {
+		return false
+	}
+	for _, r := range n {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// parentTranscriptSessionID returns the session ID a parent transcript at
+// parent parses to, or "" when parent is not a Pi-format transcript.
+func parentTranscriptSessionID(parent string) string {
 	parentID, ok := piSessionHeaderID(parent)
 	if !ok {
 		return ""

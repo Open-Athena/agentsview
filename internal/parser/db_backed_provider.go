@@ -17,19 +17,22 @@ type dbBackedSessionMeta struct {
 }
 
 type dbBackedProviderSpec struct {
-	agent        AgentType
-	dbName       string
-	findDB       func(string) string
-	streamMeta   func(context.Context, string, func(dbBackedSessionMeta) error) error
-	metaForID    func(context.Context, string, string) (dbBackedSessionMeta, bool, error)
-	parse        func(string, string, string) ([]ParseResult, error)
-	normalizeRaw func(string) string
-	caps         Capabilities
+	agent           AgentType
+	dbName          string
+	findDB          func(string) string
+	streamMeta      func(context.Context, string, func(dbBackedSessionMeta) error) error
+	metaForID       func(context.Context, string, string) (dbBackedSessionMeta, bool, error)
+	fingerprintHash func(context.Context, string, string) (string, bool, error)
+	parse           func(context.Context, string, string, string) ([]ParseResult, error)
+	normalizeRaw    func(string) string
+	caps            Capabilities
 }
 
 type dbBackedProviderFactory struct {
-	def  AgentDef
-	spec dbBackedProviderSpec
+	def            AgentDef
+	spec           func(bool) dbBackedProviderSpec
+	normalizeRoots func([]string) []string
+	tracker        *sqliteChangeTracker
 }
 
 func (f dbBackedProviderFactory) Definition() AgentDef {
@@ -37,17 +40,24 @@ func (f dbBackedProviderFactory) Definition() AgentDef {
 }
 
 func (f dbBackedProviderFactory) Capabilities() Capabilities {
-	return f.spec.caps
+	return withDBBackedRawCapture(f.spec(false).caps)
 }
 
 func (f dbBackedProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
+	if f.normalizeRoots != nil {
+		cfg.Roots = f.normalizeRoots(cfg.Roots)
+	}
+	spec := f.spec(cfg.StableSourceSnapshots)
+	sources := newDBBackedSourceSet(spec, cfg.Roots)
+	sources.tracker = f.tracker
+	sources.stableSnapshot = cfg.StableSourceSnapshots
 	return &dbBackedProvider{
 		Def:     cloneAgentDef(f.def),
-		Caps:    f.spec.caps,
+		Caps:    withDBBackedRawCapture(spec.caps),
 		Config:  cfg,
-		spec:    f.spec,
-		sources: newDBBackedSourceSet(f.spec, cfg.Roots),
+		spec:    spec,
+		sources: sources,
 	}
 }
 
@@ -55,6 +65,166 @@ type dbBackedProvider struct {
 	ProviderBase
 	spec    dbBackedProviderSpec
 	sources dbBackedSourceSet
+}
+
+var _ StreamingRawCaptureSourceProvider = (*dbBackedProvider)(nil)
+
+type dbBackedRawSource struct {
+	Root   string
+	DBPath string
+}
+
+func withDBBackedRawCapture(capabilities Capabilities) Capabilities {
+	capabilities.RawCapture = RawCaptureCapabilities{
+		Support:  CapabilitySupported,
+		Shape:    RawCaptureShapeSQLite,
+		Append:   RawCaptureAppendReplaceOnly,
+		Snapshot: RawCaptureSnapshotOnlineBackup,
+	}
+	return capabilities
+}
+
+func (p *dbBackedProvider) DiscoverRawCaptureSourcesEach(
+	ctx context.Context,
+	yield func(SourceRef) error,
+) (bool, error) {
+	complete := true
+	for _, root := range p.sources.roots {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		if err := ReportRawCaptureDiscoveryProgress(ctx); err != nil {
+			return false, err
+		}
+		dbPath := p.spec.findDB(root)
+		if dbPath == "" {
+			complete = complete && rawCaptureDBRootComplete(root, p.spec.dbName)
+			continue
+		}
+		if !rawCaptureDBPathRegular(dbPath) {
+			complete = false
+			continue
+		}
+		if err := yield(p.newRawCaptureSource(root, dbPath)); err != nil {
+			return false, err
+		}
+	}
+	return complete, nil
+}
+
+func rawCaptureDBPathRegular(path string) bool {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+	return info.Mode().IsRegular()
+}
+
+func rawCaptureDBRootComplete(root, dbName string) bool {
+	info, err := os.Stat(root)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	dbInfo, err := os.Lstat(filepath.Join(root, dbName))
+	if err == nil {
+		return dbInfo.Mode().IsRegular()
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	return true
+}
+
+func (p *dbBackedProvider) RawCaptureSourcesForChangedPath(
+	ctx context.Context,
+	req ChangedPathRequest,
+) ([]SourceRef, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	for _, root := range p.sources.roots {
+		if req.WatchRoot != "" && !samePath(req.WatchRoot, root) {
+			continue
+		}
+		dbPath, ok := p.sources.dbPathForEvent(root, req.Path)
+		if !ok || !IsRegularFile(dbPath) {
+			continue
+		}
+		return []SourceRef{p.newRawCaptureSource(root, dbPath)}, nil
+	}
+	return nil, nil
+}
+
+func (p *dbBackedProvider) PlanRawCapture(
+	ctx context.Context,
+	source SourceRef,
+) (RawCapturePlan, error) {
+	if err := ctx.Err(); err != nil {
+		return RawCapturePlan{}, err
+	}
+	raw, ok := source.Opaque.(dbBackedRawSource)
+	if !ok || raw.Root == "" || raw.DBPath == "" {
+		return RawCapturePlan{}, invalidRawCapturePlan("database source path unavailable")
+	}
+	if source.Provider != p.spec.agent || source.Key != p.spec.dbName ||
+		!samePath(raw.DBPath, filepath.Join(raw.Root, p.spec.dbName)) ||
+		!IsRegularFile(raw.DBPath) {
+		return RawCapturePlan{}, invalidRawCapturePlan("database source does not match provider root")
+	}
+	return RawCapturePlan{
+		ConfiguredRoot: raw.Root,
+		CaptureRoot:    raw.Root,
+		SourceKey:      source.Key,
+		Entries: []RawCaptureEntry{{
+			Path:      p.spec.dbName,
+			LocalPath: raw.DBPath,
+		}},
+	}, nil
+}
+
+func (p *dbBackedProvider) newRawCaptureSource(root, dbPath string) SourceRef {
+	return SourceRef{
+		Provider:       p.spec.agent,
+		Key:            p.spec.dbName,
+		DisplayPath:    dbPath,
+		FingerprintKey: dbPath,
+		Opaque: dbBackedRawSource{
+			Root: root, DBPath: dbPath,
+		},
+	}
+}
+
+// RawSnapshotSessions enumerates every logical session inside one physical
+// database snapshot, preserving the session-scoped virtual sources the
+// provider's ordinary Fingerprint and Parse contract consumes.
+func (p *dbBackedProvider) RawSnapshotSessions(
+	ctx context.Context,
+	source SourceRef,
+) ([]SourceRef, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	raw, ok := source.Opaque.(dbBackedRawSource)
+	if !ok || raw.Root == "" || raw.DBPath == "" {
+		return nil, invalidRawCapturePlan("database source path unavailable")
+	}
+	if source.Provider != p.spec.agent || source.Key != p.spec.dbName ||
+		!samePath(raw.DBPath, filepath.Join(raw.Root, p.spec.dbName)) ||
+		!IsRegularFile(raw.DBPath) {
+		return nil, invalidRawCapturePlan("database source does not match provider root")
+	}
+	var sessions []SourceRef
+	seen := make(map[string]struct{})
+	err := p.spec.streamMeta(ctx, raw.DBPath, func(meta dbBackedSessionMeta) error {
+		ref := p.sources.newSourceRef(raw.Root, raw.DBPath, meta.SessionID, meta.VirtualPath)
+		ref.DiscoveryMTimeNS = meta.FileMtime
+		addJSONLSource(ref, &sessions, seen)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return sessions, nil
 }
 
 func (p *dbBackedProvider) Discover(ctx context.Context) ([]SourceRef, error) {
@@ -139,8 +309,8 @@ func (p *dbBackedProvider) Parse(
 			// persistent archive: sessions must be preserved even when their
 			// source file no longer exists on disk. Skip without ForceReplace
 			// so the engine keeps the stored sessions instead of deleting them.
-			// The sql.ErrNoRows / empty-results cases below keep ForceReplace
-			// because the DB is still present and the row was genuinely removed.
+			// A present DB is normally authoritative for missing members below;
+			// ExplicitDeletionOnly providers preserve those members as well.
 			return ParseOutcome{
 				ResultSetComplete: true,
 				SkipReason:        SkipNoSession,
@@ -149,23 +319,24 @@ func (p *dbBackedProvider) Parse(
 		return ParseOutcome{}, fmt.Errorf("stat %s: %w", src.DBPath, err)
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
-	results, err := p.spec.parse(src.DBPath, src.SessionID, machine)
+	if p.Config.StableSourceSnapshots {
+		// A stable-snapshot config parses a materialized copy of another
+		// host's tree (hosted raw derivation or bounded capture), so working
+		// directories recorded inside the store are foreign metadata. Keep
+		// project attribution lexical so cwd helpers that never consult the
+		// context still cannot walk the local filesystem from an untrusted
+		// path.
+		ctx = WithoutFilesystemProjectDiscovery(ctx)
+	}
+	results, err := p.spec.parse(ctx, src.DBPath, src.SessionID, machine)
 	if errors.Is(err, sql.ErrNoRows) {
-		return ParseOutcome{
-			ResultSetComplete: true,
-			ForceReplace:      true,
-			SkipReason:        SkipNoSession,
-		}, nil
+		return p.missingMemberOutcome(), nil
 	}
 	if err != nil {
 		return ParseOutcome{}, err
 	}
 	if len(results) == 0 {
-		return ParseOutcome{
-			ResultSetComplete: true,
-			ForceReplace:      true,
-			SkipReason:        SkipNoSession,
-		}, nil
+		return p.missingMemberOutcome(), nil
 	}
 	out := make([]ParseResultOutcome, 0, len(results))
 	for _, result := range results {
@@ -184,6 +355,15 @@ func (p *dbBackedProvider) Parse(
 	}, nil
 }
 
+func (p *dbBackedProvider) missingMemberOutcome() ParseOutcome {
+	return ParseOutcome{
+		ResultSetComplete: true,
+		ForceReplace: p.Caps.Source.ExplicitDeletionOnly !=
+			CapabilitySupported,
+		SkipReason: SkipNoSession,
+	}
+}
+
 type dbBackedSource struct {
 	Root      string
 	DBPath    string
@@ -193,6 +373,10 @@ type dbBackedSource struct {
 type dbBackedSourceSet struct {
 	spec  dbBackedProviderSpec
 	roots []string
+	// A tracker opts into insert-only watcher work. Edits and deletions still
+	// rely on reconciliation; providers without one keep full event listings.
+	tracker        *sqliteChangeTracker
+	stableSnapshot bool
 }
 
 func newDBBackedSourceSet(
@@ -212,6 +396,20 @@ func (s dbBackedSourceSet) Discover(ctx context.Context) ([]SourceRef, error) {
 func (s dbBackedSourceSet) DiscoverEach(
 	ctx context.Context, yield func(SourceRef) error,
 ) error {
+	// Capture every root before enumeration, and publish only after the whole
+	// pass succeeds. Rows written during discovery remain visible to watchers.
+	var watermarks []sqliteDiscoveryWatermark
+	if s.tracker != nil {
+		for _, root := range s.roots {
+			if dbPath := s.spec.findDB(root); dbPath != "" {
+				state, err := s.tracker.read(ctx, dbPath, s.stableSnapshot)
+				if err != nil {
+					return err
+				}
+				watermarks = append(watermarks, sqliteDiscoveryWatermark{dbPath: dbPath, state: state})
+			}
+		}
+	}
 	for _, root := range s.roots {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -233,6 +431,9 @@ func (s dbBackedSourceSet) DiscoverEach(
 		if err != nil {
 			return err
 		}
+	}
+	if s.tracker != nil {
+		s.tracker.storeDiscoveryWatermarks(watermarks)
 	}
 	return nil
 }
@@ -268,6 +469,35 @@ func (s dbBackedSourceSet) SourcesForChangedPath(
 		if !ok {
 			continue
 		}
+		var snapshot sqliteTrackedDatabase
+		storedPaths := req.StoredSourcePaths
+		if s.tracker != nil {
+			if !IsRegularFile(dbPath) {
+				// A vanished database cannot prove that its archived members
+				// were deleted. Keep them without enumerating stored hints.
+				return nil, nil
+			}
+			ids, cold, state, err := s.tracker.changedSessionIDs(ctx, dbPath, s.stableSnapshot)
+			if err != nil {
+				return nil, err
+			}
+			if !cold {
+				sources := make([]SourceRef, 0, len(ids))
+				for _, id := range ids {
+					meta, found, err := s.spec.metaForID(ctx, dbPath, id)
+					if err != nil {
+						return nil, err
+					}
+					if found {
+						sources = append(sources, s.newSourceRef(root, dbPath, meta.SessionID, meta.VirtualPath))
+					}
+				}
+				sortJSONLSources(sources)
+				return sources, nil
+			}
+			snapshot = state
+			storedPaths = nil
+		}
 		var sources []SourceRef
 		seen := make(map[string]struct{})
 		err := s.spec.streamMeta(ctx, dbPath, func(meta dbBackedSessionMeta) error {
@@ -281,7 +511,7 @@ func (s dbBackedSourceSet) SourcesForChangedPath(
 		if err != nil {
 			return nil, err
 		}
-		for _, path := range req.StoredSourcePaths {
+		for _, path := range storedPaths {
 			ref, ok := s.sourceRef(root, path, true)
 			if !ok {
 				continue
@@ -293,6 +523,9 @@ func (s dbBackedSourceSet) SourcesForChangedPath(
 			addJSONLSource(ref, &sources, seen)
 		}
 		sortJSONLSources(sources)
+		if s.tracker != nil {
+			s.tracker.commit(dbPath, snapshot)
+		}
 		return sources, nil
 	}
 	return nil, nil
@@ -335,7 +568,7 @@ func (s dbBackedSourceSet) FindSource(
 					continue
 				}
 				if req.RequireFreshSource {
-					fresh, err := s.sourceExists(src)
+					fresh, err := s.sourceExists(ctx, src)
 					if err != nil {
 						return SourceRef{}, false, err
 					}
@@ -366,11 +599,11 @@ func (s dbBackedSourceSet) FindSource(
 	return SourceRef{}, false, nil
 }
 
-func (s dbBackedSourceSet) sourceExists(src dbBackedSource) (bool, error) {
+func (s dbBackedSourceSet) sourceExists(ctx context.Context, src dbBackedSource) (bool, error) {
 	if !IsRegularFile(src.DBPath) {
 		return false, nil
 	}
-	_, found, err := s.spec.metaForID(context.Background(), src.DBPath, src.SessionID)
+	_, found, err := s.spec.metaForID(ctx, src.DBPath, src.SessionID)
 	if err != nil {
 		return false, err
 	}
@@ -399,13 +632,20 @@ func (s dbBackedSourceSet) Fingerprint(
 	if err != nil {
 		return SourceFingerprint{}, err
 	}
+	fingerprint := SourceFingerprint{Key: key}
 	if found {
-		return SourceFingerprint{
-			Key:     key,
-			MTimeNS: meta.FileMtime,
-		}, nil
+		fingerprint.MTimeNS = meta.FileMtime
 	}
-	return SourceFingerprint{Key: key}, nil
+	if s.spec.fingerprintHash != nil && IsRegularFile(src.DBPath) {
+		hash, found, err := s.spec.fingerprintHash(ctx, src.DBPath, src.SessionID)
+		if err != nil {
+			return SourceFingerprint{}, err
+		}
+		if found {
+			fingerprint.Hash = hash
+		}
+	}
+	return fingerprint, nil
 }
 
 func (s dbBackedSourceSet) sourceFromRef(source SourceRef) (dbBackedSource, bool) {
@@ -460,9 +700,12 @@ func (s dbBackedSourceSet) dbPathForEvent(root, path string) (string, bool) {
 	if strings.Contains(rel, string(filepath.Separator)) {
 		return "", false
 	}
-	if rel == s.spec.dbName ||
-		rel == s.spec.dbName+"-wal" ||
-		rel == s.spec.dbName+"-shm" {
+	// A bare "-shm" event never resolves to the container. Every write to a
+	// WAL-mode database lands in the main file or its -wal sibling; the -shm
+	// index is also rewritten by readers, including this process's own scan,
+	// so honoring it would make each scan schedule the next one. Omnigent and
+	// Cursor IDE apply the same rule through classifySQLiteContainerPath.
+	if rel == s.spec.dbName || rel == s.spec.dbName+"-wal" {
 		dbPath := filepath.Join(root, s.spec.dbName)
 		return dbPath, true
 	}
@@ -496,11 +739,11 @@ func parseDBBackedVirtualPath(path string) (string, string, bool) {
 func newForgeProviderFactory(def AgentDef) ProviderFactory {
 	return dbBackedProviderFactory{
 		def:  cloneAgentDef(def),
-		spec: forgeProviderSpec(),
+		spec: forgeProviderSpec,
 	}
 }
 
-func forgeProviderSpec() dbBackedProviderSpec {
+func forgeProviderSpec(stableSnapshot bool) dbBackedProviderSpec {
 	return dbBackedProviderSpec{
 		agent:  AgentForge,
 		dbName: ForgeDBFilename,
@@ -508,18 +751,20 @@ func forgeProviderSpec() dbBackedProviderSpec {
 		streamMeta: func(
 			ctx context.Context, dbPath string, yield func(dbBackedSessionMeta) error,
 		) error {
-			return ForEachForgeSessionMeta(ctx, dbPath, func(meta ForgeSessionMeta) error {
+			return ForEachForgeSessionMeta(ctx, dbPath, stableSnapshot, func(meta ForgeSessionMeta) error {
 				return yield(dbBackedSessionMeta(meta))
 			})
 		},
 		metaForID: func(
 			ctx context.Context, dbPath, id string,
 		) (dbBackedSessionMeta, bool, error) {
-			meta, found, err := forgeSessionMeta(ctx, dbPath, id)
+			meta, found, err := forgeSessionMeta(ctx, dbPath, id, stableSnapshot)
 			return dbBackedSessionMeta(meta), found, err
 		},
-		parse: func(dbPath, sessionID, machine string) ([]ParseResult, error) {
-			sess, msgs, err := parseForgeSession(dbPath, sessionID, machine)
+		parse: func(
+			ctx context.Context, dbPath, sessionID, machine string,
+		) ([]ParseResult, error) {
+			sess, msgs, err := parseForgeSession(ctx, dbPath, sessionID, machine, stableSnapshot)
 			if err != nil || sess == nil {
 				return nil, err
 			}
@@ -532,11 +777,11 @@ func forgeProviderSpec() dbBackedProviderSpec {
 func newPiebaldProviderFactory(def AgentDef) ProviderFactory {
 	return dbBackedProviderFactory{
 		def:  cloneAgentDef(def),
-		spec: piebaldProviderSpec(),
+		spec: piebaldProviderSpec,
 	}
 }
 
-func piebaldProviderSpec() dbBackedProviderSpec {
+func piebaldProviderSpec(stableSnapshot bool) dbBackedProviderSpec {
 	return dbBackedProviderSpec{
 		agent:  AgentPiebald,
 		dbName: PiebaldDBFilename,
@@ -544,18 +789,20 @@ func piebaldProviderSpec() dbBackedProviderSpec {
 		streamMeta: func(
 			ctx context.Context, dbPath string, yield func(dbBackedSessionMeta) error,
 		) error {
-			return ForEachPiebaldSessionMeta(ctx, dbPath, func(meta PiebaldSessionMeta) error {
+			return ForEachPiebaldSessionMeta(ctx, dbPath, stableSnapshot, func(meta PiebaldSessionMeta) error {
 				return yield(dbBackedSessionMeta(meta))
 			})
 		},
 		metaForID: func(
 			ctx context.Context, dbPath, id string,
 		) (dbBackedSessionMeta, bool, error) {
-			meta, found, err := piebaldSessionMeta(ctx, dbPath, id)
+			meta, found, err := piebaldSessionMeta(ctx, dbPath, id, stableSnapshot)
 			return dbBackedSessionMeta(meta), found, err
 		},
-		parse: func(dbPath, sessionID, machine string) ([]ParseResult, error) {
-			return parsePiebaldSessionResults(dbPath, sessionID, machine)
+		parse: func(
+			ctx context.Context, dbPath, sessionID, machine string,
+		) ([]ParseResult, error) {
+			return parsePiebaldSessionResults(ctx, dbPath, sessionID, machine, stableSnapshot)
 		},
 		normalizeRaw: func(raw string) string {
 			chatID, _, _ := strings.Cut(raw, "-")
@@ -568,11 +815,11 @@ func piebaldProviderSpec() dbBackedProviderSpec {
 func newWarpProviderFactory(def AgentDef) ProviderFactory {
 	return dbBackedProviderFactory{
 		def:  cloneAgentDef(def),
-		spec: warpProviderSpec(),
+		spec: warpProviderSpec,
 	}
 }
 
-func warpProviderSpec() dbBackedProviderSpec {
+func warpProviderSpec(stableSnapshot bool) dbBackedProviderSpec {
 	return dbBackedProviderSpec{
 		agent:  AgentWarp,
 		dbName: WarpDBFilename,
@@ -580,18 +827,20 @@ func warpProviderSpec() dbBackedProviderSpec {
 		streamMeta: func(
 			ctx context.Context, dbPath string, yield func(dbBackedSessionMeta) error,
 		) error {
-			return ForEachWarpSessionMeta(ctx, dbPath, func(meta WarpSessionMeta) error {
+			return ForEachWarpSessionMeta(ctx, dbPath, stableSnapshot, func(meta WarpSessionMeta) error {
 				return yield(dbBackedSessionMeta(meta))
 			})
 		},
 		metaForID: func(
 			ctx context.Context, dbPath, id string,
 		) (dbBackedSessionMeta, bool, error) {
-			meta, found, err := warpSessionMeta(ctx, dbPath, id)
+			meta, found, err := warpSessionMeta(ctx, dbPath, id, stableSnapshot)
 			return dbBackedSessionMeta(meta), found, err
 		},
-		parse: func(dbPath, sessionID, machine string) ([]ParseResult, error) {
-			sess, msgs, err := parseWarpSession(dbPath, sessionID, machine)
+		parse: func(
+			ctx context.Context, dbPath, sessionID, machine string,
+		) ([]ParseResult, error) {
+			sess, msgs, err := parseWarpSession(ctx, dbPath, sessionID, machine, stableSnapshot)
 			if err != nil || sess == nil {
 				return nil, err
 			}

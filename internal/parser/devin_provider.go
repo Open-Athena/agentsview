@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -104,7 +105,7 @@ func (p *devinProvider) Parse(
 		return ParseOutcome{}, fmt.Errorf("stat %s: %w", src.DBPath, err)
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
-	sess, msgs, err := parseDevinSession(src.DBPath, src.SessionID, machine)
+	sess, msgs, err := parseDevinSession(ctx, src.DBPath, src.SessionID, machine)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ParseOutcome{
 			ResultSetComplete: true,
@@ -254,7 +255,7 @@ func (s devinSourceSet) SourcesForChangedPath(
 			return sources, nil
 		}
 		if sessionID, ok := s.transcriptSessionIDForEvent(root, req.Path); ok {
-			if ref, ok, err := s.findByRawSessionID(root, sessionID, false); err != nil {
+			if ref, ok, err := s.findByRawSessionID(ctx, root, sessionID, false); err != nil {
 				return nil, err
 			} else if ok {
 				return []SourceRef{ref}, nil
@@ -322,7 +323,7 @@ func (s devinSourceSet) FindSource(
 				continue
 			}
 			if req.RequireFreshSource {
-				fresh, err := s.sourceExists(src)
+				fresh, err := s.sourceExists(ctx, src)
 				if err != nil {
 					return SourceRef{}, false, err
 				}
@@ -337,7 +338,7 @@ func (s devinSourceSet) FindSource(
 		return SourceRef{}, false, nil
 	}
 	for _, root := range s.roots {
-		ref, ok, err := s.findByRawSessionID(root, req.RawSessionID, req.RequireFreshSource)
+		ref, ok, err := s.findByRawSessionID(ctx, root, req.RawSessionID, req.RequireFreshSource)
 		if err != nil {
 			return SourceRef{}, false, err
 		}
@@ -367,7 +368,7 @@ func (s devinSourceSet) Fingerprint(
 		}
 		return SourceFingerprint{}, fmt.Errorf("stat %s: %w", src.DBPath, err)
 	}
-	meta, err := getDevinSessionMeta(src.DBPath, src.SessionID)
+	meta, err := getDevinSessionMeta(ctx, src.DBPath, src.SessionID)
 	if err != nil {
 		return SourceFingerprint{}, err
 	}
@@ -381,7 +382,7 @@ func (s devinSourceSet) Fingerprint(
 		return SourceFingerprint{}, newDevinTranscriptError("stat", err)
 	}
 	fingerprint.MTimeNS = maxDevinFingerprintMTime(meta, dbInfo, transcriptInfo)
-	hash, err := devinFingerprintHash(meta, src.DBPath, transcriptPath, transcriptInfo)
+	hash, err := devinFingerprintHash(ctx, meta, src.DBPath, transcriptPath, transcriptInfo)
 	if err != nil {
 		return SourceFingerprint{}, err
 	}
@@ -420,7 +421,7 @@ func maxDevinFingerprintMTime(
 	return mtime
 }
 
-func devinFingerprintHash(
+func devinFingerprintHash(ctx context.Context,
 	meta *DevinSessionMeta,
 	dbPath string,
 	transcriptPath string,
@@ -441,10 +442,18 @@ func devinFingerprintHash(
 		return "", err
 	}
 	if transcriptInfo == nil {
-		if err := devinAppendMessageNodesFingerprint(h, dbPath, meta.RawSessionID); err != nil {
+		if _, err := fmt.Fprintf(
+			h,
+			"main_chain_valid\x00%t\x00main_chain\x00%d\x00",
+			meta.MainChainID.Valid,
+			meta.MainChainID.Int64,
+		); err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("%x", h.Sum(nil)), nil
+		if err := devinAppendMessageNodesFingerprint(ctx, h, dbPath, meta.RawSessionID); err != nil {
+			return "", err
+		}
+		return hex.EncodeToString(h.Sum(nil)), nil
 	}
 	if _, err := fmt.Fprintf(
 		h,
@@ -462,11 +471,11 @@ func devinFingerprintHash(
 	if _, err := io.Copy(h, f); err != nil {
 		return "", newDevinTranscriptError("hash", err)
 	}
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func devinAppendMessageNodesFingerprint(h io.Writer, dbPath, rawSessionID string) error {
-	nodes, err := listDevinMessageNodes(dbPath, rawSessionID)
+func devinAppendMessageNodesFingerprint(ctx context.Context, h io.Writer, dbPath, rawSessionID string) error {
+	nodes, err := listDevinMessageNodes(ctx, dbPath, rawSessionID)
 	if err != nil {
 		return err
 	}
@@ -545,7 +554,10 @@ func (s devinSourceSet) dbPathForEvent(root, path string) (string, bool) {
 	if !ok || strings.Contains(rel, string(filepath.Separator)) {
 		return "", false
 	}
-	if rel == devinDBFilename || rel == devinDBFilename+"-wal" || rel == devinDBFilename+"-shm" {
+	// A bare "-shm" event is ignored: the provider's own read connections
+	// rewrite that index, and every committed write lands in the main file
+	// or the WAL.
+	if rel == devinDBFilename || rel == devinDBFilename+"-wal" {
 		return filepath.Join(cliRoot, devinDBFilename), true
 	}
 	return "", false
@@ -561,18 +573,18 @@ func (s devinSourceSet) transcriptSessionIDForEvent(root, path string) (string, 
 	return strings.TrimSuffix(rel, ".json"), true
 }
 
-func (s devinSourceSet) sourceExists(src devinSource) (bool, error) {
+func (s devinSourceSet) sourceExists(ctx context.Context, src devinSource) (bool, error) {
 	if !IsRegularFile(src.DBPath) {
 		return false, nil
 	}
-	meta, err := getDevinSessionMeta(src.DBPath, src.SessionID)
+	meta, err := getDevinSessionMeta(ctx, src.DBPath, src.SessionID)
 	if err != nil {
 		return false, err
 	}
 	return meta != nil, nil
 }
 
-func (s devinSourceSet) findByRawSessionID(root, rawID string, requireFresh bool) (SourceRef, bool, error) {
+func (s devinSourceSet) findByRawSessionID(ctx context.Context, root, rawID string, requireFresh bool) (SourceRef, bool, error) {
 	if root == "" || rawID == "" {
 		return SourceRef{}, false, nil
 	}
@@ -580,7 +592,7 @@ func (s devinSourceSet) findByRawSessionID(root, rawID string, requireFresh bool
 	if dbPath == "" {
 		return SourceRef{}, false, nil
 	}
-	meta, err := getDevinSessionMeta(dbPath, rawID)
+	meta, err := getDevinSessionMeta(ctx, dbPath, rawID)
 	if err != nil {
 		return SourceRef{}, false, err
 	}
@@ -589,7 +601,7 @@ func (s devinSourceSet) findByRawSessionID(root, rawID string, requireFresh bool
 	}
 	ref := s.newSourceRefWithMTime(root, dbPath, rawID, meta.FileMtime)
 	if requireFresh {
-		fresh, err := s.sourceExists(ref.Opaque.(devinSource))
+		fresh, err := s.sourceExists(ctx, ref.Opaque.(devinSource))
 		if err != nil {
 			return SourceRef{}, false, err
 		}

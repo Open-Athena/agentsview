@@ -126,6 +126,7 @@
     thinking: m.header_transcript_blocks_thinking,
     tool: m.header_transcript_blocks_tool,
     code: m.header_transcript_blocks_code,
+    system: m.header_transcript_blocks_system,
   };
 
   const BLOCK_COLORS: Record<BlockType, string> = {
@@ -134,6 +135,7 @@
     thinking: "var(--accent-purple)",
     tool: "var(--accent-amber)",
     code: "var(--text-muted)",
+    system: "var(--text-muted)",
   };
 
   async function handleExport() {
@@ -1004,7 +1006,7 @@
   }
 
   .header-btn:disabled {
-    opacity: 0.55;
+    opacity: var(--opacity-disabled);
     cursor: default;
   }
 
@@ -1058,7 +1060,7 @@
   }
 
   .import-btn:disabled {
-    opacity: 0.55;
+    opacity: var(--opacity-disabled);
     cursor: default;
   }
 

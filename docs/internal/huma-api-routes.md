@@ -27,3 +27,35 @@ When changing route registration or generated client contracts:
   changes when the OpenAPI contract intentionally changed.
 - Keep generated frontend code under `frontend/src/lib/api/generated/`; it is
   marked as generated in `.gitattributes` and should not be hand-edited.
+
+## Generated contract and clients
+
+Run `npm run generate:api` in `frontend/` to regenerate the committed
+[`openapi.yaml`](../../openapi.yaml), the Orval TypeScript client, and the
+DoorDash Go client in `internal/apiclient`. The Go client covers CLI, service,
+raw-sync, and remote transfer operations. `npm run check:api` checks all three
+outputs for drift. The standalone `agentsview openapi --yaml` command prints the
+same schema without opening an archive or starting a server.
+
+Prek and CI run every rule in the shared `huma-check` linter at kit PR #84's
+`efb469cee12d24fd52640ea05b03ced275bf4370` revision. The linter reads the Git
+index, so stage changes before running it locally.
+
+Use Huma's group type and literal prefixes when registering routes so the linter
+can distinguish grouped routes from root paths. Archive and raw-sync clients use
+generated operations with an unread-response transport to preserve streaming and
+caller-owned response limits.
+
+## Collection nullability
+
+AgentsView uses `encoding/json/v2`, which encodes a nil Go slice as an empty
+JSON array. Server initialization sets `huma.DefaultArrayNullable` to `false`
+before Huma builds the schema, so ordinary slice fields have the same
+non-nullable array contract in OpenAPI 3.1 and on the wire.
+
+- Use an ordinary slice for an array that may be empty but never null.
+- Use an explicit nullable representation and `nullable:"true"` only when `null`
+  is part of the wire contract.
+- Use generated response types in stores and components. Do not cast a generated
+  response to a handwritten wire type; fix the schema or add a typed adapter
+  instead.

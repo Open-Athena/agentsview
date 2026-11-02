@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	stdsync "sync"
 	"time"
 
 	"go.kenn.io/agentsview/internal/db"
@@ -32,9 +35,13 @@ import (
 // interface (GetSessionFilePath, Reader). Structural nil checks
 // on local+engine replace runtime type assertions.
 type directBackend struct {
-	db     db.Store
-	local  *db.DB
-	engine *sync.Engine
+	db             db.Store
+	local          *db.DB
+	engine         *sync.Engine
+	evidenceSource string
+	memoryStatusMu stdsync.Mutex
+	memoryStatus   MemoryStatus
+	memoryStatusAt time.Time
 }
 
 // NewDirectBackend returns a full read/write SessionService
@@ -43,17 +50,101 @@ type directBackend struct {
 // work. Use NewReadOnlyBackend for stores that are not *db.DB
 // (e.g. a PostgreSQL reader).
 func NewDirectBackend(d *db.DB, engine *sync.Engine) SessionService {
-	return &directBackend{db: d, local: d, engine: engine}
+	return &directBackend{db: d, local: d, engine: engine, evidenceSource: newEvidenceSource()}
 }
 
 // NewReadOnlyBackend returns a read-only SessionService over any
 // db.Store (e.g. a PostgreSQL reader used by `pg serve`). Sync
 // returns db.ErrReadOnly unconditionally.
 func NewReadOnlyBackend(d db.Store) SessionService {
-	return &directBackend{db: d}
+	return &directBackend{db: d, evidenceSource: newEvidenceSource()}
 }
 
+// newEvidenceSource returns a random ID for this backend instance, so a
+// continuation cannot be replayed against a different archive or server.
+func newEvidenceSource() string { return rand.Text() }
+
 func (b *directBackend) SupportsRecallQueries() bool { return b.local != nil }
+
+func (b *directBackend) MemoryStatus(ctx context.Context) (MemoryStatus, error) {
+	status, err := b.computeMemoryStatus(ctx)
+	if err != nil {
+		return MemoryStatus{}, err
+	}
+	b.memoryStatusMu.Lock()
+	b.memoryStatus = status
+	b.memoryStatusAt = time.Now()
+	b.memoryStatusMu.Unlock()
+	return status, nil
+}
+
+func (b *directBackend) computeMemoryStatus(ctx context.Context) (MemoryStatus, error) {
+	now := time.Now().UTC()
+	backend := "unknown"
+	if named, ok := b.db.(db.MemoryBackendNamer); ok {
+		backend = named.MemoryBackendName()
+	}
+	archive := MemoryArchiveStatus{Backend: backend, ReadOnly: b.db.ReadOnly()}
+	if b.local != nil {
+		identity, err := b.local.GetSyncState(ctx, "artifact_local_installation_id")
+		if err != nil {
+			return MemoryStatus{}, fmt.Errorf("read memory archive identity: %w", err)
+		}
+		archive.Identity = identity
+	}
+	// Every production Store supports bounded substring and terms content
+	// search even when its optional FTS index is absent.
+	lexical := MemoryCapabilityStatus{Status: MemoryReady}
+	semantic := MemoryVectorStatus{Status: MemoryUnknown, Reason: "status_unsupported"}
+	if provider, ok := b.db.(db.SemanticReadinessProvider); ok {
+		status, err := provider.SemanticReadiness(ctx)
+		if err != nil {
+			return MemoryStatus{}, fmt.Errorf("read semantic readiness: %w", err)
+		}
+		semantic = vectorStatusFromDB(status)
+	} else if !b.db.HasSemantic() {
+		semantic = MemoryVectorStatus{Status: MemoryUnavailable, Reason: "not_configured"}
+	}
+	return MemoryStatus{
+		Status:     aggregateMemoryStatus(lexical, semantic),
+		ObservedAt: now,
+		Archive:    archive,
+		Lexical:    lexical,
+		Semantic:   semantic,
+		Sources: MemorySourceStatus{
+			Status: MemoryUnknown, Reason: "source_telemetry_unavailable",
+		},
+	}, nil
+}
+
+const memorySearchStatusTTL = 30 * time.Second
+
+func (b *directBackend) memoryStatusForSearch(
+	ctx context.Context,
+) (MemoryStatus, error) {
+	b.memoryStatusMu.Lock()
+	defer b.memoryStatusMu.Unlock()
+	if !b.memoryStatusAt.IsZero() && time.Since(b.memoryStatusAt) < memorySearchStatusTTL {
+		return b.memoryStatus, nil
+	}
+	status, err := b.computeMemoryStatus(ctx)
+	if err != nil {
+		return MemoryStatus{}, err
+	}
+	b.memoryStatus = status
+	b.memoryStatusAt = time.Now()
+	return status, nil
+}
+
+func (b *directBackend) MachineLabels(
+	ctx context.Context,
+) (MachineLabelCatalog, error) {
+	labels, err := b.db.GetMachineLabels(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return MachineLabelCatalog(labels), nil
+}
 
 func (b *directBackend) Get(
 	ctx context.Context, id string,
@@ -70,6 +161,12 @@ func (b *directBackend) FindSessionIDsByPartial(
 	ctx context.Context, partial string, limit int,
 ) ([]string, error) {
 	return b.db.FindSessionIDsByPartial(ctx, partial, limit)
+}
+
+func (b *directBackend) FindSessionIDsByRawSuffix(
+	ctx context.Context, raw string, limit int,
+) ([]string, error) {
+	return b.db.FindSessionIDsByRawSuffix(ctx, raw, limit)
 }
 
 // buildSessionDetail wraps a db.Session with its computed health
@@ -144,9 +241,13 @@ func (b *directBackend) List(
 		return nil, fmt.Errorf("list: %w", err)
 	}
 	f.Timezone = timezone
+	f.Machine, err = db.ResolveMachineFilter(ctx, b.db, f.Machine)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := db.ParseSortSpec(f.OrderBy); err != nil {
 		return nil, fmt.Errorf(
-			"list: invalid sort %q: %v (valid keys: %s)",
+			"list: invalid sort %q: %w (valid keys: %s)",
 			f.OrderBy, err, strings.Join(db.SortKeys(), ", "),
 		)
 	}
@@ -295,11 +396,45 @@ func (b *directBackend) Messages(
 		w.From = &from
 	}
 
+	revision := ""
+	w.ObservedRevision = &revision
 	msgs, err := b.db.GetMessagesWindow(ctx, id, w)
 	if err != nil {
 		return nil, err
 	}
-	list := &MessageList{Messages: msgs, Count: len(msgs)}
+	// Every store reports the revision from the same statement or
+	// snapshot as the rows, so a non-empty page arrives with its revision.
+	// An empty page has no rows for the revision to describe, so it still
+	// answers from one session lookup to tell "no messages" apart from
+	// "session gone" on a bound read.
+	boundRead := f.ExpectedRevision != "" || f.EvidenceSource != ""
+	if revision == "" && (len(msgs) > 0 || boundRead) {
+		before, err := b.db.GetSession(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if before == nil && boundRead {
+			return nil, fmt.Errorf("%w: cited session no longer exists", ErrSourceChanged)
+		}
+		if before != nil && before.TranscriptRevision != nil {
+			revision = *before.TranscriptRevision
+		}
+		if before != nil && revision == "" && boundRead {
+			return nil, ErrRevisionBoundReadUnavailable
+		}
+	}
+	if f.ExpectedRevision != "" && f.ExpectedRevision != revision {
+		return nil, fmt.Errorf("%w: transcript revision does not match", ErrSourceChanged)
+	}
+	if f.EvidenceSource != "" && f.EvidenceSource != b.evidenceSource {
+		return nil, fmt.Errorf("%w: evidence source does not match", ErrSourceChanged)
+	}
+	list := &MessageList{
+		Messages: msgs, Count: len(msgs), TranscriptRevision: revision,
+	}
+	if revision != "" {
+		list.EvidenceSource = b.evidenceSource
+	}
 	if len(msgs) > 0 {
 		first := msgs[0].Ordinal
 		last := msgs[len(msgs)-1].Ordinal
@@ -411,7 +546,7 @@ func (b *directBackend) Sync(
 
 	path := in.Path
 	if path == "" {
-		storedPath := b.local.GetSessionFilePath(in.ID)
+		storedPath := b.local.GetSessionFilePath(ctx, in.ID)
 		if storedPath == "" {
 			return nil, fmt.Errorf(
 				"sync: no file_path recorded for session %q", in.ID,
@@ -424,8 +559,7 @@ func (b *directBackend) Sync(
 		// nothing if the representative trace was deleted while the
 		// conversation lives on in a sibling. The single-session path keeps the
 		// conversation scope and follows it across sibling trace files.
-		if _, _, ok :=
-			parser.SplitVisualStudioCopilotVirtualPath(storedPath); ok {
+		if _, _, ok := parser.SplitVisualStudioCopilotVirtualPath(storedPath); ok {
 			if err := b.engine.SyncSingleSessionContext(
 				ctx, in.ID,
 			); err != nil {
@@ -626,6 +760,24 @@ func (b *directBackend) Watch(
 				if !ok {
 					return
 				}
+				if identity, ok := b.db.(db.SessionWatchStateStore); ok {
+					state, e := identity.GetSessionWatchState(id)
+					if e != nil {
+						return
+					}
+					payload, e := json.Marshal(state)
+					if e != nil {
+						return
+					}
+					select {
+					case out <- Event{Event: "session.identity", Data: string(payload)}:
+					case <-ctx.Done():
+						return
+					}
+					if state.State != db.SessionWatchResolved {
+						return
+					}
+				}
 				select {
 				case out <- Event{Event: "session_updated", Data: id}:
 				case <-ctx.Done():
@@ -656,7 +808,18 @@ func (b *directBackend) Search(
 	if query == "" {
 		return nil, &db.SearchInputError{Msg: "search: query required"}
 	}
-	if !b.db.HasFTS() {
+	for _, d := range []string{req.DateFrom, req.DateTo} {
+		if d != "" && !timeutil.IsValidDate(d) {
+			return nil, &db.SearchInputError{Msg: "search: invalid date format: use YYYY-MM-DD"}
+		}
+	}
+	if req.DateFrom != "" && req.DateTo != "" && req.DateFrom > req.DateTo {
+		return nil, &db.SearchInputError{Msg: "search: date_from must not be after date_to"}
+	}
+	if !b.db.HasFTS(ctx) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return nil, ErrSearchUnavailable
 	}
 	// Match the HTTP handler's clampLimit semantics: <=0 -> default,
@@ -670,7 +833,12 @@ func (b *directBackend) Search(
 		limit = db.MaxSearchLimit
 	}
 	page, err := b.db.Search(ctx, db.SearchFilter{
-		Query:   db.PrepareFTSQuery(query),
+		DateFrom: req.DateFrom,
+		DateTo:   req.DateTo,
+		// Pass the query through untouched. db.Search prepares it itself,
+		// and pre-quoting here made every Chinese query look like an
+		// explicit FTS5 expression, which skipped word segmentation.
+		Query:   query,
 		Project: req.Project,
 		Sort:    req.Sort,
 		Cursor:  req.Cursor,
@@ -698,6 +866,10 @@ func (b *directBackend) UsageSummary(
 	ctx context.Context, req UsageRequest,
 ) (*UsageSummaryResult, error) {
 	var err error
+	req.Machine, err = db.ResolveMachineFilter(ctx, b.db, req.Machine)
+	if err != nil {
+		return nil, err
+	}
 	req, err = ResolveUsageProjectKeys(ctx, b.db, req)
 	if err != nil {
 		return nil, err
@@ -733,6 +905,10 @@ func (b *directBackend) UsagePairwiseComparison(
 	ctx context.Context, req UsagePairwiseComparisonRequest,
 ) (*UsagePairwiseComparisonResponse, error) {
 	var err error
+	req.Machine, err = db.ResolveMachineFilter(ctx, b.db, req.Machine)
+	if err != nil {
+		return nil, err
+	}
 	req, err = ResolveUsagePairwiseProjectKeys(ctx, b.db, req)
 	if err != nil {
 		return nil, err
@@ -782,11 +958,11 @@ const maxContentSearchContext = 10
 func (b *directBackend) SearchContent(
 	ctx context.Context, req ContentSearchRequest,
 ) (*ContentSearchResult, error) {
-	if req.Mode == "fts" {
+	if req.Mode == "fts" || req.Mode == "terms" {
 		for _, s := range req.Sources {
 			if s != "messages" {
 				return nil, &db.SearchInputError{Msg: fmt.Sprintf(
-					"search: --fts searches messages only (got source %q)", s)}
+					"search: %s searches messages only (got source %q)", req.Mode, s)}
 			}
 		}
 		req.Sources = []string{"messages"}
@@ -805,25 +981,32 @@ func (b *directBackend) SearchContent(
 		return nil, &db.SearchInputError{Msg: "search: " + err.Error()}
 	}
 	req.Timezone = timezone
+	req.Machine, err = db.ResolveMachineFilter(ctx, b.db, req.Machine)
+	if err != nil {
+		return nil, err
+	}
 	page, err := b.db.SearchContent(ctx, db.ContentSearchFilter{
-		Pattern:          req.Pattern,
-		Mode:             req.Mode,
-		Sources:          req.Sources,
-		ExcludeSystem:    req.ExcludeSystem,
-		Project:          req.Project,
-		ExcludeProject:   req.ExcludeProject,
-		Machine:          req.Machine,
-		GitBranch:        req.GitBranch,
-		Agent:            req.Agent,
-		Date:             req.Date,
-		DateFrom:         req.DateFrom,
-		DateTo:           req.DateTo,
-		Timezone:         req.Timezone,
-		ActiveSince:      req.ActiveSince,
-		IncludeChildren:  req.IncludeChildren,
-		IncludeAutomated: req.IncludeAutomated,
-		IncludeOneShot:   req.IncludeOneShot,
-		Scope:            req.Scope,
+		Pattern:           req.Pattern,
+		Mode:              req.Mode,
+		Sources:           req.Sources,
+		ExcludeSystem:     req.ExcludeSystem,
+		Project:           req.Project,
+		ExcludeProject:    req.ExcludeProject,
+		Machine:           req.Machine,
+		GitBranch:         req.GitBranch,
+		SessionID:         req.SessionID,
+		GitBranchExact:    req.GitBranchExact,
+		Agent:             req.Agent,
+		Date:              req.Date,
+		DateFrom:          req.DateFrom,
+		DateTo:            req.DateTo,
+		Timezone:          req.Timezone,
+		ActiveSince:       req.ActiveSince,
+		IncludeChildren:   req.IncludeChildren,
+		IncludeAutomated:  req.IncludeAutomated,
+		IncludeOneShot:    req.IncludeOneShot,
+		ExcludeSessionIDs: req.ExcludeSessionIDs,
+		Scope:             req.Scope,
 		// The store builds snippets from the full source field and redacts
 		// secrets (including ones straddling the snippet window) unless reveal
 		// is set. Redacting the pre-truncated snippet here would miss those.
@@ -834,16 +1017,36 @@ func (b *directBackend) SearchContent(
 	if err != nil {
 		return nil, err
 	}
+	revisionBound := true
+	for i := range page.Matches {
+		if page.Matches[i].TranscriptRevision == "" {
+			revisionBound = false
+			break
+		}
+	}
 	if req.Context > 0 {
-		if err := b.enrichContentContext(
+		contextBound, err := b.enrichContentContext(
 			ctx, page.Matches, req.Context, req.Reveal,
-		); err != nil {
+		)
+		if err != nil {
 			return nil, err
+		}
+		revisionBound = revisionBound && contextBound
+	}
+	status, statusErr := b.memoryStatusForSearch(ctx)
+	coverage := status.Coverage()
+	if statusErr != nil {
+		unknown := MemoryCapabilityStatus{Status: MemoryUnknown, Reason: "status_probe_failed"}
+		coverage = MemoryCoverage{
+			Status: MemoryUnknown, Lexical: unknown,
+			Semantic: MemoryVectorStatus{Status: unknown.Status, Reason: unknown.Reason},
 		}
 	}
 	return &ContentSearchResult{
-		Matches:    page.Matches,
-		NextCursor: page.NextCursor,
+		Matches:       page.Matches,
+		NextCursor:    page.NextCursor,
+		RevisionBound: revisionBound,
+		Coverage:      coverage,
 	}, nil
 }
 
@@ -867,20 +1070,33 @@ func (b *directBackend) SearchContent(
 // adjacent message regardless of transport (HTTP, CLI, MCP all share this
 // path). When reveal is true the raw messages are attached unchanged, same
 // as the snippet path.
+//
+// The context window is read at whatever transcript revision the store
+// holds when the read runs, which can be newer than the revision the match
+// cites when a sync lands between the search and the context read. Each
+// window reports its revision; the returned bool is false when any window
+// came from a different revision than its match, so the caller can drop
+// the revision-bound claim instead of advertising context from a
+// transcript version the citation does not describe.
 func (b *directBackend) enrichContentContext(
 	ctx context.Context, matches []db.ContentMatch, n int, reveal bool,
-) error {
+) (bool, error) {
+	bound := true
 	for i := range matches {
 		m := &matches[i]
 		if m.Ordinal < 0 {
 			continue
 		}
 		anchor := m.Ordinal
+		revision := ""
 		msgs, err := b.db.GetMessagesWindow(ctx, m.SessionID, db.MessageWindow{
-			Around: &anchor, Before: n, After: n,
+			Around: &anchor, Before: n, After: n, ObservedRevision: &revision,
 		})
 		if err != nil {
-			return fmt.Errorf("content search context: %w", err)
+			return false, fmt.Errorf("content search context: %w", err)
+		}
+		if revision != m.TranscriptRevision {
+			bound = false
 		}
 		for _, msg := range msgs {
 			if !reveal {
@@ -894,7 +1110,7 @@ func (b *directBackend) enrichContentContext(
 			}
 		}
 	}
-	return nil
+	return bound, nil
 }
 
 // redactMessageSecrets returns a copy of m with every secret-shaped span
@@ -1126,11 +1342,11 @@ func (b *directBackend) Stats(
 	if err != nil {
 		return nil, err
 	}
-	stats.CodeAttribution = collectCodeAttribution(f, stats)
+	stats.CodeAttribution = collectCodeAttribution(ctx, f, stats)
 	return stats, nil
 }
 
-func collectCodeAttribution(
+func collectCodeAttribution(ctx context.Context,
 	f StatsFilter,
 	stats *SessionStats,
 ) *db.CodeAttribution {
@@ -1138,7 +1354,7 @@ func collectCodeAttribution(
 		return nil
 	}
 	sources := []db.CodeAttributionSource{}
-	if source, ok := collectCursorAttribution(f, stats); ok {
+	if source, ok := collectCursorAttribution(ctx, f, stats); ok {
 		sources = append(sources, source)
 	}
 	if len(sources) == 0 {
@@ -1156,7 +1372,7 @@ func collectCodeAttribution(
 	return &db.CodeAttribution{Sources: sources}
 }
 
-func collectCursorAttribution(
+func collectCursorAttribution(ctx context.Context,
 	f StatsFilter,
 	stats *SessionStats,
 ) (db.CodeAttributionSource, bool) {
@@ -1168,6 +1384,8 @@ func collectCursorAttribution(
 			"unsupported_filter",
 			"Cursor attribution is machine-local and cannot be scoped by project filters",
 		), true
+	case cursorAttributionLoad:
+		// Load attribution for the supported window below.
 	}
 	from, err := time.Parse(time.RFC3339, stats.Window.Since)
 	if err != nil {
@@ -1183,7 +1401,7 @@ func collectCursorAttribution(
 			"failed to parse stats window for Cursor attribution",
 		), true
 	}
-	attr, status, err := parser.LoadCursorAttribution(from, to)
+	attr, status, err := parser.LoadCursorAttribution(ctx, from, to)
 	if err != nil {
 		return cursorAttributionSource(
 			"error",

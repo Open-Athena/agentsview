@@ -1,4 +1,7 @@
+import { EventSource } from "eventsource";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+
+vi.mock("eventsource", () => ({ EventSource: vi.fn() }));
 
 // Minimal EventSource stub. Tests control when events fire and
 // assert on the number of instances created.
@@ -34,9 +37,7 @@ class FakeEventSource {
   }
 
   fireOpen() {
-    (this.listeners["open"] || []).forEach((cb) =>
-      cb(new Event("open") as MessageEvent),
-    );
+    (this.listeners["open"] || []).forEach((cb) => cb(new Event("open") as MessageEvent));
   }
 
   static reset() {
@@ -46,7 +47,9 @@ class FakeEventSource {
 
 beforeEach(async () => {
   FakeEventSource.reset();
-  vi.stubGlobal("EventSource", FakeEventSource);
+  vi.mocked(EventSource).mockImplementation(function (url) {
+    return new FakeEventSource(String(url)) as unknown as EventSource;
+  });
   const { events } = await import("./events.svelte.js");
   events.setAvailable(true);
 });
@@ -125,9 +128,7 @@ describe("events store", () => {
 
   it("self-heals a closed EventSource after a transient failure", async () => {
     vi.useFakeTimers();
-    const { events, EVENTS_STORE_HEAL_INTERVAL_MS } = await import(
-      "./events.svelte.js"
-    );
+    const { events, EVENTS_STORE_HEAL_INTERVAL_MS } = await import("./events.svelte.js");
     const received: string[] = [];
     const unsub = events.subscribe((e) => received.push(e.scope));
     const first = FakeEventSource.instances[0]!;
@@ -155,9 +156,7 @@ describe("events store", () => {
 
   it("does not heal after a permanent failure (never opened)", async () => {
     vi.useFakeTimers();
-    const { events, EVENTS_STORE_HEAL_INTERVAL_MS } = await import(
-      "./events.svelte.js"
-    );
+    const { events, EVENTS_STORE_HEAL_INTERVAL_MS } = await import("./events.svelte.js");
     const unsub = events.subscribe(() => {});
     const first = FakeEventSource.instances[0]!;
 
@@ -210,10 +209,7 @@ describe("events store", () => {
     vi.useFakeTimers();
     const { events } = await import("./events.svelte.js");
     const received: string[] = [];
-    const unsub = events.subscribeDebounced(
-      (e) => received.push(e.scope),
-      100,
-    );
+    const unsub = events.subscribeDebounced((e) => received.push(e.scope), 100);
     const es = FakeEventSource.instances[0]!;
     es.fire("data_changed", { scope: "messages" });
     es.fire("data_changed", { scope: "messages" });

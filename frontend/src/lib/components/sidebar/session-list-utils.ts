@@ -1,7 +1,5 @@
-import type {
-  SessionGroup,
-  SessionGroupInput,
-} from "../../stores/sessions.svelte.js";
+import type { SessionGroup, SessionGroupInput } from "../../stores/sessions.svelte.js";
+import { sessionAncestryMatches } from "../../utils/session-ancestry.js";
 
 export const ITEM_HEIGHT = 42;
 const CHILD_ITEM_HEIGHT = 34;
@@ -65,14 +63,9 @@ export function getInitialGroupMode(): GroupMode {
  * prefer the root session (matching the group key), otherwise
  * pick the most recently active session.
  */
-export function selectPrimaryId(
-  sessions: SessionGroupInput[],
-  groupKey: string,
-): string {
+export function selectPrimaryId(sessions: SessionGroupInput[], groupKey: string): string {
   if (sessions.length === 0) return groupKey;
-  const hasSubagents = sessions.some(
-    (s) => s.relationship_type === "subagent",
-  );
+  const hasSubagents = sessions.some((s) => s.relationship_type === "subagent");
   if (hasSubagents) {
     const root = sessions.find((s) => s.id === groupKey);
     return root ? root.id : sessions[0]!.id;
@@ -95,16 +88,11 @@ export function selectPrimaryId(
  * Groups by agent name or project depending on mode.
  * Returns empty array when mode is "none".
  */
-export function buildGroupSections(
-  groups: SessionGroup[],
-  mode: GroupMode,
-): GroupSection[] {
+export function buildGroupSections(groups: SessionGroup[], mode: GroupMode): GroupSection[] {
   if (mode === "none") return [];
   const map = new Map<string, SessionGroup[]>();
   for (const g of groups) {
-    const primary =
-      g.sessions.find((s) => s.id === g.primarySessionId) ??
-      g.sessions[0];
+    const primary = g.sessions.find((s) => s.id === g.primarySessionId) ?? g.sessions[0];
     if (!primary) continue;
     const key = mode === "agent" ? primary.agent : primary.project;
     let list = map.get(key);
@@ -122,9 +110,7 @@ export function buildGroupSections(
 
 /** Check if a session is a teammate (received a <teammate-message>). */
 function isTeammateByMessage(s: SessionGroupInput): boolean {
-  return s.is_teammate
-    ?? s.first_message?.includes("<teammate-message")
-    ?? false;
+  return s.is_teammate ?? s.first_message?.includes("<teammate-message") ?? false;
 }
 
 /**
@@ -133,24 +119,8 @@ function isTeammateByMessage(s: SessionGroupInput): boolean {
  * `<teammate-message>` tag themselves, but they belong to the
  * same teammate chain.
  */
-function isTeammate(
-  s: SessionGroupInput,
-  allSessions: SessionGroupInput[],
-): boolean {
-  if (isTeammateByMessage(s)) return true;
-  // Walk up the parent chain within the group to inherit.
-  if (s.parent_session_id) {
-    const visited = new Set<string>();
-    let cur: SessionGroupInput | undefined = s;
-    while (cur?.parent_session_id && !visited.has(cur.id)) {
-      visited.add(cur.id);
-      const parent = allSessions.find((p) => p.id === cur!.parent_session_id);
-      if (!parent) break;
-      if (isTeammateByMessage(parent)) return true;
-      cur = parent;
-    }
-  }
-  return false;
+function isTeammate(s: SessionGroupInput, allSessions: SessionGroupInput[]): boolean {
+  return sessionAncestryMatches(s, allSessions, isTeammateByMessage);
 }
 
 /**
@@ -172,20 +142,7 @@ export function isSubagentDescendant(
   s: SessionGroupInput,
   groupSessions: SessionGroupInput[],
 ): boolean {
-  if (isSubagent(s)) return true;
-  if (!s.parent_session_id) return false;
-  const visited = new Set<string>();
-  let cur: SessionGroupInput | undefined = s;
-  while (cur?.parent_session_id && !visited.has(cur.id)) {
-    visited.add(cur.id);
-    const parent = groupSessions.find(
-      (p) => p.id === cur!.parent_session_id,
-    );
-    if (!parent) break;
-    if (isSubagent(parent)) return true;
-    cur = parent;
-  }
-  return false;
+  return sessionAncestryMatches(s, groupSessions, isSubagent);
 }
 
 /**
@@ -261,7 +218,7 @@ function emitGroupItems(
     const hasFollowingGroup = subagents.length > 0 || teammates.length > 0;
     const isLast = i === continuations.length - 1 && !hasFollowingGroup;
     items.push({
-      id: `child:${s.id}`,
+      id: `child:${g.key}:${s.id}`,
       type: "session",
       label,
       count: 0,
@@ -306,7 +263,7 @@ function emitGroupItems(
       for (let i = 0; i < subagents.length; i++) {
         const s = subagents[i]!;
         items.push({
-          id: `child:${s.id}`,
+          id: `child:${g.key}:${s.id}`,
           type: "session",
           label,
           count: 0,
@@ -346,7 +303,7 @@ function emitGroupItems(
       for (let i = 0; i < teammates.length; i++) {
         const s = teammates[i]!;
         items.push({
-          id: `child:${s.id}`,
+          id: `child:${g.key}:${s.id}`,
           type: "session",
           label,
           count: 0,
@@ -428,21 +385,15 @@ export function adjacentVisibleSessionId(
 ): string | null {
   if (!activeSessionId) return null;
 
-  let current = displayItems.findIndex(
-    (item) => displaySessionId(item) === activeSessionId,
-  );
+  let current = displayItems.findIndex((item) => displaySessionId(item) === activeSessionId);
   if (current < 0) {
-    current = displayItems.findIndex(
-      (item) => item.memberSessionIds?.includes(activeSessionId),
-    );
+    current = displayItems.findIndex((item) => item.memberSessionIds?.includes(activeSessionId));
   }
   if (current < 0) {
     current = displayItems.findIndex(
       (item) =>
         item.type === "session" &&
-        item.group?.sessions.some(
-          (session) => session.id === activeSessionId,
-        ),
+        item.group?.sessions.some((session) => session.id === activeSessionId),
     );
   }
   if (current < 0) {
@@ -450,26 +401,18 @@ export function adjacentVisibleSessionId(
       (item) =>
         item.type === "header" &&
         item.sectionGroups?.some((group) =>
-          group.sessions.some(
-            (session) => session.id === activeSessionId,
-          ),
+          group.sessions.some((session) => session.id === activeSessionId),
         ),
     );
   }
 
   if (current < 0) {
-    const rows = displayItems.filter(
-      (item) => item.type === "session",
-    );
+    const rows = displayItems.filter((item) => item.type === "session");
     const edge = delta > 0 ? rows[0] : rows[rows.length - 1];
     return edge ? displaySessionId(edge) : null;
   }
 
-  for (
-    let next = current + delta;
-    next >= 0 && next < displayItems.length;
-    next += delta
-  ) {
+  for (let next = current + delta; next >= 0 && next < displayItems.length; next += delta) {
     const id = displaySessionId(displayItems[next]!);
     if (id) return id;
   }
@@ -490,10 +433,7 @@ export function computeTotalSize(displayItems: DisplayItem[]): number {
  * scrollY position.  Accounts for OVERSCAN rows before the
  * viewport.
  */
-export function findStart(
-  displayItems: DisplayItem[],
-  scrollY: number,
-): number {
+export function findStart(displayItems: DisplayItem[], scrollY: number): number {
   const target = scrollY - OVERSCAN * ITEM_HEIGHT;
   let lo = 0;
   let hi = displayItems.length - 1;

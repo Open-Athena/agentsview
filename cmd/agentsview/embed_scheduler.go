@@ -303,11 +303,9 @@ func stopTimer(t *time.Timer) {
 	}
 }
 
-// resetTimer stops and drains t before rearming it for d, the safe
-// stop-then-reset sequence for a timer whose channel may already hold an
-// unread tick.
+// resetTimer rearms t for d. Go 1.23 and later guarantee that Reset prevents a
+// subsequent receive from observing a stale value from the prior settings.
 func resetTimer(t *time.Timer, d time.Duration) {
-	stopTimer(t)
 	t.Reset(d)
 }
 
@@ -400,7 +398,7 @@ func (a recallSearcherAdapter) SearchRecall(
 ) ([]db.RecallVectorHit, bool, db.RecallVectorSnapshot, error) {
 	identity, err := a.corpusIdentity(ctx)
 	if err != nil {
-		return nil, false, db.RecallVectorSnapshot{}, fmt.Errorf("%w: %v", db.ErrSemanticUnavailable, err)
+		return nil, false, db.RecallVectorSnapshot{}, fmt.Errorf("%w: %w", db.ErrSemanticUnavailable, err)
 	}
 	stale, err := a.ix.StaleActive(
 		ctx, identity.GenerationFingerprint, identity.CorpusRevision,
@@ -445,7 +443,7 @@ func (a recallSearcherAdapter) ValidateRecallSnapshot(
 	}
 	currentIdentity, err := a.corpusIdentity(ctx)
 	if err != nil {
-		return fmt.Errorf("%w: %v", db.ErrSemanticUnavailable, err)
+		return fmt.Errorf("%w: %w", db.ErrSemanticUnavailable, err)
 	}
 	if currentIdentity != identity {
 		return fmt.Errorf(
@@ -456,10 +454,48 @@ func (a recallSearcherAdapter) ValidateRecallSnapshot(
 	return nil
 }
 
+func (a recallSearcherAdapter) MaxRecallSearchCandidates() int {
+	return a.ix.MaxSearchCandidates()
+}
+
 // newSearcherAdapter builds a searcherAdapter for gen's configured
 // embedding identity.
 func newSearcherAdapter(ix *vector.Index, enc kitvec.EncodeFunc, gen kitvec.Generation) searcherAdapter {
 	return searcherAdapter{ix: ix, enc: enc, fingerprint: gen.Fingerprint()}
+}
+
+// SemanticReadiness inspects generation metadata without encoding a query.
+func (a searcherAdapter) SemanticReadiness(
+	ctx context.Context,
+) (db.SemanticReadiness, error) {
+	generations, err := a.ix.Generations(ctx)
+	if err != nil {
+		return db.SemanticReadiness{}, err
+	}
+	for _, generation := range generations {
+		if generation.State != "active" {
+			continue
+		}
+		out := db.SemanticReadiness{
+			State:      "ready",
+			Generation: generation.Fingerprint,
+			Embedded:   generation.Embedded,
+			Missing:    generation.Missing,
+		}
+		if generation.Fingerprint != a.fingerprint {
+			out.State = "unavailable"
+			out.Reason = "configuration_mismatch"
+			return out, nil
+		}
+		if generation.Missing > 0 {
+			out.State = "partial"
+			out.Reason = "index_incomplete"
+		}
+		return out, nil
+	}
+	return db.SemanticReadiness{
+		State: "unavailable", Reason: "no_active_generation",
+	}, nil
 }
 
 // SemanticSearch implements db.VectorSearcher. A stale active generation
@@ -535,17 +571,17 @@ func (a searcherAdapter) ResolveMessageUnits(
 // db.ErrSemanticTransient so a caller can tell "not configured" apart from
 // "configured, but this request failed and can be retried".
 func translateSearchError(err error) error {
-	var buildingErr *vector.BuildingError
-	var queryEncErr *vector.QueryEncodeError
+	buildingErr, hasBuildingErr := errors.AsType[*vector.BuildingError](err)
+	queryEncErr, hasQueryEncErr := errors.AsType[*vector.QueryEncodeError](err)
 	switch {
-	case errors.As(err, &buildingErr):
+	case hasBuildingErr:
 		return fmt.Errorf("%w: index is building: %d%% complete",
 			db.ErrSemanticUnavailable, buildingErr.Percent)
 	case errors.Is(err, vector.ErrMirrorVersionMismatch):
-		return fmt.Errorf("%w: %v", db.ErrSemanticUnavailable, err)
+		return fmt.Errorf("%w: %w", db.ErrSemanticUnavailable, err)
 	case errors.Is(err, vector.ErrNoActiveGeneration):
 		return db.ErrSemanticUnavailable
-	case errors.As(err, &queryEncErr):
+	case hasQueryEncErr:
 		// Double-wrap so callers can still match the underlying cause —
 		// notably context.Canceled/DeadlineExceeded from a dead client —
 		// alongside the transient sentinel.
@@ -558,9 +594,9 @@ func translateSearchError(err error) error {
 // translateRecallSearchError preserves the shared semantic error taxonomy but
 // replaces message-store build guidance with Recall's explicit store selector.
 func translateRecallSearchError(err error) error {
-	var buildingErr *vector.BuildingError
+	buildingErr, hasBuildingErr := errors.AsType[*vector.BuildingError](err)
 	switch {
-	case errors.As(err, &buildingErr):
+	case hasBuildingErr:
 		return db.NewSemanticUnavailableError(fmt.Sprintf(
 			"recall index is building: %d%% complete", buildingErr.Percent,
 		))
@@ -607,7 +643,7 @@ func setupVectorServing(
 	ctx context.Context, cfg config.Config, database *db.DB,
 	idle *server.IdleTracker,
 ) (vectorServing, error) {
-	if !cfg.Vector.Enabled {
+	if cfg.ArchiveContent.UsageOnly() || database.ArchiveContent().UsageOnly() || !cfg.Vector.Enabled {
 		return vectorServing{}, nil
 	}
 
@@ -722,8 +758,11 @@ func setupVectorServing(
 		RecallScheduler:      recallScheduler,
 		RecallMutationNotify: recallMutationNotify,
 		Close: func() error {
-			mgr.Wait()
-			recallMgr.Wait()
+			// Shutdown, not Wait: a detached API build may be waiting out
+			// provider rate limits indefinitely and must be canceled for
+			// daemon shutdown to complete.
+			mgr.Shutdown()
+			recallMgr.Shutdown()
 			ixErr := ix.Close()
 			recallErr := recallIX.Close()
 			lockErr := lock.Close()
@@ -772,7 +811,7 @@ func recallBackstop(cfg config.Config, configured time.Duration) time.Duration {
 // caller must call it when done with d to release the read-only index
 // handle.
 func installDirectVectorSearcher(cfg config.Config, d *db.DB) func() error {
-	if !cfg.Vector.Enabled {
+	if cfg.ArchiveContent.UsageOnly() || d.ArchiveContent().UsageOnly() || !cfg.Vector.Enabled {
 		return nil
 	}
 	path := cfg.Vector.ResolvedDBPath(cfg.DataDir)

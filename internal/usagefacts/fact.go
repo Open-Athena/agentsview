@@ -3,7 +3,9 @@
 package usagefacts
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -16,22 +18,22 @@ const MaxPlausibleTokens = 2_000_000
 
 // MessageInput is the session-independent message shape used for extraction.
 type MessageInput struct {
-	Ordinal                            int
-	Role, Timestamp, Model, TokenUsage string
-	ClaudeMessageID, ClaudeRequestID   string
-	SourceUUID                         string
+	Ordinal                                        int
+	Role, Timestamp, Model, ProviderID, TokenUsage string
+	ClaudeMessageID, ClaudeRequestID               string
+	SourceUUID                                     string
 }
 
 // EventInput is the session-independent usage-event shape used for extraction.
 type EventInput struct {
-	MessageOrdinal            *int
-	Source, Timestamp, Model  string
-	CostSource, DedupKey      string
-	InputTokens, OutputTokens int64
-	ReasoningTokens           int64
-	CacheCreationTokens       int64
-	CacheReadTokens           int64
-	ReportedCostMicrodollars  *int64
+	MessageOrdinal                       *int
+	Source, Timestamp, Model, ProviderID string
+	CostSource, DedupKey                 string
+	InputTokens, OutputTokens            int64
+	ReasoningTokens                      int64
+	CacheCreationTokens                  int64
+	CacheReadTokens                      int64
+	ReportedCostMicrodollars             *int64
 }
 
 // ParsedTokenUsage is the sanitized token and billable tool-use payload.
@@ -58,6 +60,7 @@ type Fact struct {
 	RawTimestamp             string
 	UsesSessionStart         bool
 	Model                    string
+	ProviderID               string
 	InputTokens              int64
 	OutputTokens             int64
 	ReasoningTokens          int64
@@ -90,7 +93,7 @@ func FromMessage(in MessageInput) (Fact, bool) {
 	return Fact{
 		Source: "message", MessageOrdinal: &ordinal,
 		TimestampMillis: millis, TimestampNanos: nanos, RawTimestamp: raw,
-		UsesSessionStart: fallback, Model: in.Model,
+		UsesSessionStart: fallback, Model: in.Model, ProviderID: in.ProviderID,
 		InputTokens: parsed.InputTokens, OutputTokens: parsed.OutputTokens,
 		ReasoningTokens:       parsed.ReasoningTokens,
 		CacheCreationTokens:   parsed.CacheCreationTokens,
@@ -119,7 +122,7 @@ func FromEvent(in EventInput) (Fact, bool) {
 	return Fact{
 		Source: in.Source, MessageOrdinal: in.MessageOrdinal,
 		TimestampMillis: millis, TimestampNanos: nanos, RawTimestamp: raw,
-		UsesSessionStart: fallback, Model: in.Model,
+		UsesSessionStart: fallback, Model: in.Model, ProviderID: in.ProviderID,
 		InputTokens:  clamp(in.InputTokens),
 		OutputTokens: clamp(in.OutputTokens),
 		// Existing usage-event consumers normalize the four request counters
@@ -129,7 +132,7 @@ func FromEvent(in EventInput) (Fact, bool) {
 		CacheReadTokens:          clamp(in.CacheReadTokens),
 		ReportedCostMicrodollars: in.ReportedCostMicrodollars,
 		CostSource:               in.CostSource,
-		RequestScoped:            in.MessageOrdinal != nil || sourceIsRequestScoped(in.Source),
+		RequestScoped:            in.MessageOrdinal != nil || SourceIsRequestScoped(in.Source),
 		UsageDedupKey:            in.DedupKey,
 		TokenEligible:            eligible, ActivityEligible: eligible,
 	}, true
@@ -284,9 +287,15 @@ func floorTokens(value int64) int64 {
 	return value
 }
 
-func sourceIsRequestScoped(source string) bool {
-	return source == "message" || source == "goose-request" ||
-		source == "deepseek-harness"
+// SourceIsRequestScoped reports whether a usage source represents one
+// provider request even when the provider cannot attach it to a message.
+// Posit Assistant sidecar events ("posit-assistant-" + kind, e.g.
+// posit-assistant-keepalive, posit-assistant-classifier) each record one
+// provider request, so the whole prefix is request-scoped.
+func SourceIsRequestScoped(source string) bool {
+	return source == "message" || source == "goose-request" || source == "session-store" ||
+		source == "deepseek-harness" ||
+		strings.HasPrefix(source, "posit-assistant-")
 }
 
 func isTokenCounterKey(key string) bool {
@@ -410,7 +419,7 @@ func parseJSONString(input string, i int) (string, int, bool) {
 				return input[i+1 : j], j + 1, true
 			}
 			var value string
-			if err := json.Unmarshal([]byte(input[i:j+1]), &value); err != nil {
+			if err := json.Unmarshal([]byte(input[i:j+1]), &value, jsontext.AllowInvalidUTF8(true)); err != nil {
 				return "", j + 1, false
 			}
 			return value, j + 1, true
@@ -457,7 +466,7 @@ func parseTokenIntLiteral(value string) (int64, bool) {
 	if err == nil {
 		return parsed, true
 	}
-	if numErr, ok := err.(*strconv.NumError); ok && numErr.Err == strconv.ErrRange {
+	if errors.Is(err, strconv.ErrRange) {
 		if strings.HasPrefix(value, "-") {
 			return -1 << 63, true
 		}

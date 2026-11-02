@@ -9,9 +9,13 @@ import (
 	"strings"
 )
 
-var _ Provider = (*claudeProvider)(nil)
-var _ S3Provider = (*claudeProvider)(nil)
-var _ RawCaptureProvider = (*claudeProvider)(nil)
+var (
+	_ Provider                          = (*claudeProvider)(nil)
+	_ S3Provider                        = (*claudeProvider)(nil)
+	_ RawCaptureProvider                = (*claudeProvider)(nil)
+	_ RawCaptureSourceProvider          = (*claudeProvider)(nil)
+	_ StreamingRawCaptureSourceProvider = (*claudeProvider)(nil)
+)
 
 type claudeProviderFactory struct {
 	def AgentDef
@@ -50,6 +54,52 @@ func (p *claudeProvider) Discover(ctx context.Context) ([]SourceRef, error) {
 
 func (p *claudeProvider) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
 	return p.sources.DiscoverEach(ctx, yield)
+}
+
+func (p *claudeProvider) DiscoverRawCaptureSourcesEach(
+	ctx context.Context,
+	yield func(SourceRef) error,
+) (bool, error) {
+	ctx = withRawCaptureStreamingTraversal(ctx)
+	var incomplete error
+	for rootIndex, root := range p.sources.roots {
+		if err := ReportRawCaptureDiscoveryProgress(ctx); err != nil {
+			return false, err
+		}
+		if isS3URI(root) {
+			continue
+		}
+		err := p.sources.discoverEachRoot(ctx, root, func(source SourceRef) error {
+			for _, earlierRoot := range p.sources.roots[:rootIndex] {
+				earlier, ok := p.sources.sourceRefFromPath(
+					earlierRoot, source.DisplayPath,
+				)
+				if ok && earlier.Key == source.Key {
+					return nil
+				}
+			}
+			return yield(source)
+		})
+		if err == nil {
+			continue
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, ctxErr
+		}
+		rootErr, ok := rawCaptureIncompleteRootError(p.Def.Type, root, err)
+		if !ok {
+			return false, err
+		}
+		incomplete = errors.Join(incomplete, rootErr)
+	}
+	return incomplete == nil, incomplete
+}
+
+func (p *claudeProvider) RawCaptureSourcesForChangedPath(
+	ctx context.Context,
+	req ChangedPathRequest,
+) ([]SourceRef, error) {
+	return p.SourcesForChangedPath(ctx, req)
 }
 
 func (p *claudeProvider) WatchPlan(ctx context.Context) (WatchPlan, error) {
@@ -100,6 +150,27 @@ func (p *claudeProvider) PlanRawCapture(
 		LocalPath:  src.Path,
 		Appendable: true,
 	}}
+	// Background-fork lineage resolution reads sibling top-level project
+	// transcripts, so a project-level capture must carry them as appendable
+	// inputs. Provider ownership stays here: no hosted parser or classifier
+	// duplicates this set.
+	if claudeSourceIsProjectLevel(source, src.Path) {
+		siblings, err := claudeLineageCaptureSiblings(ctx, src.Path)
+		if err != nil {
+			return RawCapturePlan{}, err
+		}
+		for _, sibling := range siblings {
+			siblingRel, err := filepath.Rel(src.Root, sibling)
+			if err != nil {
+				return RawCapturePlan{}, invalidRawCapturePlan(
+					"resolve Claude lineage sibling: %s", rawCaptureFilesystemError(err),
+				)
+			}
+			entries = append(entries, RawCaptureEntry{
+				Path: filepath.ToSlash(siblingRel), LocalPath: sibling, Appendable: true,
+			})
+		}
+	}
 	sidecars, err := claudeLayoutSidecarFiles(ctx, src.Path)
 	if err != nil {
 		return RawCapturePlan{}, invalidRawCapturePlan(
@@ -146,13 +217,28 @@ func (p *claudeProvider) Parse(
 	}
 	path, ok := p.sources.pathFromSource(req.Source)
 	if !ok {
-		return ParseOutcome{}, fmt.Errorf("claude source path unavailable")
+		return ParseOutcome{}, errors.New("claude source path unavailable")
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
 	project := claudeProviderProject(ctx, req.Source.ProjectHint, path)
+	var persistedOutputPathResolver func(string) (string, bool)
+	if req.StoredPathResolver != nil {
+		// Stored companions can carry a canonical machine-qualified
+		// spelling (remote mirrors) or the raw recorded path (hosted raw
+		// materializations); try both before falling back to the on-disk
+		// layout, mirroring the shared Claude-layout provider contract.
+		persistedOutputPathResolver = func(path string) (string, bool) {
+			if local, ok := req.StoredPathResolver(path); ok {
+				return local, true
+			}
+			return req.StoredPathResolver(machine + ":" + path)
+		}
+	}
 	opts := claudeParseOptions{
-		ctx:            ctx,
-		siblingLineage: claudeSourceIsProjectLevel(req.Source, path),
+		ctx:                         ctx,
+		siblingLineage:              claudeSourceIsProjectLevel(req.Source, path),
+		persistedOutputPathResolver: persistedOutputPathResolver,
+		aiTitleFallback:             true,
 	}
 	results, excludedIDs, err := claudeParseFile(path, project, machine, opts)
 	if err != nil {
@@ -217,7 +303,7 @@ func (p *claudeProvider) ParseIncremental(
 	path, ok := p.sources.pathFromSource(req.Source)
 	if !ok {
 		return IncrementalOutcome{}, IncrementalUnsupported,
-			fmt.Errorf("claude source path unavailable")
+			errors.New("claude source path unavailable")
 	}
 	if req.Offset > 0 && req.Fingerprint.Size < req.Offset {
 		return IncrementalOutcome{ForceReplace: true},
@@ -239,6 +325,7 @@ func (p *claudeProvider) ParseIncremental(
 			},
 			storedLinearParse:         req.StoredClaudeLinearParse,
 			storedTailClaudeMessageID: req.StoredLastClaudeMessageID,
+			storedSessionName:         req.StoredSessionName,
 		},
 	)
 	if err != nil {
@@ -388,23 +475,30 @@ func (s claudeSourceSet) DiscoverEach(
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if strings.HasPrefix(root, "s3://") {
-			for _, file := range s.spec.listFiles(root) {
-				source, ok := s.discoveredSourceRef(root, file)
-				if ok {
-					if err := yield(source); err != nil {
-						return err
-					}
-				}
-			}
-			continue
-		}
-		err := s.streamLocalRoot(ctx, root, yield)
-		if err != nil {
+		if err := s.discoverEachRoot(ctx, root, yield); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (s claudeSourceSet) discoverEachRoot(
+	ctx context.Context,
+	root string,
+	yield func(SourceRef) error,
+) error {
+	if strings.HasPrefix(root, "s3://") {
+		for _, file := range s.spec.listFiles(root) {
+			source, ok := s.discoveredSourceRef(root, file)
+			if ok {
+				if err := yield(source); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	return s.streamLocalRoot(ctx, root, yield)
 }
 
 func (s claudeSourceSet) streamLocalRoot(
@@ -744,7 +838,7 @@ func claudeProviderProject(ctx context.Context, projectHint, path string) string
 }
 
 func errorsIsClaudeDAG(err error) bool {
-	return err == ErrDAGDetected
+	return errors.Is(err, ErrDAGDetected)
 }
 
 func claudeProviderUserMessageCount(msgs []ParsedMessage) int {
@@ -816,7 +910,7 @@ func claudeProviderCapabilities() Capabilities {
 		RawCapture: RawCaptureCapabilities{
 			Support:  CapabilitySupported,
 			Shape:    RawCaptureShapeFiles,
-			Append:   RawCaptureAppendOne,
+			Append:   RawCaptureAppendMany,
 			Snapshot: RawCaptureSnapshotNone,
 		},
 	}

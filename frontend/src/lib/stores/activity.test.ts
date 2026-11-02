@@ -1,6 +1,7 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vite-plus/test";
 import type { Report } from "../api/types/activity.js";
 import { testMoney } from "../test/money.js";
+import { ApiError } from "../api/runtime.js";
 
 const api = vi.hoisted(() => ({
   getActivityReport: vi.fn(),
@@ -8,10 +9,6 @@ const api = vi.hoisted(() => ({
   getProjects: vi.fn(),
   getAgents: vi.fn(),
   getMachines: vi.fn(),
-}));
-
-const apiRuntimeMocks = vi.hoisted(() => ({
-  callGenerated: vi.fn((request: () => Promise<unknown>, _signal?: AbortSignal) => request()),
 }));
 
 const eventBus = vi.hoisted(() => ({
@@ -29,9 +26,8 @@ vi.mock("../api/activity-report.js", () => ({
   fetchActivityReport: api.getActivityReport,
   fetchActivitySessions: api.getActivitySessions,
 }));
-vi.mock("../api/runtime.js", () => ({
-  configureGeneratedClient: vi.fn(),
-  callGenerated: apiRuntimeMocks.callGenerated,
+vi.mock("../api/runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../api/runtime.js")>()),
   isAbortError: vi.fn(() => false),
 }));
 vi.mock("./sync.svelte.js", () => ({ sync: { onSyncComplete: vi.fn() } }));
@@ -97,10 +93,7 @@ beforeEach(() => {
   api.getProjects.mockReset();
   api.getAgents.mockReset();
   api.getMachines.mockReset();
-  apiRuntimeMocks.callGenerated.mockReset();
-  apiRuntimeMocks.callGenerated.mockImplementation(
-    (request: () => Promise<unknown>, _signal?: AbortSignal) => request(),
-  );
+
   api.getProjects.mockResolvedValue({ projects: [] });
   api.getAgents.mockResolvedValue({ agents: [] });
   api.getMachines.mockResolvedValue({ machines: [] });
@@ -109,6 +102,8 @@ beforeEach(() => {
   activity.loading = false;
   activity.error = null;
   activity.lastUpdatedAt = null;
+  activity.lastQueryDurationMs = null;
+  activity.lastQuerySteps = [];
   activity.hasNewData = false;
   activity.projects = [];
   activity.agents = [];
@@ -344,6 +339,84 @@ describe("load", () => {
 });
 
 describe("session paging", () => {
+  it.each(["invalid activity report ID", "invalid activity session cursor"])(
+    "reloads the report after %s",
+    async (message) => {
+      activity.report = makeReport({ report_id: "expired-report" });
+      api.getActivitySessions.mockRejectedValueOnce(new ApiError(400, message));
+      api.getActivityReport.mockResolvedValueOnce(
+        makeReport({
+          report_id: "current-report",
+          sessions_next_cursor: "current-cursor",
+        }),
+      );
+
+      expect(await activity.loadSessionPage({ cursor: "expired-cursor" })).toBe(true);
+
+      expect(api.getActivityReport).toHaveBeenCalledTimes(1);
+      expect(api.getActivitySessions).toHaveBeenCalledTimes(1);
+      expect(activity.report?.report_id).toBe("current-report");
+      expect(activity.report?.sessions_next_cursor).toBe("current-cursor");
+      expect(activity.sessionsError).toBeNull();
+      expect(activity.sessionsLoading).toBe(false);
+    },
+  );
+
+  it("stops recovery when the new report fails to load", async () => {
+    activity.report = makeReport({ report_id: "expired-report" });
+    api.getActivitySessions.mockRejectedValueOnce(new ApiError(400, "invalid activity report ID"));
+    api.getActivityReport.mockRejectedValueOnce(new ApiError(503, "temporarily unavailable"));
+
+    expect(await activity.loadSessionPage({ cursor: "expired-cursor" })).toBe(false);
+
+    expect(api.getActivityReport).toHaveBeenCalledTimes(1);
+    expect(activity.report).toBeNull();
+    expect(activity.error).toBe("temporarily unavailable");
+  });
+
+  it("does not recover an expired page after route cancellation", async () => {
+    activity.report = makeReport({ report_id: "expired-report" });
+    let rejectPage!: (error: Error) => void;
+    api.getActivitySessions.mockReturnValueOnce(
+      new Promise((_, reject) => {
+        rejectPage = reject;
+      }),
+    );
+
+    const page = activity.loadSessionPage({ cursor: "expired-cursor" });
+    activity.cancelInFlightReads();
+    rejectPage(new ApiError(400, "invalid activity report ID"));
+
+    expect(await page).toBe(false);
+    expect(api.getActivityReport).not.toHaveBeenCalled();
+  });
+
+  it("does not replace a report reload when an older page expires", async () => {
+    activity.report = makeReport({ report_id: "expired-report" });
+    let rejectPage!: (error: Error) => void;
+    api.getActivitySessions.mockReturnValueOnce(
+      new Promise((_, reject) => {
+        rejectPage = reject;
+      }),
+    );
+    let resolveReport!: (report: Report) => void;
+    api.getActivityReport.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveReport = resolve;
+      }),
+    );
+
+    const page = activity.loadSessionPage({ cursor: "expired-cursor" });
+    const reload = activity.load();
+    rejectPage(new ApiError(400, "invalid activity report ID"));
+    expect(await page).toBe(false);
+    resolveReport(makeReport({ report_id: "replacement-report" }));
+    expect(await reload).toBe(true);
+
+    expect(api.getActivityReport).toHaveBeenCalledTimes(1);
+    expect(activity.report?.report_id).toBe("replacement-report");
+  });
+
   it("replaces the embedded page with a server-filtered bucket range", async () => {
     activity.report = makeReport({
       report_id: "signed-report",
@@ -415,10 +488,10 @@ describe("loadFilterOptions", () => {
 
     await activity.loadFilterOptions();
 
-    const full = { includeOneShot: true, includeAutomated: true };
-    expect(api.getProjects).toHaveBeenCalledWith(full);
-    expect(api.getAgents).toHaveBeenCalledWith(full);
-    expect(api.getMachines).toHaveBeenCalledWith(full);
+    const full = { include_one_shot: true, include_automated: true };
+    expect(api.getProjects.mock.lastCall?.[0]).toEqual(full);
+    expect(api.getAgents.mock.lastCall?.[0]).toEqual(full);
+    expect(api.getMachines.mock.lastCall?.[0]).toEqual(full);
 
     expect(activity.projects).toEqual([{ name: "proj-a", count: 1 }]);
     expect(activity.agents).toEqual([{ name: "claude", count: 2 }]);
@@ -613,6 +686,104 @@ describe("freshness state", () => {
     }
   });
 
+  it("records how long the report query took, from request to data applied", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "performance"] });
+    try {
+      expect(activity.lastQueryDurationMs).toBeNull();
+      api.getActivityReport.mockImplementationOnce(async () => {
+        vi.advanceTimersByTime(250);
+        return makeReport();
+      });
+      await activity.load();
+      expect(activity.lastQueryDurationMs).toBe(250);
+
+      api.getActivityReport.mockImplementationOnce(async () => {
+        vi.advanceTimersByTime(1800);
+        return makeReport();
+      });
+      await activity.load({ background: true });
+      expect(activity.lastQueryDurationMs).toBe(1800);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("splits the report query into its streamed phases", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "performance"] });
+    try {
+      api.getActivityReport.mockImplementationOnce(async (_query, _signal, onProgress) => {
+        vi.advanceTimersByTime(100);
+        onProgress?.({ phase: "loading_sessions" });
+        vi.advanceTimersByTime(50);
+        onProgress?.({ phase: "loading_usage" });
+        vi.advanceTimersByTime(300);
+        onProgress?.({ phase: "scanning_activity", rows_processed: 10 });
+        vi.advanceTimersByTime(20);
+        onProgress?.({ phase: "finalizing" });
+        vi.advanceTimersByTime(30);
+        onProgress?.({ phase: "done" });
+        return makeReport();
+      });
+      await activity.load();
+
+      // Request latency before the first event belongs to the first phase.
+      expect(activity.lastQuerySteps).toEqual([
+        { name: "sessions", startMs: 0, durationMs: 150 },
+        { name: "usage", startMs: 150, durationMs: 300 },
+        { name: "scan", startMs: 450, durationMs: 20 },
+        { name: "finalize", startMs: 470, durationMs: 30 },
+      ]);
+      expect(activity.lastQueryDurationMs).toBe(500);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows each streamed phase live while the report query runs", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "performance"] });
+    try {
+      const startedAt = performance.now();
+      let midway: unknown;
+      api.getActivityReport.mockImplementationOnce(async (_query, _signal, onProgress) => {
+        vi.advanceTimersByTime(100);
+        onProgress?.({ phase: "loading_sessions" });
+        vi.advanceTimersByTime(50);
+        onProgress?.({ phase: "loading_usage" });
+        midway = { startedAt: activity.liveQuery.startedAt, steps: activity.liveQuery.steps };
+        vi.advanceTimersByTime(300);
+        return makeReport();
+      });
+      await activity.load();
+
+      // The finished phase has its measured time; the phase in progress
+      // is marked running from its start.
+      expect(midway).toEqual({
+        startedAt,
+        steps: [
+          { name: "sessions", startMs: 0, durationMs: 150 },
+          { name: "usage", startMs: 150, durationMs: 0, running: true },
+        ],
+      });
+      expect(activity.liveQuery.startedAt).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("records a single report step when the response is not streamed", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "performance"] });
+    try {
+      api.getActivityReport.mockImplementationOnce(async () => {
+        vi.advanceTimersByTime(80);
+        return makeReport();
+      });
+      await activity.load();
+      expect(activity.lastQuerySteps).toEqual([{ name: "report", startMs: 0, durationMs: 80 }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("markNewData is a no-op before the first report loads", () => {
     expect(activity.lastUpdatedAt).toBeNull();
     activity.markNewData();
@@ -626,6 +797,7 @@ describe("freshness state", () => {
       api.getActivityReport.mockRejectedValueOnce(new Error("network down"));
       await activity.load();
       expect(activity.lastUpdatedAt).toBeNull();
+      expect(activity.lastQueryDurationMs).toBeNull();
       activity.markNewData();
       expect(activity.hasNewData).toBe(false);
     } finally {

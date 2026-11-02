@@ -33,8 +33,8 @@ type EncoderConfig struct {
 	// APIKey is sent as a Bearer token when non-empty. Empty means
 	// anonymous, unauthenticated requests.
 	APIKey string
-	// OllamaCPUFallback enables one native Ollama CPU retry for invalid vectors.
-	// Callers must opt in only for an Ollama endpoint ending in /v1.
+	// OllamaCPUFallback reloads an invalid Ollama Metal runner before one native
+	// CPU retry. Callers must opt in only for an Ollama endpoint ending in /v1.
 	OllamaCPUFallback bool
 	// Model is the embeddings model name sent in the request body.
 	Model string
@@ -49,9 +49,14 @@ type EncoderConfig struct {
 	RequestDimensions bool
 	// Timeout bounds each individual HTTP request.
 	Timeout time.Duration
-	// MaxRetries is the maximum total attempts on 429/5xx/network errors
-	// (4xx fails fast); values <= 0 mean one attempt.
+	// MaxRetries is the maximum total attempts on retryable errors; values
+	// <= 0 mean one attempt. A 429 does not consume this budget when
+	// RetryRateLimits is enabled.
 	MaxRetries int
+	// RetryRateLimits keeps retrying HTTP 429 responses until the request
+	// succeeds or ctx is canceled. Long-running document builds enable this;
+	// latency-sensitive query encoders leave it disabled and use MaxRetries.
+	RetryRateLimits bool
 	// InputPrefix is prepended verbatim to every input text before it is
 	// sent. Callers use distinct encoder instances when query and document
 	// inputs require different task instructions. Empty means no prefix.
@@ -190,12 +195,12 @@ type embeddingsResponseBody struct {
 }
 
 type ollamaEmbedRequest struct {
-	Model      string             `json:"model"`
-	Input      []string           `json:"input"`
-	Truncate   bool               `json:"truncate"`
-	Dimensions int                `json:"dimensions,omitzero"`
-	Options    ollamaEmbedOptions `json:"options"`
-	KeepAlive  string             `json:"keep_alive"`
+	Model      string              `json:"model"`
+	Input      []string            `json:"input"`
+	Truncate   bool                `json:"truncate"`
+	Dimensions int                 `json:"dimensions,omitzero"`
+	Options    *ollamaEmbedOptions `json:"options,omitempty"`
+	KeepAlive  string              `json:"keep_alive,omitempty"`
 }
 
 type ollamaEmbedOptions struct {
@@ -204,6 +209,13 @@ type ollamaEmbedOptions struct {
 
 type ollamaEmbedResponse struct {
 	Embeddings []embeddingVector `json:"embeddings"`
+}
+
+type ollamaProcessResponse struct {
+	Models []struct {
+		Model string `json:"model"`
+		Name  string `json:"name"`
+	} `json:"models"`
 }
 
 // embeddingVector decodes an OpenAI-compatible embedding that arrives either
@@ -324,9 +336,9 @@ func (g *ollamaEndpointGate) releaseWrite() {
 
 // NewEncoder returns a kitvec.EncodeFunc that POSTs to an OpenAI-compatible
 // embeddings endpoint. Each invocation makes primary calls according to the
-// retry policy and, when explicitly enabled, at most one native Ollama CPU
-// fallback call. Batching and concurrency are the caller's responsibility via
-// kitvec.EncodeBatched.
+// retry policy and, when explicitly enabled, recovers invalid Ollama responses
+// by unloading and retrying the Metal runner before falling back to CPU.
+// Batching and concurrency are the caller's responsibility via kitvec.EncodeBatched.
 //
 // Requests ask for base64-encoded embeddings (encoding_format "base64",
 // ~4x smaller than JSON float arrays); responses in either format are
@@ -367,6 +379,14 @@ func openAIEmbeddingsURL(endpoint string) (string, error) {
 }
 
 func ollamaEmbedURL(endpoint string) (string, error) {
+	return ollamaAPIURL(endpoint, "/api/embed")
+}
+
+func ollamaPSURL(endpoint string) (string, error) {
+	return ollamaAPIURL(endpoint, "/api/ps")
+}
+
+func ollamaAPIURL(endpoint, apiPath string) (string, error) {
 	u, err := url.Parse(endpoint)
 	if err != nil {
 		return "", fmt.Errorf("parse Ollama endpoint: %w", err)
@@ -381,9 +401,9 @@ func ollamaEmbedURL(endpoint string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("parse Ollama endpoint path: %w", err)
 		}
-		u.RawPath = rawBase + "/api/embed"
+		u.RawPath = rawBase + apiPath
 	}
-	u.Path = basePath + "/api/embed"
+	u.Path = basePath + apiPath
 	return u.String(), nil
 }
 
@@ -448,13 +468,15 @@ func (ec *encoderClient) encode(ctx context.Context, texts []string) ([][]float3
 		return nil, err
 	}
 
-	attempts := ec.cfg.MaxRetries
-	if attempts <= 0 {
-		attempts = 1
+	maxAttempts := ec.cfg.MaxRetries
+	if maxAttempts <= 0 {
+		maxAttempts = 1
 	}
 
 	var lastErr error
-	for attempt := 1; attempt <= attempts; attempt++ {
+	nonRateLimitAttempts := 0
+	rateLimitAttempts := 0
+	for {
 		vectors, retryable, err := ec.attemptEncode(ctx, reqBody, texts)
 		if err == nil {
 			return vectors, nil
@@ -479,9 +501,22 @@ func (ec *encoderClient) encode(ctx context.Context, texts []string) ([][]float3
 				ec.cfg.Model, err)
 		}
 		lastErr = err
-		if attempt == attempts && ec.cfg.OllamaCPUFallback {
+		if ec.cfg.RetryRateLimits && isRateLimitError(err) {
+			// A 429 is the one error class the provider tells us exactly how
+			// to handle: it clears with time and doesn't indicate the request
+			// itself is broken. Retry it forever (until ctx is canceled)
+			// rather than spending the limited MaxRetries budget on it, so a
+			// large build doesn't abort permanently on a transient quota.
+			rateLimitAttempts++
+			if err := sleepBackoff(ctx, rateLimitAttempts, err); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		nonRateLimitAttempts++
+		if nonRateLimitAttempts == maxAttempts && ec.cfg.OllamaCPUFallback {
 			if _, ok := errors.AsType[*InvalidEmbeddingError](err); ok {
-				merged, fallbackErr := ec.ollamaCPUFallback(ctx, texts, vectors)
+				merged, fallbackErr := ec.ollamaFallback(ctx, texts, vectors)
 				if fallbackErr == nil {
 					return merged, nil
 				}
@@ -491,17 +526,25 @@ func (ec *encoderClient) encode(ctx context.Context, texts []string) ([][]float3
 				)
 			}
 		}
-		if !retryable || attempt == attempts {
+		if !retryable || nonRateLimitAttempts == maxAttempts {
 			return nil, lastErr
 		}
-		if err := sleepBackoff(ctx, attempt, err); err != nil {
+		if err := sleepBackoff(ctx, nonRateLimitAttempts, err); err != nil {
 			return nil, err
 		}
 	}
-	return nil, lastErr
 }
 
-func (ec *encoderClient) ollamaCPUFallback(
+// isRateLimitError reports whether err is an HTTP 429 (Too Many Requests)
+// response from the embeddings endpoint.
+func isRateLimitError(err error) bool {
+	if statusErr, ok := errors.AsType[*HTTPStatusError](err); ok {
+		return statusErr.Status == http.StatusTooManyRequests
+	}
+	return false
+}
+
+func (ec *encoderClient) ollamaFallback(
 	ctx context.Context, texts []string, primaryVectors [][]float32,
 ) ([][]float32, error) {
 	if ec.gate != nil {
@@ -522,29 +565,163 @@ func (ec *encoderClient) ollamaCPUFallback(
 		invalidInputs = append(invalidInputs, requestInputs[index])
 	}
 
+	fallbackURL, err := ollamaEmbedURL(ec.cfg.Endpoint)
+	if err != nil {
+		return nil, err
+	}
+	psURL, err := ollamaPSURL(ec.cfg.Endpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	recovered, unloadErr := ec.ollamaNativeEmbed(
+		ctx, fallbackURL, invalidInputs, invalidIndices, nil, "0s",
+	)
+	unloadWaitErr := ec.waitForOllamaUnload(ctx, psURL)
+	if unloadErr == nil && unloadWaitErr == nil {
+		return mergeOllamaVectors(primaryVectors, invalidIndices, recovered), nil
+	}
+
+	var reloadErr error
+	if unloadWaitErr == nil {
+		recovered, reloadErr = ec.ollamaNativeEmbed(
+			ctx, fallbackURL, invalidInputs, invalidIndices, nil, "",
+		)
+		if reloadErr == nil {
+			return mergeOllamaVectors(primaryVectors, invalidIndices, recovered), nil
+		}
+	}
+
+	recovered, cpuErr := ec.ollamaNativeEmbed(
+		ctx, fallbackURL, invalidInputs, invalidIndices,
+		&ollamaEmbedOptions{NumGPU: 0}, "0s",
+	)
+	if cpuErr != nil {
+		var recoveryErr error
+		if unloadErr != nil {
+			recoveryErr = errors.Join(
+				recoveryErr, fmt.Errorf("ollama Metal unload request: %w", unloadErr))
+		}
+		if unloadWaitErr != nil {
+			recoveryErr = errors.Join(
+				recoveryErr, fmt.Errorf("ollama Metal unload wait: %w", unloadWaitErr))
+		}
+		if reloadErr != nil {
+			recoveryErr = errors.Join(
+				recoveryErr, fmt.Errorf("ollama Metal retry: %w", reloadErr))
+		}
+		return nil, errors.Join(recoveryErr, fmt.Errorf("ollama CPU fallback: %w", cpuErr))
+	}
+	return mergeOllamaVectors(primaryVectors, invalidIndices, recovered), nil
+}
+
+const ollamaUnloadTimeout = 10 * time.Second
+
+func (ec *encoderClient) waitForOllamaUnload(ctx context.Context, psURL string) error {
+	ctx, cancel := context.WithTimeout(ctx, ollamaUnloadTimeout)
+	defer cancel()
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		loaded, err := ec.ollamaModelLoaded(ctx, psURL)
+		if err != nil {
+			return err
+		}
+		if !loaded {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (ec *encoderClient) ollamaModelLoaded(ctx context.Context, psURL string) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, psURL, nil)
+	if err != nil {
+		return false, fmt.Errorf("build Ollama process request: %w", err)
+	}
+	if ec.cfg.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+ec.cfg.APIKey)
+	}
+	resp, err := ec.client.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("ollama process request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return false, &HTTPStatusError{
+			Status: resp.StatusCode,
+			Body:   strings.TrimSpace(string(body)),
+		}
+	}
+
+	var decoded ollamaProcessResponse
+	if err := json.UnmarshalRead(resp.Body, &decoded); err != nil {
+		return false, fmt.Errorf("decode Ollama process response: %w", err)
+	}
+	for _, model := range decoded.Models {
+		if ollamaModelNamesMatch(ec.cfg.Model, model.Model) ||
+			ollamaModelNamesMatch(ec.cfg.Model, model.Name) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func ollamaModelNamesMatch(configured, loaded string) bool {
+	return ollamaDisplayModelName(configured) == ollamaDisplayModelName(loaded)
+}
+
+func ollamaDisplayModelName(name string) string {
+	if _, rest, ok := strings.Cut(name, "://"); ok {
+		name = rest
+	}
+	parts := strings.Split(name, "/")
+	if len(parts) >= 3 && strings.EqualFold(parts[0], "registry.ollama.ai") {
+		parts = parts[1:]
+		if len(parts) == 2 && strings.EqualFold(parts[0], "library") {
+			parts = parts[1:]
+		}
+	}
+	last := len(parts) - 1
+	if !strings.Contains(parts[last], ":") {
+		parts[last] += ":latest"
+	}
+	return strings.Join(parts, "/")
+}
+
+func (ec *encoderClient) ollamaNativeEmbed(
+	ctx context.Context,
+	fallbackURL string,
+	inputs []string,
+	originalIndices []int,
+	options *ollamaEmbedOptions,
+	keepAlive string,
+) ([][]float32, error) {
 	body := ollamaEmbedRequest{
 		Model:     ec.cfg.Model,
-		Input:     invalidInputs,
+		Input:     inputs,
 		Truncate:  false,
-		Options:   ollamaEmbedOptions{NumGPU: 0},
-		KeepAlive: "0s",
+		Options:   options,
+		KeepAlive: keepAlive,
 	}
 	if ec.cfg.RequestDimensions {
 		body.Dimensions = ec.cfg.Dimension
 	}
 	reqBody, err := json.Marshal(body)
 	if err != nil {
-		return nil, fmt.Errorf("marshal Ollama CPU request: %w", err)
-	}
-	fallbackURL, err := ollamaEmbedURL(ec.cfg.Endpoint)
-	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("marshal Ollama embed request: %w", err)
 	}
 	req, err := http.NewRequestWithContext(
 		ctx, http.MethodPost, fallbackURL, bytes.NewReader(reqBody),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("build Ollama CPU request: %w", err)
+		return nil, fmt.Errorf("build Ollama embed request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if ec.cfg.APIKey != "" {
@@ -552,7 +729,7 @@ func (ec *encoderClient) ollamaCPUFallback(
 	}
 	resp, err := ec.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("ollama CPU request: %w", err)
+		return nil, fmt.Errorf("ollama embed request: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -565,29 +742,39 @@ func (ec *encoderClient) ollamaCPUFallback(
 
 	var decoded ollamaEmbedResponse
 	if err := json.UnmarshalRead(resp.Body, &decoded); err != nil {
-		return nil, fmt.Errorf("decode Ollama CPU response: %w", err)
+		return nil, fmt.Errorf("decode Ollama embed response: %w", err)
 	}
-	if len(decoded.Embeddings) != len(invalidIndices) {
+	if len(decoded.Embeddings) != len(originalIndices) {
 		return nil, fmt.Errorf(
-			"ollama CPU response count mismatch: got %d embeddings, want %d",
-			len(decoded.Embeddings), len(invalidIndices))
+			"ollama embed response count mismatch: got %d embeddings, want %d",
+			len(decoded.Embeddings), len(originalIndices))
 	}
 
-	merged := make([][]float32, len(primaryVectors))
-	copy(merged, primaryVectors)
-	for fallbackIndex, originalIndex := range invalidIndices {
+	recovered := make([][]float32, len(decoded.Embeddings))
+	for fallbackIndex, originalIndex := range originalIndices {
 		vector := []float32(decoded.Embeddings[fallbackIndex])
 		if len(vector) != ec.cfg.Dimension {
 			return nil, fmt.Errorf(
-				"ollama CPU response dimension mismatch at index %d: got %d, want %d",
+				"ollama embed response dimension mismatch at index %d: got %d, want %d",
 				originalIndex, len(vector), ec.cfg.Dimension)
 		}
 		if err := validateEmbedding(vector, originalIndex); err != nil {
 			return nil, err
 		}
-		merged[originalIndex] = vector
+		recovered[fallbackIndex] = vector
 	}
-	return merged, nil
+	return recovered, nil
+}
+
+func mergeOllamaVectors(
+	primaryVectors [][]float32, invalidIndices []int, recovered [][]float32,
+) [][]float32 {
+	merged := make([][]float32, len(primaryVectors))
+	copy(merged, primaryVectors)
+	for recoveredIndex, originalIndex := range invalidIndices {
+		merged[originalIndex] = recovered[recoveredIndex]
+	}
+	return merged
 }
 
 // isEncodingFormatRejection reports whether err is a client-error response
@@ -596,8 +783,8 @@ func (ec *encoderClient) ollamaCPUFallback(
 // generic 4xx bodies must keep flowing through the normal retry/permanence
 // classification.
 func isEncodingFormatRejection(err error) bool {
-	var statusErr *HTTPStatusError
-	if !errors.As(err, &statusErr) {
+	statusErr, hasStatusErr := errors.AsType[*HTTPStatusError](err)
+	if !hasStatusErr {
 		return false
 	}
 	if statusErr.Status < 400 || statusErr.Status >= 500 {
@@ -612,8 +799,8 @@ func isEncodingFormatRejection(err error) bool {
 // request actually carried the field; the match is body-text based and a
 // request without the field cannot be rejected for it.
 func isDimensionsRejection(err error) bool {
-	var statusErr *HTTPStatusError
-	if !errors.As(err, &statusErr) {
+	statusErr, hasStatusErr := errors.AsType[*HTTPStatusError](err)
+	if !hasStatusErr {
 		return false
 	}
 	if statusErr.Status < 400 || statusErr.Status >= 500 {
@@ -677,8 +864,8 @@ func (ec *encoderClient) attemptEncode(
 		return nil, false, err
 	}
 	if err := validateEmbeddings(vectors); err != nil {
-		var invalidErr *InvalidEmbeddingError
-		return vectors, errors.As(err, &invalidErr), err
+		_, hasInvalidErr := errors.AsType[*InvalidEmbeddingError](err)
+		return vectors, hasInvalidErr, err
 	}
 	return vectors, false, nil
 }
@@ -750,8 +937,8 @@ func sleepBackoff(ctx context.Context, attempt int, lastErr error) error {
 // Retry-After delay when present, otherwise capped exponential backoff
 // from attempt.
 func backoffDelay(attempt int, lastErr error) time.Duration {
-	var statusErr *HTTPStatusError
-	if errors.As(lastErr, &statusErr) && statusErr.RetryAfter != nil {
+	statusErr, hasStatusErr := errors.AsType[*HTTPStatusError](lastErr)
+	if hasStatusErr && statusErr.RetryAfter != nil {
 		return *statusErr.RetryAfter
 	}
 	delay := backoffBase << (attempt - 1)

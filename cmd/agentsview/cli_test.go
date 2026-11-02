@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/db"
+	"go.yaml.in/yaml/v3"
 )
 
 func executeCommand(root *cobra.Command, args ...string) (string, error) {
@@ -39,7 +40,7 @@ func TestRootHelpShowsKeySectionsAndCommands(t *testing.T) {
 		"Data Commands:",
 		"Usage Commands:",
 		"Other Commands:",
-		"serve                  Start server",
+		"serve                  Start the web UI and sync server",
 		"duckdb status          Show DuckDB sync status",
 		"pg push                Push local data to PostgreSQL",
 		"duckdb quack           Quack remote protocol commands",
@@ -47,6 +48,10 @@ func TestRootHelpShowsKeySectionsAndCommands(t *testing.T) {
 		"completion             Generate the autocompletion script for the specified shell",
 		"Flags:",
 		"--version",
+		"[agents.claude]",
+		"dirs = [\"/path/one\", \"/path/two\"]",
+		"[agents.codex]",
+		"dirs = [\"/codex/a\", \"/codex/b\"]",
 	} {
 		assert.Contains(t, help, want, "help missing %q", want)
 	}
@@ -115,6 +120,27 @@ func TestPGStatusHelpShowsProjectFlags(t *testing.T) {
 	}
 }
 
+func TestRawSyncCommandsKeepCredentialOutOfArguments(t *testing.T) {
+	help, err := executeCommand(newRootCommand(), "raw-sync", "watch", "--help")
+	require.NoError(t, err)
+	for _, want := range []string{
+		"--server", "--device-id", "--allow-insecure-http", "--debounce", "--interval",
+		"AGENTSVIEW_RAW_SYNC_CREDENTIAL",
+	} {
+		assert.Contains(t, help, want)
+	}
+	assert.NotContains(t, help, "--credential")
+	_, err = executeCommand(
+		newRootCommand(), "raw-sync", "watch", "--credential=private-value",
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown flag: --credential")
+	assert.NotContains(t, err.Error(), "private-value")
+	status, err := executeCommand(newRootCommand(), "raw-sync", "status", "--help")
+	require.NoError(t, err)
+	assert.Contains(t, status, "Show durable laptop raw-sync status")
+}
+
 func TestDuckDBQuackServeHelpShowsSafetyFlags(t *testing.T) {
 	help, err := executeCommand(newRootCommand(), "duckdb", "quack", "serve", "--help")
 	require.NoError(t, err, "Execute")
@@ -146,18 +172,31 @@ func TestOpenAPICommandEmitsSpec(t *testing.T) {
 	assert.Contains(t, spec.Paths["/api/v1/sessions/{id}/rename"], "patch")
 }
 
+func TestOpenAPICommandEmitsYAML(t *testing.T) {
+	out, err := executeCommand(newRootCommand(), "openapi", "--yaml")
+	require.NoError(t, err)
+	var spec struct {
+		OpenAPI string                    `yaml:"openapi"`
+		Paths   map[string]map[string]any `yaml:"paths"`
+	}
+	require.NoError(t, yaml.Unmarshal([]byte(out), &spec))
+	assert.Equal(t, "3.1.0", spec.OpenAPI)
+	require.Contains(t, spec.Paths, "/api/v1/sessions")
+	assert.Contains(t, spec.Paths["/api/v1/sessions"], "get")
+}
+
 func TestServeCheckDataVersionRejectsNewerDatabase(t *testing.T) {
 	dataDir := testDataDir(t)
 	dbPath := filepath.Join(dataDir, "sessions.db")
 
-	database, err := db.Open(dbPath)
+	database, err := db.Open(t.Context(), dbPath)
 	require.NoError(t, err, "open db")
 	require.NoError(t, database.Close(), "close db")
 
 	futureVersion := db.CurrentDataVersion() + 10
 	conn, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err, "raw sqlite open")
-	_, err = conn.Exec(fmt.Sprintf("PRAGMA user_version = %d", futureVersion))
+	_, err = conn.ExecContext(t.Context(), fmt.Sprintf("PRAGMA user_version = %d", futureVersion))
 	require.NoError(t, err, "set future user_version")
 	require.NoError(t, conn.Close(), "close raw sqlite")
 
@@ -194,7 +233,7 @@ func TestRootNoArgsShowsHelp(t *testing.T) {
 	for _, want := range []string{
 		"Usage:\n  agentsview [flags]\n  agentsview <command> [flags]",
 		"Core Commands:",
-		"serve                  Start server",
+		"serve                  Start the web UI and sync server",
 	} {
 		assert.Contains(t, out, want, "output missing %q", want)
 	}
@@ -365,4 +404,12 @@ func TestSyncHelpMentionsConfiguredHosts(t *testing.T) {
 	for _, want := range []string{"remote_hosts", "--host", "passwordless"} {
 		assert.Contains(t, help, want, "sync help missing %q", want)
 	}
+}
+
+func TestSyncHelpHostFlagDescribesBothTransports(t *testing.T) {
+	help, err := executeCommand(newRootCommand(), "sync", "--help")
+	require.NoError(t, err, "Execute")
+	assert.Contains(t, help, "Configured HTTP host name")
+	assert.Contains(t, help, "deprecated SSH hostname")
+	assert.NotContains(t, help, "SSH hostname for deprecated remote sync")
 }

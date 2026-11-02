@@ -26,6 +26,15 @@ var registerVecOnce sync.Once
 // ordinal for single-message (user) documents. subordinate and offsets
 // default to the "no run grouping yet" shape so a row inserted without
 // them (see mirror.go) is still valid.
+//
+// The (doc_key, content_hash) index covers the stamp anti-join that
+// countPending and generationCoverageQuery run, so SQLite can answer "which
+// documents are not stamped at their current revision" from the index alone
+// instead of reading every mirror row's content. It is additive, and
+// prepareMirrorSchema replays MirrorDDL on every write-path open, so
+// existing vectors.db files gain it on their next build without bumping
+// MirrorSchemaVersion; a bump would drop and re-embed the whole corpus for
+// what is only an index addition.
 const messageMirrorDDL = `
 CREATE TABLE IF NOT EXISTS vector_messages (
     doc_key      TEXT PRIMARY KEY,
@@ -41,6 +50,8 @@ CREATE TABLE IF NOT EXISTS vector_messages (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_vector_messages_session_ordinal
     ON vector_messages(session_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_vector_messages_revision
+    ON vector_messages(doc_key, content_hash);
 CREATE TABLE IF NOT EXISTS vector_meta (
     key TEXT PRIMARY KEY, value TEXT NOT NULL
 );
@@ -61,6 +72,8 @@ CREATE TABLE IF NOT EXISTS vector_recall_entries (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_vector_recall_entries_identity
     ON vector_recall_entries(session_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_vector_recall_entries_revision
+    ON vector_recall_entries(doc_key, content_hash);
 CREATE TABLE IF NOT EXISTS vector_recall_meta (
     key TEXT PRIMARY KEY, value TEXT NOT NULL
 );
@@ -413,7 +426,7 @@ func mirrorVersionMismatch(ctx context.Context, db *sql.DB, spec IndexSpec) (mis
 	err = db.QueryRowContext(ctx,
 		`SELECT value FROM `+spec.MetaTable+` WHERE key = ?`, mirrorSchemaVersionKey,
 	).Scan(&stamped)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return true, tables, nil
 	}
 	if err != nil {
@@ -458,7 +471,7 @@ func (ix *Index) Close() error {
 // read-only, matching internal/db's read-only guard pattern.
 func (ix *Index) requireWritable() error {
 	if ix.readOnly {
-		return fmt.Errorf("vectors.db is opened read-only")
+		return errors.New("vectors.db is opened read-only")
 	}
 	return nil
 }
@@ -626,7 +639,7 @@ var ErrGenerationNotFound = errors.New("generation not found")
 func (ix *Index) GenerationByID(ctx context.Context, id int64) (GenerationInfo, error) {
 	row := ix.db.QueryRowContext(ctx, ix.generationCoverageQuery()+` WHERE g.ordinal = ?`, id)
 	info, err := ix.scanGenerationInfo(ctx, row)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return GenerationInfo{}, fmt.Errorf("generation %d: %w", id, ErrGenerationNotFound)
 	}
 	if err != nil {
@@ -635,43 +648,22 @@ func (ix *Index) GenerationByID(ctx context.Context, id int64) (GenerationInfo, 
 	return info, nil
 }
 
-// MissingEmbeddedDocs returns how many current mirror docs are still missing
-// from genOrdinal's embedded set. A nil sessionIDs slice counts the whole
+// MissingEmbeddedDocs returns how many current mirror docs the generation
+// with fingerprint cannot export yet. A nil sessionIDs slice counts the whole
 // mirror; a non-nil slice limits the count to those sessions, which lets
-// change-scoped PG pushes bound the readiness read to their candidate set.
+// change-scoped replica pushes bound the readiness read to their candidates.
 func (ix *Index) MissingEmbeddedDocs(
-	ctx context.Context, genOrdinal int64, sessionIDs []string,
+	ctx context.Context, fingerprint string, sessionIDs []string,
 ) (int64, error) {
 	if ix.versionMismatch {
 		return 0, ErrMirrorVersionMismatch
 	}
-	if sessionIDs != nil && len(sessionIDs) == 0 {
-		return 0, nil
-	}
-	query := missingEmbeddedDocsQuery(ix.spec)
-	if sessionIDs == nil {
-		var missing int64
-		if err := ix.db.QueryRowContext(ctx, query, genOrdinal).Scan(&missing); err != nil {
-			return 0, fmt.Errorf("count generation missing docs: %w", err)
-		}
-		return missing, nil
-	}
-	var total int64
-	if err := chunkKeys(sessionIDs, func(chunk []string) error {
-		placeholders, args := inPlaceholders(chunk)
-		var missing int64
-		if err := ix.db.QueryRowContext(ctx,
-			query+` AND d.session_id IN `+placeholders,
-			append([]any{genOrdinal}, args...)...,
-		).Scan(&missing); err != nil {
-			return fmt.Errorf("count scoped generation missing docs: %w", err)
-		}
-		total += missing
-		return nil
-	}); err != nil {
+	snap, err := ix.store.Snapshot(ctx, fingerprint)
+	if err != nil {
 		return 0, err
 	}
-	return total, nil
+	defer func() { _ = snap.Close() }()
+	return missingEmbeddedDocs(ctx, snap, sessionIDs)
 }
 
 // genInfoScanner is the subset of *sql.Row / *sql.Rows Scan needs, letting
@@ -689,7 +681,7 @@ func (ix *Index) scanGenerationInfo(ctx context.Context, src genInfoScanner) (Ge
 		&info.ID, &genKey, &info.Fingerprint, &info.Dimension, &info.State,
 		&info.Embedded, &info.Missing,
 	); err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return GenerationInfo{}, err
 		}
 		return GenerationInfo{}, fmt.Errorf("scan generation: %w", err)

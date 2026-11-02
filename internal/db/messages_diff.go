@@ -3,6 +3,7 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -22,8 +23,8 @@ func messageInsertArgs(m Message) []any {
 		m.ThinkingText,
 		m.Timestamp, m.HasThinking, m.HasToolUse,
 		m.ContentLength, m.IsSystem,
-		m.Model, string(m.TokenUsage),
-		m.ContextTokens, m.OutputTokens,
+		m.Model, m.ReasoningEffort, string(m.TokenUsage),
+		m.ContextTokens, m.OutputTokens, m.ProviderID,
 		m.HasContextTokens, m.HasOutputTokens,
 		m.ClaudeMessageID, m.ClaudeRequestID,
 		m.SourceType, m.SourceSubtype, m.PromptSource, m.SourceUUID,
@@ -47,11 +48,25 @@ var messageUpdateSetClause = func() string {
 // Both sides go through the same resolve helpers the insert path
 // uses, so equality is defined on exactly the persisted tuples.
 func messageRowEqual(a, b Message) bool {
-	aArgs, bArgs := messageInsertArgs(a), messageInsertArgs(b)
-	for i := range aArgs {
-		if aArgs[i] != bArgs[i] {
-			return false
-		}
+	if a.SessionID != b.SessionID || a.Ordinal != b.Ordinal ||
+		a.Role != b.Role || a.Content != b.Content ||
+		a.ThinkingText != b.ThinkingText || a.Timestamp != b.Timestamp ||
+		a.HasThinking != b.HasThinking || a.HasToolUse != b.HasToolUse ||
+		a.ContentLength != b.ContentLength || a.IsSystem != b.IsSystem ||
+		a.Model != b.Model || a.ReasoningEffort != b.ReasoningEffort ||
+		!bytes.Equal(a.TokenUsage, b.TokenUsage) ||
+		a.ContextTokens != b.ContextTokens || a.OutputTokens != b.OutputTokens ||
+		a.ProviderID != b.ProviderID ||
+		a.HasContextTokens != b.HasContextTokens ||
+		a.HasOutputTokens != b.HasOutputTokens ||
+		a.ClaudeMessageID != b.ClaudeMessageID ||
+		a.ClaudeRequestID != b.ClaudeRequestID ||
+		a.SourceType != b.SourceType || a.SourceSubtype != b.SourceSubtype ||
+		a.PromptSource != b.PromptSource || a.SourceUUID != b.SourceUUID ||
+		a.SourceParentUUID != b.SourceParentUUID ||
+		a.IsSidechain != b.IsSidechain ||
+		a.IsCompactBoundary != b.IsCompactBoundary {
+		return false
 	}
 
 	aCalls := resolveToolCalls([]Message{a}, []int64{0})
@@ -71,7 +86,17 @@ func messageRowEqual(a, b Message) bool {
 		return false
 	}
 	for i := range aEvents {
-		if aEvents[i] != bEvents[i] {
+		x, y := aEvents[i], bEvents[i]
+		if x.SessionID != y.SessionID || x.MessageOrdinal != y.MessageOrdinal || x.CallIndex != y.CallIndex ||
+			x.Event.ToolUseID != y.Event.ToolUseID || x.Event.AgentID != y.Event.AgentID ||
+			x.Event.SubagentSessionID != y.Event.SubagentSessionID || x.Event.Source != y.Event.Source ||
+			x.Event.Status != y.Event.Status || x.Event.Content != y.Event.Content ||
+			x.Event.ContentLength != y.Event.ContentLength || x.Event.Timestamp != y.Event.Timestamp ||
+			x.Event.EventIndex != y.Event.EventIndex || !bytes.Equal(x.Event.RawContentDigest, y.Event.RawContentDigest) {
+			return false
+		}
+		if (x.Event.SummaryParticipates == nil) != (y.Event.SummaryParticipates == nil) ||
+			(x.Event.SummaryParticipates != nil && *x.Event.SummaryParticipates != *y.Event.SummaryParticipates) {
 			return false
 		}
 	}
@@ -281,7 +306,7 @@ func messagePinIdentityStable(
 // can then use the full replacement path, which drops or remaps the pin
 // through the guarded identity rules. Unpinned streaming updates retain
 // the in-place path.
-func messageDiffNeedsPinRemapTx(
+func messageDiffNeedsPinRemapTx(ctx context.Context,
 	tx *sql.Tx, plan messageDiffPlan,
 ) (bool, error) {
 	for start := 0; start < len(plan.unsafePinUpdateIDs); start += diffDeleteChunkSize {
@@ -291,7 +316,7 @@ func messageDiffNeedsPinRemapTx(
 			args = append(args, id)
 		}
 		var exists int
-		if err := tx.QueryRow(
+		if err := tx.QueryRowContext(ctx,
 			"SELECT EXISTS (SELECT 1 FROM pinned_messages "+
 				"WHERE message_id IN ("+placeholderList(len(args))+"))",
 			args...,
@@ -309,7 +334,7 @@ func messageDiffNeedsPinRemapTx(
 // are updated in place (keeping rowids, so pins survive and the FTS
 // triggers reindex only those rows), their tool rows are rebuilt,
 // and new ordinals are inserted through the normal insert path.
-func applySessionMessageDiffTx(
+func applySessionMessageDiffTx(ctx context.Context,
 	tx *sql.Tx, sessionID string, plan messageDiffPlan,
 ) error {
 	if len(plan.updates) > 0 {
@@ -320,7 +345,7 @@ func applySessionMessageDiffTx(
 		msgs := make([]Message, 0, len(plan.updates))
 		for _, u := range plan.updates {
 			args := append(messageInsertArgs(u.msg), u.id)
-			if _, err := tx.Exec(updateSQL, args...); err != nil {
+			if _, err := tx.ExecContext(ctx, updateSQL, args...); err != nil {
 				return fmt.Errorf(
 					"updating message ord=%d: %w",
 					u.msg.Ordinal, err,
@@ -330,7 +355,7 @@ func applySessionMessageDiffTx(
 			ordinals = append(ordinals, u.msg.Ordinal)
 			msgs = append(msgs, u.msg)
 		}
-		if err := deleteToolRowsForMessagesTx(
+		if err := deleteToolRowsForMessagesTx(ctx,
 			tx, sessionID, ids, ordinals,
 		); err != nil {
 			return err
@@ -369,7 +394,7 @@ func applySessionMessageDiffTx(
 // deleteToolRowsForMessagesTx clears tool_calls and
 // tool_result_events for the updated messages so their rebuilt rows
 // cannot duplicate the stale ones.
-func deleteToolRowsForMessagesTx(
+func deleteToolRowsForMessagesTx(ctx context.Context,
 	tx *sql.Tx, sessionID string, ids []int64, ordinals []int,
 ) error {
 	for start := 0; start < len(ids); start += diffDeleteChunkSize {
@@ -379,7 +404,21 @@ func deleteToolRowsForMessagesTx(
 		for _, id := range ids[start:end] {
 			idArgs = append(idArgs, id)
 		}
-		if _, err := tx.Exec(
+		// Agent-state rows use stable message/call coordinates. Clear every
+		// occurrence owned by the messages being rebuilt so removed agents and
+		// reused provider IDs cannot leave stale summary state.
+		if _, err := tx.ExecContext(ctx,
+			"DELETE FROM tool_call_occurrence_agent_state WHERE session_id = ?"+
+				" AND message_ordinal IN ("+
+				"SELECT ordinal FROM messages WHERE id IN ("+
+				placeholderList(len(idArgs))+"))",
+			append([]any{sessionID}, idArgs...)...,
+		); err != nil {
+			return fmt.Errorf(
+				"deleting stale tool-call occurrence state: %w", err,
+			)
+		}
+		if _, err := tx.ExecContext(ctx,
 			"DELETE FROM tool_calls WHERE message_id IN ("+
 				placeholderList(len(idArgs))+")",
 			idArgs...,
@@ -392,7 +431,7 @@ func deleteToolRowsForMessagesTx(
 		for _, ord := range ordinals[start:end] {
 			ordArgs = append(ordArgs, ord)
 		}
-		if _, err := tx.Exec(
+		if _, err := tx.ExecContext(ctx,
 			"DELETE FROM tool_result_events WHERE session_id = ?"+
 				" AND tool_call_message_ordinal IN ("+
 				placeholderList(len(ordArgs)-1)+")",

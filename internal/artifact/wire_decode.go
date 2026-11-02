@@ -225,8 +225,7 @@ func preflightSegmentData(data []byte, limits artifactLimits) (segmentPreflight,
 				limits.segmentMessages,
 			)
 		}
-		recordVersion, messageNested, err :=
-			preflightMessageNestedCollections(line, limits)
+		recordVersion, messageNested, err := preflightMessageNestedCollections(line, limits)
 		if err != nil {
 			return segmentPreflight{}, err
 		}
@@ -345,6 +344,8 @@ func (m segmentMessage) dbMessage() db.Message {
 		HasToolUse:        m.HasToolUse,
 		ContentLength:     m.ContentLength,
 		Model:             m.Model,
+		ReasoningEffort:   m.ReasoningEffort,
+		ProviderID:        m.ProviderID,
 		TokenUsage:        m.TokenUsage,
 		ContextTokens:     m.ContextTokens,
 		OutputTokens:      m.OutputTokens,
@@ -391,6 +392,12 @@ func (m segmentMessage) dbMessage() db.Message {
 					}
 				}
 			}
+		}
+		// The archive drops a summary its single result event repeats, and
+		// the wire format carries the stored rows verbatim. Refill it so a
+		// decoded message matches a locally loaded one.
+		for i := range msg.ToolCalls {
+			db.RestoreToolCallResultContent(&msg.ToolCalls[i])
 		}
 	}
 	return msg

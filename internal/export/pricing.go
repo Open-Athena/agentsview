@@ -136,9 +136,10 @@ type EffectivePricingRow struct {
 }
 
 type PricingLookup struct {
-	Rates   ModelRates
-	Pattern string
-	OK      bool
+	Rates      ModelRates
+	Pattern    string
+	OK         bool
+	Adjustment string
 }
 
 type PricingResolver struct {
@@ -175,6 +176,7 @@ type pricingRecordKey struct {
 	input, output                       int64
 	cacheWrite, cacheWrite1h, cacheRead int64
 	bands                               string
+	adjustment                          string
 }
 
 func NewPricingResolver(rows []EffectivePricingRow) *PricingResolver {
@@ -235,6 +237,68 @@ func clonePricingLookup(lookup PricingLookup) PricingLookup {
 	return lookup
 }
 
+// ResolveBilled resolves model pricing without a usage timestamp, then applies
+// one exact provider adjustment.
+func (r *PricingResolver) ResolveBilled(providerID, reportedModel, canonicalModel string) (string, PricingLookup, error) {
+	return r.ResolveBilledAt(providerID, reportedModel, canonicalModel, time.Time{})
+}
+
+// ResolveBilledAt selects model, historical, band, and cache rates at
+// timestamp before applying one exact provider adjustment.
+func (r *PricingResolver) ResolveBilledAt(providerID, reportedModel, canonicalModel string, timestamp time.Time) (string, PricingLookup, error) {
+	pricedModel, lookup := r.ResolveAt(reportedModel, canonicalModel, timestamp)
+	policy, ok := pricingpkg.BillingPolicyFor(providerID)
+	if !ok || !lookup.OK || lookup.Rates.Source == PricingRowSourceCustom {
+		return pricedModel, lookup, nil
+	}
+	rates, err := scaleModelRates(lookup.Rates, policy.Numerator, policy.Denominator)
+	if err != nil {
+		return "", PricingLookup{}, err
+	}
+	lookup.Rates = rates
+	lookup.Adjustment = policy.Service + "@" + policy.Version
+	return pricedModel, lookup, nil
+}
+
+func scaleModelRates(r ModelRates, numerator, denominator int64) (ModelRates, error) {
+	scale := func(v money.Money) (money.Money, error) { return money.ScaleRatio(v, numerator, denominator) }
+	var err error
+	if r.InputPerMTok, err = scale(r.InputPerMTok); err != nil {
+		return ModelRates{}, err
+	}
+	if r.OutputPerMTok, err = scale(r.OutputPerMTok); err != nil {
+		return ModelRates{}, err
+	}
+	if r.CacheWritePerMTok, err = scale(r.CacheWritePerMTok); err != nil {
+		return ModelRates{}, err
+	}
+	if r.CacheWrite1hPerMTok, err = scale(r.CacheWrite1hPerMTok); err != nil {
+		return ModelRates{}, err
+	}
+	if r.CacheReadPerMTok, err = scale(r.CacheReadPerMTok); err != nil {
+		return ModelRates{}, err
+	}
+	r.Bands = append([]PricingBand(nil), r.Bands...)
+	for i := range r.Bands {
+		if r.Bands[i].InputPerMTok, err = scale(r.Bands[i].InputPerMTok); err != nil {
+			return ModelRates{}, err
+		}
+		if r.Bands[i].OutputPerMTok, err = scale(r.Bands[i].OutputPerMTok); err != nil {
+			return ModelRates{}, err
+		}
+		if r.Bands[i].CacheWritePerMTok, err = scale(r.Bands[i].CacheWritePerMTok); err != nil {
+			return ModelRates{}, err
+		}
+		if r.Bands[i].CacheWrite1hPerMTok, err = scale(r.Bands[i].CacheWrite1hPerMTok); err != nil {
+			return ModelRates{}, err
+		}
+		if r.Bands[i].CacheReadPerMTok, err = scale(r.Bands[i].CacheReadPerMTok); err != nil {
+			return ModelRates{}, err
+		}
+	}
+	return r, nil
+}
+
 // Resolve selects the effective priced model while preserving the model name
 // reported by the source. An exact custom rate for the reported name takes
 // precedence over caller-supplied canonicalization.
@@ -248,12 +312,71 @@ func (r *PricingResolver) Resolve(
 // model, then the timestamp-aware GenAI Prices document, then the existing
 // LiteLLM/OpenRouter rows. An exact custom rate for the reported model still
 // takes precedence over caller-supplied canonicalization.
+//
+// When that whole ladder finds nothing and the model carries an Ollama Cloud
+// tag ("kimi-k2.7-code:cloud", "gpt-oss:120b-cloud"), the ladder runs once
+// more on the untagged name. Ollama bills its cloud models per token at the
+// upstream model's own rate, so the untagged catalog row is the estimate.
+// This runs only after every exact, custom, historical, and canonical attempt
+// on the tagged name has failed, so a catalogued cloud row (LiteLLM's
+// ollama/gpt-oss:120b-cloud) or a custom rate for the tagged name is never
+// reduced. The tagged name stays the priced model; Pattern reports the row.
+//
+// An exception is a zero-rate Ollama Cloud catalog row (LiteLLM's real
+// ollama/gpt-oss:120b-cloud entry), which is treated as non-authoritative so
+// the upstream untagged rate is used instead. Explicit nonzero cloud rates
+// and custom rates still take precedence. If no untagged base row exists,
+// the placeholder is discarded and the lookup reports OK=false.
 func (r *PricingResolver) ResolveAt(
 	reportedModel, canonicalModel string, timestamp time.Time,
 ) (string, PricingLookup) {
 	if r == nil {
 		return reportedModel, PricingLookup{}
 	}
+	pricedModel, lookup := r.resolveAt(reportedModel, canonicalModel, timestamp)
+	if lookup.OK && !isPlaceholderOllamaCloudRate(lookup) {
+		return pricedModel, lookup
+	}
+	if isPlaceholderOllamaCloudRate(lookup) {
+		// A placeholder must never count as priced; only a real base row
+		// can replace it.
+		lookup = PricingLookup{}
+	}
+	base := pricingpkg.OllamaCloudBaseModel(pricedModel)
+	if base == pricedModel {
+		return pricedModel, lookup
+	}
+	if _, baseLookup := r.resolveAt(base, base, timestamp); baseLookup.OK {
+		return pricedModel, baseLookup
+	}
+	return pricedModel, lookup
+}
+
+// isPlaceholderOllamaCloudRate reports whether a lookup found only a zero-rate
+// Ollama Cloud row. LiteLLM publishes rows such as
+// "ollama/gpt-oss:120b-cloud" with all-zero rates because Ollama Cloud
+// passes through the upstream model price; those rows should not block the
+// fallback to the real upstream rate for the untagged base model name.
+// Explicit custom zero rates are never treated as placeholders, and neither
+// is a row whose flat rates are zero but which prices usage through bands.
+func isPlaceholderOllamaCloudRate(lookup PricingLookup) bool {
+	if !lookup.OK || lookup.Rates.Source == PricingRowSourceCustom {
+		return false
+	}
+	if pricingpkg.OllamaCloudBaseModel(lookup.Pattern) == lookup.Pattern {
+		return false
+	}
+	return len(lookup.Rates.Bands) == 0 &&
+		lookup.Rates.InputPerMTok.Microdollars == 0 &&
+		lookup.Rates.OutputPerMTok.Microdollars == 0 &&
+		lookup.Rates.CacheWritePerMTok.Microdollars == 0 &&
+		lookup.Rates.CacheWrite1hPerMTok.Microdollars == 0 &&
+		lookup.Rates.CacheReadPerMTok.Microdollars == 0
+}
+
+func (r *PricingResolver) resolveAt(
+	reportedModel, canonicalModel string, timestamp time.Time,
+) (string, PricingLookup) {
 	if rates, ok := r.byModel[reportedModel]; ok &&
 		rates.Source == PricingRowSourceCustom {
 		return reportedModel, PricingLookup{
@@ -271,8 +394,13 @@ func (r *PricingResolver) ResolveAt(
 		return pricedModel, flatLookup
 	}
 	if !timestamp.IsZero() {
+		var genAIFallbackModel string
+		if flatLookup.OK &&
+			pricingpkg.EffortTierBaseModel(pricedModel) != pricedModel {
+			genAIFallbackModel = flatLookup.Pattern
+		}
 		if pricedModel, rates, ok := r.resolveGenAI(
-			reportedModel, canonicalModel, timestamp,
+			reportedModel, canonicalModel, genAIFallbackModel, timestamp,
 		); ok {
 			return pricedModel, rates
 		}
@@ -281,22 +409,63 @@ func (r *PricingResolver) ResolveAt(
 }
 
 func (r *PricingResolver) resolveGenAI(
-	reportedModel, canonicalModel string, timestamp time.Time,
+	reportedModel, canonicalModel, fallbackModel string, timestamp time.Time,
 ) (string, PricingLookup, bool) {
 	if r.genAI == nil {
 		return "", PricingLookup{}, false
 	}
-	models := []string{reportedModel}
+	type modelAlias struct {
+		lookup string
+		priced string
+	}
+	type modelCandidate struct {
+		provider string
+		model    string
+		priced   string
+	}
+	// At most four aliases (canonical, reported, effort-tier base, flat
+	// fallback) and two candidates per alias; fixed backing arrays keep
+	// both lists off the heap.
+	var aliasStorage [4]modelAlias
+	models := append(aliasStorage[:0],
+		modelAlias{lookup: reportedModel, priced: reportedModel})
 	if canonicalModel != "" && canonicalModel != reportedModel {
-		models = []string{canonicalModel, reportedModel}
+		models = append(models[:0],
+			modelAlias{lookup: canonicalModel, priced: canonicalModel},
+			modelAlias{lookup: reportedModel, priced: reportedModel},
+		)
+	}
+	pricedModel := canonicalModel
+	if pricedModel == "" {
+		pricedModel = reportedModel
+	}
+	baseModel := pricingpkg.EffortTierBaseModel(pricedModel)
+	if baseModel != pricedModel && baseModel != reportedModel &&
+		baseModel != canonicalModel {
+		models = append(models, modelAlias{
+			lookup: baseModel,
+			priced: pricedModel,
+		})
+	}
+	if fallbackModel != "" && fallbackModel != reportedModel &&
+		fallbackModel != canonicalModel && fallbackModel != baseModel {
+		models = append(models, modelAlias{
+			lookup: fallbackModel,
+			priced: pricedModel,
+		})
 	}
 	for _, model := range models {
-		provider, unqualified := genAIProviderAndModel(model)
-		for _, candidate := range []struct {
-			provider string
-			model    string
-			priced   string
-		}{{provider, unqualified, model}, {"", model, model}} {
+		provider, unqualified := genAIProviderAndModel(model.lookup)
+		var candidateStorage [2]modelCandidate
+		candidates := append(candidateStorage[:0],
+			modelCandidate{provider, unqualified, model.priced})
+		if provider != "" || unqualified != model.lookup {
+			candidates = append(candidates, modelCandidate{
+				model:  model.lookup,
+				priced: model.priced,
+			})
+		}
+		for _, candidate := range candidates {
 			if candidate.model == "" {
 				continue
 			}
@@ -464,6 +633,7 @@ func (r *PricingResolver) record(
 		cacheWrite1h: lookup.Rates.CacheWrite1hPerMTok.Microdollars,
 		cacheRead:    lookup.Rates.CacheReadPerMTok.Microdollars,
 		bands:        r.recordedBandsKey(lookup.Rates.Bands),
+		adjustment:   lookup.Adjustment,
 	}
 	rec := byPricedModel[key]
 	if rec == nil {
@@ -540,7 +710,7 @@ func pricingBandEqual(a, b PricingBand) bool {
 }
 
 func pricingLookupEqual(a, b PricingLookup) bool {
-	if a.Pattern != b.Pattern || a.OK != b.OK ||
+	if a.Pattern != b.Pattern || a.OK != b.OK || a.Adjustment != b.Adjustment ||
 		a.Rates.InputPerMTok != b.Rates.InputPerMTok ||
 		a.Rates.OutputPerMTok != b.Rates.OutputPerMTok ||
 		a.Rates.CacheWritePerMTok != b.Rates.CacheWritePerMTok ||
@@ -660,6 +830,7 @@ func (r *PricingResolver) BuildBlock() (PricingBlock, error) {
 func comparePricingRecordKey(a, b pricingRecordKey) int {
 	for _, comparison := range []int{
 		strings.Compare(a.pricedModel, b.pricedModel),
+		strings.Compare(a.adjustment, b.adjustment),
 		strings.Compare(a.pattern, b.pattern),
 		strings.Compare(string(a.source), string(b.source)),
 		cmp.Compare(a.input, b.input),

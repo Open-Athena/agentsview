@@ -1,18 +1,9 @@
 // @vitest-environment jsdom
-import {
-  describe,
-  it,
-  expect,
-  vi,
-  beforeEach,
-  afterEach,
-} from "vite-plus/test";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 const mocks = vi.hoisted(() => ({
   downloadExport: vi.fn().mockResolvedValue(undefined),
-  getMarkdownExportUrl: vi
-    .fn()
-    .mockReturnValue("/api/v1/sessions/sess-123/md"),
+  getMarkdownExportUrl: vi.fn().mockReturnValue("/api/v1/sessions/sess-123/md"),
   copyToClipboard: vi.fn().mockResolvedValue(true),
 }));
 
@@ -38,6 +29,19 @@ import AppHeader from "./AppHeader.svelte";
 
 function testSession(overrides: Partial<Session> = {}): Session {
   return {
+    compaction_count: 0,
+    consecutive_failure_max: 0,
+    edit_churn_count: 0,
+    ended_with_role: "",
+    final_failure_streak: 0,
+    has_peak_context_tokens: false,
+    has_total_output_tokens: false,
+    mid_task_compaction_count: 0,
+    outcome: "",
+    outcome_confidence: "",
+    secret_leak_count: 0,
+    tool_failure_signal_count: 0,
+    tool_retry_count: 0,
     id: "sess-123",
     project: "agentsview",
     machine: "test-machine",
@@ -99,10 +103,8 @@ describe("AppHeader export actions", () => {
     exportButton!.click();
     await tick();
 
-    const copyButton = Array.from(
-      document.querySelectorAll<HTMLButtonElement>("button"),
-    ).find((button) =>
-      button.textContent?.includes("Copy markdown export link"),
+    const copyButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
+      (button) => button.textContent?.includes("Copy markdown export link"),
     );
     expect(copyButton).not.toBeNull();
 
@@ -133,10 +135,8 @@ describe("AppHeader export actions", () => {
     exportButton!.click();
     await tick();
 
-    const copyPathButton = Array.from(
-      document.querySelectorAll<HTMLButtonElement>("button"),
-    ).find((button) =>
-      button.textContent?.includes("Copy source file path"),
+    const copyPathButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
+      (button) => button.textContent?.includes("Copy source file path"),
     );
     expect(copyPathButton).toBeDefined();
 
@@ -219,9 +219,7 @@ describe("AppHeader export actions", () => {
     );
 
     expect(sidebarButton).not.toBeNull();
-    expect(sidebarButton?.getAttribute("aria-controls")).toBe(
-      "session-sidebar",
-    );
+    expect(sidebarButton?.getAttribute("aria-controls")).toBe("session-sidebar");
     expect(sidebarButton?.getAttribute("aria-expanded")).toBe("false");
 
     sidebarButton!.click();
@@ -269,13 +267,14 @@ describe("AppHeader export actions", () => {
 
     expect(syncButton).not.toBeNull();
     expect(syncButton?.textContent?.trim()).toBe("Sync");
-    expect(
-      syncButton?.querySelector("svg.lucide-database-backup"),
-    ).not.toBeNull();
+    expect(syncButton?.querySelector("svg.lucide-database-backup")).not.toBeNull();
   });
 
   it("labels read-only global refresh with the refresh action", async () => {
     sync.serverVersion = {
+      api_version: 1,
+      data_version: 1,
+      insight_generation_available: false,
       version: "dev",
       commit: "unknown",
       build_date: "",
@@ -291,14 +290,15 @@ describe("AppHeader export actions", () => {
 
     expect(refreshButton).not.toBeNull();
     expect(refreshButton?.textContent?.trim()).toBe("Refresh");
-    expect(
-      refreshButton?.querySelector("svg.lucide-database-backup"),
-    ).not.toBeNull();
+    expect(refreshButton?.querySelector("svg.lucide-database-backup")).not.toBeNull();
     expect(document.body.textContent).toContain("Recall");
   });
 
   it("keeps Recall available when settings report a read-only backend", async () => {
     sync.serverVersion = {
+      api_version: 1,
+      data_version: 1,
+      insight_generation_available: false,
       version: "dev",
       commit: "unknown",
       build_date: "",

@@ -26,17 +26,17 @@ func seedSource(t *testing.T) string {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "source.db")
 
-	d, err := db.Open(path)
+	d, err := db.Open(t.Context(), path)
 	require.NoError(t, err, "open source db")
 
-	require.NoError(t, d.UpsertSession(db.Session{
+	require.NoError(t, d.UpsertSession(t.Context(), db.Session{
 		ID: "s-main", Project: "alpha", Machine: "local", Agent: "claude",
 	}), "upsert s-main")
-	require.NoError(t, d.UpsertSession(db.Session{
+	require.NoError(t, d.UpsertSession(t.Context(), db.Session{
 		ID: "s-sub", Project: "beta", Machine: "local", Agent: "claude",
 		ParentSessionID: new("s-main"), RelationshipType: "subagent",
 	}), "upsert s-sub")
-	require.NoError(t, d.UpsertSession(db.Session{
+	require.NoError(t, d.UpsertSession(t.Context(), db.Session{
 		ID: "s-other", Project: "gamma", Machine: "local", Agent: "claude",
 	}), "upsert s-other")
 
@@ -55,12 +55,12 @@ func seedSource(t *testing.T) string {
 		ToolName: "Bash", Category: "exec",
 		ResultContent: "tool result text", ResultContentLength: 16,
 	}}
-	require.NoError(t, d.ReplaceSessionMessages("s-main", mainMsgs),
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "s-main", mainMsgs),
 		"messages s-main")
-	require.NoError(t, d.ReplaceSessionMessages("s-sub", []db.Message{
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "s-sub", []db.Message{
 		msg("s-sub", 0, "subagent message"),
 	}), "messages s-sub")
-	require.NoError(t, d.ReplaceSessionMessages("s-other", []db.Message{
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "s-other", []db.Message{
 		msg("s-other", 0, "other project message"),
 	}), "messages s-other")
 
@@ -271,9 +271,9 @@ func TestExportPrivateSessionElided(t *testing.T) {
 		"baseline longest-prompts includes s-main")
 
 	// Now flag s-main private via the DB and re-export.
-	d, err := db.Open(src)
+	d, err := db.Open(t.Context(), src)
 	require.NoError(t, err, "reopen source")
-	require.NoError(t, d.SetSessionPrivate("s-main", true), "flag private")
+	require.NoError(t, d.SetSessionPrivate(context.Background(), "s-main", true), "flag private")
 	require.NoError(t, d.Close(), "close source")
 
 	out := filepath.Join(t.TempDir(), "snap")
@@ -406,7 +406,7 @@ func TestLoadViewConfigErrors(t *testing.T) {
 func seedDatedSource(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "source.db")
-	d, err := db.Open(path)
+	d, err := db.Open(t.Context(), path)
 	require.NoError(t, err, "open source db")
 
 	require.NoError(t, d.UpsertModelPricing([]db.ModelPricing{{
@@ -420,7 +420,7 @@ func seedDatedSource(t *testing.T) string {
 	// MessageCount/UserMessageCount are session-row counters maintained by the
 	// sync engine, not by ReplaceSessionMessages — the analytics panels read
 	// them, so seed them to match the messages written below.
-	require.NoError(t, d.UpsertSession(db.Session{
+	require.NoError(t, d.UpsertSession(t.Context(), db.Session{
 		ID: "s-long", Project: "alpha", Machine: "local", Agent: "claude",
 		StartedAt: &started, EndedAt: &ended,
 		MessageCount: 8, UserMessageCount: 4,
@@ -447,7 +447,7 @@ func seedDatedSource(t *testing.T) string {
 				`{"input_tokens":1000000,"output_tokens":1000000}`),
 		})
 	}
-	require.NoError(t, d.ReplaceSessionMessages("s-long", msgs),
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "s-long", msgs),
 		"messages s-long")
 
 	require.NoError(t, d.Close(), "close source db")

@@ -200,7 +200,7 @@ func openScopedTemp(
 		cleanup()
 		return nil, "", nil, err
 	}
-	if tdb, err = db.Open(tmpPath); err != nil {
+	if tdb, err = db.Open(ctx, tmpPath); err != nil {
 		cleanup()
 		return nil, "", nil, fmt.Errorf("snapshot: open analytics db: %w", err)
 	}
@@ -241,7 +241,7 @@ func copySnapshotSubset(
 ) error {
 	// db.Open creates the schema (tables, FTS, triggers); close it so the
 	// raw connection below owns the file for the bulk ATTACH copy.
-	seed, err := db.Open(tmpPath)
+	seed, err := db.Open(ctx, tmpPath)
 	if err != nil {
 		return fmt.Errorf("snapshot: seed analytics schema: %w", err)
 	}

@@ -14,8 +14,13 @@ import (
 // createSchema. The mirror schema is create-only: there are no in-place
 // migrations between versions. A version mismatch means the mirror file
 // must be rebuilt with 'agentsview duckdb push --full'. v12 adds the 1h
-// cache-write rate columns on top of v11's raw GenAI pricing document.
-const SchemaVersion = 12
+// cache-write rate columns on top of v11's raw GenAI pricing document. v13
+// adds row-level provider identity to messages and usage events. v14 adds
+// reasoning effort to messages. v15 adds explicit session-project
+// assignment state. v16 rebuilds after SQLite data version 111 rewrote
+// stored Devin source identities; pre-111 mirrors would otherwise keep
+// serving bare ids that deduplicate across sessions.
+const SchemaVersion = 16
 
 const schemaVersionMetadataKey = "agentsview_schema_version"
 
@@ -108,6 +113,7 @@ var mirrorTables = []tableSpec{
 		create: `CREATE TABLE IF NOT EXISTS sessions (
 			id TEXT PRIMARY KEY,
 			project TEXT NOT NULL,
+			project_assigned BOOLEAN NOT NULL DEFAULT FALSE,
 			machine TEXT NOT NULL DEFAULT 'local',
 			agent TEXT NOT NULL DEFAULT 'claude',
 			agent_label TEXT NOT NULL DEFAULT '',
@@ -179,6 +185,7 @@ var mirrorTables = []tableSpec{
 		columns: []columnSpec{
 			{"id", "id TEXT"},
 			{"project", "project TEXT NOT NULL DEFAULT ''"},
+			{"project_assigned", "project_assigned BOOLEAN NOT NULL DEFAULT FALSE"},
 			{"machine", "machine TEXT NOT NULL DEFAULT 'local'"},
 			{"agent", "agent TEXT NOT NULL DEFAULT 'claude'"},
 			{"agent_label", "agent_label TEXT NOT NULL DEFAULT ''"},
@@ -272,9 +279,11 @@ var mirrorTables = []tableSpec{
 			content_length INTEGER NOT NULL DEFAULT 0,
 			is_system BOOLEAN NOT NULL DEFAULT FALSE,
 			model TEXT NOT NULL DEFAULT '',
+			reasoning_effort TEXT NOT NULL DEFAULT '',
 			token_usage TEXT NOT NULL DEFAULT '',
 			context_tokens INTEGER NOT NULL DEFAULT 0,
 			output_tokens INTEGER NOT NULL DEFAULT 0,
+			provider_id TEXT NOT NULL DEFAULT '',
 			has_context_tokens BOOLEAN NOT NULL DEFAULT FALSE,
 			has_output_tokens BOOLEAN NOT NULL DEFAULT FALSE,
 			claude_message_id TEXT NOT NULL DEFAULT '',
@@ -301,9 +310,11 @@ var mirrorTables = []tableSpec{
 			{"content_length", "content_length INTEGER NOT NULL DEFAULT 0"},
 			{"is_system", "is_system BOOLEAN NOT NULL DEFAULT FALSE"},
 			{"model", "model TEXT NOT NULL DEFAULT ''"},
+			{"reasoning_effort", "reasoning_effort TEXT NOT NULL DEFAULT ''"},
 			{"token_usage", "token_usage TEXT NOT NULL DEFAULT ''"},
 			{"context_tokens", "context_tokens INTEGER NOT NULL DEFAULT 0"},
 			{"output_tokens", "output_tokens INTEGER NOT NULL DEFAULT 0"},
+			{"provider_id", "provider_id TEXT NOT NULL DEFAULT ''"},
 			{"has_context_tokens", "has_context_tokens BOOLEAN NOT NULL DEFAULT FALSE"},
 			{"has_output_tokens", "has_output_tokens BOOLEAN NOT NULL DEFAULT FALSE"},
 			{"claude_message_id", "claude_message_id TEXT NOT NULL DEFAULT ''"},
@@ -330,6 +341,7 @@ var mirrorTables = []tableSpec{
 			message_ordinal INTEGER,
 			source TEXT NOT NULL,
 			model TEXT NOT NULL,
+			provider_id TEXT NOT NULL DEFAULT '',
 			input_tokens INTEGER NOT NULL DEFAULT 0,
 			output_tokens INTEGER NOT NULL DEFAULT 0,
 			cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -347,6 +359,7 @@ var mirrorTables = []tableSpec{
 			{"message_ordinal", "message_ordinal INTEGER"},
 			{"source", "source TEXT NOT NULL DEFAULT ''"},
 			{"model", "model TEXT NOT NULL DEFAULT ''"},
+			{"provider_id", "provider_id TEXT NOT NULL DEFAULT ''"},
 			{"input_tokens", "input_tokens INTEGER NOT NULL DEFAULT 0"},
 			{"output_tokens", "output_tokens INTEGER NOT NULL DEFAULT 0"},
 			{"cache_creation_input_tokens", "cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0"},
@@ -453,10 +466,10 @@ var mirrorTables = []tableSpec{
 	{
 		name: "genai_pricing",
 		create: `CREATE TABLE IF NOT EXISTS genai_pricing (
-			singleton SMALLINT PRIMARY KEY CHECK (singleton = 1),
+			singleton SMALLINT PRIMARY KEY,
 			version TEXT NOT NULL,
 			source_ref TEXT NOT NULL DEFAULT '',
-			source TEXT NOT NULL CHECK (source IN ('embedded', 'fetched')),
+			source TEXT NOT NULL,
 			data_json BLOB NOT NULL,
 			updated_at TEXT NOT NULL DEFAULT ''
 		)`,

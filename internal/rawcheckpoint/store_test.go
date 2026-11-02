@@ -264,7 +264,7 @@ func TestStoreConcurrentAdvanceHeadReturnsCASResults(t *testing.T) {
 		case errors.Is(err, ErrHeadConflict):
 			conflicts++
 		default:
-			assert.NoError(t, err, "concurrent writers must return a CAS result")
+			require.NoError(t, err, "concurrent writers must return a CAS result")
 		}
 	}
 	assert.Equal(t, 1, successes)
@@ -306,6 +306,30 @@ func TestStoreSetDeviceChangeClearsHeads(t *testing.T) {
 	require.NoError(t, store.db.QueryRowContext(t.Context(),
 		`SELECT created_at FROM device_config WHERE id = 1`).Scan(&createdAtAfter))
 	assert.Equal(t, createdAt, createdAtAfter)
+}
+
+func TestStoreEnsureDeviceRejectsReprovisioningWithoutMutatingState(t *testing.T) {
+	t.Parallel()
+	store := openTestStore(t)
+	require.NoError(t, store.SetDevice(t.Context(), "dev_1"))
+	first := testCommitResult(1, 1)
+	require.NoError(t, store.AdvanceHead(
+		t.Context(), "dev_1", parser.AgentClaude, "root-1", "src-1", "", first,
+	))
+
+	err := store.EnsureDevice(t.Context(), "dev_2")
+
+	require.ErrorIs(t, err, ErrDeviceMismatch)
+	device, ok, readErr := store.Device(t.Context())
+	require.NoError(t, readErr)
+	require.True(t, ok)
+	assert.Equal(t, "dev_1", device)
+	head, ok, readErr := store.SourceHead(
+		t.Context(), parser.AgentClaude, "root-1", "src-1",
+	)
+	require.NoError(t, readErr)
+	require.True(t, ok)
+	assert.Equal(t, first.Receipt, head.Receipt)
 }
 
 // TestStoreAdvanceHeadRequiresConfiguredDevice: advancement before any

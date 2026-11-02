@@ -70,11 +70,73 @@ func ResolveMatch[T any](model string, m map[string]T) Match[T] {
 		}
 	}
 	// 4. Canonical match with curated decoration stripping
-	v, pattern, ok := resolveCanonicalMatch(m, model)
-	if !ok {
-		return Match[T]{Value: zero}
+	if v, pattern, ok := resolveCanonicalMatch(m, model); ok {
+		return Match[T]{Value: v, Pattern: pattern, OK: true}
 	}
-	return Match[T]{Value: v, Pattern: pattern, OK: true}
+	// 5. Reasoning-effort / speed tier fallback. Agents such as Devin append
+	// a reasoning-effort tier (e.g. "-thinking", "-high", "-medium", "-max")
+	// and sometimes a "-fast" speed tier to a base model that prices
+	// identically regardless of tier. Strip those trailing tiers and retry
+	// the full ladder on the base. This runs only after every exact and
+	// canonical attempt above has failed, so any real model whose full name
+	// is catalogued (mistral-medium, grok-4-fast, o3-mini-high,
+	// moonshot/kimi-k2-thinking) is matched first and never reduced.
+	if base := EffortTierBaseModel(model); base != model {
+		if sub := ResolveMatch(base, m); sub.OK {
+			return sub
+		}
+	}
+	return Match[T]{Value: zero}
+}
+
+// effortTierSuffixes are reasoning-effort tiers that do not change a model's
+// per-token price: the same base model is billed identically whether the
+// provider ran it at minimal or maximal effort. They are only ever stripped
+// as a last resort (see ResolveMatch step 5), so a catalogued model that
+// genuinely ends in one of these words is matched by an earlier exact or
+// canonical step and never reaches the stripping path.
+var effortTierSuffixes = map[string]struct{}{
+	"thinking": {}, "minimal": {}, "low": {}, "medium": {},
+	"high": {}, "xhigh": {}, "max": {},
+}
+
+// EffortTierBaseModel removes trailing reasoning-effort tiers from a model
+// name, plus a single trailing "-fast" speed tier when it rides on top of an
+// effort tier ("<base>-medium-fast"). A bare trailing "-fast" is preserved
+// because some providers price it as a distinct model (xAI grok-*-fast), as is
+// any name that carries no effort tier. Comparison is case-insensitive.
+func EffortTierBaseModel(model string) string {
+	s := model
+	// A speed tier is only strippable atop an effort tier; drop one "-fast"
+	// when the token before it is itself an effort tier.
+	if tok, rest, ok := lastDashToken(s); ok && tok == "fast" {
+		if prev, _, ok2 := lastDashToken(rest); ok2 {
+			if _, isEffort := effortTierSuffixes[prev]; isEffort {
+				s = rest
+			}
+		}
+	}
+	for {
+		tok, rest, ok := lastDashToken(s)
+		if !ok {
+			return s
+		}
+		if _, isEffort := effortTierSuffixes[tok]; !isEffort {
+			return s
+		}
+		s = rest
+	}
+}
+
+// lastDashToken splits off the final '-'-delimited token of s, returning the
+// lowercased token and the remainder before the '-'. It reports false when
+// there is no interior '-' (a leading '-' is not a separator).
+func lastDashToken(s string) (tok, rest string, ok bool) {
+	idx := strings.LastIndex(s, "-")
+	if idx <= 0 {
+		return "", "", false
+	}
+	return strings.ToLower(s[idx+1:]), s[:idx], true
 }
 
 // resolveCanonicalMatch matches the canonicalized model name exactly against
@@ -218,4 +280,29 @@ func stripTrailingDate(s string) string {
 		}
 	}
 	return s[:i]
+}
+
+// OllamaCloudBaseModel removes the Ollama Cloud marker from a model tag.
+// Ollama names its hosted models with a ":cloud" tag ("kimi-k2.7-code:cloud")
+// or a "-cloud" suffix on a size tag ("gpt-oss:120b-cloud"). Both run the
+// same upstream model that Ollama bills per token at that model's own
+// published rate, so the catalog row for the untagged name is the right
+// estimate: "kimi-k2.7-code:cloud" -> "kimi-k2.7-code", "gpt-oss:120b-cloud"
+// -> "gpt-oss:120b". Local tags (":27b-mlx", ":latest", ":31b") are preserved
+// because a locally served model has no per-token price, and the size in a
+// tag is kept because size changes the rate. Comparison is case-insensitive.
+func OllamaCloudBaseModel(model string) string {
+	idx := strings.LastIndex(model, ":")
+	if idx <= 0 {
+		return model
+	}
+	const marker = "cloud"
+	tag := strings.ToLower(model[idx+1:])
+	switch {
+	case tag == marker:
+		return model[:idx]
+	case len(tag) > len(marker)+1 && strings.HasSuffix(tag, "-"+marker):
+		return model[:len(model)-len(marker)-1]
+	}
+	return model
 }

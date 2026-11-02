@@ -39,14 +39,16 @@ const (
 	checkpointFormatVersion = 1
 	// Manifest v2 replaces usage_events[].cost_usd floats with exact
 	// integer-microdollar cost objects. Manifest v3 adds the optional
-	// session_kind provenance field; v2 manifests still decode, with the
-	// field defaulting to empty.
-	manifestFormatVersion    = 3
+	// session_kind provenance field. Manifest v4 adds the optional
+	// provider_id billing field on usage events; v2 and v3 manifests still
+	// decode, with the fields defaulting to empty.
+	manifestFormatVersion    = 4
 	manifestMinDecodeVersion = 2
 	// Segment v2 adds the optional prompt_source provenance field on
-	// message records; v1 segments still decode, with the field defaulting
-	// to empty.
-	messageSegmentFormatVersion    = 2
+	// message records. Segment v3 adds the optional provider_id billing
+	// field. Segment v4 adds the optional reasoning_effort field; v1 through
+	// v3 segments still decode, with the fields defaulting to empty.
+	messageSegmentFormatVersion    = 4
 	messageSegmentMinDecodeVersion = 1
 	metadataEventFormatVersion     = 1
 )
@@ -88,7 +90,7 @@ func normalizeCheckpointName(name string) (string, error) {
 func checkpointSequence(filename string) (int, error) {
 	sequence, err := db.ParseArtifactCheckpointSequence(filename)
 	if err != nil {
-		return 0, fmt.Errorf("%w: %v", ErrArtifactInvalid, err)
+		return 0, fmt.Errorf("%w: %w", ErrArtifactInvalid, err)
 	}
 	return sequence, nil
 }
@@ -142,6 +144,7 @@ type artifactUsageEvent struct {
 	MessageOrdinal           *int         `json:"message_ordinal,omitempty"`
 	Source                   string       `json:"source"`
 	Model                    string       `json:"model"`
+	ProviderID               string       `json:"provider_id,omitempty"`
 	InputTokens              int          `json:"input_tokens,omitzero"`
 	OutputTokens             int          `json:"output_tokens,omitzero"`
 	CacheCreationInputTokens int          `json:"cache_creation_input_tokens,omitzero"`
@@ -191,6 +194,8 @@ type segmentMessage struct {
 	HasToolUse        bool              `json:"has_tool_use,omitzero"`
 	ContentLength     int               `json:"content_length,omitzero"`
 	Model             string            `json:"model,omitempty"`
+	ReasoningEffort   string            `json:"reasoning_effort,omitempty"`
+	ProviderID        string            `json:"provider_id,omitempty"`
 	TokenUsage        jsontext.Value    `json:"token_usage,omitempty"`
 	ContextTokens     int               `json:"context_tokens,omitzero"`
 	OutputTokens      int               `json:"output_tokens,omitzero"`
@@ -300,6 +305,8 @@ func segmentMessageFromDB(msg db.Message) segmentMessage {
 		HasToolUse:        msg.HasToolUse,
 		ContentLength:     msg.ContentLength,
 		Model:             msg.Model,
+		ReasoningEffort:   msg.ReasoningEffort,
+		ProviderID:        msg.ProviderID,
 		TokenUsage:        msg.TokenUsage,
 		ContextTokens:     msg.ContextTokens,
 		OutputTokens:      msg.OutputTokens,

@@ -112,10 +112,10 @@ func (ix *Index) Build(
 		return BuildResult{}, err
 	}
 	if o.RepairInvalid && o.FullRebuild {
-		return BuildResult{}, fmt.Errorf("repair-invalid and full-rebuild are mutually exclusive")
+		return BuildResult{}, errors.New("repair-invalid and full-rebuild are mutually exclusive")
 	}
 	if o.RepairInvalid && o.Backstop {
-		return BuildResult{}, fmt.Errorf("repair-invalid and backstop are mutually exclusive")
+		return BuildResult{}, errors.New("repair-invalid and backstop are mutually exclusive")
 	}
 	if o.RepairInvalid {
 		return ix.buildInvalidRepair(ctx, enc, gen, o)
@@ -293,7 +293,7 @@ func (ix *Index) buildInvalidRepair(
 	}
 	if fill.Failed > 0 {
 		return result, fmt.Errorf(
-			"invalid vector repair incomplete: %d permanently rejected targets remain queued; first failure: %v",
+			"invalid vector repair incomplete: %d permanently rejected targets remain queued; first failure: %w",
 			fill.Failed, fill.FirstFailure)
 	}
 	if remaining > 0 {
@@ -382,8 +382,8 @@ func isPermanentEncodeError(err error) bool {
 	if errors.Is(err, kitvec.ErrEmptyEmbeddingInput) {
 		return true
 	}
-	var statusErr *HTTPStatusError
-	return errors.As(err, &statusErr) && statusErr != nil && statusErr.Permanent()
+	statusErr, hasStatusErr := errors.AsType[*HTTPStatusError](err)
+	return hasStatusErr && statusErr != nil && statusErr.Permanent()
 }
 
 // noWatermarkYet reports whether Refresh has never advanced the stored
@@ -537,12 +537,7 @@ func (ix *Index) countPending(ctx context.Context, fp string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	rows, err := ix.db.QueryContext(ctx, `
-SELECT content FROM `+ix.spec.DocsTable+` d WHERE NOT EXISTS (
-    SELECT 1 FROM `+ix.spec.stampsTable()+` s WHERE s.ordinal = ? AND s.doc_key = d.doc_key
-      AND s.revision = d.content_hash)`,
-		ordinal,
-	)
+	rows, err := ix.db.QueryContext(ctx, ix.pendingContentQuery(), ordinal)
 	if err != nil {
 		return 0, fmt.Errorf("count pending documents: %w", err)
 	}
@@ -560,6 +555,27 @@ SELECT content FROM `+ix.spec.DocsTable+` d WHERE NOT EXISTS (
 		return 0, fmt.Errorf("iterating pending documents: %w", err)
 	}
 	return total, nil
+}
+
+// pendingContentQuery returns the content of every document not stamped at
+// its current revision for the bound generation ordinal.
+//
+// The pending CTE is materialized on purpose: it resolves doc_keys through
+// the mirror's (doc_key, content_hash) covering index alone, and the outer
+// join then reads content only for the documents that survive. Flattened
+// into one statement, SQLite reads every mirror row's content just to
+// discard the already-stamped ones, so an after-sync refresh with nothing
+// pending still paid for the whole corpus.
+func (ix *Index) pendingContentQuery() string {
+	return `
+WITH pending AS MATERIALIZED (
+    SELECT d.doc_key FROM ` + ix.spec.DocsTable + ` d WHERE NOT EXISTS (
+        SELECT 1 FROM ` + ix.spec.stampsTable() + ` s
+         WHERE s.ordinal = ? AND s.doc_key = d.doc_key
+           AND s.revision = d.content_hash)
+)
+SELECT d.content FROM pending p
+  JOIN ` + ix.spec.DocsTable + ` d ON d.doc_key = p.doc_key`
 }
 
 // ordinalForFingerprint looks up a generation's generations-table ordinal

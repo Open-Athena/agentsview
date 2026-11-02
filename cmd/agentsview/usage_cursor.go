@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/cursorusage"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/timeutil"
 )
 
 var newCursorUsageClient = cursorusage.NewClient
@@ -37,7 +39,7 @@ func newUsageCursorCommand() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg.EmailChanged = cmd.Flags().Changed("email")
 			cfg.UserIDChanged = cmd.Flags().Changed("user-id")
-			return runUsageCursor(cfg)
+			return runUsageCursor(cmd.Context(), cfg)
 		},
 	}
 	cmd.Flags().StringVar(&cfg.Since, "since", "", "Start date (YYYY-MM-DD)")
@@ -49,7 +51,7 @@ func newUsageCursorCommand() *cobra.Command {
 	return cmd
 }
 
-func runUsageCursor(cfg UsageCursorConfig) error {
+func runUsageCursor(ctx context.Context, cfg UsageCursorConfig) error {
 	appCfg, err := config.LoadMinimal()
 	if err != nil {
 		return err
@@ -65,7 +67,7 @@ func runUsageCursor(cfg UsageCursorConfig) error {
 
 	apiKey := strings.TrimSpace(appCfg.CursorAdminAPIKey)
 	if apiKey == "" {
-		return fmt.Errorf("missing Cursor admin API key")
+		return errors.New("missing Cursor admin API key")
 	}
 
 	email := strings.TrimSpace(cfg.Email)
@@ -82,10 +84,7 @@ func runUsageCursor(cfg UsageCursorConfig) error {
 		}
 	}
 
-	loc, err := time.LoadLocation(localTimezone())
-	if err != nil {
-		loc = time.Local
-	}
+	loc := timeutil.LocalLocation()
 
 	start, end, err := resolveCursorUsageWindow(cfg, loc)
 	if err != nil {
@@ -126,7 +125,7 @@ func runUsageCursor(cfg UsageCursorConfig) error {
 			IsHeadless:       ev.IsHeadless,
 		})
 	}
-	if err := database.InsertCursorUsageEvents(rows); err != nil {
+	if err := database.InsertCursorUsageEvents(ctx, rows); err != nil {
 		return err
 	}
 

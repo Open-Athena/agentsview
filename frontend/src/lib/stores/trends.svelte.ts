@@ -1,21 +1,14 @@
-import {
-  TrendsService,
-} from "../api/generated/index";
-import type { TrendsTermsResponse } from "../api/types.js";
-import { callGenerated, isAbortError } from "../api/runtime.js";
+import { m } from "../i18n/index.js";
+import { TrendsService, type DbTrendsTermsResponse } from "../api/generated/index";
+import { isAbortError } from "../api/runtime.js";
 import { rollingRange } from "../utils/dates.js";
 import { LatestRead } from "../utils/latest-read.js";
 import { perf } from "./perf.svelte.js";
 
-type TrendsTermsParams = Parameters<
-  typeof TrendsService.getApiV1TrendsTerms
->[0];
-export type TrendsGranularity = NonNullable<
-  TrendsTermsParams["granularity"]
->;
+type TrendsTermsParams = NonNullable<Parameters<typeof TrendsService.getApiV1TrendsTerms>[0]>;
+export type TrendsGranularity = NonNullable<TrendsTermsParams["granularity"]>;
 
-const DEFAULT_TERMS =
-  "load bearing | load-bearing\nseam\nblast radius";
+const DEFAULT_TERMS = "load bearing | load-bearing\nseam\nblast radius";
 
 // Default to a rolling one-year window under the shared N-days-inclusive
 // semantics (today plus the preceding 364 days), so selectionFromRange()
@@ -29,7 +22,7 @@ class TrendsStore {
   granularity: TrendsGranularity = $state("week");
   normalized: boolean = $state(false);
   termText: string = $state(DEFAULT_TERMS);
-  response: TrendsTermsResponse | null = $state(null);
+  response: DbTrendsTermsResponse | null = $state(null);
   loading = $state({ terms: false });
   errors = $state<{ terms: string | null }>({ terms: null });
   private version = 0;
@@ -65,10 +58,7 @@ class TrendsStore {
     const started = performance.now();
     let status: "ok" | "error" | "aborted" = "ok";
     try {
-      const data = await callGenerated(() =>
-        TrendsService.getApiV1TrendsTerms(this.params()),
-        signal,
-      ) as unknown as TrendsTermsResponse;
+      const data = await TrendsService.getApiV1TrendsTerms(this.params(), { signal });
       if (this.version === v && this.termsRead.isCurrent(signal)) {
         this.response = data;
         this.errors.terms = null;
@@ -80,8 +70,7 @@ class TrendsStore {
       }
       status = "error";
       if (this.version === v) {
-        this.errors.terms =
-          e instanceof Error ? e.message : "Failed to load";
+        this.errors.terms = e instanceof Error ? e.message : m.shared_failed_to_load();
         if (isFirstLoad) {
           this.response = null;
         } else {

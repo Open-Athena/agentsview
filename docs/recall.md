@@ -1,7 +1,12 @@
 ---
 title: Recall (Experimental)
-description: Experimental, provenance-linked durable knowledge over the local session archive
+description: Find reusable lessons from past sessions, with links to the supporting messages
 ---
+
+Recall helps you reuse facts, procedures, preferences, and warnings from past
+agent sessions. It stores them as entries with links to the messages that
+support each claim. You can browse these entries, search them, or collect them
+into a task brief.
 
 !!! warning "Active research"
 
@@ -11,15 +16,9 @@ description: Experimental, provenance-linked durable knowledge over the local se
     them. The session archive remains authoritative and must not be deleted,
     truncated, or recreated to reset Recall.
 
-Recall is an experimental layer for durable, provenance-linked knowledge from
-past agent sessions. It stores compact facts, procedures, preferences, and
-warnings as entries that can be listed, queried, and packed into a task brief.
-
-This is different from [semantic search](/semantic-search/). Semantic search
-finds relevant passages in the transcript archive. Recall searches a separate
-set of distilled entries and keeps the transcript region supporting each entry
-as evidence. Recall queries support lexical, vector, and hybrid retrieval; the
-default remains lexical while this feature is experimental.
+[Semantic search](/docs/semantic-search/) finds passages in transcripts. Recall
+searches the extracted entries. It can match words (`lexical`, the default),
+meaning (`vector`), or both (`hybrid`).
 
 ## Current surface
 
@@ -35,11 +34,11 @@ The current implementation is local and SQLite-only. The CLI provides:
 
 The top-level **Recall** page has two tabs:
 
-- **Corpus** is a read-only browser for distilled entries. It shows extraction
-  coverage and generation state, and filters entries by text, project, entry
-  type, generation, and review state. Expand an entry to inspect its body,
-  trigger, uncertainty, provenance metadata, and evidence links back to the
-  source transcript.
+- **Corpus** is a browser and review surface for distilled entries. It shows
+  extraction coverage and generation state, and filters entries by text,
+  project, entry type, generation, and review state. Expand an entry to
+  inspect its body, trigger, uncertainty, provenance metadata, evidence links
+  back to the source transcript, and review controls for automatic entries.
 - **Generated insights** creates and stores longer reports over an explicit
   session scope. Its form always shows the date range, project, session agent,
   automated-session scope, report template, generator, and optional focus used
@@ -49,19 +48,19 @@ The top-level **Recall** page has two tabs:
 Open Recall from the header or navigate directly to `/recall`. Generated-report
 links use `/recall?tab=generated&insight=<id>`.
 
-![Recall corpus browser](/assets/generated/screenshots/recall-corpus.png)
+![Recall corpus browser](/docs/assets/generated/screenshots/recall-corpus.png)
 
-![Generated insights](/assets/generated/screenshots/recall-generated-insights.png)
+![Generated insights](/docs/assets/generated/screenshots/recall-generated-insights.png)
 
 Generated insights use the configured OpenAI-compatible endpoint when
 `[insights]` has both an `endpoint` and `model`; when `[insights]` is absent,
 they use the selected agent CLI on your machine. Partial endpoint configuration
-is rejected during configuration validation. Endpoint mode sends one non-streaming
-`POST /chat/completions` request with the generated prompt as a user message.
-It accepts the first choice's `assistant` message with string `message.content`
-and optional response `model`. It does not support streaming, `/responses`, legacy completions,
-tool calls, or content-part arrays. An endpoint failure returns an error and
-does not retry through a CLI.
+is rejected during configuration validation. Endpoint mode sends one
+non-streaming `POST /chat/completions` request with the generated prompt as a
+user message. It accepts the first choice's `assistant` message with string
+`message.content` and optional response `model`. It does not support streaming,
+`/responses`, legacy completions, tool calls, or content-part arrays. An
+endpoint failure returns an error and does not retry through a CLI.
 
 ```toml
 [insights]
@@ -71,16 +70,19 @@ api_key_env = "OPENAI_API_KEY" # optional; the value is read at runtime
 # allow_http = true            # required for non-loopback HTTP endpoints
 ```
 
-Loopback HTTP endpoints are allowed for local models. Remote endpoints must
-use HTTPS unless `allow_http = true` explicitly opts into plaintext transport.
-The endpoint receives transcript-derived content, so review the provider's
-privacy and retention behavior. API keys stay in the environment and are sent
-only as a bearer header; they are not stored in the AgentsView configuration.
-Canned insight cache keys include the effective backend, model, and a safe
-endpoint identity, so changing `[insights]` after restarting the server selects
-a separate cached report. Changes to credentials or transport opt-ins do not
+Loopback HTTP endpoints are allowed for local models. Remote endpoints must use
+HTTPS unless `allow_http = true` explicitly opts into plaintext transport. The
+endpoint receives transcript-derived content, so review the provider's privacy
+and retention behavior. API keys stay in the environment and are sent only as a
+bearer header; they are not stored in the AgentsView configuration. Canned
+insight cache keys include the effective backend, model, and a safe endpoint
+identity, so changing `[insights]` after restarting the server selects a
+separate cached report. Changes to credentials or transport opt-ins do not
 change that identity; use force refresh when those changes should regenerate a
 report under the same endpoint and model.
+
+Generated insights can also be listed, fetched, and generated from the CLI with
+`agentsview insight`; see the [CLI reference](/docs/commands/).
 
 ### Configuring agent binaries
 
@@ -109,12 +111,36 @@ The Corpus tab is not available through PostgreSQL or DuckDB stores, so those
 read-only servers open Recall on Generated insights instead. On the local SQLite
 UI, Session Vital Signs also includes a read-only Recall panel for the open
 session and links each evidence range back to the transcript. Corpus population,
-review, extraction-generation management, and ranked querying remain CLI and
-HTTP API workflows.
+extraction-generation management, and ranked querying remain CLI and HTTP API
+workflows.
 
 The daemon exposes the same inspection and query operations over its HTTP API.
 Ordinary queries record measurement data when the SQLite store is writable, but
 read-only archives remain queryable without recording.
+
+### Review extracted entries
+
+Expand an accepted `unreviewed_auto` entry in the Corpus table to approve or
+archive it. **Approve** immediately marks the entry `human_reviewed`; approval
+is disabled when its source evidence has been revoked. **Archive** asks for
+confirmation, then marks the entry `human_rejected` and removes it from the
+served Recall corpus.
+
+Review actions are unavailable when `archive_content = "usage"`, which excludes
+transcript-derived Recall entries from storage.
+
+Both decisions are durable human states and are not reversed by later
+extraction-generation changes. This surface deliberately has no entry editing,
+bulk review, or undo action.
+
+Recall requires SQLite FTS5, which all standard builds include. Writable open
+upgrades the previous review-state schema when present and converts any old FTS4
+Recall search indexes to FTS5 in the same transaction. Index conversion also
+runs when the review-state schema is already current. Entries and evidence are
+preserved; existing FTS5 indexes do not need rebuilding. The migration blocks
+startup until it finishes and does not run again on later opens. Read-only
+archives keep their existing indexes and use a slower text lookup when legacy
+indexes cannot run the ranked entry search.
 
 ## Vector and hybrid retrieval
 
@@ -145,8 +171,14 @@ one-time consent for that invocation.
 Vector and hybrid queries fail closed when the active Recall corpus is newer
 than its last completed vector build. Rebuild the Recall store, or continue
 using lexical mode while an automatic refresh catches up. See
-[Semantic Search](/semantic-search/#enabling-vector) for the shared embedding
-configuration and endpoint privacy considerations.
+[Semantic Search](/docs/semantic-search/#enabling-vector) for the shared
+embedding configuration and endpoint privacy considerations.
+
+Vector candidates are ranked before Recall filters are applied. The embedding
+backend bounds the candidate window, so a narrow project, cwd, or other filter
+can produce a short vector page when that boundary is reached. Hybrid search
+still ranks the lexical candidates selected for the query, then fuses those
+results with the available vector candidates.
 
 ## Automatic extraction
 
@@ -185,7 +217,8 @@ Optional keys: `deployment` (labels which serving instance produced the corpus),
 `server` (selects among multiple named servers), `quiet_period` (default `"30m"`
 — how long a session must have been ended before extraction),
 `backstop_interval` (default `"1h"`), `failure_backoff` (default `"1h"`),
-`max_window_chars` (default 50000), `max_tokens`, per-server `api_key_env`, a
+`max_window_chars` (default 50000), `max_tokens`, `candidate_findings`
+(`"block"` default, or `"allow"` — see below), per-server `api_key_env`, a
 `[recall.extract.prompts]` table (`profile`, `dir`), and a
 `[recall.extract.request]` table (`temperature`, `extra_body`).
 
@@ -198,11 +231,22 @@ names, and even a same-origin allowance can be steered elsewhere by re-resolving
 the hostname. Configure the endpoint with its final URL.
 
 Sessions are only ever extracted when they are not automated, not trashed, and
-have a clean, current **full** secret scan — a session with secret findings of
-any confidence, one never scanned, or one covered only by the fast inline sync
-scan never reaches the model. Run `agentsview secrets scan --backfill` to make
-sessions eligible. These filters are not configurable. Session content is sent
-only to the endpoints you configure.
+have a clean, current **full** secret scan. By default, a session with secret
+findings of any confidence, one never scanned, or one covered only by the fast
+inline sync scan never reaches the model. Run
+`agentsview secrets scan --backfill` to make sessions eligible. Session content
+is sent only to the endpoints you configure.
+
+One knob narrows that boundary deliberately: `candidate_findings = "allow"`
+under `[recall.extract]`. Candidate-confidence findings — the false-positive-
+prone heuristics (`high-entropy-assignment`, JWT-shaped tokens, basic-auth URLs)
+that `secrets list` hides unless asked — then stay recorded for review but no
+longer exclude a session; only definite findings do, in discovery, in the
+pre-send transcript check, at commit, and in reconciliation. The default,
+`"block"`, keeps every recorded finding blocking. Consider `"allow"` when the
+endpoint is a machine you own and the archive is full of paths and identifiers
+that trip the entropy heuristic; keep the default for any endpoint you would not
+send a suspected secret to.
 
 Each distillation configuration (model, prompts, segmentation, request shape) is
 fingerprinted as a *generation*; changing the configuration builds a new corpus
@@ -231,14 +275,15 @@ or manufacture stable message IDs and digests. Evidence must belong to the same
 source session as its entry. These checks run through the shared insertion and
 reviewed-import boundaries rather than through a separate model write path.
 
-Entries have one of four review states:
+Entries have one of five review states:
 
-| Review state      | Meaning                                                 |
-| ----------------- | ------------------------------------------------------- |
-| `human_reviewed`  | Explicitly accepted through the reviewed import surface |
-| `unreviewed_auto` | Generated or omitted review decision                    |
-| `calibrated_auto` | Automated output from a calibrated future policy        |
-| `eval_raw`        | Quarantined evaluation material                         |
+| Review state      | Meaning                                          |
+| ----------------- | ------------------------------------------------ |
+| `human_reviewed`  | Explicitly approved by a human                   |
+| `human_rejected`  | Explicitly rejected and archived by a human      |
+| `unreviewed_auto` | Generated or omitted review decision             |
+| `calibrated_auto` | Automated output from a calibrated future policy |
+| `eval_raw`        | Quarantined evaluation material                  |
 
 A trusted-only read requires an accepted, `human_reviewed` entry that is both
 transferable and provenance-valid. Automated labels cannot confer

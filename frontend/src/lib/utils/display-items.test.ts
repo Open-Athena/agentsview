@@ -1,14 +1,14 @@
 import { describe, it, expect } from "vite-plus/test";
 import { buildDisplayItems } from "./display-items.js";
 import { hasVisibleSegments } from "./content-parser.js";
-import type { Message } from "../api/types.js";
+import type { DbMessage as Message } from "../api/generated/index.js";
 
 let nextId = 1;
 
-function msg(
-  overrides: Partial<Message> & { content: string },
-): Message {
+function msg(overrides: Partial<Message> & { content: string }): Message {
   return {
+    has_context_tokens: false,
+    has_output_tokens: false,
     id: nextId++,
     session_id: "s1",
     ordinal: 0,
@@ -27,11 +27,7 @@ function msg(
   };
 }
 
-function toolMsg(
-  ordinal: number,
-  tool = "Bash",
-  args = "$ ls",
-) {
+function toolMsg(ordinal: number, tool = "Bash", args = "$ ls") {
   return msg({
     ordinal,
     content: `[${tool}]\n${args}`,
@@ -39,12 +35,14 @@ function toolMsg(
   });
 }
 
-function textMsg(
-  ordinal: number,
-  content: string,
-  role: "user" | "assistant" = "assistant",
-) {
-  return msg({ ordinal, content, role });
+function textMsg(ordinal: number, content: string, role: "user" | "assistant" = "assistant") {
+  return msg({
+    has_context_tokens: false,
+    has_output_tokens: false,
+    ordinal,
+    content,
+    role,
+  });
 }
 
 describe("buildDisplayItems", () => {
@@ -53,22 +51,14 @@ describe("buildDisplayItems", () => {
   });
 
   it("wraps all text messages as individual items", () => {
-    const msgs = [
-      textMsg(0, "Hello"),
-      textMsg(1, "Hi", "user"),
-      textMsg(2, "How can I help?"),
-    ];
+    const msgs = [textMsg(0, "Hello"), textMsg(1, "Hi", "user"), textMsg(2, "How can I help?")];
     const items = buildDisplayItems(msgs);
     expect(items).toHaveLength(3);
     expect(items.every((i) => i.kind === "message")).toBe(true);
   });
 
   it("groups all tool-only messages into one group", () => {
-    const msgs = [
-      toolMsg(0),
-      toolMsg(1, "Read", "file.ts"),
-      toolMsg(2, "Edit", "changes"),
-    ];
+    const msgs = [toolMsg(0), toolMsg(1, "Read", "file.ts"), toolMsg(2, "Edit", "changes")];
     const items = buildDisplayItems(msgs);
     expect(items).toHaveLength(1);
     expect(items[0]).toMatchObject({
@@ -116,6 +106,8 @@ describe("buildDisplayItems", () => {
   it("user messages are always individual items", () => {
     const msgs = [
       msg({
+        has_context_tokens: false,
+        has_output_tokens: false,
         ordinal: 0,
         role: "user",
         content: "[Bash]\n$ ls",
@@ -165,11 +157,7 @@ describe("buildDisplayItems with skipToolGrouping", () => {
   });
 
   it("emits tool-only messages as individual MessageItems when skipToolGrouping is true", () => {
-    const msgs = [
-      toolMsg(0),
-      toolMsg(1, "Read", "file.ts"),
-      toolMsg(2, "Edit", "changes"),
-    ];
+    const msgs = [toolMsg(0), toolMsg(1, "Read", "file.ts"), toolMsg(2, "Edit", "changes")];
     const items = buildDisplayItems(msgs, { skipToolGrouping: true });
     expect(items).toHaveLength(3);
     expect(items.every((i) => i.kind === "message")).toBe(true);
@@ -239,9 +227,7 @@ describe("skipToolGrouping preserves thinking in tool-only messages", () => {
     });
   }
 
-  function visibilityFrom(
-    visible: Set<string>,
-  ): (type: string) => boolean {
+  function visibilityFrom(visible: Set<string>): (type: string) => boolean {
     return (type: string) => visible.has(type);
   }
 
@@ -252,43 +238,26 @@ describe("skipToolGrouping preserves thinking in tool-only messages", () => {
   });
 
   it("thinking+tool message becomes individual item with skipToolGrouping", () => {
-    const items = buildDisplayItems(
-      [thinkingToolMsg(0)],
-      { skipToolGrouping: true },
-    );
+    const items = buildDisplayItems([thinkingToolMsg(0)], { skipToolGrouping: true });
     expect(items).toHaveLength(1);
     expect(items[0]!.kind).toBe("message");
   });
 
   it("individual thinking+tool message stays visible when tool hidden but thinking visible", () => {
-    const items = buildDisplayItems(
-      [thinkingToolMsg(0)],
-      { skipToolGrouping: true },
-    );
-    const noTool = visibilityFrom(
-      new Set(["user", "assistant", "thinking", "code"]),
-    );
+    const items = buildDisplayItems([thinkingToolMsg(0)], { skipToolGrouping: true });
+    const noTool = visibilityFrom(new Set(["user", "assistant", "thinking", "code"]));
     expect(items[0]!.kind).toBe("message");
     if (items[0]!.kind === "message") {
-      expect(
-        hasVisibleSegments(items[0]!.message, noTool),
-      ).toBe(true);
+      expect(hasVisibleSegments(items[0]!.message, noTool)).toBe(true);
     }
   });
 
   it("individual thinking+tool message hidden when both tool and thinking hidden", () => {
-    const items = buildDisplayItems(
-      [thinkingToolMsg(0)],
-      { skipToolGrouping: true },
-    );
-    const noToolNoThinking = visibilityFrom(
-      new Set(["user", "assistant", "code"]),
-    );
+    const items = buildDisplayItems([thinkingToolMsg(0)], { skipToolGrouping: true });
+    const noToolNoThinking = visibilityFrom(new Set(["user", "assistant", "code"]));
     expect(items[0]!.kind).toBe("message");
     if (items[0]!.kind === "message") {
-      expect(
-        hasVisibleSegments(items[0]!.message, noToolNoThinking),
-      ).toBe(false);
+      expect(hasVisibleSegments(items[0]!.message, noToolNoThinking)).toBe(false);
     }
   });
 });

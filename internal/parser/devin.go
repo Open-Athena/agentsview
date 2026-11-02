@@ -30,6 +30,12 @@ type DevinSessionMeta struct {
 	LastActivity time.Time
 	UpdatedAt    time.Time
 	FileMtime    int64
+	// MainChainID is the leaf node of the session's main conversation
+	// chain (sessions.main_chain_id). message_nodes is a forest of
+	// retries and edits; walking parents from this leaf yields the one
+	// linear chain whose per-message metrics must be summed. Only
+	// loaded on the per-session read path, not the discovery listing.
+	MainChainID sql.NullInt64
 }
 
 // devinDBPath returns <root>/cli/sessions.db when present.
@@ -121,15 +127,14 @@ func ForEachDevinSessionMeta(
 }
 
 func openDevinDB(dbPath string) (*sql.DB, error) {
-	dsn := "file:" + sqliteURIPath(dbPath) + "?mode=ro&_busy_timeout=3000"
-	db, err := sql.Open("sqlite3", dsn)
+	db, err := openSQLiteReadOnly(dbPath, sqliteReadOptions{busyTimeoutMS: 3000})
 	if err != nil {
 		return nil, fmt.Errorf("opening devin db %s: %w", dbPath, err)
 	}
 	return db, nil
 }
 
-func getDevinSessionMeta(
+func getDevinSessionMeta(ctx context.Context,
 	dbPath, rawSessionID string,
 ) (*DevinSessionMeta, error) {
 	db, err := openDevinDB(dbPath)
@@ -142,28 +147,44 @@ func getDevinSessionMeta(
 	var createdAt int64
 	var lastActivity sql.NullInt64
 	var updatedAt int64
-	err = db.QueryRow(`
+	const (
+		queryPrefix = `
 		SELECT id,
 		       COALESCE(title, ''),
 		       COALESCE(working_directory, ''),
 		       COALESCE(model, ''),
 		       COALESCE(created_at, 0),
 		       last_activity_at,
-		       COALESCE(last_activity_at, created_at, 0)
+		       COALESCE(last_activity_at, created_at, 0),
+		       `
+		querySuffix = `
 		  FROM sessions
 		 WHERE COALESCE(hidden, 0) <> 1
 		   AND id = ?
-	`, rawSessionID).Scan(
-		&meta.RawSessionID,
-		&meta.Title,
-		&meta.CWD,
-		&meta.Model,
-		&createdAt,
-		&lastActivity,
-		&updatedAt,
+	`
+		currentQuery = queryPrefix + "main_chain_id" + querySuffix
+		legacyQuery  = queryPrefix + "NULL" + querySuffix
 	)
+	query := func(statement string) error {
+		return db.QueryRowContext(ctx, statement, rawSessionID).Scan(
+			&meta.RawSessionID,
+			&meta.Title,
+			&meta.CWD,
+			&meta.Model,
+			&createdAt,
+			&lastActivity,
+			&updatedAt,
+			&meta.MainChainID,
+		)
+	}
+	err = query(currentQuery)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) &&
+		devinSessionsTablePredatesMainChainID(ctx, db) {
+		meta.MainChainID = sql.NullInt64{}
+		err = query(legacyQuery)
+	}
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("loading devin session meta: %w", err)
@@ -177,6 +198,28 @@ func getDevinSessionMeta(
 	meta.UpdatedAt = devinUnixSec(updatedAt)
 	meta.FileMtime = devinFileMtimeNS(updatedAt)
 	return &meta, nil
+}
+
+// devinSessionsTablePredatesMainChainID distinguishes the known legacy schema
+// from other query failures without relying on SQLite's error text. It runs
+// only after the current metadata query fails, so current databases keep the
+// single-query read path.
+func devinSessionsTablePredatesMainChainID(ctx context.Context, db *sql.DB) bool {
+	var tableExists, columnExists int
+	err := db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+		           SELECT 1
+		             FROM sqlite_schema
+		            WHERE type = 'table'
+		              AND name = 'sessions'
+		       ),
+		       EXISTS (
+		           SELECT 1
+		             FROM pragma_table_info('sessions')
+		            WHERE name = 'main_chain_id'
+		       )
+	`).Scan(&tableExists, &columnExists)
+	return err == nil && tableExists == 1 && columnExists == 0
 }
 
 // devinMaxEpochSec is the largest epoch-second value whose nanosecond form
@@ -262,8 +305,8 @@ func devinRedactedSessionID() string {
 	return "<redacted-session-id>"
 }
 
-func parseDevinSession(dbPath, rawSessionID, machine string) (*ParsedSession, []ParsedMessage, error) {
-	meta, err := getDevinSessionMeta(dbPath, rawSessionID)
+func parseDevinSession(ctx context.Context, dbPath, rawSessionID, machine string) (*ParsedSession, []ParsedMessage, error) {
+	meta, err := getDevinSessionMeta(ctx, dbPath, rawSessionID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -278,7 +321,7 @@ func parseDevinSession(dbPath, rawSessionID, machine string) (*ParsedSession, []
 			return nil, nil, newDevinTranscriptError("stat", err)
 		}
 		fallbackErr := newDevinTranscriptError("missing", nil)
-		sess, msgs, ok, err := parseDevinSessionFromMessageNodes(dbPath, rawSessionID, machine, meta)
+		sess, msgs, ok, err := parseDevinSessionFromMessageNodes(ctx, dbPath, rawSessionID, machine, meta)
 		if err == nil && ok {
 			return sess, msgs, nil
 		}
@@ -320,7 +363,7 @@ func parseDevinSession(dbPath, rawSessionID, machine string) (*ParsedSession, []
 	)
 
 	steps.ForEach(func(_, step gjson.Result) bool {
-		msg, ok := parseDevinStep(step, stepOrdinal, model)
+		msg, ok := parseDevinStep(rawSessionID, step, stepOrdinal, model)
 		stepOrdinal++
 		if !ok {
 			return true
@@ -364,11 +407,11 @@ func parseDevinSession(dbPath, rawSessionID, machine string) (*ParsedSession, []
 	return sess, messages, nil
 }
 
-func parseDevinSessionFromMessageNodes(
+func parseDevinSessionFromMessageNodes(ctx context.Context,
 	dbPath, rawSessionID, machine string,
 	meta *DevinSessionMeta,
 ) (*ParsedSession, []ParsedMessage, bool, error) {
-	rows, err := listDevinMessageNodes(dbPath, rawSessionID)
+	rows, err := listDevinMessageNodes(ctx, dbPath, rawSessionID)
 	if err != nil {
 		return nil, nil, false, err
 	}
@@ -379,6 +422,8 @@ func parseDevinSessionFromMessageNodes(
 	model := metaValue(meta, func(m *DevinSessionMeta) string { return m.Model })
 	cwd := metaValue(meta, func(m *DevinSessionMeta) string { return m.CWD })
 
+	chain := devinMainChainRows(rows, meta)
+
 	var (
 		messages     []ParsedMessage
 		firstMessage string
@@ -386,8 +431,8 @@ func parseDevinSessionFromMessageNodes(
 		lastStepAt   time.Time
 		userMsgCount int
 	)
-	for _, row := range rows {
-		msg, ok, err := parseDevinDBMessageNode(row, len(messages), model)
+	for _, row := range chain {
+		msg, ok, err := parseDevinDBMessageNode(rawSessionID, row, len(messages), model)
 		if err != nil {
 			return nil, nil, false, err
 		}
@@ -425,7 +470,54 @@ func parseDevinSessionFromMessageNodes(
 	fileInfo := devinBaseFileInfo(dbPath, rawSessionID)
 	devinApplyFileInfoTimes(&fileInfo, meta, endedAt)
 	sess := buildDevinParsedSession(meta, rawSessionID, machine, cwd, firstMessage, startedAt, endedAt, userMsgCount, messages, fileInfo)
+	accumulateMessageTokenUsage(sess, messages)
 	return sess, messages, true, nil
+}
+
+// devinMainChainRows returns the message-node rows along the session's main
+// conversation chain, ordered root-to-leaf. message_nodes is a forest:
+// retries and edits create alternate branches, so summing every row would
+// double-count token metrics. Starting at sessions.main_chain_id (the leaf)
+// and walking parent_node_id links isolates the single chain that matches the
+// exported transcript. When main_chain_id is missing or dangling, or the walk
+// cannot reach a root (a cycle), it falls back to every row in the original
+// created_at order so short/legacy sessions still parse.
+func devinMainChainRows(
+	rows []devinMessageNodeRow, meta *DevinSessionMeta,
+) []devinMessageNodeRow {
+	if meta == nil || !meta.MainChainID.Valid {
+		return rows
+	}
+	byNodeID := make(map[int64]int, len(rows))
+	for i := range rows {
+		byNodeID[rows[i].NodeID] = i
+	}
+	leaf, ok := byNodeID[meta.MainChainID.Int64]
+	if !ok {
+		return rows
+	}
+
+	reversed := make([]devinMessageNodeRow, 0, len(rows))
+	cur := rows[leaf]
+	for {
+		if len(reversed) == len(rows) {
+			return rows // cycle: fall back rather than loop forever
+		}
+		reversed = append(reversed, cur)
+		if !cur.ParentNodeID.Valid {
+			break
+		}
+		parent, ok := byNodeID[cur.ParentNodeID.Int64]
+		if !ok {
+			return rows
+		}
+		cur = rows[parent]
+	}
+
+	for i, j := 0, len(reversed)-1; i < j; i, j = i+1, j-1 {
+		reversed[i], reversed[j] = reversed[j], reversed[i]
+	}
+	return reversed
 }
 
 type devinMessageNodeRow struct {
@@ -436,14 +528,14 @@ type devinMessageNodeRow struct {
 	CreatedAt    int64
 }
 
-func listDevinMessageNodes(dbPath, rawSessionID string) ([]devinMessageNodeRow, error) {
+func listDevinMessageNodes(ctx context.Context, dbPath, rawSessionID string) ([]devinMessageNodeRow, error) {
 	db, err := openDevinDB(dbPath)
 	if err != nil {
 		return nil, err
 	}
 	defer db.Close()
 
-	rows, err := db.Query(`
+	rows, err := db.QueryContext(ctx, `
 		SELECT row_id,
 		       node_id,
 		       parent_node_id,
@@ -473,6 +565,7 @@ func listDevinMessageNodes(dbPath, rawSessionID string) ([]devinMessageNodeRow, 
 }
 
 func parseDevinDBMessageNode(
+	rawSessionID string,
 	row devinMessageNodeRow,
 	ordinal int,
 	model string,
@@ -486,7 +579,7 @@ func parseDevinDBMessageNode(
 		return ParsedMessage{}, false, nil
 	}
 
-	content, thinking, hasThinking, hasToolUse, toolCalls, toolResults := ExtractTextContent(root.Get("content"))
+	content, thinking, hasThinking, hasToolUse, toolCalls, toolResults := ExtractTextContent(context.Background(), root.Get("content"))
 	topThinking := strings.TrimSpace(root.Get("thinking").Str)
 	if topThinking != "" && topThinking != thinking {
 		thinking = joinNonEmpty(thinking, topThinking)
@@ -507,29 +600,121 @@ func parseDevinDBMessageNode(
 		}
 	}
 
-	if strings.TrimSpace(content) == "" && len(toolCalls) == 0 && len(toolResults) == 0 {
+	tokenUsage, contextTokens, outputTokens, hasContextTokens, hasOutputTokens := devinTokenUsageFromNodeMetrics(root.Get("metadata.metrics"))
+
+	// The per-message generation model is the authoritative model for both
+	// display and pricing: the session-level sessions.model column is often
+	// empty or a coarse alias, and each request records the concrete model it
+	// used at metadata.generation_model. Mirror the transcript path, which
+	// prefers extra.generation_model over the session model.
+	messageModel := firstNonEmpty(root.Get("metadata.generation_model").Str, model)
+
+	// Keep otherwise-empty assistant turns that still consumed tokens (for
+	// example a "stop" turn with no text and no tool calls): dropping them
+	// would silently discard their prompt/completion usage and undercount
+	// the session. Content-empty turns without any token metrics remain
+	// skipped so genuinely empty nodes do not create blank messages.
+	if strings.TrimSpace(content) == "" && len(toolCalls) == 0 && len(toolResults) == 0 &&
+		!hasContextTokens && !hasOutputTokens {
 		return ParsedMessage{}, false, nil
 	}
 
 	msg := ParsedMessage{
-		Ordinal:       ordinal,
-		Role:          role,
-		Content:       content,
-		ThinkingText:  thinking,
-		Timestamp:     devinUnixSec(row.CreatedAt),
-		HasThinking:   hasThinking,
-		HasToolUse:    hasToolUse || len(toolCalls) > 0,
-		IsSystem:      isSystem,
-		ContentLength: len(content),
-		ToolCalls:     toolCalls,
-		ToolResults:   toolResults,
-		Model:         model,
-		SourceUUID:    fmt.Sprintf("%d", row.NodeID),
+		Ordinal:          ordinal,
+		Role:             role,
+		Content:          content,
+		ThinkingText:     thinking,
+		Timestamp:        devinUnixSec(row.CreatedAt),
+		HasThinking:      hasThinking,
+		HasToolUse:       hasToolUse || len(toolCalls) > 0,
+		IsSystem:         isSystem,
+		ContentLength:    len(content),
+		ToolCalls:        toolCalls,
+		ToolResults:      toolResults,
+		Model:            messageModel,
+		TokenUsage:       tokenUsage,
+		ContextTokens:    contextTokens,
+		OutputTokens:     outputTokens,
+		HasContextTokens: hasContextTokens,
+		HasOutputTokens:  hasOutputTokens,
+		SourceUUID:       devinNodeSourceUUID(rawSessionID, row.NodeID),
 	}
 	if row.ParentNodeID.Valid {
-		msg.SourceParentUUID = fmt.Sprintf("%d", row.ParentNodeID.Int64)
+		msg.SourceParentUUID = devinNodeSourceUUID(rawSessionID, row.ParentNodeID.Int64)
 	}
 	return msg, true, nil
+}
+
+// devinNodeSourceUUID scopes a message_nodes identity to its session. Devin's
+// node_id is a per-session sequence (UNIQUE(session_id, node_id)), so bare ids
+// collide across sessions in usage deduplication; prefixing the session id
+// makes the source identity global.
+func devinNodeSourceUUID(rawSessionID string, nodeID int64) string {
+	return fmt.Sprintf("%s:%d", rawSessionID, nodeID)
+}
+
+// devinTokenUsageFromNodeMetrics reads the per-assistant-message token counters
+// that Devin records at chat_message -> metadata.metrics in message_nodes.
+// Unlike transcript step metrics (prompt_tokens/completion_tokens/cached_tokens
+// aggregates), node metrics expose the raw request fields separately, so cache
+// creation and cache read are priced distinctly:
+//
+//	total_prompt_tokens = input_tokens + cache_read_tokens + cache_creation_tokens
+//	total_completion    = output_tokens
+//	total_cached        = cache_read_tokens
+//
+// Fields may be null (serialized as JSON null); those are treated as zero and
+// do not by themselves establish presence.
+func devinTokenUsageFromNodeMetrics(metrics gjson.Result) (
+	jsontext.Value, int, int, bool, bool,
+) {
+	if !metrics.Exists() || metrics.Type != gjson.JSON {
+		return nil, 0, 0, false, false
+	}
+
+	input, hasInput := devinMetricInt(metrics.Get("input_tokens"))
+	output, hasOutput := devinMetricInt(metrics.Get("output_tokens"))
+	cacheRead, hasCacheRead := devinMetricInt(metrics.Get("cache_read_tokens"))
+	cacheCreation, hasCacheCreation := devinMetricInt(metrics.Get("cache_creation_tokens"))
+
+	hasContext := hasInput || hasCacheRead || hasCacheCreation
+	if !hasContext && !hasOutput {
+		return nil, 0, 0, false, false
+	}
+
+	payload := make(map[string]int, 4)
+	if hasInput {
+		payload["input_tokens"] = input
+	}
+	if hasOutput {
+		payload["output_tokens"] = output
+	}
+	if hasCacheRead {
+		payload["cache_read_input_tokens"] = cacheRead
+	}
+	if hasCacheCreation {
+		payload["cache_creation_input_tokens"] = cacheCreation
+	}
+	raw, err := json.Marshal(payload, json.Deterministic(true))
+	if err != nil {
+		return nil, 0, 0, false, false
+	}
+
+	context := input + cacheRead + cacheCreation
+	return raw, context, output, hasContext, hasOutput
+}
+
+// devinMetricInt reads a non-negative token counter from a metrics field.
+// Presence requires an actual JSON number: absent fields and explicit null
+// (both common in metadata.metrics) report not-present and contribute zero.
+func devinMetricInt(value gjson.Result) (int, bool) {
+	if value.Type != gjson.Number {
+		return 0, false
+	}
+	if n := int(value.Int()); n > 0 {
+		return n, true
+	}
+	return 0, true
 }
 
 func parseDevinDBToolCalls(toolCalls gjson.Result) ([]ParsedToolCall, string) {
@@ -543,10 +728,11 @@ func parseDevinDBToolCalls(toolCalls gjson.Result) ([]ParsedToolCall, string) {
 	toolCalls.ForEach(func(_, tc gjson.Result) bool {
 		parsedCall, ok := parseDevinDBToolCall(tc)
 		if ok {
-			parsed = append(parsed, parsedCall)
 			if text := formatDevinDBToolCall(parsedCall); text != "" {
+				parsedCall.Rendering = text
 				parts = append(parts, text)
 			}
+			parsed = append(parsed, parsedCall)
 		}
 		return true
 	})
@@ -554,7 +740,7 @@ func parseDevinDBToolCalls(toolCalls gjson.Result) ([]ParsedToolCall, string) {
 }
 
 func parseDevinDBToolCall(tc gjson.Result) (ParsedToolCall, bool) {
-	if parsed, ok := parseToolCall(tc); ok {
+	if parsed, ok := parseToolCall(context.Background(), tc); ok {
 		return parsed, true
 	}
 	name := firstNonEmpty(tc.Get("function.name").Str, tc.Get("name").Str)
@@ -779,14 +965,13 @@ func positiveGJSONInt(value gjson.Result) (int, bool) {
 	return 0, false
 }
 
-func parseDevinStep(step gjson.Result, ordinal int, model string) (ParsedMessage, bool) {
+func parseDevinStep(rawSessionID string, step gjson.Result, ordinal int, model string) (ParsedMessage, bool) {
 	role, isSystem, ok := devinRoleForSource(step.Get("source").Str)
 	if !ok {
 		return ParsedMessage{}, false
 	}
 
-	content, thinking, hasThinking, hasToolUse, toolCalls, toolResults :=
-		ExtractTextContent(step.Get("message"))
+	content, thinking, hasThinking, hasToolUse, toolCalls, toolResults := ExtractTextContent(context.Background(), step.Get("message"))
 	topLevelToolText, topLevelToolCalls := formatTopLevelToolUses(step.Get("tool_use"))
 	if topLevelToolText != "" {
 		content = joinNonEmpty(content, topLevelToolText)
@@ -802,8 +987,7 @@ func parseDevinStep(step gjson.Result, ordinal int, model string) (ParsedMessage
 		role = RoleTool
 		isSystem = false
 	}
-	tokenUsage, contextTokens, outputTokens, hasContextTokens, hasOutputTokens :=
-		devinTokenUsageFromMetrics(step.Get("metrics"))
+	tokenUsage, contextTokens, outputTokens, hasContextTokens, hasOutputTokens := devinTokenUsageFromMetrics(step.Get("metrics"))
 	messageModel := firstNonEmpty(
 		step.Get("extra.generation_model").Str,
 		step.Get("model_name").Str,
@@ -828,7 +1012,7 @@ func parseDevinStep(step gjson.Result, ordinal int, model string) (ParsedMessage
 		OutputTokens:     outputTokens,
 		HasContextTokens: hasContextTokens,
 		HasOutputTokens:  hasOutputTokens,
-		SourceUUID:       devinStepID(step.Get("step_id")),
+		SourceUUID:       devinStepSourceUUID(rawSessionID, step.Get("step_id")),
 	}, true
 }
 
@@ -884,6 +1068,17 @@ func nonNegativeGJSONInt(value gjson.Result) (int, bool) {
 	return n, true
 }
 
+// devinStepSourceUUID scopes a transcript step_id the way
+// devinNodeSourceUUID scopes node_id: step_id is also a per-session sequence.
+// A step without a usable step_id yields "" rather than a bare prefix.
+func devinStepSourceUUID(rawSessionID string, stepID gjson.Result) string {
+	id := devinStepID(stepID)
+	if id == "" {
+		return ""
+	}
+	return rawSessionID + ":" + id
+}
+
 func devinStepID(stepID gjson.Result) string {
 	switch stepID.Type {
 	case gjson.String:
@@ -904,10 +1099,12 @@ func formatTopLevelToolUses(toolUses gjson.Result) (string, []ParsedToolCall) {
 		calls []ParsedToolCall
 	)
 	toolUses.ForEach(func(_, toolUse gjson.Result) bool {
-		if text := strings.TrimSpace(formatToolUse(toolUse)); text != "" {
+		text := strings.TrimSpace(formatToolUse(toolUse))
+		if text != "" {
 			parts = append(parts, text)
 		}
-		if tc, ok := parseToolCall(toolUse); ok {
+		if tc, ok := parseToolCall(context.Background(), toolUse); ok {
+			tc.Rendering = text
 			calls = append(calls, tc)
 		}
 		return true

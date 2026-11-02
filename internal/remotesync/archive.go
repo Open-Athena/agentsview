@@ -2,6 +2,7 @@ package remotesync
 
 import (
 	"archive/tar"
+	"context"
 	"fmt"
 	"io"
 	"io/fs"
@@ -12,27 +13,27 @@ import (
 	"go.kenn.io/agentsview/internal/parser"
 )
 
-func WriteArchive(w io.Writer, targets TargetSet) error {
+func WriteArchive(ctx context.Context, w io.Writer, targets TargetSet) error {
 	tw := tar.NewWriter(w)
 	forbidden := newForbiddenRootMatcher(targets.ForbiddenRoots)
-	hermesSQLite := make(map[string]string)
-	for _, stateDB := range hermesStateDBTargets(targets) {
-		for _, path := range hermesSQLitePaths(stateDB) {
-			hermesSQLite[path] = stateDB
+	snapshotSQLite := make(map[string]string)
+	for stateDB := range sqliteSnapshotTargets(targets) {
+		for _, path := range sqliteSnapshotPaths(stateDB) {
+			snapshotSQLite[path] = stateDB
 		}
 	}
-	writtenHermesState := make(map[string]struct{})
+	writtenSnapshots := make(map[string]struct{})
 	writePath := func(path string, optional bool) error {
 		if forbidden.within(path) {
 			return nil
 		}
 		clean := filepath.Clean(path)
-		if stateDB, ok := hermesSQLite[clean]; ok {
-			if _, written := writtenHermesState[stateDB]; written {
+		if stateDB, ok := snapshotSQLite[clean]; ok {
+			if _, written := writtenSnapshots[stateDB]; written {
 				return nil
 			}
-			writtenHermesState[stateDB] = struct{}{}
-			return writeHermesStateDBSnapshot(tw, stateDB)
+			writtenSnapshots[stateDB] = struct{}{}
+			return writeSQLiteStateDBSnapshot(ctx, tw, stateDB)
 		}
 		if optional {
 			return writeOptionalArchiveFile(tw, path)
@@ -43,7 +44,7 @@ func WriteArchive(w io.Writer, targets TargetSet) error {
 		if parser.RemoteSyncExcludedAgent(agent) {
 			continue
 		}
-		if _, fileScoped := targets.Files[agent]; fileScoped {
+		if targets.isFileScoped(agent) {
 			continue
 		}
 		for _, root := range dirs {
@@ -57,7 +58,7 @@ func WriteArchive(w io.Writer, targets TargetSet) error {
 			continue
 		}
 		if agent == parser.AgentWindsurf {
-			if err := writeWindsurfArchiveFiles(tw, files, forbidden); err != nil {
+			if err := writeWindsurfArchiveFiles(ctx, tw, files, forbidden); err != nil {
 				return err
 			}
 			continue
@@ -83,33 +84,42 @@ func WriteArchive(w io.Writer, targets TargetSet) error {
 	return nil
 }
 
-func writeHermesStateDBSnapshot(tw *tar.Writer, stateDB string) error {
-	_, modTime, exists := hermesSQLiteSnapshotIdentity(stateDB)
+func writeSQLiteStateDBSnapshot(ctx context.Context, tw *tar.Writer, stateDB string) error {
+	_, modTime, exists := sqliteSnapshotIdentity(ctx, stateDB)
 	if !exists {
 		return nil
 	}
-	tmpDir, err := os.MkdirTemp("", "agentsview-hermes-snapshot-*")
+	tmpDir, err := os.MkdirTemp("", "agentsview-sqlite-snapshot-*")
 	if err != nil {
-		return fmt.Errorf("create hermes snapshot dir: %w", err)
+		return fmt.Errorf("create sqlite snapshot dir: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
 	snapshotPath := filepath.Join(tmpDir, "state.db")
-	if err := writeHermesSnapshotFile(snapshotPath, stateDB); err != nil {
-		return fmt.Errorf("snapshot hermes database %q: %w", stateDB, err)
+	if err := writeSQLiteSnapshotFile(snapshotPath, stateDB); err != nil {
+		// The source can vanish or turn unreadable between the identity
+		// probe above and the online backup. Re-probe it: an unusable
+		// source is an omitted archive entry, exactly as if the probe
+		// had failed first, so the next manifest evicts the mirror's
+		// stale copy. A still-usable source means the failure was local
+		// (temp dir, destination write) and must propagate.
+		if _, _, stillUsable := sqliteSnapshotIdentity(ctx, stateDB); !stillUsable {
+			return nil
+		}
+		return fmt.Errorf("snapshot sqlite database %q: %w", stateDB, err)
 	}
 	if err := os.Chtimes(snapshotPath, modTime, modTime); err != nil {
-		return fmt.Errorf("stamp hermes database snapshot: %w", err)
+		return fmt.Errorf("stamp sqlite database snapshot: %w", err)
 	}
 	info, err := os.Stat(snapshotPath)
 	if err != nil {
-		return fmt.Errorf("stat hermes database snapshot: %w", err)
+		return fmt.Errorf("stat sqlite database snapshot: %w", err)
 	}
 	return writeArchiveFileAs(tw, stateDB, snapshotPath, info)
 }
 
-var writeHermesSnapshotFile = writeSQLiteSnapshot
+var writeSQLiteSnapshotFile = writeSQLiteSnapshot
 
-func writeWindsurfArchiveFiles(
+func writeWindsurfArchiveFiles(ctx context.Context,
 	tw *tar.Writer, files []string, forbidden forbiddenRootMatcher,
 ) error {
 	seen := make(map[string]struct{}, len(files))
@@ -123,7 +133,7 @@ func writeWindsurfArchiveFiles(
 		seen[path] = struct{}{}
 		switch filepath.Base(path) {
 		case parser.WindsurfStateDBName:
-			if err := writeSanitizedWindsurfStateDB(tw, path); err != nil {
+			if err := writeSanitizedWindsurfStateDB(ctx, tw, path); err != nil {
 				return err
 			}
 		case parser.WindsurfStateDBName + "-wal",
@@ -140,7 +150,7 @@ func writeWindsurfArchiveFiles(
 	return nil
 }
 
-func writeSanitizedWindsurfStateDB(tw *tar.Writer, dbPath string) error {
+func writeSanitizedWindsurfStateDB(ctx context.Context, tw *tar.Writer, dbPath string) error {
 	info, err := os.Stat(dbPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -157,7 +167,7 @@ func writeSanitizedWindsurfStateDB(tw *tar.Writer, dbPath string) error {
 	}
 	defer os.RemoveAll(tmpDir)
 	tmpPath := filepath.Join(tmpDir, parser.WindsurfStateDBName)
-	if err := parser.WriteSanitizedWindsurfStateDB(tmpPath, dbPath); err != nil {
+	if err := parser.WriteSanitizedWindsurfStateDB(ctx, tmpPath, dbPath); err != nil {
 		return fmt.Errorf("sanitize windsurf state db %q: %w", dbPath, err)
 	}
 	mtime := windsurfArchiveModTime(info, dbPath)
@@ -361,26 +371,23 @@ func writeArchiveHeader(
 // validated relative component, so a client-supplied string can never
 // escape the resolved targets, even if a future caller forgets to
 // validate.
-func WriteArchiveFiles(w io.Writer, allowed TargetSet, files []string) error {
+func WriteArchiveFiles(ctx context.Context, w io.Writer, allowed TargetSet, files []string) error {
 	tw := tar.NewWriter(w)
 	forbidden := newForbiddenRootMatcher(allowed.ForbiddenRoots)
 	allowedRoots := allowed.DeltaAllowedRoots()
-	hermesStateDBs := make(map[string]struct{})
-	for _, stateDB := range hermesStateDBTargets(allowed) {
-		hermesStateDBs[filepath.Clean(stateDB)] = struct{}{}
-	}
-	writtenHermesState := make(map[string]struct{})
+	snapshotDBs := sqliteSnapshotTargets(allowed)
+	writtenSnapshots := make(map[string]struct{})
 	for _, path := range files {
 		local, ok := resolveDeltaFilePath(allowedRoots, forbidden, path)
 		if !ok {
 			continue
 		}
-		if stateDB, isHermesSQLite := hermesStateDBForArchivePath(local); isHermesSQLite {
+		if stateDB, isSnapshotSQLite := sqliteSnapshotForArchivePath(local); isSnapshotSQLite {
 			stateDB = filepath.Clean(stateDB)
-			if _, allowed := hermesStateDBs[stateDB]; allowed {
-				if _, written := writtenHermesState[stateDB]; !written {
-					writtenHermesState[stateDB] = struct{}{}
-					if err := writeHermesStateDBSnapshot(tw, stateDB); err != nil {
+			if _, allowed := snapshotDBs[stateDB]; allowed {
+				if _, written := writtenSnapshots[stateDB]; !written {
+					writtenSnapshots[stateDB] = struct{}{}
+					if err := writeSQLiteStateDBSnapshot(ctx, tw, stateDB); err != nil {
 						return err
 					}
 				}

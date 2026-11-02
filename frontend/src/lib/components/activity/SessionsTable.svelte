@@ -35,7 +35,7 @@
   // by_session is typed `any[] | null` by the codegen; cast to the
   // generated element model for field-level type safety.
   const rows = $derived(
-    (report.by_session ?? []) as ActivitySessionRow[],
+    report.by_session ?? [],
   );
 
   function setSort(key: ActivitySessionSort) {
@@ -160,7 +160,9 @@
                   >
                     {row.title || row.session_id}
                   </a>
-                  {#if row.is_automated}
+                  {#if row.is_subagent}
+                    <span class="subagent-badge">{m.activity_subagent()}</span>
+                  {:else if row.is_automated}
                     <span class="auto-badge" title={m.activity_automated_session()}>{m.activity_auto()}</span>
                   {/if}
                 </div>
@@ -322,15 +324,21 @@
     text-decoration: none;
   }
 
-  .auto-badge {
+  .auto-badge,
+  .subagent-badge {
     flex-shrink: 0;
     padding: 1px 5px;
     border-radius: 999px;
     font-size: 9px;
     font-weight: 600;
-    color: var(--accent-orange);
-    background: color-mix(in srgb, var(--accent-orange) 14%, transparent);
-    border: 1px solid color-mix(in srgb, var(--accent-orange) 35%, transparent);
+    --badge-color: var(--accent-orange);
+    color: var(--badge-color);
+    background: color-mix(in srgb, var(--badge-color) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--badge-color) 35%, transparent);
+  }
+
+  .subagent-badge {
+    --badge-color: var(--accent-violet);
   }
 
   .session-link:hover {

@@ -43,23 +43,37 @@ func (db *DB) queryUsageRollups(
 	ctx context.Context, filter UsageFilter, kind usageQueryKind,
 	includeCursor bool,
 ) (usageQuerySnapshot, usageFactsResult, *export.PricingResolver, error) {
+	// Live archive writes no longer force a recapture: facts are filled from
+	// their own read snapshot and rollups aggregate committed facts only.
+	// What remains is cache-generation retirement, which replaces the whole
+	// cache, and cache-side invalidation of an install between the build and
+	// the read. Both are resolved by recapturing, and neither is driven by
+	// the write rate.
+	var lastErr error
+	report := func(phase string) {
+		if filter.Progress != nil {
+			filter.Progress(phase)
+		}
+	}
 	for attempt := 1; attempt <= usageFillMaxAttempts; attempt++ {
 		started := time.Now()
 		var timings usageRollupRequestTimings
+		report("Reading archived sessions for this report")
 		snapshot, captureErr := db.captureUsageQuery(ctx, filter, kind)
 		if captureErr != nil {
 			return usageQuerySnapshot{}, usageFactsResult{}, nil, captureErr
 		}
 		timings.capture = time.Since(started)
 		timings.candidates = len(snapshot.Versions)
+		report("Checking the usage cache for this report")
 		if !includeCursor || !usageCursorIncluded(filter) {
 			snapshot.CursorHighWater = 0
 		}
 		cache, release, generationErr := db.usageCache.acquireGeneration(
 			ctx, snapshot.DatabaseID)
 		if generationErr != nil {
-			if errors.Is(generationErr, errUsageCacheSourceChanged) &&
-				attempt < usageFillMaxAttempts {
+			if errors.Is(generationErr, errUsageCacheSourceChanged) {
+				lastErr = generationErr
 				continue
 			}
 			return usageQuerySnapshot{}, usageFactsResult{}, nil, generationErr
@@ -71,13 +85,14 @@ func (db *DB) queryUsageRollups(
 		}
 		timings.sweep = time.Since(sweepStarted)
 		fillStarted := time.Now()
+		report(fmt.Sprintf("Preparing usage data for %d sessions in this report", timings.candidates))
 		fills, fillErr := cache.fill.Ensure(
 			ctx, snapshot.Versions, snapshot.CursorHighWater,
 		)
 		if fillErr != nil {
 			release()
-			if errors.Is(fillErr, errUsageCacheSourceChanged) &&
-				attempt < usageFillMaxAttempts {
+			if errors.Is(fillErr, errUsageCacheSourceChanged) {
+				lastErr = fillErr
 				continue
 			}
 			return usageQuerySnapshot{}, usageFactsResult{}, nil, fillErr
@@ -85,18 +100,20 @@ func (db *DB) queryUsageRollups(
 		timings.fill = time.Since(fillStarted)
 		snapshot.dropDeleted(fills)
 		resolver := export.NewPricingResolver(snapshot.PricingRows)
+		report(fmt.Sprintf("Calculating daily totals for %d sessions in this report", timings.candidates))
 		installs, rollupMetrics, rollupErr := cache.rollup.Ensure(
 			ctx, snapshot, fills, resolver)
 		if rollupErr != nil {
 			release()
-			if errors.Is(rollupErr, errUsageCacheSourceChanged) &&
-				attempt < usageFillMaxAttempts {
+			if errors.Is(rollupErr, errUsageCacheSourceChanged) {
+				lastErr = rollupErr
 				continue
 			}
 			return usageQuerySnapshot{}, usageFactsResult{}, nil, rollupErr
 		}
 		timings.rollup = rollupMetrics
 		readStarted := time.Now()
+		report("Reading cached daily totals")
 		var facts usageFactsResult
 		var queryErr error
 		if kind == usageQueryKindActivity {
@@ -115,14 +132,12 @@ func (db *DB) queryUsageRollups(
 			return snapshot, facts, resolver, nil
 		}
 		release()
-		if !usageCacheReadShouldRecapture(queryErr) || attempt == usageFillMaxAttempts {
+		if !usageCacheReadShouldRecapture(queryErr) {
 			return usageQuerySnapshot{}, usageFactsResult{}, nil, queryErr
 		}
+		lastErr = queryErr
 	}
-	return usageQuerySnapshot{}, usageFactsResult{}, nil, fmt.Errorf(
-		"usage cache read could not stabilize after %d attempts",
-		usageFillMaxAttempts,
-	)
+	return usageQuerySnapshot{}, usageFactsResult{}, nil, lastErr
 }
 
 // GetTopSessionsByCost returns filtered sessions ranked by cost or tokens.

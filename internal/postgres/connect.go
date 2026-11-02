@@ -5,16 +5,19 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
 // RedactDSN returns the host portion of the DSN for diagnostics,
@@ -125,9 +128,7 @@ var validIdentifier = regexp.MustCompile(
 // to prevent injection.
 func quoteIdentifier(name string) (string, error) {
 	if name == "" {
-		return "", fmt.Errorf(
-			"schema name must not be empty",
-		)
+		return "", errors.New("schema name must not be empty")
 	}
 	if !validIdentifier.MatchString(name) {
 		return "", fmt.Errorf(
@@ -146,8 +147,24 @@ func quoteIdentifier(name string) (string, error) {
 func Open(
 	dsn, schema string, allowInsecure bool,
 ) (*sql.DB, error) {
+	ctx, cancel := context.WithTimeout(
+		context.Background(), 10*time.Second,
+	)
+	defer cancel()
+	return OpenContext(ctx, dsn, schema, allowInsecure)
+}
+
+// OpenContext opens a PostgreSQL pool and bounds its initial connectivity
+// check with ctx. Callers that own a shorter lifecycle deadline use this
+// instead of Open's ten-second default.
+func OpenContext(
+	ctx context.Context, dsn, schema string, allowInsecure bool,
+) (*sql.DB, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if dsn == "" {
-		return nil, fmt.Errorf("postgres URL is required")
+		return nil, errors.New("postgres URL is required")
 	}
 	quoted, err := quoteIdentifier(schema)
 	if err != nil {
@@ -185,10 +202,6 @@ func Open(
 	db.SetConnMaxLifetime(30 * time.Minute)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 
-	ctx, cancel := context.WithTimeout(
-		context.Background(), 10*time.Second,
-	)
-	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf(
@@ -201,7 +214,7 @@ func Open(
 
 func pgTargetFingerprint(dsn, schema string) (string, error) {
 	if dsn == "" {
-		return "", fmt.Errorf("postgres URL is required")
+		return "", errors.New("postgres URL is required")
 	}
 	cfg, err := pgconn.ParseConfig(dsn)
 	if err != nil {
@@ -218,7 +231,7 @@ func pgTargetFingerprint(dsn, schema string) (string, error) {
 		if host != "" && !strings.HasPrefix(host, "/") {
 			host = strings.ToLower(host)
 		}
-		fields = append(fields, host, fmt.Sprintf("%d", port))
+		fields = append(fields, host, strconv.FormatUint(uint64(port), 10))
 	}
 	appendTargetEndpoint(cfg.Host, cfg.Port)
 	for _, fallback := range cfg.Fallbacks {
@@ -262,4 +275,53 @@ func appendConnParams(
 		result += k + "=" + v
 	}
 	return result, nil
+}
+
+// OpenHosted opens and verifies a restricted pool permanently assigned to one
+// tenant schema. Startup parameters override caller values on every connection;
+// checkout reset restores context after connection reuse or caller SET commands.
+func OpenHosted(dsn, schema, tenant string, allowInsecure bool) (*sql.DB, error) {
+	if err := validateHostedBinding(schema, tenant); err != nil {
+		return nil, err
+	}
+	if dsn == "" {
+		return nil, errors.New("postgres URL is required")
+	}
+	if allowInsecure {
+		WarnInsecureSSL(dsn)
+	} else if err := CheckSSL(dsn); err != nil {
+		return nil, err
+	}
+	quoted, _ := quoteIdentifier(schema)
+	connStr, err := appendConnParams(dsn, map[string]string{"search_path": quoted, "TimeZone": "UTC"})
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := pgx.ParseConfig(connStr)
+	if err != nil {
+		return nil, err
+	}
+	// libpq options and role parameters must not override our startup boundary.
+	delete(cfg.RuntimeParams, "options")
+	delete(cfg.RuntimeParams, "role")
+	// Naming pg_temp explicitly prevents its otherwise implicit first priority.
+	searchPath := quoted + ", pg_temp"
+	cfg.RuntimeParams["search_path"] = searchPath
+	cfg.RuntimeParams["agentsview.tenant_id"] = tenant
+	cfg.RuntimeParams["row_security"] = "on"
+	database := stdlib.OpenDB(*cfg, stdlib.OptionResetSession(func(ctx context.Context, c *pgx.Conn) error {
+		_, err := c.Exec(ctx, `SELECT set_config('search_path',$1,false),set_config('agentsview.tenant_id',$2,false),set_config('row_security','on',false)`, searchPath, tenant)
+		return err
+	}))
+	database.SetMaxOpenConns(5)
+	database.SetMaxIdleConns(5)
+	database.SetConnMaxLifetime(30 * time.Minute)
+	database.SetConnMaxIdleTime(5 * time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err = CheckHostedTenant(ctx, database, schema, tenant); err != nil {
+		database.Close()
+		return nil, err
+	}
+	return database, nil
 }

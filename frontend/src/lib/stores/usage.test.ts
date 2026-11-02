@@ -1,10 +1,12 @@
+import { attachResponseTiming } from "../api/runtime.js";
+import { UsageService } from "../api/generated/index";
 import { beforeEach, afterEach, describe, expect, it, vi } from "vite-plus/test";
 import type {
-  TopSessionEntry,
-  UsageComparison,
-  UsagePairwiseComparisonResponse,
+  Comparison,
+  DbTopSessionEntry,
+  ServiceUsagePairwiseComparisonResponse,
   UsageSummaryResponse,
-} from "../api/types/usage.js";
+} from "../api/generated/index";
 import { testMoney } from "../test/money.js";
 
 const usageServiceMocks = vi.hoisted(() => {
@@ -143,13 +145,15 @@ const apiRuntimeMocks = vi.hoisted(() => {
   }
   return {
     ApiError,
-    configureGeneratedClient: vi.fn(),
-    callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
+
     isAbortError: vi.fn(() => false),
   };
 });
 
-vi.mock("../api/runtime.js", () => apiRuntimeMocks);
+vi.mock("../api/runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../api/runtime.js")>()),
+  ...apiRuntimeMocks,
+}));
 
 vi.mock("../api/generated/index", () => ({
   UsageService: {
@@ -162,7 +166,7 @@ vi.mock("../api/generated/index", () => ({
 
 const TOGGLES_KEY = "usage-toggles";
 
-function topSession(sessionId: string): TopSessionEntry {
+function topSession(sessionId: string): DbTopSessionEntry {
   return {
     sessionId,
     displayName: sessionId,
@@ -209,12 +213,14 @@ function usageSummary(totalCost = 0): UsageSummaryResponse {
   return {
     from: "2024-01-01",
     to: "2024-01-31",
+    projects: {},
     totals: {
       inputTokens: 0,
       outputTokens: 0,
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
       totalCost: testMoney(totalCost),
+      cacheSavings: testMoney(0),
     },
     daily: [],
     projectTotals: [
@@ -272,7 +278,7 @@ function usageSummary(totalCost = 0): UsageSummaryResponse {
   };
 }
 
-function usageComparison(): UsageComparison {
+function usageComparison(): Comparison {
   return {
     priorFrom: "2023-12-01",
     priorTo: "2023-12-31",
@@ -294,12 +300,14 @@ function usageSummaryWithOptions(
   return {
     from: "2024-01-01",
     to: "2024-01-31",
+    projects: {},
     totals: {
       inputTokens: 0,
       outputTokens: 0,
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
       totalCost: testMoney(totalCost),
+      cacheSavings: testMoney(0),
     },
     daily: [],
     projectTotals: projects.map((project) => ({
@@ -336,7 +344,7 @@ function usageSummaryWithOptions(
   };
 }
 
-function usagePairwiseComparison(): UsagePairwiseComparisonResponse {
+function usagePairwiseComparison(): ServiceUsagePairwiseComparisonResponse {
   return {
     left: {
       totalCost: testMoney(1),
@@ -383,9 +391,7 @@ function usagePairwiseComparison(): UsagePairwiseComparisonResponse {
   };
 }
 
-afterEach(() => {
-  apiRuntimeMocks.callGenerated.mockImplementation((request: () => Promise<unknown>) => request());
-});
+afterEach(() => {});
 
 describe("UsageStore filter persistence", () => {
   beforeEach(() => {
@@ -400,12 +406,14 @@ describe("UsageStore filter persistence", () => {
     usage.excludedProjects = "proj-a";
     usage.excludedProjectKeys = "pl1:sha256:proj-a";
     usage.excludedAgents = "claude";
+    usage.excludedModels = "opus";
     await usage.fetchAll();
 
     const saved = JSON.parse(localStorage.getItem("usage-filters") ?? "{}");
     expect(saved.excludedProjects).toBe("proj-a");
     expect(saved.excludedProjectKeys).toBeUndefined();
     expect(saved.excludedAgents).toBe("claude");
+    expect(saved.excludedModels).toBe("opus");
   });
 
   it("restores usage filters from localStorage on load", async () => {
@@ -415,14 +423,12 @@ describe("UsageStore filter persistence", () => {
         excludedProjects: "saved-proj",
         excludedProjectKeys: "pl1:sha256:saved-proj",
         excludedModels: "opus",
-        selectedModels: "sonnet",
       }),
     );
     const { usage } = await loadStore();
     expect(usage.excludedProjects).toBe("saved-proj");
     expect(usage.excludedProjectKeys).toBe("");
-    expect(usage.excludedModels).toBe("");
-    expect(usage.selectedModels).toBe("sonnet");
+    expect(usage.excludedModels).toBe("opus");
     expect(usage.excludedAgents).toBe("");
   });
 
@@ -522,29 +528,29 @@ describe("UsageStore session filter params", () => {
 
     await usage.fetchAll();
 
-    expect(usageServiceMocks.getApiV1UsageSummary).toHaveBeenLastCalledWith(
+    expect(usageServiceMocks.getApiV1UsageSummary.mock.lastCall?.[0]).toEqual(
       expect.objectContaining({
         project: "proj-a",
         machine: "host-a,host-b",
         agent: "claude,codex",
         termination: "abandoned",
-        minUserMessages: 5,
-        includeOneShot: false,
-        includeAutomated: true,
+        min_user_messages: 5,
+        include_one_shot: false,
+        include_automated: true,
       }),
     );
     const params = usageServiceMocks.getApiV1UsageSummary.mock.lastCall?.[0];
-    expect(params?.activeSince).toEqual(expect.any(String));
+    expect(params?.active_since).toEqual(expect.any(String));
 
-    expect(usageServiceMocks.getApiV1UsageTopSessions).toHaveBeenLastCalledWith(
+    expect(usageServiceMocks.getApiV1UsageTopSessions.mock.lastCall?.[0]).toEqual(
       expect.objectContaining({
         project: "proj-a",
         machine: "host-a,host-b",
         agent: "claude,codex",
         termination: "abandoned",
-        minUserMessages: 5,
-        includeOneShot: false,
-        includeAutomated: true,
+        min_user_messages: 5,
+        include_one_shot: false,
+        include_automated: true,
         sort: "cost",
       }),
     );
@@ -555,10 +561,10 @@ describe("UsageStore session filter params", () => {
     usage.mode = "token";
     usage.setSelectedTokenTypes(["output"]);
     await usage.fetchTopSessions();
-    expect(usageServiceMocks.getApiV1UsageTopSessions).toHaveBeenLastCalledWith(
+    expect(usageServiceMocks.getApiV1UsageTopSessions.mock.lastCall?.[0]).toEqual(
       expect.objectContaining({
         sort: "tokens",
-        tokenTypes: "output",
+        token_types: "output",
       }),
     );
   });
@@ -609,23 +615,20 @@ describe("UsageStore session filter params", () => {
   });
 
   it("aborts an in-flight ranking when the usage mode changes", async () => {
-    const signals: (AbortSignal | undefined)[] = [];
-    apiRuntimeMocks.callGenerated.mockImplementation(
-      (request: () => Promise<unknown>, signal?: AbortSignal) => {
-        signals.push(signal);
-        return request();
-      },
-    );
     usageServiceMocks.getApiV1UsageTopSessions.mockImplementationOnce(() => new Promise(() => {}));
     const { usage } = await loadStore();
 
     void usage.fetchTopSessions();
     await Promise.resolve();
-    expect(signals[0]?.aborted).toBe(false);
+    expect(
+      vi.mocked(UsageService.getApiV1UsageTopSessions).mock.calls[0]?.[1]?.signal?.aborted,
+    ).toBe(false);
 
     usage.setMode("token");
 
-    expect(signals[0]?.aborted).toBe(true);
+    expect(
+      vi.mocked(UsageService.getApiV1UsageTopSessions).mock.calls[0]?.[1]?.signal?.aborted,
+    ).toBe(true);
     expect(usage.topSessions).toBeNull();
   });
 
@@ -638,18 +641,18 @@ describe("UsageStore session filter params", () => {
 
     await usage.fetchAll();
 
-    expect(usageServiceMocks.getApiV1UsageSummary).toHaveBeenLastCalledWith(
+    expect(usageServiceMocks.getApiV1UsageSummary.mock.lastCall?.[0]).toEqual(
       expect.objectContaining({
-        excludeProject: "proj-a,proj-b",
-        excludeProjectKey: "pl1:sha256:project",
-        excludeAgent: "codex",
+        exclude_project: "proj-a,proj-b",
+        exclude_project_key: "pl1:sha256:project",
+        exclude_agent: "codex",
       }),
     );
-    expect(usageServiceMocks.getApiV1UsageTopSessions).toHaveBeenLastCalledWith(
+    expect(usageServiceMocks.getApiV1UsageTopSessions.mock.lastCall?.[0]).toEqual(
       expect.objectContaining({
-        excludeProject: "proj-a,proj-b",
-        excludeProjectKey: "pl1:sha256:project",
-        excludeAgent: "codex",
+        exclude_project: "proj-a,proj-b",
+        exclude_project_key: "pl1:sha256:project",
+        exclude_agent: "codex",
       }),
     );
   });
@@ -669,15 +672,13 @@ describe("UsageStore session filter params", () => {
 
     expect(usage.excludedProjectKeys).toBe("");
     expect(usageServiceMocks.getApiV1UsageSummary).toHaveBeenCalledTimes(2);
-    expect(usageServiceMocks.getApiV1UsageSummary).toHaveBeenNthCalledWith(
-      1,
+    expect(usageServiceMocks.getApiV1UsageSummary.mock.calls[0]?.[0]).toEqual(
       expect.objectContaining({
-        excludeProjectKey: "pl1:sha256:stale",
+        exclude_project_key: "pl1:sha256:stale",
       }),
     );
-    expect(usageServiceMocks.getApiV1UsageSummary).toHaveBeenNthCalledWith(
-      2,
-      expect.not.objectContaining({ excludeProjectKey: expect.anything() }),
+    expect(usageServiceMocks.getApiV1UsageSummary.mock.calls[1]?.[0]).toEqual(
+      expect.not.objectContaining({ exclude_project_key: expect.anything() }),
     );
     expect(usageServiceMocks.getApiV1UsageTopSessions).toHaveBeenCalledTimes(2);
     expect(usage.pairwiseSelection.left.value).not.toBe("pl1:sha256:stale");
@@ -886,6 +887,78 @@ describe("UsageStore session filter params", () => {
     }
   });
 
+  it("records how long the full refresh took, from request to data applied", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "performance"] });
+    try {
+      const { usage } = await loadStore();
+      expect(usage.lastQueryDurationMs).toBeNull();
+
+      // The slowest panel bounds the refresh: top sessions lands 400 ms in.
+      usageServiceMocks.getApiV1UsageTopSessions.mockImplementationOnce(async () => {
+        vi.advanceTimersByTime(400);
+        return [];
+      });
+      await usage.fetchAll();
+
+      expect(usage.lastQueryDurationMs).toBe(400);
+      expect(usage.lastQuerySteps[0]?.name).toBe("summary");
+      expect(usage.lastQuerySteps).toContainEqual({
+        name: "topSessions",
+        startMs: 0,
+        durationMs: 400,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("records the window summary as its own step and delays apply until both arrive", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "performance"] });
+    try {
+      const { usage } = await loadStore();
+      usage.applyDateRange("2026-06-04", "2026-06-18");
+      usage.summary = usageSummary(15);
+      usage.selectedTimeRange = { from: "2026-06-07", to: "2026-06-10" };
+      // The selected-range response lands 20 ms after it is sent, the
+      // full-window one 60 ms after; the store applies both together.
+      const timedSummary = async (params: { from?: string; to?: string }) => {
+        const sentAt = performance.now();
+        const isWindow = params.from === "2026-06-04" && params.to === "2026-06-18";
+        const data = usageSummary(isWindow ? 15 : 3);
+        await Promise.resolve();
+        vi.advanceTimersByTime(isWindow ? 60 : 20);
+        const at = performance.now();
+        attachResponseTiming(data, { sentAt, headersAt: at, bodyAt: at });
+        return data;
+      };
+      // One-shot for the two summary requests of this refresh only, so the
+      // default mock stays in place for later tests.
+      usageServiceMocks.getApiV1UsageSummary
+        .mockImplementationOnce(timedSummary)
+        .mockImplementationOnce(timedSummary);
+
+      await usage.fetchAll({ preserveTimeRange: true });
+
+      expect(usage.lastQuerySteps.map((step) => step.name).slice(0, 2)).toEqual([
+        "summary",
+        "contextSummary",
+      ]);
+      const summary = usage.lastQuerySteps.find((step) => step.name === "summary")!;
+      const window = usage.lastQuerySteps.find((step) => step.name === "contextSummary")!;
+      const windowBody = window.segments!.find((segment) => segment.phase === "download")!;
+      // The selected-range body arrived first; its apply phase waits for the
+      // window body instead of being drawn as render time.
+      expect(summary.segments!.find((segment) => segment.phase === "apply")!.startMs).toBe(
+        windowBody.startMs + windowBody.durationMs,
+      );
+      expect(
+        summary.segments!.find((segment) => segment.phase === "download")!.startMs,
+      ).toBeLessThan(windowBody.startMs);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not mark cached partial refresh failures as current", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -960,15 +1033,15 @@ describe("UsageStore session filter params", () => {
       deltaPct: 0.5,
     });
     expect(usage.pairwiseComparison).toEqual(usagePairwiseComparison());
-    expect(usageServiceMocks.getApiV1UsageComparison).toHaveBeenCalledWith(
-      expect.objectContaining({ currentMicrodollars: 0 }),
+    expect(usageServiceMocks.getApiV1UsageComparison.mock.lastCall?.[0]).toEqual(
+      expect.objectContaining({ current_microdollars: 0 }),
     );
-    expect(usageServiceMocks.getApiV1UsagePairwiseComparison).toHaveBeenCalledWith(
+    expect(usageServiceMocks.getApiV1UsagePairwiseComparison.mock.lastCall?.[0]).toEqual(
       expect.objectContaining({
-        leftDimension: expect.any(String),
-        leftValue: expect.any(String),
-        rightDimension: expect.any(String),
-        rightValue: expect.any(String),
+        left_dimension: expect.any(String),
+        left_value: expect.any(String),
+        right_dimension: expect.any(String),
+        right_value: expect.any(String),
       }),
     );
   });
@@ -1005,13 +1078,6 @@ describe("UsageStore session filter params", () => {
   });
 
   it("aborts stale top sessions when a new full refresh starts", async () => {
-    const signals: (AbortSignal | undefined)[] = [];
-    apiRuntimeMocks.callGenerated.mockImplementation(
-      (request: () => Promise<unknown>, signal?: AbortSignal) => {
-        signals.push(signal);
-        return request();
-      },
-    );
     usageServiceMocks.getApiV1UsageTopSessions.mockImplementationOnce(() => new Promise(() => {}));
     usageServiceMocks.getApiV1UsageSummary.mockImplementationOnce(() => new Promise(() => {}));
 
@@ -1019,22 +1085,19 @@ describe("UsageStore session filter params", () => {
 
     void usage.fetchTopSessions();
     await Promise.resolve();
-    expect(signals[0]?.aborted).toBe(false);
+    expect(
+      vi.mocked(UsageService.getApiV1UsageTopSessions).mock.calls[0]?.[1]?.signal?.aborted,
+    ).toBe(false);
 
     void usage.fetchAll();
     await Promise.resolve();
 
-    expect(signals[0]?.aborted).toBe(true);
+    expect(
+      vi.mocked(UsageService.getApiV1UsageTopSessions).mock.calls[0]?.[1]?.signal?.aborted,
+    ).toBe(true);
   });
 
   it("aborts visible panel requests on teardown", async () => {
-    const signals: (AbortSignal | undefined)[] = [];
-    apiRuntimeMocks.callGenerated.mockImplementation(
-      (request: () => Promise<unknown>, signal?: AbortSignal) => {
-        signals.push(signal);
-        return request();
-      },
-    );
     usageServiceMocks.getApiV1UsageSummary.mockImplementationOnce(() => new Promise(() => {}));
     const { usage } = await loadStore();
 
@@ -1042,7 +1105,9 @@ describe("UsageStore session filter params", () => {
     await Promise.resolve();
     usage.cancelInFlightReads();
 
-    expect(signals[0]?.aborted).toBe(true);
+    expect(vi.mocked(UsageService.getApiV1UsageSummary).mock.calls[0]?.[1]?.signal?.aborted).toBe(
+      true,
+    );
   });
 
   it("reuses summary params for top sessions during full refresh", async () => {
@@ -1070,28 +1135,20 @@ describe("UsageStore session filter params", () => {
       await fetch;
 
       const topSessionParams = usageServiceMocks.getApiV1UsageTopSessions.mock.lastCall?.[0];
-      expect(topSessionParams?.activeSince).toBe(summaryParams?.activeSince);
+      expect(topSessionParams?.active_since).toBe(summaryParams?.active_since);
     } finally {
       vi.useRealTimers();
     }
   });
 
   it("does not let stale comparison abort the current comparison", async () => {
-    const signals: (AbortSignal | undefined)[] = [];
-    apiRuntimeMocks.callGenerated.mockImplementation(
-      (request: () => Promise<unknown>, signal?: AbortSignal) => {
-        signals.push(signal);
-        return request();
-      },
-    );
-
     const { usage } = await loadStore();
     const loaded = await usage.fetchSummary({ loadComparison: false });
     expect(loaded).not.toBeNull();
     if (!loaded) return;
     const loadedSummary = loaded;
 
-    let resolveComparison: ((value: UsageComparison) => void) | undefined;
+    let resolveComparison: ((value: Comparison) => void) | undefined;
     usageServiceMocks.getApiV1UsageComparison.mockImplementationOnce(
       () =>
         new Promise((resolve) => {
@@ -1112,7 +1169,8 @@ describe("UsageStore session filter params", () => {
       loadedSummary.params,
     );
     await Promise.resolve();
-    const currentSignal = signals[1];
+    const currentSignal = vi.mocked(UsageService.getApiV1UsageComparison).mock.calls[0]?.[1]
+      ?.signal;
     expect(currentSignal).toBeDefined();
     expect(currentSignal?.aborted).toBe(false);
 
@@ -1130,14 +1188,6 @@ describe("UsageStore session filter params", () => {
   });
 
   it("aborts active comparison when a newer summary starts", async () => {
-    const signals: (AbortSignal | undefined)[] = [];
-    apiRuntimeMocks.callGenerated.mockImplementation(
-      (request: () => Promise<unknown>, signal?: AbortSignal) => {
-        signals.push(signal);
-        return request();
-      },
-    );
-
     const { usage } = await loadStore();
     const loaded = await usage.fetchSummary({ loadComparison: false });
     expect(loaded).not.toBeNull();
@@ -1158,7 +1208,8 @@ describe("UsageStore session filter params", () => {
       loadedSummary.params,
     );
     await Promise.resolve();
-    const comparisonSignal = signals[1];
+    const comparisonSignal = vi.mocked(UsageService.getApiV1UsageComparison).mock.calls[0]?.[1]
+      ?.signal;
     expect(comparisonSignal).toBeDefined();
     expect(comparisonSignal?.aborted).toBe(false);
 
@@ -1193,8 +1244,8 @@ describe("UsageStore session filter params", () => {
     await usage.fetchAll();
     expect(usage.pairwiseComparison).toEqual(usagePairwiseComparison());
 
-    let resolveFirst: ((value: UsagePairwiseComparisonResponse) => void) | undefined;
-    let resolveSecond: ((value: UsagePairwiseComparisonResponse) => void) | undefined;
+    let resolveFirst: ((value: ServiceUsagePairwiseComparisonResponse) => void) | undefined;
+    let resolveSecond: ((value: ServiceUsagePairwiseComparisonResponse) => void) | undefined;
     usageServiceMocks.getApiV1UsagePairwiseComparison
       .mockImplementationOnce(
         () =>
@@ -1246,30 +1297,21 @@ describe("UsageStore session filter params", () => {
     await vi.waitFor(() => {
       expect(usage.pairwiseComparison).toEqual(latest);
     });
-    expect(usageServiceMocks.getApiV1UsagePairwiseComparison).toHaveBeenNthCalledWith(
-      2,
+    expect(usageServiceMocks.getApiV1UsagePairwiseComparison.mock.calls[1]?.[0]).toEqual(
       expect.objectContaining({
-        leftDimension: "project",
+        left_dimension: "project",
       }),
     );
-    expect(usageServiceMocks.getApiV1UsagePairwiseComparison).toHaveBeenNthCalledWith(
-      3,
+    expect(usageServiceMocks.getApiV1UsagePairwiseComparison.mock.calls[2]?.[0]).toEqual(
       expect.objectContaining({
-        leftDimension: "project",
-        rightDimension: "project",
-        rightValue: "pl1:sha256:alpha",
+        left_dimension: "project",
+        right_dimension: "project",
+        right_value: "pl1:sha256:alpha",
       }),
     );
   });
 
   it("aborts stale summary requests when a newer fetch starts", async () => {
-    const signals: (AbortSignal | undefined)[] = [];
-    apiRuntimeMocks.callGenerated.mockImplementation(
-      (request: () => Promise<unknown>, signal?: AbortSignal) => {
-        signals.push(signal);
-        return request();
-      },
-    );
     usageServiceMocks.getApiV1UsageSummary
       .mockImplementationOnce(() => new Promise(() => {}))
       .mockResolvedValueOnce({
@@ -1308,8 +1350,10 @@ describe("UsageStore session filter params", () => {
     void usage.fetchSummary();
     await Promise.resolve();
 
-    expect(signals[0]).toBeDefined();
-    expect(signals[0]?.aborted).toBe(true);
+    expect(vi.mocked(UsageService.getApiV1UsageSummary).mock.calls[0]?.[1]?.signal).toBeDefined();
+    expect(vi.mocked(UsageService.getApiV1UsageSummary).mock.calls[0]?.[1]?.signal?.aborted).toBe(
+      true,
+    );
   });
 });
 
@@ -1406,7 +1450,7 @@ describe("UsageStore time-series range selection", () => {
     expect(usage.from).toBe("2026-06-04");
     expect(usage.to).toBe("2026-06-18");
     expect(usage.timeSeriesSummary).toEqual(context);
-    expect(usageServiceMocks.getApiV1UsageSummary).toHaveBeenLastCalledWith(
+    expect(usageServiceMocks.getApiV1UsageSummary.mock.lastCall?.[0]).toEqual(
       expect.objectContaining({ from: "2026-06-07", to: "2026-06-10" }),
     );
   });
@@ -1447,10 +1491,10 @@ describe("UsageStore time-series range selection", () => {
     expect(usage.summary).toMatchObject(refreshedSelection);
     expect(usage.timeSeriesSummary).toEqual(refreshedParent);
     expect(usageServiceMocks.getApiV1UsageSummary).toHaveBeenCalledTimes(2);
-    expect(usageServiceMocks.getApiV1UsageSummary).toHaveBeenCalledWith(
+    expect(usageServiceMocks.getApiV1UsageSummary.mock.calls[0]?.[0]).toEqual(
       expect.objectContaining({ from: "2026-06-07", to: "2026-06-10" }),
     );
-    expect(usageServiceMocks.getApiV1UsageSummary).toHaveBeenCalledWith(
+    expect(usageServiceMocks.getApiV1UsageSummary.mock.calls[1]?.[0]).toEqual(
       expect.objectContaining({ from: "2026-06-04", to: "2026-06-18" }),
     );
 
@@ -1506,6 +1550,9 @@ describe("UsageStore time-series range selection", () => {
             cost: testMoney(1),
           },
         ],
+        modelBreakdowns: [],
+        agentBreakdowns: [],
+        machineBreakdowns: [],
       },
       {
         date: "2026-06-08",
@@ -1526,6 +1573,9 @@ describe("UsageStore time-series range selection", () => {
             cost: testMoney(2),
           },
         ],
+        modelBreakdowns: [],
+        agentBreakdowns: [],
+        machineBreakdowns: [],
       },
       {
         date: "2026-06-09",
@@ -1546,6 +1596,9 @@ describe("UsageStore time-series range selection", () => {
             cost: testMoney(3),
           },
         ],
+        modelBreakdowns: [],
+        agentBreakdowns: [],
+        machineBreakdowns: [],
       },
     ];
     usage.summary = context;
@@ -1609,7 +1662,7 @@ describe("UsageStore time-series range selection", () => {
     await vi.waitFor(() => {
       expect(usageServiceMocks.getApiV1UsageTopSessions).toHaveBeenCalledTimes(2);
     });
-    expect(usageServiceMocks.getApiV1UsageTopSessions).toHaveBeenLastCalledWith(
+    expect(usageServiceMocks.getApiV1UsageTopSessions.mock.lastCall?.[0]).toEqual(
       expect.objectContaining({ from: "2026-06-04", to: "2026-06-18" }),
     );
     expect(usage.topSessions).toEqual([topSession("parent-after")]);
@@ -1666,8 +1719,8 @@ describe("UsageStore time-series range selection", () => {
     usage.toggleModel("model-a");
 
     expect(usage.selectedTimeRange).toBeNull();
-    expect(usageServiceMocks.getApiV1UsageSummary).toHaveBeenLastCalledWith(
-      expect.objectContaining({ from: "2026-06-04", to: "2026-06-18", model: "model-a" }),
+    expect(usageServiceMocks.getApiV1UsageSummary.mock.lastCall?.[0]).toEqual(
+      expect.objectContaining({ from: "2026-06-04", to: "2026-06-18", exclude_model: "model-a" }),
     );
   });
 
@@ -1724,7 +1777,7 @@ describe("UsageStore time-series range selection", () => {
         to: "2026-06-18",
       }),
     );
-    expect(parentRequest?.excludeAgent).toBeUndefined();
+    expect(parentRequest?.exclude_agent).toBeUndefined();
     resolveInitialRange?.(usageSummary(15));
   });
 
@@ -1739,7 +1792,7 @@ describe("UsageStore time-series range selection", () => {
 
     expect(usage.selectedTimeRange).toBeNull();
     expect(usage.summary).toEqual(usage.timeSeriesSummary);
-    expect(usageServiceMocks.getApiV1UsageSummary).toHaveBeenLastCalledWith(
+    expect(usageServiceMocks.getApiV1UsageSummary.mock.lastCall?.[0]).toEqual(
       expect.objectContaining({ from: "2026-06-04", to: "2026-06-18" }),
     );
   });
@@ -1757,12 +1810,11 @@ describe("buildUsageUrlParams", () => {
       excludedProjectKeys: "pk1",
       excludedAgents: "a1",
       excludedModels: "m1",
-      selectedModels: "m2",
     });
     expect(params).toEqual({
       exclude_project: "p1",
       exclude_agent: "a1",
-      model: "m2",
+      exclude_model: "m1",
     });
   });
 
@@ -1777,7 +1829,6 @@ describe("buildUsageUrlParams", () => {
       excludedProjectKeys: "",
       excludedAgents: "",
       excludedModels: "",
-      selectedModels: "",
     });
     expect(params).toEqual({
       from: "2026-01-01",
@@ -1796,7 +1847,6 @@ describe("buildUsageUrlParams", () => {
       excludedProjectKeys: "",
       excludedAgents: "",
       excludedModels: "",
-      selectedModels: "",
     });
     expect(params).toEqual({});
   });
@@ -1812,7 +1862,6 @@ describe("buildUsageUrlParams", () => {
       excludedProjectKeys: "",
       excludedAgents: "",
       excludedModels: "",
-      selectedModels: "",
     });
     expect(params).toEqual({});
   });
@@ -1828,7 +1877,6 @@ describe("buildUsageUrlParams", () => {
       excludedProjectKeys: "",
       excludedAgents: "",
       excludedModels: "",
-      selectedModels: "",
     });
     expect(params).toEqual({ window_days: "7" });
   });
@@ -1844,7 +1892,6 @@ describe("buildUsageUrlParams", () => {
       excludedProjectKeys: "",
       excludedAgents: "",
       excludedModels: "",
-      selectedModels: "",
     });
     expect(params).toEqual({
       from: "2026-01-01",

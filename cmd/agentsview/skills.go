@@ -6,10 +6,12 @@ import (
 	"context"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -33,6 +35,12 @@ func newSkillsCommand() *cobra.Command {
 			return cmd.Help()
 		},
 	}
+	cmd.PersistentFlags().String("server", "",
+		"Remote daemon URL to bake into generated skill examples "+
+			"(or AGENTSVIEW_SKILLS_SERVER); pass --server \"\" to un-bake")
+	cmd.PersistentFlags().String("server-token-file", "",
+		"Token file path to bake into generated skill examples "+
+			"(or AGENTSVIEW_SKILLS_SERVER_TOKEN_FILE)")
 	cmd.AddCommand(newSkillsInstallCommand())
 	cmd.AddCommand(newSkillsListCommand())
 	return cmd
@@ -58,7 +66,11 @@ func newSkillsInstallCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return runSkillsInstall(cmd.OutOrStdout(), harnesses, base, force)
+			remote, err := skillRemoteFromFlags(cmd)
+			if err != nil {
+				return err
+			}
+			return runSkillsInstall(cmd.OutOrStdout(), harnesses, base, force, remote)
 		},
 	}
 	flags := cmd.Flags()
@@ -72,46 +84,56 @@ func newSkillsInstallCommand() *cobra.Command {
 	return cmd
 }
 
-// runSkillsInstall renders and writes each harness's skill file under base,
-// printing one line per target. It processes every target before returning
-// so a refusal on one harness never blocks another, then reports a non-nil
-// error if any target was refused.
-func runSkillsInstall(out io.Writer, harnesses []skills.Harness, base string, force bool) error {
+// runSkillsInstall renders and writes each harness's recall package under
+// base, printing one line per artifact. It processes every artifact before
+// returning so one refusal never blocks other safe writes, then reports a
+// non-nil error if any artifact was refused.
+func runSkillsInstall(
+	out io.Writer, harnesses []skills.Harness, base string, force bool,
+	remote skillRemoteSource,
+) error {
 	var refused []string
 	for _, h := range harnesses {
-		rendered, err := skills.Render(h, version)
+		skillPath := filepath.Join(skills.TargetDir(h, base), skillFileName)
+		installedSkill, err := readSkillFile(skillPath)
 		if err != nil {
 			return err
 		}
-		dir := skills.TargetDir(h, base)
-		path := filepath.Join(dir, skillFileName)
-
-		existing, err := readSkillFile(path)
+		pkg, err := skills.RenderPackage(h, version, remote.resolve(installedSkill))
 		if err != nil {
 			return err
 		}
-		state := skills.Classify(existing, rendered)
 
-		if !force && (state == skills.StateModified || state == skills.StateForeign) {
-			fmt.Fprintf(out, "%s was modified (or not generated); use --force to overwrite\n", path)
-			refused = append(refused, path)
-			continue
-		}
+		for _, rendered := range pkg {
+			path := filepath.Join(base, rendered.RelativePath)
+			existing, err := readSkillFile(path)
+			if err != nil {
+				return err
+			}
+			state := skills.Classify(existing, rendered)
 
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return fmt.Errorf("skills: create %s: %w", dir, err)
-		}
-		if err := os.WriteFile(path, []byte(rendered.Content), 0o644); err != nil {
-			return fmt.Errorf("skills: write %s: %w", path, err)
-		}
+			if !force && (state == skills.StateModified || state == skills.StateForeign) {
+				fmt.Fprintf(out, "%s was modified (or not generated); use --force to overwrite\n", path)
+				refused = append(refused, path)
+				continue
+			}
 
-		switch state {
-		case skills.StateMissing:
-			fmt.Fprintf(out, "installed %s\n", path)
-		case skills.StateCurrent:
-			fmt.Fprintf(out, "up to date %s\n", path)
-		default: // StateStale, or StateModified/StateForeign forced
-			fmt.Fprintf(out, "updated %s\n", path)
+			dir := filepath.Dir(path)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return fmt.Errorf("skills: create %s: %w", dir, err)
+			}
+			if err := os.WriteFile(path, []byte(rendered.Content), 0o644); err != nil {
+				return fmt.Errorf("skills: write %s: %w", path, err)
+			}
+
+			switch state {
+			case skills.StateMissing:
+				fmt.Fprintf(out, "installed %s\n", path)
+			case skills.StateCurrent:
+				fmt.Fprintf(out, "up to date %s\n", path)
+			default: // StateStale, or StateModified/StateForeign forced
+				fmt.Fprintf(out, "updated %s\n", path)
+			}
 		}
 	}
 
@@ -136,7 +158,11 @@ func newSkillsListCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			rows, err := listSkillRows(base, project)
+			remote, err := skillRemoteFromFlags(cmd)
+			if err != nil {
+				return err
+			}
+			rows, err := listSkillRows(base, project, remote)
 			if err != nil {
 				return err
 			}
@@ -156,52 +182,75 @@ func newSkillsListCommand() *cobra.Command {
 
 // skillListRow is one row of `skills list` output, in both human and JSON form.
 type skillListRow struct {
-	Harness string `json:"harness"`
-	Level   string `json:"level"`
-	State   string `json:"state"`
-	Path    string `json:"path"`
+	Harness  string `json:"harness"`
+	Artifact string `json:"artifact"`
+	Level    string `json:"level"`
+	State    string `json:"state"`
+	Path     string `json:"path"`
 }
 
-// listSkillRows classifies every harness's skill file under base against a
-// fresh render.
-func listSkillRows(base string, project bool) ([]skillListRow, error) {
+// listSkillRows classifies every artifact in every harness package under base
+// against a fresh render.
+func listSkillRows(
+	base string, project bool, remote skillRemoteSource,
+) ([]skillListRow, error) {
 	level := "user"
 	if project {
 		level = "project"
 	}
 
 	harnesses := skills.AllHarnesses()
-	rows := make([]skillListRow, 0, len(harnesses))
+	rows := make([]skillListRow, 0, len(harnesses)+1)
 	for _, h := range harnesses {
-		rendered, err := skills.Render(h, version)
+		skillPath := filepath.Join(skills.TargetDir(h, base), skillFileName)
+		installedSkill, err := readSkillFile(skillPath)
 		if err != nil {
 			return nil, err
 		}
-		dir := skills.TargetDir(h, base)
-		path := filepath.Join(dir, skillFileName)
-
-		existing, err := readSkillFile(path)
+		pkg, err := skills.RenderPackage(h, version, remote.resolve(installedSkill))
 		if err != nil {
 			return nil, err
 		}
-		state := skills.Classify(existing, rendered)
 
-		rows = append(rows, skillListRow{
-			Harness: string(h),
-			Level:   level,
-			State:   skillStateString(state),
-			Path:    path,
-		})
+		for _, rendered := range pkg {
+			path := filepath.Join(base, rendered.RelativePath)
+			existing, err := readSkillFile(path)
+			if err != nil {
+				return nil, err
+			}
+			state := skills.Classify(existing, rendered)
+
+			rows = append(rows, skillListRow{
+				Harness:  string(h),
+				Artifact: skillArtifactName(rendered),
+				Level:    level,
+				State:    skillStateString(state),
+				Path:     path,
+			})
+		}
 	}
 	return rows, nil
 }
 
 func printSkillListHuman(w io.Writer, rows []skillListRow) error {
-	fmt.Fprintf(w, "%-8s  %-8s  %-8s  %s\n", "HARNESS", "LEVEL", "STATE", "PATH")
+	fmt.Fprintf(w, "%-8s  %-12s  %-8s  %-8s  %s\n",
+		"HARNESS", "ARTIFACT", "LEVEL", "STATE", "PATH")
 	for _, r := range rows {
-		fmt.Fprintf(w, "%-8s  %-8s  %-8s  %s\n", r.Harness, r.Level, r.State, r.Path)
+		fmt.Fprintf(w, "%-8s  %-12s  %-8s  %-8s  %s\n",
+			r.Harness, r.Artifact, r.Level, r.State, r.Path)
 	}
 	return nil
+}
+
+func skillArtifactName(rendered skills.Rendered) string {
+	switch filepath.Base(rendered.RelativePath) {
+	case skillFileName:
+		return "skill"
+	case "LICENSE":
+		return "license"
+	default:
+		return "search-agent"
+	}
 }
 
 func skillStateString(s skills.InstalledState) string {
@@ -232,6 +281,72 @@ func readSkillFile(path string) ([]byte, error) {
 		return nil, fmt.Errorf("skills: read %s: %w", path, err)
 	}
 	return content, nil
+}
+
+// skillRemoteSource holds the remote-daemon inputs for one skills command,
+// so each target file can be resolved against what it already has baked in.
+type skillRemoteSource struct {
+	flag skills.Remote
+	// explicit is true when --server or --server-token-file was passed, in
+	// which case the flag value wins even if it is empty. That is the only
+	// way to un-bake a remote and go back to a local-SQLite skill.
+	explicit bool
+	env      skills.Remote
+}
+
+// resolve picks the remote to render for one skill file. Explicit flags win.
+// Otherwise an installed file decides, including when it bakes no remote at
+// all: "this skill is local" is recorded intent too. The environment only
+// seeds a file that is not there yet, so exporting AGENTSVIEW_SKILLS_SERVER
+// cannot retroactively mark every installed skill stale in `skills list`.
+func (s skillRemoteSource) resolve(existing []byte) skills.Remote {
+	if s.explicit {
+		return s.flag
+	}
+	if len(existing) > 0 {
+		return skills.ParseRemote(string(existing))
+	}
+	return s.env
+}
+
+// skillRemoteFromFlags reads the remote-daemon inputs for skill examples.
+// The environment variables are skills-only on purpose and are named apart
+// from AGENTSVIEW_SERVER_TOKEN so they cannot be mistaken for a default read
+// path for `session` commands, which have none. A token file without a
+// server is an error.
+func skillRemoteFromFlags(cmd *cobra.Command) (skillRemoteSource, error) {
+	server, err := cmd.Flags().GetString("server")
+	if err != nil {
+		return skillRemoteSource{}, err
+	}
+	tokenFile, err := cmd.Flags().GetString("server-token-file")
+	if err != nil {
+		return skillRemoteSource{}, err
+	}
+	src := skillRemoteSource{
+		flag: skills.Remote{
+			Server:    strings.TrimSpace(server),
+			TokenFile: strings.TrimSpace(tokenFile),
+		},
+		explicit: cmd.Flags().Changed("server") ||
+			cmd.Flags().Changed("server-token-file"),
+		env: skills.Remote{
+			Server:    strings.TrimSpace(os.Getenv("AGENTSVIEW_SKILLS_SERVER")),
+			TokenFile: strings.TrimSpace(os.Getenv("AGENTSVIEW_SKILLS_SERVER_TOKEN_FILE")),
+		},
+	}
+	if src.explicit {
+		if src.flag.TokenFile != "" && src.flag.Server == "" {
+			return skillRemoteSource{}, errors.New(
+				"skills: --server-token-file requires --server")
+		}
+		return src, src.flag.Validate()
+	}
+	if src.env.TokenFile != "" && src.env.Server == "" {
+		return skillRemoteSource{}, errors.New(
+			"skills: AGENTSVIEW_SKILLS_SERVER_TOKEN_FILE requires AGENTSVIEW_SKILLS_SERVER")
+	}
+	return src, src.env.Validate()
 }
 
 // resolveSkillHarnesses maps --harness flag values to skills.Harness,

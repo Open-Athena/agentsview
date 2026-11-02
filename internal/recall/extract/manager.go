@@ -15,6 +15,7 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	recall "go.kenn.io/agentsview/internal/recall"
 	"go.kenn.io/agentsview/internal/secrets"
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 const (
@@ -51,6 +52,14 @@ type ManagerConfig struct {
 	FailureBackoff time.Duration
 	// MaxAttempts bounds transient retries per model call. Defaults to 3.
 	MaxAttempts int
+	// AllowCandidateFindings narrows the secret gate to definite-confidence
+	// findings: candidate-tier matches (high-entropy assignments, JWT-shaped
+	// tokens, basic-auth URLs) stay recorded for review but no longer keep a
+	// session out of extraction, in discovery, the pre-send transcript
+	// re-scan, commit-time drift checks, and ineligibility reconciliation.
+	// Off by default: every recorded finding blocks. NewManager applies the
+	// same policy to the archive so the SQL boundaries agree with it.
+	AllowCandidateFindings bool
 }
 
 // Manager drives extraction for one generation: it scans for eligible
@@ -128,10 +137,10 @@ type Status struct {
 // NewManager validates the configuration and computes its fingerprint.
 func NewManager(cfg ManagerConfig) (*Manager, error) {
 	if cfg.DB == nil {
-		return nil, fmt.Errorf("extraction manager requires a database")
+		return nil, errors.New("extraction manager requires a database")
 	}
 	if cfg.Client == nil {
-		return nil, fmt.Errorf("extraction manager requires a client")
+		return nil, errors.New("extraction manager requires a client")
 	}
 	if err := cfg.Client.ValidateRequestShape(); err != nil {
 		return nil, err
@@ -143,7 +152,7 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 		)
 	}
 	if strings.TrimSpace(cfg.Identity.Model) == "" {
-		return nil, fmt.Errorf("extraction manager requires a model identity")
+		return nil, errors.New("extraction manager requires a model identity")
 	}
 	for _, role := range cfg.Segmenter.PromptRoles() {
 		if strings.TrimSpace(cfg.Prompts[role]) == "" {
@@ -156,6 +165,7 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	if cfg.FailureBackoff <= 0 {
 		cfg.FailureBackoff = defaultFailureBackoff
 	}
+	cfg.DB.SetExtractCandidateFindingsAllowed(cfg.AllowCandidateFindings)
 	if cfg.MaxAttempts <= 0 {
 		cfg.MaxAttempts = defaultMaxAttempts
 	}
@@ -219,6 +229,9 @@ func (m *Manager) runPassLocked(
 	ctx context.Context, opts PassOptions,
 ) (PassResult, error) {
 	var result PassResult
+	if m.cfg.DB.ArchiveContent().UsageOnly() {
+		return result, fmt.Errorf("%w: recall extraction is unavailable with archive_content=usage", db.ErrArchiveContentExcluded)
+	}
 	passStart := time.Now()
 	if err := m.ensureGeneration(ctx); err != nil {
 		return result, err
@@ -277,8 +290,8 @@ func (m *Manager) runPassLocked(
 			// pass) own it. Aborting would drop the pass's remaining
 			// candidates. An explicit run keeps the error — the caller
 			// named the session and must hear why it was refused.
-			var ineligible *ineligibleSessionError
-			if opts.SessionID == "" && errors.As(err, &ineligible) {
+			_, hasIneligible := errors.AsType[*ineligibleSessionError](err)
+			if opts.SessionID == "" && hasIneligible {
 				continue
 			}
 			return result, err
@@ -404,13 +417,29 @@ func (m *Manager) refuseSecretFindings(
 	if err != nil {
 		return err
 	}
-	if len(findings) > 0 {
+	if n := m.blockingFindings(findings); n > 0 {
 		return &ineligibleSessionError{err: fmt.Errorf(
 			"session %s has %d recorded secret findings and is excluded "+
-				"from extraction", sessionID, len(findings),
+				"from extraction", sessionID, n,
 		)}
 	}
 	return nil
+}
+
+// blockingFindings counts the recorded findings that exclude a session:
+// all of them by default, definite-confidence ones only when candidate
+// findings are allowed.
+func (m *Manager) blockingFindings(findings []db.SecretFinding) int {
+	if !m.cfg.AllowCandidateFindings {
+		return len(findings)
+	}
+	n := 0
+	for _, f := range findings {
+		if f.Confidence == secrets.ConfidenceDefinite {
+			n++
+		}
+	}
+	return n
 }
 
 // settledPastQuietPeriod refuses a session whose ended_at falls inside
@@ -538,7 +567,8 @@ func (m *Manager) extractSession(
 	}
 	if session == nil {
 		return outcome, &ineligibleSessionError{
-			err: fmt.Errorf("session %s not found", sessionID)}
+			err: fmt.Errorf("session %s not found", sessionID),
+		}
 	}
 	if err := extractableSession(sessionID, session); err != nil {
 		return outcome, &ineligibleSessionError{err: err}
@@ -591,7 +621,7 @@ func (m *Manager) extractSession(
 	// incremental append whose deferred rescan crashed before it landed).
 	// Re-scanning the content this function is about to send makes the
 	// boundary independent of that history.
-	secretMatches := transcriptSecretMatches(rows)
+	secretMatches := transcriptSecretMatches(rows, m.cfg.AllowCandidateFindings)
 	messages := make([]Message, 0, len(rows))
 	for _, row := range rows {
 		messages = append(messages, Message{
@@ -610,7 +640,7 @@ func (m *Manager) extractSession(
 	// token in the scan that the endpoint still receives contiguously. Raw
 	// contents, not formatted unit texts, so interposed formatting cannot
 	// push a straddling key under the scanner's payload-purity gate.
-	secretMatches += aggregateModelSecretMatches(messages)
+	secretMatches += aggregateModelSecretMatches(messages, m.cfg.AllowCandidateFindings)
 	units := m.cfg.Segmenter.Units(messages)
 	digest := unitsDigest(units)
 	// A digest change means previously extracted units may have different
@@ -634,7 +664,7 @@ func (m *Manager) extractSession(
 		// eligible for activation. A row already carrying this digest
 		// needs no upsert at all; a missing or digest-changed row is
 		// created or reset to pending, which a crash leaves retryable.
-		cursor := 0
+		var cursor int
 		if found && previous.ContentDigest == digest {
 			cursor = previous.UnitCursor
 		} else {
@@ -908,13 +938,13 @@ func (m *Manager) recheckExtraction(
 		return false, false, err
 	}
 	if recheck == nil || extractableSession(sessionID, recheck) != nil {
-		return false, false, nil
+		return false, false, nil //nolint:nilerr // An ineligible session is a normal extraction outcome; read errors propagate above.
 	}
 	findings, err := m.cfg.DB.SessionSecretFindings(ctx, sessionID)
 	if err != nil {
 		return false, false, err
 	}
-	if len(findings) > 0 {
+	if m.blockingFindings(findings) > 0 {
 		return false, false, nil
 	}
 	return true, !sessionSnapshotChanged(before, recheck), nil
@@ -946,11 +976,7 @@ func boundedLastError(err error) string {
 	if len(msg) <= maxStoredErrorBytes {
 		return msg
 	}
-	cut := maxStoredErrorBytes - len(marker)
-	for cut > 0 && !utf8.RuneStart(msg[cut]) {
-		cut--
-	}
-	return msg[:cut] + marker
+	return stringutil.SafeTruncate(msg, maxStoredErrorBytes-len(marker)) + marker
 }
 
 func (m *Manager) discardSessionOutput(
@@ -984,17 +1010,29 @@ func (m *Manager) discardSessionOutput(
 // single-token credential split mid-token across messages, which the newline
 // would otherwise break so a regex needing contiguous characters could not
 // match. Either matching means the material is present.
-func aggregateModelSecretMatches(messages []Message) int {
+func aggregateModelSecretMatches(messages []Message, allowCandidates bool) int {
 	texts := VisibleContents(messages)
-	matches := len(secrets.Scan(strings.Join(texts, "\n")))
-	matches += len(secrets.Scan(strings.Join(texts, "")))
+	scan := gateScanner(allowCandidates)
+	matches := len(scan(strings.Join(texts, "\n")))
+	matches += len(scan(strings.Join(texts, "")))
 	return matches
 }
 
-func transcriptSecretMatches(rows []db.Message) int {
+// gateScanner picks the ruleset the pre-send re-scan applies: the full
+// ruleset by default, definite rules only when candidate findings are
+// allowed — the same tier split the archive's eligibility SQL uses.
+func gateScanner(allowCandidates bool) func(string) []secrets.Match {
+	if allowCandidates {
+		return secrets.ScanDefinite
+	}
+	return secrets.Scan
+}
+
+func transcriptSecretMatches(rows []db.Message, allowCandidates bool) int {
+	scan := gateScanner(allowCandidates)
 	matches := 0
 	for _, row := range rows {
-		matches += len(secrets.Scan(row.Content))
+		matches += len(scan(row.Content))
 	}
 	return matches
 }

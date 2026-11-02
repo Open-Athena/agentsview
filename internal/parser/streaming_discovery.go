@@ -10,7 +10,10 @@ import (
 
 const streamingDirectoryBatchSize = 64
 
-var errStopStreamingDiscovery = errors.New("stop streaming discovery")
+var (
+	errStopStreamingDiscovery    = errors.New("stop streaming discovery")
+	errStreamingDirectoryChanged = errors.New("streaming directory changed during discovery")
+)
 
 // DiscoveryIncompleteError reports a bounded traversal that stopped before it
 // could authoritatively enumerate its configured scope. Callers must retain the
@@ -28,13 +31,13 @@ func (err DiscoveryIncompleteError) Error() string {
 	return string(err.Provider) + " discovery incomplete: " + err.Reason
 }
 
-type discoveryIncompleteCause struct {
+type discoveryIncompleteError struct {
 	incomplete DiscoveryIncompleteError
 	cause      error
 }
 
-func (err discoveryIncompleteCause) Error() string { return err.incomplete.Error() }
-func (err discoveryIncompleteCause) Unwrap() []error {
+func (err discoveryIncompleteError) Error() string { return err.incomplete.Error() }
+func (err discoveryIncompleteError) Unwrap() []error {
 	return []error{err.incomplete, err.cause}
 }
 
@@ -49,7 +52,7 @@ func incompleteDiscoveryError(
 	if _, ok := errors.AsType[DiscoveryIncompleteError](cause); ok {
 		return cause
 	}
-	return discoveryIncompleteCause{
+	return discoveryIncompleteError{
 		incomplete: DiscoveryIncompleteError{
 			Provider: provider,
 			Reason:   reason + ": " + cause.Error(),
@@ -59,8 +62,8 @@ func incompleteDiscoveryError(
 }
 
 func discoveryYieldCause(err error) (error, bool) {
-	var yieldErr discoveryYieldError
-	if !errors.As(err, &yieldErr) {
+	yieldErr, hasYieldErr := errors.AsType[discoveryYieldError](err)
+	if !hasYieldErr {
 		return nil, false
 	}
 	return yieldErr.cause, true
@@ -97,10 +100,12 @@ func withStreamingDirectoryReader(
 	return context.WithValue(ctx, streamingDirectoryReaderContextKey{}, reader)
 }
 
-type streamingDiscoveryBufferObserverKey struct{}
-type streamingRetainedBytesObserverKey struct{}
-type sharedContainerScanObserverKey struct{}
-type reconciliationRetainedMemberObserverKey struct{}
+type (
+	streamingDiscoveryBufferObserverKey     struct{}
+	streamingRetainedBytesObserverKey       struct{}
+	sharedContainerScanObserverKey          struct{}
+	reconciliationRetainedMemberObserverKey struct{}
+)
 
 // WithStreamingDiscoveryBufferObserver attaches instrumentation to direct
 // provider discovery. Providers report actual bounded read/source batches at
@@ -252,11 +257,27 @@ func streamDirectoryEntries(
 func streamDirectoryEntriesDirect(
 	ctx context.Context, dir string, yield func(os.DirEntry) error,
 ) error {
-	file, err := os.Open(dir)
+	root, err := os.OpenRoot(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
+		return err
+	}
+	file, err := root.Open(".")
+	if err != nil {
+		_ = root.Close()
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	// Root.Open on Windows establishes the directory file with delete sharing,
+	// while OpenRoot's traversal handle itself does not. Once the directory
+	// file is open, retaining the root handle adds no confinement and would
+	// prevent a paused bounded audit from allowing that directory to be renamed.
+	if err := root.Close(); err != nil {
+		_ = file.Close()
 		return err
 	}
 	defer file.Close()
@@ -283,6 +304,45 @@ func streamDirectoryEntriesDirect(
 			return readErr
 		}
 	}
+}
+
+func withRawCaptureStreamingTraversal(ctx context.Context) context.Context {
+	reader := streamingDirectoryReader(streamDirectoryEntriesDirect)
+	if configured, ok := ctx.Value(
+		streamingDirectoryReaderContextKey{},
+	).(streamingDirectoryReader); ok {
+		reader = configured
+	}
+	return withStreamingDirectoryReader(ctx, func(
+		readerCtx context.Context,
+		dir string,
+		yield func(os.DirEntry) error,
+	) error {
+		openedInfo, err := os.Stat(dir)
+		if err != nil {
+			return err
+		}
+		// Windows resolves Stat identity lazily from the path. Prime it before
+		// traversal so a replacement cannot make openedInfo adopt the new ID.
+		_ = os.SameFile(openedInfo, openedInfo)
+		err = reader(readerCtx, dir, func(entry os.DirEntry) error {
+			if err := ReportRawCaptureDiscoveryProgress(readerCtx); err != nil {
+				return err
+			}
+			return yield(entry)
+		})
+		if err != nil {
+			return err
+		}
+		currentInfo, err := os.Stat(dir)
+		if err != nil {
+			return errors.Join(errStreamingDirectoryChanged, err)
+		}
+		if !os.SameFile(openedInfo, currentInfo) {
+			return errStreamingDirectoryChanged
+		}
+		return nil
+	})
 }
 
 // streamDirectoryTree walks a directory without filepath.WalkDir's

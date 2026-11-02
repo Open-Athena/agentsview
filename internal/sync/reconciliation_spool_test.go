@@ -2,7 +2,6 @@ package sync
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,9 +15,9 @@ import (
 
 func TestReconciliationSpoolSelectsPreferredCandidateInSQL(t *testing.T) {
 	archivePath := filepath.Join(t.TempDir(), "sessions.db")
-	spool, err := newReconciliationSpool(archivePath)
+	spool, err := newReconciliationSpool(t.Context(), archivePath)
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, spool.CloseAndRemove()) })
+	t.Cleanup(func() { require.NoError(t, spool.CloseAndRemove(t.Context())) })
 
 	ctx := t.Context()
 	require.NoError(t, spool.Add(ctx, reconciliationCandidate{
@@ -32,6 +31,11 @@ func TestReconciliationSpoolSelectsPreferredCandidateInSQL(t *testing.T) {
 		Machine:     "new-machine",
 		Preference1: 200, Preference2: 2,
 	}))
+	assert.False(t, spool.LastAddWon(),
+		"a winner replacement must not count as a new discovered identity")
+	replaced, ok := spool.LastAddReplaced()
+	require.True(t, ok)
+	assert.Equal(t, "/sessions/old.jsonl", replaced.Path)
 	require.NoError(t, spool.Add(ctx, reconciliationCandidate{
 		Provider: parser.AgentCodex, Identity: "uuid", Path: "/archived/rollout-uuid.jsonl",
 		Preference1: 0,
@@ -40,6 +44,13 @@ func TestReconciliationSpoolSelectsPreferredCandidateInSQL(t *testing.T) {
 		Provider: parser.AgentCodex, Identity: "uuid", Path: "/sessions/2026/07/14/rollout-uuid.jsonl",
 		Preference1: 1,
 	}))
+	require.NoError(t, spool.Add(ctx, reconciliationCandidate{
+		Provider: parser.AgentClaude, Identity: "same", Path: "/sessions/old.jsonl",
+		StoredPath: "remote:/sessions/old.jsonl", Machine: "old-machine",
+		Preference1: 100, Preference2: 1,
+	}))
+	assert.False(t, spool.LastAddWon(),
+		"a lower-ranked duplicate must not count as a discovered winner")
 
 	page, err := spool.Page(ctx, reconciliationCursor{}, reconciliationPageSize)
 	require.NoError(t, err)
@@ -70,6 +81,59 @@ func TestReconciliationSpoolSelectsPreferredCandidateInSQL(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, present,
 		"path reuse by a different identity must not prove source membership")
+}
+
+func TestReconciliationSpoolCarriesWinningSourceState(t *testing.T) {
+	archivePath := filepath.Join(t.TempDir(), "sessions.db")
+	spool, err := newReconciliationSpool(t.Context(), archivePath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, spool.CloseAndRemove(t.Context())) })
+
+	ctx := t.Context()
+	oldState := parser.ReconciliationSourceState{
+		Version: 1,
+		Payload: []byte("old"),
+	}
+	newState := parser.ReconciliationSourceState{
+		Version: 1,
+		Payload: []byte("new"),
+	}
+	require.NoError(t, spool.Add(ctx, reconciliationCandidate{
+		Provider: parser.AgentOpenCode, Identity: "same", Path: "/old",
+		SourceState: oldState, Preference1: 1,
+	}))
+	require.NoError(t, spool.Add(ctx, reconciliationCandidate{
+		Provider: parser.AgentOpenCode, Identity: "same", Path: "/new",
+		SourceState: newState, Preference1: 2,
+	}))
+
+	page, err := spool.Page(ctx, reconciliationCursor{}, reconciliationPageSize)
+	require.NoError(t, err)
+	require.Len(t, page, 1)
+	assert.Equal(t, "/new", page[0].Path)
+	assert.Equal(t, newState.Version, page[0].SourceState.Version)
+	assert.Equal(t, newState.Payload, page[0].SourceState.Payload)
+}
+
+func TestReconciliationSpoolFallsBackForOversizedSourceState(t *testing.T) {
+	spool, err := newReconciliationSpool(t.Context(), filepath.Join(t.TempDir(), "sessions.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, spool.CloseAndRemove(t.Context())) })
+
+	err = spool.Add(t.Context(), reconciliationCandidate{
+		Provider: parser.AgentOpenCode, Identity: "large", Path: "/large",
+		SourceState: parser.ReconciliationSourceState{
+			Version: 1,
+			Payload: make([]byte, maxReconciliationSourceStateBytes+1),
+		},
+	})
+	require.NoError(t, err)
+	page, err := spool.Page(t.Context(), reconciliationCursor{}, reconciliationPageSize)
+	require.NoError(t, err)
+	require.Len(t, page, 1)
+	assert.Zero(t, page[0].SourceState.Version,
+		"oversized optional state must fall back to authoritative rehydration")
+	assert.Empty(t, page[0].SourceState.Payload)
 }
 
 func TestReconciliationSpoolDSNEscapesPortablePaths(t *testing.T) {
@@ -104,7 +168,7 @@ func TestReconciliationSpoolDSNEscapesPortablePaths(t *testing.T) {
 
 func TestReconciliationSpoolPagesStayBoundedAndCleanup(t *testing.T) {
 	dir := t.TempDir()
-	spool, err := newReconciliationSpool(filepath.Join(dir, "sessions.db"))
+	spool, err := newReconciliationSpool(t.Context(), filepath.Join(dir, "sessions.db"))
 	require.NoError(t, err)
 	path := spool.path
 	assert.Equal(t, dir, filepath.Dir(path))
@@ -132,7 +196,7 @@ func TestReconciliationSpoolPagesStayBoundedAndCleanup(t *testing.T) {
 	assert.Equal(t, reconciliationPageSize*3+17, total)
 	assert.Equal(t, reconciliationPageSize, spool.Metrics().MaxSpoolPageRows)
 
-	require.NoError(t, spool.CloseAndRemove())
+	require.NoError(t, spool.CloseAndRemove(t.Context()))
 	for _, suffix := range []string{"", "-wal", "-shm"} {
 		_, err := os.Stat(path + suffix)
 		assert.ErrorIs(t, err, os.ErrNotExist)
@@ -140,9 +204,9 @@ func TestReconciliationSpoolPagesStayBoundedAndCleanup(t *testing.T) {
 }
 
 func TestReconciliationSpoolNonAuthoritativeScopesStayPageBounded(t *testing.T) {
-	spool, err := newReconciliationSpool(filepath.Join(t.TempDir(), "sessions.db"))
+	spool, err := newReconciliationSpool(t.Context(), filepath.Join(t.TempDir(), "sessions.db"))
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, spool.CloseAndRemove()) })
+	t.Cleanup(func() { require.NoError(t, spool.CloseAndRemove(t.Context())) })
 
 	ctx := t.Context()
 	require.NoError(t, spool.Add(ctx, reconciliationCandidate{
@@ -185,26 +249,26 @@ func TestReconciliationSpoolNonAuthoritativeScopesStayPageBounded(t *testing.T) 
 }
 
 func TestReconciliationSpoolCancellationAndClosedErrors(t *testing.T) {
-	spool, err := newReconciliationSpool(filepath.Join(t.TempDir(), "sessions.db"))
+	spool, err := newReconciliationSpool(t.Context(), filepath.Join(t.TempDir(), "sessions.db"))
 	require.NoError(t, err)
 	path := spool.path
 
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	assert.ErrorIs(t, spool.Add(ctx, reconciliationCandidate{
+	require.ErrorIs(t, spool.Add(ctx, reconciliationCandidate{
 		Provider: parser.AgentClaude, Identity: "cancelled", Path: "/cancelled",
 	}), context.Canceled)
 
-	require.NoError(t, spool.closeDB())
+	require.NoError(t, spool.closeDB(ctx))
 	err = spool.Add(t.Context(), reconciliationCandidate{
 		Provider: parser.AgentClaude, Identity: "closed", Path: "/closed",
 	})
-	assert.Error(t, err)
-	assert.False(t, errors.Is(err, context.Canceled))
+	require.Error(t, err)
+	require.NotErrorIs(t, err, context.Canceled)
 	_, err = spool.Page(t.Context(), reconciliationCursor{}, reconciliationPageSize)
-	assert.Error(t, err)
+	require.Error(t, err)
 
-	require.NoError(t, spool.CloseAndRemove())
+	require.NoError(t, spool.CloseAndRemove(ctx))
 	_, err = os.Stat(path)
 	assert.ErrorIs(t, err, os.ErrNotExist)
 }

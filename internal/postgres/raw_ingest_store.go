@@ -20,8 +20,10 @@ const rawIngestBatchRows = 256
 
 // RawIngestStore implements raw custody metadata over PostgreSQL.
 type RawIngestStore struct {
-	db         *sql.DB
-	newReceipt func() (string, error)
+	db            *sql.DB
+	tenant        string
+	hostedVersion string
+	newReceipt    func() (string, error)
 }
 
 // NewRawIngestStore constructs a PostgreSQL raw custody metadata store.
@@ -30,6 +32,41 @@ func NewRawIngestStore(db *sql.DB) (*RawIngestStore, error) {
 		return nil, fmt.Errorf("%w: PostgreSQL connection is required", rawsync.ErrInvalid)
 	}
 	return &RawIngestStore{db: db, newReceipt: generateRawIngestReceipt}, nil
+}
+
+// NewTenantRawIngestStore binds custody and job operations to one configured
+// tenant. Callers must separately validate the hosted pool at startup.
+func NewTenantRawIngestStore(database *sql.DB, tenant string) (*RawIngestStore, error) {
+	if err := validateHostedBinding("hosted", tenant); err != nil {
+		return nil, err
+	}
+	s, err := NewRawIngestStore(database)
+	if err != nil {
+		return nil, err
+	}
+	s.tenant = tenant
+	return s, nil
+}
+
+// NewHostedRawIngestStore atomically selects the configured projection on new
+// acceptance and limits claims to that exact processing version.
+func NewHostedRawIngestStore(database *sql.DB, tenant, version string) (*RawIngestStore, error) {
+	if err := validateRawIngestProcessingVersion(version); err != nil {
+		return nil, err
+	}
+	s, err := NewTenantRawIngestStore(database, tenant)
+	if err != nil {
+		return nil, err
+	}
+	s.hostedVersion = version
+	return s, nil
+}
+
+func (s *RawIngestStore) validateIdentity(identity rawsync.AuthIdentity) error {
+	if s.tenant != "" && identity.TenantID != s.tenant {
+		return rawsync.ErrUnauthorized
+	}
+	return validateRawIngestIdentity(identity)
 }
 
 // RecordVerifiedObject records an object only after physical verification.
@@ -47,7 +84,7 @@ func (s *RawIngestStore) RecordVerifiedObjects(
 	identity rawsync.AuthIdentity,
 	objects []rawsync.ObjectRef,
 ) error {
-	if err := validateRawIngestIdentity(identity); err != nil {
+	if err := s.validateIdentity(identity); err != nil {
 		return err
 	}
 	unique, err := uniqueRawIngestObjects(objects)
@@ -94,7 +131,7 @@ func (s *RawIngestStore) MissingObjects(
 	identity rawsync.AuthIdentity,
 	objects []rawsync.ObjectRef,
 ) ([]rawsync.ObjectRef, error) {
-	if err := validateRawIngestIdentity(identity); err != nil {
+	if err := s.validateIdentity(identity); err != nil {
 		return nil, err
 	}
 	unique, err := uniqueRawIngestObjects(objects)
@@ -114,12 +151,22 @@ func (s *RawIngestStore) MissingObjects(
 	return missing, nil
 }
 
-// CommitManifest atomically records a manifest, advances its head, and queues parsing.
+// CommitManifest atomically records a manifest, advances its head, queues
+// parsing, and supersedes one prior-head nonterminal parse job so stale
+// prefixes never accumulate behind the current head. Legacy duplicate
+// processing versions for the prior head stay nonterminal here and drain
+// through the bounded claim-time supersession fallback.
 func (s *RawIngestStore) CommitManifest(
 	ctx context.Context,
 	manifest rawsync.CanonicalManifest,
 	processingVersion string,
 ) (rawsync.CommitResult, error) {
+	if s.hostedVersion != "" && processingVersion != s.hostedVersion {
+		return rawsync.CommitResult{}, rawsync.ErrInvalid
+	}
+	if err := s.validateIdentity(manifest.Identity); err != nil {
+		return rawsync.CommitResult{}, err
+	}
 	if err := validateRawIngestProcessingVersion(processingVersion); err != nil {
 		return rawsync.CommitResult{}, err
 	}
@@ -177,7 +224,7 @@ func (s *RawIngestStore) CommitManifest(
 		}
 	}
 	if head.Generation == math.MaxInt64 {
-		return rawsync.CommitResult{}, fmt.Errorf("raw source generation exhausted")
+		return rawsync.CommitResult{}, errors.New("raw source generation exhausted")
 	}
 	generation := head.Generation + 1
 	receipt, err := s.newReceipt()
@@ -245,6 +292,43 @@ func (s *RawIngestStore) CommitManifest(
 	}
 	if affected != 1 {
 		return rawsync.CommitResult{}, fmt.Errorf("advancing raw source head affected %d rows", affected)
+	}
+	if s.hostedVersion != "" {
+		if _, err := selectRawSourceGenerationTx(ctx, tx, manifest, processingVersion); err != nil {
+			return rawsync.CommitResult{}, err
+		}
+	}
+	if head.ManifestID != "" {
+		// The unique key permits legacy rows with several processing versions
+		// per manifest, so supersede exactly one deterministic candidate per
+		// advance and leave the remaining duplicates to the bounded fallback.
+		// We intentionally rely on the outer UPDATE's nonterminal-state
+		// predicate rather than a FOR UPDATE lock: under READ COMMITTED, when
+		// this statement waits on the candidate's row lock, EvalPlanQual
+		// rechecks the WHERE clause against the newest committed version, so
+		// a candidate completed or failed by a concurrent lease transition is
+		// skipped instead of overwritten, and the remaining obsolete rows are
+		// handled by the bounded claim-time fallback.
+		if _, err := tx.ExecContext(ctx, `
+			WITH candidate AS (
+				SELECT job.id
+				FROM raw_ingest_jobs AS job
+				WHERE job.tenant_id = $1 AND job.manifest_id = $2
+					AND job.stage = 'parse'
+					AND job.state IN ('ready', 'retrying', 'leased')
+				ORDER BY job.id
+				LIMIT 1
+			)
+			UPDATE raw_ingest_jobs AS job
+			SET state = 'superseded', lease_owner = '', lease_expires_at = NULL,
+				updated_at = now()
+			FROM candidate
+			WHERE job.id = candidate.id
+				AND job.state IN ('ready', 'retrying', 'leased')`,
+			manifest.Identity.TenantID, head.ManifestID,
+		); err != nil {
+			return rawsync.CommitResult{}, fmt.Errorf("superseding prior raw parse job: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return rawsync.CommitResult{}, fmt.Errorf("committing raw manifest: %w", err)
@@ -347,49 +431,52 @@ func lockRawIngestHead(
 	return head, nil
 }
 
-type rawObjectQueryer interface {
-	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
-}
-
 func loadPresentRawObjects(
 	ctx context.Context,
-	queryer rawObjectQueryer,
+	queryer pgSessionQueryer,
 	tenantID string,
 	objects []rawsync.ObjectRef,
 ) (map[rawsync.ObjectRef]bool, error) {
 	present := make(map[rawsync.ObjectRef]bool, len(objects))
 	for start := 0; start < len(objects); start += rawIngestBatchRows {
-		end := min(start+rawIngestBatchRows, len(objects))
-		var query strings.Builder
-		query.WriteString(`SELECT sha256, size_bytes FROM raw_objects WHERE tenant_id = $1 AND (sha256, size_bytes) IN (`)
-		args := make([]any, 1, 1+2*(end-start))
-		args[0] = tenantID
-		for i, object := range objects[start:end] {
-			if i > 0 {
-				query.WriteByte(',')
+		if err := func() error {
+			end := min(start+rawIngestBatchRows, len(objects))
+			var query strings.Builder
+			query.WriteString(`SELECT sha256, size_bytes FROM raw_objects WHERE tenant_id = $1 AND (sha256, size_bytes) IN (`)
+			args := make([]any, 1, 1+2*(end-start))
+			args[0] = tenantID
+			for i, object := range objects[start:end] {
+				if i > 0 {
+					query.WriteByte(',')
+				}
+				argument := 2 + i*2
+				fmt.Fprintf(&query, "($%d,$%d)", argument, argument+1)
+				args = append(args, object.SHA256, object.Length)
 			}
-			argument := 2 + i*2
-			fmt.Fprintf(&query, "($%d,$%d)", argument, argument+1)
-			args = append(args, object.SHA256, object.Length)
-		}
-		query.WriteByte(')')
-		rows, err := queryer.QueryContext(ctx, query.String(), args...)
-		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
-			var object rawsync.ObjectRef
-			if err := rows.Scan(&object.SHA256, &object.Length); err != nil {
+			query.WriteByte(')')
+			rows, err := queryer.QueryContext(ctx, query.String(), args...)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var object rawsync.ObjectRef
+				if err := rows.Scan(&object.SHA256, &object.Length); err != nil {
+					_ = rows.Close()
+					return err
+				}
+				present[object] = true
+			}
+			if err := rows.Err(); err != nil {
 				_ = rows.Close()
-				return nil, err
+				return err
 			}
-			present[object] = true
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		if err := rows.Close(); err != nil {
+			if err := rows.Close(); err != nil {
+				return err
+			}
+
+			return nil
+		}(); err != nil {
 			return nil, err
 		}
 	}

@@ -1,6 +1,8 @@
 package scripts
 
 import (
+	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +13,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+const windowsStatusDLLInitFailed = uint32(0xc0000142)
 
 func TestHydrateAssetsForceFetchesRemoteAssetBranches(t *testing.T) {
 	tempDir := t.TempDir()
@@ -57,9 +61,7 @@ func TestHydrateAssetsForceFetchesRemoteAssetBranches(t *testing.T) {
 	scriptPath := filepath.Join(docsAssetsDir, "hydrate-assets.sh")
 	require.NoError(t, os.WriteFile(scriptPath, script, 0o755))
 
-	cmd := exec.Command("bash", scriptPath)
-	cmd.Dir = localRepo
-	output, err := cmd.CombinedOutput()
+	output, err := runBash(t, localRepo, nil, scriptPath)
 	require.NoError(t, err, string(output))
 
 	logo, err := os.ReadFile(filepath.Join(localRepo, "docs", "assets", "static", "og-image.png"))
@@ -100,7 +102,6 @@ func TestAssetPublishersRejectUnexpectedFiles(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-
 			tempDir := t.TempDir()
 			repo := filepath.Join(tempDir, "repo")
 			sourceDir := filepath.Join(tempDir, "source")
@@ -110,9 +111,7 @@ func TestAssetPublishersRejectUnexpectedFiles(t *testing.T) {
 			require.NoError(t, os.WriteFile(filepath.Join(sourceDir, ".env.local"), []byte("TOKEN=secret\n"), 0o600))
 
 			scriptPath := installScript(t, repo, tc.scriptRel)
-			cmd := exec.Command("bash", scriptPath, "--source", sourceDir)
-			cmd.Dir = repo
-			output, err := cmd.CombinedOutput()
+			output, err := runBash(t, repo, nil, scriptPath, "--source", sourceDir)
 
 			require.Error(t, err, string(output))
 			assert.Contains(t, string(output), "unexpected")
@@ -133,12 +132,10 @@ func TestGeneratedAssetPublisherAcceptsSemanticSetupScreenshot(t *testing.T) {
 		t, repo,
 		filepath.Join("docs", "screenshots", "update-generated-assets-branch.sh"),
 	)
-	cmd := exec.Command("bash", scriptPath, "--source", sourceDir)
-	cmd.Dir = repo
-	output, err := cmd.CombinedOutput()
+	output, err := runBash(t, repo, nil, scriptPath, "--source", sourceDir)
 	require.NoError(t, err, string(output))
 
-	show := exec.Command(
+	show := exec.CommandContext(t.Context(),
 		"git", "show",
 		"docs-generated-assets:screenshots/semantic-search-setup.png",
 	)
@@ -174,11 +171,9 @@ func TestCheckDocsRejectsCorruptedMarkdownSyntax(t *testing.T) {
 		0o644,
 	))
 
-	cmd := exec.Command("bash", checkScript)
-	cmd.Dir = repo
 	pythonPath := requireRunnablePython3(t)
-	cmd.Env = append(envWithout("PATH", "PYTHON"), "PYTHON="+pythonPath, "PATH=/usr/bin:/bin")
-	output, err := cmd.CombinedOutput()
+	env := append(envWithout("PATH", "PYTHON"), "PYTHON="+pythonPath, "PATH=/usr/bin:/bin")
+	output, err := runBash(t, repo, env, checkScript)
 
 	require.Error(t, err, string(output))
 	assert.Contains(t, string(output), "docs markdown")
@@ -212,15 +207,11 @@ func TestCheckDocsRequiresRipgrepForMediaReferenceChecks(t *testing.T) {
 		0o644,
 	))
 
-	bashPath, err := exec.LookPath("bash")
-	require.NoError(t, err)
-	cmd := exec.Command(bashPath, checkScript)
-	cmd.Dir = repo
 	pythonPath := requireRunnablePython3(t)
 	emptyBin := filepath.Join(tempDir, "empty-bin")
 	require.NoError(t, os.MkdirAll(emptyBin, 0o755))
-	cmd.Env = append(envWithout("PATH", "PYTHON"), "PYTHON="+pythonPath, "PATH="+emptyBin)
-	output, err := cmd.CombinedOutput()
+	env := append(envWithout("PATH", "PYTHON"), "PYTHON="+pythonPath, "PATH="+emptyBin)
+	output, err := runBash(t, repo, env, checkScript)
 
 	require.Error(t, err, string(output))
 	assert.Contains(t, string(output), "rg not found")
@@ -235,7 +226,7 @@ func TestBuiltSiteCheckRequiresMarkdownCompanions(t *testing.T) {
 	writeMinimalBuiltDocsSite(t, filepath.Join(repo, "docs", "site"))
 
 	pythonPath := requireRunnablePython3(t)
-	cmd := exec.Command(pythonPath, checkScript)
+	cmd := exec.CommandContext(t.Context(), pythonPath, checkScript)
 	cmd.Dir = filepath.Join(repo, "docs")
 	output, err := cmd.CombinedOutput()
 
@@ -278,7 +269,7 @@ func TestBuiltSiteCheckRejectsSvgUsePlainHref(t *testing.T) {
 			require.NoError(t, os.WriteFile(indexPath, []byte(patched), 0o644))
 
 			pythonPath := requireRunnablePython3(t)
-			cmd := exec.Command(pythonPath, checkScript)
+			cmd := exec.CommandContext(t.Context(), pythonPath, checkScript)
 			cmd.Dir = filepath.Join(repo, "docs")
 			output, err := cmd.CombinedOutput()
 
@@ -334,36 +325,75 @@ func TestZensicalDocsBuildExcludesScreenshotToolchain(t *testing.T) {
 	require.NoError(t, os.WriteFile(
 		publicScreenshot, []byte("public screenshot\n"), 0o644,
 	))
+	agentGuide := filepath.Join(docsDir, "agents", "testing.md")
+	require.NoError(t, os.MkdirAll(filepath.Dir(agentGuide), 0o755))
+	require.NoError(t, os.WriteFile(
+		agentGuide, []byte("contributor-only instructions\n"), 0o644,
+	))
+	writeWebsiteTierFixture(t, docsDir)
 
 	fakeZensical := filepath.Join(docsDir, ".venv", "bin", "zensical")
 	require.NoError(t, os.MkdirAll(filepath.Dir(fakeZensical), 0o755))
 	require.NoError(t, os.WriteFile(fakeZensical, []byte(`#!/usr/bin/env bash
 set -euo pipefail
 public_docs="$(find . -maxdepth 1 -type d -name 'zensical-public-docs.*' -print -quit)"
-mkdir -p site
-cp -R "$public_docs"/. site/
+mkdir -p site/docs
+cp -R "$public_docs"/. site/docs/
+printf '<urlset></urlset>\n' > site/docs/sitemap.xml
 `), 0o755))
 
-	cmd := exec.Command("bash", scriptPath, "build")
-	cmd.Dir = docsDir
-	output, err := cmd.CombinedOutput()
+	output, err := runBash(t, docsDir, nil, scriptPath, "build")
 	require.NoError(t, err, string(output))
-	assert.FileExists(t, filepath.Join(docsDir, "site", "index.md"))
+	assert.FileExists(t, filepath.Join(docsDir, "site", "docs", "index.md"))
 	assert.FileExists(t, filepath.Join(
-		docsDir, "site", "assets", "generated", "screenshots",
+		docsDir, "site", "docs", "assets", "generated", "screenshots",
 		"dashboard.png",
 	))
+	assert.FileExists(t, filepath.Join(docsDir, "site", "index.html"))
+	assert.FileExists(t, filepath.Join(docsDir, "site", "guide", "index.html"))
+	assert.FileExists(t, filepath.Join(docsDir, "site", "llms.txt"))
+	assert.FileExists(t, filepath.Join(docsDir, "site", "sitemap.xml"))
+	assert.FileExists(t, filepath.Join(docsDir, "site", "docs", "sitemap.xml"))
+	assert.NoDirExists(t, filepath.Join(docsDir, "site", "docs", "website"))
+	assert.NoDirExists(t, filepath.Join(docsDir, "site", "docs", "agents"))
+	assert.NoFileExists(t, filepath.Join(docsDir, "site", "docs", "llms.txt"))
 	assert.NoFileExists(t, filepath.Join(
-		docsDir, "site", "screenshots", "node_modules", "playwright-core",
-		"trace-viewer.html",
+		docsDir, "site", "docs", "screenshots", "node_modules",
+		"playwright-core", "trace-viewer.html",
 	))
 	assert.NoFileExists(t, filepath.Join(
-		docsDir, "site", "screenshots", "test-results", "trace.zip",
+		docsDir, "site", "docs", "screenshots", "test-results", "trace.zip",
+	))
+}
+
+func writeWebsiteTierFixture(t *testing.T, docsDir string) {
+	t.Helper()
+
+	websiteDir := filepath.Join(docsDir, "website")
+	files := map[string]string{
+		"index.html":                         "<!doctype html>\n",
+		"index.md":                           "# Home\n",
+		filepath.Join("guide", "index.html"): "<!doctype html>\n",
+		"guide.md":                           "# Guide\n",
+		"404.html":                           "<!doctype html>\n",
+		"favicon.svg":                        "<svg xmlns=\"http://www.w3.org/2000/svg\"/>\n",
+		filepath.Join("styles", "site.css"):  "body {}\n",
+		filepath.Join("scripts", "site.js"):  "// site\n",
+		filepath.Join("fonts", "Inter-Regular.woff2"): "font\n",
+	}
+	for name, content := range files {
+		path := filepath.Join(websiteDir, name)
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+	}
+	require.NoError(t, os.WriteFile(
+		filepath.Join(docsDir, "llms.txt"), []byte("# AgentsView\n"), 0o644,
 	))
 }
 
 func installScript(t *testing.T, repo, scriptRel string) string {
 	t.Helper()
+
 	script, err := os.ReadFile(filepath.Join("..", scriptRel))
 	require.NoError(t, err)
 	scriptPath := filepath.Join(repo, scriptRel)
@@ -372,13 +402,44 @@ func installScript(t *testing.T, repo, scriptRel string) string {
 	return scriptPath
 }
 
+func runBash(
+	t *testing.T, dir string, env []string, args ...string,
+) ([]byte, error) {
+	t.Helper()
+	bashPath, err := exec.LookPath("bash")
+	require.NoError(t, err)
+	var output []byte
+	for range 3 {
+		cmd := exec.CommandContext(t.Context(), bashPath, args...)
+		cmd.Dir = dir
+		if env != nil {
+			cmd.Env = env
+		}
+		output, err = cmd.CombinedOutput()
+		if !windowsDLLInitializationFailure(err) {
+			return output, err
+		}
+	}
+	return output, err
+}
+
+// Git for Windows can occasionally terminate MSYS Bash before the script runs.
+// Retry only the Windows loader failure; script failures remain single-attempt.
+func windowsDLLInitializationFailure(err error) bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+	exitErr, ok := errors.AsType[*exec.ExitError](err)
+	return ok && uint32(exitErr.ExitCode()) == windowsStatusDLLInitFailed
+}
+
 func requireRunnablePython3(t *testing.T) string {
 	t.Helper()
 	pythonPath, err := exec.LookPath("python3")
 	if err != nil {
 		t.Skipf("python3 not available on PATH: %v", err)
 	}
-	cmd := exec.Command(pythonPath, "--version")
+	cmd := exec.CommandContext(t.Context(), pythonPath, "--version")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		if runtime.GOOS == "windows" {
 			t.Skipf("python3 is not runnable: %v\n%s", err, out)
@@ -388,30 +449,60 @@ func requireRunnablePython3(t *testing.T) string {
 	return pythonPath
 }
 
-var builtDocsRoutes = []string{
-	"/",
-	"/quickstart/",
-	"/usage/",
-	"/activity/",
-	"/recent-edits/",
-	"/session-intelligence/",
-	"/mcp/",
-	"/token-usage/",
-	"/chat-import/",
-	"/quality/",
-	"/recall/",
-	"/commands/",
-	"/stats/",
-	"/session-api/",
-	"/configuration/",
-	"/remote-access/",
-	"/pg-sync/",
-	"/duckdb/",
-	"/changelog/",
+var builtDocsRoutes = func() []string {
+	pages := []string{
+		"quickstart",
+		"changelog",
+		"contributing",
+		"configuration",
+		"usage",
+		"activity",
+		"data",
+		"recent-edits",
+		"session-intelligence",
+		"mcp",
+		"token-usage",
+		"one-shot-capture",
+		"chat-import",
+		"quality",
+		"commands",
+		"session-export",
+		"conversation-export",
+		"reporting-export",
+		"stats",
+		"session-api",
+		"semantic-search",
+		"semantic-search-internals",
+		"recall",
+		"remote-access",
+		"artifact-sync",
+		"filesystem-sync",
+		"pg-sync",
+		"hosted-raw-sync",
+		"duckdb",
+		"clickhouse-sync",
+	}
+	routes := []string{"/", "/guide/", "/docs/"}
+	for _, page := range pages {
+		routes = append(routes, "/docs/"+page+"/")
+	}
+	return routes
+}()
+
+func routeMarkdownPath(route string) string {
+	switch route {
+	case "/":
+		return "/index.md"
+	case "/docs/":
+		return "/docs/index.md"
+	default:
+		return "/" + strings.Trim(route, "/") + ".md"
+	}
 }
 
 func writeMinimalBuiltDocsSite(t *testing.T, siteDir string) {
 	t.Helper()
+
 	for _, route := range builtDocsRoutes {
 		path := filepath.Join(siteDir, strings.Trim(route, "/"), "index.html")
 		if route == "/" {
@@ -419,45 +510,58 @@ func writeMinimalBuiltDocsSite(t *testing.T, siteDir string) {
 		}
 		ids := []string{}
 		switch route {
-		case "/configuration/":
+		case "/docs/configuration/":
 			ids = append(ids, "session-discovery")
-		case "/token-usage/":
-			ids = append(ids, "how-it-compares-to-ccusage")
-		case "/session-api/":
+		case "/docs/token-usage/":
+			ids = append(ids, "reporting-model")
+		case "/docs/session-api/":
 			ids = append(ids, "agentsview-session-usage")
 		}
 		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
-		require.NoError(t, os.WriteFile(path, []byte(minimalDocsHTML(ids)), 0o644))
+		require.NoError(t, os.WriteFile(path, []byte(minimalDocsHTML(route, ids)), 0o644))
 	}
-	require.NoError(t, os.WriteFile(filepath.Join(siteDir, "404.html"), []byte(minimalDocsHTML(nil)), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(siteDir, "404.html"), []byte(minimalDocsHTML("", nil)), 0o644))
 	require.NoError(t, os.WriteFile(
 		filepath.Join(siteDir, "sitemap.xml"),
-		[]byte("<urlset><url><loc>https://agentsview.io/</loc></url></urlset>\n"),
+		[]byte("<urlset>"+
+			"<url><loc>https://agentsview.io/</loc></url>"+
+			"<url><loc>https://agentsview.io/guide/</loc></url>"+
+			"<url><loc>https://agentsview.io/docs/</loc></url>"+
+			"</urlset>\n"),
 		0o644,
 	))
 }
 
 func writeBuiltSiteMarkdownCompanions(t *testing.T, siteDir string) {
 	t.Helper()
+
+	var llms strings.Builder
+	llms.WriteString("# AgentsView\n\n")
 	for _, route := range builtDocsRoutes {
-		path := filepath.Join(siteDir, strings.Trim(route, "/")+".md")
-		if route == "/" {
-			path = filepath.Join(siteDir, "index.md")
-		}
+		markdownPath := routeMarkdownPath(route)
+		path := filepath.Join(siteDir, filepath.FromSlash(strings.TrimPrefix(markdownPath, "/")))
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
 		require.NoError(t, os.WriteFile(path, []byte("# Page\n"), 0o644))
+		llms.WriteString("- [Page](https://agentsview.io" + markdownPath + "): Page\n")
 	}
+	require.NoError(t, os.WriteFile(filepath.Join(siteDir, "llms.txt"), []byte(llms.String()), 0o644))
 }
 
-func minimalDocsHTML(ids []string) string {
+func minimalDocsHTML(route string, ids []string) string {
 	var b strings.Builder
 	b.WriteString(`<!doctype html><html><head>`)
-	b.WriteString(`<meta property="og:image" content="https://agentsview.io/assets/static/og-image.png">`)
+	b.WriteString(`<meta property="og:image" content="https://agentsview.io/docs/assets/static/og-image.png">`)
 	b.WriteString(`<meta property="og:image:width" content="1200">`)
 	b.WriteString(`<meta property="og:image:height" content="630">`)
 	b.WriteString(`<meta property="og:type" content="website">`)
 	b.WriteString(`<meta property="og:site_name" content="AgentsView">`)
 	b.WriteString(`<meta name="twitter:card" content="summary_large_image">`)
-	b.WriteString(`<meta name="twitter:image" content="https://agentsview.io/assets/static/og-image.png">`)
+	b.WriteString(`<meta name="twitter:image" content="https://agentsview.io/docs/assets/static/og-image.png">`)
+	if route != "" {
+		b.WriteString(`<link rel="alternate" type="text/markdown" href="https://agentsview.io`)
+		b.WriteString(routeMarkdownPath(route))
+		b.WriteString(`">`)
+	}
 	b.WriteString(`</head><body>`)
 	b.WriteString(`<a class="agentsview-discord-link" aria-label="Join Discord" href="https://discord.gg/fDnmxB8Wkq">Discord</a>`)
 	for _, id := range ids {
@@ -525,6 +629,7 @@ func writeGeneratedAssets(t *testing.T, dir, content string) {
 		"screenshots/import-modal-chatgpt.png",
 		"screenshots/import-modal-claude.png",
 		"screenshots/in-session-search.png",
+		"screenshots/in-session-search-results.png",
 		"screenshots/quality.png",
 		"screenshots/recall-generated-insights.png",
 		"screenshots/layout-compact.png",
@@ -532,11 +637,15 @@ func writeGeneratedAssets(t *testing.T, dir, content string) {
 		"screenshots/machine-labels.png",
 		"screenshots/message-copy-btn.png",
 		"screenshots/message-viewer.png",
+		"screenshots/open-session.png",
 		"screenshots/project-breakdown.png",
+		"screenshots/project-mapping-bulk.png",
 		"screenshots/publish-modal.png",
 		"screenshots/recall-corpus.png",
 		"screenshots/recent-edits.png",
+		"screenshots/remote-resume-command.png",
 		"screenshots/resync-modal.png",
+		"screenshots/search-filters.png",
 		"screenshots/search-grouped.png",
 		"screenshots/search-results.png",
 		"screenshots/semantic-search-setup.png",
@@ -549,8 +658,11 @@ func writeGeneratedAssets(t *testing.T, dir, content string) {
 		"screenshots/session-resume-menu.png",
 		"screenshots/session-shape.png",
 		"screenshots/session-vital-signs.png",
+		"screenshots/settings-agent-homes.png",
+		"screenshots/settings-archive-content.png",
 		"screenshots/settings-chart-colors.png",
 		"screenshots/settings-embeddings.png",
+		"screenshots/settings-image-cleanup.png",
 		"screenshots/settings-remote.png",
 		"screenshots/settings.png",
 		"screenshots/shortcuts-modal.png",
@@ -613,7 +725,7 @@ func updateBareBranch(t *testing.T, bareRepo, branch, commit string) {
 
 func git(t *testing.T, dir string, args ...string) {
 	t.Helper()
-	cmd := exec.Command("git", args...)
+	cmd := exec.CommandContext(t.Context(), "git", args...)
 	cmd.Dir = dir
 	output, err := cmd.CombinedOutput()
 	require.NoError(t, err, string(output))
@@ -623,7 +735,7 @@ func gitBareWorkTree(
 	t *testing.T, bareRepo, workTree string, env []string, args ...string,
 ) {
 	t.Helper()
-	output, err := gitBareCmd(bareRepo, workTree, env, args...).CombinedOutput()
+	output, err := gitBareCmd(t.Context(), bareRepo, workTree, env, args...).CombinedOutput()
 	require.NoError(t, err, string(output))
 }
 
@@ -631,33 +743,33 @@ func gitBareWorkTreeOutput(
 	t *testing.T, bareRepo, workTree string, env []string, args ...string,
 ) string {
 	t.Helper()
-	output, err := gitBareCmd(bareRepo, workTree, env, args...).Output()
+	output, err := gitBareCmd(t.Context(), bareRepo, workTree, env, args...).Output()
 	require.NoError(t, err)
 	return strings.TrimSpace(string(output))
 }
 
 func gitBare(t *testing.T, bareRepo string, env []string, args ...string) {
 	t.Helper()
-	output, err := gitBareCmd(bareRepo, "", env, args...).CombinedOutput()
+	output, err := gitBareCmd(t.Context(), bareRepo, "", env, args...).CombinedOutput()
 	require.NoError(t, err, string(output))
 }
 
 func gitBareOutput(t *testing.T, bareRepo string, env []string, args ...string) string {
 	t.Helper()
-	output, err := gitBareCmd(bareRepo, "", env, args...).Output()
+	output, err := gitBareCmd(t.Context(), bareRepo, "", env, args...).Output()
 	require.NoError(t, err)
 	return strings.TrimSpace(string(output))
 }
 
 func gitBareCmd(
-	bareRepo, workTree string, env []string, args ...string,
+	ctx context.Context, bareRepo, workTree string, env []string, args ...string,
 ) *exec.Cmd {
 	fullArgs := []string{"--git-dir", bareRepo}
 	if workTree != "" {
 		fullArgs = append(fullArgs, "--work-tree", workTree)
 	}
 	fullArgs = append(fullArgs, args...)
-	cmd := exec.Command("git", fullArgs...)
+	cmd := exec.CommandContext(ctx, "git", fullArgs...)
 	if workTree != "" {
 		cmd.Dir = workTree
 	}

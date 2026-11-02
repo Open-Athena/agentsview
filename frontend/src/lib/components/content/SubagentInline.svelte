@@ -1,15 +1,11 @@
 <!-- ABOUTME: Expandable inline view of a subagent's conversation.
      ABOUTME: Lazily loads and renders subagent messages within a parent ToolBlock. -->
 <script lang="ts">
-  import type {
-    Message,
-    MessagesResponse,
-    Session,
-  } from "../../api/types.js";
+  import type { Session } from "../../api/types.js";
+import type { DbMessage as Message } from "../../api/generated/index.js";
+import type { ServiceMessageList as MessagesResponse } from "../../api/generated/index.js";
   import { SessionsService } from "../../api/generated/index";
   import {
-    callGenerated,
-    configureGeneratedClient,
     isAbortError,
   } from "../../api/runtime.js";
   import { formatTokenUsage } from "../../utils/format.js";
@@ -64,19 +60,13 @@
       loading = true;
       error = null;
       try {
-        configureGeneratedClient();
         const [resp, meta] = await Promise.all([
-          callGenerated(
-            () => SessionsService.getApiV1SessionsIdMessages({
-              id: sessionId,
-              limit: 1000,
-            }),
-            signal,
-          ) as unknown as Promise<MessagesResponse>,
-          (callGenerated(
-            () => SessionsService.getApiV1SessionsId({ id: sessionId }),
-            signal,
-          ) as unknown as Promise<Session>).catch((e) => {
+          SessionsService.getApiV1SessionsByIdMessages(
+                { id: sessionId },
+                { limit: 1000 },
+                { signal },
+              ),
+          (SessionsService.getApiV1SessionsById({ id: sessionId }, { signal })).catch((e) => {
             if (isAbortError(e)) throw e;
             return null;
           }),

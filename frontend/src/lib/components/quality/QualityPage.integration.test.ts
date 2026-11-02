@@ -1,23 +1,13 @@
 // @vitest-environment jsdom
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 import { analytics } from "../../stores/analytics.svelte.js";
 import { analyticsPageDates } from "../../stores/analyticsPageDates.js";
 import { router } from "../../stores/router.svelte.js";
 import { ui } from "../../stores/ui.svelte.js";
 import { yokedDates } from "../../stores/yokedDates.svelte.js";
-import {
-  AnalyticsService,
-  CancelablePromise,
-} from "../../api/generated/index.js";
-import type { SignalsAnalyticsResponse } from "../../api/types.js";
+import { AnalyticsService } from "../../api/generated/index.js";
+import type { DbSignalsAnalyticsResponse as SignalsAnalyticsResponse } from "../../api/generated/index.js";
 // @ts-ignore
 import QualityPage from "./QualityPage.svelte";
 
@@ -145,6 +135,7 @@ vi.mock("../../paraglide/messages.js", () => {
 
 vi.mock("../../utils/markdown.js", () => ({
   renderMarkdown: (content: string) => content,
+  loadAssetImages: () => ({ destroy() {} }),
 }));
 
 vi.mock("../../utils/highlight-fences.js", () => ({
@@ -160,16 +151,12 @@ async function flushEffects() {
 }
 
 async function selectCustomRange(fromLabel: string, toLabel: string) {
-  const trigger = document.querySelector<HTMLButtonElement>(
-    ".kit-date-range-picker__trigger",
-  );
+  const trigger = document.querySelector<HTMLButtonElement>(".kit-date-range-picker__trigger");
   expect(trigger).not.toBeNull();
   trigger!.click();
   await flushEffects();
 
-  const customTab = [
-    ...document.querySelectorAll<HTMLElement>('[role="radio"]'),
-  ][2];
+  const customTab = [...document.querySelectorAll<HTMLElement>('[role="radio"]')][2];
   expect(customTab).not.toBeUndefined();
   customTab!.click();
   await flushEffects();
@@ -288,17 +275,15 @@ describe("QualityPage date yoke integration", () => {
       from: string;
       to: string;
     }> = [];
-    vi.spyOn(analytics, "fetchSignalsForQuality").mockImplementation(
-      () => {
-        fetchStates.push({
-          isPinned: analytics.isPinned,
-          windowDays: analytics.windowDays,
-          from: analytics.from,
-          to: analytics.to,
-        });
-        return Promise.resolve();
-      },
-    );
+    vi.spyOn(analytics, "fetchSignalsForQuality").mockImplementation(() => {
+      fetchStates.push({
+        isPinned: analytics.isPinned,
+        windowDays: analytics.windowDays,
+        from: analytics.from,
+        to: analytics.to,
+      });
+      return Promise.resolve();
+    });
     analytics.isPinned = false;
     analytics.windowDays = 365;
     analytics.from = "2025-07-11";
@@ -339,21 +324,23 @@ describe("QualityPage date yoke integration", () => {
 
   it("aborts its pending signals transport when unmounted", async () => {
     const cancelTransport = vi.fn();
-    vi.spyOn(
-      AnalyticsService,
-      "getApiV1AnalyticsSignals",
-    ).mockImplementation(
-      () =>
-        new CancelablePromise((_resolve, _reject, onCancel) => {
-          onCancel(cancelTransport);
+    vi.spyOn(AnalyticsService, "getApiV1AnalyticsSignals").mockImplementation(
+      (_parameters, options) =>
+        new Promise((_resolve, reject) => {
+          options?.signal?.addEventListener(
+            "abort",
+            () => {
+              cancelTransport();
+              reject(new DOMException("Aborted", "AbortError"));
+            },
+            { once: true },
+          );
         }),
     );
 
     component = mount(QualityPage, { target: document.body });
     await flushEffects();
-    expect(
-      AnalyticsService.getApiV1AnalyticsSignals,
-    ).toHaveBeenCalled();
+    expect(AnalyticsService.getApiV1AnalyticsSignals).toHaveBeenCalled();
 
     unmount(component);
     component = undefined;
@@ -440,21 +427,15 @@ describe("QualityPage date yoke integration", () => {
       from: string;
       to: string;
     }> = [];
-    vi.spyOn(analytics, "fetchSignalsForQuality").mockImplementation(
-      () => {
-        fetchStates.push({
-          isPinned: analytics.isPinned,
-          from: analytics.from,
-          to: analytics.to,
-        });
-        return Promise.resolve();
-      },
-    );
-    window.history.replaceState(
-      null,
-      "",
-      "/quality?date_from=2026-06-01&date_to=2026-06-07",
-    );
+    vi.spyOn(analytics, "fetchSignalsForQuality").mockImplementation(() => {
+      fetchStates.push({
+        isPinned: analytics.isPinned,
+        from: analytics.from,
+        to: analytics.to,
+      });
+      return Promise.resolve();
+    });
+    window.history.replaceState(null, "", "/quality?date_from=2026-06-01&date_to=2026-06-07");
     router.params = {
       date_from: "2026-06-01",
       date_to: "2026-06-07",
@@ -482,16 +463,14 @@ describe("QualityPage date yoke integration", () => {
       from: string;
       to: string;
     }> = [];
-    vi.spyOn(analytics, "fetchSignalsForQuality").mockImplementation(
-      () => {
-        fetchStates.push({
-          isPinned: analytics.isPinned,
-          from: analytics.from,
-          to: analytics.to,
-        });
-        return Promise.resolve();
-      },
-    );
+    vi.spyOn(analytics, "fetchSignalsForQuality").mockImplementation(() => {
+      fetchStates.push({
+        isPinned: analytics.isPinned,
+        from: analytics.from,
+        to: analytics.to,
+      });
+      return Promise.resolve();
+    });
     yokedDates.setEnabled(true);
     yokedDates.updateFromPanel({
       from: "2026-06-01",
@@ -543,10 +522,7 @@ describe("QualityPage evidence navigation", () => {
   });
 
   it("navigates with the clicked example's session and message ordinal", async () => {
-    vi.spyOn(
-      AnalyticsService,
-      "getApiV1AnalyticsSignalSessions",
-    ).mockResolvedValue({
+    vi.spyOn(AnalyticsService, "getApiV1AnalyticsSignalSessions").mockResolvedValue({
       signal: "short_prompt_count",
       sessions: [
         {
@@ -586,18 +562,14 @@ describe("QualityPage evidence navigation", () => {
       ],
     });
     const scrollToOrdinal = vi.spyOn(ui, "scrollToOrdinal");
-    const routeToSession = vi
-      .spyOn(router, "navigateToSession")
-      .mockImplementation(() => {});
+    const routeToSession = vi.spyOn(router, "navigateToSession").mockImplementation(() => {});
 
     component = mount(QualityPage, { target: document.body });
     await flushEffects();
     document.querySelector<HTMLButtonElement>(".driver-row")!.click();
     await flushEffects();
 
-    const evidenceLinks = document.querySelectorAll<HTMLAnchorElement>(
-      "a.evidence-row",
-    );
+    const evidenceLinks = document.querySelectorAll<HTMLAnchorElement>("a.evidence-row");
     expect(evidenceLinks).toHaveLength(2);
     evidenceLinks[1]!.click();
     await flushEffects();

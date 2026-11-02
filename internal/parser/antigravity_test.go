@@ -68,7 +68,7 @@ func parseAntigravityTestSession(
 	t *testing.T, path, project, machine string,
 ) (*ParsedSession, []ParsedMessage, []ParsedUsageEvent, error) {
 	t.Helper()
-	return newAntigravityTestProvider(t).parseSession(path, project, machine)
+	return newAntigravityTestProvider(t).parseSession(t.Context(), path, project, machine)
 }
 
 // discoverAntigravityCLITestSessions discovers CLI sessions under root through
@@ -92,7 +92,9 @@ func parseAntigravityCLITestSessionWithStatus(
 	t *testing.T, path, project, machine string,
 ) (*ParsedSession, []ParsedMessage, []ParsedUsageEvent, AntigravityCLIParseStatus, error) {
 	t.Helper()
-	return newAntigravityCLITestProvider(t).parseSessionWithStatus(path, project, machine)
+	return newAntigravityCLITestProvider(t).parseSessionWithStatus(
+		t.Context(), path, project, "", machine,
+	)
 }
 
 // parseAntigravityCLITestSession is the no-status convenience wrapper the tests
@@ -230,7 +232,7 @@ func TestAgProtoLengthOverflow(t *testing.T) {
 	// bogus slice.
 	defer func() {
 		if r := recover(); r != nil {
-			t.Fatalf("agProtoParse panicked: %v", r)
+			require.FailNowf(t, "test failed", "agProtoParse panicked: %v", r)
 		}
 	}()
 	_, err := agProtoParse(payload)
@@ -244,7 +246,6 @@ func TestAgProtoLengthOverflow(t *testing.T) {
 // truncates instead of failing, so a payload past the budget keeps
 // its decoded prefix rather than losing all content.
 func TestAgProtoFieldBudget(t *testing.T) {
-
 	// One field per two bytes: tag 0x08 (field 1, varint), value 0.
 	dense := func(fields int) []byte {
 		return bytes.Repeat([]byte{0x08, 0x00}, fields)
@@ -356,6 +357,14 @@ func TestAntigravityCLIDiscoverAndParse(t *testing.T) {
 	require.Len(t, files, 1, "discover")
 	assert.Equal(t, "/tmp/proj", files[0].Project, "project")
 
+	provider := newAntigravityCLITestProvider(t, root)
+	sources, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	require.Len(t, sources, 1)
+	assert.Equal(t, SourceCwdResolved, sources[0].CwdResolution.State)
+	assert.Equal(t, "/tmp/proj", sources[0].CwdResolution.Path)
+	assert.Equal(t, CapabilitySupported, provider.Capabilities().Content.Cwd)
+
 	// Find by id should locate the same .pb.
 	assert.Equal(t, files[0].Path, findAntigravityCLITestSourceFile(t, root, id), "find")
 
@@ -364,6 +373,7 @@ func TestAntigravityCLIDiscoverAndParse(t *testing.T) {
 	)
 	require.NoError(t, err, "parse")
 	assert.Equal(t, "antigravity-cli:"+id, sess.ID)
+	assert.Equal(t, "/tmp/proj", sess.Cwd)
 	// One user message from history + one assistant from brain.
 	require.Len(t, msgs, 2)
 	assert.Equal(t, RoleUser, msgs[0].Role)
@@ -406,7 +416,8 @@ func TestAntigravityCLIDiscoverAndParseDB(t *testing.T) {
 	assert.Equal(t, "antigravity-cli:"+id, sess.ID)
 	assert.Equal(t, AgentAntigravityCLI, sess.Agent)
 	assert.Equal(t, dbPath, sess.File.Path)
-	assert.Equal(t, "/tmp/db-proj", sess.Project)
+	assert.Equal(t, "db_proj", sess.Project)
+	assert.Equal(t, "/tmp/db-proj", sess.Cwd)
 	require.Len(t, msgs, 2)
 	assert.Equal(t, RoleUser, msgs[0].Role)
 	assert.Equal(t, "db prompt fallback", msgs[0].Content)
@@ -431,10 +442,123 @@ func TestAntigravityCLIProjectFallbackPromptAndProximity(t *testing.T) {
 	mustWrite(t, filepath.Join(root, "history.jsonl"),
 		[]byte(`{"display":"  user prompt text goes here  ","timestamp":1779000010000,"workspace":"/tmp/fallback-proj"}`))
 
-	sess, msgs, err := parseAntigravityCLITestSession(t, dbPath, "", "m")
+	provider := newAntigravityCLITestProvider(t, root)
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
+	require.Len(t, sources, 1)
+	assert.Equal(t, SourceCwdUnspecified, sources[0].CwdResolution.State)
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
+		Source:  sources[0],
+		Machine: "m",
+	})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	sess := &outcome.Results[0].Result.Session
+	msgs := outcome.Results[0].Result.Messages
 	require.Len(t, msgs, 2)
-	assert.Equal(t, "/tmp/fallback-proj", sess.Project, "should successfully fallback infer project")
+	assert.Equal(t, "fallback_proj", sess.Project, "should normalize the inferred project label")
+	assert.Equal(t, "/tmp/fallback-proj", sess.Cwd, "should successfully fallback infer cwd")
+}
+
+// TestAntigravityCLIParse_GroupsGitWorktreesUnderOneProject reproduces
+// GitHub issue #1484: two Antigravity CLI sessions recorded from different
+// git worktrees of the same repo must resolve to the same project, matching
+// how the Codex provider already normalizes cwd through
+// ExtractProjectFromCwdWithBranchContext (see
+// TestParseCodexSession_WorktreeBranchFallback).
+func TestAntigravityCLIParse_GroupsGitWorktreesUnderOneProject(t *testing.T) {
+	skipIfNoGit(t)
+
+	root := t.TempDir()
+	mainRepo := filepath.Join(root, "agentsview")
+	mustMkdirAll(t, mainRepo)
+	gitRun(t, mainRepo, "init", "-q", "-b", "main")
+	gitRun(t, mainRepo,
+		"-c", "user.email=test@example.com",
+		"-c", "user.name=Test User",
+		"-c", "commit.gpgsign=false",
+		"commit", "--allow-empty", "-q", "-m", "seed",
+	)
+	worktree := filepath.Join(root, "agentsview-feature")
+	gitRun(t, mainRepo, "worktree", "add", "-q", "-b", "feature", worktree)
+
+	cliRoot := t.TempDir()
+	mustMkdir(t, filepath.Join(cliRoot, "conversations"))
+	mainID := "11111111-2222-3333-4444-555555555555"
+	worktreeID := "66666666-7777-8888-9999-000000000000"
+	mustMkdir(t, filepath.Join(cliRoot, "brain", mainID))
+	mustMkdir(t, filepath.Join(cliRoot, "brain", worktreeID))
+	createAntigravityTestDB(t, filepath.Join(cliRoot, "conversations", mainID+".db"))
+	createAntigravityTestDB(t, filepath.Join(cliRoot, "conversations", worktreeID+".db"))
+	mustWrite(t, filepath.Join(cliRoot, "history.jsonl"), []byte(
+		antigravityCLIHistoryLine(t, mainID, mainRepo)+
+			antigravityCLIHistoryLine(t, worktreeID, worktree),
+	))
+
+	files := discoverAntigravityCLITestSessions(t, cliRoot)
+	require.Len(t, files, 2, "discover")
+
+	projects := make(map[string]string, 2)
+	for _, f := range files {
+		sess, _, err := parseAntigravityCLITestSession(t, f.Path, f.Project, "test-machine")
+		require.NoError(t, err, "parse %s", f.Path)
+		projects[f.Path] = sess.Project
+	}
+
+	mainSess := projects[filepath.Join(cliRoot, "conversations", mainID+".db")]
+	worktreeSess := projects[filepath.Join(cliRoot, "conversations", worktreeID+".db")]
+	assert.Equal(t, "agentsview", mainSess, "main checkout project")
+	assert.Equal(t, "agentsview", worktreeSess, "worktree project")
+	assert.Equal(t, mainSess, worktreeSess,
+		"sessions from different worktrees of the same repo must group under one project")
+}
+
+// TestAntigravityCLIParse_RemoteParseSkipsLocalGitDiscovery guards the remote
+// (path-rewritten) parse path: history.jsonl's workspace names a path on the
+// remote machine, so project attribution must not run git-root discovery on
+// the importing host, where a same-named local checkout would misattribute
+// the session to the local repository. Lexical normalization still applies.
+func TestAntigravityCLIParse_RemoteParseSkipsLocalGitDiscovery(t *testing.T) {
+	skipIfNoGit(t)
+
+	root := t.TempDir()
+	mainRepo := filepath.Join(root, "agentsview")
+	mustMkdirAll(t, mainRepo)
+	gitRun(t, mainRepo, "init", "-q", "-b", "main")
+	gitRun(t, mainRepo,
+		"-c", "user.email=test@example.com",
+		"-c", "user.name=Test User",
+		"-c", "commit.gpgsign=false",
+		"commit", "--allow-empty", "-q", "-m", "seed",
+	)
+	worktree := filepath.Join(root, "agentsview-feature")
+	gitRun(t, mainRepo, "worktree", "add", "-q", "-b", "feature", worktree)
+
+	cliRoot := t.TempDir()
+	mustMkdir(t, filepath.Join(cliRoot, "conversations"))
+	id := "11111111-2222-3333-4444-555555555555"
+	createAntigravityTestDB(t, filepath.Join(cliRoot, "conversations", id+".db"))
+	mustWrite(t, filepath.Join(cliRoot, "history.jsonl"), []byte(
+		antigravityCLIHistoryLine(t, id, worktree),
+	))
+
+	provider, ok := NewProvider(AgentAntigravityCLI, ProviderConfig{
+		Roots:        []string{cliRoot},
+		PathRewriter: func(path string) string { return "remote-host:" + path },
+	})
+	require.True(t, ok)
+	cp, ok := provider.(*antigravityCLIProvider)
+	require.True(t, ok)
+
+	sess, _, _, _, err := cp.parseSessionWithStatus(
+		t.Context(),
+		filepath.Join(cliRoot, "conversations", id+".db"),
+		worktree, "", "remote-host",
+	)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	assert.Equal(t, "agentsview_feature", sess.Project,
+		"remote parse must not resolve the workspace against the local checkout")
 }
 
 func TestAntigravityCLIProjectFallbackStrictWindow(t *testing.T) {
@@ -454,6 +578,7 @@ func TestAntigravityCLIProjectFallbackStrictWindow(t *testing.T) {
 	sess, _, err := parseAntigravityCLITestSession(t, dbPath, "", "m")
 	require.NoError(t, err)
 	assert.Empty(t, sess.Project, "should reject match outside 1-minute window")
+	assert.Empty(t, sess.Cwd, "should reject cwd outside 1-minute window")
 }
 
 func TestAntigravityCLIProjectFallbackAmbiguous(t *testing.T) {
@@ -474,6 +599,7 @@ func TestAntigravityCLIProjectFallbackAmbiguous(t *testing.T) {
 	sess, _, err := parseAntigravityCLITestSession(t, dbPath, "", "m")
 	require.NoError(t, err)
 	assert.Empty(t, sess.Project, "should reject ambiguous match with different workspaces at same time closeness")
+	assert.Empty(t, sess.Cwd, "should reject ambiguous cwd match")
 }
 
 func TestAntigravityCLIProjectFallbackShortPrompt(t *testing.T) {
@@ -493,6 +619,31 @@ func TestAntigravityCLIProjectFallbackShortPrompt(t *testing.T) {
 	sess, _, err := parseAntigravityCLITestSession(t, dbPath, "", "m")
 	require.NoError(t, err)
 	assert.Empty(t, sess.Project, "should reject matching short prompts")
+	assert.Empty(t, sess.Cwd, "should reject cwd from matching short prompts")
+}
+
+func TestAntigravityCLIRejectsRelativeWorkspaceAsCwd(t *testing.T) {
+	root := t.TempDir()
+	id := "b0b0b0b0-b1b1-b2b2-b3b3-b4b4b4b4b4b4"
+
+	mustMkdir(t, filepath.Join(root, "conversations"))
+	mustWrite(t, filepath.Join(root, "conversations", id+".pb"),
+		[]byte("encrypted-placeholder"))
+	mustWrite(t, filepath.Join(root, "history.jsonl"),
+		[]byte(`{"display":"relative workspace","timestamp":1779000000000,`+
+			`"workspace":"relative/project","conversationId":"`+id+`"}`))
+
+	provider := newAntigravityCLITestProvider(t, root)
+	sources, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	require.Len(t, sources, 1)
+	assert.Equal(t, SourceCwdAmbiguous, sources[0].CwdResolution.State)
+	assert.Empty(t, sources[0].CwdResolution.Path)
+
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: sources[0]})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	assert.Empty(t, outcome.Results[0].Result.Session.Cwd)
 }
 
 func createAntigravityOvershortPromptDB(t *testing.T, path string) {
@@ -580,6 +731,26 @@ func TestAntigravityCLIFileInfoIncludesHistoryForLegacySync(t *testing.T) {
 		assert.Equal(t, int64(len("pb")+len(history)), info.Size())
 		assert.Equal(t, late.UnixNano(), info.ModTime().UnixNano())
 	})
+}
+
+func TestAntigravityCLIFileInfoIncludesWorkspaceCacheMtime(t *testing.T) {
+	root := t.TempDir()
+	id := "14141414-2525-3636-4747-585858585858"
+	sourcePath := filepath.Join(root, "conversations", id+".pb")
+	cachePath := filepath.Join(root, "cache", "last_conversations.json")
+	mustMkdir(t, filepath.Dir(sourcePath))
+	mustMkdir(t, filepath.Dir(cachePath))
+	mustWrite(t, sourcePath, []byte("pb"))
+	mustWrite(t, cachePath, []byte(`{"/tmp/proj":"`+id+`"}`))
+
+	early := time.Unix(1779000000, 0)
+	late := time.Unix(1779000300, 0)
+	require.NoError(t, os.Chtimes(sourcePath, early, early))
+	require.NoError(t, os.Chtimes(cachePath, late, late))
+
+	info, err := AntigravityCLIFileInfo(sourcePath)
+	require.NoError(t, err)
+	assert.Equal(t, late.UnixNano(), info.ModTime().UnixNano())
 }
 
 // TestAntigravityCLIFileInfoIncludesBrainArtifacts pins brain
@@ -1182,11 +1353,55 @@ func TestBuildAntigravityProjectMapRobust(t *testing.T) {
 	assert.False(t, ok, "id-2 had no workspace, should be absent")
 }
 
+func TestAntigravityProjectMapFromLastConversations(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "last_conversations.json")
+	assert.Empty(t, antigravityProjectMapFromLastConversations(path))
+	mustWrite(t, path, []byte(
+		`{"/tmp/a":"id-1","/tmp/b":"id-1",`+
+			`"relative/project":"id-2","/tmp/empty":""}`,
+	))
+	m := antigravityProjectMapFromLastConversations(path)
+	require.Len(t, m, 2)
+	assert.Equal(t, "/tmp/a", m["id-1"])
+	assert.Equal(t, "relative/project", m["id-2"])
+}
+
+func TestNormalizeAntigravityCLIWorkspaceAcceptsForeignAbsolutePaths(t *testing.T) {
+	tests := []struct {
+		workspace string
+		want      string
+	}{
+		{workspace: "/home/user/project", want: "/home/user/project"},
+		{workspace: `C:\Users\dev\project`, want: `C:\Users\dev\project`},
+		{workspace: `\\server\share\project`, want: `\\server\share\project`},
+		{workspace: "relative/project"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.workspace, func(t *testing.T) {
+			assert.Equal(t, tt.want, normalizeAntigravityCLIWorkspace(tt.workspace))
+		})
+	}
+}
+
 // ---- helpers --------------------------------------------------
 
 func mustMkdir(t *testing.T, p string) {
 	t.Helper()
 	require.NoError(t, os.MkdirAll(p, 0o755), "mkdir %s", p)
+}
+
+// antigravityCLIHistoryLine renders one history.jsonl row with real JSON
+// encoding. Workspace paths must go through json.Marshal because Windows
+// paths contain backslashes, which are escape characters inside a JSON
+// string literal.
+func antigravityCLIHistoryLine(t *testing.T, conversationID, workspace string) string {
+	t.Helper()
+	line, err := json.Marshal(map[string]string{
+		"conversationId": conversationID,
+		"workspace":      workspace,
+	})
+	require.NoError(t, err, "marshal history line")
+	return string(line) + "\n"
 }
 
 func mustWrite(t *testing.T, p string, b []byte) {
@@ -1298,7 +1513,7 @@ func mustExec(
 	t *testing.T, db *sql.DB, q string, args ...any,
 ) {
 	t.Helper()
-	_, err := db.Exec(q, args...)
+	_, err := db.ExecContext(t.Context(), q, args...)
 	require.NoError(t, err, "exec %q", q)
 }
 
@@ -1614,7 +1829,7 @@ func TestAntigravityCLITrajectoryParse(t *testing.T) {
 	assert.Equal(t, "Bash", msgs[1].ToolCalls[0].Category)
 
 	assert.Equal(t, RoleUser, msgs[2].Role)
-	assert.Equal(t, "", msgs[2].Content)
+	assert.Empty(t, msgs[2].Content)
 	require.Len(t, msgs[2].ToolResults, 1)
 	assert.Equal(t, "tc-1", msgs[2].ToolResults[0].ToolUseID)
 	assert.Contains(t, msgs[2].ToolResults[0].ContentRaw, "file1.txt")
@@ -2350,6 +2565,77 @@ func TestAntigravityCLIDBWithoutGenMetadataGetsSidecarUsage(t *testing.T) {
 	assert.True(t, sess.HasPeakContextTokens)
 }
 
+func TestAntigravityCLISidecarModelUsesCoveringExecutorEffort(t *testing.T) {
+	tests := []struct {
+		name                  string
+		executorLastStepIndex int
+		wantModel             string
+	}{
+		{
+			name:                  "covered serving variant gains executor effort",
+			executorLastStepIndex: 1,
+			wantModel:             "gemini-3.7-flash-high",
+		},
+		{
+			name:                  "step outside executor range preserves serving variant",
+			executorLastStepIndex: 0,
+			wantModel:             "gemini-3.7-flash-exp-b",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			id := "adadadad-bebe-cfcf-d0d0-e1e1e1e1e1e1"
+			mustMkdir(t, filepath.Join(root, "conversations"))
+
+			dbPath := filepath.Join(root, "conversations", id+".db")
+			createAntigravityTestDB(t, dbPath)
+			db, err := sql.Open("sqlite3", dbPath)
+			require.NoError(t, err)
+			mustExec(t, db, `CREATE TABLE executor_metadata (
+				idx integer, data blob, size integer, PRIMARY KEY (idx))`)
+			executorData := createAntigravityMockExecutorMetadata(
+				tt.executorLastStepIndex, "gemini-3.7-flash-high",
+			)
+			mustExec(t, db,
+				`INSERT INTO executor_metadata (idx, data, size) VALUES (0, ?, ?)`,
+				executorData, len(executorData))
+			require.NoError(t, db.Close())
+
+			genJSON := `[{
+				"stepIndices": [1],
+				"chatModel": {
+					"model": "gemini-3.7-flash-exp-b",
+					"usage": {
+						"inputTokens": "1500",
+						"outputTokens": "77"
+					}
+				}
+			}]`
+			writeAntigravityTestSidecarWithGenMetadata(
+				t, root, id, 2, genJSON,
+			)
+
+			_, msgs, usageEvents, status, err := parseAntigravityCLITestSessionWithStatus(
+				t, dbPath, "", "test-machine",
+			)
+			require.NoError(t, err)
+			assert.False(t, status.NeedsRetry)
+			require.Len(t, msgs, 2)
+			assert.Equal(t, tt.wantModel, msgs[1].Model)
+			assert.Equal(t, 1500, msgs[1].ContextTokens)
+			assert.Equal(t, 77, msgs[1].OutputTokens)
+
+			require.Len(t, usageEvents, 1)
+			assert.Equal(t, "sidecar", usageEvents[0].Source)
+			assert.Equal(t, tt.wantModel, usageEvents[0].Model)
+			assert.Equal(t, 1500, usageEvents[0].InputTokens)
+			assert.Equal(t, 77, usageEvents[0].OutputTokens)
+		})
+	}
+}
+
 func TestAntigravityCLINonCoveringSidecarUsageRejected(t *testing.T) {
 	root := t.TempDir()
 	id := "acacacac-bdbd-cece-dfdf-565656565656"
@@ -2672,6 +2958,13 @@ func TestAntigravityCLIGenerationMetadataMapsToPlannerStepAndExecutorModel(t *te
 			wantModel:       "gemini-3.7-flash-high",
 		},
 		{
+			name:            "experimental serving variant gains executor effort",
+			generationModel: "gemini-3.7-flash-exp-b",
+			modelField:      agChatModelMetadataResponseModelField,
+			executorModel:   "gemini-3.7-flash-high",
+			wantModel:       "gemini-3.7-flash-high",
+		},
+		{
 			name:            "different executor base is ignored",
 			generationModel: "claude-sonnet-4-6",
 			modelField:      agChatModelMetadataResponseModelField,
@@ -2684,6 +2977,34 @@ func TestAntigravityCLIGenerationMetadataMapsToPlannerStepAndExecutorModel(t *te
 			modelField:      agChatModelMetadataModelDisplayNameField,
 			executorModel:   "gemini-3.7-flash-medium",
 			wantModel:       "Gemini 3.7 Flash (High)",
+		},
+		{
+			name:            "empty executor preserves generation model",
+			generationModel: "gemini-3.7-flash-high",
+			modelField:      agChatModelMetadataResponseModelField,
+			executorModel:   "",
+			wantModel:       "gemini-3.7-flash-high",
+		},
+		{
+			name:            "mismatched executor preserves experimental generation model",
+			generationModel: "gemini-3.7-flash-exp-b",
+			modelField:      agChatModelMetadataResponseModelField,
+			executorModel:   "claude-sonnet-4-6",
+			wantModel:       "gemini-3.7-flash-exp-b",
+		},
+		{
+			name:            "conflicting generation effort is preserved",
+			generationModel: "gemini-3.7-flash-low",
+			modelField:      agChatModelMetadataResponseModelField,
+			executorModel:   "gemini-3.7-flash-high",
+			wantModel:       "gemini-3.7-flash-low",
+		},
+		{
+			name:            "generic exp model is preserved rather than treated as serving alias",
+			generationModel: "gemini-2.0-flash-exp",
+			modelField:      agChatModelMetadataResponseModelField,
+			executorModel:   "gemini-2.0-flash-high",
+			wantModel:       "gemini-2.0-flash-exp",
 		},
 	}
 
@@ -2747,10 +3068,9 @@ func TestAntigravityCLIGenerationMetadataMapsToPlannerStepAndExecutorModel(t *te
 				`INSERT INTO executor_metadata (idx, data, size) VALUES (0, ?, ?)`,
 				executorData, len(executorData))
 
-			_, msgs, usageEvents, _, err :=
-				parseAntigravityCLITestSessionWithStatus(
-					t, dbPath, "test-project", "test-machine",
-				)
+			_, msgs, usageEvents, _, err := parseAntigravityCLITestSessionWithStatus(
+				t, dbPath, "test-project", "test-machine",
+			)
 			require.NoError(t, err)
 			require.Len(t, msgs, 2)
 			assert.Equal(t, tt.wantModel, msgs[1].Model)
@@ -2813,8 +3133,7 @@ func TestExtractAntigravityStepIndicesDistinguishesAbsentAndMalformed(t *testing
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			indices, present, valid :=
-				extractAntigravityStepIndices(tt.data)
+			indices, present, valid := extractAntigravityStepIndices(tt.data)
 			assert.Equal(t, tt.wantIndices, indices)
 			assert.Equal(t, tt.wantPresent, present)
 			assert.Equal(t, tt.wantValid, valid)
@@ -3120,6 +3439,8 @@ func TestAntigravityGenMetadataWithoutUsageFlag(t *testing.T) {
 		{
 			name: "no gen_metadata table",
 			setupDB: func(t *testing.T, db *sql.DB) {
+				t.Helper()
+
 				createAntigravityStepTables(t, db)
 				decodableStep(t, db)
 			},
@@ -3128,6 +3449,8 @@ func TestAntigravityGenMetadataWithoutUsageFlag(t *testing.T) {
 		{
 			name: "empty gen_metadata table",
 			setupDB: func(t *testing.T, db *sql.DB) {
+				t.Helper()
+
 				createAntigravityStepTables(t, db)
 				mustExec(t, db, `CREATE TABLE gen_metadata (idx integer, data blob, size integer, PRIMARY KEY (idx))`)
 				decodableStep(t, db)
@@ -3137,6 +3460,8 @@ func TestAntigravityGenMetadataWithoutUsageFlag(t *testing.T) {
 		{
 			name: "gen_metadata rows decode to usage",
 			setupDB: func(t *testing.T, db *sql.DB) {
+				t.Helper()
+
 				createAntigravityStepTables(t, db)
 				mustExec(t, db, `CREATE TABLE gen_metadata (idx integer, data blob, size integer, PRIMARY KEY (idx))`)
 				decodableStep(t, db)
@@ -3148,6 +3473,8 @@ func TestAntigravityGenMetadataWithoutUsageFlag(t *testing.T) {
 		{
 			name: "gen_metadata rows all undecodable",
 			setupDB: func(t *testing.T, db *sql.DB) {
+				t.Helper()
+
 				createAntigravityStepTables(t, db)
 				mustExec(t, db, `CREATE TABLE gen_metadata (idx integer, data blob, size integer, PRIMARY KEY (idx))`)
 				decodableStep(t, db)
@@ -3195,6 +3522,8 @@ func TestAntigravityCLIGenMetadataWithoutUsageFlag(t *testing.T) {
 		{
 			name: "undecodable gen_metadata rescued by sidecar usage",
 			setup: func(t *testing.T, root, id, dbPath string) {
+				t.Helper()
+
 				db, err := sql.Open("sqlite3", dbPath)
 				require.NoError(t, err)
 				createAntigravityStepTables(t, db)
@@ -3224,6 +3553,8 @@ func TestAntigravityCLIGenMetadataWithoutUsageFlag(t *testing.T) {
 		{
 			name: "undecodable gen_metadata and no sidecar usage",
 			setup: func(t *testing.T, root, id, dbPath string) {
+				t.Helper()
+
 				db, err := sql.Open("sqlite3", dbPath)
 				require.NoError(t, err)
 				createAntigravityStepTables(t, db)
@@ -3317,10 +3648,14 @@ func TestAntigravityTokenUsageDynamicField(t *testing.T) {
 }
 
 func createAntigravityMockGenMetadata(t *testing.T, uncachedInput, totalOutput, cacheRead int, model string) []byte {
+	t.Helper()
+
 	return createAntigravityMockGenMetadataWithField(t, 1020, uncachedInput, totalOutput, cacheRead, model)
 }
 
 func createAntigravityMockGenMetadataWithField(t *testing.T, fieldNum int, uncachedInput, totalOutput, cacheRead int, model string) []byte {
+	t.Helper()
+
 	return createAntigravityMockGenMetadataData(
 		t, fieldNum, uncachedInput, totalOutput, cacheRead,
 		model, agChatModelMetadataModelDisplayNameField,
@@ -3570,6 +3905,7 @@ func TestExtractTokenUsageFalsePositiveGuards(t *testing.T) {
 // sessions, which leaked into messages.model with an embedded NUL byte
 // and broke `pg push` (PG rejects NUL with SQLSTATE 22021).
 func TestExtractModelNameRejectsNonPrintable(t *testing.T) {
+	t.Parallel()
 	// hex 080020022A0201024001: a nested message (field 1 varint,
 	// field 4 varint, field 5 bytes, field 8 varint), all bytes
 	// < 0x80 so utf8.Valid accepts it.
@@ -3624,6 +3960,7 @@ func TestExtractModelNameRejectsNonPrintable(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			assert.Equal(t, tt.want, extractModelName(tt.data))
 		})
 	}
@@ -3857,6 +4194,7 @@ func TestAntigravityToolCallsRejectsGenericStrings(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			calls := extractAntigravityToolCalls(0, tc.fields)
 			assert.Len(t, calls, tc.wantLen)
 		})
@@ -4045,7 +4383,7 @@ func TestAntigravityIDEHeuristicFallbackWhenSidecarMissing(t *testing.T) {
 	assert.Equal(t, "user prompt text goes here", msgs[0].Content)
 	assert.Contains(t, msgs[1].Content, "assistant reply content body")
 	// Fidelity unchanged from prior IDE behavior: empty (treated as full).
-	assert.Equal(t, "", sess.TranscriptFidelity)
+	assert.Empty(t, sess.TranscriptFidelity)
 }
 
 func TestAntigravityIDEKeepsDBDecodeWhenSidecarLags(t *testing.T) {
@@ -4065,7 +4403,7 @@ func TestAntigravityIDEKeepsDBDecodeWhenSidecarLags(t *testing.T) {
 	require.Len(t, msgs, 2)
 	assert.Equal(t, "user prompt text goes here", msgs[0].Content)
 	assert.Contains(t, msgs[1].Content, "assistant reply content body")
-	assert.Equal(t, "", sess.TranscriptFidelity)
+	assert.Empty(t, sess.TranscriptFidelity)
 }
 
 func TestAntigravityIDEMalformedSidecarFallsBack(t *testing.T) {
@@ -4085,7 +4423,7 @@ func TestAntigravityIDEMalformedSidecarFallsBack(t *testing.T) {
 	require.Len(t, msgs, 2)
 	assert.Equal(t, "user prompt text goes here", msgs[0].Content)
 	assert.Contains(t, msgs[1].Content, "assistant reply content body")
-	assert.Equal(t, "", sess.TranscriptFidelity)
+	assert.Empty(t, sess.TranscriptFidelity)
 }
 
 // TestAntigravityIDESidecarWinsKeepsGenMetadataUsage verifies the
@@ -4213,7 +4551,7 @@ func TestAntigravityIDENonCoveringSidecarUsageRejected(t *testing.T) {
 	// Heuristic decode wins; sidecar usage rejected like its transcript.
 	require.Len(t, msgs, 2)
 	assert.Equal(t, "user prompt text goes here", msgs[0].Content)
-	assert.Equal(t, "", sess.TranscriptFidelity)
+	assert.Empty(t, sess.TranscriptFidelity)
 	assert.Empty(t, usageEvents,
 		"non-covering sidecar usage must be rejected like its transcript")
 }

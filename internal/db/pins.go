@@ -3,19 +3,22 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 )
 
 // PinnedMessage represents a row in the pinned_messages table.
 type PinnedMessage struct {
-	ID        int64   `json:"id"`
-	SessionID string  `json:"session_id"`
-	MessageID int64   `json:"message_id"`
-	Ordinal   int     `json:"ordinal"`
-	Note      *string `json:"note,omitempty"`
-	Content   *string `json:"content,omitempty"`
-	Role      *string `json:"role,omitempty"`
-	CreatedAt string  `json:"created_at"`
+	MessageKey string  `json:"message_key,omitempty"`
+	Unresolved bool    `json:"unresolved,omitempty"`
+	ID         int64   `json:"id"`
+	SessionID  string  `json:"session_id"`
+	MessageID  int64   `json:"message_id"`
+	Ordinal    int     `json:"ordinal"`
+	Note       *string `json:"note,omitempty"`
+	Content    *string `json:"content,omitempty"`
+	Role       *string `json:"role,omitempty"`
+	CreatedAt  string  `json:"created_at"`
 
 	// Session metadata — populated only for the "all pins" query.
 	SessionProject      *string `json:"session_project,omitempty"`
@@ -50,9 +53,13 @@ func scanPinnedRowWithContent(rs rowScanner) (PinnedMessage, error) {
 // PinMessage creates a pin for a message. If the message is
 // already pinned, the note is updated. The message must belong to
 // the specified session (enforced via INSERT ... SELECT).
-func (db *DB) PinMessage(
+func (db *DB) PinMessage(ctx context.Context,
 	sessionID string, messageID int64, note *string,
 ) (int64, error) {
+	if db.usageOnlyStorage() {
+		// A usage archive stores no free text, and a note is free text.
+		note = nil
+	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -61,7 +68,7 @@ func (db *DB) PinMessage(
 	// RowsAffected is not checked because SQLite may report 0 on
 	// an idempotent upsert (same note value). Instead we rely on
 	// the subsequent SELECT to detect a missing pin.
-	if _, err := db.getWriter().Exec(
+	if _, err := db.getWriter().Exec(ctx,
 		`INSERT INTO pinned_messages (session_id, message_id, ordinal, note)
 		 SELECT ?, m.id, m.ordinal, ?
 		 FROM messages m
@@ -76,12 +83,12 @@ func (db *DB) PinMessage(
 	// upsert in SQLite). If no row exists the message did not
 	// belong to the session (the INSERT ... SELECT matched nothing).
 	var id int64
-	err := db.getWriter().QueryRow(
+	err := db.getWriter().QueryRow(ctx,
 		"SELECT id FROM pinned_messages WHERE session_id = ? AND message_id = ?",
 		sessionID, messageID,
 	).Scan(&id)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return 0, nil
 		}
 		return 0, fmt.Errorf("retrieving pin id: %w", err)
@@ -90,10 +97,10 @@ func (db *DB) PinMessage(
 }
 
 // UnpinMessage removes a pin.
-func (db *DB) UnpinMessage(sessionID string, messageID int64) error {
+func (db *DB) UnpinMessage(ctx context.Context, sessionID string, messageID int64) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	_, err := db.getWriter().Exec(
+	_, err := db.getWriter().Exec(ctx,
 		"DELETE FROM pinned_messages WHERE session_id = ? AND message_id = ?",
 		sessionID, messageID,
 	)
@@ -227,4 +234,9 @@ func (db *DB) GetPinnedMessageIDs(
 		ids[id] = true
 	}
 	return ids, rows.Err()
+}
+
+// PinReferenceStore removes a retained normalized anchor after its message disappears.
+type PinReferenceStore interface {
+	RemovePinReference(ctx context.Context, sessionID, messageKey string) error
 }

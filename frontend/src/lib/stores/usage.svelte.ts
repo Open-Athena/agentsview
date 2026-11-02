@@ -1,25 +1,35 @@
-import type {
-  UsageComparison,
-  UsagePairwiseComparisonResponse,
-  UsagePairwiseDimension,
-  UsageSummaryResponse,
-  TopUsageSessionsResponse,
-  LongestUserPromptsResponse,
-} from "../api/types/usage.js";
-import { UsageService, MessagesService } from "../api/generated/index";
+import { m } from "../i18n/index.js";
+import { queryStepFrom, type QueryStep } from "../utils/refresh.js";
+import { LiveQuery } from "../utils/liveQuery.svelte.js";
+import type { UsagePairwiseDimension } from "../api/types/usage.js";
 import {
-  ApiError,
-  callGenerated,
-  isAbortError,
-} from "../api/runtime.js";
+  MessagesService,
+  UsageService,
+  type DbLongestUserPrompt,
+  type DbTopSessionEntry,
+  type ServiceUsagePairwiseComparisonResponse,
+  type UsageSummaryResponse,
+} from "../api/generated/index";
+import { ApiError, isAbortError, responseTimingOf } from "../api/runtime.js";
 import { sessions } from "./sessions.svelte.js";
 import { perf, type PerfEntryStatus } from "./perf.svelte.js";
 import { rollingRange, today } from "../utils/dates.js";
 import { ALL_TOKEN_TYPES, canonicalTokenTypes, type UsageTokenType } from "./usageTokenTypes.js";
 
-type UsageParams = Parameters<typeof UsageService.getApiV1UsageSummary>[0];
+type UsageParams = NonNullable<Parameters<typeof UsageService.getApiV1UsageSummary>[0]>;
 type UsagePairwiseParams = Parameters<typeof UsageService.getApiV1UsagePairwiseComparison>[0];
 type UsagePanel = "summary" | "comparison" | "pairwise" | "topSessions";
+// Steps of a full refresh in execution order; the breakdown follows it. The
+// window summary is the second summary request made while a time range is
+// selected on the chart.
+type UsageStep = UsagePanel | "contextSummary";
+const USAGE_STEP_ORDER: readonly UsageStep[] = [
+  "summary",
+  "contextSummary",
+  "topSessions",
+  "comparison",
+  "pairwise",
+];
 type FetchResult = "ok" | "error" | "aborted";
 type FetchAllOptions = {
   preserveTimeRange?: boolean;
@@ -126,7 +136,6 @@ export interface UsageFilterState {
   excludedProjectKeys?: string;
   excludedAgents: string;
   excludedModels: string;
-  selectedModels: string;
 }
 
 function loadUsageFilters(): UsageFilterState {
@@ -138,8 +147,7 @@ function loadUsageFilters(): UsageFilterState {
         excludedProjects: saved.excludedProjects ?? "",
         excludedProjectKeys: "",
         excludedAgents: saved.excludedAgents ?? "",
-        excludedModels: "",
-        selectedModels: saved.selectedModels ?? "",
+        excludedModels: saved.excludedModels ?? "",
       };
     }
   } catch {
@@ -150,7 +158,6 @@ function loadUsageFilters(): UsageFilterState {
     excludedProjectKeys: "",
     excludedAgents: "",
     excludedModels: "",
-    selectedModels: "",
   };
 }
 
@@ -160,7 +167,6 @@ function saveUsageFilters(f: UsageFilterState): void {
       excludedProjects: f.excludedProjects,
       excludedAgents: f.excludedAgents,
       excludedModels: f.excludedModels,
-      selectedModels: f.selectedModels,
     };
     localStorage.setItem(USAGE_FILTERS_KEY, JSON.stringify(data));
   } catch {
@@ -298,6 +304,9 @@ function summaryForDateRange(
       cacheCreationTokens,
       cacheReadTokens,
       totalCost: { microdollars: totalMicrodollars },
+      // Daily entries carry no per-day savings, so a derived range cannot
+      // recompute them; the UI does not read this field for derived ranges.
+      cacheSavings: { microdollars: 0 },
     },
     projectTotals: [...projectTotals.values()].sort(
       (a, b) => byCost(a, b) || a.project_key.localeCompare(b.project_key),
@@ -330,14 +339,13 @@ class UsageStore {
   selectedTokenTypes: UsageTokenType[] = $state([...ALL_TOKEN_TYPES]);
   selectedTimeRange: { from: string; to: string } | null = $state(null);
 
-  // Excluded project items and included model items
-  // (comma-separated strings). Empty models = all models.
+  // Empty exclusion sets show all items. Chart clicks and picker checkboxes
+  // share these comma-separated sets.
   // Initialized from localStorage to survive tab switches.
   excludedProjects: string = $state("");
   excludedProjectKeys: string = $state("");
   excludedAgents: string = $state("");
   excludedModels: string = $state("");
-  selectedModels: string = $state("");
   knownProjects: UsageProjectFilterItem[] = $state([]);
 
   constructor() {
@@ -346,17 +354,28 @@ class UsageStore {
     this.excludedProjectKeys = saved.excludedProjectKeys ?? "";
     this.excludedAgents = saved.excludedAgents;
     this.excludedModels = saved.excludedModels;
-    this.selectedModels = saved.selectedModels;
   }
 
   summary = $state<UsageSummaryResponse | null>(null);
   private timeSeriesContextSummary = $state<UsageSummaryResponse | null>(null);
   isTimeRangeSummaryProvisional = $state(false);
-  pairwiseComparison = $state<UsagePairwiseComparisonResponse | null>(null);
+  pairwiseComparison = $state<ServiceUsagePairwiseComparisonResponse | null>(null);
   pairwiseSelection = $state<UsagePairwiseSelection>(emptyPairwiseSelection());
-  topSessions = $state<TopUsageSessionsResponse | null>(null);
-  longestPrompts = $state<LongestUserPromptsResponse | null>(null);
+  topSessions = $state<DbTopSessionEntry[] | null>(null);
+  longestPrompts = $state<DbLongestUserPrompt[] | null>(null);
   lastUpdatedAt: number | null = $state(null);
+  // Wall-clock ms of the most recent full refresh, request start to data
+  // applied, shown next to the refresh label. null until the first load.
+  lastQueryDurationMs: number | null = $state(null);
+  // Per-panel timings behind lastQueryDurationMs, in execution order.
+  lastQuerySteps: QueryStep[] = $state([]);
+  // Latest successful timing per panel, collected while a full refresh runs
+  // and snapshotted into lastQuerySteps when it completes. Offsets are
+  // relative to refreshStartedAt.
+  private stepTimings = new Map<UsageStep, QueryStep>();
+  private refreshStartedAt = 0;
+  // The full refresh running now, drawn live by the refresh control.
+  readonly liveQuery = new LiveQuery();
   hasNewData: boolean = $state(false);
 
   loading = $state({
@@ -414,27 +433,27 @@ class UsageStore {
       machine: sessionFilters.machine || undefined,
       agent: sessionFilters.agent || undefined,
       termination: sessionFilters.termination || undefined,
-      minUserMessages:
+      min_user_messages:
         sessionFilters.minUserMessages > 0 ? sessionFilters.minUserMessages : undefined,
-      includeOneShot: sessionFilters.includeOneShot,
-      includeAutomated: sessionFilters.includeAutomated || undefined,
-      activeSince: sessionFilters.recentlyActive
+      include_one_shot: sessionFilters.includeOneShot,
+      include_automated: sessionFilters.includeAutomated || undefined,
+      active_since: sessionFilters.recentlyActive
         ? new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
         : undefined,
     };
     if (sessionFilters.hideUnknownProject && sessionFilters.project !== "unknown") {
-      p.excludeProject = joinCsvParts(this.excludedProjects, "unknown");
+      p.exclude_project = joinCsvParts(this.excludedProjects, "unknown");
     } else if (this.excludedProjects) {
-      p.excludeProject = this.excludedProjects;
+      p.exclude_project = this.excludedProjects;
     }
     if (this.excludedProjectKeys) {
-      p.excludeProjectKey = this.excludedProjectKeys;
+      p.exclude_project_key = this.excludedProjectKeys;
     }
     if (this.excludedAgents) {
-      p.excludeAgent = this.excludedAgents;
+      p.exclude_agent = this.excludedAgents;
     }
-    if (this.selectedModels) {
-      p.model = this.selectedModels;
+    if (this.excludedModels) {
+      p.exclude_model = this.excludedModels;
     }
     return p;
   }
@@ -649,17 +668,26 @@ class UsageStore {
     });
   }
 
-  toggleModel(name: string, options: { preserveTimeRange?: boolean } = {}): void {
-    const previousSelected = this.selectedModels;
-    const previousExcluded = this.excludedModels;
+  hideModel(name: string, options: { preserveTimeRange?: boolean } = {}): void {
+    const previous = this.excludedModels;
     const hadSelectedTimeRange = options.preserveTimeRange && this.selectedTimeRange !== null;
-    this.selectedModels = this.toggleCsv(this.selectedModels, name);
-    this.excludedModels = "";
-    const changed = this.selectedModels;
+    this.excludedModels = joinCsvParts(this.excludedModels, name);
+    const changed = this.excludedModels;
     void this.fetchAllWithResult(options).then((result) => {
-      if (result !== "error" || !hadSelectedTimeRange || this.selectedModels !== changed) return;
-      this.selectedModels = previousSelected;
-      this.excludedModels = previousExcluded;
+      if (result !== "error" || !hadSelectedTimeRange || this.excludedModels !== changed) return;
+      this.excludedModels = previous;
+      void this.fetchAll({ preserveTimeRange: true });
+    });
+  }
+
+  toggleModel(name: string, options: { preserveTimeRange?: boolean } = {}): void {
+    const previous = this.excludedModels;
+    const hadSelectedTimeRange = options.preserveTimeRange && this.selectedTimeRange !== null;
+    this.excludedModels = this.toggleCsv(this.excludedModels, name);
+    const changed = this.excludedModels;
+    void this.fetchAllWithResult(options).then((result) => {
+      if (result !== "error" || !hadSelectedTimeRange || this.excludedModels !== changed) return;
+      this.excludedModels = previous;
       void this.fetchAll({ preserveTimeRange: true });
     });
   }
@@ -697,11 +725,6 @@ class UsageStore {
     return this.excludedModels.split(",").includes(name);
   }
 
-  isModelSelected(name: string): boolean {
-    if (!this.selectedModels) return false;
-    return this.selectedModels.split(",").includes(name);
-  }
-
   selectAllProjects(): void {
     this.excludedProjects = "";
     this.excludedProjectKeys = "";
@@ -728,14 +751,12 @@ class UsageStore {
   }
 
   selectAllModels(): void {
-    this.selectedModels = "";
     this.excludedModels = "";
     this.fetchAll();
   }
 
-  deselectAllModels(_all: string[]): void {
-    this.selectedModels = "";
-    this.excludedModels = "";
+  deselectAllModels(all: string[]): void {
+    this.excludedModels = joinCsvParts(this.excludedModels, all.join(","));
     this.fetchAll();
   }
 
@@ -744,7 +765,6 @@ class UsageStore {
     this.excludedProjectKeys = "";
     this.excludedAgents = "";
     this.excludedModels = "";
-    this.selectedModels = "";
     this.fetchAll();
   }
 
@@ -753,7 +773,7 @@ class UsageStore {
       this.excludedProjects !== "" ||
       this.excludedProjectKeys !== "" ||
       this.excludedAgents !== "" ||
-      this.selectedModels !== ""
+      this.excludedModels !== ""
     );
   }
 
@@ -822,6 +842,18 @@ class UsageStore {
   }
 
   private async fetchAllWithResult(options: FetchAllOptions = {}): Promise<FetchResult> {
+    const startedAt = performance.now();
+    this.stepTimings.clear();
+    this.refreshStartedAt = startedAt;
+    const live = this.liveQuery.begin(startedAt);
+    try {
+      return await this.fetchAllSteps(startedAt, options);
+    } finally {
+      this.liveQuery.end(live);
+    }
+  }
+
+  private async fetchAllSteps(startedAt: number, options: FetchAllOptions): Promise<FetchResult> {
     const selectedRangeAtStart = this.selectedTimeRange ? { ...this.selectedTimeRange } : null;
     if (!options.preserveTimeRange && this.selectedTimeRange !== null) {
       this.selectedTimeRange = null;
@@ -890,7 +922,7 @@ class UsageStore {
       comparisonResult === "ok" &&
       pairwiseResult === "ok"
     ) {
-      this.markRefreshComplete();
+      this.markRefreshComplete(startedAt);
       return "ok";
     }
     if (
@@ -927,6 +959,10 @@ class UsageStore {
     // error state in place until we have a definitive result.
     if (isFirstLoad) this.errors.summary = null;
     const started = performance.now();
+    const liveStep = this.liveQuery.start("summary", started);
+    const liveContextStep = options.contextParams
+      ? this.liveQuery.start("contextSummary", started)
+      : 0;
     let status: Extract<PerfEntryStatus, "ok" | "error" | "aborted"> = "ok";
     try {
       const params = options.params ?? this.baseParams();
@@ -934,18 +970,26 @@ class UsageStore {
       let data: UsageSummaryResponse;
       let contextData: UsageSummaryResponse | null = null;
       if (contextParams) {
-        [data, contextData] = (await Promise.all([
-          callGenerated(() => UsageService.getApiV1UsageSummary(params), signal),
-          callGenerated(() => UsageService.getApiV1UsageSummary(contextParams), signal),
-        ])) as [UsageSummaryResponse, UsageSummaryResponse];
+        [data, contextData] = await Promise.all([
+          UsageService.getApiV1UsageSummary(params, { signal }),
+          UsageService.getApiV1UsageSummary(contextParams, { signal }),
+        ]);
       } else {
-        data = (await callGenerated(
-          () => UsageService.getApiV1UsageSummary(params),
-          signal,
-        )) as unknown as UsageSummaryResponse;
+        data = await UsageService.getApiV1UsageSummary(params, { signal });
       }
       if (this.versions.summary === v) {
         this.summary = data;
+        // Both responses are applied together, so each request's apply
+        // phase starts once the later body has arrived; the earlier one
+        // shows a gap while it waited for its sibling.
+        const bodies = [data, contextData]
+          .map((body) => responseTimingOf(body)?.bodyAt)
+          .filter((at): at is number => at !== undefined);
+        const applyStartedAt = bodies.length > 0 ? Math.max(...bodies) : undefined;
+        this.noteStep("summary", liveStep, started, data, applyStartedAt);
+        if (contextData !== null) {
+          this.noteStep("contextSummary", liveContextStep, started, contextData, applyStartedAt);
+        }
         this.isTimeRangeSummaryProvisional = false;
         if (contextData !== null) {
           this.timeSeriesContextSummary = contextData;
@@ -1011,20 +1055,17 @@ class UsageStore {
           this.selectedTimeRange = null;
           this.timeSeriesContextSummary = null;
           this.isTimeRangeSummaryProvisional = false;
-          this.errors.summary = e instanceof Error ? e.message : "Failed to load";
+          this.errors.summary = e instanceof Error ? e.message : m.shared_failed_to_load();
         } else if (this.summary === null) {
-          this.errors.summary = e instanceof Error ? e.message : "Failed to load";
+          this.errors.summary = e instanceof Error ? e.message : m.shared_failed_to_load();
         } else {
           console.warn("usage.fetchSummary refetch failed:", e);
         }
       }
     } finally {
-      perf.recordPanel({
-        route: "usage",
-        name: "summary",
-        durationMs: performance.now() - started,
-        status,
-      });
+      this.recordStep("summary", started, status);
+      this.liveQuery.abandon(liveStep);
+      this.liveQuery.abandon(liveContextStep);
       this.clearAbortSignal("summary", signal);
       if (this.versions.summary === v) {
         this.loading.summary = false;
@@ -1041,18 +1082,19 @@ class UsageStore {
     if (this.versions.summary !== summaryVersion) return "aborted";
     const signal = this.nextAbortSignal("comparison");
     const started = performance.now();
+    const liveStep = this.liveQuery.start("comparison", started);
     let status: Extract<PerfEntryStatus, "ok" | "error" | "aborted"> = "ok";
     try {
-      const comparison = (await callGenerated(
-        () =>
-          UsageService.getApiV1UsageComparison({
-            ...params,
-            currentMicrodollars: summary.totals.totalCost.microdollars,
-          }),
-        signal,
-      )) as unknown as UsageComparison;
+      const comparison = await UsageService.getApiV1UsageComparison(
+        {
+          ...params,
+          current_microdollars: summary.totals.totalCost.microdollars,
+        },
+        { signal },
+      );
       if (this.versions.summary === summaryVersion) {
         this.summary = { ...summary, comparison };
+        this.noteStep("comparison", liveStep, started, comparison);
         return "ok";
       }
       return "aborted";
@@ -1067,12 +1109,8 @@ class UsageStore {
       }
       return "error";
     } finally {
-      perf.recordPanel({
-        route: "usage",
-        name: "comparison",
-        durationMs: performance.now() - started,
-        status,
-      });
+      this.recordStep("comparison", started, status);
+      this.liveQuery.abandon(liveStep);
       this.clearAbortSignal("comparison", signal);
     }
   }
@@ -1084,10 +1122,10 @@ class UsageStore {
     }
     return {
       ...params,
-      leftDimension: selection.left.dimension,
-      leftValue: selection.left.value,
-      rightDimension: selection.right.dimension,
-      rightValue: selection.right.value,
+      left_dimension: selection.left.dimension,
+      left_value: selection.left.value,
+      right_dimension: selection.right.dimension,
+      right_value: selection.right.value,
     };
   }
 
@@ -1107,15 +1145,14 @@ class UsageStore {
     if (isFirstLoad) this.loading.pairwise = true;
     if (isFirstLoad) this.errors.pairwise = null;
     const started = performance.now();
+    const liveStep = this.liveQuery.start("pairwise", started);
     let status: Extract<PerfEntryStatus, "ok" | "error" | "aborted"> = "ok";
     try {
-      const comparison = (await callGenerated(
-        () => UsageService.getApiV1UsagePairwiseComparison(request),
-        signal,
-      )) as unknown as UsagePairwiseComparisonResponse;
+      const comparison = await UsageService.getApiV1UsagePairwiseComparison(request, { signal });
       if (this.versions.summary === summaryVersion && this.versions.pairwise === pairwiseVersion) {
         this.pairwiseComparison = comparison;
         this.errors.pairwise = null;
+        this.noteStep("pairwise", liveStep, started, comparison);
         return "ok";
       }
       return "aborted";
@@ -1127,19 +1164,15 @@ class UsageStore {
       status = "error";
       if (this.versions.summary === summaryVersion && this.versions.pairwise === pairwiseVersion) {
         if (this.pairwiseComparison === null) {
-          this.errors.pairwise = e instanceof Error ? e.message : "Failed to load";
+          this.errors.pairwise = e instanceof Error ? e.message : m.shared_failed_to_load();
         } else {
           console.warn("usage.fetchPairwise failed:", e);
         }
       }
       return "error";
     } finally {
-      perf.recordPanel({
-        route: "usage",
-        name: "pairwise",
-        durationMs: performance.now() - started,
-        status,
-      });
+      this.recordStep("pairwise", started, status);
+      this.liveQuery.abandon(liveStep);
       this.clearAbortSignal("pairwise", signal);
       if (this.versions.summary === summaryVersion && this.versions.pairwise === pairwiseVersion) {
         this.loading.pairwise = false;
@@ -1154,23 +1187,24 @@ class UsageStore {
     if (isFirstLoad) this.loading.topSessions = true;
     if (isFirstLoad) this.errors.topSessions = null;
     const started = performance.now();
+    const liveStep = this.liveQuery.start("topSessions", started);
     let status: Extract<PerfEntryStatus, "ok" | "error" | "aborted"> = "ok";
     try {
-      const data = (await callGenerated(
-        () =>
-          UsageService.getApiV1UsageTopSessions({
-            ...(params ?? this.baseParams()),
-            sort: this.mode === "token" ? "tokens" : "cost",
-            tokenTypes:
-              this.mode === "token" && this.selectedTokenTypes.length < ALL_TOKEN_TYPES.length
-                ? this.selectedTokenTypes.join(",")
-                : undefined,
-          }),
-        signal,
-      )) as unknown as TopUsageSessionsResponse;
+      const data = await UsageService.getApiV1UsageTopSessions(
+        {
+          ...(params ?? this.baseParams()),
+          sort: this.mode === "token" ? "tokens" : "cost",
+          token_types:
+            this.mode === "token" && this.selectedTokenTypes.length < ALL_TOKEN_TYPES.length
+              ? this.selectedTokenTypes.join(",")
+              : undefined,
+        },
+        { signal },
+      );
       if (this.versions.topSessions === v) {
         this.topSessions = data;
         this.errors.topSessions = null;
+        this.noteStep("topSessions", liveStep, started, data);
         return "ok";
       }
       return "aborted";
@@ -1182,19 +1216,15 @@ class UsageStore {
       status = "error";
       if (this.versions.topSessions === v) {
         if (this.topSessions === null) {
-          this.errors.topSessions = e instanceof Error ? e.message : "Failed to load";
+          this.errors.topSessions = e instanceof Error ? e.message : m.shared_failed_to_load();
         } else {
           console.warn("usage.fetchTopSessions refetch failed:", e);
         }
       }
       return "error";
     } finally {
-      perf.recordPanel({
-        route: "usage",
-        name: "topSessions",
-        durationMs: performance.now() - started,
-        status,
-      });
+      this.recordStep("topSessions", started, status);
+      this.liveQuery.abandon(liveStep);
       this.clearAbortSignal("topSessions", signal);
       if (this.versions.topSessions === v) {
         this.loading.topSessions = false;
@@ -1211,12 +1241,10 @@ class UsageStore {
       // Only project + limit are honored server-side, but we pass
       // the full baseParams() so the project filter from the session
       // filter dropdown flows through naturally.
-      const data = await callGenerated(() =>
-        MessagesService.getApiV1MessagesLongest({
-          ...this.baseParams(),
-          limit: 10,
-        }),
-      ) as unknown as LongestUserPromptsResponse;
+      const data = await MessagesService.getApiV1MessagesLongest({
+        ...this.baseParams(),
+        limit: 10,
+      });
       if (this.versions.longestPrompts === v) {
         this.longestPrompts = data ?? [];
         this.errors.longestPrompts = null;
@@ -1270,6 +1298,7 @@ class UsageStore {
 
   cancelInFlightReads(): void {
     this.fetchAllVersion++;
+    this.liveQuery.end();
     this.versions.summary++;
     this.versions.pairwise++;
     this.versions.topSessions++;
@@ -1283,9 +1312,46 @@ class UsageStore {
     this.loading.topSessions = false;
   }
 
-  private markRefreshComplete(): void {
+  private markRefreshComplete(startedAt: number): void {
     this.lastUpdatedAt = Date.now();
+    this.lastQueryDurationMs = performance.now() - startedAt;
+    this.lastQuerySteps = USAGE_STEP_ORDER.flatMap((name) => this.stepTimings.get(name) ?? []);
     this.hasNewData = false;
+  }
+
+  private recordStep(
+    panel: UsagePanel,
+    startedAt: number,
+    status: "ok" | "error" | "aborted",
+  ): void {
+    perf.recordPanel({
+      route: "usage",
+      name: panel,
+      durationMs: performance.now() - startedAt,
+      status,
+    });
+  }
+
+  // Called once a request's data is applied: the step spans request sent to
+  // data applied and carries the request's wait/download/apply phases.
+  // `liveStep` is the handle the live query gave the request when it began.
+  private noteStep(
+    step: UsageStep,
+    liveStep: number,
+    startedAt: number,
+    data: unknown,
+    applyStartedAt?: number,
+  ): void {
+    const timing = queryStepFrom(
+      step,
+      responseTimingOf(data),
+      startedAt,
+      performance.now(),
+      this.refreshStartedAt,
+      applyStartedAt,
+    );
+    this.stepTimings.set(step, timing);
+    this.liveQuery.settle(liveStep, timing);
   }
 }
 
@@ -1300,7 +1366,6 @@ export interface UsageUrlState {
   excludedProjectKeys: string;
   excludedAgents: string;
   excludedModels: string;
-  selectedModels: string;
 }
 
 export const USAGE_DEFAULT_WINDOW_DAYS = DEFAULT_WINDOW_DAYS;
@@ -1322,8 +1387,8 @@ export function buildUsageUrlParams(state: UsageUrlState): Record<string, string
   } else if (state.windowDays > 0 && state.windowDays !== DEFAULT_WINDOW_DAYS) {
     params["window_days"] = String(state.windowDays);
   }
-  if (state.selectedModels) {
-    params["model"] = state.selectedModels;
+  if (state.excludedModels) {
+    params["exclude_model"] = state.excludedModels;
   }
   if (state.excludedProjects) {
     params["exclude_project"] = state.excludedProjects;

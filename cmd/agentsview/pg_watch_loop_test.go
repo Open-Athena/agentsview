@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -243,7 +244,7 @@ func TestPushLoopShutdownFlushClaimsPendingBatch(t *testing.T) {
 		pushed <- attempt{reason: reason, batch: batch}
 		return nil
 	})
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	go loop.Run(ctx)
 	loop.NotifyBatch(syncpkg.WatchBatch{Paths: []string{"/sessions/final"}})
 	cancel()
@@ -295,11 +296,9 @@ func TestPushLoop_DirtyTriggersOnePush(t *testing.T) {
 
 	select {
 	case r := <-pushed:
-		if r != reasonChange {
-			t.Fatalf("reason = %q, want %q", r, reasonChange)
-		}
+		assert.Equal(t, reasonChange, r)
 	case <-time.After(time.Second):
-		t.Fatal("expected a push")
+		require.FailNow(t, "expected a push")
 	}
 }
 
@@ -321,11 +320,11 @@ func TestPushLoop_BurstCoalesces(t *testing.T) {
 	select {
 	case <-pushed:
 	case <-time.After(time.Second):
-		t.Fatal("expected a push")
+		require.FailNow(t, "expected a push")
 	}
 	select {
 	case <-pushed:
-		t.Fatal("expected exactly one push for a burst")
+		require.FailNow(t, "expected exactly one push for a burst")
 	case <-time.After(100 * time.Millisecond):
 	}
 }
@@ -343,11 +342,9 @@ func TestPushLoop_FloorPushesWithoutDirty(t *testing.T) {
 
 	select {
 	case r := <-pushed:
-		if r != reasonInterval {
-			t.Fatalf("reason = %q, want %q", r, reasonInterval)
-		}
+		assert.Equal(t, reasonInterval, r)
 	case <-time.After(time.Second):
-		t.Fatal("expected an interval push")
+		require.FailNow(t, "expected an interval push")
 	}
 }
 
@@ -374,7 +371,7 @@ func TestPushLoop_ErrorDoesNotStopLoop(t *testing.T) {
 	select {
 	case <-pushed: // second succeeds -> loop survived the error
 	case <-time.After(time.Second):
-		t.Fatal("loop did not survive a push error")
+		require.FailNow(t, "loop did not survive a push error")
 	}
 }
 
@@ -390,7 +387,7 @@ func TestPushLoop_NotifyDirtyWithAckWaitsForSuccessfulRetry(t *testing.T) {
 		}
 		return nil
 	})
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 	go l.Run(ctx)
 
@@ -412,7 +409,7 @@ func TestPushLoop_NotifyDirtyWithAckWaitsForSuccessfulRetry(t *testing.T) {
 
 func TestPushLoop_NotifyDirtyWithAckIsNonBlockingAndCoalescesWaiters(t *testing.T) {
 	l, fire, _ := newTestLoop(func(context.Context, pushReason) error { return nil })
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 	go l.Run(ctx)
 
@@ -423,6 +420,35 @@ func TestPushLoop_NotifyDirtyWithAckIsNonBlockingAndCoalescesWaiters(t *testing.
 	fire <- time.Now()
 	require.NoError(t, <-first)
 	require.NoError(t, <-second)
+}
+
+func TestPushLoop_RunWithWakeQueuesChange(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		wake := make(chan struct{}, 1)
+		var reasons []pushReason
+		loop := &pushLoop{
+			debounce: time.Second,
+			dirty:    make(chan struct{}, 1),
+			floor:    make(chan time.Time),
+			after:    time.After,
+			push: func(
+				_ context.Context, reason pushReason, _ *syncpkg.WatchBatch,
+			) error {
+				reasons = append(reasons, reason)
+				return nil
+			},
+			promotionCounts: make(map[syncpkg.WatchBatchPromotionReason]int),
+		}
+		go loop.RunWithWake(ctx, wake)
+
+		wake <- struct{}{}
+		time.Sleep(time.Second)
+		synctest.Wait()
+
+		require.Equal(t, []pushReason{reasonChange}, reasons)
+	})
 }
 
 func TestPushWatchFallbackCoverageMarksLoopDirty(t *testing.T) {
@@ -445,17 +471,15 @@ func TestPushLoop_ShutdownFlushes(t *testing.T) {
 		pushed <- r
 		return nil
 	})
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	go l.Run(ctx)
 
 	cancel()
 	select {
 	case r := <-pushed:
-		if r != reasonShutdown {
-			t.Fatalf("reason = %q, want %q", r, reasonShutdown)
-		}
+		assert.Equal(t, reasonShutdown, r)
 	case <-time.After(time.Second):
-		t.Fatal("expected a shutdown flush push")
+		require.FailNow(t, "expected a shutdown flush push")
 	}
 }
 
@@ -467,16 +491,16 @@ func TestPushLoop_ShutdownFlushHonorsTimeout(t *testing.T) {
 		return nil
 	})
 	l.flushTimeout = 50 * time.Millisecond
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	go l.Run(ctx)
 	cancel()
 
 	select {
 	case ok := <-gotDeadline:
 		if !ok {
-			t.Fatal("shutdown flush ctx should carry a deadline when flushTimeout > 0")
+			require.FailNow(t, "shutdown flush ctx should carry a deadline when flushTimeout > 0")
 		}
 	case <-time.After(time.Second):
-		t.Fatal("expected a shutdown flush push")
+		require.FailNow(t, "expected a shutdown flush push")
 	}
 }

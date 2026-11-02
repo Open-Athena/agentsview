@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vite-plus/test";
 import type { Session } from "../../api/types.js";
-import type { SessionGroup } from "../../stores/sessions.svelte.js";
+import { buildSessionGroups, type SessionGroup } from "../../stores/sessions.svelte.js";
 import {
   ITEM_HEIGHT,
   HEADER_HEIGHT,
@@ -21,6 +21,19 @@ import type { DisplayItem } from "./session-list-utils.js";
 
 function makeSession(overrides: Partial<Session> = {}): Session {
   return {
+    compaction_count: 0,
+    consecutive_failure_max: 0,
+    edit_churn_count: 0,
+    ended_with_role: "",
+    final_failure_streak: 0,
+    has_peak_context_tokens: false,
+    has_total_output_tokens: false,
+    mid_task_compaction_count: 0,
+    outcome: "",
+    outcome_confidence: "",
+    secret_leak_count: 0,
+    tool_failure_signal_count: 0,
+    tool_retry_count: 0,
     id: overrides.id ?? crypto.randomUUID(),
     project: "test-project",
     machine: "localhost",
@@ -38,11 +51,7 @@ function makeSession(overrides: Partial<Session> = {}): Session {
   };
 }
 
-function makeGroup(
-  agent: string,
-  sessionCount = 1,
-  idPrefix?: string,
-): SessionGroup {
+function makeGroup(agent: string, sessionCount = 1, idPrefix?: string): SessionGroup {
   const prefix = idPrefix ?? agent;
   const sessions: Session[] = [];
   for (let i = 0; i < sessionCount; i++) {
@@ -143,10 +152,7 @@ describe("buildGroupSections", () => {
   });
 
   it("groups by project when mode is project", () => {
-    const groups = [
-      makeGroup("claude", 1, "c1"),
-      makeGroup("gpt", 1, "g1"),
-    ];
+    const groups = [makeGroup("claude", 1, "c1"), makeGroup("gpt", 1, "g1")];
     // Both groups have project "test-project" from makeGroup.
     const result = buildGroupSections(groups, "project");
     expect(result).toHaveLength(1);
@@ -161,10 +167,7 @@ describe("buildGroupSections", () => {
 
 describe("buildDisplayItems (ungrouped)", () => {
   it("creates flat session items with correct ids", () => {
-    const groups = [
-      makeGroup("claude", 1, "a"),
-      makeGroup("gpt", 1, "b"),
-    ];
+    const groups = [makeGroup("claude", 1, "a"), makeGroup("gpt", 1, "b")];
     const items = buildDisplayItems(groups, [], "none", new Set(), new Set());
 
     expect(items).toHaveLength(2);
@@ -270,12 +273,8 @@ describe("buildDisplayItems (grouped)", () => {
 
   it("header items have correct count", () => {
     const { items } = setup();
-    const claudeHeader = items.find(
-      (i) => i.type === "header" && i.label === "claude",
-    );
-    const gptHeader = items.find(
-      (i) => i.type === "header" && i.label === "gpt",
-    );
+    const claudeHeader = items.find((i) => i.type === "header" && i.label === "claude");
+    const gptHeader = items.find((i) => i.type === "header" && i.label === "gpt");
 
     expect(claudeHeader!.count).toBe(2);
     expect(gptHeader!.count).toBe(1);
@@ -304,9 +303,7 @@ describe("buildDisplayItems (grouped)", () => {
   it("collapsed agents still show correct header count", () => {
     const { items } = setup({ collapsed: ["claude"] });
 
-    const claudeHeader = items.find(
-      (i) => i.type === "header" && i.label === "claude",
-    );
+    const claudeHeader = items.find((i) => i.type === "header" && i.label === "claude");
     expect(claudeHeader!.count).toBe(2);
   });
 
@@ -318,12 +315,8 @@ describe("buildDisplayItems (grouped)", () => {
 
   it("header ids differ from session ids with same agent", () => {
     const { items } = setup();
-    const claudeHeader = items.find(
-      (i) => i.type === "header" && i.label === "claude",
-    );
-    const claudeSessions = items.filter(
-      (i) => i.type === "session" && i.label === "claude",
-    );
+    const claudeHeader = items.find((i) => i.type === "header" && i.label === "claude");
+    const claudeSessions = items.filter((i) => i.type === "session" && i.label === "claude");
 
     expect(claudeHeader!.id).toMatch(/^header:/);
     for (const s of claudeSessions) {
@@ -353,21 +346,11 @@ describe("adjacentVisibleSessionId", () => {
       makeGroup("claude", 1, "c2"),
     ];
     const sections = buildGroupSections(groups, "agent");
-    const items = buildDisplayItems(
-      groups,
-      sections,
-      "agent",
-      new Set(),
-      new Set(),
-    );
+    const items = buildDisplayItems(groups, sections, "agent", new Set(), new Set());
 
-    expect(
-      adjacentVisibleSessionId(
-        items,
-        groups[2]!.primarySessionId,
-        1,
-      ),
-    ).toBe(groups[0]!.primarySessionId);
+    expect(adjacentVisibleSessionId(items, groups[2]!.primarySessionId, 1)).toBe(
+      groups[0]!.primarySessionId,
+    );
   });
 
   it("maps a hidden child to its collapsed lineage row", () => {
@@ -387,17 +370,9 @@ describe("adjacentVisibleSessionId", () => {
       endedAt: child.ended_at,
     };
     const next = makeGroup("gpt", 1, "next");
-    const items = buildDisplayItems(
-      [lineage, next],
-      [],
-      "none",
-      new Set(),
-      new Set(),
-    );
+    const items = buildDisplayItems([lineage, next], [], "none", new Set(), new Set());
 
-    expect(adjacentVisibleSessionId(items, child.id, 1)).toBe(
-      next.primarySessionId,
-    );
+    expect(adjacentVisibleSessionId(items, child.id, 1)).toBe(next.primarySessionId);
   });
 
   it.each([
@@ -435,20 +410,10 @@ describe("adjacentVisibleSessionId", () => {
       endedAt: hidden.ended_at,
     };
     const next = makeGroup("gpt", 1, "next");
-    const items = buildDisplayItems(
-      [lineage, next],
-      [],
-      "none",
-      new Set(),
-      new Set([lineage.key]),
-    );
+    const items = buildDisplayItems([lineage, next], [], "none", new Set(), new Set([lineage.key]));
 
-    expect(adjacentVisibleSessionId(items, hidden.id, -1)).toBe(
-      continuation.id,
-    );
-    expect(adjacentVisibleSessionId(items, hidden.id, 1)).toBe(
-      next.primarySessionId,
-    );
+    expect(adjacentVisibleSessionId(items, hidden.id, -1)).toBe(continuation.id);
+    expect(adjacentVisibleSessionId(items, hidden.id, 1)).toBe(next.primarySessionId);
   });
 
   it("moves from a collapsed section to the next visible session", () => {
@@ -456,36 +421,18 @@ describe("adjacentVisibleSessionId", () => {
     const gpt = makeGroup("gpt", 1, "visible");
     const groups = [claude, gpt];
     const sections = buildGroupSections(groups, "agent");
-    const items = buildDisplayItems(
-      groups,
-      sections,
-      "agent",
-      new Set(["claude"]),
-      new Set(),
-    );
+    const items = buildDisplayItems(groups, sections, "agent", new Set(["claude"]), new Set());
 
-    expect(
-      adjacentVisibleSessionId(items, claude.primarySessionId, 1),
-    ).toBe(gpt.primarySessionId);
+    expect(adjacentVisibleSessionId(items, claude.primarySessionId, 1)).toBe(gpt.primarySessionId);
   });
 
   it("uses the visible edge when the active session is filtered out", () => {
     const first = makeGroup("claude", 1, "first");
     const last = makeGroup("gpt", 1, "last");
-    const items = buildDisplayItems(
-      [first, last],
-      [],
-      "none",
-      new Set(),
-      new Set(),
-    );
+    const items = buildDisplayItems([first, last], [], "none", new Set(), new Set());
 
-    expect(adjacentVisibleSessionId(items, "filtered", 1)).toBe(
-      first.primarySessionId,
-    );
-    expect(adjacentVisibleSessionId(items, "filtered", -1)).toBe(
-      last.primarySessionId,
-    );
+    expect(adjacentVisibleSessionId(items, "filtered", 1)).toBe(first.primarySessionId);
+    expect(adjacentVisibleSessionId(items, "filtered", -1)).toBe(last.primarySessionId);
   });
 });
 
@@ -499,26 +446,18 @@ describe("computeTotalSize", () => {
   });
 
   it("returns correct size for flat list", () => {
-    const groups = [
-      makeGroup("claude", 1, "a"),
-      makeGroup("gpt", 1, "b"),
-    ];
+    const groups = [makeGroup("claude", 1, "a"), makeGroup("gpt", 1, "b")];
     const items = buildDisplayItems(groups, [], "none", new Set(), new Set());
     expect(computeTotalSize(items)).toBe(2 * ITEM_HEIGHT);
   });
 
   it("accounts for mixed header and session heights", () => {
-    const groups = [
-      makeGroup("claude", 1, "c1"),
-      makeGroup("gpt", 1, "g1"),
-    ];
+    const groups = [makeGroup("claude", 1, "c1"), makeGroup("gpt", 1, "g1")];
     const sections = buildGroupSections(groups, "agent");
     const items = buildDisplayItems(groups, sections, "agent", new Set(), new Set());
     // claude: HEADER_HEIGHT + ITEM_HEIGHT
     // gpt:    HEADER_HEIGHT + ITEM_HEIGHT
-    expect(computeTotalSize(items)).toBe(
-      2 * HEADER_HEIGHT + 2 * ITEM_HEIGHT,
-    );
+    expect(computeTotalSize(items)).toBe(2 * HEADER_HEIGHT + 2 * ITEM_HEIGHT);
   });
 
   it("smaller total when agents are collapsed", () => {
@@ -528,28 +467,12 @@ describe("computeTotalSize", () => {
       makeGroup("gpt", 1, "g1"),
     ];
     const sections = buildGroupSections(groups, "agent");
-    const expanded = buildDisplayItems(
-      groups,
-      sections,
-      "agent",
-      new Set(),
-      new Set(),
-    );
-    const collapsed = buildDisplayItems(
-      groups,
-      sections,
-      "agent",
-      new Set(["claude"]),
-      new Set(),
-    );
+    const expanded = buildDisplayItems(groups, sections, "agent", new Set(), new Set());
+    const collapsed = buildDisplayItems(groups, sections, "agent", new Set(["claude"]), new Set());
 
-    expect(computeTotalSize(collapsed)).toBeLessThan(
-      computeTotalSize(expanded),
-    );
+    expect(computeTotalSize(collapsed)).toBeLessThan(computeTotalSize(expanded));
     // Difference should be exactly the two collapsed claude sessions.
-    expect(
-      computeTotalSize(expanded) - computeTotalSize(collapsed),
-    ).toBe(2 * ITEM_HEIGHT);
+    expect(computeTotalSize(expanded) - computeTotalSize(collapsed)).toBe(2 * ITEM_HEIGHT);
   });
 });
 
@@ -641,10 +564,7 @@ describe("STORAGE_KEY", () => {
 
 describe("DisplayItem id stability", () => {
   it("produces identical ids for the same input", () => {
-    const groups = [
-      makeGroup("claude", 1, "c1"),
-      makeGroup("gpt", 1, "g1"),
-    ];
+    const groups = [makeGroup("claude", 1, "c1"), makeGroup("gpt", 1, "g1")];
     const sections = buildGroupSections(groups, "agent");
     const items1 = buildDisplayItems(groups, sections, "agent", new Set(), new Set());
     const items2 = buildDisplayItems(groups, sections, "agent", new Set(), new Set());
@@ -653,10 +573,7 @@ describe("DisplayItem id stability", () => {
   });
 
   it("ungrouped ids are deterministic from primarySessionId", () => {
-    const groups = [
-      makeGroup("claude", 1, "x"),
-      makeGroup("gpt", 1, "y"),
-    ];
+    const groups = [makeGroup("claude", 1, "x"), makeGroup("gpt", 1, "y")];
     const items = buildDisplayItems(groups, [], "none", new Set(), new Set());
 
     expect(items[0]!.id).toBe("session:x-session-0");
@@ -678,18 +595,11 @@ describe("DisplayItem id stability", () => {
 // ---------------------------------------------------------------------------
 
 describe("starred-only session count", () => {
-  function filterGroupsForStarred(
-    groups: SessionGroup[],
-    starredIds: Set<string>,
-  ): SessionGroup[] {
+  function filterGroupsForStarred(groups: SessionGroup[], starredIds: Set<string>): SessionGroup[] {
     return groups
       .map((g) => {
-        const filtered = g.sessions.filter((s) =>
-          starredIds.has(s.id),
-        );
-        const primaryStillPresent = filtered.some(
-          (s) => s.id === g.primarySessionId,
-        );
+        const filtered = g.sessions.filter((s) => starredIds.has(s.id));
+        const primaryStillPresent = filtered.some((s) => s.id === g.primarySessionId);
         return {
           ...g,
           sessions: filtered,
@@ -706,17 +616,10 @@ describe("starred-only session count", () => {
     const g2 = makeGroup("gpt", 3, "g");
     const groups = [g1, g2];
 
-    const starred = new Set([
-      "c-session-0",
-      "c-session-2",
-      "g-session-1",
-    ]);
+    const starred = new Set(["c-session-0", "c-session-2", "g-session-1"]);
     const filtered = filterGroupsForStarred(groups, starred);
 
-    const count = filtered.reduce(
-      (n, g) => n + g.sessions.length,
-      0,
-    );
+    const count = filtered.reduce((n, g) => n + g.sessions.length, 0);
     expect(count).toBe(3);
     expect(filtered).toHaveLength(2);
   });
@@ -729,25 +632,16 @@ describe("starred-only session count", () => {
     const starred = new Set(["c-session-0"]);
     const filtered = filterGroupsForStarred(groups, starred);
 
-    const count = filtered.reduce(
-      (n, g) => n + g.sessions.length,
-      0,
-    );
+    const count = filtered.reduce((n, g) => n + g.sessions.length, 0);
     expect(count).toBe(1);
     expect(filtered).toHaveLength(1);
   });
 
   it("returns zero when nothing is starred", () => {
     const groups = [makeGroup("claude", 3, "c")];
-    const filtered = filterGroupsForStarred(
-      groups,
-      new Set(),
-    );
+    const filtered = filterGroupsForStarred(groups, new Set());
 
-    const count = filtered.reduce(
-      (n, g) => n + g.sessions.length,
-      0,
-    );
+    const count = filtered.reduce((n, g) => n + g.sessions.length, 0);
     expect(count).toBe(0);
     expect(filtered).toHaveLength(0);
   });
@@ -787,9 +681,7 @@ describe("starred-only session count", () => {
 
     // Expand so children are emitted.
     const expanded = new Set(["root", `team:root`]);
-    const items = buildDisplayItems(
-      [group], [], "none", new Set(), expanded,
-    );
+    const items = buildDisplayItems([group], [], "none", new Set(), expanded);
 
     // cont should be classified as a teammate (under "Team"),
     // NOT as a continuation, because allSessions lets the
@@ -837,11 +729,7 @@ describe("starred-only session count", () => {
     expect(filtered).toHaveLength(1);
     // primarySessionId must be the most recent surviving session.
     expect(filtered[0]!.primarySessionId).toBe("s2");
-    expect(
-      filtered[0]!.sessions.some(
-        (s) => s.id === filtered[0]!.primarySessionId,
-      ),
-    ).toBe(true);
+    expect(filtered[0]!.sessions.some((s) => s.id === filtered[0]!.primarySessionId)).toBe(true);
   });
 });
 
@@ -850,6 +738,39 @@ describe("starred-only session count", () => {
 // ---------------------------------------------------------------------------
 
 describe("child classification precedence", () => {
+  it.each([
+    ["subagent", "continuation", "subagent-group"],
+    ["subagent", "fork", "subagent-group"],
+    ["teammate", "continuation", "team-group"],
+    ["teammate", "fork", "team-group"],
+  ] as const)("keeps a shared %s %s under its ancestors' section", (kind, relation, section) => {
+    const roots = [makeSession({ id: "root-a" }), makeSession({ id: "root-b" })];
+    const parents = roots.map((root, i) =>
+      makeSession({
+        id: `parent-${i}`,
+        parent_session_id: root.id,
+        relationship_type: kind === "subagent" ? "subagent" : undefined,
+        first_message: kind === "teammate" ? "<teammate-message>hello</teammate-message>" : "hello",
+      }),
+    );
+    const child = makeSession({
+      id: "shared-child",
+      relationship_type: relation,
+      parent_session_ids: ["parent-0", "parent-1"],
+    });
+    const groups = buildSessionGroups([...roots, ...parents, child]);
+    const items = buildDisplayItems(groups, [], "none", new Set(), new Set(["root-a", "root-b"]));
+    expect(
+      items
+        .filter((item) => item.memberSessionIds?.includes("shared-child"))
+        .map((item) => [item.group?.key, item.type]),
+    ).toEqual([
+      ["root-a", section],
+      ["root-b", section],
+    ]);
+    expect(items.some((item) => item.session?.id === "shared-child")).toBe(false);
+  });
+
   it("subagent child of teammate is classified as subagent", () => {
     // root -> teammate -> subagent
     const root = makeSession({ id: "root", agent: "claude" });
@@ -878,14 +799,10 @@ describe("child classification precedence", () => {
 
     // Expand the group so children are emitted.
     const expanded = new Set([group.key]);
-    const items = buildDisplayItems(
-      [group], [], "none", new Set(), expanded,
-    );
+    const items = buildDisplayItems([group], [], "none", new Set(), expanded);
 
     // The subagent should appear under "Subagents", not "Team".
-    const subagentHeader = items.find(
-      (i) => i.type === "subagent-group",
-    );
+    const subagentHeader = items.find((i) => i.type === "subagent-group");
     expect(subagentHeader).toBeDefined();
     expect(subagentHeader!.label).toBe("Subagents");
 
@@ -893,19 +810,13 @@ describe("child classification precedence", () => {
     // the subagent group (when expanded).
     const subKey = `subagent:${group.key}`;
     const expandedWithSub = new Set([group.key, subKey]);
-    const items2 = buildDisplayItems(
-      [group], [], "none", new Set(), expandedWithSub,
-    );
-    const subItem = items2.find(
-      (i) => i.session?.id === "sub",
-    );
+    const items2 = buildDisplayItems([group], [], "none", new Set(), expandedWithSub);
+    const subItem = items2.find((i) => i.session?.id === "sub");
     expect(subItem).toBeDefined();
     expect(subItem!.depth).toBe(2);
 
     // The teammate should be under "Team", not subagents.
-    const teamHeader = items2.find(
-      (i) => i.type === "team-group",
-    );
+    const teamHeader = items2.find((i) => i.type === "team-group");
     expect(teamHeader).toBeDefined();
     expect(teamHeader!.label).toBe("Team");
   });
@@ -946,13 +857,9 @@ describe("child classification precedence", () => {
     };
 
     const expanded = new Set(["root", `subagent:root`]);
-    const items = buildDisplayItems(
-      [group], [], "none", new Set(), expanded,
-    );
+    const items = buildDisplayItems([group], [], "none", new Set(), expanded);
 
-    const childItems = items.filter(
-      (i) => i.session && i.depth === 2,
-    );
+    const childItems = items.filter((i) => i.session && i.depth === 2);
     expect(childItems).toHaveLength(3);
     // Most recent first.
     expect(childItems[0]!.session!.id).toBe("sub-new");

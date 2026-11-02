@@ -7,7 +7,7 @@ import { usage } from "../../stores/usage.svelte.js";
 import { testMoney } from "../../test/money.js";
 import type { Money } from "../../money.js";
 import { settings } from "../../stores/settings.svelte.js";
-import type { DailyUsageEntry, UsageSummaryResponse } from "../../api/types/usage.js";
+import type { DbDailyUsageEntry, UsageSummaryResponse } from "../../api/generated/index";
 import { usageChartColorMaps } from "../../utils/usageChartColors.js";
 import { setLocale } from "../../i18n/index.js";
 
@@ -47,7 +47,7 @@ class ImmediateResizeObserver implements ResizeObserver {
   disconnect(): void {}
 }
 
-function dailyEntry(index: number): DailyUsageEntry {
+function dailyEntry(index: number): DbDailyUsageEntry {
   const date = new Date("2026-06-04T00:00:00");
   date.setDate(date.getDate() + index);
   const isoDate = date.toISOString().slice(0, 10);
@@ -71,6 +71,9 @@ function dailyEntry(index: number): DailyUsageEntry {
         cost: testMoney(10),
       },
     ],
+    modelBreakdowns: [],
+    agentBreakdowns: [],
+    machineBreakdowns: [],
   };
 }
 
@@ -78,12 +81,14 @@ function usageSummary(): UsageSummaryResponse {
   return {
     from: "2026-06-04",
     to: "2026-06-18",
+    projects: {},
     totals: {
       inputTokens: 1500,
       outputTokens: 750,
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
       totalCost: testMoney(150),
+      cacheSavings: testMoney(0),
     },
     daily: Array.from({ length: 15 }, (_, i) => dailyEntry(i)),
     projectTotals: [
@@ -118,9 +123,9 @@ function usageSummary(): UsageSummaryResponse {
 function modelDailyEntry(
   index: number,
   models: Array<{ modelName: string; cost: Money }>,
-): DailyUsageEntry {
+): DbDailyUsageEntry {
   const entry = dailyEntry(index);
-  entry.projectBreakdowns = undefined;
+  entry.projectBreakdowns = [];
   entry.modelBreakdowns = models.map(({ modelName, cost }) => ({
     modelName,
     inputTokens: 60,
@@ -158,7 +163,7 @@ describe("CostTimeSeriesChart", () => {
     usage.selectedTimeRange = null;
     usage.excludedProjectKeys = "";
     usage.excludedAgents = "";
-    usage.selectedModels = "";
+    usage.excludedModels = "";
     usage.mode = "cost";
     usage.setSelectedTokenTypes(["input", "cache_write", "cache_read", "output"]);
     settings.chartPalette = "agentsview";
@@ -429,18 +434,26 @@ describe("CostTimeSeriesChart", () => {
     const component = mountChart();
     await tick();
     const target = document.querySelector<HTMLElement>(".lc-tooltip-context")!;
+    Object.defineProperty(target, "offsetWidth", {
+      configurable: true,
+      value: OBSERVED_WIDTH,
+    });
+    Object.defineProperty(target, "offsetHeight", {
+      configurable: true,
+      value: 180,
+    });
     target.dispatchEvent(
       new MouseEvent("pointerenter", {
         bubbles: true,
-        clientX: 0,
-        clientY: 0,
+        clientX: 50,
+        clientY: 40,
       }),
     );
     target.dispatchEvent(
       new MouseEvent("pointermove", {
         bubbles: true,
-        clientX: 0,
-        clientY: 0,
+        clientX: 50,
+        clientY: 40,
       }),
     );
     await tick();
@@ -526,6 +539,34 @@ describe("CostTimeSeriesChart", () => {
     expect(document.querySelector(".empty")).toBeTruthy();
     expect(document.querySelectorAll(".chart-svg path.lc-area-path")).toHaveLength(0);
     unmount(component);
+  });
+
+  it("hides and restores model series in the cached chart range", async () => {
+    usage.toggles.timeSeries.groupBy = "model";
+    usage.summary!.daily = [
+      modelDailyEntry(0, [
+        { modelName: "model-alpha", cost: testMoney(3) },
+        { modelName: "model-bravo", cost: testMoney(2) },
+      ]),
+      modelDailyEntry(1, [
+        { modelName: "model-alpha", cost: testMoney(3) },
+        { modelName: "model-bravo", cost: testMoney(2) },
+      ]),
+    ];
+    usage.excludedModels = "model-alpha";
+    const component = mountChart();
+    await tick();
+    try {
+      expect(document.querySelectorAll("path.lc-area-path")).toHaveLength(1);
+      usage.excludedModels = "model-alpha,model-bravo";
+      await tick();
+      expect(document.querySelectorAll("path.lc-area-path")).toHaveLength(0);
+      usage.excludedModels = "";
+      await tick();
+      expect(document.querySelectorAll("path.lc-area-path")).toHaveLength(2);
+    } finally {
+      await unmount(component);
+    }
   });
 
   it("uses aggregate-cost-ranked Matplotlib colors for model paths and legend dots", async () => {

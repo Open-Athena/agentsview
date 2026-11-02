@@ -147,9 +147,7 @@
 
   // Seed from URL/local model filters before a response arrives.
   $effect(() => {
-    const filtered = [
-      usage.selectedModels,
-    ].filter(Boolean).join(",");
+    const filtered = usage.excludedModels;
     untrack(() => {
       if (!filtered) return;
       mergeIntoKnownModels(filtered.split(","));
@@ -158,11 +156,6 @@
 
   const modelItems = $derived(
     knownModels.map((m) => ({ name: m })),
-  );
-  const selectedModels = $derived(
-    usage.selectedModels
-      ? usage.selectedModels.split(",").filter(Boolean)
-      : [],
   );
   const unsupportedUsageMessage = $derived.by(() => {
     const kind = usage.isTimeRangeSummaryProvisional
@@ -213,7 +206,7 @@
   // apply params that are actually present in the URL.
   const USAGE_FILTER_KEYS = new Set([
     "from", "to", "window_days",
-    "model", "exclude_model", "exclude_agent",
+    "exclude_model", "exclude_agent",
   ]);
   const SESSION_FILTER_KEYS = new Set([
     "project", "machine", "agent",
@@ -380,14 +373,9 @@
         usage.excludedAgents = newExAgent;
         changed = true;
       }
-      if (usage.excludedModels) {
-        usage.excludedModels = "";
-        changed = true;
-      }
-      const newModel = params["model"] ?? "";
-      if (newModel !== usage.selectedModels) {
-        usage.selectedModels = newModel;
-        if (newModel) usage.excludedModels = "";
+      const newExModel = params["exclude_model"] ?? "";
+      if (newExModel !== usage.excludedModels) {
+        usage.excludedModels = newExModel;
         changed = true;
       }
       if ((changed || sessionChanged) && urlInitRan) {
@@ -409,7 +397,6 @@
       excludedProjectKeys: usage.excludedProjectKeys,
       excludedAgents: usage.excludedAgents,
       excludedModels: usage.excludedModels,
-      selectedModels: usage.selectedModels,
     };
     const nextParams = withSelectedTokenTypes(
       withUsageMode(
@@ -522,8 +509,7 @@
       <FilterDropdown
         label={m.usage_model()}
         items={modelItems}
-        excludedCsv={usage.selectedModels}
-        mode="include"
+        excludedCsv={usage.excludedModels}
         onToggle={(name) => usage.toggleModel(name)}
         onSelectAll={() => usage.selectAllModels()}
         onDeselectAll={() =>
@@ -532,6 +518,9 @@
 
       <RefreshControl
         lastUpdatedAt={usage.lastUpdatedAt}
+        queryDurationMs={usage.lastQueryDurationMs}
+        querySteps={usage.lastQuerySteps}
+        liveQuery={usage.liveQuery}
         busy={usage.isQuerying}
         onRefresh={() => usage.fetchAll({ preserveTimeRange: true })}
         label={m.usage_refresh()}
@@ -542,10 +531,8 @@
   </div>
 
   <SessionActiveFilters
-    modelFilters={selectedModels}
     onClearProjects={() => usage.selectAllProjects()}
     onClearAgents={() => usage.selectAllAgents()}
-    onRemoveModel={(model) => usage.toggleModel(model)}
     onClearModels={() => usage.selectAllModels()}
   />
 

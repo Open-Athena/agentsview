@@ -1,6 +1,9 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
+vi.mock("../../feature-flags.js", () => ({
+  PROJECT_MAPPING_WORKSPACE_ENABLED: true,
+}));
 import Breakdowns from "./Breakdowns.svelte";
 import { router } from "../../stores/router.svelte.js";
 import type { Report } from "../../api/types.js";
@@ -9,13 +12,28 @@ import { testMoney } from "../../test/money.js";
 function makeReport(): Report {
   return {
     peak: { agents: 0, at: null },
+    interactive_peak: { agents: 0, at: null },
+    subagent_peak: { agents: 0, at: null },
+    automated_peak: { agents: 0, at: null },
     totals: {
-      active_minutes: 0, idle_minutes: 0, agent_minutes: 0, sessions: 0,
-      untimed_sessions: 0, distinct_projects: 0, distinct_models: 0,
-      output_tokens: 0, cost: testMoney(0),
-      automated_agent_minutes: 0, interactive_agent_minutes: 0,
-      automated_cost: testMoney(0), interactive_cost: testMoney(0),
-      automated_sessions: 0, interactive_sessions: 0,
+      active_minutes: 0,
+      idle_minutes: 0,
+      agent_minutes: 0,
+      sessions: 0,
+      untimed_sessions: 0,
+      distinct_projects: 0,
+      distinct_models: 0,
+      output_tokens: 0,
+      cost: testMoney(0),
+      subagent_agent_minutes: 0,
+      automated_agent_minutes: 0,
+      interactive_agent_minutes: 0,
+      subagent_cost: testMoney(0),
+      automated_cost: testMoney(0),
+      interactive_cost: testMoney(0),
+      automated_sessions: 0,
+      subagent_sessions: 0,
+      interactive_sessions: 0,
     },
     partial: false,
     as_of: null,
@@ -30,14 +48,28 @@ function makeReport(): Report {
     buckets: [],
     by_project: [
       {
-        key: "alpha", project_key: "pl1:sha256:alpha", agent_minutes: 30, cost: testMoney(0),
-        interactive_agent_minutes: 20, automated_agent_minutes: 10,
-        interactive_cost: testMoney(0), automated_cost: testMoney(0),
+        key: "alpha",
+        project_key: "pl1:sha256:alpha",
+        agent_minutes: 30,
+        cost: testMoney(6),
+        interactive_agent_minutes: 15,
+        subagent_agent_minutes: 5,
+        automated_agent_minutes: 10,
+        interactive_cost: testMoney(3),
+        subagent_cost: testMoney(1),
+        automated_cost: testMoney(2),
       },
       {
-        key: "beta", project_key: "pl1:sha256:beta", agent_minutes: 10, cost: testMoney(0),
-        interactive_agent_minutes: 10, automated_agent_minutes: 0,
-        interactive_cost: testMoney(0), automated_cost: testMoney(0),
+        key: "beta",
+        project_key: "pl1:sha256:beta",
+        agent_minutes: 10,
+        cost: testMoney(0),
+        interactive_agent_minutes: 10,
+        subagent_agent_minutes: 0,
+        automated_agent_minutes: 0,
+        interactive_cost: testMoney(0),
+        subagent_cost: testMoney(0),
+        automated_cost: testMoney(0),
       },
     ],
     by_model: [],
@@ -73,26 +105,42 @@ describe("Breakdowns", () => {
     target.remove();
   });
 
-  it("stacks interactive and automated segments and shows the split in the tooltip", async () => {
+  it("stacks three disjoint classes for minutes and cost and shows each contribution", async () => {
     const target = document.createElement("div");
     document.body.appendChild(target);
     const c = mount(Breakdowns, { target, props: { report: makeReport() } });
     await tick();
-    // First project row = alpha (20 interactive + 10 automated agent-minutes).
+    // First project row = alpha (15 interactive + 5 subagent + 10 automated minutes).
     const row = target.querySelector(".bar-row") as HTMLElement;
     const interactive = row.querySelector(".bar-seg.interactive") as HTMLElement;
     const automated = row.querySelector(".bar-seg.automated") as HTMLElement;
+    const subagent = row.querySelector(".bar-seg.subagent") as HTMLElement;
     expect(interactive).toBeTruthy();
     expect(automated).toBeTruthy();
-    // The interactive share (20) is wider than the automated share (10).
+    expect(subagent).toBeTruthy();
     const width = (el: HTMLElement) => Number.parseFloat(el.style.width);
-    expect(width(interactive)).toBeGreaterThan(width(automated));
+    expect(width(interactive)).toBeCloseTo(50);
+    expect(width(subagent)).toBeCloseTo(100 / 6);
+    expect(width(automated)).toBeCloseTo(100 / 3);
 
     row.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
     await tick();
     const tip = target.querySelector(".tooltip");
-    expect(tip!.textContent).toContain("int 20");
+    expect(tip!.textContent).toContain("int 15");
+    expect(tip!.textContent).toContain("sub 5");
     expect(tip!.textContent).toContain("auto 10");
+    const cost = [...target.querySelectorAll<HTMLButtonElement>(".metric-btn")].find(
+      (button) => button.textContent?.trim() === "Cost",
+    )!;
+    cost.click();
+    await tick();
+    const costRow = target.querySelector(".bar-row") as HTMLElement;
+    expect(width(costRow.querySelector(".bar-seg.subagent")!)).toBeCloseTo(100 / 6);
+    costRow.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
+    await tick();
+    expect(target.querySelector(".tooltip")?.textContent).toContain(
+      "int $3.00 / sub $1.00 / auto $2.00",
+    );
     unmount(c);
     target.remove();
   });
@@ -103,14 +151,26 @@ describe("Breakdowns", () => {
     // usage; they must not render as empty "0" bars in the minutes view.
     report.by_project = [
       {
-        key: "timed", agent_minutes: 30, cost: testMoney(1),
-        interactive_agent_minutes: 30, automated_agent_minutes: 0,
-        interactive_cost: testMoney(1), automated_cost: testMoney(0),
+        key: "timed",
+        agent_minutes: 30,
+        cost: testMoney(1),
+        interactive_agent_minutes: 30,
+        subagent_agent_minutes: 0,
+        automated_agent_minutes: 0,
+        interactive_cost: testMoney(1),
+        subagent_cost: testMoney(0),
+        automated_cost: testMoney(0),
       },
       {
-        key: "costonly", agent_minutes: 0, cost: testMoney(5),
-        interactive_agent_minutes: 0, automated_agent_minutes: 0,
-        interactive_cost: testMoney(5), automated_cost: testMoney(0),
+        key: "costonly",
+        agent_minutes: 0,
+        cost: testMoney(5),
+        interactive_agent_minutes: 0,
+        subagent_agent_minutes: 0,
+        automated_agent_minutes: 0,
+        interactive_cost: testMoney(5),
+        subagent_cost: testMoney(0),
+        automated_cost: testMoney(0),
       },
     ] as Report["by_project"];
     const target = document.createElement("div");
@@ -130,14 +190,26 @@ describe("Breakdowns", () => {
     const report = makeReport();
     report.by_project = [
       {
-        key: "timed", agent_minutes: 30, cost: testMoney(1),
-        interactive_agent_minutes: 30, automated_agent_minutes: 0,
-        interactive_cost: testMoney(1), automated_cost: testMoney(0),
+        key: "timed",
+        agent_minutes: 30,
+        cost: testMoney(1),
+        interactive_agent_minutes: 30,
+        subagent_agent_minutes: 0,
+        automated_agent_minutes: 0,
+        interactive_cost: testMoney(1),
+        subagent_cost: testMoney(0),
+        automated_cost: testMoney(0),
       },
       {
-        key: "costonly", agent_minutes: 0, cost: testMoney(5),
-        interactive_agent_minutes: 0, automated_agent_minutes: 0,
-        interactive_cost: testMoney(5), automated_cost: testMoney(0),
+        key: "costonly",
+        agent_minutes: 0,
+        cost: testMoney(5),
+        interactive_agent_minutes: 0,
+        subagent_agent_minutes: 0,
+        automated_agent_minutes: 0,
+        interactive_cost: testMoney(5),
+        subagent_cost: testMoney(0),
+        automated_cost: testMoney(0),
       },
     ] as Report["by_project"];
     const target = document.createElement("div");
@@ -182,8 +254,8 @@ describe("Breakdowns", () => {
 
   it("links project rows to Data and leaves other panels plain", async () => {
     const report = makeReport();
-    report.by_model = [{ ...report.by_project![0], key: "model-a" }];
-    report.by_agent = [{ ...report.by_project![0], key: "agent-a" }];
+    report.by_model = [{ ...report.by_project![0]!, key: "model-a" }];
+    report.by_agent = [{ ...report.by_project![0]!, key: "agent-a" }];
     const target = document.createElement("div");
     document.body.appendChild(target);
     const component = mount(Breakdowns, { target, props: { report } });
@@ -191,13 +263,28 @@ describe("Breakdowns", () => {
 
     const links = target.querySelectorAll("a.bar-label");
     expect(links).toHaveLength(2);
-    expect(links[0]!.getAttribute("href")).toBe(
-      "/data?project_key=pl1%3Asha256%3Aalpha",
-    );
+    expect(links[0]!.getAttribute("href")).toBe("/data?project_key=pl1%3Asha256%3Aalpha");
     expect(links[0]!.getAttribute("title")).toBe("View alpha in Data");
     // Model/agent panels render plain spans, and no action buttons remain.
     expect(target.querySelectorAll("span.bar-label")).toHaveLength(2);
     expect(target.querySelectorAll(".bar-row button")).toHaveLength(0);
+    unmount(component);
+  });
+
+  it("renders project rows as plain labels when the workspace is disabled", async () => {
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    const component = mount(Breakdowns, {
+      target,
+      props: { report: makeReport(), projectWorkspaceEnabled: false },
+    });
+    await tick();
+
+    expect(target.querySelectorAll("a.bar-label")).toHaveLength(0);
+    const labels = [...target.querySelectorAll("span.bar-label")].map(
+      (element) => element.textContent?.trim(),
+    );
+    expect(labels).toEqual(["alpha", "beta"]);
     unmount(component);
   });
 
@@ -212,9 +299,7 @@ describe("Breakdowns", () => {
 
     try {
       const link = target.querySelector("a.bar-label") as HTMLAnchorElement;
-      expect(link.getAttribute("href")).toBe(
-        "/data?desktop=&project_key=pl1%3Asha256%3Aalpha",
-      );
+      expect(link.getAttribute("href")).toBe("/data?desktop=&project_key=pl1%3Asha256%3Aalpha");
     } finally {
       unmount(component);
       window.history.replaceState(null, "", "/");

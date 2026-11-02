@@ -225,6 +225,9 @@ func (s *Server) isRawSyncOwnAuthPath(path string) bool {
 	if path == "/api/v1/raw-sync/tokens" {
 		return true
 	}
+	if path == "/api/v1/raw-sync/status" {
+		return s.rawSyncStatus != nil
+	}
 	if s.rawSyncCustody == nil {
 		return false
 	}
@@ -237,7 +240,13 @@ func (s *Server) isRawSyncOwnAuthPath(path string) bool {
 
 func (s *Server) authenticateRawSyncRequest(
 	r *http.Request,
-) (rawsync.AuthIdentity, error) {
+) (identity rawsync.AuthIdentity, resultErr error) {
+	defer func() {
+		if resultErr == nil && s.rawSyncTenant != "" && identity.TenantID != s.rawSyncTenant {
+			identity = rawsync.AuthIdentity{}
+			resultErr = rawsync.ErrUnauthorized
+		}
+	}()
 	secret, err := rawSyncBearer(r.Header.Get("Authorization"))
 	if err != nil {
 		return rawsync.AuthIdentity{}, err
@@ -254,6 +263,10 @@ func (s *Server) authenticateRawSyncRequest(
 	case "/api/v1/raw-sync/manifests":
 		return s.rawSyncDeviceAuth.AuthenticateToken(
 			r.Context(), secret, rawsync.ScopeCommit,
+		)
+	case "/api/v1/raw-sync/status":
+		return s.rawSyncDeviceAuth.AuthenticateToken(
+			r.Context(), secret, rawsync.ScopeStatus,
 		)
 	default:
 		if s.rawSyncUploads != nil && isRawSyncUploadPath(r.URL.Path) {

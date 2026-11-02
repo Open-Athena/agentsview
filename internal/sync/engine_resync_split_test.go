@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,11 +23,12 @@ import (
 // callers can delete a source file and drive a resync.
 func newResyncSplitEngine(t *testing.T) (*Engine, *db.DB, string) {
 	t.Helper()
+
 	root := t.TempDir()
-	database, err := db.Open(filepath.Join(t.TempDir(), "archive.db"))
+	database, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "archive.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, database.Close()) })
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {root}},
 		Machine:   "local",
 	})
@@ -41,8 +43,132 @@ func newResyncSplitEngine(t *testing.T) (*Engine, *db.DB, string) {
 			String()
 		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
 	}
-	require.Equal(t, 3, engine.SyncAll(context.Background(), nil).Synced)
+	require.Equal(t, 3, engine.SyncAll(t.Context(), nil).Synced)
 	return engine, database, root
+}
+
+func newResyncFailureEngine(t *testing.T) (
+	*Engine, *db.DB, *directStreamingProvider, string, string,
+) {
+	t.Helper()
+	root := t.TempDir()
+	database, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "archive.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	path := filepath.Join(root, "source.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte("source"), 0o600))
+	const agent parser.AgentType = "resync-failure"
+	source := parser.SourceRef{
+		Provider: agent, Key: path, DisplayPath: path, FingerprintKey: path,
+	}
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	started := time.Unix(1704067200, 0)
+	provider := &directStreamingProvider{
+		Def: parser.AgentDef{Type: agent, FileBased: true},
+		Caps: parser.Capabilities{Source: parser.SourceCapabilities{
+			DiscoverSources:    parser.CapabilitySupported,
+			StreamingDiscovery: parser.CapabilitySupported,
+			WatchSources:       parser.CapabilitySupported,
+		}},
+		source:        &source,
+		fingerprint:   parser.SourceFingerprint{Key: path, MTimeNS: info.ModTime().UnixNano()},
+		allowDiscover: true,
+		parseOutcome: parser.ParseOutcome{
+			Results: []parser.ParseResultOutcome{{
+				Result: parser.ParseResult{Session: parser.ParsedSession{
+					ID: "resync-failure", Agent: agent,
+					Project: "project", Machine: "local",
+					StartedAt: started, EndedAt: started,
+					File: parser.FileInfo{Path: path},
+				}},
+				DataVersion: parser.DataVersionCurrent,
+			}},
+			ResultSetComplete: true,
+		},
+	}
+	engine := NewEngine(t.Context(), database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{agent: {root}},
+		Machine:   "local",
+		ProviderFactories: []parser.ProviderFactory{
+			directStreamingFactory{provider: provider},
+		},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			agent: parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	t.Cleanup(engine.Close)
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+	return engine, database, provider, root, path
+}
+
+func TestAbortedResyncKeepsSourceFailures(t *testing.T) {
+	for _, useBuild := range []bool{false, true} {
+		t.Run(map[bool]string{false: "resync-all", true: "resync-build"}[useBuild], func(t *testing.T) {
+			engine, database, provider, root, path := newResyncFailureEngine(t)
+			provider.parseErr = errors.New("malformed source")
+
+			var stats SyncStats
+			if useBuild {
+				_, buildStats, err := engine.ResyncBuild(t.Context(), nil)
+				require.NoError(t, err)
+				stats = buildStats
+			} else {
+				stats = engine.ResyncAll(t.Context(), nil)
+			}
+			require.True(t, stats.Aborted)
+
+			parsed := provider.parseCalls.Load()
+			next := engine.processFile(t.Context(), parser.DiscoveredFile{
+				Path: path, Agent: provider.Def.Type,
+				ProviderSource: provider.source, ProviderProcess: true,
+			})
+			require.NoError(t, next.err)
+			assert.True(t, next.skip)
+			assert.True(t, next.cachedFailure)
+			assert.Equal(t, parsed, provider.parseCalls.Load(),
+				"the pass after an aborted resync must not reparse the broken source")
+
+			restarted := NewEngine(t.Context(), database, EngineConfig{
+				AgentDirs: map[parser.AgentType][]string{provider.Def.Type: {root}},
+				Machine:   "local",
+				ProviderFactories: []parser.ProviderFactory{
+					directStreamingFactory{provider: provider},
+				},
+				ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+					provider.Def.Type: parser.ProviderMigrationProviderAuthoritative,
+				},
+			})
+			t.Cleanup(restarted.Close)
+			afterRestart := restarted.processFile(t.Context(), parser.DiscoveredFile{
+				Path: path, Agent: provider.Def.Type,
+				ProviderSource: provider.source, ProviderProcess: true,
+			})
+			require.NoError(t, afterRestart.err)
+			assert.True(t, afterRestart.cachedFailure,
+				"the failure must survive a restart after the aborted resync")
+		})
+	}
+}
+
+func TestCanceledResyncDoesNotRecordSourceFailure(t *testing.T) {
+	engine, _, provider, _, path := newResyncFailureEngine(t)
+	provider.parseErr = errors.New("malformed source")
+	ctx, cancel := context.WithCancel(t.Context())
+	provider.parseCancel = cancel
+
+	_, stats, err := engine.ResyncBuild(ctx, nil)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.True(t, stats.Aborted)
+
+	provider.parseCancel = nil
+	next := engine.processFile(t.Context(), parser.DiscoveredFile{
+		Path: path, Agent: provider.Def.Type,
+		ProviderSource: provider.source, ProviderProcess: true,
+	})
+	require.Error(t, next.err)
+	assert.False(t, next.cachedFailure,
+		"a failure seen while the pass was being canceled may be an artifact of cancellation")
 }
 
 // TestResyncBuildThenSwapMatchesResyncAll drives the split resync path
@@ -53,7 +179,7 @@ func TestResyncBuildThenSwapMatchesResyncAll(t *testing.T) {
 	e, database, root := newResyncSplitEngine(t)
 	require.NoError(t, os.Remove(filepath.Join(root, "project", "orphan.jsonl")))
 
-	tempPath, stats, err := e.ResyncBuild(context.Background(), nil)
+	tempPath, stats, err := e.ResyncBuild(t.Context(), nil)
 	require.NoError(t, err)
 	require.False(t, stats.Aborted)
 	require.FileExists(t, tempPath)
@@ -61,16 +187,16 @@ func TestResyncBuildThenSwapMatchesResyncAll(t *testing.T) {
 	installed, err := e.SwapResyncDatabase(tempPath)
 	require.NoError(t, err)
 	assert.True(t, installed)
-	require.NoError(t, e.ResetCachesAfterSwap())
+	require.NoError(t, e.ResetCachesAfterSwap(t.Context()))
 
 	assert.False(t, database.NeedsResync())
-	orphan, err := database.GetSession(context.Background(), "orphan")
+	orphan, err := database.GetSession(t.Context(), "orphan")
 	require.NoError(t, err)
 	require.NotNil(t, orphan, "orphan sessions must survive the split resync")
 	assert.Positive(t, stats.TotalSessions)
 	assert.NoFileExists(t, tempPath)
 
-	warm := e.SyncAll(context.Background(), nil)
+	warm := e.SyncAll(t.Context(), nil)
 	assert.Zero(t, warm.Synced, "persisted skip state must survive the swap")
 }
 
@@ -81,26 +207,26 @@ func TestSwapWindowRejectsDirectWrites(t *testing.T) {
 	e, database, _ := newResyncSplitEngine(t)
 
 	require.NoError(t, database.CloseWriter())
-	_, starErr := database.StarSession("keep0")
-	assert.ErrorIs(t, starErr, db.ErrWriterClosed,
+	_, starErr := database.StarSession(t.Context(), "keep0")
+	require.ErrorIs(t, starErr, db.ErrWriterClosed,
 		"a direct write during the barrier window must be rejected")
 
 	// The build reads the original and writes only the replacement, so it
 	// proceeds while the writer is closed. The swap reopens the writer.
-	tempPath, _, err := e.ResyncBuild(context.Background(), nil)
+	tempPath, _, err := e.ResyncBuild(t.Context(), nil)
 	require.NoError(t, err)
 	installed, err := e.SwapResyncDatabase(tempPath)
 	require.NoError(t, err)
 	assert.True(t, installed)
-	require.NoError(t, e.ResetCachesAfterSwap())
+	require.NoError(t, e.ResetCachesAfterSwap(t.Context()))
 
-	starred, err := database.ListStarredSessionIDs(context.Background())
+	starred, err := database.ListStarredSessionIDs(t.Context())
 	require.NoError(t, err)
 	assert.NotContains(t, starred, "keep0",
 		"a rejected write must not appear in the swapped archive")
 
 	// The writer is usable again after the swap reopened it.
-	ok, err := database.StarSession("keep0")
+	ok, err := database.StarSession(t.Context(), "keep0")
 	require.NoError(t, err)
 	assert.True(t, ok)
 }
@@ -118,13 +244,13 @@ func TestResyncAbortsWhenBarrierCannotBeEstablished(t *testing.T) {
 	}
 	defer func() { closeWriterForResyncBarrier = prev }()
 
-	stats := e.ResyncAll(context.Background(), nil)
+	stats := e.ResyncAll(t.Context(), nil)
 	assert.True(t, stats.Aborted, "resync must abort without a clean barrier")
 	require.NotEmpty(t, stats.Warnings)
 	assert.Contains(t, stats.Warnings[0], "close writer for barrier")
 	assert.Zero(t, stats.Synced, "no build may run without the barrier")
 
-	page, err := database.ListSessions(context.Background(), db.SessionFilter{})
+	page, err := database.ListSessions(t.Context(), db.SessionFilter{})
 	require.NoError(t, err)
 	assert.Len(t, page.Sessions, 3, "original archive must be untouched")
 	assert.NoFileExists(t, e.ResyncTempPath(),
@@ -151,10 +277,10 @@ func TestResyncBarrierCloseFailureRestoresWriter(t *testing.T) {
 	}
 	defer func() { closeWriterForResyncBarrier = prev }()
 
-	stats := e.ResyncAll(context.Background(), nil)
+	stats := e.ResyncAll(t.Context(), nil)
 	require.True(t, stats.Aborted, "resync must abort without a clean barrier")
 
-	ok, err := database.StarSession("keep0")
+	ok, err := database.StarSession(t.Context(), "keep0")
 	require.NoError(t, err,
 		"writes must recover after the aborted resync without a restart")
 	assert.True(t, ok)
@@ -163,7 +289,7 @@ func TestResyncBarrierCloseFailureRestoresWriter(t *testing.T) {
 func TestResyncMappingFailureKeepsOriginalArchive(t *testing.T) {
 	for _, failure := range []string{"discovery", "apply"} {
 		t.Run(failure, func(t *testing.T) {
-			ctx := context.Background()
+			ctx := t.Context()
 			root := t.TempDir()
 			worktreePrefix := filepath.Join(t.TempDir(), "worktrees")
 			sessionCwd := filepath.Join(worktreePrefix, "feature")
@@ -180,7 +306,7 @@ func TestResyncMappingFailureKeepsOriginalArchive(t *testing.T) {
 					String(),
 			), 0o644))
 
-			database, err := db.Open(filepath.Join(t.TempDir(), "archive.db"))
+			database, err := db.Open(ctx, filepath.Join(t.TempDir(), "archive.db"))
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, database.Close()) })
 			_, err = database.CreateWorktreeProjectMapping(
@@ -191,7 +317,7 @@ func TestResyncMappingFailureKeepsOriginalArchive(t *testing.T) {
 				},
 			)
 			require.NoError(t, err)
-			engine := NewEngine(database, EngineConfig{
+			engine := NewEngine(ctx, database, EngineConfig{
 				AgentDirs: map[parser.AgentType][]string{
 					parser.AgentClaude: {root},
 				},
@@ -240,7 +366,7 @@ func TestResyncMappingFailureKeepsOriginalArchive(t *testing.T) {
 			require.NotNil(t, after)
 			assert.Equal(t, "canonical_project", after.Project,
 				"failed mapping reconciliation must retain the active archive")
-			starred, err := database.StarSession("mapped")
+			starred, err := database.StarSession(ctx, "mapped")
 			require.NoError(t, err,
 				"the original archive must remain writable after the abort")
 			assert.True(t, starred)
@@ -265,16 +391,20 @@ func TestResyncAbortsWhenReplacementCloseFails(t *testing.T) {
 	// build's final Close cannot drain.
 	var pinned *sql.Rows
 	stats, err := e.resyncAllWithOptionsAndOperations(
-		context.Background(), nil, RebuildOptions{}, rebuildOperations{
-			rebuildFTS: func(newDB *db.DB) error {
-				if err := newDB.RebuildFTS(); err != nil {
+		t.Context(), nil, RebuildOptions{}, rebuildOperations{
+			rebuildFTS: func(ctx context.Context, newDB *db.DB) error {
+				if err := newDB.RebuildFTS(t.Context()); err != nil {
 					return err
 				}
-				rows, qerr := newDB.Reader().Query("SELECT 1")
+				rows, qerr := newDB.Reader().Query(t.Context(), "SELECT 1")
 				if qerr != nil {
 					return qerr
 				}
 				pinned = rows
+				t.Cleanup(func() {
+					require.NoError(t, rows.Err())
+					require.NoError(t, rows.Close())
+				})
 				return nil
 			},
 		},
@@ -286,15 +416,16 @@ func TestResyncAbortsWhenReplacementCloseFails(t *testing.T) {
 	assert.Contains(t, stats.Warnings[len(stats.Warnings)-1], "aborting swap")
 
 	// The original archive was not swapped and still serves reads and writes.
-	page, listErr := database.ListSessions(context.Background(), db.SessionFilter{})
+	page, listErr := database.ListSessions(t.Context(), db.SessionFilter{})
 	require.NoError(t, listErr)
 	assert.Len(t, page.Sessions, 3, "original archive must be untouched")
-	ok, starErr := database.StarSession("keep0")
+	ok, starErr := database.StarSession(t.Context(), "keep0")
 	require.NoError(t, starErr,
 		"writes must recover after the aborted resync without a restart")
 	assert.True(t, ok)
 
 	require.NotNil(t, pinned, "the FTS hook must have pinned a connection")
+	require.NoError(t, pinned.Err())
 	require.NoError(t, pinned.Close())
 }
 
@@ -305,12 +436,13 @@ func TestResyncAbortsWhenReplacementCloseFails(t *testing.T) {
 // wrongly retained replacement-build skip entry is observable.
 func newResyncSwapFailureEngine(t *testing.T) (*Engine, *db.DB, string) {
 	t.Helper()
+
 	claudeRoot := t.TempDir()
 	kimiRoot := t.TempDir()
-	database, err := db.Open(filepath.Join(t.TempDir(), "archive.db"))
+	database, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "archive.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, database.Close()) })
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentClaude: {claudeRoot},
 			parser.AgentKimi:   {kimiRoot},
@@ -328,7 +460,7 @@ func newResyncSwapFailureEngine(t *testing.T) (*Engine, *db.DB, string) {
 			String()
 		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
 	}
-	require.Equal(t, 2, engine.SyncAll(context.Background(), nil).Synced)
+	require.Equal(t, 2, engine.SyncAll(t.Context(), nil).Synced)
 	return engine, database, kimiRoot
 }
 
@@ -338,6 +470,7 @@ func newResyncSwapFailureEngine(t *testing.T) (*Engine, *db.DB, string) {
 // and the file mtime the skip entry will be keyed on.
 func writeKimiGhost(t *testing.T, kimiRoot string) (string, string, time.Time) {
 	t.Helper()
+
 	workdir := "wd_kimi-code_057f5c09ee3f"
 	sessionDir := "session_cf2c3d74-c9d2-4ae4-95b7-d1d817298382"
 	wirePath := filepath.Join(
@@ -363,6 +496,7 @@ func requireGhostSyncsAfterFailedSwap(
 	wirePath, sessionID string, mtime time.Time,
 ) {
 	t.Helper()
+
 	session := `{"type": "metadata", "protocol_version": "1.3"}` + "\n" +
 		`{"timestamp": 1704067200.0, "message": {"type": "TurnBegin", ` +
 		`"payload": {"user_input": [{"type": "text", "text": "Hello Kimi"}]}}}` + "\n" +
@@ -370,9 +504,9 @@ func requireGhostSyncsAfterFailedSwap(
 	require.NoError(t, os.WriteFile(wirePath, []byte(session), 0o644))
 	require.NoError(t, os.Chtimes(wirePath, mtime, mtime))
 
-	synced := e.SyncAll(context.Background(), nil)
+	synced := e.SyncAll(t.Context(), nil)
 	require.False(t, synced.Aborted)
-	sess, err := database.GetSession(context.Background(), sessionID)
+	sess, err := database.GetSession(t.Context(), sessionID)
 	require.NoError(t, err)
 	require.NotNil(t, sess,
 		"a skip entry from the discarded replacement build must not "+
@@ -389,7 +523,7 @@ func TestResyncSwapRenameFailureRestoresSkipCache(t *testing.T) {
 	wirePath, sessionID, mtime := writeKimiGhost(t, kimiRoot)
 
 	var removed atomic.Bool
-	stats := e.ResyncAll(context.Background(), func(p Progress) {
+	stats := e.ResyncAll(t.Context(), func(p Progress) {
 		if p.Phase == PhaseSwappingDatabase &&
 			removed.CompareAndSwap(false, true) {
 			// Deleting the staged replacement makes the swap's os.Rename
@@ -404,7 +538,7 @@ func TestResyncSwapRenameFailureRestoresSkipCache(t *testing.T) {
 		"resync swap failed")
 
 	// The original archive is still in place and serving.
-	page, err := database.ListSessions(context.Background(), db.SessionFilter{})
+	page, err := database.ListSessions(t.Context(), db.SessionFilter{})
 	require.NoError(t, err)
 	assert.Len(t, page.Sessions, 2, "original archive must be untouched")
 
@@ -425,27 +559,29 @@ func TestResyncSwapCloseFailureRestoresSkipCache(t *testing.T) {
 
 	// Pin a reader connection on the original so its pre-swap
 	// CloseConnections cannot drain and the swap aborts before the rename.
-	pinned, err := database.Reader().Query("SELECT 1")
+	pinned, err := database.Reader().Query(t.Context(), "SELECT 1")
 	require.NoError(t, err)
 	pinnedOpen := true
 	defer func() {
 		if pinnedOpen {
+			require.NoError(t, pinned.Err())
 			require.NoError(t, pinned.Close())
 		}
 	}()
 
-	stats := e.ResyncAll(context.Background(), nil)
+	stats := e.ResyncAll(t.Context(), nil)
 	require.True(t, stats.Aborted,
 		"a failed close before the swap must abort the resync")
 	require.NotEmpty(t, stats.Warnings)
 	assert.Contains(t, stats.Warnings[len(stats.Warnings)-1],
 		"close before swap failed")
 
+	require.NoError(t, pinned.Err())
 	require.NoError(t, pinned.Close())
 	pinnedOpen = false
 
 	// The original archive is still in place and serving.
-	page, err := database.ListSessions(context.Background(), db.SessionFilter{})
+	page, err := database.ListSessions(t.Context(), db.SessionFilter{})
 	require.NoError(t, err)
 	assert.Len(t, page.Sessions, 2, "original archive must be untouched")
 
@@ -468,21 +604,224 @@ func TestInProcessResyncRejectsConcurrentDirectWrite(t *testing.T) {
 	onProgress := func(p Progress) {
 		if p.Phase == PhaseReclassifying && fired.CompareAndSwap(false, true) {
 			go func() {
-				_, starErr = database.StarSession("keep0")
+				_, starErr = database.StarSession(t.Context(), "keep0")
 				close(done)
 			}()
 			<-done
 		}
 	}
 
-	stats := e.ResyncAll(context.Background(), onProgress)
+	stats := e.ResyncAll(t.Context(), onProgress)
 	require.False(t, stats.Aborted)
 	require.True(t, fired.Load(), "the concurrent write must have fired mid-resync")
 
-	assert.ErrorIs(t, starErr, db.ErrWriterClosed,
+	require.ErrorIs(t, starErr, db.ErrWriterClosed,
 		"a direct write in the copy-to-swap window must be rejected, not lost")
-	starred, err := database.ListStarredSessionIDs(context.Background())
+	starred, err := database.ListStarredSessionIDs(t.Context())
 	require.NoError(t, err)
 	assert.NotContains(t, starred, "keep0",
 		"a rejected write must not silently land in the swapped archive")
+}
+
+// resyncPublicationState is the archive content a replacement must carry
+// through publication: literal messages, revisions and user metadata.
+type resyncPublicationState struct {
+	content  []string
+	revision *string
+	starred  []string
+	trashed  bool
+	orphan   bool
+}
+
+func readResyncPublicationState(t *testing.T, database *db.DB) resyncPublicationState {
+	t.Helper()
+	var state resyncPublicationState
+	msgs, err := database.GetMessages(t.Context(), "keep0", 0, 100, true)
+	require.NoError(t, err)
+	orphanMsgs, err := database.GetMessages(t.Context(), "orphan", 0, 100, true)
+	require.NoError(t, err)
+	for _, m := range append(msgs, orphanMsgs...) {
+		state.content = append(state.content, m.Content)
+	}
+	keep, err := database.GetSession(t.Context(), "keep0")
+	require.NoError(t, err)
+	require.NotNil(t, keep)
+	state.revision = keep.TranscriptRevision
+	state.starred, err = database.ListStarredSessionIDs(t.Context())
+	require.NoError(t, err)
+	trashed, err := database.GetSessionFull(t.Context(), "keep1")
+	require.NoError(t, err)
+	state.trashed = trashed != nil && trashed.DeletedAt != nil
+	orphan, err := database.GetSession(t.Context(), "orphan")
+	require.NoError(t, err)
+	state.orphan = orphan != nil
+	return state
+}
+
+func newResyncPublicationEngine(t *testing.T) (*Engine, *db.DB, resyncPublicationState) {
+	t.Helper()
+	e, database, root := newResyncSplitEngine(t)
+	_, err := database.StarSession(t.Context(), "keep0")
+	require.NoError(t, err)
+	require.NoError(t, database.SoftDeleteSession(t.Context(), "keep1"))
+	require.NoError(t, os.Remove(filepath.Join(root, "project", "orphan.jsonl")))
+	want := readResyncPublicationState(t, database)
+	require.Equal(t,
+		[]string{"hello keep0", "hi keep0", "hello orphan", "hi orphan"},
+		want.content)
+	require.Equal(t, []string{"keep0"}, want.starred)
+	require.True(t, want.trashed)
+	require.True(t, want.orphan)
+	return e, database, want
+}
+
+func isResyncPublicationDetail(detail string) bool {
+	return slices.Contains([]string{
+		"Checkpointing rebuilt database",
+		"Closing rebuilt database",
+		"Swapping rebuilt database into place",
+	}, detail)
+}
+
+// TestResyncPublishesCompleteReplacementMainFile pins the publication
+// contract: the swap installs only the replacement's main file, so every
+// committed row must be checkpointed into it before the build returns.
+func TestResyncPublishesCompleteReplacementMainFile(t *testing.T) {
+	t.Run("worker handoff", func(t *testing.T) {
+		e, database, want := newResyncPublicationEngine(t)
+		tempPath, stats, err := e.ResyncBuild(t.Context(), nil)
+		require.NoError(t, err)
+		require.False(t, stats.Aborted)
+		if info, statErr := os.Stat(tempPath + "-wal"); statErr == nil {
+			assert.Zero(t, info.Size(), "the replacement WAL must be empty")
+		}
+
+		mainOnly := filepath.Join(t.TempDir(), "main-only.db")
+		data, err := os.ReadFile(tempPath)
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(mainOnly, data, 0o600))
+		copied, err := db.Open(t.Context(), mainOnly)
+		require.NoError(t, err)
+		assert.Equal(t, want, readResyncPublicationState(t, copied))
+		require.NoError(t, copied.Close())
+
+		installed, err := e.SwapResyncDatabase(tempPath)
+		require.NoError(t, err)
+		require.True(t, installed)
+		require.NoError(t, e.ResetCachesAfterSwap(t.Context()))
+		assert.Equal(t, want, readResyncPublicationState(t, database))
+	})
+
+	t.Run("in-process", func(t *testing.T) {
+		e, database, want := newResyncPublicationEngine(t)
+		var details []string
+		stats := e.ResyncAll(t.Context(), func(p Progress) {
+			if isResyncPublicationDetail(p.Detail) {
+				details = append(details, p.Detail)
+			}
+		})
+		require.False(t, stats.Aborted, "warnings: %v", stats.Warnings)
+		require.True(t, stats.ArchiveRebuilt)
+		assert.Equal(t, []string{
+			"Checkpointing rebuilt database",
+			"Closing rebuilt database",
+			"Swapping rebuilt database into place",
+		}, details)
+		assert.Equal(t, want, readResyncPublicationState(t, database))
+	})
+}
+
+// requireOriginalArchiveServes checks that an aborted build left the original
+// archive in place, readable and writable.
+func requireOriginalArchiveServes(t *testing.T, e *Engine, database *db.DB) {
+	t.Helper()
+	page, err := database.ListSessions(t.Context(), db.SessionFilter{})
+	require.NoError(t, err)
+	assert.Len(t, page.Sessions, 3, "original archive must be untouched")
+	ok, err := database.StarSession(t.Context(), "keep0")
+	require.NoError(t, err,
+		"writes must recover after the aborted resync without a restart")
+	assert.True(t, ok)
+}
+
+// TestResyncAbortsWhenReplacementCheckpointFails pins a real read snapshot on
+// the replacement while later build steps commit, so the final truncate
+// checkpoint reports busy. The build must abort before closing or installing.
+func TestResyncAbortsWhenReplacementCheckpointFails(t *testing.T) {
+	e, database, _ := newResyncSplitEngine(t)
+	restore := db.SetCloseDrainTimeoutForTest(100 * time.Millisecond)
+	defer restore()
+
+	var pinned *sql.Rows
+	var details []string
+	stats, err := e.resyncAllWithOptionsAndOperations(
+		t.Context(), func(p Progress) {
+			if isResyncPublicationDetail(p.Detail) {
+				details = append(details, p.Detail)
+			}
+		}, RebuildOptions{}, rebuildOperations{
+			rebuildUsageIndexes: func(ctx context.Context, newDB *db.DB) error {
+				if err := newDB.RebuildBulkImportIndexes(ctx); err != nil {
+					return err
+				}
+				rows, qerr := newDB.Reader().Query(t.Context(), "SELECT id FROM sessions")
+				if qerr != nil {
+					return qerr
+				}
+				t.Cleanup(func() {
+					require.NoError(t, rows.Err())
+					require.NoError(t, rows.Close())
+				})
+				require.True(t, rows.Next())
+				pinned = rows
+				return nil
+			},
+		},
+	)
+	require.NotNil(t, pinned, "the usage-index hook must have pinned a snapshot")
+	require.NoError(t, pinned.Close())
+	require.ErrorIs(t, err, db.ErrWALCheckpointBusy)
+	assert.True(t, stats.Aborted)
+	assert.False(t, stats.ArchiveRebuilt)
+	require.NotEmpty(t, stats.Warnings)
+	assert.Contains(t, stats.Warnings[len(stats.Warnings)-1],
+		"replacement checkpoint failed")
+	assert.Equal(t, []string{"Checkpointing rebuilt database"}, details)
+	requireOriginalArchiveServes(t, e, database)
+}
+
+// TestResyncCanceledDuringFinalizationAborts cancels the rebuild before the
+// checkpoint and before the close. Either way the build must abort without
+// publishing the replacement, through both the worker and in-process paths.
+func TestResyncCanceledDuringFinalizationAborts(t *testing.T) {
+	for _, tc := range []struct{ detail, warning string }{
+		{"Checkpointing rebuilt database", "replacement checkpoint failed"},
+		{"Closing rebuilt database", "resync canceled before swap"},
+	} {
+		t.Run(tc.detail, func(t *testing.T) {
+			e, database, _ := newResyncSplitEngine(t)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			cancelAt := func(p Progress) {
+				if p.Detail == tc.detail {
+					cancel()
+				}
+			}
+
+			_, buildStats, err := e.ResyncBuild(ctx, cancelAt)
+			require.ErrorIs(t, err, context.Canceled)
+			assert.True(t, buildStats.Aborted)
+			assert.NoFileExists(t, e.ResyncTempPath())
+
+			ctx, cancel = context.WithCancel(t.Context())
+			defer cancel()
+			stats := e.ResyncAll(ctx, cancelAt)
+			assert.True(t, stats.Aborted)
+			assert.False(t, stats.ArchiveRebuilt)
+			require.NotEmpty(t, stats.Warnings)
+			assert.Contains(t, stats.Warnings[len(stats.Warnings)-1], tc.warning)
+			requireOriginalArchiveServes(t, e, database)
+			assert.NoFileExists(t, e.ResyncTempPath())
+		})
+	}
 }

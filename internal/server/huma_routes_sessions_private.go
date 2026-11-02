@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"github.com/danielgtaylor/huma/v2"
 	"net/http"
 
 	"go.kenn.io/agentsview/internal/db"
@@ -13,7 +14,7 @@ import (
 // analytics but its transcript is elided from published snapshot exports (see
 // specs/per-session-redaction.md). Local/admin only; the deployed snapshot
 // Worker exposes no such mutation.
-func (s *Server) registerSessionPrivateRoute(group routeGroup) {
+func (s *Server) registerSessionPrivateRoute(group *huma.Group) {
 	s.patch(group, "/sessions/{id}/private", "Set session private", s.humaSetSessionPrivate)
 }
 
@@ -35,7 +36,7 @@ func (s *Server) humaSetSessionPrivate(
 	if session == nil {
 		return nil, apiError(http.StatusNotFound, "session not found")
 	}
-	if err := s.db.SetSessionPrivate(in.ID, in.Body.Private); err != nil {
+	if err := s.db.SetSessionPrivate(ctx, in.ID, in.Body.Private); err != nil {
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
 		}

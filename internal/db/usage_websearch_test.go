@@ -3,7 +3,6 @@
 package db
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
@@ -96,12 +95,19 @@ func TestUsageRowWebSearchRequestsIgnoresUsageEvents(t *testing.T) {
 	assert.Zero(t, usageRowWebSearchRequests("usage_event", blob))
 }
 
-// webSearchUsageDB seeds one Claude session whose two assistant messages
+// webSearchUsageDBForAgent seeds one agent session whose two assistant messages
 // bill identical tokens, one of them alongside the given number of
 // web searches.
 // Pricing is $1/MTok in and $2/MTok out, so each message's token cost is
 // exactly $0.30 (100_000 in, 100_000 out).
 func webSearchUsageDB(t *testing.T, model string, searches int) *DB {
+	t.Helper()
+	return webSearchUsageDBForAgent(t, model, searches, "claude")
+}
+
+func webSearchUsageDBForAgent(
+	t *testing.T, model string, searches int, agent string,
+) *DB {
 	t.Helper()
 	d := testDB(t)
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
@@ -113,9 +119,13 @@ func webSearchUsageDB(t *testing.T, model string, searches int) *DB {
 	}}), "UpsertModelPricing")
 
 	insertSession(t, d, "sess-ws", "proj1", func(s *Session) {
-		s.Agent = "claude"
+		s.Agent = agent
 		s.StartedAt = new("2026-07-30T10:00:00Z")
 	})
+	providerID := ""
+	if agent == "posit-assistant" {
+		providerID = "positai"
+	}
 	usage := func(webSearchRequests int) jsontext.Value {
 		blob := `{"input_tokens":100000,"output_tokens":100000,` +
 			`"cache_creation_input_tokens":0,` +
@@ -131,6 +141,7 @@ func webSearchUsageDB(t *testing.T, model string, searches int) *DB {
 			Role:            "assistant",
 			Timestamp:       "2026-07-30T10:01:00Z",
 			Model:           model,
+			ProviderID:      providerID,
 			TokenUsage:      usage(searches),
 			OutputTokens:    100000,
 			HasOutputTokens: true,
@@ -142,6 +153,7 @@ func webSearchUsageDB(t *testing.T, model string, searches int) *DB {
 			Role:            "assistant",
 			Timestamp:       "2026-07-30T10:02:00Z",
 			Model:           model,
+			ProviderID:      providerID,
 			TokenUsage:      usage(0),
 			OutputTokens:    100000,
 			HasOutputTokens: true,
@@ -153,7 +165,7 @@ func webSearchUsageDB(t *testing.T, model string, searches int) *DB {
 }
 
 func TestSessionUsageBillsWebSearchRequests(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	d := webSearchUsageDB(t, "claude-websearch-test", 2)
 
 	usage, err := d.GetSessionUsage(ctx, "sess-ws", true)
@@ -173,7 +185,7 @@ func TestSessionUsageBillsWebSearchRequests(t *testing.T) {
 }
 
 func TestSessionUsageBreakdownOmitsAbsentWebSearchRequests(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	d := webSearchUsageDB(t, "claude-websearch-test", 0)
 
 	usage, err := d.GetSessionUsage(ctx, "sess-ws", true)
@@ -188,7 +200,7 @@ func TestSessionUsageBreakdownOmitsAbsentWebSearchRequests(t *testing.T) {
 }
 
 func TestDailyUsageBillsWebSearchRequestsOnce(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	d := webSearchUsageDB(t, "claude-websearch-test", 2)
 
 	result, err := d.GetDailyUsage(ctx, UsageFilter{
@@ -200,10 +212,37 @@ func TestDailyUsageBillsWebSearchRequestsOnce(t *testing.T) {
 		result.Totals.TotalCost)
 }
 
+func TestPositUsagePremiumLeavesWebSearchFeeUnadjusted(t *testing.T) {
+	ctx := t.Context()
+	d := webSearchUsageDBForAgent(
+		t, "claude-websearch-test", 2, "posit-assistant")
+
+	usage, err := d.GetSessionUsage(ctx, "sess-ws", true)
+	require.NoError(t, err)
+	require.NotNil(t, usage)
+	require.Len(t, usage.Breakdown, 2)
+	assert.Equal(t, money.MustParseDollars("0.68"), usage.Cost)
+	assert.Equal(t, money.MustParseDollars("0.35"), usage.Breakdown[0].Cost)
+	assert.Equal(t, money.MustParseDollars("0.33"), usage.Breakdown[1].Cost)
+
+	daily, err := d.GetDailyUsage(ctx, UsageFilter{
+		From: "2026-07-01", To: "2026-07-31", Timezone: "UTC",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, money.MustParseDollars("0.68"), daily.Totals.TotalCost)
+
+	report, err := d.GetActivityReport(ctx,
+		AnalyticsFilter{Timezone: "UTC"}, dayQuery(t, "2026-07-30", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, money.MustParseDollars("0.68"), report.Totals.Cost)
+	t.Logf("observed Posit model cost: $%.6f at 11/10=1.1; fixed fee remains $0.02",
+		float64(usage.Breakdown[0].Cost.Microdollars)/1_000_000)
+}
+
 // A duplicate of the same Claude message must not double the fee, the same
 // way it must not double the tokens.
 func TestDailyUsageWebSearchFeeSurvivesDedup(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	d := webSearchUsageDB(t, "claude-websearch-test", 2)
 
 	insertSession(t, d, "sess-ws-fork", "proj1", func(s *Session) {
@@ -236,7 +275,7 @@ func TestDailyUsageWebSearchFeeSurvivesDedup(t *testing.T) {
 }
 
 func TestAsymmetricClaudeSnapshotsPreserveWebSearchFee(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	d := webSearchUsageDB(t, "claude-websearch-test", 2)
 	insertMessages(t, d, Message{
 		SessionID: "sess-ws", Ordinal: 2,
@@ -285,7 +324,7 @@ func TestAsymmetricClaudeSnapshotsPreserveWebSearchFee(t *testing.T) {
 // spend that does not depend on token rates. The row stays unpriced so the
 // session is still reported as an incomplete estimate.
 func TestSessionUsageBillsWebSearchOnUnpricedModel(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	d := webSearchUsageDB(t, "some-unlisted-model", 2)
 
 	usage, err := d.GetSessionUsage(ctx, "sess-ws", true)
@@ -310,7 +349,7 @@ func TestSessionUsageBillsWebSearchOnUnpricedModel(t *testing.T) {
 }
 
 func TestActivityReportBillsWebSearchRequests(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	d := webSearchUsageDB(t, "claude-websearch-test", 2)
 
 	report, err := d.GetActivityReport(ctx,
@@ -322,7 +361,7 @@ func TestActivityReportBillsWebSearchRequests(t *testing.T) {
 }
 
 func TestSessionUsageRowsCarryWebSearchRequests(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	d := webSearchUsageDB(t, "claude-websearch-test", 2)
 
 	rowSet, err := d.GetSessionUsageRows(ctx, []string{"sess-ws"})

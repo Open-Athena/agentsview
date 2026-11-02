@@ -1,15 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import {
-  ApiError as GeneratedApiError,
-  CancelablePromise,
-  SearchService,
-} from "../api/generated/index.js";
-import type { SearchResponse } from "../api/types.js";
-import {
-  SEARCH_MODE_STORAGE_KEY,
-  createSearchStore,
-  type SearchMode,
-} from "./search.svelte.js";
+import { SearchService } from "../api/generated/index.js";
+import { ApiError } from "../api/runtime.js";
+import type { SearchResponse } from "../api/generated/index.js";
+import type { DbContentMatch, ServiceContentSearchResult } from "../api/generated/index.js";
+import { SEARCH_MODE_STORAGE_KEY, createSearchStore, type SearchMode } from "./search.svelte.js";
 
 vi.mock("../api/generated/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/generated/index.js")>();
@@ -24,6 +18,18 @@ vi.mock("../api/generated/index.js", async (importOriginal) => {
 
 const searchService = vi.mocked(SearchService);
 const DEBOUNCE_MS = 300;
+
+function contentResult(matches: DbContentMatch[]): ServiceContentSearchResult {
+  return {
+    matches,
+    revision_bound: false,
+    coverage: {
+      status: "ready",
+      lexical: { status: "ready" },
+      semantic: { status: "ready" },
+    },
+  };
+}
 
 function memoryStorage(initial: Record<string, string> = {}) {
   const values = new Map(Object.entries(initial));
@@ -51,12 +57,15 @@ function fullTextResponse(query: string, count = 1): SearchResponse {
   };
 }
 
-function contentMatch(sessionId: string, ordinal: number, score: number) {
+function contentMatch(sessionId: string, ordinal: number, score: number): DbContentMatch {
   return {
     session_id: sessionId,
     project: "semantic-project",
     agent: "claude",
+    location: "message",
+    role: "user",
     ordinal,
+    ordinal_range: [ordinal, ordinal],
     timestamp: `2026-06-${String(ordinal).padStart(2, "0")}T10:00:00Z`,
     snippet: `semantic snippet ${ordinal}`,
     score,
@@ -73,18 +82,8 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-function generatedApiError(status: number, detail: string): GeneratedApiError {
-  return new GeneratedApiError(
-    {} as never,
-    {
-      url: "/api/v1/search/content",
-      ok: false,
-      status,
-      statusText: status === 501 ? "Not Implemented" : "Service Unavailable",
-      body: { error: detail },
-    },
-    `request failed with ${status}`,
-  );
+function generatedApiError(status: number, detail: string): ApiError {
+  return new ApiError(status, detail);
 }
 
 async function runDebounce() {
@@ -143,10 +142,7 @@ describe("SearchStore", () => {
     store.setSort("recency");
     store.clear();
 
-    expect(storage.setItem).toHaveBeenCalledWith(
-      SEARCH_MODE_STORAGE_KEY,
-      "hybrid",
-    );
+    expect(storage.setItem).toHaveBeenCalledWith(SEARCH_MODE_STORAGE_KEY, "hybrid");
     expect(store.mode).toBe("hybrid");
     expect(store.sort).toBe("recency");
   });
@@ -158,12 +154,15 @@ describe("SearchStore", () => {
     store.search("needle", "alpha");
     await runDebounce();
 
-    expect(searchService.getApiV1Search).toHaveBeenCalledWith({
-      q: "needle",
-      project: "alpha",
-      limit: 30,
-      sort: "relevance",
-    });
+    expect(searchService.getApiV1Search).toHaveBeenCalledWith(
+      {
+        q: "needle",
+        project: "alpha",
+        limit: 30,
+        sort: "relevance",
+      },
+      expect.objectContaining({ signal: expect.anything() }),
+    );
     expect(searchService.getApiV1SearchContent).not.toHaveBeenCalled();
     expect(store.results).toEqual([
       {
@@ -185,22 +184,27 @@ describe("SearchStore", () => {
     async (mode: SearchMode) => {
       const store = createSearchStore(memoryStorage());
       store.setMode(mode);
-      searchService.getApiV1SearchContent.mockResolvedValueOnce({
-        matches: [contentMatch("semantic-1", 4, 0.9)],
-      });
+      searchService.getApiV1SearchContent.mockResolvedValueOnce(
+        contentResult([contentMatch("semantic-1", 4, 0.9)]),
+      );
 
       store.search("  padded query  ", "semantic-project");
       await runDebounce();
 
-      expect(searchService.getApiV1SearchContent).toHaveBeenCalledWith({
-        pattern: "padded query",
-        mode,
-        project: "semantic-project",
-        limit: 120,
-        xAgentsViewSearchIntent: "semantic",
-        includeOneShot: true,
-        includeAutomated: true,
-      });
+      expect(searchService.getApiV1SearchContent).toHaveBeenCalledWith(
+        {
+          pattern: "padded query",
+          mode,
+          project: "semantic-project",
+          limit: 120,
+          include_one_shot: true,
+          include_automated: true,
+        },
+        expect.objectContaining({
+          signal: expect.anything(),
+          headers: { "X-AgentsView-Search-Intent": "semantic" },
+        }),
+      );
       expect(searchService.getApiV1Search).not.toHaveBeenCalled();
       expect(store.results[0]).toEqual({
         session_id: "semantic-1",
@@ -215,10 +219,79 @@ describe("SearchStore", () => {
     },
   );
 
-  it("deduplicates ranked content results in response order and truncates to 30", async () => {
-    const store = createSearchStore(
-      memoryStorage({ [SEARCH_MODE_STORAGE_KEY]: "semantic" }),
+  it.each(["fulltext", "semantic", "hybrid"] as const)(
+    "reruns %s with the selected dates and removes bounds for All time",
+    async (mode) => {
+      const store = createSearchStore(memoryStorage());
+      store.setMode(mode);
+      searchService.getApiV1Search.mockResolvedValue(fullTextResponse("needle"));
+      searchService.getApiV1SearchContent.mockResolvedValue(contentResult([]));
+      const request =
+        mode === "fulltext" ? searchService.getApiV1Search : searchService.getApiV1SearchContent;
+
+      store.search("needle", "alpha");
+      await runDebounce();
+      store.setRange({ mode: "custom", from: "2026-07-01", to: "2026-07-14" });
+      await flushMicrotasks();
+
+      expect(request).toHaveBeenCalledTimes(2);
+      expect(request).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          project: "alpha",
+          date_from: "2026-07-01",
+          date_to: "2026-07-14",
+          ...(mode === "fulltext"
+            ? {}
+            : {
+                timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+              }),
+        }),
+        expect.anything(),
+      );
+
+      store.setRange({ mode: "relative", days: 0 });
+      await flushMicrotasks();
+      const params = request.mock.calls.at(-1)![0];
+      expect(params).not.toHaveProperty("date_from");
+      expect(params).not.toHaveProperty("date_to");
+      expect(request).toHaveBeenCalledTimes(3);
+    },
+  );
+
+  it("cancels the previous range request and keeps the range across retries and mode changes", async () => {
+    const store = createSearchStore(memoryStorage());
+    store.setMode("semantic");
+    const old = deferred<ServiceContentSearchResult>();
+    searchService.getApiV1SearchContent.mockReturnValueOnce(old.promise);
+    searchService.getApiV1SearchContent.mockRejectedValueOnce(new Error("timeout"));
+    store.search("needle");
+    await runDebounce();
+    const oldSignal = searchService.getApiV1SearchContent.mock.calls[0]![1]!.signal!;
+
+    store.setRange({ mode: "calendar", unit: "day", anchor: "2026-07-04" });
+    await flushMicrotasks();
+    expect(oldSignal.aborted).toBe(true);
+    old.resolve(contentResult([contentMatch("out-of-range", 1, 0.9)]));
+    await flushMicrotasks();
+    expect(store.results).toEqual([]);
+    expect(store.error?.kind).toBe("timeout");
+
+    searchService.getApiV1SearchContent.mockResolvedValue(
+      contentResult([contentMatch("in-range", 4, 0.8)]),
     );
+    store.retry();
+    await flushMicrotasks();
+    store.setMode("hybrid");
+    await flushMicrotasks();
+    expect(searchService.getApiV1SearchContent).toHaveBeenLastCalledWith(
+      expect.objectContaining({ mode: "hybrid", date_from: "2026-07-04", date_to: "2026-07-04" }),
+      expect.anything(),
+    );
+    expect(store.results[0]?.session_id).toBe("in-range");
+  });
+
+  it("deduplicates ranked content results in response order and truncates to 30", async () => {
+    const store = createSearchStore(memoryStorage({ [SEARCH_MODE_STORAGE_KEY]: "semantic" }));
     const matches = [
       contentMatch("first", 1, 0.1),
       contentMatch("duplicate", 2, 0.99),
@@ -227,7 +300,7 @@ describe("SearchStore", () => {
         contentMatch(`session-${index}`, index + 4, 100 - index),
       ),
     ];
-    searchService.getApiV1SearchContent.mockResolvedValueOnce({ matches });
+    searchService.getApiV1SearchContent.mockResolvedValueOnce(contentResult(matches));
 
     store.search("ranked");
     await runDebounce();
@@ -239,38 +312,32 @@ describe("SearchStore", () => {
       "session-0",
       "session-1",
     ]);
-    expect(store.results.find((result) => result.session_id === "duplicate")?.ordinal)
-      .toBe(2);
+    expect(store.results.find((result) => result.session_id === "duplicate")?.ordinal).toBe(2);
     expect(store.results.at(-1)?.session_id).toBe("session-27");
   });
 
   it.each([
-    [501, "Semantic search is unavailable: run agentsview embeddings build", "semantic-unavailable"],
+    [
+      501,
+      "Semantic search is unavailable: run agentsview embeddings build",
+      "semantic-unavailable",
+    ],
     [503, "Embedding provider is temporarily unavailable; retry shortly", "generic"],
-  ] as const)(
-    "preserves actionable backend detail for HTTP %i",
-    async (status, detail, kind) => {
-      const store = createSearchStore(
-        memoryStorage({ [SEARCH_MODE_STORAGE_KEY]: "semantic" }),
-      );
-      searchService.getApiV1SearchContent.mockRejectedValueOnce(
-        generatedApiError(status, detail),
-      );
+  ] as const)("preserves actionable backend detail for HTTP %i", async (status, detail, kind) => {
+    const store = createSearchStore(memoryStorage({ [SEARCH_MODE_STORAGE_KEY]: "semantic" }));
+    searchService.getApiV1SearchContent.mockRejectedValueOnce(generatedApiError(status, detail));
 
-      store.search("failure");
-      await runDebounce();
+    store.search("failure");
+    await runDebounce();
 
-      expect(store.error).toEqual({ detail, kind });
-      expect(store.results).toEqual([]);
-      expect(store.isSearching).toBe(false);
-    },
-  );
+    expect(store.error).toEqual({ detail, kind });
+    expect(store.results).toEqual([]);
+    expect(store.isSearching).toBe(false);
+  });
 
   it("keeps a full-text 501 generic: setup guidance only applies to semantic modes", async () => {
     const store = createSearchStore(memoryStorage());
-    searchService.getApiV1Search.mockRejectedValueOnce(
-      generatedApiError(501, "not implemented"),
-    );
+    searchService.getApiV1Search.mockRejectedValueOnce(generatedApiError(501, "not implemented"));
 
     store.search("fulltext failure");
     await runDebounce();
@@ -304,7 +371,7 @@ describe("SearchStore", () => {
     const storage = memoryStorage();
     const store = createSearchStore(storage);
     store.search("  rerun me  ", "alpha");
-    searchService.getApiV1SearchContent.mockResolvedValueOnce({ matches: [] });
+    searchService.getApiV1SearchContent.mockResolvedValueOnce(contentResult([]));
 
     store.setMode("semantic");
     await flushMicrotasks();
@@ -312,21 +379,24 @@ describe("SearchStore", () => {
 
     expect(searchService.getApiV1Search).not.toHaveBeenCalled();
     expect(searchService.getApiV1SearchContent).toHaveBeenCalledOnce();
-    expect(searchService.getApiV1SearchContent).toHaveBeenCalledWith({
-      pattern: "rerun me",
-      mode: "semantic",
-      project: "alpha",
-      limit: 120,
-      xAgentsViewSearchIntent: "semantic",
-      includeOneShot: true,
-      includeAutomated: true,
-    });
+    expect(searchService.getApiV1SearchContent).toHaveBeenCalledWith(
+      {
+        pattern: "rerun me",
+        mode: "semantic",
+        project: "alpha",
+        limit: 120,
+        include_one_shot: true,
+        include_automated: true,
+      },
+      expect.objectContaining({
+        signal: expect.anything(),
+        headers: { "X-AgentsView-Search-Intent": "semantic" },
+      }),
+    );
   });
 
   it("retry immediately reruns the active semantic query exactly once", async () => {
-    const store = createSearchStore(
-      memoryStorage({ [SEARCH_MODE_STORAGE_KEY]: "semantic" }),
-    );
+    const store = createSearchStore(memoryStorage({ [SEARCH_MODE_STORAGE_KEY]: "semantic" }));
     searchService.getApiV1SearchContent.mockRejectedValueOnce(
       generatedApiError(503, "Embedding provider is temporarily unavailable"),
     );
@@ -335,30 +405,33 @@ describe("SearchStore", () => {
     expect(store.error).not.toBeNull();
 
     vi.clearAllMocks();
-    searchService.getApiV1SearchContent.mockResolvedValueOnce({ matches: [] });
+    searchService.getApiV1SearchContent.mockResolvedValueOnce(contentResult([]));
     store.retry();
     await flushMicrotasks();
     await vi.advanceTimersByTimeAsync(DEBOUNCE_MS + 10);
 
     expect(searchService.getApiV1SearchContent).toHaveBeenCalledOnce();
-    expect(searchService.getApiV1SearchContent).toHaveBeenCalledWith({
-      pattern: "try again",
-      mode: "semantic",
-      project: "alpha",
-      limit: 120,
-      xAgentsViewSearchIntent: "semantic",
-      includeOneShot: true,
-      includeAutomated: true,
-    });
+    expect(searchService.getApiV1SearchContent).toHaveBeenCalledWith(
+      {
+        pattern: "try again",
+        mode: "semantic",
+        project: "alpha",
+        limit: 120,
+        include_one_shot: true,
+        include_automated: true,
+      },
+      expect.objectContaining({
+        signal: expect.anything(),
+        headers: { "X-AgentsView-Search-Intent": "semantic" },
+      }),
+    );
     expect(searchService.getApiV1Search).not.toHaveBeenCalled();
   });
 
   it.each(["semantic", "hybrid"] as const)(
     "classifies a %s request timeout for friendly presentation",
     async (mode) => {
-      const store = createSearchStore(
-        memoryStorage({ [SEARCH_MODE_STORAGE_KEY]: mode }),
-      );
+      const store = createSearchStore(memoryStorage({ [SEARCH_MODE_STORAGE_KEY]: mode }));
       searchService.getApiV1SearchContent.mockRejectedValueOnce(
         generatedApiError(503, "request timed out"),
       );
@@ -391,9 +464,9 @@ describe("SearchStore", () => {
     store.search("stale");
     await runDebounce();
 
-    searchService.getApiV1SearchContent.mockResolvedValueOnce({
-      matches: [contentMatch("newer", 8, 0.8)],
-    });
+    searchService.getApiV1SearchContent.mockResolvedValueOnce(
+      contentResult([contentMatch("newer", 8, 0.8)]),
+    );
     store.setMode("semantic");
     await flushMicrotasks();
 
@@ -409,13 +482,20 @@ describe("SearchStore", () => {
     const store = createSearchStore(memoryStorage());
     let completeRequest!: (value: SearchResponse) => void;
     let wasCancelled = false;
-    const request = new CancelablePromise<SearchResponse>((resolve, _reject, onCancel) => {
-      completeRequest = resolve;
-      onCancel(() => {
-        wasCancelled = true;
-      });
-    });
-    searchService.getApiV1Search.mockReturnValueOnce(request as never);
+    searchService.getApiV1Search.mockImplementationOnce(
+      (_params, options) =>
+        new Promise<SearchResponse>((resolve, reject) => {
+          completeRequest = resolve;
+          options?.signal?.addEventListener(
+            "abort",
+            () => {
+              reject(new DOMException("Aborted", "AbortError"));
+              wasCancelled = true;
+            },
+            { once: true },
+          );
+        }) as never,
+    );
 
     store.search("cancel me");
     await runDebounce();

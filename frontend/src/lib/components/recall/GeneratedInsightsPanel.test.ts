@@ -30,6 +30,7 @@ const state = vi.hoisted(() => {
     created_at: "2026-08-01T12:00:00Z",
   };
   return {
+    serverVersion: { read_only: false, insight_generation_available: true },
     sessions: {
       agents: [] as Array<{ name: string; session_count: number }>,
       projects: [],
@@ -82,10 +83,7 @@ vi.mock("../../stores/sessions.svelte.js", () => ({
 
 vi.mock("../../stores/sync.svelte.js", () => ({
   sync: {
-    serverVersion: {
-      read_only: false,
-      insight_generation_available: true,
-    },
+    serverVersion: state.serverVersion,
     stats: { earliest_session: "2026-01-01T00:00:00Z" },
   },
 }));
@@ -96,6 +94,7 @@ vi.mock("../../api/client.js", () => ({
 
 vi.mock("../../utils/markdown.js", () => ({
   renderMarkdown: (content: string) => content,
+  loadAssetImages: () => ({ destroy() {} }),
 }));
 
 // @ts-ignore
@@ -106,6 +105,7 @@ describe("GeneratedInsightsPanel", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    state.serverVersion.insight_generation_available = true;
     router.route = "recall";
     router.params = { tab: "generated" };
     state.store.selectedId = 42;
@@ -148,19 +148,29 @@ describe("GeneratedInsightsPanel", () => {
     component = mount(GeneratedInsightsPanel, { target: document.body });
     await tick();
 
-    expect(state.sessions.agents.map((agent) => agent.name)).toEqual([
-      "codex",
-      "claude",
-    ]);
+    expect(state.sessions.agents.map((agent) => agent.name)).toEqual(["codex", "claude"]);
+  });
+
+  it("disables generation when a writable server denies the capability", async () => {
+    state.serverVersion.insight_generation_available = false;
+    component = mount(GeneratedInsightsPanel, { target: document.body });
+    await tick();
+    const generate = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
+      (button) => button.textContent?.trim() === "Generate",
+    );
+    expect(generate).toBeDefined();
+    expect(generate!.disabled).toBe(true);
+    generate!.click();
+    expect(mocks.generate).not.toHaveBeenCalled();
   });
 
   it("generates from the scope retained in the insights store", async () => {
     component = mount(GeneratedInsightsPanel, { target: document.body });
     await tick();
 
-    const generate = Array.from(
-      document.querySelectorAll<HTMLButtonElement>("button"),
-    ).find((button) => button.textContent?.trim() === "Generate");
+    const generate = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
+      (button) => button.textContent?.trim() === "Generate",
+    );
     expect(generate).toBeDefined();
     generate!.click();
 
@@ -173,9 +183,7 @@ describe("GeneratedInsightsPanel", () => {
     await tick();
 
     const report = Array.from(
-      document.querySelectorAll<HTMLButtonElement>(
-        ".generated-list button",
-      ),
+      document.querySelectorAll<HTMLButtonElement>(".generated-list button"),
     ).find((button) => button.textContent?.includes("agentsview"));
     expect(report).toBeDefined();
     report!.click();
@@ -190,14 +198,10 @@ describe("GeneratedInsightsPanel", () => {
     component = mount(GeneratedInsightsPanel, { target: document.body });
     await tick();
 
-    const buttons = Array.from(
-      document.querySelectorAll<HTMLButtonElement>("button"),
-    );
+    const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>("button"));
     buttons.find((button) => button.textContent?.trim() === "Export")!.click();
     buttons.find((button) => button.textContent?.trim() === "Publish")!.click();
-    buttons.find(
-      (button) => button.ariaLabel === "Delete generated insight",
-    )!.click();
+    buttons.find((button) => button.ariaLabel === "Delete generated insight")!.click();
     await tick();
 
     expect(mocks.downloadInsightExport).toHaveBeenCalledWith(42);

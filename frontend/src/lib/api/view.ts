@@ -1,8 +1,8 @@
-import { authHeaders, getBase, responseErrorMessage } from "./runtime.js";
+import { orvalFetch } from "./runtime.js";
 
 // Published-snapshot self-description. Served only by the snapshot Worker at
 // /api/v1/view/meta, so it is not part of the generated OpenAPI client (the
-// live Go server has no such route). Hand-written fetch against runtime.js.
+// live Go server has no such route).
 export interface ViewMeta {
   title?: string;
   statsOnly: boolean;
@@ -13,7 +13,5 @@ export interface ViewMeta {
 }
 
 export async function getViewMeta(): Promise<ViewMeta> {
-  const res = await fetch(`${getBase()}/view/meta`, authHeaders());
-  if (!res.ok) throw new Error(await responseErrorMessage(res));
-  return res.json() as Promise<ViewMeta>;
+  return orvalFetch<ViewMeta>("/api/v1/view/meta", { method: "GET" });
 }

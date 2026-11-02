@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -19,9 +20,10 @@ import (
 // Store wraps a PostgreSQL connection for read-only session
 // queries.
 type Store struct {
-	pg           *sql.DB
-	cursorMu     sync.RWMutex
-	cursorSecret []byte
+	hostedRelations bool
+	pg              *sql.DB
+	cursorMu        sync.RWMutex
+	cursorSecret    []byte
 
 	insightCapabilityMu        sync.RWMutex
 	insightGenerationAvailable bool
@@ -44,7 +46,7 @@ type Store struct {
 
 // pgSessionBaseCols is the column list for PG session queries that do not
 // expose source paths.
-const pgSessionBaseCols = `id, project, machine, agent,
+const pgSessionBaseCols = `id, project, project_assigned, machine, agent,
 	agent_label, entrypoint, session_kind,
 	first_message, COALESCE(display_name, session_name) AS display_name, created_at, started_at,
 	ended_at, message_count, user_message_count,
@@ -214,7 +216,7 @@ func scanPGSessionWithSource(
 	var createdAt *time.Time
 	var startedAt, endedAt, deletedAt *time.Time
 	targets := []any{
-		&s.ID, &s.Project, &s.Machine, &s.Agent,
+		&s.ID, &s.Project, &s.ProjectAssigned, &s.Machine, &s.Agent,
 		&s.AgentLabel, &s.Entrypoint, &s.SessionKind,
 		&s.FirstMessage, &s.DisplayName,
 		&createdAt, &startedAt, &endedAt,
@@ -374,13 +376,13 @@ func (s *Store) DecodeCursor(
 		)
 		if err != nil {
 			return db.SessionCursor{},
-				fmt.Errorf("%w: %v",
+				fmt.Errorf("%w: %w",
 					db.ErrInvalidCursor, err)
 		}
 		var c db.SessionCursor
 		if err := json.Unmarshal(data, &c); err != nil {
 			return db.SessionCursor{},
-				fmt.Errorf("%w: %v",
+				fmt.Errorf("%w: %w",
 					db.ErrInvalidCursor, err)
 		}
 		c.Total = 0
@@ -397,7 +399,7 @@ func (s *Store) DecodeCursor(
 	data, err := base64.RawURLEncoding.DecodeString(payload)
 	if err != nil {
 		return db.SessionCursor{},
-			fmt.Errorf("%w: invalid payload: %v",
+			fmt.Errorf("%w: invalid payload: %w",
 				db.ErrInvalidCursor, err)
 	}
 
@@ -405,7 +407,7 @@ func (s *Store) DecodeCursor(
 	if err != nil {
 		return db.SessionCursor{},
 			fmt.Errorf(
-				"%w: invalid signature encoding: %v",
+				"%w: invalid signature encoding: %w",
 				db.ErrInvalidCursor, err)
 	}
 
@@ -427,7 +429,7 @@ func (s *Store) DecodeCursor(
 	var c db.SessionCursor
 	if err := json.Unmarshal(data, &c); err != nil {
 		return db.SessionCursor{},
-			fmt.Errorf("%w: invalid json: %v",
+			fmt.Errorf("%w: invalid json: %w",
 				db.ErrInvalidCursor, err)
 	}
 	return c, nil
@@ -441,7 +443,7 @@ func (s *Store) ListSessions(
 		f.Limit = db.DefaultSessionLimit
 	}
 
-	where, args := buildPGSessionFilter(f)
+	where, args := db.BuildSessionFilterSQL(f, s.sessionDialect())
 
 	dialect := db.PostgresQueryDialect()
 	rs := db.ResolveSort(f)
@@ -537,7 +539,7 @@ func (s *Store) GetSidebarSessionIndex(
 	rootFilter.IncludeChildren = false
 	rootWhere, rootArgs := buildPGSessionBaseFilter(rootFilter)
 	canonicalRootWhere := db.BuildCanonicalRootWhere(
-		db.PostgresQueryDialect(), "sessions", f.IncludeOrphans,
+		s.sessionDialect(), "sessions", f.IncludeOrphans,
 	)
 	var total int
 	countQuery := "SELECT COUNT(*) FROM sessions WHERE " +
@@ -549,13 +551,14 @@ func (s *Store) GetSidebarSessionIndex(
 			fmt.Errorf("counting sidebar roots: %w", err)
 	}
 
-	where, args := buildPGSessionFilter(f)
+	where, args := db.BuildSessionFilterSQL(f, s.sessionDialect())
 	query := `
 		SELECT
 			id,
 			parent_session_id,
 			relationship_type,
 			project,
+			project_assigned,
 			machine,
 			agent,
 			agent_label,
@@ -608,7 +611,7 @@ func (s *Store) getSidebarSessionIndexPage(
 	rootFilter.Cursor = ""
 	rootFilter.Starred = false
 	rootWhere, rootArgs := buildPGSessionBaseFilter(rootFilter)
-	canonicalRootWhere := db.BuildCanonicalRootWhere(db.PostgresQueryDialect(), "sessions", f.IncludeOrphans)
+	canonicalRootWhere := db.BuildCanonicalRootWhere(s.sessionDialect(), "sessions", f.IncludeOrphans)
 	childAutomationPred := pgAutomatedScopePredicate(
 		normalizePGAutomatedScope(f.AutomatedScope, f.ExcludeAutomated),
 		"s.is_automated",
@@ -642,7 +645,7 @@ func (s *Store) getSidebarSessionIndexPage(
 					UNION
 					SELECT t.root_id, s.id
 					FROM sessions s
-					JOIN tree t ON s.parent_session_id = t.id
+					JOIN tree t ON ` + s.sessionDialect().ParentRelation("s", "t") + `
 					WHERE s.message_count > 0
 					  AND s.deleted_at IS NULL
 					  ` + childAutomationWhere + `
@@ -692,7 +695,7 @@ func (s *Store) getSidebarSessionIndexPage(
 			UNION
 			SELECT t.root_id, s.id
 			FROM sessions s
-			JOIN tree t ON s.parent_session_id = t.id
+			JOIN tree t ON ` + s.sessionDialect().ParentRelation("s", "t") + `
 			WHERE s.message_count > 0
 			  AND s.deleted_at IS NULL
 			  ` + childAutomationWhere + `
@@ -781,7 +784,7 @@ func (s *Store) getSidebarSessionIndexPage(
 			UNION
 			SELECT s.id, t.ord
 			FROM sessions s
-			JOIN tree t ON s.parent_session_id = t.id
+			JOIN tree t ON ` + s.sessionDialect().ParentRelation("s", "t") + `
 			WHERE s.message_count > 0
 			  AND s.deleted_at IS NULL
 			  ` + childAutomationWhere + `
@@ -796,6 +799,7 @@ func (s *Store) getSidebarSessionIndexPage(
 			s.parent_session_id,
 			s.relationship_type,
 			s.project,
+			s.project_assigned,
 			s.machine,
 			s.agent,
 			s.agent_label,
@@ -844,6 +848,7 @@ func scanPGSidebarSessionIndexRows(
 			&row.ParentSessionID,
 			&row.RelationshipType,
 			&row.Project,
+			&row.ProjectAssigned,
 			&row.Machine,
 			&row.Agent,
 			&row.AgentLabel,
@@ -897,7 +902,7 @@ func (s *Store) GetSession(
 		id,
 	)
 	sess, err := scanPGSession(row)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
@@ -910,7 +915,7 @@ func (s *Store) GetSession(
 
 // FindSessionIDsByRawSuffix returns up to limit session IDs whose
 // stored id is either the exact raw input or the raw input preceded
-// by an agent prefix. The suffix comparison is literal and results
+// by an agent or host prefix. The suffix comparison is literal and results
 // match SQLite ordering: exact match first, then most recent session.
 func (s *Store) FindSessionIDsByRawSuffix(
 	ctx context.Context, raw string, limit int,
@@ -924,7 +929,7 @@ func (s *Store) FindSessionIDsByRawSuffix(
 	rows, err := s.pg.QueryContext(ctx,
 		`SELECT id FROM sessions
 		 WHERE (id = $1
-		        OR RIGHT(id, LENGTH($1) + 1) = ':' || $1)
+		        OR RIGHT(id, LENGTH($1) + 1) IN (':' || $1, '~' || $1))
 		   AND deleted_at IS NULL
 		 ORDER BY (id = $1) DESC,
 		          COALESCE(ended_at, started_at, created_at) DESC
@@ -968,7 +973,7 @@ func (s *Store) GetSessionFull(
 		id,
 	)
 	sess, err := scanPGSession(row)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
@@ -1018,20 +1023,12 @@ func (s *Store) GetStats(
 	if excludeAutomated {
 		filter += " AND is_automated = FALSE"
 	}
-	query := fmt.Sprintf(`
-		SELECT
-			(SELECT COUNT(*) FROM sessions
-			 WHERE %s),
-			(SELECT COALESCE(SUM(message_count), 0)
-			 FROM sessions WHERE %s),
-			(SELECT COUNT(DISTINCT project) FROM sessions
-			 WHERE %s),
-			(SELECT COUNT(DISTINCT machine) FROM sessions
-			 WHERE %s),
-			(SELECT MIN(COALESCE(started_at, created_at))
-			 FROM sessions
-			 WHERE %s)`,
-		filter, filter, filter, filter, filter)
+	// Sidebar polling needs all totals for the same rows. Aggregate them
+	// together so each refresh visits the filtered sessions only once.
+	query := `SELECT COUNT(*), COALESCE(SUM(message_count), 0),
+		COUNT(DISTINCT project), COUNT(DISTINCT machine),
+		MIN(COALESCE(started_at, created_at))
+		FROM sessions WHERE ` + filter
 
 	var st db.Stats
 	var earliest *time.Time

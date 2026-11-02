@@ -8,12 +8,16 @@ import (
 	"fmt"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/stringutil"
 	kitvec "go.kenn.io/kit/vector"
 )
 
 // snippetMaxRunes bounds the length of a Hit's Snippet; longer chunks are
 // truncated with a trailing ellipsis.
-const snippetMaxRunes = 200
+const (
+	snippetMaxRunes  = 200
+	MaxKNNCandidates = 4096 // sqlite-vec's vec0 KNN candidate ceiling.
+)
 
 // Hit is one unit-level semantic search result, anchored to a specific
 // message. For a run document Ordinal is the anchor: the member message
@@ -115,13 +119,12 @@ func (ix *Index) SearchPage(
 		return nil, false, ix.noActiveGenerationError(ctx)
 	}
 
-	vectors, err := kitvec.EncodeBatched(ctx, enc,
-		[]kitvec.Chunk{{Index: 0, Text: query}})
+	queryVector, err := kitvec.EncodeOne(ctx, enc, query)
 	if err != nil {
 		return nil, false, &QueryEncodeError{Err: err}
 	}
 
-	hits, err := ix.store.QueryGeneration(ctx, active, vectors[0], limit)
+	hits, err := ix.store.QueryGeneration(ctx, active, queryVector, limit)
 	if err != nil {
 		return nil, false, fmt.Errorf("search: %w", err)
 	}
@@ -133,6 +136,12 @@ func (ix *Index) SearchPage(
 
 	hydrated, err := ix.hydrateHits(ctx, hits)
 	return hydrated, exhausted, err
+}
+
+// MaxSearchCandidates reports the largest KNN candidate count accepted by
+// the sqlite-vec engine backing this index.
+func (ix *Index) MaxSearchCandidates() int {
+	return MaxKNNCandidates
 }
 
 // noActiveGenerationError distinguishes an empty index (ErrNoActiveGeneration)
@@ -298,7 +307,7 @@ func resolveRunAnchor(
 	if lo >= hi {
 		lo, hi = memberStart, memberEnd
 	}
-	return offsets[member].Ordinal, truncateRunes(string(runes[lo:hi]), snippetMaxRunes)
+	return offsets[member].Ordinal, stringutil.TruncateRunes(string(runes[lo:hi]), snippetMaxRunes, "…")
 }
 
 // chunkWindow returns the [start, end) rune window of content's
@@ -355,6 +364,7 @@ SELECT doc_key, session_id, ordinal, ordinal_end, subordinate, offsets, content
 		if err != nil {
 			return fmt.Errorf("look up search hit documents: %w", err)
 		}
+		defer rows.Close()
 		for rows.Next() {
 			var key, offsets string
 			var doc mirrorDoc
@@ -404,21 +414,10 @@ func chunkSnippet(content string, chunkIndex int, split kitvec.SplitOptions) str
 	}
 	for _, chunk := range kitvec.Split(content, split) {
 		if chunk.Index == chunkIndex {
-			return truncateRunes(chunk.Text, snippetMaxRunes)
+			return stringutil.TruncateRunes(chunk.Text, snippetMaxRunes, "…")
 		}
 	}
 	return ""
-}
-
-// truncateRunes truncates s to at most maxRunes runes, appending an
-// ellipsis when truncation occurs. It measures in runes so multi-byte
-// characters are never torn apart.
-func truncateRunes(s string, maxRunes int) string {
-	runes := []rune(s)
-	if len(runes) <= maxRunes {
-		return s
-	}
-	return string(runes[:maxRunes]) + "…"
 }
 
 // ResolveMessageUnits maps each ref to the mirror unit containing it,

@@ -1,9 +1,11 @@
 import { describe, it, expect } from "vite-plus/test";
-import { computeMainModel } from "./model.js";
-import type { Message } from "../api/types.js";
+import { computeMainModel, computeMainModelInfo, formatModelEffort } from "./model.js";
+import type { DbMessage as Message } from "../api/generated/index.js";
 
-function msg(role: string, model: string): Message {
+function msg(role: string, model: string, reasoning_effort?: string): Message {
   return {
+    has_context_tokens: false,
+    has_output_tokens: false,
     id: 0,
     session_id: "",
     ordinal: 0,
@@ -15,6 +17,7 @@ function msg(role: string, model: string): Message {
     has_tool_use: false,
     content_length: 0,
     model,
+    reasoning_effort,
     context_tokens: 0,
     output_tokens: 0,
     is_system: false,
@@ -27,11 +30,7 @@ describe("computeMainModel", () => {
   });
 
   it("returns the single model", () => {
-    expect(
-      computeMainModel([
-        msg("assistant", "claude-sonnet-4.6"),
-      ]),
-    ).toBe("claude-sonnet-4.6");
+    expect(computeMainModel([msg("assistant", "claude-sonnet-4.6")])).toBe("claude-sonnet-4.6");
   });
 
   it("returns most frequent model", () => {
@@ -45,12 +44,9 @@ describe("computeMainModel", () => {
   });
 
   it("breaks ties alphabetically", () => {
-    expect(
-      computeMainModel([
-        msg("assistant", "b-model"),
-        msg("assistant", "a-model"),
-      ]),
-    ).toBe("a-model");
+    expect(computeMainModel([msg("assistant", "b-model"), msg("assistant", "a-model")])).toBe(
+      "a-model",
+    );
   });
 
   it("matches the resume mixed-model selection boundary", () => {
@@ -63,38 +59,26 @@ describe("computeMainModel", () => {
   });
 
   it("matches UTF-16 tie ordering for astral and BMP models", () => {
-    expect(
-      computeMainModel([
-        msg("assistant", "\uE000"),
-        msg("assistant", "\u{10000}"),
-      ]),
-    ).toBe("\u{10000}");
+    expect(computeMainModel([msg("assistant", "\uE000"), msg("assistant", "\u{10000}")])).toBe(
+      "\u{10000}",
+    );
   });
 
   it("ignores user messages", () => {
     expect(
-      computeMainModel([
-        msg("user", "some-model"),
-        msg("assistant", "claude-sonnet-4.6"),
-      ]),
+      computeMainModel([msg("user", "some-model"), msg("assistant", "claude-sonnet-4.6")]),
     ).toBe("claude-sonnet-4.6");
   });
 
   it("ignores empty model strings", () => {
-    expect(
-      computeMainModel([
-        msg("assistant", ""),
-        msg("assistant", "claude-sonnet-4.6"),
-      ]),
-    ).toBe("claude-sonnet-4.6");
+    expect(computeMainModel([msg("assistant", ""), msg("assistant", "claude-sonnet-4.6")])).toBe(
+      "claude-sonnet-4.6",
+    );
   });
 
   it("ignores synthetic-only histories", () => {
     expect(
-      computeMainModel([
-        msg("assistant", "<synthetic>"),
-        msg("assistant", "<synthetic>"),
-      ]),
+      computeMainModel([msg("assistant", "<synthetic>"), msg("assistant", "<synthetic>")]),
     ).toBe("");
   });
 
@@ -109,11 +93,41 @@ describe("computeMainModel", () => {
   });
 
   it("returns empty when no model data", () => {
+    expect(computeMainModel([msg("assistant", ""), msg("user", "")])).toBe("");
+  });
+});
+
+describe("computeMainModelInfo", () => {
+  it("returns an empty pair when there are no messages", () => {
+    expect(computeMainModelInfo([])).toEqual({
+      model: "",
+      reasoningEffort: "",
+    });
+  });
+
+  it("selects effort only from the winning assistant model", () => {
     expect(
-      computeMainModel([
-        msg("assistant", ""),
-        msg("user", ""),
+      computeMainModelInfo([
+        msg("assistant", "winning", "medium"),
+        msg("assistant", "winning", "medium"),
+        msg("assistant", "other", "high"),
+        msg("user", "winning", "high"),
       ]),
-    ).toBe("");
+    ).toEqual({ model: "winning", reasoningEffort: "medium" });
+  });
+
+  it("keeps the empty effort bucket as the alphabetical tie winner", () => {
+    expect(
+      computeMainModelInfo([msg("assistant", "model", "high"), msg("assistant", "model")]),
+    ).toEqual({ model: "model", reasoningEffort: "" });
+  });
+
+  it("formats absent effort as model only", () => {
+    expect(formatModelEffort({ model: "model", reasoningEffort: "" })).toBe("model");
+    expect(formatModelEffort({ model: "model", reasoningEffort: "high" })).toBe("model high");
+  });
+
+  it("formats an empty model as an empty label", () => {
+    expect(formatModelEffort({ model: "", reasoningEffort: "high" })).toBe("");
   });
 });

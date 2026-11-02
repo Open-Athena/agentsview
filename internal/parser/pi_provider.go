@@ -2,7 +2,7 @@ package parser
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -125,6 +125,13 @@ func (p *piProvider) FindSource(
 			return source, ok, err
 		}
 	}
+	// Native Pi default filenames are timestamp-prefixed, so a bare header
+	// UUID lookup finds nothing by filename. Fall back to scanning session
+	// headers only after the filename/directory lookup misses, so files with
+	// no header still resolve by their filename-derived identity.
+	if p.Def.Type == AgentPi {
+		return p.sourceForHeaderSessionID(ctx, req.RawSessionID)
+	}
 	return SourceRef{}, false, nil
 }
 
@@ -165,7 +172,7 @@ func (p *piProvider) sourceForSessionID(
 
 	entries, err := os.ReadDir(root)
 	if err != nil {
-		return SourceRef{}, false, nil
+		return SourceRef{}, false, nil //nolint:nilerr // Unavailable optional discovery roots have no matching source.
 	}
 	target := sessionID + ".jsonl"
 	for _, entry := range entries {
@@ -234,7 +241,7 @@ func (p *piProvider) Parse(
 		return ParseOutcome{}, err
 	}
 	if !ok {
-		return ParseOutcome{}, fmt.Errorf("pi source path unavailable")
+		return ParseOutcome{}, errors.New("pi source path unavailable")
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
 	sess, msgs, err := p.parseSession(path, req.Source.ProjectHint, machine)
@@ -289,6 +296,21 @@ func newPiSourceSet(agent AgentType, roots []string) JSONLSourceSet {
 		)
 	}
 
+	// Pi's native session-dir override writes transcripts directly into the
+	// chosen directory, and default homes group them by project. The
+	// pi-subagents extension nests subagent runs several levels below the
+	// project directory, so transcript depth is not capped.
+	if agent == AgentPi {
+		return NewJSONLSourceSet(agent, roots,
+			WithRecursive(),
+			WithSymlinkFollowing(),
+			WithIncludePath(isPiSourcePathAtAnyDepth),
+			WithProjectHint(func(root, path string) string { return "" }),
+			WithSessionIDFromPath(piSessionIDFromPath),
+			WithContentHashing(),
+		)
+	}
+
 	// OMP nests subagent transcripts one directory deeper than the main
 	// session (<project>/<session>/<agent>.jsonl), so it cannot use the
 	// strict two-segment DirectoryJSONLSourceSet layout the other pi-family
@@ -317,6 +339,30 @@ func newPiSourceSet(agent AgentType, roots []string) JSONLSourceSet {
 
 func isPiSourcePath(root, path string) bool {
 	return strings.HasSuffix(filepath.Base(path), ".jsonl")
+}
+
+// isPiSourcePathAtAnyDepth accepts a Pi transcript anywhere under a configured
+// sessions root: directly inside it (the native session-dir override), one
+// project directory down (default homes), or deeper, where pi-subagents keeps
+// each run's child session under the parent transcript's name
+// (<project>/<parent>/<runId>/run-N/session.jsonl). A delegated child can
+// spawn its own children, so the depth is not capped; only empty and traversal
+// segments are rejected. IsPiSessionFile still filters the file contents, so a
+// nested .jsonl that is not a Pi session is not indexed.
+func isPiSourcePathAtAnyDepth(root, path string) bool {
+	if !isPiSourcePath(root, path) {
+		return false
+	}
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	if err != nil {
+		return false
+	}
+	for part := range strings.SplitSeq(rel, string(filepath.Separator)) {
+		if part == "" || part == "." || part == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // isOMPSourcePath accepts OMP transcripts at the main-session depth

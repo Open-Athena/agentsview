@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"github.com/danielgtaylor/huma/v2"
 
 	"go.kenn.io/agentsview/internal/db"
 )
@@ -10,7 +11,8 @@ import (
 // just "longest user prompts": the top-N longest user-role messages by
 // content length, optionally scoped to a comma-separated project list.
 func (s *Server) registerMessagesRoutes() {
-	group := newRouteGroup(s.api, "/api/v1/messages", "Messages")
+	group := huma.NewGroup(s.api, "/api/v1/messages")
+	configureRouteGroup(group, "Messages")
 	s.get(group, "/longest", "Longest user prompts", s.humaLongestPrompts)
 }
 

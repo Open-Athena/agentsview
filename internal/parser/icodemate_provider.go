@@ -2,7 +2,7 @@ package parser
 
 import (
 	"context"
-	"fmt"
+	"errors"
 )
 
 // Icodemate hosts two storage families under one provider and one agent ID:
@@ -21,9 +21,10 @@ import (
 // roots fall through to the generic directory plan.
 
 var (
-	_ Provider                     = (*icodemateProvider)(nil)
-	_ StreamingDiscoverer          = (*icodemateProvider)(nil)
-	_ ChangedPathRelevanceProvider = (*icodemateProvider)(nil)
+	_ Provider                          = (*icodemateProvider)(nil)
+	_ StreamingDiscoverer               = (*icodemateProvider)(nil)
+	_ ChangedPathRelevanceProvider      = (*icodemateProvider)(nil)
+	_ ReconciliationSourceStateResolver = (*icodemateProvider)(nil)
 )
 
 type icodemateProviderFactory struct {
@@ -48,11 +49,11 @@ func (f icodemateProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	opencodeCfg := cfg
 	opencodeCfg.Roots = opencodeRoots
 	provider := &icodemateProvider{
-		opencode: &openCodeFormatProvider{
+		opencode: &SourceSetProvider{
 			sources: newOpenCodeFormatSourceSet(
 				opencodeRoots,
 				openCodeProviderSpecForAgent(AgentIcodemate),
-				cfg.SQLiteContainerUnchangedSinceTrust,
+				cfg.SQLiteContainerListsWatermarkOnly,
 			),
 		},
 		cli:      newIcodemateCLISourceSet(cliRoots),
@@ -66,7 +67,7 @@ func (f icodemateProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 		allSources: newOpenCodeFormatSourceSet(
 			cfg.Roots,
 			openCodeProviderSpecForAgent(AgentIcodemate),
-			cfg.SQLiteContainerUnchangedSinceTrust,
+			cfg.SQLiteContainerListsWatermarkOnly,
 		),
 	}
 	provider.ProviderBase = ProviderBase{
@@ -119,7 +120,7 @@ func splitIcodemateRoots(roots []string) (opencodeRoots, cliRoots []string) {
 
 type icodemateProvider struct {
 	ProviderBase
-	opencode *openCodeFormatProvider
+	opencode *SourceSetProvider
 	cli      *icodemateCLISourceSet
 	// allRoots carries every configured root so reconciliation validates and
 	// walks the full configured scope, not just the OpenCode subset the inner
@@ -221,7 +222,7 @@ func (p *icodemateProvider) Fingerprint(
 	case claudeSource, *claudeSource, MaterializedFileSource:
 		return p.cli.Fingerprint(ctx, source)
 	default:
-		return SourceFingerprint{}, fmt.Errorf("icodemate source path unavailable")
+		return SourceFingerprint{}, errors.New("icodemate source path unavailable")
 	}
 }
 
@@ -236,7 +237,7 @@ func (p *icodemateProvider) Parse(
 		req.Machine = firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
 		return p.cli.Parse(ctx, req)
 	default:
-		return ParseOutcome{}, fmt.Errorf("icodemate source path unavailable")
+		return ParseOutcome{}, errors.New("icodemate source path unavailable")
 	}
 }
 
@@ -264,6 +265,26 @@ func (p *icodemateProvider) SourceForReconciliation(
 	return p.allSources.SourceForReconciliation(ctx, path, project)
 }
 
+func (p *icodemateProvider) SourceForReconciliationWithState(
+	ctx context.Context, path, project string, state ReconciliationSourceState,
+) (SourceRef, bool, error) {
+	return p.allSources.SourceForReconciliationWithState(
+		ctx, path, project, state,
+	)
+}
+
+func (p *icodemateProvider) ReconciliationSourceState(ctx context.Context,
+	source SourceRef,
+) (ReconciliationSourceState, bool) {
+	return p.allSources.ReconciliationSourceState(ctx, source)
+}
+
+func (p *icodemateProvider) ApplyReconciliationSourceState(ctx context.Context,
+	source *SourceRef, state ReconciliationSourceState,
+) error {
+	return p.allSources.ApplyReconciliationSourceState(ctx, source, state)
+}
+
 // ResolveReconciliationScopes preserves the OpenCode container topology for
 // the shared icodemate.db under every configured icodemate root (allSources)
 // while letting CLI projects roots fall through to the generic directory
@@ -279,6 +300,6 @@ func (p *icodemateProvider) ResolveReconciliationScopes(
 		return ReconciliationScopePlan{}, err
 	}
 	return containerAwareReconciliationScopePlan(
-		p.allRoots, req.Roots, p.allSources.reconciliationContainer,
+		p.allRoots, req.Roots, p.allSources.ReconciliationContainer,
 	), nil
 }

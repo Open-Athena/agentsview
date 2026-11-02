@@ -8,14 +8,12 @@ import type { Report } from "../../api/types.js";
 import type { ActivitySessionRow } from "../../api/generated/index";
 import { testMoney } from "../../test/money.js";
 
-function makeRow(
-  overrides: Partial<ActivitySessionRow> = {},
-): ActivitySessionRow {
+function makeRow(overrides: Partial<ActivitySessionRow> = {}): ActivitySessionRow {
   return {
     session_id: "sess",
     title: "Session",
     project: "proj",
-	project_key: "pl1:sha256:proj",
+    project_key: "pl1:sha256:proj",
     agent: "claude",
     primary_model: "opus",
     models: ["opus"],
@@ -26,6 +24,7 @@ function makeRow(
     last_active: "2026-06-16T09:00:00Z",
     timing_quality: "high",
     is_automated: false,
+    is_subagent: false,
     ...overrides,
   };
 }
@@ -33,6 +32,9 @@ function makeRow(
 function makeReport(rows: ActivitySessionRow[]): Report {
   return {
     peak: { agents: 0, at: null },
+    interactive_peak: { agents: 0, at: null },
+    subagent_peak: { agents: 0, at: null },
+    automated_peak: { agents: 0, at: null },
     totals: {
       active_minutes: 0,
       idle_minutes: 0,
@@ -61,7 +63,7 @@ function makeReport(rows: ActivitySessionRow[]): Report {
     by_session: rows,
     sessions_total: rows.length,
     projects: {},
-  } as Report;
+  } as unknown as Report;
 }
 
 // Two timed rows with distinct agent_minutes/cost orderings plus
@@ -148,9 +150,7 @@ describe("SessionsTable", () => {
     });
     await tick();
 
-    const costHeader = document.querySelector(
-      "th.sort-cost button",
-    ) as HTMLElement | null;
+    const costHeader = document.querySelector("th.sort-cost button") as HTMLElement | null;
     expect(costHeader).toBeTruthy();
     costHeader!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     await tick();
@@ -162,9 +162,7 @@ describe("SessionsTable", () => {
   });
 
   it("intercepts a plain left-click on a session link for SPA navigation", async () => {
-    const navSpy = vi
-      .spyOn(router, "navigateToSession")
-      .mockImplementation(() => {});
+    const navSpy = vi.spyOn(router, "navigateToSession").mockImplementation(() => {});
     const report = makeReport(fixtureRows());
     const c = mount(SessionsTable, {
       target: document.body,
@@ -173,9 +171,7 @@ describe("SessionsTable", () => {
     await tick();
 
     // Default order is high-min first, so the first link is its row.
-    const link = document.querySelector(
-      ".session-row .session-link",
-    ) as HTMLAnchorElement | null;
+    const link = document.querySelector(".session-row .session-link") as HTMLAnchorElement | null;
     expect(link).toBeTruthy();
 
     // Real browser clicks are cancelable; preventDefault is a no-op
@@ -223,9 +219,7 @@ describe("SessionsTable", () => {
     });
     await tick();
 
-    const badge = document.querySelector(
-      ".filter-badge",
-    ) as HTMLButtonElement | null;
+    const badge = document.querySelector(".filter-badge") as HTMLButtonElement | null;
     expect(badge).toBeTruthy();
     expect(badge!.textContent).toContain("06:00–09:00");
     badge!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -253,10 +247,11 @@ describe("SessionsTable", () => {
     unmount(c);
   });
 
-  it("flags only automated sessions with an Auto badge", async () => {
+  it("labels subagents before automation and leaves interactive sessions unbadged", async () => {
     const report = makeReport([
       makeRow({ session_id: "human", title: "Human", is_automated: false }),
       makeRow({ session_id: "robot", title: "Robot", is_automated: true }),
+      makeRow({ session_id: "child", title: "Child", is_subagent: true, is_automated: true }),
     ]);
     const c = mount(SessionsTable, {
       target: document.body,
@@ -265,14 +260,13 @@ describe("SessionsTable", () => {
     await tick();
 
     expect(document.querySelectorAll(".auto-badge").length).toBe(1);
-    const robotRow = document.querySelector(
-      '.session-row[data-session-id="robot"]',
-    );
-    const humanRow = document.querySelector(
-      '.session-row[data-session-id="human"]',
-    );
+    const robotRow = document.querySelector('.session-row[data-session-id="robot"]');
+    const humanRow = document.querySelector('.session-row[data-session-id="human"]');
     expect(robotRow?.querySelector(".auto-badge")).toBeTruthy();
     expect(humanRow?.querySelector(".auto-badge")).toBeNull();
+    const child = document.querySelector('.session-row[data-session-id="child"]');
+    expect(child?.querySelector(".subagent-badge")?.textContent).toBe("Subagent");
+    expect(child?.querySelector(".auto-badge")).toBeNull();
 
     unmount(c);
   });

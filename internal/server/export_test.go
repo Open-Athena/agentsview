@@ -586,9 +586,10 @@ func TestGenerateExportHTML_PreservesNonGoalSystemPrefixedRows(t *testing.T) {
 func TestFocusedExportOrdinals(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name string
-		msgs []db.Message
-		want []int
+		name  string
+		agent string
+		msgs  []db.Message
+		want  []int
 	}{
 		{
 			name: "keeps final assistant before next user",
@@ -720,12 +721,44 @@ func TestFocusedExportOrdinals(t *testing.T) {
 			},
 			want: []int{0, 1, 2, 3},
 		},
+		{
+			name:  "keeps a Codex answer that further tool work follows",
+			agent: "codex",
+			msgs: []db.Message{
+				exportUserMsg(0),
+				exportAssistantMsg(1, "answer"),
+				exportToolMsg(2, "[Bash]\nkeep going"),
+				exportUserMsg(3),
+			},
+			want: []int{0, 1, 3},
+		},
+		{
+			name:  "keeps a TraeX answer that further tool work follows",
+			agent: "traex",
+			msgs: []db.Message{
+				exportUserMsg(0),
+				exportAssistantMsg(1, "answer"),
+				exportToolMsg(2, "[Bash]\nkeep going"),
+				exportUserMsg(3),
+			},
+			want: []int{0, 1, 3},
+		},
+		{
+			name:  "keeps dropping Codex turns that never answered",
+			agent: "codex",
+			msgs: []db.Message{
+				exportUserMsg(0),
+				exportToolMsg(1, "[Bash]\nmake test"),
+				exportUserMsg(2),
+			},
+			want: []int{0, 2},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			visible := focusedExportOrdinals(tt.msgs)
+			visible := focusedExportOrdinals(tt.msgs, tt.agent)
 			got := make([]int, 0, len(tt.msgs))
 			for _, msg := range tt.msgs {
 				if visible[msg.Ordinal] {
@@ -1161,27 +1194,6 @@ func TestSanitizeFilename(t *testing.T) {
 	}
 }
 
-func TestTruncateStr(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name string
-		in   string
-		max  int
-		want string
-	}{
-		{"Short", "hi", 10, "hi"},
-		{"Exact", "hello", 5, "hello"},
-		{"Long", "hello world", 5, "hello..."},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			got := truncateStr(tt.in, tt.max)
-			assert.Equal(t, tt.want, got)
-		})
-	}
-}
-
 // TestExportTemplateValid ensures the template parses and
 // renders without error for a minimal input.
 func TestExportTemplateValid(t *testing.T) {
@@ -1283,7 +1295,7 @@ func TestCreateGist(t *testing.T) {
 			ts := stubServer(t, http.MethodPost, "tok", tt.respStatus, tt.respBody)
 			defer ts.Close()
 
-			ctx := context.Background()
+			ctx := t.Context()
 			if tt.cancelCtx {
 				var cancel context.CancelFunc
 				ctx, cancel = context.WithCancel(ctx)
@@ -1342,7 +1354,7 @@ func TestCreateGistVisibility(t *testing.T) {
 			defer ts.Close()
 
 			_, err := createGistWithURL(
-				context.Background(), ts.URL,
+				t.Context(), ts.URL,
 				"tok", "f.html", "desc", "content", tt.public,
 			)
 			require.NoError(t, err)
@@ -1355,9 +1367,9 @@ func TestResolveGitHubToken(t *testing.T) {
 	originalGhAuthTokenOutput := ghAuthTokenOutput
 	t.Cleanup(func() { ghAuthTokenOutput = originalGhAuthTokenOutput })
 
-	localCtx := context.WithValue(context.Background(), ctxKeyHumaRequestInfo,
+	localCtx := context.WithValue(t.Context(), ctxKeyHumaRequestInfo,
 		requestInfo{RemoteAddr: "127.0.0.1:1234"})
-	remoteCtx := context.WithValue(context.Background(), ctxKeyHumaRequestInfo,
+	remoteCtx := context.WithValue(t.Context(), ctxKeyHumaRequestInfo,
 		requestInfo{RemoteAddr: "127.0.0.1:1234", Forwarded: true})
 	tests := []struct {
 		name       string
@@ -1484,7 +1496,7 @@ func TestValidateGithubToken(t *testing.T) {
 			ts := stubServer(t, http.MethodGet, "tok", tt.respStatus, tt.respBody)
 			defer ts.Close()
 
-			ctx := context.Background()
+			ctx := t.Context()
 			if tt.cancelCtx {
 				var cancel context.CancelFunc
 				ctx, cancel = context.WithCancel(ctx)

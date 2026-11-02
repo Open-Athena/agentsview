@@ -1,7 +1,6 @@
 package server_test
 
 import (
-	"context"
 	"net/http"
 	"testing"
 
@@ -30,7 +29,7 @@ func TestSessionManagementSetPrivateHandler(t *testing.T) {
 	assert.True(t, got.Private, "response reports private")
 
 	// Persisted: a fresh GetSession sees it.
-	stored, err := te.db.GetSession(context.Background(), "s1")
+	stored, err := te.db.GetSession(t.Context(), "s1")
 	require.NoError(t, err)
 	require.NotNil(t, stored)
 	assert.True(t, stored.Private, "flag persisted")
@@ -97,7 +96,7 @@ func TestSessionManagementTrashRestoreAndPermanentDeleteHandlers(t *testing.T) {
 	w = te.del(t, "/api/v1/sessions/s1/permanent")
 	require.Equal(t, http.StatusNoContent, w.Code, "body: %s", w.Body.String())
 
-	got, err := te.db.GetSessionFull(context.Background(), "s1")
+	got, err := te.db.GetSessionFull(t.Context(), "s1")
 	require.NoError(t, err)
 	assert.Nil(t, got)
 }

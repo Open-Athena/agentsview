@@ -11,14 +11,13 @@
   import {
     DataService,
     SettingsService,
-    type ApplyWorktreeMappingsResponse,
-    type DataProjectRulesResponse,
     type DbProjectRule,
     type WorktreeMappingRequest,
   } from "../../api/generated/index";
-  import { callGenerated, isAbortError } from "../../api/runtime.js";
+  import { isAbortError } from "../../api/runtime.js";
   import { formatDateTime, m } from "../../i18n/index.js";
   import { LatestRead } from "../../utils/latest-read.js";
+  import { sessions } from "../../stores/sessions.svelte.js";
 
   interface Props {
     readOnly?: boolean;
@@ -32,7 +31,7 @@
      * component switches machines locally.
      */
     onMachineChange?: (machine: string) => void;
-    onSelectProject: (label: string) => void;
+    onSelectProject?: (label: string) => void;
     /** Called after each successful create/update/delete/apply mutation. */
     onMutated?: () => void;
   }
@@ -49,7 +48,7 @@
     machine: initialMachine = "",
     refreshVersion = 0,
     onMachineChange = undefined,
-    onSelectProject,
+    onSelectProject = undefined,
     onMutated = undefined,
   }: Props = $props();
 
@@ -82,7 +81,12 @@
   let refreshVersionInitialized = false;
 
   const machineOptions = $derived(
-    machines.map((name) => ({ name, label: name, displayLabel: name })),
+    machines.map((name) => ({
+      name,
+      label: sessions.machineLabel(name),
+      displayLabel: sessions.machineLabel(name),
+      meta: sessions.machineLabel(name) !== name ? name : undefined,
+    })),
   );
   const isRepoDotWorktrees = $derived(layout === repoDotWorktreesLayout);
   const canSave = $derived(
@@ -111,19 +115,15 @@
     loading = true;
     error = "";
     try {
-      const res = await callGenerated(
-        () =>
-          DataService.getApiV1DataProjectRules({
+      const res = await DataService.getApiV1DataProjectRules({
             machine: requestedMachine || undefined,
-          }),
-        signal,
-      ) as DataProjectRulesResponse;
+          }, { signal });
       if (!mappingsRead.isCurrent(signal)) return;
       localMachine = res.local_machine;
       machine = res.machine;
-      machines = Array.from(new Set([res.machine, ...((res.machines ?? []) as string[])]))
+      machines = Array.from(new Set([res.machine, ...(res.machines ?? [])]))
         .filter(Boolean);
-      mappings = (res.rules ?? []) as DbProjectRule[];
+      mappings = res.rules ?? [];
     } catch (err) {
       if (isAbortError(err) || !mappingsRead.isCurrent(signal)) return;
       error = err instanceof Error ? err.message : m.worktree_failed_load();
@@ -213,16 +213,9 @@
     applyMessage = "";
     try {
       if (id == null) {
-        await callGenerated(() =>
-          SettingsService.postApiV1SettingsWorktreeMappings({ requestBody: input }),
-        );
+        await SettingsService.postApiV1SettingsWorktreeMappings(input);
       } else {
-        await callGenerated(() =>
-          SettingsService.putApiV1SettingsWorktreeMappingsId({
-            id: String(id),
-            requestBody: input,
-          }),
-        );
+        await SettingsService.putApiV1SettingsWorktreeMappingsById({ id: String(id) }, input);
       }
       // The mutation committed even if the machine selection has since
       // changed, so the host's cached inventory is stale either way.
@@ -249,11 +242,9 @@
     error = "";
     applyMessage = "";
     try {
-      await callGenerated(() =>
-        SettingsService.deleteApiV1SettingsWorktreeMappingsId({
+      await SettingsService.deleteApiV1SettingsWorktreeMappingsById({
           id: String(mapping.id),
-        }),
-      );
+        });
       onMutated?.();
       if (!isCurrentMachine(initiatingMachine, generation)) return;
       if (editingId === mapping.id) resetForm();
@@ -284,11 +275,7 @@
     error = "";
     applyMessage = "";
     try {
-      const res = await callGenerated(() =>
-        SettingsService.postApiV1SettingsWorktreeMappingsApply({
-          requestBody: { machine: initiatingMachine },
-        }),
-      ) as ApplyWorktreeMappingsResponse;
+      const res = await SettingsService.postApiV1SettingsWorktreeMappingsApply({ machine: initiatingMachine });
       onMutated?.();
       if (!isCurrentMachine(initiatingMachine, generation)) return;
       applyMessage = m.worktree_apply_result({
@@ -352,7 +339,7 @@
       <Typeahead
         options={machineOptions}
         value={machine}
-        fallbackLabel={machine || localMachine}
+        fallbackLabel={sessions.machineLabel(machine || localMachine)}
         placeholder={m.worktree_select_machine()}
         title={m.worktree_select_machine()}
         emptyLabel={m.worktree_no_machines()}
@@ -394,12 +381,14 @@
                 <tr class="rule-row" class:disabled={!mapping.enabled}>
                   <td class="col-prefix" title={mapping.path_prefix}>{mapping.path_prefix}</td>
                   <td>
-                    {#if mapping.project}
+                    {#if mapping.project && onSelectProject}
                       <button
                         class="link-btn"
                         title={m.data_rules_view_project({ project: mapping.project })}
-                        onclick={() => onSelectProject(mapping.project)}
+                        onclick={() => onSelectProject?.(mapping.project)}
                       >{mapping.project}</button>
+                    {:else if mapping.project}
+                      <span>{mapping.project}</span>
                     {:else}
                       <span class="derived-label">{derivedLayoutLabel(mapping)}</span>
                     {/if}

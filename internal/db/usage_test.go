@@ -6,8 +6,6 @@ import (
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"fmt"
-	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -62,6 +60,17 @@ func TestDailyUsageAmountsPricingBandRequestScope(t *testing.T) {
 		{
 			name:        "Goose request uses band without message ordinal",
 			usageSource: "goose-request",
+			wantCost:    600_000,
+			wantApplication: export.PricingApplication{
+				Bands: []export.AppliedPricingBand{{
+					AboveInputTokens: 200_000,
+					RequestCount:     1,
+				}},
+			},
+		},
+		{
+			name:        "Posit Assistant sidecar event uses band without message ordinal",
+			usageSource: "posit-assistant-keepalive",
 			wantCost:    600_000,
 			wantApplication: export.PricingApplication{
 				Bands: []export.AppliedPricingBand{{
@@ -177,6 +186,42 @@ func TestDailyUsageAmountsPricingBandApplicationCounts(t *testing.T) {
 	}, provenance.Resolutions[0].Application)
 }
 
+func TestDailyUsageAmountsRecordsChargedLookup(t *testing.T) {
+	tests := []struct {
+		name       string
+		reported   sql.NullInt64
+		wantCost   int64
+		wantOutput int64
+	}{
+		{name: "computed uses billed rate", wantCost: 1_100_000, wantOutput: 1_100_000},
+		{
+			name:     "reported keeps catalog rate",
+			reported: sql.NullInt64{Int64: 77, Valid: true},
+			wantCost: 77, wantOutput: 1_000_000,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+				ModelPattern: "model-a",
+				Rates:        export.ModelRates{OutputPerMTok: money.Money{Microdollars: 1_000_000}},
+			}})
+			_, _, _, _, cost, _, err := dailyUsageAmounts(dailyUsageScanRow{
+				usageSource: "session", model: "model-a", providerID: "positai",
+				outputTokens: 1_000_000, cost: tt.reported, costSource: "provider-reported",
+			}, resolver)
+			require.NoError(t, err)
+			block, err := resolver.BuildBlock()
+			require.NoError(t, err)
+			resolutions := block.Models["model-a"].Resolutions
+			require.Len(t, resolutions, 1)
+
+			assert.Equal(t, tt.wantCost, cost.Microdollars)
+			assert.Equal(t, tt.wantOutput, resolutions[0].OutputCostPerMTok.Microdollars)
+		})
+	}
+}
+
 func TestSessionRowCostPricingBandRequestScope(t *testing.T) {
 	resolver := pricingBandTestResolver()
 	cost, priced, contributes, err := sessionRowCost(usageScanRow{
@@ -254,7 +299,7 @@ func TestGetDailyUsageReturnsAggregateCostOverflow(t *testing.T) {
 	d := testDB(t)
 	insertSession(t, d, "usage-overflow", "project")
 	large := money.Money{Microdollars: 1 << 62}
-	require.NoError(t, d.ReplaceSessionUsageEvents("usage-overflow", []UsageEvent{
+	require.NoError(t, d.ReplaceSessionUsageEvents(t.Context(), "usage-overflow", []UsageEvent{
 		{
 			Source: "provider", Model: "model", Cost: &large,
 			OccurredAt: "2026-07-26T12:00:00Z", DedupKey: "overflow-1",
@@ -274,7 +319,7 @@ func TestGetDailyUsageReturnsAggregateCostOverflow(t *testing.T) {
 
 func TestUsageDailyEmptyProjectsMapExcludesUnrelatedObservations(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	seedProjectIdentityObservation(t, d, "unrelated-project")
 
 	result, err := d.GetDailyUsage(ctx, UsageFilter{
@@ -289,8 +334,7 @@ func openDailyUsageFixtureDB(t *testing.T) *DB {
 	t.Helper()
 
 	dailyUsageFixtureOnce.Do(func() {
-		dailyUsageFixtureDir, dailyUsageFixturePath =
-			buildDailyUsageFixtureTemplate(t)
+		dailyUsageFixtureDir, dailyUsageFixturePath = buildDailyUsageFixtureTemplate(t)
 	})
 
 	dst := filepath.Join(t.TempDir(), "test.db")
@@ -310,16 +354,17 @@ func openDailyUsageFixtureDB(t *testing.T) *DB {
 func buildDailyUsageFixtureTemplate(t *testing.T) (string, string) {
 	t.Helper()
 
-	dir, err := os.MkdirTemp("", "agentsview-daily-usage-*")
-	require.NoError(t, err, "create daily usage fixture dir")
+	dir := filepath.Join(testDBFixtureTempDir, "daily-usage")
+	require.NoError(t, os.MkdirAll(dir, 0o700), "create daily usage fixture dir")
+	var err error
 	path := filepath.Join(dir, "test.db")
-	require.NoError(t, copyTestDBTemplate(path),
+	require.NoError(t, copyTestDBTemplate(t, path),
 		"copy base db template for daily usage fixture")
 
 	d, err := OpenPreparedTestDB(path)
 	require.NoError(t, err, "open daily usage template")
 	seedDailyUsageFixture(t, d)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	require.NoError(t, d.CheckpointWALTruncate(ctx),
 		"checkpoint daily usage template")
@@ -331,10 +376,14 @@ func seedDailyUsageFixture(t *testing.T, d *DB) {
 	t.Helper()
 
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{
-		{ModelPattern: "model-a", InputPerMTok: money.MustParseDollars("2.0"),
-			OutputPerMTok: money.MustParseDollars("10.0")},
-		{ModelPattern: "gpt-5", InputPerMTok: money.MustParseDollars("2.5"),
-			OutputPerMTok: money.MustParseDollars("10.0")},
+		{
+			ModelPattern: "model-a", InputPerMTok: money.MustParseDollars("2.0"),
+			OutputPerMTok: money.MustParseDollars("10.0"),
+		},
+		{
+			ModelPattern: "gpt-5", InputPerMTok: money.MustParseDollars("2.5"),
+			OutputPerMTok: money.MustParseDollars("10.0"),
+		},
 	}), "UpsertModelPricing")
 
 	type combo struct {
@@ -389,7 +438,7 @@ func seedDailyUsageFixture(t *testing.T, d *DB) {
 
 func TestGetDailyUsageEmpty(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	result, err := d.GetDailyUsage(ctx, UsageFilter{
 		From: "2024-01-01",
@@ -398,7 +447,7 @@ func TestGetDailyUsageEmpty(t *testing.T) {
 	requireNoError(t, err, "GetDailyUsage empty")
 
 	require.NotNil(t, result.Daily, "Daily should be non-nil empty slice")
-	assert.Len(t, result.Daily, 0, "got")
+	assert.Empty(t, result.Daily, "got")
 	assert.Equal(t, money.Money{}, result.Totals.TotalCost, "TotalCost")
 }
 
@@ -497,7 +546,7 @@ func TestTopSessionsUsageRowQueryUsesNarrowScan(t *testing.T) {
 
 func TestUsageEventsReplaceAndList(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "hermes:event", "proj", func(s *Session) {
 		s.Agent = "hermes"
@@ -512,6 +561,7 @@ func TestUsageEventsReplaceAndList(t *testing.T) {
 		MessageOrdinal:           &ordinal,
 		Source:                   "session",
 		Model:                    "gpt-5.4",
+		ProviderID:               "positai",
 		InputTokens:              100,
 		OutputTokens:             50,
 		CacheCreationInputTokens: 7,
@@ -523,7 +573,7 @@ func TestUsageEventsReplaceAndList(t *testing.T) {
 		OccurredAt:               "2026-05-14T10:05:00Z",
 		DedupKey:                 "session:hermes:event",
 	}}
-	err := d.ReplaceSessionUsageEvents("hermes:event", events)
+	err := d.ReplaceSessionUsageEvents(ctx, "hermes:event", events)
 	require.NoError(t, err, "ReplaceSessionUsageEvents")
 
 	got, err := d.GetUsageEvents(ctx, "hermes:event")
@@ -539,6 +589,7 @@ func TestUsageEventsReplaceAndList(t *testing.T) {
 		"CacheReadInputTokens (token fields not round-tripped: %#v)", got[0])
 	require.Equal(t, 13, got[0].ReasoningTokens,
 		"ReasoningTokens (token fields not round-tripped: %#v)", got[0])
+	require.Equal(t, "positai", got[0].ProviderID, "ProviderID")
 	require.NotNil(t, got[0].MessageOrdinal, "MessageOrdinal want 3")
 	require.Equal(t, 3, *got[0].MessageOrdinal, "MessageOrdinal")
 	require.NotNil(t, got[0].Cost, "Cost want %v", cost)
@@ -548,13 +599,13 @@ func TestUsageEventsReplaceAndList(t *testing.T) {
 	require.NoError(t, err, "UsageEventFingerprints")
 	require.NotEmpty(t, fps["hermes:event"],
 		"expected non-empty usage event fingerprint")
-	require.Equal(t, "", fps["missing"], "missing fingerprint")
+	require.Empty(t, fps["missing"], "missing fingerprint")
 
-	err = d.ReplaceSessionUsageEvents("hermes:event", nil)
+	err = d.ReplaceSessionUsageEvents(ctx, "hermes:event", nil)
 	require.NoError(t, err, "ReplaceSessionUsageEvents clear")
 	got, err = d.GetUsageEvents(ctx, "hermes:event")
 	require.NoError(t, err, "GetUsageEvents after clear")
-	require.Len(t, got, 0, "usage events after clear =")
+	require.Empty(t, got, "usage events after clear =")
 }
 
 func TestUsageEventsReplaceRejectsDuplicateDedupKeysAndRollsBack(t *testing.T) {
@@ -564,7 +615,7 @@ func TestUsageEventsReplaceRejectsDuplicateDedupKeysAndRollsBack(t *testing.T) {
 	// the whole replace, leaving the prior events untouched. Parsers
 	// therefore dedupe in memory before handing events to the DB.
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "grok:dup", "proj", func(s *Session) {
 		s.Agent = "grok"
@@ -577,7 +628,7 @@ func TestUsageEventsReplaceRejectsDuplicateDedupKeysAndRollsBack(t *testing.T) {
 		InputTokens: 1,
 		DedupKey:    "session:grok:dup:p-1:grok-4.5",
 	}}
-	require.NoError(t, d.ReplaceSessionUsageEvents("grok:dup", prior))
+	require.NoError(t, d.ReplaceSessionUsageEvents(ctx, "grok:dup", prior))
 
 	dup := []UsageEvent{{
 		SessionID:   "grok:dup",
@@ -592,7 +643,7 @@ func TestUsageEventsReplaceRejectsDuplicateDedupKeysAndRollsBack(t *testing.T) {
 		InputTokens: 3,
 		DedupKey:    "session:grok:dup:p-2:grok-4.5",
 	}}
-	err := d.ReplaceSessionUsageEvents("grok:dup", dup)
+	err := d.ReplaceSessionUsageEvents(ctx, "grok:dup", dup)
 	require.Error(t, err, "duplicate dedup keys must violate idx_usage_events_dedup")
 
 	got, err := d.GetUsageEvents(ctx, "grok:dup")
@@ -603,7 +654,7 @@ func TestUsageEventsReplaceRejectsDuplicateDedupKeysAndRollsBack(t *testing.T) {
 
 func TestGetDailyUsageWithData(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	err := d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:         "claude-sonnet-4-20250514",
@@ -668,7 +719,7 @@ func TestGetDailyUsageWithData(t *testing.T) {
 
 func TestUsageRowsHandleBlankMessageTimestampWithoutSessionStart(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "blank-ts", "proj", func(s *Session) {
 		s.Agent = "claude"
@@ -697,7 +748,7 @@ func TestUsageRowsHandleBlankMessageTimestampWithoutSessionStart(t *testing.T) {
 
 func TestUsagePreservesSessionSummaryUsageEventTokens(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	rawInput := MaxPlausibleTokens + 250_000
 	rawOutput := MaxPlausibleTokens + 500_000
 
@@ -716,7 +767,7 @@ func TestUsagePreservesSessionSummaryUsageEventTokens(t *testing.T) {
 		s.HasTotalOutputTokens = true
 		s.HasPeakContextTokens = true
 	})
-	requireNoError(t, d.ReplaceSessionUsageEvents(
+	requireNoError(t, d.ReplaceSessionUsageEvents(ctx,
 		"hermes:summary",
 		[]UsageEvent{{
 			SessionID:    "hermes:summary",
@@ -754,7 +805,7 @@ func TestUsagePreservesSessionSummaryUsageEventTokens(t *testing.T) {
 
 func TestGetDailyUsageFallsBackForEmptyMessageTimestamp(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "gpt-5.6-luna",
@@ -796,7 +847,7 @@ func TestBoundedUsagePreservesMalformedTimestampDateFallbackBeforeSnapshotRankin
 	t *testing.T,
 ) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet",
@@ -850,7 +901,7 @@ func TestBoundedUsagePreservesMalformedTimestampDateFallbackBeforeSnapshotRankin
 
 func TestUsageQueriesUnionMessageAndUsageEvents(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "claude:msg", "proj-a", func(s *Session) {
 		s.Agent = "claude"
@@ -873,7 +924,7 @@ func TestUsageQueriesUnionMessageAndUsageEvents(t *testing.T) {
 		s.StartedAt = new("2026-05-14T10:00:00Z")
 		s.UserMessageCount = 2
 	})
-	requireNoError(t, d.ReplaceSessionUsageEvents(
+	requireNoError(t, d.ReplaceSessionUsageEvents(ctx,
 		"hermes:event",
 		[]UsageEvent{{
 			SessionID:            "hermes:event",
@@ -890,7 +941,7 @@ func TestUsageQueriesUnionMessageAndUsageEvents(t *testing.T) {
 		s.StartedAt = new("2026-05-14T10:10:00Z")
 		s.UserMessageCount = 2
 	})
-	requireNoError(t, d.ReplaceSessionUsageEvents(
+	requireNoError(t, d.ReplaceSessionUsageEvents(ctx,
 		"hermes:event-2",
 		[]UsageEvent{{
 			SessionID:    "hermes:event-2",
@@ -943,9 +994,9 @@ func TestUsageQueriesUnionMessageAndUsageEvents(t *testing.T) {
 
 func TestGetDailyUsageIncludesCursorUsageEvents(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
-	require.NoError(t, d.InsertCursorUsageEvents([]CursorUsageEvent{{
+	require.NoError(t, d.InsertCursorUsageEvents(ctx, []CursorUsageEvent{{
 		OccurredAt:       "2026-05-14T10:05:00Z",
 		Model:            "claude-4.6-opus-high-thinking",
 		Kind:             "USAGE_EVENT_KIND_USAGE_BASED",
@@ -986,9 +1037,9 @@ func TestGetDailyUsageIncludesCursorUsageEvents(t *testing.T) {
 
 func TestGetDailyUsageIncludesCursorUsageEventsWithSessionDefaults(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
-	require.NoError(t, d.InsertCursorUsageEvents([]CursorUsageEvent{{
+	require.NoError(t, d.InsertCursorUsageEvents(ctx, []CursorUsageEvent{{
 		OccurredAt:       "2026-05-14T10:05:00Z",
 		Model:            "claude-4.6-opus-high-thinking",
 		Kind:             "USAGE_EVENT_KIND_USAGE_BASED",
@@ -1017,9 +1068,9 @@ func TestGetDailyUsageIncludesCursorUsageEventsWithSessionDefaults(t *testing.T)
 
 func TestGetDailyUsageSkipsCursorUsageEventsForExcludeOneShot(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
-	require.NoError(t, d.InsertCursorUsageEvents([]CursorUsageEvent{{
+	require.NoError(t, d.InsertCursorUsageEvents(ctx, []CursorUsageEvent{{
 		OccurredAt:       "2026-05-14T10:05:00Z",
 		Model:            "claude-4.6-opus-high-thinking",
 		Kind:             "USAGE_EVENT_KIND_USAGE_BASED",
@@ -1049,7 +1100,7 @@ func TestGetDailyUsageSkipsCursorUsageEventsForExcludeOneShot(t *testing.T) {
 	cache, err := d.usageCache.Generation(ctx, databaseID)
 	require.NoError(t, err)
 	var cursorFacts int
-	require.NoError(t, cache.db.QueryRow(
+	require.NoError(t, cache.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM cursor_usage_facts`).Scan(&cursorFacts))
 	assert.Zero(t, cursorFacts,
 		"a filtered request must not copy unrelated Cursor history")
@@ -1057,7 +1108,7 @@ func TestGetDailyUsageSkipsCursorUsageEventsForExcludeOneShot(t *testing.T) {
 
 func TestGetDailyUsageSkipsCursorUsageEventsForTerminationFilter(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern: "claude-sonnet-4-20250514",
@@ -1079,7 +1130,7 @@ func TestGetDailyUsageSkipsCursorUsageEventsForTerminationFilter(t *testing.T) {
 			`{"input_tokens":100,"output_tokens":40}`,
 		),
 	})
-	require.NoError(t, d.InsertCursorUsageEvents([]CursorUsageEvent{{
+	require.NoError(t, d.InsertCursorUsageEvents(ctx, []CursorUsageEvent{{
 		OccurredAt:      "2026-05-14T10:05:00Z",
 		Model:           "claude-4.6-opus-high-thinking",
 		Kind:            "USAGE_EVENT_KIND_USAGE_BASED",
@@ -1121,12 +1172,12 @@ func TestInsertCursorUsageEventsDedupesAtPostgresTimestampPrecision(t *testing.T
 		UserEmail:        "member@example.com",
 		IsHeadless:       false,
 	}
-	require.NoError(t, d.InsertCursorUsageEvents([]CursorUsageEvent{event}))
+	require.NoError(t, d.InsertCursorUsageEvents(t.Context(), []CursorUsageEvent{event}))
 	event.OccurredAt = "2026-05-14T10:05:00.123456Z"
-	require.NoError(t, d.InsertCursorUsageEvents([]CursorUsageEvent{event}))
+	require.NoError(t, d.InsertCursorUsageEvents(t.Context(), []CursorUsageEvent{event}))
 
 	var count int
-	require.NoError(t, d.getReader().QueryRow(
+	require.NoError(t, d.getReader().QueryRow(t.Context(),
 		"SELECT count(*) FROM cursor_usage_events",
 	).Scan(&count))
 	assert.Equal(t, 1, count,
@@ -1139,7 +1190,7 @@ func TestInsertCursorUsageEventsDedupesAtPostgresTimestampPrecision(t *testing.T
 // standard rate would misreport a premium-rate workload.
 func TestGetDailyUsage_CacheSavingsUsesPerModelRates(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{
 		{
@@ -1216,7 +1267,7 @@ func TestGetDailyUsage_CacheSavingsUsesPerModelRates(t *testing.T) {
 // and 1h writes bill at the 1h rate (2x input), not the 5m rate.
 func TestGetDailyUsage_Claude1hCacheWritesUseThe1hRate(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:           "claude-fable-5",
@@ -1285,7 +1336,7 @@ func TestGetDailyUsage_Claude1hCacheWritesUseThe1hRate(t *testing.T) {
 // cache-write subset at the 1h rate.
 func TestGetDailyUsage_1hCacheWritesSurviveTheExceptionTier(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:           "claude-fable-5",
@@ -1335,7 +1386,7 @@ func TestGetDailyUsage_1hCacheWritesSurviveTheExceptionTier(t *testing.T) {
 // portion of one request at its own rate.
 func TestGetDailyUsage_MixedTTLCacheWritesSplitTheRates(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:           "claude-fable-5",
@@ -1379,7 +1430,7 @@ func TestGetDailyUsage_MixedTTLCacheWritesSplitTheRates(t *testing.T) {
 
 func TestGetDailyUsageAgentFilter(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	err := d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:         "claude-sonnet-4-20250514",
@@ -1434,7 +1485,7 @@ func TestGetDailyUsageAgentFilter(t *testing.T) {
 
 func TestGetDailyUsageMultipleDaysAndModels(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	err := d.UpsertModelPricing([]ModelPricing{
 		{
@@ -1525,7 +1576,7 @@ func TestGetDailyUsageMultipleDaysAndModels(t *testing.T) {
 
 func TestGetDailyUsageNoPricing(t *testing.T) {
 	d := openDailyUsageFixtureDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	result, err := d.GetDailyUsage(ctx, UsageFilter{
 		From: "2024-07-01",
@@ -1545,7 +1596,7 @@ func TestGetDailyUsageNoPricing(t *testing.T) {
 
 func TestGetDailyUsageCostsMessageReasoningTokens(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "reasoning-model",
@@ -1585,7 +1636,7 @@ func TestGetDailyUsageCostsMessageReasoningTokens(t *testing.T) {
 // corruption modes reachable from our parsers don't produce silent zeros.
 func TestGetDailyUsageTruncatedTokenJSON(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet-4-20250514",
@@ -1692,7 +1743,7 @@ func TestParseUsageTokenCounters(t *testing.T) {
 
 func TestUsageAggregationClampsMessageTokenJSON(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	const maxTokens = 2_000_000
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
@@ -1761,7 +1812,7 @@ func TestGetDailyUsage_DedupesByClaudeMessageAndRequestID(t *testing.T) {
 
 	mustExec := func(q string, args ...any) {
 		t.Helper()
-		_, err := d.getWriter().Exec(q, args...)
+		_, err := d.getWriter().Exec(t.Context(), q, args...)
 		require.NoError(t, err, "exec %q", q)
 	}
 	mustExec(`INSERT INTO sessions (id, project, machine, agent, started_at, ended_at)
@@ -1791,7 +1842,7 @@ func TestGetDailyUsage_DedupesByClaudeMessageAndRequestID(t *testing.T) {
 			row.sid, row.ord, row.ts, row.usage, row.mid, row.rid)
 	}
 
-	result, err := d.GetDailyUsage(context.Background(), UsageFilter{
+	result, err := d.GetDailyUsage(t.Context(), UsageFilter{
 		From: "2026-04-10", To: "2026-04-10", Timezone: "UTC",
 	})
 	require.NoError(t, err, "GetDailyUsage")
@@ -1845,7 +1896,7 @@ func TestGetDailyUsage_DistinguishesClaudeIDsContainingNUL(t *testing.T) {
 
 func TestUsageAggregatesPreferCompleteClaudeSnapshotAcrossSessions(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	seedOpusPricing(t, d)
 	insertSession(t, d, "claude:daily-streamed", "parent-project", func(s *Session) {
 		s.Agent = "parent-agent"
@@ -1935,7 +1986,7 @@ func TestUsageAggregatesPreferCompleteClaudeSnapshotAcrossSessions(t *testing.T)
 
 func TestGetDailyUsageRanksTruncatedClaudeSnapshot(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	seedOpusPricing(t, d)
 	insertSession(t, d, "claude:truncated-snapshot", "proj", func(s *Session) {
 		s.Agent = "claude"
@@ -1972,7 +2023,7 @@ func TestGetDailyUsageRanksTruncatedClaudeSnapshot(t *testing.T) {
 
 func TestGetDailyUsagePrefersTimestampedEqualClaudeSnapshot(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	seedOpusPricing(t, d)
 	insertSession(t, d, "a-null-snapshot", "proj", func(s *Session) {
 		s.Agent = "claude"
@@ -2042,12 +2093,13 @@ func querySnapshotRankedRows(
 	t *testing.T, d *DB, f UsageFilter,
 ) [][3]string {
 	t.Helper()
+
 	bounds := usageBoundsForFilter(f)
 	rowsSQL, rowsArgs := usageRowsSQLForBounds(
 		usageSnapshotInputFilter(f), bounds)
 	ranked, args := snapshotRankedDailyUsageRowsSQL(
 		rowsSQL, rowsArgs, f, bounds)
-	rows, err := d.getReader().Query(`
+	rows, err := d.getReader().Query(t.Context(), `
 		SELECT session_id, snapshot_attribution_session_id, token_usage
 		FROM (`+ranked+`)
 		ORDER BY session_id`, args...)
@@ -2160,7 +2212,8 @@ func TestSnapshotRankedDailyUsageRowsRanksOnlyDuplicatedRequests(t *testing.T) {
 	}, got)
 
 	got = querySnapshotRankedRows(t, d, UsageFilter{
-		From: "2026-05-20", To: "2026-05-20", Timezone: "UTC"})
+		From: "2026-05-20", To: "2026-05-20", Timezone: "UTC",
+	})
 	require.Equal(t, [][3]string{
 		{"solo", "solo", `{"input_tokens":5,"output_tokens":7}`},
 		{"solo", "solo", `{"input_tokens":6,"output_tokens":8}`},
@@ -2234,7 +2287,7 @@ func TestGetDailyUsage_DedupKeyVariants(t *testing.T) {
 	)
 
 	t.Run("dedupes by source uuid when claude pair incomplete", func(t *testing.T) {
-		result, err := d.GetDailyUsage(context.Background(), UsageFilter{
+		result, err := d.GetDailyUsage(t.Context(), UsageFilter{
 			From: "2026-04-10", To: "2026-04-10", Timezone: "UTC",
 		})
 		require.NoError(t, err, "GetDailyUsage")
@@ -2247,7 +2300,7 @@ func TestGetDailyUsage_DedupKeyVariants(t *testing.T) {
 	})
 
 	t.Run("missing dedup keys counted every time", func(t *testing.T) {
-		result, err := d.GetDailyUsage(context.Background(), UsageFilter{
+		result, err := d.GetDailyUsage(t.Context(), UsageFilter{
 			From: "2026-04-11", To: "2026-04-11", Timezone: "UTC",
 		})
 		require.NoError(t, err, "GetDailyUsage")
@@ -2260,7 +2313,7 @@ func TestGetDailyUsage_DedupKeyVariants(t *testing.T) {
 
 func TestGetDailyUsageLongLivedSession(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet-4-6",
@@ -2269,7 +2322,7 @@ func TestGetDailyUsageLongLivedSession(t *testing.T) {
 	}}), "upsert pricing")
 
 	// Session started on Apr 1 but has messages on Apr 10.
-	requireNoError(t, d.UpsertSession(Session{
+	requireNoError(t, d.UpsertSession(ctx, Session{
 		ID: "long-lived", Project: "proj", Machine: "local",
 		Agent:     "claude",
 		StartedAt: new("2026-04-01T10:00:00Z"),
@@ -2318,9 +2371,8 @@ func TestGetDailyUsageLongLivedSession(t *testing.T) {
 }
 
 func TestGetDailyUsageProjectFilter(t *testing.T) {
-
 	d := openDailyUsageFixtureDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	result, err := d.GetDailyUsage(ctx, UsageFilter{
 		From:    "2024-06-01",
@@ -2336,9 +2388,8 @@ func TestGetDailyUsageProjectFilter(t *testing.T) {
 }
 
 func TestGetDailyUsageModelFilter(t *testing.T) {
-
 	d := openDailyUsageFixtureDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	result, err := d.GetDailyUsage(ctx, UsageFilter{
 		From:  "2024-06-01",
@@ -2354,9 +2405,8 @@ func TestGetDailyUsageModelFilter(t *testing.T) {
 }
 
 func TestGetDailyUsageProjectBreakdowns(t *testing.T) {
-
 	d := openDailyUsageFixtureDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	result, err := d.GetDailyUsage(ctx, UsageFilter{
 		From:       "2024-06-01",
@@ -2405,7 +2455,7 @@ func TestDailyUsageEntryBreakdownSlicesMarshalAsEmptyArrays(t *testing.T) {
 
 func TestGetDailyUsageMachineBreakdowns(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "model-a",
 		InputPerMTok:  money.MustParseDollars("1"),
@@ -2471,9 +2521,8 @@ func TestGetDailyUsageMachineBreakdowns(t *testing.T) {
 }
 
 func TestGetDailyUsageAgentBreakdowns(t *testing.T) {
-
 	d := openDailyUsageFixtureDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	result, err := d.GetDailyUsage(ctx, UsageFilter{
 		From:       "2024-06-01",
@@ -2506,9 +2555,8 @@ func TestGetDailyUsageAgentBreakdowns(t *testing.T) {
 }
 
 func TestGetDailyUsageBreakdownInvariant(t *testing.T) {
-
 	d := openDailyUsageFixtureDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	result, err := d.GetDailyUsage(ctx, UsageFilter{
 		From:       "2024-06-01",
@@ -2554,7 +2602,7 @@ func TestGetDailyUsageBreakdownInvariant(t *testing.T) {
 // non-destructive benchmark procedure.
 func TestGetTopSessionsByCost(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:         "claude-sonnet",
@@ -2623,7 +2671,7 @@ func TestGetTopSessionsByCost(t *testing.T) {
 // A high-token/low-cost session must outrank a low-token/high-cost one.
 func TestGetTopSessionsByTokens(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{
 		{
@@ -2704,7 +2752,7 @@ func TestSortAndLimitTopSessions(t *testing.T) {
 
 func TestGetTopSessionsByCost_DisplayNameFallback(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:         "claude-sonnet",
@@ -2805,7 +2853,7 @@ func TestGetTopSessionsByCost_DedupesByClaudeMessageAndRequestID(
 	t *testing.T,
 ) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:         "claude-sonnet",
@@ -2896,7 +2944,7 @@ func TestGetTopSessionsByCost_DedupesBySourceUUIDWhenClaudePairIncomplete(
 	t *testing.T,
 ) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:         "claude-sonnet",
@@ -2967,7 +3015,7 @@ func TestGetTopSessionsByCost_DedupesBySourceUUIDWhenClaudePairIncomplete(
 
 func TestGetTopSessionsByCostLimit(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet",
@@ -3001,7 +3049,7 @@ func TestGetTopSessionsByCostLimit(t *testing.T) {
 
 func TestGetUsageSessionCounts(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// s1: proj-a / claude — TWO messages across TWO days
 	insertSession(t, d, "s1", "proj-a", func(s *Session) {
@@ -3094,7 +3142,7 @@ func TestGetUsageSessionCountsFiltersAfterCrossSessionSnapshotSelection(
 	t *testing.T,
 ) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	insertSession(t, d, "count-parent", "parent-project", func(s *Session) {
 		s.Agent = "claude"
 		s.StartedAt = new("2026-05-20T10:00:00Z")
@@ -3140,7 +3188,7 @@ func TestGetUsageSessionCountsFiltersAfterCrossSessionSnapshotSelection(
 
 func TestGetUsageMatchingSessionCount(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "copilot-empty", "proj-a", func(s *Session) {
 		s.Agent = "copilot"
@@ -3224,7 +3272,7 @@ func TestGetUsageMatchingSessionCount_UsesMessageTimestampNotSessionActivity(
 	t *testing.T,
 ) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "copilot-late-message", "proj-a", func(s *Session) {
 		s.Agent = "copilot"
@@ -3271,7 +3319,7 @@ func TestGetUsageMatchingSessionCount_ModelFilterAppliesToBoundedRow(
 	t *testing.T,
 ) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "copilot-mixed-model", "proj-a", func(s *Session) {
 		s.Agent = "copilot"
@@ -3326,7 +3374,7 @@ func TestGetUsageMatchingSessionCount_CountsAssistantMessageWithNoModel(
 	t *testing.T,
 ) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "copilot-no-model", "proj-a", func(s *Session) {
 		s.Agent = "copilot"
@@ -3358,7 +3406,7 @@ func TestGetUsageMatchingSessionCount_UnboundedMatchesBoundedSemantics(
 	t *testing.T,
 ) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "copilot-user-only", "proj-a", func(s *Session) {
 		s.Agent = "copilot"
@@ -3475,7 +3523,7 @@ func TestGetUsageSessionCounts_DedupesByClaudeMessageAndRequestID(
 	t *testing.T,
 ) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Parent starts first.
 	insertSession(t, d, "s-parent", "proj", func(s *Session) {
@@ -3525,7 +3573,7 @@ func TestGetUsageSessionCounts_DedupesBySourceUUIDWhenClaudePairIncomplete(
 	t *testing.T,
 ) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "s-parent", "proj", func(s *Session) {
 		s.Agent = "claude"
@@ -3568,7 +3616,7 @@ func TestGetUsageSessionCounts_DedupesBySourceUUIDWhenClaudePairIncomplete(
 // ignore them. Guardrail against drift between usage queries.
 func TestUsageQueryEligibilityParity(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet",
@@ -3627,7 +3675,7 @@ func TestUsageQueryEligibilityParity(t *testing.T) {
 			`{"input_tokens":999,"output_tokens":999}`),
 	})
 	requireNoError(t,
-		d.SoftDeleteSession("bad-deleted"),
+		d.SoftDeleteSession(ctx, "bad-deleted"),
 		"SoftDeleteSession")
 
 	filter := UsageFilter{
@@ -3658,7 +3706,7 @@ func TestUsageQueryEligibilityParity(t *testing.T) {
 // matching projects from all three usage queries.
 func TestExcludeProjectFilter(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet",
@@ -3681,15 +3729,21 @@ func TestExcludeProjectFilter(t *testing.T) {
 
 	usage := `{"input_tokens":1000,"output_tokens":500}`
 	insertMessages(t, d,
-		Message{SessionID: "sA", Ordinal: 0, Role: "assistant",
+		Message{
+			SessionID: "sA", Ordinal: 0, Role: "assistant",
 			Timestamp: "2024-06-15T10:30:00Z", Model: "claude-sonnet",
-			TokenUsage: jsontext.Value(usage)},
-		Message{SessionID: "sB", Ordinal: 0, Role: "assistant",
+			TokenUsage: jsontext.Value(usage),
+		},
+		Message{
+			SessionID: "sB", Ordinal: 0, Role: "assistant",
 			Timestamp: "2024-06-15T10:30:00Z", Model: "claude-sonnet",
-			TokenUsage: jsontext.Value(usage)},
-		Message{SessionID: "sC", Ordinal: 0, Role: "assistant",
+			TokenUsage: jsontext.Value(usage),
+		},
+		Message{
+			SessionID: "sC", Ordinal: 0, Role: "assistant",
 			Timestamp: "2024-06-15T10:30:00Z", Model: "claude-sonnet",
-			TokenUsage: jsontext.Value(usage)},
+			TokenUsage: jsontext.Value(usage),
+		},
 	)
 
 	base := UsageFilter{From: "2024-06-01", To: "2024-06-30"}
@@ -3726,7 +3780,7 @@ func TestExcludeProjectFilter(t *testing.T) {
 
 func TestUsageSessionFilters(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet",
@@ -3773,7 +3827,7 @@ func TestUsageSessionFilters(t *testing.T) {
 		s.UserMessageCount = 3
 		s.StartedAt = new("2024-06-15T10:00:00Z")
 	})
-	_, err := d.getWriter().Exec(
+	_, err := d.getWriter().Exec(ctx,
 		"UPDATE sessions SET is_automated = 1 WHERE id = ?",
 		"usage-filter-automated",
 	)
@@ -3823,7 +3877,7 @@ func TestUsageSessionFilters(t *testing.T) {
 
 func TestUsageTerminationFilter(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet",
@@ -3870,20 +3924,20 @@ func TestUsageTerminationFilter(t *testing.T) {
 	daily, err := d.GetDailyUsage(ctx, filter)
 	requireNoError(t, err, "GetDailyUsage termination filter")
 	if daily.Totals.InputTokens != 1000 {
-		t.Errorf("InputTokens = %d, want 1000",
-			daily.Totals.InputTokens)
+		assert.Equal(t, 1000, daily.Totals.InputTokens, "InputTokens")
 	}
 
 	top, err := d.GetTopSessionsByCost(ctx, filter, 10)
 	requireNoError(t, err, "GetTopSessionsByCost termination filter")
 	if len(top) != 1 || top[0].SessionID != "usage-filter-clean" {
-		t.Fatalf("top sessions = %+v, want only usage-filter-clean", top)
+		require.Len(t, top, 1, "top sessions")
+		require.Equal(t, "usage-filter-clean", top[0].SessionID, "top session")
 	}
 
 	counts, err := d.GetUsageSessionCounts(ctx, filter)
 	requireNoError(t, err, "GetUsageSessionCounts termination filter")
 	if counts.Total != 1 {
-		t.Errorf("counts.Total = %d, want 1", counts.Total)
+		assert.Equal(t, 1, counts.Total, "counts.Total")
 	}
 }
 
@@ -3894,7 +3948,7 @@ func TestUsageTerminationFilter(t *testing.T) {
 // unclean termination filters. NULLIF must let the fallback reach started_at.
 func TestUsageActivityFallbackEmptyEndedAt(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet",
@@ -3945,7 +3999,7 @@ func TestUsageActivityFallbackEmptyEndedAt(t *testing.T) {
 
 func TestUsageExcludeOneShotUsesUserMessageCount(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet",
@@ -4009,7 +4063,7 @@ func TestUsageExcludeOneShotUsesUserMessageCount(t *testing.T) {
 // TestExcludeAgentFilter verifies ExcludeAgent on GetDailyUsage.
 func TestExcludeAgentFilter(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{{
 		ModelPattern:  "claude-sonnet",
@@ -4028,12 +4082,16 @@ func TestExcludeAgentFilter(t *testing.T) {
 
 	usage := `{"input_tokens":1000,"output_tokens":500}`
 	insertMessages(t, d,
-		Message{SessionID: "s1", Ordinal: 0, Role: "assistant",
+		Message{
+			SessionID: "s1", Ordinal: 0, Role: "assistant",
 			Timestamp: "2024-06-15T10:30:00Z", Model: "claude-sonnet",
-			TokenUsage: jsontext.Value(usage)},
-		Message{SessionID: "s2", Ordinal: 0, Role: "assistant",
+			TokenUsage: jsontext.Value(usage),
+		},
+		Message{
+			SessionID: "s2", Ordinal: 0, Role: "assistant",
 			Timestamp: "2024-06-15T10:30:00Z", Model: "claude-sonnet",
-			TokenUsage: jsontext.Value(usage)},
+			TokenUsage: jsontext.Value(usage),
+		},
 	)
 
 	f := UsageFilter{
@@ -4049,13 +4107,17 @@ func TestExcludeAgentFilter(t *testing.T) {
 // TestExcludeModelFilter verifies ExcludeModel on GetDailyUsage.
 func TestExcludeModelFilter(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{
-		{ModelPattern: "sonnet", InputPerMTok: money.MustParseDollars("3.0"),
-			OutputPerMTok: money.MustParseDollars("15.0")},
-		{ModelPattern: "opus", InputPerMTok: money.MustParseDollars("15.0"),
-			OutputPerMTok: money.MustParseDollars("75.0")},
+		{
+			ModelPattern: "sonnet", InputPerMTok: money.MustParseDollars("3.0"),
+			OutputPerMTok: money.MustParseDollars("15.0"),
+		},
+		{
+			ModelPattern: "opus", InputPerMTok: money.MustParseDollars("15.0"),
+			OutputPerMTok: money.MustParseDollars("75.0"),
+		},
 	}), "UpsertModelPricing")
 
 	insertSession(t, d, "s1", "proj", func(s *Session) {
@@ -4064,14 +4126,18 @@ func TestExcludeModelFilter(t *testing.T) {
 	})
 
 	insertMessages(t, d,
-		Message{SessionID: "s1", Ordinal: 0, Role: "assistant",
+		Message{
+			SessionID: "s1", Ordinal: 0, Role: "assistant",
 			Timestamp: "2024-06-15T10:30:00Z", Model: "sonnet",
 			TokenUsage: jsontext.Value(
-				`{"input_tokens":1000,"output_tokens":500}`)},
-		Message{SessionID: "s1", Ordinal: 1, Role: "assistant",
+				`{"input_tokens":1000,"output_tokens":500}`),
+		},
+		Message{
+			SessionID: "s1", Ordinal: 1, Role: "assistant",
 			Timestamp: "2024-06-15T11:30:00Z", Model: "opus",
 			TokenUsage: jsontext.Value(
-				`{"input_tokens":1000,"output_tokens":500}`)},
+				`{"input_tokens":1000,"output_tokens":500}`),
+		},
 	)
 
 	f := UsageFilter{
@@ -4093,26 +4159,31 @@ func TestExcludeModelFilter(t *testing.T) {
 // so benchgate can compare this branch directly with its merge base.
 func BenchmarkGetDailyUsage(b *testing.B) {
 	d := testDB(b)
-	ctx := context.Background()
-	origLog := log.Writer()
-	log.SetOutput(io.Discard)
-	defer log.SetOutput(origLog)
+	ctx := b.Context()
 
 	if err := d.UpsertModelPricing([]ModelPricing{
-		{ModelPattern: "claude-sonnet-4-20250514",
+		{
+			ModelPattern: "claude-sonnet-4-20250514",
 			InputPerMTok: money.MustParseDollars("3.0"), OutputPerMTok: money.MustParseDollars("15.0"),
-			CacheCreationPerMTok: money.MustParseDollars("3.75"), CacheReadPerMTok: money.MustParseDollars("0.30")},
-		{ModelPattern: "claude-opus-4-20250514",
+			CacheCreationPerMTok: money.MustParseDollars("3.75"), CacheReadPerMTok: money.MustParseDollars("0.30"),
+		},
+		{
+			ModelPattern: "claude-opus-4-20250514",
 			InputPerMTok: money.MustParseDollars("15.0"), OutputPerMTok: money.MustParseDollars("75.0"),
-			CacheCreationPerMTok: money.MustParseDollars("18.75"), CacheReadPerMTok: money.MustParseDollars("1.50")},
-		{ModelPattern: "gpt-5",
+			CacheCreationPerMTok: money.MustParseDollars("18.75"), CacheReadPerMTok: money.MustParseDollars("1.50"),
+		},
+		{
+			ModelPattern: "gpt-5",
 			InputPerMTok: money.MustParseDollars("2.5"), OutputPerMTok: money.MustParseDollars("10.0"),
-			CacheCreationPerMTok: money.MustParseDollars("2.5"), CacheReadPerMTok: money.MustParseDollars("0.25")},
-		{ModelPattern: "gemini-2.5-pro",
+			CacheCreationPerMTok: money.MustParseDollars("2.5"), CacheReadPerMTok: money.MustParseDollars("0.25"),
+		},
+		{
+			ModelPattern: "gemini-2.5-pro",
 			InputPerMTok: money.MustParseDollars("1.25"), OutputPerMTok: money.MustParseDollars("5.0"),
-			CacheCreationPerMTok: money.MustParseDollars("1.25"), CacheReadPerMTok: money.MustParseDollars("0.125")},
+			CacheCreationPerMTok: money.MustParseDollars("1.25"), CacheReadPerMTok: money.MustParseDollars("0.125"),
+		},
 	}); err != nil {
-		b.Fatalf("UpsertModelPricing: %v", err)
+		require.NoError(b, err, "UpsertModelPricing")
 	}
 
 	projects := []string{
@@ -4139,7 +4210,7 @@ func BenchmarkGetDailyUsage(b *testing.B) {
 	// Pre-parse the anchor timestamp once; the seed loop offsets from it.
 	startTime, err := time.Parse(time.RFC3339, "2024-06-01T00:00:00Z")
 	if err != nil {
-		b.Fatalf("parsing start time: %v", err)
+		require.NoError(b, err, "parsing start time")
 	}
 
 	for i := range sessionCount {
@@ -4156,8 +4227,8 @@ func BenchmarkGetDailyUsage(b *testing.B) {
 			MessageCount: msgsPerSession,
 			StartedAt:    new(startTime.Format(time.RFC3339)),
 		}
-		if err := d.UpsertSession(s); err != nil {
-			b.Fatalf("UpsertSession: %v", err)
+		if err := d.UpsertSession(ctx, s); err != nil {
+			require.NoError(b, err, "UpsertSession")
 		}
 		msgs := make([]Message, msgsPerSession)
 		for j := range msgsPerSession {
@@ -4170,24 +4241,24 @@ func BenchmarkGetDailyUsage(b *testing.B) {
 				TokenUsage: jsontext.Value(tokenUsage),
 			}
 		}
-		if err := d.InsertMessages(msgs); err != nil {
-			b.Fatalf("InsertMessages: %v", err)
+		if err := d.InsertMessages(ctx, msgs); err != nil {
+			require.NoError(b, err, "InsertMessages")
 		}
 	}
 
 	filter := UsageFilter{From: "2024-06-01", To: "2024-08-01"}
 	if _, err := d.GetDailyUsage(ctx, filter); err != nil {
-		b.Fatalf("warming GetDailyUsage: %v", err)
+		require.NoError(b, err, "warming GetDailyUsage")
 	}
-	// Logs stay discarded through the timed loop: a slow-request log
-	// line interleaving with the benchmark result line corrupts the
-	// bench-gate capture (see silenceBenchLogs in internal/sync).
+	// Logs go through b.Output for the whole benchmark (testDB): a
+	// slow-request log line written straight to stderr would split the
+	// benchmark result line and corrupt the bench-gate capture.
 	b.ResetTimer()
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_, err := d.GetDailyUsage(ctx, filter)
 		if err != nil {
-			b.Fatalf("GetDailyUsage: %v", err)
+			require.NoError(b, err, "GetDailyUsage")
 		}
 	}
 }
@@ -4239,9 +4310,8 @@ func BenchmarkGetDailyUsageSnapshotAutomaticIndexOff(b *testing.B) {
 	_, err := reader.ExecContext(b.Context(), "PRAGMA automatic_index = OFF")
 	require.NoError(b, err)
 	var automaticIndex int
-	require.NoError(b,
-		reader.QueryRowContext(b.Context(), "PRAGMA automatic_index").
-			Scan(&automaticIndex))
+	require.NoError(b, reader.QueryRowContext(b.Context(), "PRAGMA automatic_index").
+		Scan(&automaticIndex))
 	require.Zero(b, automaticIndex)
 
 	benchmarkDailyUsageSnapshotWindow(
@@ -4253,16 +4323,10 @@ func BenchmarkGetDailyUsageSnapshotAutomaticIndexOff(b *testing.B) {
 }
 
 func BenchmarkUsageRollup(b *testing.B) {
-	// Cold sub-benchmarks exceed the slow-request threshold on CI
-	// runners; the resulting log line would interleave with benchmark
-	// result lines and corrupt the bench-gate capture.
-	origLog := log.Writer()
-	log.SetOutput(io.Discard)
-	b.Cleanup(func() { log.SetOutput(origLog) })
 	database := testDB(b)
 	seedDailyUsageSnapshotBenchmark(b, database)
 	seedLongLivedUsageBenchmark(b, database)
-	ctx := context.Background()
+	ctx := b.Context()
 	windows := []struct {
 		name         string
 		filter       UsageFilter
@@ -4322,11 +4386,10 @@ func BenchmarkUsageRollup(b *testing.B) {
 				captured, captureErr = database.captureUsageQuery(
 					ctx, window.filter, usageQueryKindToken)
 				if captureErr != nil {
-					b.Fatal(captureErr)
+					require.NoError(b, captureErr)
 				}
 				if len(captured.Sessions) != window.wantSessions {
-					b.Fatalf("candidate sessions = %d, want %d",
-						len(captured.Sessions), window.wantSessions)
+					require.Len(b, captured.Sessions, window.wantSessions, "candidate sessions")
 				}
 			}
 		})
@@ -4373,7 +4436,7 @@ func BenchmarkUsageRollup(b *testing.B) {
 				b.StartTimer()
 				_, queryErr = database.GetDailyUsage(ctx, cold.filter)
 				if queryErr != nil {
-					b.Fatal(queryErr)
+					require.NoError(b, queryErr)
 				}
 			}
 			b.StopTimer()
@@ -4399,7 +4462,7 @@ func BenchmarkUsageRollup(b *testing.B) {
 			for range b.N {
 				if _, queryErr = database.GetDailyUsage(
 					ctx, window.filter); queryErr != nil {
-					b.Fatal(queryErr)
+					require.NoError(b, queryErr)
 				}
 			}
 		})
@@ -4437,16 +4500,15 @@ func BenchmarkUsageRollup(b *testing.B) {
 				exceptions, readErr = readUsageRollupExceptions(
 					ctx, conn, timezoneID, snapshot, window.filter)
 				if readErr != nil {
-					b.Fatal(readErr)
+					require.NoError(b, readErr)
 				}
 				groups, aggregateErr = aggregateUsageRollupExceptions(
 					exceptions, snapshot, window.filter, resolver)
 				if aggregateErr != nil {
-					b.Fatal(aggregateErr)
+					require.NoError(b, aggregateErr)
 				}
 				if len(groups) != exceptionGroups {
-					b.Fatalf("exception groups = %d, want %d",
-						len(groups), exceptionGroups)
+					require.Len(b, groups, exceptionGroups, "exception groups")
 				}
 			}
 		})
@@ -4470,7 +4532,7 @@ func BenchmarkUsageRollup(b *testing.B) {
 			if _, fillErr = cache.fill.Ensure(
 				ctx, allSnapshot.Versions, allSnapshot.CursorHighWater,
 			); fillErr != nil {
-				b.Fatal(fillErr)
+				require.NoError(b, fillErr)
 			}
 		}
 		b.StopTimer()
@@ -4491,11 +4553,10 @@ func BenchmarkUsageRollup(b *testing.B) {
 			captured, captureErr = database.captureUsageQuery(
 				ctx, filter, usageQueryKindActivity)
 			if captureErr != nil {
-				b.Fatal(captureErr)
+				require.NoError(b, captureErr)
 			}
 			if len(captured.Sessions) != 253 {
-				b.Fatalf("relaxed candidates = %d, want 253",
-					len(captured.Sessions))
+				require.Len(b, captured.Sessions, 253, "relaxed candidates")
 			}
 		}
 	})
@@ -4512,6 +4573,7 @@ func requireDailyUsageBenchmarkResult(
 	tb testing.TB, result DailyUsageResult, want benchmarkDailyUsageExpectation,
 ) {
 	tb.Helper()
+
 	require.Len(tb, result.Daily, want.days)
 	assert.Equal(tb, want.input, result.Totals.InputTokens)
 	assert.Equal(tb, want.output, result.Totals.OutputTokens)
@@ -4523,7 +4585,7 @@ func requireDailyUsageBenchmarkResult(
 func requireUsageFactsCount(tb testing.TB, cache *usageCache, want int) {
 	tb.Helper()
 	var got int
-	require.NoError(tb, cache.db.QueryRow(`SELECT COUNT(*) FROM usage_facts`).Scan(&got))
+	require.NoError(tb, cache.db.QueryRowContext(tb.Context(), `SELECT COUNT(*) FROM usage_facts`).Scan(&got))
 	require.Equal(tb, want, got, "usage facts")
 }
 
@@ -4533,7 +4595,7 @@ func usageRollupExceptionMetrics(
 	tb.Helper()
 	identity := usageTimezoneIdentityFor(filter.location(), nil)
 	var rows, groups int64
-	require.NoError(tb, cache.db.QueryRow(`SELECT COUNT(*),
+	require.NoError(tb, cache.db.QueryRowContext(tb.Context(), `SELECT COUNT(*),
 		COUNT(DISTINCT e.group_kind || char(0) || e.group_key)
 		FROM usage_rollup_exceptions e
 		JOIN usage_rollup_installs i ON i.id = e.rollup_install_id
@@ -4558,7 +4620,7 @@ func usageCacheDiskBytes(path string) int64 {
 
 func clearUsageFactsBenchmarkCache(tb testing.TB, cache *usageCache) {
 	tb.Helper()
-	_, err := cache.db.Exec(`
+	_, err := cache.db.ExecContext(tb.Context(), `
 		DELETE FROM usage_rollup_timezones;
 		DELETE FROM usage_cached_sessions;
 		DELETE FROM cursor_usage_facts;
@@ -4584,7 +4646,8 @@ func benchmarkDailyUsageSnapshotWindow(
 	want benchmarkDailyUsageExpectation,
 ) {
 	b.Helper()
-	ctx := context.Background()
+
+	ctx := b.Context()
 	filter := UsageFilter{
 		From: from, To: "2024-07-30", Timezone: "UTC",
 		SkipSessionCounts: true,
@@ -4601,10 +4664,10 @@ func benchmarkDailyUsageSnapshotWindow(
 
 	b.ResetTimer()
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_, err := d.GetDailyUsage(ctx, filter)
 		if err != nil {
-			b.Fatalf("GetDailyUsage: %v", err)
+			require.NoError(b, err, "GetDailyUsage")
 		}
 	}
 }
@@ -4613,23 +4676,28 @@ func benchmarkDailyUsageSnapshotWindow(
 // lower-output snapshots across 500 sessions and 60 days.
 func seedDailyUsageSnapshotBenchmark(tb testing.TB, d *DB) {
 	tb.Helper()
-	origLog := log.Writer()
-	log.SetOutput(io.Discard)
-	defer log.SetOutput(origLog)
 
 	require.NoError(tb, d.UpsertModelPricing([]ModelPricing{
-		{ModelPattern: "claude-sonnet-4-20250514",
+		{
+			ModelPattern: "claude-sonnet-4-20250514",
 			InputPerMTok: money.MustParseDollars("3.0"), OutputPerMTok: money.MustParseDollars("15.0"),
-			CacheCreationPerMTok: money.MustParseDollars("3.75"), CacheReadPerMTok: money.MustParseDollars("0.30")},
-		{ModelPattern: "claude-opus-4-20250514",
+			CacheCreationPerMTok: money.MustParseDollars("3.75"), CacheReadPerMTok: money.MustParseDollars("0.30"),
+		},
+		{
+			ModelPattern: "claude-opus-4-20250514",
 			InputPerMTok: money.MustParseDollars("15.0"), OutputPerMTok: money.MustParseDollars("75.0"),
-			CacheCreationPerMTok: money.MustParseDollars("18.75"), CacheReadPerMTok: money.MustParseDollars("1.50")},
-		{ModelPattern: "gpt-5",
+			CacheCreationPerMTok: money.MustParseDollars("18.75"), CacheReadPerMTok: money.MustParseDollars("1.50"),
+		},
+		{
+			ModelPattern: "gpt-5",
 			InputPerMTok: money.MustParseDollars("2.5"), OutputPerMTok: money.MustParseDollars("10.0"),
-			CacheCreationPerMTok: money.MustParseDollars("2.5"), CacheReadPerMTok: money.MustParseDollars("0.25")},
-		{ModelPattern: "gemini-2.5-pro",
+			CacheCreationPerMTok: money.MustParseDollars("2.5"), CacheReadPerMTok: money.MustParseDollars("0.25"),
+		},
+		{
+			ModelPattern: "gemini-2.5-pro",
 			InputPerMTok: money.MustParseDollars("1.25"), OutputPerMTok: money.MustParseDollars("5.0"),
-			CacheCreationPerMTok: money.MustParseDollars("1.25"), CacheReadPerMTok: money.MustParseDollars("0.125")},
+			CacheCreationPerMTok: money.MustParseDollars("1.25"), CacheReadPerMTok: money.MustParseDollars("0.125"),
+		},
 	}))
 
 	projects := []string{
@@ -4695,20 +4763,20 @@ func seedDailyUsageSnapshotBenchmark(tb testing.TB, d *DB) {
 			}
 		}
 
-		require.NoError(tb, d.UpsertSession(Session{
+		require.NoError(tb, d.UpsertSession(tb.Context(), Session{
 			ID: id, Project: projects[i%len(projects)],
 			Machine: defaultMachine, Agent: agent,
 			MessageCount: len(msgs), StartedAt: new(day.Format(time.RFC3339)),
 		}))
-		require.NoError(tb, d.InsertMessages(msgs))
+		require.NoError(tb, d.InsertMessages(tb.Context(), msgs))
 	}
 
 	var messageRows, recordedMessages, duplicateRequests int
-	require.NoError(tb, d.rawWriter().QueryRow(
+	require.NoError(tb, d.rawWriter().QueryRowContext(tb.Context(),
 		`SELECT COUNT(*) FROM messages`).Scan(&messageRows))
-	require.NoError(tb, d.rawWriter().QueryRow(
+	require.NoError(tb, d.rawWriter().QueryRowContext(tb.Context(),
 		`SELECT SUM(message_count) FROM sessions`).Scan(&recordedMessages))
-	require.NoError(tb, d.rawWriter().QueryRow(`
+	require.NoError(tb, d.rawWriter().QueryRowContext(tb.Context(), `
 		SELECT COUNT(*) FROM (
 			SELECT claude_message_id, claude_request_id
 			FROM messages
@@ -4726,6 +4794,7 @@ func seedDailyUsageSnapshotBenchmark(tb testing.TB, d *DB) {
 // cost that activity-bound candidate discovery alone cannot predict.
 func seedLongLivedUsageBenchmark(tb testing.TB, database *DB) {
 	tb.Helper()
+
 	const (
 		sessionCount = 5
 		messageCount = 366
@@ -4744,11 +4813,11 @@ func seedLongLivedUsageBenchmark(tb testing.TB, database *DB) {
 			}
 		}
 		startedAt := start.Format(time.RFC3339)
-		require.NoError(tb, database.UpsertSession(Session{
+		require.NoError(tb, database.UpsertSession(tb.Context(), Session{
 			ID: sessionID, Project: "long-lived", Machine: defaultMachine,
 			Agent: "codex", StartedAt: &startedAt, MessageCount: messageCount,
 		}))
-		require.NoError(tb, database.InsertMessages(messages))
+		require.NoError(tb, database.InsertMessages(tb.Context(), messages))
 	}
 }
 
@@ -4759,7 +4828,7 @@ func benchClaudeID(kind string, session, ordinal int) string {
 
 func TestGetDailyUsage_PricingPrecedence(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{
 		{
@@ -4873,7 +4942,7 @@ func seedOpusPricing(t *testing.T, d *DB) {
 
 func TestGetSessionUsage_PricedModel(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	seedOpusPricing(t, d)
 
 	insertSession(t, d, "claude:s1", "proj", func(s *Session) {
@@ -4923,7 +4992,7 @@ func TestGetSessionUsage_PricedModel(t *testing.T) {
 
 func TestGetSessionUsage_UnpricedModel(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	insertSession(t, d, "claude:s2", "proj", func(s *Session) {
 		s.Agent = "claude-code"
 		s.StartedAt = new("2026-05-20T10:00:00Z")
@@ -4947,7 +5016,7 @@ func TestGetSessionUsage_UnpricedModel(t *testing.T) {
 
 func TestGetSessionUsage_MixedPricedUnpriced(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	seedOpusPricing(t, d)
 	insertSession(t, d, "claude:s3", "proj", func(s *Session) {
 		s.Agent = "claude-code"
@@ -4978,13 +5047,13 @@ func TestGetSessionUsage_MixedPricedUnpriced(t *testing.T) {
 
 func TestGetSessionUsage_ExplicitCostOnly(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	insertSession(t, d, "hermes:s4", "proj", func(s *Session) {
 		s.Agent = "hermes"
 		s.StartedAt = new("2026-05-20T10:00:00Z")
 	})
 	cost := money.MustParseDollars("0.02")
-	require.NoError(t, d.ReplaceSessionUsageEvents("hermes:s4", []UsageEvent{{
+	require.NoError(t, d.ReplaceSessionUsageEvents(ctx, "hermes:s4", []UsageEvent{{
 		SessionID: "hermes:s4", Source: "session", Model: "gpt-5.4",
 		InputTokens: 100, OutputTokens: 50,
 		Cost: &cost, CostStatus: "estimated", CostSource: "hermes",
@@ -5009,7 +5078,7 @@ func TestGetSessionUsage_ExplicitCostOnly(t *testing.T) {
 
 func TestGetSessionUsage_BreakdownOrderingAndBuckets(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	seedOpusPricing(t, d)
 	insertSession(t, d, "claude:s-breakdown", "proj", func(s *Session) {
 		s.Agent = "claude-code"
@@ -5069,7 +5138,7 @@ func TestGetSessionUsage_BreakdownOrderingAndBuckets(t *testing.T) {
 
 func TestGetSessionUsage_DedupesDuplicateClaudeRows(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	seedOpusPricing(t, d)
 	insertSession(t, d, "claude:s6", "proj", func(s *Session) {
 		s.Agent = "claude-code"
@@ -5104,7 +5173,7 @@ func TestGetSessionUsage_DedupesDuplicateClaudeRows(t *testing.T) {
 
 func TestGetSessionUsage_PrefersCompleteClaudeSnapshot(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	seedOpusPricing(t, d)
 	insertSession(t, d, "claude:streamed", "proj", func(s *Session) {
 		s.Agent = "claude-code"
@@ -5139,7 +5208,7 @@ func TestGetSessionUsage_PrefersCompleteClaudeSnapshot(t *testing.T) {
 
 func TestGetSessionUsage_DedupesBySourceUUIDWhenClaudePairIncomplete(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	seedOpusPricing(t, d)
 	insertSession(t, d, "claude:s7", "proj", func(s *Session) {
 		s.Agent = "claude-code"
@@ -5167,7 +5236,7 @@ func TestGetSessionUsage_DedupesBySourceUUIDWhenClaudePairIncomplete(t *testing.
 
 func TestGetSessionUsage_NoTokenRowsKeepsMetadata(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	insertSession(t, d, "claude:s5", "proj", func(s *Session) {
 		s.Agent = "claude-code"
 		s.StartedAt = new("2026-05-20T10:00:00Z")
@@ -5194,7 +5263,7 @@ func TestGetSessionUsage_NoTokenRowsKeepsMetadata(t *testing.T) {
 
 func TestGetSessionUsage_NotFound(t *testing.T) {
 	d := testDB(t)
-	u, err := d.GetSessionUsage(context.Background(), "nope:x", true)
+	u, err := d.GetSessionUsage(t.Context(), "nope:x", true)
 	requireNoError(t, err, "GetSessionUsage")
 	assert.Nil(t, u, "usage")
 }
@@ -5218,7 +5287,7 @@ func TestGetDailyUsage_RollsUpSubagentToParentProject(t *testing.T) {
 
 	mustExec := func(q string, args ...any) {
 		t.Helper()
-		_, err := d.getWriter().Exec(q, args...)
+		_, err := d.getWriter().Exec(t.Context(), q, args...)
 		require.NoError(t, err, "exec %q", q)
 	}
 
@@ -5285,7 +5354,7 @@ func TestGetSessionUsage_AICreditsCapability(t *testing.T) {
 	})
 
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	seedOpusPricing(t, d)
 
 	insertSession(t, d, "ai-credit-agent:s1", "proj", func(s *Session) {
@@ -5312,7 +5381,7 @@ func TestGetSessionUsage_AICreditsCapability(t *testing.T) {
 
 func TestCopilotReportedCostSuppressesSessionEstimates(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	seedOpusPricing(t, d)
 
 	for _, id := range []string{"copilot:reported", "copilot:fallback"} {
@@ -5322,7 +5391,7 @@ func TestCopilotReportedCostSuppressesSessionEstimates(t *testing.T) {
 		})
 	}
 	reportedCost := money.MustParseDollars("0.0275")
-	require.NoError(t, d.ReplaceSessionUsageEvents("copilot:reported", []UsageEvent{
+	require.NoError(t, d.ReplaceSessionUsageEvents(ctx, "copilot:reported", []UsageEvent{
 		{
 			Source: "shutdown", Model: "claude-opus-4-6",
 			InputTokens: 1000, OutputTokens: 500,
@@ -5336,7 +5405,7 @@ func TestCopilotReportedCostSuppressesSessionEstimates(t *testing.T) {
 			OccurredAt: "2026-05-21T10:20:00Z", DedupKey: "segment-2",
 		},
 	}))
-	require.NoError(t, d.ReplaceSessionUsageEvents("copilot:fallback", []UsageEvent{{
+	require.NoError(t, d.ReplaceSessionUsageEvents(ctx, "copilot:fallback", []UsageEvent{{
 		Source: "shutdown", Model: "claude-opus-4-6",
 		InputTokens: 1000, OutputTokens: 500,
 		OccurredAt: "2026-05-20T10:30:00Z", DedupKey: "fallback",
@@ -5401,7 +5470,7 @@ func TestCopilotReportedZeroCostSuppressesEstimate(t *testing.T) {
 		s.StartedAt = new("2026-05-21T10:00:00Z")
 	})
 	zeroCost := money.Money{}
-	require.NoError(t, d.ReplaceSessionUsageEvents(
+	require.NoError(t, d.ReplaceSessionUsageEvents(t.Context(),
 		"copilot:reported-zero",
 		[]UsageEvent{{
 			Source: "shutdown", Model: "claude-opus-4-6",
@@ -5413,13 +5482,13 @@ func TestCopilotReportedZeroCostSuppressesEstimate(t *testing.T) {
 	))
 
 	session, err := d.GetSessionUsage(
-		context.Background(), "copilot:reported-zero", false)
+		t.Context(), "copilot:reported-zero", false)
 	require.NoError(t, err)
 	require.NotNil(t, session)
 	assert.True(t, session.HasCost)
 	assert.Zero(t, session.Cost)
 
-	daily, err := d.GetDailyUsage(context.Background(), UsageFilter{
+	daily, err := d.GetDailyUsage(t.Context(), UsageFilter{
 		From: "2026-05-21", To: "2026-05-21", Timezone: "UTC",
 	})
 	require.NoError(t, err)
@@ -5441,7 +5510,7 @@ func TestGetDailyUsage_CopilotAICredits(t *testing.T) {
 	})
 
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{
 		{
@@ -5625,14 +5694,14 @@ func TestCostUSDFromCost(t *testing.T) {
 // covered by other tests; this pins only the cost-flow contract.
 func TestGetDailyUsage_CodebuffCostOnly(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "codebuff:cost-only", "proj", func(s *Session) {
 		s.Agent = "codebuff"
 		s.StartedAt = new("2026-07-15T10:00:00Z")
 	})
 	cost := money.MustParseDollars("0.05")
-	require.NoError(t, d.ReplaceSessionUsageEvents(
+	require.NoError(t, d.ReplaceSessionUsageEvents(ctx,
 		"codebuff:cost-only",
 		[]UsageEvent{{
 			Source:     "session",
@@ -5664,7 +5733,7 @@ func TestGetDailyUsage_CodebuffCostOnly(t *testing.T) {
 // on K2.6, while static k3/k3-agent rows price flat at K3.
 func TestGetDailyUsage_KimiAliasPricing(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// K2.6 era rates (matching the moonshot/kimi-k2.6 snapshot row) and
 	// K3 era rates (matching the static supplemental rows).
@@ -5833,12 +5902,123 @@ func TestGetDailyUsage_KimiAliasPricing(t *testing.T) {
 	}
 }
 
+// TestGetDailyUsage_GPTReserveLunaPricing proves Codex Luna Reserve turns
+// that persist gpt-reserve keep that reported name in the pricing block
+// while costing the same as an explicit gpt-5.6-luna row. There is no
+// gpt-reserve catalog key, so a missed mapping yields zero against a
+// priced Luna sibling.
+func TestGetDailyUsage_GPTReserveLunaPricing(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	ts := "2026-09-05T12:00:00Z"
+	tokenUsage := jsontext.Value(`{"input_tokens":1000000,"output_tokens":0}`)
+	for _, fixture := range []struct {
+		id    string
+		model string
+	}{
+		{id: "codex-gpt-reserve", model: pricingpkg.GPTReserveModelName},
+		{id: "codex-gpt-luna", model: pricingpkg.GPT56LunaCanonical},
+	} {
+		insertSession(t, d, fixture.id, "proj", func(s *Session) {
+			s.Agent = "codex"
+			s.StartedAt = new(ts)
+		})
+		insertMessages(t, d, Message{
+			SessionID:  fixture.id,
+			Ordinal:    0,
+			Role:       "assistant",
+			Timestamp:  ts,
+			Model:      fixture.model,
+			TokenUsage: tokenUsage,
+		})
+	}
+
+	luna, err := d.GetDailyUsage(ctx, UsageFilter{
+		From:     "2026-09-05",
+		To:       "2026-09-05",
+		Timezone: "UTC",
+		Model:    pricingpkg.GPT56LunaCanonical,
+	})
+	requireNoError(t, err, "GetDailyUsage luna")
+	assert.NotZero(t, luna.Totals.TotalCost.Microdollars,
+		"explicit Luna usage must be priced")
+	assert.Equal(t, 1_000_000, luna.Totals.InputTokens)
+
+	reserve, err := d.GetDailyUsage(ctx, UsageFilter{
+		From:     "2026-09-05",
+		To:       "2026-09-05",
+		Timezone: "UTC",
+		Model:    pricingpkg.GPTReserveModelName,
+	})
+	requireNoError(t, err, "GetDailyUsage reserve")
+	assert.Equal(t, 1_000_000, reserve.Totals.InputTokens)
+	assert.Equal(t, luna.Totals.TotalCost, reserve.Totals.TotalCost, "TotalCost")
+	require.NotNil(t, reserve.Pricing, "pricing block")
+	require.Contains(t, reserve.Pricing.Models, pricingpkg.GPTReserveModelName)
+	resolutions := reserve.Pricing.Models[pricingpkg.GPTReserveModelName].Resolutions
+	require.Len(t, resolutions, 1)
+	assert.Equal(t, pricingpkg.GPT56LunaCanonical, resolutions[0].PricedModel)
+	assert.NotContains(t, reserve.Pricing.Models, pricingpkg.GPT56LunaCanonical)
+}
+
+func TestGetDailyUsage_CodexNamespacedPricing(t *testing.T) {
+	d := testDB(t)
+	d.SetEmptyCatalogPricing(fallbackRateMap())
+	// This region-qualified row is newer than the embedded snapshot.
+	d.SetEffectivePricing(map[string]export.ModelRates{
+		"bedrock_mantle/us-gov-west-1/openai.gpt-5.4": {
+			InputPerMTok:  money.MustParseDollars("3.3"),
+			OutputPerMTok: money.MustParseDollars("19.8"),
+			Source:        export.PricingRowSourceFetched,
+		},
+	})
+	tests := []struct {
+		model, date, canonical, pattern, input, output, cost string
+	}{
+		{"openai.gpt-5.4", "2026-09-09", "bedrock_mantle/openai.gpt-5.4", "aws/openai.gpt-5.4", "2.75", "16.5", "1.925"},
+		{"openai.gpt-5.6-luna", "2026-07-29", "bedrock_mantle/openai.gpt-5.6-luna", "aws/openai.gpt-5.6-luna", "1.1", "6.6", "0.77"},
+		{"openai.gpt-5.6-luna", "2026-07-30", "bedrock_mantle/openai.gpt-5.6-luna", "aws/openai.gpt-5.6-luna", "0.22", "1.32", "0.154"},
+		{"openai.gpt-5.6-terra", "2026-07-29", "bedrock_mantle/openai.gpt-5.6-terra", "aws/openai.gpt-5.6-terra", "2.75", "16.5", "1.925"},
+		{"openai.gpt-5.6-terra", "2026-07-30", "bedrock_mantle/openai.gpt-5.6-terra", "aws/openai.gpt-5.6-terra", "2.2", "13.2", "1.54"},
+		{"openai.gpt-6-astra", "2026-09-09", "bedrock_mantle/openai.gpt-6-astra", "bedrock_mantle/openai.gpt-6-astra", "11", "55", "6.6"},
+		{"bedrock_mantle/us-gov-west-1/openai.gpt-5.4", "2026-09-09", "bedrock_mantle/us-gov-west-1/openai.gpt-5.4", "bedrock_mantle/us-gov-west-1/openai.gpt-5.4", "3.3", "19.8", "2.31"},
+	}
+	for i, tt := range tests {
+		t.Run(tt.model+"/"+tt.date, func(t *testing.T) {
+			ts := tt.date + "T12:00:00Z"
+			id := fmt.Sprintf("codex-namespaced-%d", i)
+			insertSession(t, d, id, "proj", func(s *Session) {
+				s.Agent = "codex"
+				s.StartedAt = new(ts)
+			})
+			insertMessages(t, d, Message{
+				SessionID: id, Ordinal: 0, Role: "assistant",
+				Timestamp: ts, Model: tt.model,
+				TokenUsage: jsontext.Value(`{"input_tokens":100000,"output_tokens":100000}`),
+			})
+			got, err := d.GetDailyUsage(t.Context(), UsageFilter{
+				From: tt.date, To: tt.date, Timezone: "UTC", Model: tt.model,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, money.MustParseDollars(tt.cost), got.Totals.TotalCost)
+			require.NotNil(t, got.Pricing)
+			resolutions := got.Pricing.Models[tt.model].Resolutions
+			require.Len(t, resolutions, 1)
+			assert.Equal(t, tt.canonical, resolutions[0].PricedModel)
+			assert.Equal(t, new(tt.pattern), resolutions[0].MatchedPattern)
+			assert.Equal(t, money.MustParseDollars(tt.input), resolutions[0].InputCostPerMTok)
+			assert.Equal(t, money.MustParseDollars(tt.output), resolutions[0].OutputCostPerMTok)
+		})
+	}
+}
+
 // TestGetDailyUsage_KimiDateAliasMixedDaySameModel proves one reported
 // model straddling the cutoff sums both eras: a pre-cutoff row prices
 // at K2.6 and a post-cutoff row at K3 within the same model breakdown.
 func TestGetDailyUsage_KimiDateAliasMixedDaySameModel(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	requireNoError(t, d.UpsertModelPricing([]ModelPricing{
 		{

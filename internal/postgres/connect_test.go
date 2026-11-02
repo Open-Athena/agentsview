@@ -1,10 +1,27 @@
 package postgres
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestOpenContextHonorsCanceledContextBeforeConnecting(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	database, err := OpenContext(
+		ctx,
+		"postgres://127.0.0.1:1/database?sslmode=disable",
+		"public",
+		false,
+	)
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, database)
+}
 
 func TestCheckSSL(t *testing.T) {
 	tests := []struct {
@@ -173,26 +190,26 @@ func TestPGTargetFingerprint(t *testing.T) {
 		"postgres://alice:secret@db.example.com:5432/agents?sslmode=require&application_name=agentsview",
 		"agentsview",
 	)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	samePasswordChanged, err := pgTargetFingerprint(
 		"postgres://alice:new-secret@db.example.com:5432/agents?sslmode=require&application_name=other",
 		"agentsview",
 	)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, base, samePasswordChanged)
 
 	baseWithFallback, err := pgTargetFingerprint(
 		"postgres://alice:secret@db.example.com:5432/agents?sslmode=require&application_name=agentsview&host=db.example.com,standby-a.example.com&port=5432,6432",
 		"agentsview",
 	)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	sameFallbackNoiseChanged, err := pgTargetFingerprint(
 		"postgres://alice:new-secret@db.example.com:5432/agents?sslmode=require&application_name=other&host=DB.EXAMPLE.COM,standby-a.example.com&port=5432,6432",
 		"agentsview",
 	)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, baseWithFallback, sameFallbackNoiseChanged)
 
 	cases := []struct {
@@ -235,7 +252,7 @@ func TestPGTargetFingerprint(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := pgTargetFingerprint(tc.dsn, tc.schema)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			wantDifferentFrom := base
 			if tc.name == "fallback host change" || tc.name == "fallback port change" {
 				wantDifferentFrom = baseWithFallback

@@ -8,10 +8,13 @@ import (
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/service"
+
+	"github.com/danielgtaylor/huma/v2"
 )
 
 func (s *Server) registerSearchRoutes() {
-	group := newRouteGroup(s.api, "/api/v1/search", "Search")
+	group := huma.NewGroup(s.api, "/api/v1/search")
+	configureRouteGroup(group, "Search")
 
 	s.get(group, "", "Search sessions", s.humaSearch)
 	s.getLong(group, "/content", "Search session content", s.humaSearchContent)
@@ -24,17 +27,19 @@ type contentSearchMode string
 type contentSearchScope string
 
 type searchInput struct {
-	Query   string     `query:"q" required:"true" doc:"Search query"`
-	Project string     `query:"project" doc:"Filter by project"`
-	Sort    searchSort `query:"sort" enum:"relevance,recency" default:"relevance" doc:"Sort order"`
-	Limit   int        `query:"limit" minimum:"0" doc:"Maximum number of results"`
-	Cursor  int        `query:"cursor" minimum:"0" doc:"Pagination cursor"`
+	DateFrom string     `query:"date_from" format:"date" doc:"Filter sessions active on or after this date"`
+	DateTo   string     `query:"date_to" format:"date" doc:"Filter sessions active on or before this date"`
+	Query    string     `query:"q" required:"true" doc:"Search query"`
+	Project  string     `query:"project" doc:"Filter by project"`
+	Sort     searchSort `query:"sort" enum:"relevance,recency" default:"relevance" doc:"Sort order"`
+	Limit    int        `query:"limit" minimum:"0" doc:"Maximum number of results"`
+	Cursor   int        `query:"cursor" minimum:"0" doc:"Pagination cursor"`
 }
 
 type contentSearchInput struct {
 	Pattern          string             `query:"pattern" required:"true" doc:"Pattern to search for"`
-	Mode             contentSearchMode  `query:"mode" enum:"substring,regex,fts,semantic,hybrid" doc:"Search mode"`
-	Scope            contentSearchScope `query:"scope" enum:"top,all,subordinate" doc:"Semantic/hybrid result scope: top, all, or subordinate (default all)"`
+	Mode             contentSearchMode  `query:"mode" enum:"substring,regex,fts,terms,semantic,hybrid" doc:"Search mode"`
+	Scope            contentSearchScope `query:"scope" enum:"top,all,subordinate" doc:"Semantic/hybrid/terms result scope: top, all, or subordinate (default all)"`
 	SearchIntent     string             `header:"X-AgentsView-Search-Intent" doc:"Required for semantic/hybrid GET searches"`
 	In               string             `query:"in" doc:"Comma-separated content sources"`
 	ExcludeSystem    bool               `query:"exclude_system" doc:"Exclude system messages"`
@@ -43,6 +48,8 @@ type contentSearchInput struct {
 	ExcludeProject   string             `query:"exclude_project" doc:"Exclude a project"`
 	Machine          string             `query:"machine" doc:"Filter by machine"`
 	GitBranch        string             `query:"git_branch" doc:"Filter by git branch; opaque (project, branch) tokens from the /branches endpoint"`
+	SessionID        string             `query:"session_id" doc:"Filter by exact full stored session ID"`
+	GitBranchExact   string             `query:"git_branch_exact" doc:"Filter by exact raw git branch"`
 	Agent            string             `query:"agent" doc:"Filter by agent"`
 	Date             string             `query:"date" format:"date" doc:"Filter sessions active on this YYYY-MM-DD date"`
 	DateFrom         string             `query:"date_from" format:"date" doc:"Filter sessions active on or after this date"`
@@ -52,6 +59,7 @@ type contentSearchInput struct {
 	IncludeChildren  bool               `query:"include_children" doc:"Include child sessions"`
 	IncludeAutomated bool               `query:"include_automated" doc:"Include automated sessions"`
 	IncludeOneShot   bool               `query:"include_one_shot" doc:"Include one-shot sessions"`
+	ExcludeSession   []string           `query:"exclude_session,explode" doc:"Session IDs to exclude; repeatable"`
 	Limit            int                `query:"limit" minimum:"0" doc:"Maximum number of results"`
 	Cursor           int                `query:"cursor" minimum:"0" doc:"Pagination cursor"`
 	Context          int                `query:"context" doc:"Include N messages of context before and after each match (max 10)"`
@@ -66,11 +74,13 @@ func (s *Server) humaSearch(
 		return nil, apiError(http.StatusBadRequest, "query required")
 	}
 	res, err := s.sessions.Search(ctx, service.SearchRequest{
-		Query:   query,
-		Project: in.Project,
-		Sort:    string(in.Sort),
-		Cursor:  in.Cursor,
-		Limit:   in.Limit,
+		DateFrom: in.DateFrom,
+		DateTo:   in.DateTo,
+		Query:    query,
+		Project:  in.Project,
+		Sort:     string(in.Sort),
+		Cursor:   in.Cursor,
+		Limit:    in.Limit,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrSearchUnavailable) {
@@ -103,9 +113,9 @@ func (s *Server) humaSearchContent(
 		return nil, apiError(http.StatusForbidden,
 			"semantic and hybrid search require "+service.SemanticSearchIntentHeader)
 	}
-	if in.Scope != "" && !requiresSemanticSearchIntent(in.Mode) {
+	if in.Scope != "" && !db.ContentSearchModeSupportsScope(string(in.Mode)) {
 		return nil, apiError(http.StatusBadRequest,
-			"scope is only supported for semantic and hybrid search modes")
+			db.ContentSearchScopeUnsupportedMsg)
 	}
 	var sources []string
 	if in.In != "" {
@@ -119,28 +129,31 @@ func (s *Server) humaSearchContent(
 		return nil, apiError(http.StatusBadRequest, err.Error())
 	}
 	res, err := s.sessions.SearchContent(ctx, service.ContentSearchRequest{
-		Pattern:          in.Pattern,
-		Mode:             string(in.Mode),
-		Sources:          sources,
-		ExcludeSystem:    in.ExcludeSystem,
-		Reveal:           in.Reveal,
-		Project:          in.Project,
-		ExcludeProject:   in.ExcludeProject,
-		Machine:          in.Machine,
-		GitBranch:        in.GitBranch,
-		Agent:            in.Agent,
-		Date:             in.Date,
-		DateFrom:         in.DateFrom,
-		DateTo:           in.DateTo,
-		Timezone:         timezone,
-		ActiveSince:      in.ActiveSince,
-		IncludeChildren:  in.IncludeChildren,
-		IncludeAutomated: in.IncludeAutomated,
-		IncludeOneShot:   in.IncludeOneShot,
-		Scope:            string(in.Scope),
-		Limit:            in.Limit,
-		Cursor:           in.Cursor,
-		Context:          in.Context,
+		Pattern:           in.Pattern,
+		Mode:              string(in.Mode),
+		Sources:           sources,
+		ExcludeSystem:     in.ExcludeSystem,
+		Reveal:            in.Reveal,
+		Project:           in.Project,
+		ExcludeProject:    in.ExcludeProject,
+		Machine:           in.Machine,
+		GitBranch:         in.GitBranch,
+		SessionID:         in.SessionID,
+		GitBranchExact:    in.GitBranchExact,
+		Agent:             in.Agent,
+		Date:              in.Date,
+		DateFrom:          in.DateFrom,
+		DateTo:            in.DateTo,
+		Timezone:          timezone,
+		ActiveSince:       in.ActiveSince,
+		IncludeChildren:   in.IncludeChildren,
+		IncludeAutomated:  in.IncludeAutomated,
+		IncludeOneShot:    in.IncludeOneShot,
+		ExcludeSessionIDs: in.ExcludeSession,
+		Scope:             string(in.Scope),
+		Limit:             in.Limit,
+		Cursor:            in.Cursor,
+		Context:           in.Context,
 	})
 	if err != nil {
 		if handled := handleHumaContextError(err); handled != nil {

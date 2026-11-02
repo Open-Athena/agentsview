@@ -27,7 +27,7 @@ const (
 // naturally skips completed work.
 func (db *DB) StartUsageCacheBackfill(ctx context.Context) error {
 	if db.readOnly {
-		return fmt.Errorf("usage cache background backfill requires a writable archive")
+		return errors.New("usage cache background backfill requires a writable archive")
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -106,6 +106,20 @@ func (db *DB) WaitUsageCacheBackfill(ctx context.Context) error {
 	return err
 }
 
+// restartUsageCacheBackfillIfEnabled resumes the background coverage pass
+// after maintenance stopped it, but only when this process explicitly enabled
+// it (daemon lifecycle). A CLI resync or compaction reopening the archive
+// must not kick off a full background scan on its own.
+func (db *DB) restartUsageCacheBackfillIfEnabled() error {
+	db.usageBackfillMu.Lock()
+	enabled := db.usageBackfillEnabled
+	db.usageBackfillMu.Unlock()
+	if !enabled {
+		return nil
+	}
+	return db.StartUsageCacheBackfill(context.Background())
+}
+
 // StopUsageCacheBackfill cancels and joins the active pass before cache handles
 // are closed.
 func (db *DB) StopUsageCacheBackfill() {
@@ -121,35 +135,30 @@ func (db *DB) StopUsageCacheBackfill() {
 	}
 }
 
+// runUsageCacheBackfill runs one coverage pass. Facts are filled per session
+// from their own archive read snapshot and rollups aggregate only committed
+// facts, so a pass no longer has to be restarted because the archive was
+// written while it ran. Sessions written during the pass are picked up by
+// their own mutation notification.
 func (db *DB) runUsageCacheBackfill(ctx context.Context) error {
-	started := time.Now()
-	var lastErr error
-	for attempt := 1; attempt <= usageFillMaxAttempts; attempt++ {
-		lastErr = db.runUsageCacheBackfillPass(ctx, started)
-		if !errors.Is(lastErr, errUsageCacheSourceChanged) {
-			return lastErr
-		}
-	}
-	return fmt.Errorf(
-		"usage cache backfill could not stabilize after %d attempts: %w",
-		usageFillMaxAttempts, lastErr)
-}
-
-func (db *DB) runUsageCacheBackfillPass(
-	ctx context.Context, started time.Time,
-) error {
 	snapshot, err := db.captureUsageQuery(
 		ctx, UsageFilter{}, usageQueryKindActivity)
 	if err != nil {
 		return err
 	}
+	return db.runUsageCacheBackfillPass(ctx, time.Now(), snapshot)
+}
+
+func (db *DB) runUsageCacheBackfillPass(
+	ctx context.Context, started time.Time, snapshot usageQuerySnapshot,
+) error {
 	cache, release, err := db.usageCache.acquireGeneration(ctx, snapshot.DatabaseID)
 	if err != nil {
 		return err
 	}
 	defer release()
 	if cache == nil || cache.fill == nil || cache.rollup == nil {
-		return fmt.Errorf("usage cache generation is not attached to the archive")
+		return errors.New("usage cache generation is not attached to the archive")
 	}
 	locations, err := usageBackfillLocations(ctx, cache, snapshot.location)
 	if err != nil {
@@ -464,7 +473,7 @@ func (cache *usageCache) incrementalVacuum(
 	ctx context.Context, threshold, pages int,
 ) (bool, error) {
 	if threshold < 0 || pages <= 0 {
-		return false, fmt.Errorf("invalid usage cache vacuum bounds")
+		return false, errors.New("invalid usage cache vacuum bounds")
 	}
 	var freelist int
 	if err := cache.db.QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&freelist); err != nil {

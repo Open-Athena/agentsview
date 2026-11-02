@@ -49,10 +49,10 @@ func TestSessionSearchSinceRejectsInvalidFormat(t *testing.T) {
 // so `session search <pattern>` has something to match.
 func seedSearchMessage(t *testing.T, dataDir, sessionID, content string) {
 	t.Helper()
-	d, err := db.Open(filepath.Join(dataDir, "sessions.db"))
+	d, err := db.Open(t.Context(), filepath.Join(dataDir, "sessions.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = d.Close() })
-	require.NoError(t, d.InsertMessages([]db.Message{{
+	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{{
 		SessionID:     sessionID,
 		Ordinal:       1,
 		Role:          "user",
@@ -85,6 +85,7 @@ func TestHumanizeMatchAge(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			assert.Equal(t, tc.want, humanizeMatchAge(tc.ts, renderNow))
 		})
 	}
@@ -118,9 +119,9 @@ func TestSessionSearchDocumentedIdentifierRecipeFindsToolInput(t *testing.T) {
 	dataDir := newAgentDataDir(t)
 	seedSessionWithOpts(t, dataDir, "tool-only", "p", nil)
 
-	d, err := db.Open(sessionsDBPath(dataDir))
+	d, err := db.Open(t.Context(), sessionsDBPath(dataDir))
 	require.NoError(t, err)
-	require.NoError(t, d.ReplaceSessionMessages("tool-only", []db.Message{{
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "tool-only", []db.Message{{
 		SessionID: "tool-only",
 		Ordinal:   1,
 		Role:      "assistant",
@@ -144,6 +145,25 @@ func TestSessionSearchDocumentedIdentifierRecipeFindsToolInput(t *testing.T) {
 	assert.Equal(t, "tool-only", got.Matches[0].SessionID)
 	assert.Equal(t, "tool_input", got.Matches[0].Location)
 	assert.Contains(t, got.Matches[0].Snippet, identifier)
+}
+
+func TestSessionSearchExcludeSessionDropsMatches(t *testing.T) {
+	dataDir := newAgentDataDir(t)
+	seedSessionsWithOpts(t, dataDir,
+		sessionSeed{id: "keep", project: "p"},
+		sessionSeed{id: "drop", project: "p"},
+	)
+	seedSearchMessage(t, dataDir, "keep", "needle in keep")
+	seedSearchMessage(t, dataDir, "drop", "needle in drop")
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "search", "needle",
+		"--exclude-session", "drop", "--format", "json")
+	require.NoError(t, err)
+
+	got := decodeCLIJSON[service.ContentSearchResult](t, out)
+	require.Len(t, got.Matches, 1)
+	assert.Equal(t, "keep", got.Matches[0].SessionID)
 }
 
 func TestSessionSearchFTSWithToolSource(t *testing.T) {
@@ -249,10 +269,14 @@ func TestValidateScopeFlag(t *testing.T) {
 		{name: "top with semantic", scope: "top", useSemantic: true},
 		{name: "all with hybrid", scope: "all", useHybrid: true},
 		{name: "subordinate with semantic", scope: "subordinate", useSemantic: true},
-		{name: "scope without mode flag", scope: "top",
-			wantErr: "--semantic or --hybrid"},
-		{name: "invalid value", scope: "bogus", useSemantic: true,
-			wantErr: "top, all, or subordinate"},
+		{
+			name: "scope without mode flag", scope: "top",
+			wantErr: "--semantic or --hybrid",
+		},
+		{
+			name: "invalid value", scope: "bogus", useSemantic: true,
+			wantErr: "top, all, or subordinate",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -479,10 +503,14 @@ func TestPrintContentMatchesTableScoreColumn(t *testing.T) {
 	score := 0.834
 	res := &service.ContentSearchResult{
 		Matches: []db.ContentMatch{
-			{SessionID: "s1", Project: "p", Location: "message",
-				Ordinal: 3, Snippet: "hit", Score: &score},
-			{SessionID: "s2", Project: "p", Location: "message",
-				Ordinal: 1, Snippet: "hit"},
+			{
+				SessionID: "s1", Project: "p", Location: "message",
+				Ordinal: 3, Snippet: "hit", Score: &score,
+			},
+			{
+				SessionID: "s2", Project: "p", Location: "message",
+				Ordinal: 1, Snippet: "hit",
+			},
 		},
 	}
 	var buf bytes.Buffer
@@ -518,8 +546,10 @@ func TestPrintContentMatchesTableRangeAndSub(t *testing.T) {
 func TestPrintContentMatchesTableSnippetFillsWidth(t *testing.T) {
 	res := &service.ContentSearchResult{
 		Matches: []db.ContentMatch{
-			{SessionID: "s1", Project: "p", Location: "message",
-				Ordinal: 1, Snippet: strings.Repeat("x", 500)},
+			{
+				SessionID: "s1", Project: "p", Location: "message",
+				Ordinal: 1, Snippet: strings.Repeat("x", 500),
+			},
 		},
 	}
 	const width = 100
@@ -539,8 +569,10 @@ func TestPrintContentMatchesTableSnippetFillsWidth(t *testing.T) {
 func TestPrintContentMatchesTableLocationCap(t *testing.T) {
 	res := &service.ContentSearchResult{
 		Matches: []db.ContentMatch{
-			{SessionID: "s1", Project: "p", Location: "tool_result",
-				ToolName: strings.Repeat("t", 200), Ordinal: 1, Snippet: "hit"},
+			{
+				SessionID: "s1", Project: "p", Location: "tool_result",
+				ToolName: strings.Repeat("t", 200), Ordinal: 1, Snippet: "hit",
+			},
 		},
 	}
 	loc := "tool_result:" + strings.Repeat("t", 200)
@@ -571,8 +603,10 @@ func TestPrintContentMatchesTableEmptyAndCursor(t *testing.T) {
 	buf.Reset()
 	res := &service.ContentSearchResult{
 		Matches: []db.ContentMatch{
-			{SessionID: "s1", Project: "p", Location: "message",
-				Ordinal: 1, Snippet: "hit"},
+			{
+				SessionID: "s1", Project: "p", Location: "message",
+				Ordinal: 1, Snippet: "hit",
+			},
 		},
 		NextCursor: 7,
 	}
@@ -637,8 +671,10 @@ func TestPrintContentMatchesTableSnippetExactFit(t *testing.T) {
 	snippet := strings.Repeat("x", 65)
 	res := &service.ContentSearchResult{
 		Matches: []db.ContentMatch{
-			{SessionID: "s1", Project: "p", Location: "message",
-				Ordinal: 1, Snippet: snippet},
+			{
+				SessionID: "s1", Project: "p", Location: "message",
+				Ordinal: 1, Snippet: snippet,
+			},
 		},
 	}
 	var buf bytes.Buffer
@@ -647,7 +683,7 @@ func TestPrintContentMatchesTableSnippetExactFit(t *testing.T) {
 	require.Len(t, lines, 2)
 	assert.True(t, strings.HasSuffix(lines[1], snippet),
 		"exact-fit snippet prints unmodified")
-	assert.Equal(t, width, len([]rune(lines[1])))
+	assert.Len(t, []rune(lines[1]), width)
 }
 
 // TestPrintContentMatchesTableProjectCap pins the PROJECT cap: on a TTY
@@ -657,8 +693,10 @@ func TestPrintContentMatchesTableSnippetExactFit(t *testing.T) {
 func TestPrintContentMatchesTableProjectCap(t *testing.T) {
 	res := &service.ContentSearchResult{
 		Matches: []db.ContentMatch{
-			{SessionID: "s1", Project: strings.Repeat("p", 200) + "\nq",
-				Location: "message", Ordinal: 1, Snippet: "hit"},
+			{
+				SessionID: "s1", Project: strings.Repeat("p", 200) + "\nq",
+				Location: "message", Ordinal: 1, Snippet: "hit",
+			},
 		},
 	}
 	var buf bytes.Buffer
@@ -669,8 +707,7 @@ func TestPrintContentMatchesTableProjectCap(t *testing.T) {
 	assert.NotContains(t, lines[1], "\nq", "project whitespace collapsed")
 	assert.Contains(t, lines[1], "…")
 	assert.Contains(t, lines[1], "hit", "snippet survives a huge project name")
-	assert.LessOrEqual(t,
-		strings.Index(lines[1], "hit"), 100,
+	assert.LessOrEqual(t, strings.Index(lines[1], "hit"), 100,
 		"fixed columns stay bounded ahead of the snippet")
 
 	buf.Reset()
@@ -688,10 +725,14 @@ func TestPrintContentMatchesTableProjectCap(t *testing.T) {
 func TestPrintContentMatchesTableWideRunesAlign(t *testing.T) {
 	res := &service.ContentSearchResult{
 		Matches: []db.ContentMatch{
-			{SessionID: "s1", Project: "日本語", Location: "message",
-				Ordinal: 1, Snippet: "hit"},
-			{SessionID: "s2", Project: "ascii", Location: "message",
-				Ordinal: 2, Snippet: "hit"},
+			{
+				SessionID: "s1", Project: "日本語", Location: "message",
+				Ordinal: 1, Snippet: "hit",
+			},
+			{
+				SessionID: "s2", Project: "ascii", Location: "message",
+				Ordinal: 2, Snippet: "hit",
+			},
 		},
 	}
 	var buf bytes.Buffer
@@ -713,8 +754,10 @@ func TestPrintContentMatchesTableWideRunesAlign(t *testing.T) {
 func TestPrintContentMatchesTableWideSnippetBudget(t *testing.T) {
 	res := &service.ContentSearchResult{
 		Matches: []db.ContentMatch{
-			{SessionID: "s1", Project: "p", Location: "message",
-				Ordinal: 1, Snippet: strings.Repeat("界", 200)},
+			{
+				SessionID: "s1", Project: "p", Location: "message",
+				Ordinal: 1, Snippet: strings.Repeat("界", 200),
+			},
 		},
 	}
 	const width = 100

@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/service"
 )
@@ -26,7 +28,7 @@ func newInMemoryPair(
 	t *testing.T, srv *mcp.Server,
 ) (*mcp.ServerSession, *mcp.ClientSession) {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	st, ct := mcp.NewInMemoryTransports()
 	ss, err := srv.Connect(ctx, st, nil)
 	require.NoError(t, err)
@@ -41,7 +43,7 @@ func callParams(name string, args map[string]any) *mcp.CallToolParams {
 	return &mcp.CallToolParams{Name: name, Arguments: args}
 }
 
-func TestNewServer_RegistersSevenReadOnlyTools(t *testing.T) {
+func TestNewServer_RegistersEightReadOnlyTools(t *testing.T) {
 	d := dbtest.OpenTestDB(t)
 	srv := newServer(ServeOptions{
 		Service: service.NewDirectBackend(d, nil),
@@ -50,9 +52,9 @@ func TestNewServer_RegistersSevenReadOnlyTools(t *testing.T) {
 	require.NotNil(t, srv)
 
 	st, ct := newInMemoryPair(t, srv)
-	tools, err := ct.ListTools(context.Background(), nil)
+	tools, err := ct.ListTools(t.Context(), nil)
 	require.NoError(t, err)
-	require.Len(t, tools.Tools, 7)
+	require.Len(t, tools.Tools, 8)
 	for _, tl := range tools.Tools {
 		require.NotNil(t, tl.Annotations, "tool %s missing annotations", tl.Name)
 		require.True(t, tl.Annotations.ReadOnlyHint,
@@ -60,6 +62,79 @@ func TestNewServer_RegistersSevenReadOnlyTools(t *testing.T) {
 	}
 	require.NoError(t, ct.Close())
 	require.NoError(t, st.Wait())
+}
+
+func TestNewServer_MemoryProfileRegistersOnlyEvidenceTools(t *testing.T) {
+	d := dbtest.OpenTestDB(t)
+	srv := newServer(ServeOptions{
+		Service: service.NewDirectBackend(d, nil),
+		Profile: ProfileMemory,
+		Now:     func() time.Time { return fixedNow },
+	})
+
+	st, ct := newInMemoryPair(t, srv)
+	tools, err := ct.ListTools(t.Context(), nil)
+	require.NoError(t, err)
+	require.Len(t, tools.Tools, 3)
+	names := make([]string, 0, len(tools.Tools))
+	for _, tool := range tools.Tools {
+		names = append(names, tool.Name)
+		require.NotNil(t, tool.Annotations, "tool %s missing annotations", tool.Name)
+		assert.True(t, tool.Annotations.ReadOnlyHint,
+			"tool %s should be annotated read-only", tool.Name)
+		if tool.Name == ToolSearchContent {
+			assert.NotContains(t, tool.Description, ToolSearchSessions,
+				"memory-profile tools must not refer to unavailable tools")
+		}
+	}
+	assert.ElementsMatch(t, []string{ToolSearchContent, ToolGetMessages, ToolGetMemoryStatus}, names)
+	require.NoError(t, ct.Close())
+	require.NoError(t, st.Wait())
+}
+
+func TestServer_GetMemoryStatus(t *testing.T) {
+	d := dbtest.OpenTestDB(t)
+	srv := newServer(ServeOptions{
+		Service: service.NewDirectBackend(d, nil),
+		Version: "v-test",
+		Now:     func() time.Time { return fixedNow },
+	})
+
+	st, ct := newInMemoryPair(t, srv)
+	defer func() {
+		require.NoError(t, ct.Close())
+		require.NoError(t, st.Wait())
+	}()
+	res, err := ct.CallTool(t.Context(), callParams(ToolGetMemoryStatus, nil))
+	require.NoError(t, err)
+	require.False(t, res.IsError)
+	var status service.MemoryStatus
+	raw, err := json.Marshal(res.StructuredContent)
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(raw, &status))
+	assert.Equal(t, "v-test", status.ServerVersion)
+	assert.Equal(t, "sqlite", status.Archive.Backend)
+	assert.Equal(t, service.MemoryReady, status.Lexical.Status)
+	assert.Equal(t, service.MemoryUnavailable, status.Semantic.Status)
+	assert.Equal(t, service.MemoryPartial, status.Status)
+}
+
+func TestParseProfile(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"", string(ProfileFull), string(ProfileMemory)} {
+		profile, err := ParseProfile(name)
+		require.NoError(t, err)
+		if name == "" {
+			assert.Equal(t, ProfileFull, profile)
+		} else {
+			assert.Equal(t, Profile(name), profile)
+		}
+	}
+
+	_, err := ParseProfile("analytics")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown MCP profile")
 }
 
 func TestNewServer_OmitsRecallToolForUnsupportedBackend(t *testing.T) {
@@ -70,14 +145,62 @@ func TestNewServer_OmitsRecallToolForUnsupportedBackend(t *testing.T) {
 	})
 
 	st, ct := newInMemoryPair(t, srv)
-	tools, err := ct.ListTools(context.Background(), nil)
+	tools, err := ct.ListTools(t.Context(), nil)
 	require.NoError(t, err)
-	require.Len(t, tools.Tools, 6)
+	require.Len(t, tools.Tools, 7)
 	for _, tool := range tools.Tools {
 		assert.NotEqual(t, ToolQueryRecall, tool.Name)
 	}
 	require.NoError(t, ct.Close())
 	require.NoError(t, st.Wait())
+}
+
+func TestServer_SearchSessionsBySessionID(t *testing.T) {
+	d := dbtest.OpenTestDB(t)
+	rootID := "remote~U"
+	dbtest.SeedSession(t, d, rootID, "root-project", func(s *db.Session) {
+		s.SessionName = new("Root session")
+		s.EndedAt = new("2024-01-01T00:00:00Z")
+	})
+	for i := range 1000 {
+		dbtest.SeedSession(t, d, fmt.Sprintf("remote~U-E%04d", i), "fork-project", func(s *db.Session) {
+			s.EndedAt = new("2025-01-01T00:00:00Z")
+		})
+	}
+
+	srv := newServer(ServeOptions{
+		Service: service.NewDirectBackend(d, nil),
+		Now:     func() time.Time { return fixedNow },
+	})
+	st, ct := newInMemoryPair(t, srv)
+	defer func() {
+		require.NoError(t, ct.Close())
+		require.NoError(t, st.Wait())
+	}()
+
+	res, err := ct.CallTool(t.Context(), callParams(ToolSearchSessions, map[string]any{
+		"session_id": "U",
+		"query":      "does-not-exist",
+		"project":    "does-not-exist",
+		"date_from":  "not-a-date",
+		"cursor":     99,
+		"limit":      1,
+	}))
+	require.NoError(t, err)
+	require.False(t, res.IsError, "%+v", res.Content)
+
+	var out searchSessionsOut
+	raw, err := json.Marshal(res.StructuredContent)
+	require.NoError(t, err)
+	t.Logf("head: fixture_sessions=%d response=%s", 1001, raw)
+	require.NoError(t, json.Unmarshal(raw, &out))
+	require.Len(t, out.Results, 1)
+	assert.Equal(t, rootID, out.Results[0].SessionID)
+	assert.Equal(t, "root-project", out.Results[0].Project)
+	assert.Equal(t, "Root session", out.Results[0].Name)
+	assert.Empty(t, out.Results[0].Snippet)
+	assert.Zero(t, out.Results[0].MatchOrdinal)
+	assert.Nil(t, out.NextCursor)
 }
 
 func TestIsCleanStdioShutdown(t *testing.T) {
@@ -118,7 +241,7 @@ func TestServeStdio_ClientDisconnectIsClean(t *testing.T) {
 		pr, pw := io.Pipe()
 		tr := &mcp.IOTransport{Reader: pr, Writer: nopWriteCloser{io.Discard}}
 		done := make(chan error, 1)
-		go func() { done <- srv.Run(context.Background(), tr) }()
+		go func() { done <- srv.Run(t.Context(), tr) }()
 		_, _ = io.WriteString(pw, msgs)
 		require.NoError(t, pw.Close())
 		select {
@@ -126,7 +249,7 @@ func TestServeStdio_ClientDisconnectIsClean(t *testing.T) {
 			assert.True(t, isCleanStdioShutdown(err),
 				"client disconnect must be clean, got %v", err)
 		case <-time.After(5 * time.Second):
-			t.Fatal("server did not return after client disconnect")
+			require.Fail(t, "server did not return after client disconnect")
 		}
 	}
 }
@@ -137,7 +260,7 @@ func TestWithBearerAuth(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 	req := func(auth string) *http.Request {
-		r := httptest.NewRequest(http.MethodPost, "/", nil)
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/", nil)
 		if auth != "" {
 			r.Header.Set("Authorization", auth)
 		}
@@ -174,7 +297,7 @@ func TestHTTPHandler_DNSRebindingProtection(t *testing.T) {
 
 	body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"x","version":"0"}}}`
 	do := func(host string) int {
-		req, err := http.NewRequest(http.MethodPost, ts.URL, strings.NewReader(body))
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, ts.URL, strings.NewReader(body))
 		require.NoError(t, err)
 		if host != "" {
 			req.Host = host
@@ -198,7 +321,7 @@ func TestHTTPHandler_DNSRebindingProtection(t *testing.T) {
 // returning context.Canceled (which the command treats as a clean exit).
 func TestServeHTTP_ShutsDownOnContextCancel(t *testing.T) {
 	d := dbtest.OpenTestDB(t)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() {
 		done <- ServeHTTP(ctx, ServeOptions{
@@ -208,8 +331,8 @@ func TestServeHTTP_ShutsDownOnContextCancel(t *testing.T) {
 	cancel()
 	select {
 	case err := <-done:
-		assert.ErrorIs(t, err, context.Canceled)
+		require.ErrorIs(t, err, context.Canceled)
 	case <-time.After(10 * time.Second):
-		t.Fatal("ServeHTTP did not return after context cancel")
+		require.Fail(t, "ServeHTTP did not return after context cancel")
 	}
 }

@@ -29,8 +29,8 @@ func TestRecoverInvalidatesBrokenOfflineSuffixAndResetsAcknowledgedBase(t *testi
 		ManifestID: validCheckpointDigest(1), Receipt: validCheckpointDigest(2),
 		Generation: 1, Created: true,
 	}
-	require.NoError(t, store.BindFinalizedManifestID(
-		t.Context(), "device-a", first.CaptureID, commit.ManifestID,
+	require.NoError(t, store.BindFinalizedCommit(
+		t.Context(), "device-a", first.CaptureID, commit,
 	))
 	_, err = store.AcknowledgeGeneration(t.Context(), "device-a", first.CaptureID, commit)
 	require.NoError(t, err)
@@ -95,7 +95,7 @@ func TestRecoverInvalidatesBrokenOfflineSuffixAndResetsAcknowledgedBase(t *testi
 	assert.Zero(t, usage.UsedBytes)
 	assert.Zero(t, usage.ReservedBytes)
 	var generations int
-	require.NoError(t, store.db.QueryRow(`SELECT count(*) FROM outbox_generations`).Scan(
+	require.NoError(t, store.db.QueryRowContext(t.Context(), `SELECT count(*) FROM outbox_generations`).Scan(
 		&generations,
 	))
 	assert.Zero(t, generations)
@@ -135,7 +135,7 @@ func TestOpenRecoversInterruptedSourceReservationAsCoverageGap(t *testing.T) {
 	assert.Equal(t, CoverageDegraded, coverage.State)
 	assert.Equal(t, "capture_interrupted", coverage.Reason)
 	var failureReason string
-	require.NoError(t, reopened.db.QueryRow(`SELECT reason FROM raw_coverage_failures
+	require.NoError(t, reopened.db.QueryRowContext(t.Context(), `SELECT reason FROM raw_coverage_failures
 		WHERE provider = ? AND configured_root_id = ? AND source_key = ?`,
 		string(source.Provider), source.ConfiguredRootID, source.SourceKey,
 	).Scan(&failureReason))

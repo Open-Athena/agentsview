@@ -12,13 +12,7 @@
     type SegmentedControlOption,
     type TypeaheadOption,
   } from "@kenn-io/kit-ui";
-  import {
-    activateRecallExtractionGeneration,
-    fetchRecallEntries,
-    fetchRecallExtractionProgress,
-    fetchRecallExtractionStatus,
-    retireRecallExtractionGeneration,
-  } from "../../api/recall.js";
+  import { RecallService } from "../../api/generated/index.js";
   import type {
     RecallEntry,
     RecallEvidence,
@@ -26,8 +20,9 @@
     RecallExtractProgress,
     RecallExtractProgressState,
     RecallExtractionStatus,
+    RecallReviewAction,
   } from "../../api/types/recall.js";
-  import { ApiError, isAbortError } from "../../api/runtime.js";
+  import { ApiError, isAbortError, responseTimingOf, type ResponseTiming } from "../../api/runtime.js";
   import { formatDateTime, m } from "../../i18n/index.js";
   import { ChevronDownIcon, ChevronRightIcon } from "../../icons.js";
   import { router } from "../../stores/router.svelte.js";
@@ -35,6 +30,8 @@
   import { ui } from "../../stores/ui.svelte.js";
   import { LatestRead } from "../../utils/latest-read.js";
   import RefreshControl from "../shared/RefreshControl.svelte";
+  import { LiveQuery } from "../../utils/liveQuery.svelte.js";
+  import { queryStepFrom, type QueryStep } from "../../utils/refresh.js";
 
   const ENTRY_TYPES = [
     "fact",
@@ -47,6 +44,7 @@
   ];
   const REVIEW_STATES = [
     "human_reviewed",
+    "human_rejected",
     "unreviewed_auto",
     "calibrated_auto",
     "eval_raw",
@@ -67,6 +65,25 @@
   let statusFailed = $state(false);
   let entriesUpdatedAt = $state<number | null>(null);
   let statusUpdatedAt = $state<number | null>(null);
+  // Wall-clock ms of the most recent query, request start to data applied:
+  // an entries load on its own, or the entries and status pair on refresh.
+  let queryDurationMs = $state<number | null>(null);
+  let querySteps = $state<QueryStep[]>([]);
+  // The query running now, drawn live by the refresh control.
+  const liveQuery = new LiveQuery();
+  // What one loader measured when it applied its response. Each loader
+  // returns its own record, or null when it failed or a newer load
+  // superseded it, so a refresh can only publish the requests it made.
+  // `seq` is the loader's start counter at the time, so a refresh can also
+  // tell when a later load has overtaken one of its requests.
+  interface LoadTiming {
+    seq: number;
+    startedAt: number;
+    appliedAt: number;
+    timing: ResponseTiming | undefined;
+  }
+  let entriesLoadSeq = 0;
+  let statusLoadSeq = 0;
   let progress = $state<RecallExtractProgress[]>([]);
   let progressExpanded = $state(false);
   let progressState = $state<"" | RecallExtractProgressState>("");
@@ -76,6 +93,9 @@
   let generationAction = $state<GenerationAction | null>(null);
   let generationActionLoading = $state(false);
   let generationActionError = $state("");
+  let reviewingEntryIds = $state<string[]>([]);
+  let reviewErrors = $state<Record<string, string>>({});
+  let archiveEntry = $state<RecallEntry | null>(null);
   let search = $state("");
   let query = $state("");
   let project = $state("");
@@ -141,8 +161,8 @@
     },
     ...REVIEW_STATES.map((name) => ({
       name,
-      label: name,
-      displayLabel: name,
+      label: reviewStateLabel(name),
+      displayLabel: reviewStateLabel(name),
     })),
   ]);
   const progressStateOptions = $derived<SegmentedControlOption[]>([
@@ -162,32 +182,49 @@
     },
   ]);
 
-  async function loadEntries(cursor = "") {
+  // An entries load on its own (a filter change or the next page) reports
+  // itself as the latest query. refreshRecall passes publishTiming=false and
+  // reports the entries and status pair together once both have applied.
+  async function loadEntries(cursor = "", publishTiming = true): Promise<LoadTiming | null> {
+    const seq = ++entriesLoadSeq;
+    const startedAt = performance.now();
     const signal = entriesRead.begin();
     const appending = cursor !== "";
     entriesLoading = true;
     entriesFailed = false;
+    const live = publishTiming ? liveQuery.begin(startedAt) : null;
+    const liveStep = live === null ? 0 : liveQuery.start("entries", startedAt);
+    let load: LoadTiming | null = null;
     try {
-      const page = await fetchRecallEntries({
-        query: query || undefined,
+      const page = await RecallService.getApiV1RecallEntries({
+        limit: 200,
+        q: query || undefined,
         project: project || undefined,
         type: entryType || undefined,
-        sourceRunId: generation || undefined,
-        reviewState: reviewState || undefined,
+        source_run_id: generation || undefined,
+        status: reviewState === "human_rejected" ? "archived" : undefined,
+        review_state: reviewState || undefined,
         cursor: cursor || undefined,
-      }, signal);
-      if (!entriesRead.isCurrent(signal)) return;
+      }, { signal });
+      if (!entriesRead.isCurrent(signal)) return null;
       entries = appending
         ? [...entries, ...page.entries]
         : page.entries;
-      nextCursor = page.nextCursor ?? "";
-      resultCap = page.resultCap ?? 0;
+      nextCursor = page.next_cursor ?? "";
+      resultCap = page.result_cap ?? 0;
       entriesUpdatedAt = Date.now();
+      load = { seq, startedAt, appliedAt: performance.now(), timing: responseTimingOf(page) };
+      if (publishTiming) {
+        queryDurationMs = load.appliedAt - startedAt;
+        querySteps = [stepOf("entries", load, startedAt)];
+      }
+      return load;
     } catch (error) {
-      if (isAbortError(error) || !entriesRead.isCurrent(signal)) return;
+      if (isAbortError(error) || !entriesRead.isCurrent(signal)) return null;
       if (appending && error instanceof ApiError && error.status === 409) {
-        await loadEntries();
-        return;
+        // Awaited so this call's cleanup runs after the retry has
+        // reported its own step to the live query.
+        return await loadEntries("", publishTiming);
       }
       if (!appending) {
         entries = [];
@@ -195,24 +232,33 @@
         resultCap = 0;
         entriesFailed = true;
       }
+      return null;
     } finally {
+      if (live !== null) {
+        settleLive(liveStep, "entries", load, startedAt);
+        liveQuery.end(live);
+      }
       if (entriesRead.finish(signal)) entriesLoading = false;
     }
   }
 
-  async function loadStatus() {
+  async function loadStatus(): Promise<LoadTiming | null> {
+    const seq = ++statusLoadSeq;
+    const startedAt = performance.now();
     const signal = statusRead.begin();
     statusLoading = true;
     statusFailed = false;
     try {
-      const next = await fetchRecallExtractionStatus(signal);
-      if (!statusRead.isCurrent(signal)) return;
+      const next = await RecallService.getApiV1RecallExtractionStatus({ signal });
+      if (!statusRead.isCurrent(signal)) return null;
       status = next;
       statusUpdatedAt = Date.now();
+      return { seq, startedAt, appliedAt: performance.now(), timing: responseTimingOf(next) };
     } catch (error) {
-      if (isAbortError(error) || !statusRead.isCurrent(signal)) return;
+      if (isAbortError(error) || !statusRead.isCurrent(signal)) return null;
       status = null;
       statusFailed = true;
+      return null;
     } finally {
       if (statusRead.finish(signal)) statusLoading = false;
     }
@@ -224,16 +270,17 @@
     progressLoading = true;
     progressFailed = false;
     try {
-      const page = await fetchRecallExtractionProgress({
+      const page = await RecallService.getApiV1RecallExtractionProgress({
+        limit: 50,
         generation: status?.fingerprint || undefined,
         state: progressState || undefined,
         cursor: cursor || undefined,
-      }, signal);
+      }, { signal });
       if (!progressRead.isCurrent(signal)) return;
       progress = appending
         ? [...progress, ...page.progress]
         : page.progress;
-      progressNextCursor = page.nextCursor ?? "";
+      progressNextCursor = page.next_cursor ?? "";
     } catch (error) {
       if (isAbortError(error) || !progressRead.isCurrent(signal)) return;
       if (!appending) {
@@ -253,8 +300,44 @@
     }, 250);
   }
 
+  function stepOf(name: string, load: LoadTiming, originMs: number): QueryStep {
+    return queryStepFrom(name, load.timing, load.startedAt, load.appliedAt, originMs);
+  }
+
+  function settleLive(liveStep: number, name: string, load: LoadTiming | null, originMs: number) {
+    if (load === null) liveQuery.abandon(liveStep);
+    else liveQuery.settle(liveStep, stepOf(name, load, originMs));
+  }
+
   async function refreshRecall() {
-    await Promise.all([loadEntries(), loadStatus()]);
+    const startedAt = performance.now();
+    const live = liveQuery.begin(startedAt);
+    const entriesStep = liveQuery.start("entries", startedAt);
+    const statusStep = liveQuery.start("status", startedAt);
+    const [entriesLoad, statusLoad] = await Promise.all([
+      loadEntries("", false).then((load) => {
+        settleLive(entriesStep, "entries", load, startedAt);
+        return load;
+      }),
+      loadStatus().then((load) => {
+        settleLive(statusStep, "status", load, startedAt);
+        return load;
+      }),
+    ]);
+    liveQuery.end(live);
+    // Only a refresh whose own two requests both applied, and were not
+    // overtaken by a later load while the other was still in flight, counts
+    // as a completed query. Otherwise the previous duration and timeline
+    // stay, which after a filter change is that load's own timeline.
+    if (
+      entriesLoad !== null &&
+      statusLoad !== null &&
+      entriesLoad.seq === entriesLoadSeq &&
+      statusLoad.seq === statusLoadSeq
+    ) {
+      queryDurationMs = performance.now() - startedAt;
+      querySteps = [stepOf("entries", entriesLoad, startedAt), stepOf("status", statusLoad, startedAt)];
+    }
     if (progressExpanded) await loadProgress();
   }
 
@@ -287,9 +370,9 @@
     generationActionError = "";
     try {
       if (action.kind === "activate") {
-        await activateRecallExtractionGeneration();
+        await RecallService.postApiV1RecallExtractionActivate();
       } else {
-        await retireRecallExtractionGeneration(action.generation.fingerprint);
+        await RecallService.postApiV1RecallExtractionGenerationsByFingerprintRetire({ fingerprint: action.generation.fingerprint });
       }
       await refreshRecall();
       generationAction = null;
@@ -312,6 +395,66 @@
       case "failed":
         return m.recall_page_progress_failed();
     }
+  }
+
+  function reviewStateLabel(state: string): string {
+    switch (state) {
+      case "human_reviewed":
+        return m.recall_page_review_state_human_reviewed();
+      case "human_rejected":
+        return m.recall_page_review_state_human_rejected();
+      case "unreviewed_auto":
+        return m.recall_page_review_state_unreviewed_auto();
+      case "calibrated_auto":
+        return m.recall_page_review_state_calibrated_auto();
+      case "eval_raw":
+        return m.recall_page_review_state_eval_raw();
+      default:
+        return state;
+    }
+  }
+
+  function isReviewable(entry: RecallEntry): boolean {
+    return entry.status === "accepted" &&
+      entry.review_state === "unreviewed_auto";
+  }
+
+  function keepAfterReview(entry: RecallEntry): boolean {
+    return entry.status === "accepted" &&
+      (!reviewState || entry.review_state === reviewState);
+  }
+
+  async function submitReview(
+    entry: RecallEntry,
+    action: RecallReviewAction,
+  ) {
+    if (reviewingEntryIds.includes(entry.id)) return;
+    reviewingEntryIds = [...reviewingEntryIds, entry.id];
+    reviewErrors = { ...reviewErrors, [entry.id]: "" };
+    try {
+      const updated = await RecallService.postApiV1RecallEntriesByIdReview({ id: entry.id }, { action });
+      const keep = keepAfterReview(updated);
+      entries = keep
+        ? entries.map((item) => item.id === updated.id ? updated : item)
+        : entries.filter((item) => item.id !== updated.id);
+      if (!keep) {
+        expandedEntryIds = expandedEntryIds.filter((id) => id !== updated.id);
+      }
+      archiveEntry = null;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      reviewErrors = {
+        ...reviewErrors,
+        [entry.id]: m.recall_page_review_error({ error: detail }),
+      };
+    } finally {
+      reviewingEntryIds = reviewingEntryIds.filter((id) => id !== entry.id);
+    }
+  }
+
+  function closeArchiveReview() {
+    if (archiveEntry && reviewingEntryIds.includes(archiveEntry.id)) return;
+    archiveEntry = null;
   }
 
   function progressTimestamp(value: string): string {
@@ -392,6 +535,28 @@
   {/if}
 {/snippet}
 
+{#snippet archiveReviewFooter()}
+  {#if archiveEntry}
+    {@const busy = reviewingEntryIds.includes(archiveEntry.id)}
+    <span class="review-modal-actions">
+      <Button
+        label={m.recall_page_review_cancel()}
+        tone="neutral"
+        surface="outline"
+        disabled={busy}
+        onclick={closeArchiveReview}
+      />
+      <Button
+        label={m.recall_page_review_archive()}
+        tone="danger"
+        surface="solid"
+        disabled={busy}
+        onclick={() => submitReview(archiveEntry!, "archive")}
+      />
+    </span>
+  {/if}
+{/snippet}
+
 <div class="recall-corpus-panel">
   <header class="recall-page-header">
     <div>
@@ -408,6 +573,9 @@
       {/if}
       <RefreshControl
         {lastUpdatedAt}
+        {queryDurationMs}
+        {querySteps}
+        {liveQuery}
         busy={entriesLoading || statusLoading || progressLoading}
         onRefresh={refreshRecall}
         label={m.shared_refresh()}
@@ -659,6 +827,22 @@
     </Modal>
   {/if}
 
+  {#if archiveEntry}
+    <Modal
+      title={m.recall_page_review_archive_title()}
+      closeLabel={m.recall_page_review_close()}
+      tone="danger"
+      width="460px"
+      closeOnOverlayClick={!reviewingEntryIds.includes(archiveEntry.id)}
+      onclose={closeArchiveReview}
+      footer={archiveReviewFooter}
+    >
+      <p class="review-modal-copy">
+        {m.recall_page_review_archive_message({ title: archiveEntry.title })}
+      </p>
+    </Modal>
+  {/if}
+
   <div class="recall-toolbar">
     <SearchInput
       class="recall-search"
@@ -775,7 +959,7 @@
               </td>
               <td><span class="entry-type">{entry.type}</span></td>
               <td class="project-cell">{entry.project ?? "—"}</td>
-              <td class="review-cell">{entry.review_state}</td>
+              <td class="review-cell">{reviewStateLabel(entry.review_state)}</td>
             </tr>
             {#if expanded}
               <tr class="entry-detail-row">
@@ -825,6 +1009,48 @@
                             <span>{evidenceLabel(evidence)}</span>
                           {/if}
                         {/each}
+                      </div>
+                    {/if}
+                    {#if isReviewable(entry)}
+                      {@const busy = reviewingEntryIds.includes(entry.id)}
+                      <div class="entry-review">
+                        <div class="entry-review-actions">
+                          <Button
+                            size="sm"
+                            tone="info"
+                            surface="solid"
+                            label={m.recall_page_review_approve()}
+                            disabled={busy || !entry.provenance_ok}
+                            title={!entry.provenance_ok
+                              ? m.recall_page_review_approve_disabled()
+                              : undefined}
+                            onclick={() => submitReview(entry, "approve")}
+                          />
+                          <Button
+                            size="sm"
+                            tone="danger"
+                            surface="outline"
+                            label={m.recall_page_review_archive()}
+                            disabled={busy}
+                            onclick={() => {
+                              reviewErrors = {
+                                ...reviewErrors,
+                                [entry.id]: "",
+                              };
+                              archiveEntry = entry;
+                            }}
+                          />
+                        </div>
+                        {#if !entry.provenance_ok}
+                          <p class="entry-review-note">
+                            {m.recall_page_review_approve_disabled()}
+                          </p>
+                        {/if}
+                        {#if reviewErrors[entry.id]}
+                          <p class="entry-review-error">
+                            {reviewErrors[entry.id]}
+                          </p>
+                        {/if}
                       </div>
                     {/if}
                   </div>
@@ -1009,8 +1235,13 @@
     display: contents;
   }
 
+  .review-modal-actions {
+    display: contents;
+  }
+
   .generation-modal-copy,
-  .generation-action-error {
+  .generation-action-error,
+  .review-modal-copy {
     margin: 0;
     color: var(--text-secondary);
     font-size: 12px;
@@ -1252,6 +1483,30 @@
   :global(.evidence-button) {
     font-family: var(--font-mono);
     font-size: 9px;
+  }
+
+  .entry-review {
+    margin-top: var(--space-5);
+    padding-top: var(--space-5);
+    border-top: 1px solid var(--border-default);
+  }
+
+  .entry-review-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+  }
+
+  .entry-review-note,
+  .entry-review-error {
+    margin-top: var(--space-3);
+    color: var(--text-muted);
+    font-size: 10px;
+    line-height: 1.5;
+  }
+
+  .entry-review-error {
+    color: var(--slow-fg);
   }
 
   .load-more {

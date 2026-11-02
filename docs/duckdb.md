@@ -7,7 +7,7 @@ As of 0.33.0, AgentsView can mirror its local SQLite archive into a DuckDB
 database and serve the read-only web UI from that mirror — either from the local
 file or remotely over DuckDB's Quack protocol. SQLite remains the source of
 truth for ingestion; the mirror is populated by `duckdb push` or
-`duckdb push --watch`, the same one-way model as [PostgreSQL sync](/pg-sync/).
+`duckdb push --watch`, the same one-way model as [PostgreSQL sync](/docs/pg-sync/).
 
 This is useful when you want a portable single-file analytics copy of your
 archive, or want to query your sessions with DuckDB directly, without standing
@@ -35,7 +35,7 @@ agentsview duckdb push --watch
 ```
 
 `duckdb push` accepts the same project-filter and foreground watcher flags as
-[`pg push`](/pg-sync/#project-filtering):
+[`pg push`](/docs/pg-sync/#project-filtering):
 
 | Flag                 | Default | Description                                                    |
 | -------------------- | ------- | -------------------------------------------------------------- |
@@ -66,7 +66,7 @@ expose a different mirror than the one used by `duckdb push`, `duckdb status`,
 and `duckdb serve`.
 
 `duckdb serve` accepts the same serve flags as
-[`pg serve`](/pg-sync/#agentsview-pg-serve) (`--host`, `--port`, `--base-path`,
+[`pg serve`](/docs/pg-sync/#agentsview-pg-serve) (`--host`, `--port`, `--base-path`,
 proxy and TLS flags) and is read-only in the same way — no uploads, file
 watching, or local sync.
 
@@ -119,16 +119,28 @@ Safety defaults:
   behind TLS, a VPN, or an SSH tunnel before exposing it beyond
   the local machine.
 
+## Machine Identity and Upgrades
+
+The mirror retains each session's installation ID and copies its display label
+and adopted hostname aliases. Set `local_machine_name` in `config.toml`, restart
+the daemon, and push again to update the displayed name.
+
+The [installation upgrade](/docs/configuration/#upgrading-historical-machine-keys)
+changes the default mirror machine key from a hostname to an installation ID.
+The next `duckdb push` rebuilds the mirror once for that change; SQLite history
+stays intact.
+
 ## Configuration
 
 DuckDB settings live in a `[duckdb]` section of `~/.agentsview/config.toml`:
 
 ```toml
+local_machine_name = "Laptop"
+
 [duckdb]
 path = "~/.agentsview/sessions.duckdb"
 url = "quack:127.0.0.1:9494"
 token = "..."
-machine_name = "my-laptop"
 allow_insecure = false
 attach_timeout = "20s"
 projects = ["alpha", "beta"]
@@ -140,7 +152,7 @@ projects = ["alpha", "beta"]
 | `path`             | `~/.agentsview/sessions.duckdb` | Local DuckDB mirror file                                                                    |
 | `url`              |                                 | Remote Quack endpoint for `duckdb status` and `duckdb serve` (`quack:` URI); read side only — `duckdb push` rejects it |
 | `token`            |                                 | Quack authentication token                                                                  |
-| `machine_name`     | OS hostname                     | Identifies the pushing machine                                                              |
+| `machine_name`     | Installation ID                 | Explicit machine key for legacy local-sentinel rows; new sessions retain their recorded installation ID                |
 | `allow_insecure`   | `false`                         | Allow plain-HTTP Quack beyond loopback                                                      |
 | `attach_timeout`   | `20s`                           | Bound on a remote Quack `ATTACH` (and its TCP preflight); `0` uses the default, a negative value disables the guard |
 | `projects`         |                                 | Array of project names to include in push                                                   |

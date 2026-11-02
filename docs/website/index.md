@@ -1,0 +1,127 @@
+# See what your AI coding agents did, and what it cost
+
+AgentsView brings your AI coding sessions into one searchable archive. Browse
+recorded conversations from more than 60 agent formats, compare activity and
+costs, and reuse lessons from past work. The archive stays on your machine
+unless you turn on a feature that shares it.
+
+## Install
+
+On macOS or Linux:
+
+```bash
+curl -fsSL https://agentsview.io/install.sh | bash
+```
+
+On Windows:
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://agentsview.io/install.ps1 | iex"
+```
+
+Desktop app, pip/uvx, and Docker installs are covered in the
+[quick start](/docs/quickstart/). Then [follow the guide](/guide/) or read the
+[documentation](/docs/).
+
+## Your coding sessions, in one archive
+
+A background server watches the session directories your agents already write
+and imports supported formats into a local SQLite archive. It finds the default
+directories automatically. You can configure other locations. Supported
+harnesses include Claude Code, OpenClaude, Codex, Augure Code, Augure Desktop,
+Cline CLI, Crush, CodeBuddy CN, Gemini, Copilot (CLI, VS Code, and Visual
+Studio), Cursor, Cursor IDE, IcodeMate, Qwen Code, DeepSeek TUI and Harness,
+Mistral Vibe, Zed, Warp, OpenCode, Positron, Posit Assistant, Claude Cowork,
+Aider, Antigravity, gptme, Kilo, Kimi, Kiro, OpenHands, Goose, Grok, RooCode,
+Trae, Windsurf, and dozens more. Every supported source is listed in
+[session discovery](/docs/configuration/#session-discovery).
+
+- **60+** agent formats parsed
+- **1** binary, zero accounts
+- **SQLite** archive of record
+
+## See when your agents are actually working
+
+The [Activity dashboard](/docs/activity/) shows peak concurrency and the exact
+moment it happened, active versus idle time, agent-minutes across parallel
+sessions, and cost. Scope it to any day, week, month, or custom range, and
+filter by project, agent, and machine. Live sync streams new messages into the
+UI as sessions run.
+
+## Know what every agent costs
+
+[Token and cost reports](/docs/token-usage/) read from the pre-indexed archive
+instead of reparsing raw session files every time. Pricing tracks LiteLLM and
+OpenRouter rates with an offline fallback, and cache-aware accounting covers
+prompt-cache creation and reads.
+
+```bash
+agentsview usage daily          # last 30 days, terminal table
+agentsview usage statusline     # $9.61 today
+agentsview capture run -- claude -p "fix the tests"
+```
+
+## Search and score every transcript
+
+Find a conversation by project and date in the
+[command palette](/docs/usage/#command-palette), or open it by ID with
+`Ctrl/Cmd+G`. Full-text search matches words; opt-in
+[semantic and hybrid search](/docs/semantic-search/) match by meaning.
+[Health scores](/docs/session-intelligence/) and
+[quality signals](/docs/quality/) link back to the transcript so you can check
+the evidence.
+
+## Turn transcripts into durable knowledge
+
+[Recall](/docs/recall/) (experimental) extracts decisions, warnings, and project
+facts from your archive. Each entry links to the messages that support it.
+Generated Insights write model-authored reports over an explicit session scope.
+
+## Your agents can read it too
+
+The same archive you browse is available to your agents:
+
+- **CLI:** scriptable reports and session queries.
+- **REST:** programmatic [session and usage access](/docs/session-api/).
+- **MCP:** [session history as assistant tools](/docs/mcp/).
+- **SSE:** live message streams as sessions run.
+- **Web:** embedded Svelte UI served from the binary.
+- **Desktop:** native app sharing the same data directory.
+
+An agent can check what a previous session already tried, quote its own history,
+or watch its spend mid-run.
+
+## One machine or the whole team
+
+SQLite is the archive of record. From there:
+
+- [PostgreSQL sync](/docs/pg-sync/) pushes each machine's archive to a shared
+  team backend with per-machine labels and a read-only merged server.
+- [ClickHouse sync](/docs/clickhouse-sync/) serves the dashboard from a remote
+  copy. Session edits stay in SQLite.
+- [DuckDB mirror](/docs/duckdb/) serves analytical reads locally or over the
+  Quack protocol.
+- [Filesystem sync](/docs/filesystem-sync/) and
+  [artifact folder sync](/docs/artifact-sync/) move sessions between machines
+  without any database server.
+- [Hosted raw sync](/docs/hosted-raw-sync/) keeps original provider files in
+  hosted storage with device authentication and resumable uploads. Hosted
+  browsing still requires PostgreSQL sync.
+- [Remote access](/docs/remote-access/) stays loopback-only by default, with
+  explicit flags for SSH forwards and authenticated exposure.
+
+## Local by default. Shared when you choose
+
+Your agent transcripts are some of the most sensitive data on your machine.
+AgentsView starts with one local SQLite archive and a loopback-only server. Data
+leaves the machine only when you choose a feature such as PostgreSQL or
+ClickHouse sync, remote DuckDB access, Generated Insights, GitHub publishing, or
+hosted raw sync. Each feature documents what it sends and where it goes.
+
+## Start
+
+Install AgentsView and it finds the sessions that are already on your machine.
+
+- [Follow the guide](/guide/)
+- [Run the quickstart](/docs/quickstart/)
+- [Read the docs](/docs/)

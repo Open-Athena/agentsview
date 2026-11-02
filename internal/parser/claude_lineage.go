@@ -4,6 +4,9 @@ package parser
 
 import (
 	"context"
+	"crypto/sha256"
+	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -49,6 +52,12 @@ const (
 	// cache is rebuilt lazily after a reset, so overflow only costs
 	// re-reads of transcript heads.
 	claudeSniffCacheMaxEntries = 8192
+	// claudeSniffDigestBytes bounds the transcript prefix hashed to
+	// verify every metadata-matching sniff-cache entry. Size, mtime and
+	// ctime can all match after a rapid same-length rewrite,
+	// so those hits require an unchanged leading digest too.
+	// Heads whose parse runs past the bound are not memoized.
+	claudeSniffDigestBytes = 64 << 10
 )
 
 // claudeHeadSniff summarizes the first uuid-bearing chain entry of a
@@ -62,6 +71,7 @@ type claudeHeadSniff struct {
 type claudeSniffCacheEntry struct {
 	size    int64
 	mtimeNS int64
+	headSHA [sha256.Size]byte
 	sniff   claudeHeadSniff
 }
 
@@ -86,6 +96,9 @@ type claudeParseOptions struct {
 	// compatibleTitleEvents enables the sessionName, custom-title, and
 	// ai-title fields written by compatible transcript producers.
 	compatibleTitleEvents bool
+	// aiTitleFallback enables native Claude ai-title metadata. /rename keeps
+	// priority; sessionName and custom-title remain compatible-only fields.
+	aiTitleFallback bool
 }
 
 // claudeLineagePlan describes an established fork lineage: the leading
@@ -107,59 +120,113 @@ func claudeSniffHead(
 	}
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() {
-		return claudeHeadSniff{}, nil
+		return claudeHeadSniff{}, nil //nolint:nilerr // Unavailable optional lineage metadata yields no lineage hint.
 	}
 	claudeSniffMu.Lock()
-	if e, ok := claudeSniffCache[path]; ok &&
-		e.size == info.Size() && e.mtimeNS == info.ModTime().UnixNano() {
-		claudeSniffMu.Unlock()
-		return e.sniff, nil
-	}
+	e, cached := claudeSniffCache[path]
 	claudeSniffMu.Unlock()
+	if cached && e.size == info.Size() && e.mtimeNS == info.ModTime().UnixNano() {
+		// Matching metadata does not prove matching content: a
+		// same-length rewrite can restore mtime while ctime also stays
+		// unchanged. Verify the bounded leading-byte digest on every
+		// metadata hit before reusing a root UUID or background stamp.
+		headSHA, ok := claudeHeadDigest(path)
+		if ok && headSHA == e.headSHA {
+			return e.sniff, nil
+		}
+	}
 
-	sniff, err := claudeSniffHeadUncached(ctx, path)
+	sniff, headSHA, verified, err := claudeSniffHeadUncached(ctx, path)
 	if err != nil {
 		return claudeHeadSniff{}, err
 	}
 	if err := ctx.Err(); err != nil {
 		return claudeHeadSniff{}, err
 	}
-
-	claudeSniffMu.Lock()
-	if len(claudeSniffCache) >= claudeSniffCacheMaxEntries {
-		claudeSniffCache = map[string]claudeSniffCacheEntry{}
+	if verified {
+		claudeSniffMu.Lock()
+		if len(claudeSniffCache) >= claudeSniffCacheMaxEntries {
+			claudeSniffCache = map[string]claudeSniffCacheEntry{}
+		}
+		claudeSniffCache[path] = claudeSniffCacheEntry{
+			size:    info.Size(),
+			mtimeNS: info.ModTime().UnixNano(),
+			headSHA: headSHA,
+			sniff:   sniff,
+		}
+		claudeSniffMu.Unlock()
 	}
-	claudeSniffCache[path] = claudeSniffCacheEntry{
-		size:    info.Size(),
-		mtimeNS: info.ModTime().UnixNano(),
-		sniff:   sniff,
-	}
-	claudeSniffMu.Unlock()
 	return sniff, nil
+}
+
+// claudeHeadDigest hashes the leading claudeSniffDigestBytes of
+// path. ok is false when the file cannot be opened or read.
+func claudeHeadDigest(path string) ([sha256.Size]byte, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return [sha256.Size]byte{}, false
+	}
+	defer f.Close()
+	headSHA, _, ok := claudeHashLeading(f, claudeSniffDigestBytes)
+	return headSHA, ok
+}
+
+// claudeHashLeading hashes the leading limit bytes of f without
+// moving the file offset, returning the digest and the number of
+// bytes hashed. ok is false when the read fails, including for
+// files that do not support positioned reads.
+func claudeHashLeading(
+	f *os.File, limit int64,
+) ([sha256.Size]byte, int64, bool) {
+	h := sha256.New()
+	n, err := io.Copy(h, io.NewSectionReader(f, 0, limit))
+	if err != nil {
+		return [sha256.Size]byte{}, 0, false
+	}
+	var headSHA [sha256.Size]byte
+	copy(headSHA[:], h.Sum(nil))
+	return headSHA, n, true
 }
 
 func claudeSniffHeadUncached(
 	ctx context.Context, path string,
-) (claudeHeadSniff, error) {
+) (claudeHeadSniff, [sha256.Size]byte, bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return claudeHeadSniff{}, nil
+		return claudeHeadSniff{}, [sha256.Size]byte{}, false, nil
 	}
 	defer f.Close()
+	// Digest the head before parsing it, from the same open file, so
+	// the stored digest cannot describe content newer than the
+	// parsed lines. A rewrite racing between the digest read and the
+	// parse can still pair a digest with lines it did not cover; the
+	// settled file then hashes differently and the next lookup
+	// misses, so the mismatch cannot be served as a hit. The parse is
+	// memoized only when it consumed bytes inside the digested
+	// prefix: beyond it, a rewrite could hide from the digest.
+	headSHA, hashed, digestOK := claudeHashLeading(f, claudeSniffDigestBytes)
 	lr := newLineReaderContext(ctx, f, maxLineSize)
 	defer releaseLineReader(lr)
+	sniff, consumed, err := claudeSniffHeadLines(ctx, lr)
+	verified := digestOK && consumed <= hashed
+	return sniff, headSHA, verified, err
+}
+
+func claudeSniffHeadLines(
+	ctx context.Context, lr *lineReader,
+) (claudeHeadSniff, int64, error) {
 	for range claudeLineageSniffMaxLines {
 		if err := ctx.Err(); err != nil {
-			return claudeHeadSniff{}, err
+			return claudeHeadSniff{}, lr.bytesRead, err
 		}
 		lineBytes, ok := lr.nextBytes()
 		if !ok {
 			if lr.Err() != nil {
 				if err := ctx.Err(); err != nil {
-					return claudeHeadSniff{}, err
+					return claudeHeadSniff{}, lr.bytesRead, err
 				}
 			}
-			return claudeHeadSniff{}, nil
+			return claudeHeadSniff{}, lr.bytesRead, nil
 		}
 		if !gjson.ValidBytes(lineBytes) {
 			continue
@@ -172,18 +239,18 @@ func claudeSniffHeadUncached(
 		// replayed copy, which starts at the conversation root) has no
 		// parentUuid. Any other head shape is unexpected: fail open.
 		if gjson.GetBytes(lineBytes, "parentUuid").Str != "" {
-			return claudeHeadSniff{}, nil
+			return claudeHeadSniff{}, lr.bytesRead, nil
 		}
 		return claudeHeadSniff{
 			rootUUID: uuid,
 			rootIsBG: gjson.GetBytes(lineBytes, "sessionKind").Str == "bg",
 			ok:       true,
-		}, nil
+		}, lr.bytesRead, nil
 	}
 	if err := ctx.Err(); err != nil {
-		return claudeHeadSniff{}, err
+		return claudeHeadSniff{}, lr.bytesRead, err
 	}
-	return claudeHeadSniff{}, nil
+	return claudeHeadSniff{}, lr.bytesRead, nil
 }
 
 // claudeForkLine is one uuid-bearing line of a fork transcript.
@@ -234,11 +301,59 @@ func claudeScanUUIDs(
 	return lr.Err() == nil, nil
 }
 
+// claudeLineageCaptureSiblings returns the sibling transcripts the lineage
+// parser must be able to read for path: when path is a top-level project
+// transcript whose head is a bg-marked fork, every sibling .jsonl in the same
+// project directory whose first chain entry replays the fork's root uuid.
+// Only bg-marked forks ever trim or link, so interactive originals, subagent
+// transcripts, and unrelated conversations contribute no entries. The set is
+// exactly the candidate filter claudeResolveSiblingLineage applies, so a
+// capture generation carries every input the parser needs at replay time.
+func claudeLineageCaptureSiblings(ctx context.Context, path string) ([]string, error) {
+	self, err := claudeSniffHead(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if !self.ok || !self.rootIsBG {
+		return nil, nil
+	}
+	dir := filepath.Dir(path)
+	dirEntries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, invalidRawCapturePlan(
+			"read Claude lineage siblings: %s", rawCaptureFilesystemError(err),
+		)
+	}
+	base := filepath.Base(path)
+	var siblings []string
+	for _, entry := range dirEntries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		name := entry.Name()
+		if entry.IsDir() || name == base ||
+			!strings.HasSuffix(name, ".jsonl") ||
+			strings.HasPrefix(name, "agent-") {
+			continue
+		}
+		siblingPath := filepath.Join(dir, name)
+		sniff, err := claudeSniffHead(ctx, siblingPath)
+		if err != nil {
+			return nil, err
+		}
+		if sniff.ok && sniff.rootUUID == self.rootUUID {
+			siblings = append(siblings, siblingPath)
+		}
+	}
+	return siblings, nil
+}
+
 // claudeResolveSiblingLineage establishes the background-fork lineage
 // for path, or returns nil when no lineage can be positively oriented.
-// Sibling discovery is head-sniff only (memoized per size and mtime);
-// the qualifying candidates' full uuid sets are read once per full
-// parse of a bg-marked fork.
+// Sibling discovery is head-sniff only (memoized per size and mtime,
+// with a bounded leading digest verifying every metadata hit).
+// Qualifying candidates' full uuid sets are read once per full parse of a
+// bg-marked fork.
 func claudeResolveSiblingLineage(
 	ctx context.Context, path string,
 ) (*claudeLineagePlan, error) {
@@ -252,7 +367,7 @@ func claudeResolveSiblingLineage(
 	dir := filepath.Dir(path)
 	dirEntries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, nil
+		return nil, nil //nolint:nilerr // Unavailable optional lineage metadata yields no lineage hint.
 	}
 	base := filepath.Base(path)
 	type candidate struct {
@@ -323,6 +438,8 @@ func claudeResolveSiblingLineage(
 	bestRun := 0
 	bestStem := ""
 	var bestSet map[string]struct{}
+	bestTied := false
+	bestBG := false
 	for _, c := range candidates {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -352,9 +469,15 @@ func claudeResolveSiblingLineage(
 			bestRun = run
 			bestStem = c.stem
 			bestSet = set
+			bestTied = false
+			bestBG = c.bg
+		} else if run > 0 && run == bestRun && c.bg == bestBG && !maps.Equal(set, bestSet) {
+			bestTied = true
 		}
 	}
-	if bestRun == 0 {
+	// Different UUID sets sharing a maximum do not identify an ancestor:
+	// they may be independent forks. Identical sets keep the smallest stem.
+	if bestRun == 0 || bestTied {
 		return nil, nil
 	}
 	dropUUIDs := make(map[string]struct{}, bestRun)

@@ -12,22 +12,37 @@ import (
 )
 
 const (
-	defaultParseRetentionBytes      = int64(64 << 20)
-	parseRetentionFixedBytes        = int64(64 << 10)
-	parseRetentionMultiplier        = int64(4)
-	parseRetentionScavengeThreshold = int64(16 << 20)
+	defaultParseRetentionBytes = int64(64 << 20)
+	// Keep all eight workers available for roughly 6 MiB sources under the
+	// four-times-source-size estimate. Active parses and pending writes have
+	// nominal budgets totaling 384 MiB. An indivisible oversized or unknown
+	// source may exceed the pending budget before its standalone batch is
+	// written; these estimates are not a hard heap limit.
+	defaultBulkParseRetentionBytes   = int64(256 << 20)
+	defaultBulkPendingRetentionBytes = int64(128 << 20)
+	parseRetentionFixedBytes         = int64(64 << 10)
+	parseRetentionMultiplier         = int64(4)
+	parseRetentionScavengeThreshold  = int64(16 << 20)
+	// Bound pending daemon writes by source bytes as well as session count.
+	parseBatchBytesLimit = defaultParseRetentionBytes
 )
 
+// bulkPendingRetentionBytes is the pending-result budget each new bulk budget
+// receives. It is a variable only so benchmarks can compare budgets over the
+// same fixture; rebuild contributor engines construct their own budgets, so a
+// per-engine field would not reach them.
+var bulkPendingRetentionBytes = defaultBulkPendingRetentionBytes
+
 type parseRetentionBudget struct {
-	capacity int64
-	// weighted is nil for the bulk budget, which admits every parse
-	// immediately so archive-scale passes run at full worker parallelism.
-	weighted        *semaphore.Weighted
-	pressure        chan struct{}
-	waiters         atomic.Int64
-	scavengePending atomic.Bool
-	scavenge        func()
-	acquired        atomic.Int64 // total successful acquisitions, for tests
+	capacity             int64
+	pendingCapacity      int64
+	weighted             *semaphore.Weighted
+	pressure             chan struct{}
+	waiters              atomic.Int64
+	scavengeEveryAcquire bool
+	scavengePending      atomic.Bool
+	scavenge             func()
+	acquired             atomic.Int64 // total successful acquisitions, for tests
 }
 
 func newParseRetentionBudget(capacity int64) *parseRetentionBudget {
@@ -42,34 +57,30 @@ func newParseRetentionBudget(capacity int64) *parseRetentionBudget {
 	}
 }
 
-// newBulkParseRetentionBudget returns the budget archive-scale passes use
-// (full sync, resync rebuild, remote import processing). It never throttles
-// parse admission: peak memory during a bulk pass is bounded by worker
-// parallelism, not by a byte budget. Instead it releases the pass's retained
-// memory back to the OS in one scavenge once the pass completes, keeping the
-// long-running daemon's settled footprint low without serializing the pass.
-func newBulkParseRetentionBudget() *parseRetentionBudget {
-	return &parseRetentionBudget{
-		pressure: make(chan struct{}, 1),
-		scavenge: debug.FreeOSMemory,
-	}
+// newBulkParseRetentionBudget returns the byte-weighted budget archive-scale
+// passes use (full sync, resync rebuild, remote import processing). Active and
+// queued parses use the weighted semaphore while completed results transfer to
+// a separately bounded collector batch. It keeps the bulk pass's end-of-pass
+// scavenge even when every admitted source is smaller than the default
+// budget's large-source threshold.
+func newBulkParseRetentionBudget(capacity int64) *parseRetentionBudget {
+	budget := newParseRetentionBudget(capacity)
+	budget.pendingCapacity = bulkPendingRetentionBytes
+	budget.scavengeEveryAcquire = true
+	return budget
 }
 
 func (budget *parseRetentionBudget) acquire(
 	ctx context.Context, sourceBytes int64,
 ) (*parseRetentionLease, error) {
-	if budget.weighted == nil {
-		// Bulk pass: admit immediately and remember that parsed payloads
-		// were retained so the end-of-pass scavenge runs exactly once.
-		budget.scavengePending.Store(true)
-		budget.acquired.Add(1)
-		return &parseRetentionLease{}, nil
-	}
 	weight := budget.weight(sourceBytes)
+	retainedBytes := budget.retainedBytes(sourceBytes)
 	if budget.weighted.TryAcquire(weight) {
 		budget.noteKnownLargeSource(sourceBytes)
 		budget.acquired.Add(1)
-		return &parseRetentionLease{budget: budget, weight: weight}, nil
+		return &parseRetentionLease{
+			budget: budget, weight: weight, retainedBytes: retainedBytes,
+		}, nil
 	}
 	budget.waiters.Add(1)
 	defer budget.waiters.Add(-1)
@@ -82,11 +93,13 @@ func (budget *parseRetentionBudget) acquire(
 	}
 	budget.noteKnownLargeSource(sourceBytes)
 	budget.acquired.Add(1)
-	return &parseRetentionLease{budget: budget, weight: weight}, nil
+	return &parseRetentionLease{
+		budget: budget, weight: weight, retainedBytes: retainedBytes,
+	}, nil
 }
 
 func (budget *parseRetentionBudget) noteKnownLargeSource(sourceBytes int64) {
-	if sourceBytes >= parseRetentionScavengeThreshold {
+	if budget.scavengeEveryAcquire || sourceBytes >= parseRetentionScavengeThreshold {
 		budget.scavengePending.Store(true)
 	}
 }
@@ -110,11 +123,16 @@ func (budget *parseRetentionBudget) underPressure() bool {
 }
 
 func (budget *parseRetentionBudget) weight(sourceBytes int64) int64 {
+	return min(budget.retainedBytes(sourceBytes), budget.capacity)
+}
+
+func (budget *parseRetentionBudget) retainedBytes(sourceBytes int64) int64 {
+	limit := max(budget.capacity, budget.pendingCapacity)
 	if sourceBytes <= 0 {
-		return budget.capacity
+		return limit
 	}
-	if sourceBytes >= (budget.capacity-parseRetentionFixedBytes)/parseRetentionMultiplier {
-		return budget.capacity
+	if sourceBytes >= (limit-parseRetentionFixedBytes)/parseRetentionMultiplier {
+		return limit
 	}
 	return parseRetentionFixedBytes + sourceBytes*parseRetentionMultiplier
 }
@@ -122,7 +140,12 @@ func (budget *parseRetentionBudget) weight(sourceBytes int64) int64 {
 type parseRetentionLease struct {
 	budget *parseRetentionBudget
 	weight int64
-	once   gosync.Once
+	// retainedBytes estimates the parsed payload transferred to an archive-scale
+	// collector. It may exceed weight because an oversized source acquires the
+	// active parse budget exclusively but must still count at full cost against
+	// the collector's separate pending-data bound.
+	retainedBytes int64
+	once          gosync.Once
 }
 
 func (lease *parseRetentionLease) Release() {
@@ -140,7 +163,15 @@ func releaseParseRetentionLeases(leases []*parseRetentionLease) {
 	}
 }
 
-func parseRetentionSourceBytes(file parser.DiscoveredFile) int64 {
+// parseRetentionSourceBytes estimates the bytes one discovered source
+// contributes to a parse. A shared SQLite container fans into one virtual
+// source per session row and every member stats back to the same container
+// file, so the raw size would charge each member for rows only its siblings
+// hold. Members partition the container, so the container size divided by the
+// sessions this pass discovered in it sums back to the container across the
+// whole membership. An unknown or partial count returns a larger share and
+// therefore admits fewer parses, never more.
+func (e *Engine) parseRetentionSourceBytes(file parser.DiscoveredFile) int64 {
 	if file.SourceSize > 0 {
 		return file.SourceSize
 	}
@@ -150,10 +181,21 @@ func parseRetentionSourceBytes(file parser.DiscoveredFile) int64 {
 			path = providerPath
 		}
 	}
-	path = validatedProviderSourceStatPath(path)
-	info, err := os.Stat(path)
+	info, err := os.Stat(validatedProviderSourceStatPath(path))
 	if err != nil || !info.Mode().IsRegular() {
 		return 0
+	}
+	// Membership follows the same resolved path as the stat: a virtual member
+	// promoted to its storage JSON shadow stats the shadow, so dividing that
+	// size by the container's membership would undercharge the parse.
+	resolved := parser.DiscoveredFile{Agent: file.Agent, Path: path}
+	if members := e.sqliteContainerDiscoveredMembers(resolved); members > 1 {
+		// Sole-member containers keep the raw size so a zero-byte container
+		// still reports zero, which retainedBytes reads as an unknown source.
+		// Above one member the share floors at a byte instead, because a
+		// non-positive estimate would charge the whole budget: the fault this
+		// fixes.
+		return max(info.Size()/int64(members), 1)
 	}
 	return info.Size()
 }

@@ -1,12 +1,5 @@
 // @vitest-environment jsdom
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 // @ts-ignore
 import SessionList from "./SessionList.svelte";
@@ -18,11 +11,7 @@ import type { Session } from "../../api/types.js";
 import { starred } from "../../stores/starred.svelte.js";
 import { ui } from "../../stores/ui.svelte.js";
 import { m, setLocale } from "../../i18n/index.js";
-import {
-  ITEM_HEIGHT,
-  OVERSCAN,
-  STORAGE_KEY_GROUP,
-} from "./session-list-utils.js";
+import { ITEM_HEIGHT, OVERSCAN, STORAGE_KEY_GROUP } from "./session-list-utils.js";
 
 vi.mock("../../api/client.js", () => ({
   listSessions: vi.fn().mockResolvedValue({
@@ -78,6 +67,7 @@ describe("SessionList filter dropdown", () => {
         return 1;
       });
     sessions.sessions = [];
+    sessions.projects = [];
     sessions.agents = [];
     sessions.machines = [];
     sessions.activeSessionId = null;
@@ -86,9 +76,7 @@ describe("SessionList filter dropdown", () => {
     sessions.selectedIds = new Set();
     sessions.selectMode = false;
     sessions.sidebarIndexVersion++;
-    sessions.hydratedSessionsByVersion = new Map([
-      [sessions.sidebarIndexVersion, new Map()],
-    ]);
+    sessions.hydratedSessionsByVersion = new Map([[sessions.sidebarIndexVersion, new Map()]]);
     readProgress.reset();
     starred.filterOnly = false;
     starred.ids = new Set();
@@ -121,22 +109,16 @@ describe("SessionList filter dropdown", () => {
     component = mount(SessionList, { target: document.body });
     await tick();
 
-    const filterButton = document.querySelector<HTMLButtonElement>(
-      ".filter-btn",
-    );
+    const filterButton = document.querySelector<HTMLButtonElement>(".filter-btn");
     expect(filterButton).not.toBeNull();
 
     filterButton!.click();
     await tick();
 
-    const dropdown = document.querySelector<HTMLElement>(
-      ".filter-dropdown",
-    );
+    const dropdown = document.querySelector<HTMLElement>(".filter-dropdown");
     expect(dropdown).not.toBeNull();
 
-    expect(sessionFilterControlSource).toContain(
-      "max-height: min(560px, calc(100vh - 128px));",
-    );
+    expect(sessionFilterControlSource).toContain("max-height: min(560px, calc(100vh - 128px));");
     expect(sessionFilterControlSource).toContain("overflow-y: auto;");
   });
 
@@ -144,9 +126,7 @@ describe("SessionList filter dropdown", () => {
     component = mount(SessionList, { target: document.body });
     await tick();
 
-    const filterButton = document.querySelector<HTMLButtonElement>(
-      ".filter-btn",
-    );
+    const filterButton = document.querySelector<HTMLButtonElement>(".filter-btn");
 
     expect(filterButton).not.toBeNull();
     expect(filterButton?.title).toBe("Filter sessions");
@@ -157,9 +137,7 @@ describe("SessionList filter dropdown", () => {
     component = mount(SessionList, { target: document.body });
     await tick();
 
-    const filterButton = document.querySelector<HTMLButtonElement>(
-      ".filter-btn",
-    );
+    const filterButton = document.querySelector<HTMLButtonElement>(".filter-btn");
     const collapseButton = document.querySelector<HTMLButtonElement>(
       'button[aria-label="Close sidebar"]',
     );
@@ -181,9 +159,7 @@ describe("SessionList filter dropdown", () => {
     component = mount(SessionList, { target: document.body });
     await tick();
 
-    expect(
-      document.querySelector('button[aria-label="Close sidebar"]'),
-    ).toBeNull();
+    expect(document.querySelector('button[aria-label="Close sidebar"]')).toBeNull();
   });
 
   it("renders translated sidebar filter controls and row actions", async () => {
@@ -205,9 +181,7 @@ describe("SessionList filter dropdown", () => {
     component = mount(SessionList, { target: document.body });
     await tick();
 
-    const filterButton = document.querySelector<HTMLButtonElement>(
-      ".filter-btn",
-    );
+    const filterButton = document.querySelector<HTMLButtonElement>(".filter-btn");
     expect(filterButton).not.toBeNull();
     expect(filterButton?.title).toBe("筛选会话");
     expect(filterButton?.getAttribute("aria-label")).toBe("筛选器");
@@ -237,6 +211,7 @@ describe("SessionList filter dropdown", () => {
     await tick();
 
     expect(document.body.textContent).toContain("重命名");
+    expect(document.body.textContent).toContain("更改项目");
     expect(document.body.textContent).toContain("在新标签页打开");
     expect(document.body.textContent).toContain("删除");
 
@@ -245,9 +220,7 @@ describe("SessionList filter dropdown", () => {
     await tick();
 
     expect(document.body.textContent).toContain("已选择 1 个");
-    const batchSelectButton = document.querySelector<HTMLButtonElement>(
-      ".batch-select-all-btn",
-    );
+    const batchSelectButton = document.querySelector<HTMLButtonElement>(".batch-select-all-btn");
     expect(batchSelectButton?.textContent?.trim()).toBe("清除");
     expect(document.body.textContent).toContain("取消");
   });
@@ -267,25 +240,90 @@ describe("SessionList filter dropdown", () => {
         is_index_only: true,
       }),
     ];
-    readProgress.baseline(
-      "changed",
-      "old",
-      1,
-    );
-    readProgress.baseline(
-      "same",
-      "same",
-      1,
-    );
+    readProgress.baseline("changed", "old", 1);
+    readProgress.baseline("same", "same", 1);
     vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
 
     component = mount(SessionList, { target: document.body });
     await tick();
 
-    const indicators = document.querySelectorAll(
-      '[aria-label="Unread messages"]',
-    );
+    const indicators = document.querySelectorAll('[aria-label="Unread messages"]');
     expect(indicators).toHaveLength(1);
+  });
+
+  it("assigns an individual session from its searchable project editor", async () => {
+    sessions.projects = [{ name: "destination", session_count: 4 }];
+    sessions.sessions = [
+      makeSession({
+        id: "move-session",
+        display_name: "Move this session",
+        is_index_only: false,
+        project_assigned: false,
+      }),
+    ];
+    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
+    vi.spyOn(sessions, "loadProjects").mockResolvedValue(undefined);
+    const assign = vi.spyOn(sessions, "assignSessionProject").mockResolvedValue("destination");
+
+    component = mount(SessionList, { target: document.body });
+    await tick();
+    document
+      .querySelector<HTMLElement>(".session-item")!
+      .dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 12, clientY: 12 }));
+    await tick();
+    Array.from(document.querySelectorAll<HTMLButtonElement>(".context-menu-item"))
+      .find((button) => button.textContent?.includes("Change project"))!
+      .click();
+    await tick();
+
+    expect(document.body.textContent).toContain(m.data_session_assignment_automatic());
+    document
+      .querySelector<HTMLButtonElement>(`[title="${m.data_session_assignment_target()}"]`)!
+      .click();
+    await tick();
+    document
+      .querySelector<HTMLElement>('[role="option"]')!
+      .dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    await tick();
+    Array.from(document.querySelectorAll<HTMLButtonElement>(".project-editor button"))
+      .find((button) => button.textContent?.includes(m.data_session_assignment_save()))!
+      .click();
+    await tick();
+
+    expect(assign).toHaveBeenCalledWith("move-session", "destination");
+  });
+
+  it("restores automatic assignment for a manually moved session", async () => {
+    sessions.sessions = [
+      makeSession({
+        id: "manual-session",
+        display_name: "Manual session",
+        is_index_only: false,
+        project_assigned: true,
+      }),
+    ];
+    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
+    vi.spyOn(sessions, "loadProjects").mockResolvedValue(undefined);
+    const clear = vi.spyOn(sessions, "clearSessionProjectAssignment").mockResolvedValue("proj");
+
+    component = mount(SessionList, { target: document.body });
+    await tick();
+    document
+      .querySelector<HTMLElement>(".session-item")!
+      .dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 12, clientY: 12 }));
+    await tick();
+    Array.from(document.querySelectorAll<HTMLButtonElement>(".context-menu-item"))
+      .find((button) => button.textContent?.includes("Change project"))!
+      .click();
+    await tick();
+
+    expect(document.body.textContent).toContain(m.data_session_assignment_manual());
+    Array.from(document.querySelectorAll<HTMLButtonElement>(".project-editor button"))
+      .find((button) => button.textContent?.includes(m.data_session_assignment_use_automatic()))!
+      .click();
+    await tick();
+
+    expect(clear).toHaveBeenCalledWith("manual-session");
   });
 });
 
@@ -318,9 +356,7 @@ describe("SessionList visible hydration", () => {
     sessions.selectedIds = new Set();
     sessions.selectMode = false;
     sessions.sidebarIndexVersion++;
-    sessions.hydratedSessionsByVersion = new Map([
-      [sessions.sidebarIndexVersion, new Map()],
-    ]);
+    sessions.hydratedSessionsByVersion = new Map([[sessions.sidebarIndexVersion, new Map()]]);
     readProgress.reset();
     starred.filterOnly = false;
     starred.ids = new Set();
@@ -349,9 +385,7 @@ describe("SessionList visible hydration", () => {
     sessions.sessions = Array.from({ length: 20 }, (_, i) =>
       makeSession({ id: `s${i}`, is_index_only: true }),
     );
-    const hydrate = vi
-      .spyOn(sessions, "hydrateVisibleSessions")
-      .mockResolvedValue(undefined);
+    const hydrate = vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
 
     component = mount(SessionList, { target: document.body });
     await tick();
@@ -401,9 +435,7 @@ describe("SessionList visible hydration", () => {
         is_index_only: true,
       }),
     ];
-    vi.spyOn(sessions, "hydrateVisibleSessions").mockReturnValue(
-      new Promise<void>(() => {}),
-    );
+    vi.spyOn(sessions, "hydrateVisibleSessions").mockReturnValue(new Promise<void>(() => {}));
 
     component = mount(SessionList, { target: document.body });
     await tick();
@@ -412,8 +444,7 @@ describe("SessionList visible hydration", () => {
   });
 
   it("keeps long session labels intact for responsive CSS clipping", async () => {
-    const title =
-      "test: validate GitLab write parity against a real GitLab instance";
+    const title = "test: validate GitLab write parity against a real GitLab instance";
     sessions.sessions = [
       makeSession({
         id: "long-title",
@@ -450,12 +481,8 @@ describe("SessionList visible hydration", () => {
     component = mount(SessionList, { target: document.body });
     await tick();
 
-    const active = document.querySelector<HTMLElement>(
-      '[data-session-id="active-session"]',
-    );
-    const other = document.querySelector<HTMLElement>(
-      '[data-session-id="other-session"]',
-    );
+    const active = document.querySelector<HTMLElement>('[data-session-id="active-session"]');
+    const other = document.querySelector<HTMLElement>('[data-session-id="other-session"]');
     expect(active).not.toBeNull();
     expect(active?.getAttribute("aria-current")).toBe("page");
     expect(other).not.toBeNull();
@@ -474,9 +501,7 @@ describe("SessionList visible hydration", () => {
     sessions.sessions = Array.from({ length: 50 }, (_, i) =>
       makeSession({ id: `s${i}`, is_index_only: true }),
     );
-    const hydrate = vi
-      .spyOn(sessions, "hydrateVisibleSessions")
-      .mockResolvedValue(undefined);
+    const hydrate = vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
 
     component = mount(SessionList, { target: document.body });
     await tick();
@@ -496,9 +521,7 @@ describe("SessionList visible hydration", () => {
     sessions.sessions = Array.from({ length: 50 }, (_, i) =>
       makeSession({ id: `s${i}`, is_index_only: true }),
     );
-    const hydrate = vi
-      .spyOn(sessions, "hydrateVisibleSessions")
-      .mockResolvedValue(undefined);
+    const hydrate = vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
 
     component = mount(SessionList, { target: document.body });
     await tick();
@@ -554,9 +577,7 @@ describe("SessionList visible hydration", () => {
     await tick();
     load.mockClear();
 
-    const filterButton = document.querySelector<HTMLButtonElement>(
-      ".filter-btn",
-    );
+    const filterButton = document.querySelector<HTMLButtonElement>(".filter-btn");
     expect(filterButton).not.toBeNull();
     filterButton!.click();
     await tick();
@@ -581,24 +602,18 @@ describe("SessionList visible hydration", () => {
         is_index_only: false,
       }),
     ];
-    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(
-      undefined,
-    );
+    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
 
     component = mount(SessionList, { target: document.body });
     await tick();
 
-    const link = document.querySelector<HTMLAnchorElement>(
-      ".session-info-link",
-    );
+    const link = document.querySelector<HTMLAnchorElement>(".session-info-link");
     expect(link).not.toBeNull();
     expect(link?.getAttribute("href")).toBe("/sessions/native-session");
   });
 
   it("keeps keyboard-style anchor activation on the SPA session path", async () => {
-    const selectSession = vi
-      .spyOn(sessions, "selectSession")
-      .mockImplementation(() => {});
+    const selectSession = vi.spyOn(sessions, "selectSession").mockImplementation(() => {});
     sessions.sessions = [
       makeSession({
         id: "keyboard-session",
@@ -606,16 +621,12 @@ describe("SessionList visible hydration", () => {
         is_index_only: false,
       }),
     ];
-    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(
-      undefined,
-    );
+    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
 
     component = mount(SessionList, { target: document.body });
     await tick();
 
-    const link = document.querySelector<HTMLAnchorElement>(
-      ".session-info-link",
-    );
+    const link = document.querySelector<HTMLAnchorElement>(".session-info-link");
     expect(link).not.toBeNull();
     const click = new MouseEvent("click", {
       bubbles: true,
@@ -629,9 +640,7 @@ describe("SessionList visible hydration", () => {
   });
 
   it("toggles selection from the session link in select mode", async () => {
-    const selectSession = vi
-      .spyOn(sessions, "selectSession")
-      .mockImplementation(() => {});
+    const selectSession = vi.spyOn(sessions, "selectSession").mockImplementation(() => {});
     sessions.sessions = [
       makeSession({
         id: "link-select-session",
@@ -639,23 +648,17 @@ describe("SessionList visible hydration", () => {
         is_index_only: false,
       }),
     ];
-    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(
-      undefined,
-    );
+    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
 
     component = mount(SessionList, { target: document.body });
     await tick();
 
-    const selectModeButton = document.querySelector<HTMLButtonElement>(
-      ".select-toggle-btn",
-    );
+    const selectModeButton = document.querySelector<HTMLButtonElement>(".select-toggle-btn");
     expect(selectModeButton).not.toBeNull();
     selectModeButton!.click();
     await tick();
 
-    const link = document.querySelector<HTMLAnchorElement>(
-      ".session-info-link",
-    );
+    const link = document.querySelector<HTMLAnchorElement>(".session-info-link");
     expect(link).not.toBeNull();
     const click = new MouseEvent("click", {
       bubbles: true,
@@ -669,9 +672,7 @@ describe("SessionList visible hydration", () => {
   });
 
   it("keeps the non-link parts of the row selectable", async () => {
-    const selectSession = vi
-      .spyOn(sessions, "selectSession")
-      .mockImplementation(() => {});
+    const selectSession = vi.spyOn(sessions, "selectSession").mockImplementation(() => {});
     sessions.sessions = [
       makeSession({
         id: "row-session",
@@ -679,9 +680,7 @@ describe("SessionList visible hydration", () => {
         is_index_only: false,
       }),
     ];
-    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(
-      undefined,
-    );
+    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
 
     component = mount(SessionList, { target: document.body });
     await tick();
@@ -701,17 +700,13 @@ describe("SessionList visible hydration", () => {
         is_index_only: false,
       }),
     ];
-    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(
-      undefined,
-    );
+    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
 
     component = mount(SessionList, { target: document.body });
     await tick();
 
     const row = document.querySelector<HTMLElement>(".session-item");
-    const link = document.querySelector<HTMLAnchorElement>(
-      ".session-info-link",
-    );
+    const link = document.querySelector<HTMLAnchorElement>(".session-info-link");
     expect(row).not.toBeNull();
     expect(row?.getAttribute("role")).toBe("button");
     expect(row?.getAttribute("tabindex")).toBe("0");
@@ -720,9 +715,7 @@ describe("SessionList visible hydration", () => {
   });
 
   it("opens the same canonical href from the context menu in a new tab", async () => {
-    const openSpy = vi
-      .spyOn(window, "open")
-      .mockReturnValue(null as unknown as Window);
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null as unknown as Window);
     sessions.sessions = [
       makeSession({
         id: "native-open-session",
@@ -730,9 +723,7 @@ describe("SessionList visible hydration", () => {
         is_index_only: false,
       }),
     ];
-    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(
-      undefined,
-    );
+    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
 
     component = mount(SessionList, { target: document.body });
     await tick();
@@ -755,12 +746,49 @@ describe("SessionList visible hydration", () => {
     expect(openInNewTab).not.toBeNull();
     openInNewTab!.click();
 
-    expect(openSpy).toHaveBeenCalledWith(
-      "/sessions/native-open-session",
-      "_blank",
-      "noopener",
-    );
+    expect(openSpy).toHaveBeenCalledWith("/sessions/native-open-session", "_blank", "noopener");
   });
+
+  it.each(["continuation", "subagent", "teammate"])(
+    "renders a shared %s under both expanded parent groups",
+    async (kind) => {
+      sessions.sessions = [
+        makeSession({ id: "root-a", display_name: "Parent A" }),
+        makeSession({ id: "root-b", display_name: "Parent B" }),
+        makeSession({
+          id: "shared-child",
+          display_name: "Shared child",
+          parent_session_ids: ["root-a", "root-b"],
+          relationship_type: kind === "subagent" ? "subagent" : "continuation",
+          is_teammate: kind === "teammate",
+        }),
+      ];
+      vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
+
+      component = mount(SessionList, { target: document.body });
+      await tick();
+      for (const id of ["root-a", "root-b"]) {
+        const expand = document.querySelector<HTMLButtonElement>(
+          `[data-session-id="${id}"] button[aria-label="Expand"]`,
+        );
+        expect(expand).not.toBeNull();
+        expand!.click();
+        await tick();
+      }
+
+      expect(document.querySelectorAll('[data-session-id="shared-child"]')).toHaveLength(2);
+      document
+        .querySelector<HTMLButtonElement>(
+          '[data-session-id="root-a"] button[aria-label="Collapse"]',
+        )!
+        .click();
+      await tick();
+      expect(document.querySelectorAll('[data-session-id="shared-child"]')).toHaveLength(1);
+      expect(document.querySelector('[data-session-id="shared-child"]')?.textContent).toContain(
+        "Shared child",
+      );
+    },
+  );
 
   it("uses is_teammate for the collapsed group teammate hint", async () => {
     sessions.sessions = [
@@ -805,13 +833,9 @@ describe("SessionList visible hydration", () => {
     component = mount(SessionList, { target: document.body });
     await tick();
 
-    const indicator = document.querySelector(
-      '[aria-label="Unread messages"]',
-    );
+    const indicator = document.querySelector('[aria-label="Unread messages"]');
     expect(indicator).not.toBeNull();
-    expect(
-      indicator?.closest<HTMLElement>(".session-item")?.dataset.sessionId,
-    ).toBe("root");
+    expect(indicator?.closest<HTMLElement>(".session-item")?.dataset.sessionId).toBe("root");
   });
 
   it("selects only rendered session rows when selecting all visible", async () => {
@@ -837,23 +861,15 @@ describe("SessionList visible hydration", () => {
     component = mount(SessionList, { target: document.body });
     await tick();
 
-    expect(
-      document.querySelector<HTMLElement>('[data-session-id="child"]'),
-    ).not.toBeNull();
-    expect(
-      document.querySelector<HTMLElement>('[data-session-id="parent"]'),
-    ).toBeNull();
+    expect(document.querySelector<HTMLElement>('[data-session-id="child"]')).not.toBeNull();
+    expect(document.querySelector<HTMLElement>('[data-session-id="parent"]')).toBeNull();
 
-    const selectModeButton = document.querySelector<HTMLButtonElement>(
-      ".select-toggle-btn",
-    );
+    const selectModeButton = document.querySelector<HTMLButtonElement>(".select-toggle-btn");
     expect(selectModeButton).not.toBeNull();
     selectModeButton!.click();
     await tick();
 
-    const selectAllButton = document.querySelector<HTMLButtonElement>(
-      ".batch-select-all-btn",
-    );
+    const selectAllButton = document.querySelector<HTMLButtonElement>(".batch-select-all-btn");
     expect(selectAllButton).not.toBeNull();
     selectAllButton!.click();
     await tick();
@@ -875,23 +891,17 @@ describe("SessionList visible hydration", () => {
       }),
     ];
     vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
-    const batchDelete = vi
-      .spyOn(sessions, "batchDeleteSessions")
-      .mockResolvedValue(undefined);
+    const batchDelete = vi.spyOn(sessions, "batchDeleteSessions").mockResolvedValue(undefined);
 
     component = mount(SessionList, { target: document.body });
     await tick();
 
-    const selectModeButton = document.querySelector<HTMLButtonElement>(
-      ".select-toggle-btn",
-    );
+    const selectModeButton = document.querySelector<HTMLButtonElement>(".select-toggle-btn");
     expect(selectModeButton).not.toBeNull();
     selectModeButton!.click();
     await tick();
 
-    const selectAllButton = document.querySelector<HTMLButtonElement>(
-      ".batch-select-all-btn",
-    );
+    const selectAllButton = document.querySelector<HTMLButtonElement>(".batch-select-all-btn");
     expect(selectAllButton).not.toBeNull();
     selectAllButton!.click();
     await tick();
@@ -901,13 +911,13 @@ describe("SessionList visible hydration", () => {
     await tick();
 
     expect(document.querySelector('[data-session-id="hidden"]')).toBeNull();
-    expect(document.body.textContent).toContain(m.sidebar_selected_count({
-      countLabel: "1",
-    }));
-
-    const deleteButton = document.querySelector<HTMLButtonElement>(
-      ".batch-delete-btn",
+    expect(document.body.textContent).toContain(
+      m.sidebar_selected_count({
+        countLabel: "1",
+      }),
     );
+
+    const deleteButton = document.querySelector<HTMLButtonElement>(".batch-delete-btn");
     expect(deleteButton).not.toBeNull();
     deleteButton!.click();
     await tick();
@@ -927,9 +937,7 @@ describe("SessionList visible hydration", () => {
     );
     sessions.nextCursor = "next-page";
     vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
-    const loadMore = vi
-      .spyOn(sessions, "loadMore")
-      .mockResolvedValue(undefined);
+    const loadMore = vi.spyOn(sessions, "loadMore").mockResolvedValue(undefined);
 
     component = mount(SessionList, { target: document.body });
     await tick();
@@ -939,10 +947,21 @@ describe("SessionList visible hydration", () => {
   });
 });
 
-function makeSession(
-  overrides: Partial<Session> & { id: string },
-): Session {
+function makeSession(overrides: Partial<Session> & { id: string }): Session {
   return {
+    compaction_count: 0,
+    consecutive_failure_max: 0,
+    edit_churn_count: 0,
+    ended_with_role: "",
+    final_failure_streak: 0,
+    has_peak_context_tokens: false,
+    has_total_output_tokens: false,
+    mid_task_compaction_count: 0,
+    outcome: "",
+    outcome_confidence: "",
+    secret_leak_count: 0,
+    tool_failure_signal_count: 0,
+    tool_retry_count: 0,
     project: "proj",
     machine: "local",
     agent: "claude",
