@@ -29,6 +29,8 @@ function makeReport(overrides: ReportOverrides = {}): Report {
       start: "2026-06-16T00:00:00Z",
       end: "2026-06-16T03:00:00Z",
       max_agents: 0,
+      user_messages: 0,
+      assistant_messages: 0,
       agent_minutes: 0,
       output_tokens: 0,
       cost: testMoney(0),
@@ -39,6 +41,8 @@ function makeReport(overrides: ReportOverrides = {}): Report {
       start: "2026-06-16T03:00:00Z",
       end: "2026-06-16T06:00:00Z",
       max_agents: 2,
+      user_messages: 0,
+      assistant_messages: 0,
       agent_minutes: 12,
       output_tokens: 4000,
       cost: testMoney(0.4),
@@ -49,6 +53,8 @@ function makeReport(overrides: ReportOverrides = {}): Report {
       start: "2026-06-16T06:00:00Z",
       end: "2026-06-16T09:00:00Z",
       max_agents: 3,
+      user_messages: 0,
+      assistant_messages: 0,
       agent_minutes: 30,
       input_tokens: 120000,
       output_tokens: 9000,
@@ -60,6 +66,8 @@ function makeReport(overrides: ReportOverrides = {}): Report {
       start: "2026-06-16T09:00:00Z",
       end: "2026-06-16T12:00:00Z",
       max_agents: 1,
+      user_messages: 0,
+      assistant_messages: 0,
       agent_minutes: 8,
       output_tokens: 2000,
       cost: testMoney(0.2),
@@ -70,6 +78,8 @@ function makeReport(overrides: ReportOverrides = {}): Report {
       start: "2026-06-16T12:00:00Z",
       end: "2026-06-16T15:00:00Z",
       max_agents: 0,
+      user_messages: 0,
+      assistant_messages: 0,
       agent_minutes: 0,
       output_tokens: 0,
       cost: testMoney(0),
@@ -138,6 +148,8 @@ function popoverReport(): Report {
         start: "2026-06-16T10:00:00Z",
         end: "2026-06-16T10:05:00Z",
         max_agents: 2,
+        user_messages: 0,
+        assistant_messages: 0,
         agent_minutes: 4,
         output_tokens: 0,
         cost: testMoney(0),
@@ -191,6 +203,8 @@ function minuteReport(overrides: Partial<Report> = {}): Report {
         start: "2026-06-16T00:00:00Z",
         end: "2026-06-16T00:05:00Z",
         max_agents: 1,
+        user_messages: 0,
+        assistant_messages: 0,
         agent_minutes: 5,
         output_tokens: 10,
         cost: testMoney(0),
@@ -199,6 +213,8 @@ function minuteReport(overrides: Partial<Report> = {}): Report {
         start: "2026-06-16T00:05:00Z",
         end: "2026-06-16T00:10:00Z",
         max_agents: 2,
+        user_messages: 0,
+        assistant_messages: 0,
         agent_minutes: 5,
         output_tokens: 20,
         cost: testMoney(0),
@@ -207,6 +223,8 @@ function minuteReport(overrides: Partial<Report> = {}): Report {
         start: "2026-06-16T00:10:00Z",
         end: "2026-06-16T00:15:00Z",
         max_agents: 1,
+        user_messages: 0,
+        assistant_messages: 0,
         agent_minutes: 5,
         output_tokens: 5,
         cost: testMoney(0),
@@ -230,6 +248,58 @@ async function chooseOverlayMetric(target: HTMLElement, label: string) {
   expect(option).toBeTruthy();
   await fireEvent.mouseDown(option!);
   await tick();
+}
+
+// A full day of five-minute buckets. Bucket 4 holds the 00:15-00:30 peak.
+function fullDayMinuteReport(): Report {
+  const dayStart = Date.parse("2026-06-16T00:00:00Z");
+  const buckets: BucketFixture[] = Array.from({ length: 288 }, (_, i) => ({
+    start: new Date(dayStart + i * 300_000).toISOString(),
+    end: new Date(dayStart + (i + 1) * 300_000).toISOString(),
+    max_agents: i === 4 ? 5 : i === 3 || i === 5 ? 1 : 0,
+    interactive_at_peak: i === 4 ? 2 : i === 3 || i === 5 ? 1 : 0,
+    automated_at_peak: i === 4 ? 3 : 0,
+    max_interactive_agents: i === 3 ? 4 : i === 4 ? 2 : i === 5 ? 1 : 0,
+    max_automated_agents: i === 4 ? 3 : 0,
+    user_messages: 1,
+    assistant_messages: 2,
+    agent_minutes: 5,
+    output_tokens: 1000,
+    cost: testMoney(0.1),
+  }));
+  return makeReport({
+    range_start: "2026-06-16T00:00:00Z",
+    range_end: "2026-06-17T00:00:00Z",
+    effective_end: "2026-06-17T00:00:00Z",
+    bucket_unit: "minute",
+    bucket_seconds: 300,
+    bucket_count: 288,
+    elapsed_bucket_count: 288,
+    buckets,
+  });
+}
+
+// Reports one content width to every observer, as a resized panel would.
+function useChartWidth(width: number) {
+  Object.defineProperty(globalThis, "ResizeObserver", {
+    configurable: true,
+    writable: true,
+    value: resizeObserverWithWidth(width),
+  });
+}
+
+function resizeObserverWithWidth(width: number) {
+  return class {
+    constructor(private callback: ResizeObserverCallback) {}
+    observe(target: Element) {
+      this.callback(
+        [{ target, contentRect: { width } } as unknown as ResizeObserverEntry],
+        this as unknown as ResizeObserver,
+      );
+    }
+    unobserve() {}
+    disconnect() {}
+  };
 }
 
 async function dragRange(target: HTMLElement, start: number, end: number) {
@@ -268,6 +338,52 @@ describe("ConcurrencyTimeline", () => {
     vi.restoreAllMocks();
   });
 
+  it("switches to exact message counts with a separate scale and keeps time selection", async () => {
+    const report = makeReport();
+    report.buckets = report.buckets!.map((bucket, i) => ({
+      ...bucket,
+      user_messages: [0, 1, 2, 1, 0][i]!,
+      assistant_messages: [0, 20, 80, 0, 0][i]!,
+    }));
+    const onSelectRange = vi.fn();
+    const { container, getByRole } = render(ConcurrencyTimeline, { report, onSelectRange });
+    await tick();
+    const originalX = container.querySelector('[data-concurrency-bar="2"] rect')!.getAttribute("x");
+
+    await fireEvent.click(getByRole("radio", { name: "User messages" }));
+    expect([...container.querySelectorAll(".y-label")].map((el) => el.textContent)).toEqual([
+      "0",
+      "1",
+      "2",
+    ]);
+    expect(container.querySelector(".chart-peak")?.textContent).toBe("4 total");
+    const prompt = container.querySelector('[data-concurrency-bar="2"] rect')!;
+    expect(prompt.getAttribute("x")).toBe(originalX);
+    expect(Number(prompt.getAttribute("height"))).toBe(160);
+    await fireEvent.mouseEnter(container.querySelectorAll(".slot-hit")[2]!);
+    expect(container.querySelector(".tooltip-metrics")?.textContent).toMatch(/User messages\s*2/);
+    expect(container.querySelector(".tooltip-metrics")?.textContent).toMatch(
+      /Assistant messages\s*80/,
+    );
+    await dragRange(container, 1, 2);
+    expect(onSelectRange).toHaveBeenCalledWith({ start: 1, end: 3, label: "Tue 03:00–09:00" });
+
+    await fireEvent.click(getByRole("radio", { name: "Assistant messages" }));
+    expect([...container.querySelectorAll(".y-label")].map((el) => el.textContent)).toEqual([
+      "0",
+      "20",
+      "40",
+      "60",
+      "80",
+    ]);
+    expect(container.querySelector(".chart-peak")?.textContent).toBe("100 total");
+    expect(container.querySelector('[data-concurrency-bar="3"] rect')).toBeNull();
+
+    await fireEvent.click(getByRole("radio", { name: "Concurrency" }));
+    expect(container.querySelector(".chart-peak")?.textContent).toBe("peak 3 at 06:00");
+    expect(container.querySelectorAll('[data-concurrency-bar="2"] rect')).toHaveLength(2);
+  });
+
   it("stacks the at-peak split of every bucket on one shared scale", async () => {
     const report = makeReport();
     // The combined peak of 100 splits 20/60/20, while the independent class
@@ -275,6 +391,8 @@ describe("ConcurrencyTimeline", () => {
     report.buckets![2] = {
       ...report.buckets![2]!,
       max_agents: 100,
+      user_messages: 0,
+      assistant_messages: 0,
       interactive_at_peak: 20,
       subagent_at_peak: 60,
       automated_at_peak: 20,
@@ -378,6 +496,8 @@ describe("ConcurrencyTimeline", () => {
     report.buckets![2] = {
       ...report.buckets![2]!,
       max_agents: 0,
+      user_messages: 0,
+      assistant_messages: 0,
       agent_minutes: 0,
       output_tokens: 0,
     };
@@ -522,6 +642,8 @@ describe("ConcurrencyTimeline", () => {
             start: "2026-06-17T00:00:00Z",
             end: "2026-06-17T03:00:00Z",
             max_agents: 1,
+            user_messages: 0,
+            assistant_messages: 0,
             agent_minutes: 4,
             output_tokens: 0,
             cost: testMoney(0),
@@ -530,6 +652,8 @@ describe("ConcurrencyTimeline", () => {
             start: "2026-06-17T03:00:00Z",
             end: "2026-06-17T06:00:00Z",
             max_agents: 1,
+            user_messages: 0,
+            assistant_messages: 0,
             agent_minutes: 4,
             output_tokens: 0,
             cost: testMoney(0),
@@ -538,6 +662,8 @@ describe("ConcurrencyTimeline", () => {
             start: "2026-06-17T06:00:00Z",
             end: "2026-06-17T09:00:00Z",
             max_agents: 0,
+            user_messages: 0,
+            assistant_messages: 0,
             agent_minutes: 0,
             output_tokens: 0,
             cost: testMoney(0),
@@ -571,7 +697,7 @@ describe("ConcurrencyTimeline", () => {
       "Subagent peak 0",
       "Automated peak 1",
       "Agent-min 7.5K",
-      "Input Tokens 120K",
+      "Uncached Input 120K",
       "Output Tokens 9K",
       "Cost $0.90",
     ]);
@@ -596,6 +722,9 @@ describe("ConcurrencyTimeline", () => {
 
   it("emits an idle one-bucket range without computing membership locally", async () => {
     const report = makeReport({
+      range_start: "2026-06-16T10:00:00Z",
+      range_end: "2026-06-16T10:15:00Z",
+      effective_end: "2026-06-16T10:10:00Z",
       bucket_unit: "minute",
       bucket_seconds: 300,
       bucket_count: 3,
@@ -605,6 +734,8 @@ describe("ConcurrencyTimeline", () => {
           start: "2026-06-16T10:00:00Z",
           end: "2026-06-16T10:05:00Z",
           max_agents: 1,
+          user_messages: 0,
+          assistant_messages: 0,
           agent_minutes: 1,
           output_tokens: 0,
           cost: testMoney(0),
@@ -613,6 +744,8 @@ describe("ConcurrencyTimeline", () => {
           start: "2026-06-16T10:05:00Z",
           end: "2026-06-16T10:10:00Z",
           max_agents: 0,
+          user_messages: 0,
+          assistant_messages: 0,
           agent_minutes: 0,
           output_tokens: 0,
           cost: testMoney(0),
@@ -705,6 +838,35 @@ describe("ConcurrencyTimeline", () => {
     target.remove();
   });
 
+  it("keeps the keyboard anchor when a session page replaces the report", async () => {
+    const onSelectRange = vi.fn();
+    const report = minuteReport();
+    const { container, rerender } = render(ConcurrencyTimeline, {
+      report,
+      onSelectRange,
+    });
+    const shiftRight = (idx: number) =>
+      container
+        .querySelector(`[data-concurrency-bucket-index="${idx}"]`)!
+        .dispatchEvent(
+          new KeyboardEvent("keydown", { key: "ArrowRight", shiftKey: true, bubbles: true }),
+        );
+
+    shiftRight(0);
+    await tick();
+    expect(onSelectRange).toHaveBeenLastCalledWith(expect.objectContaining({ start: 0, end: 2 }));
+
+    // ActivityPage loads the selected sessions and stores a new report object
+    // that keeps the same buckets.
+    await rerender({
+      report: { ...report, report_id: "page-2", by_session: [] },
+      selectedRange: { start: 0, end: 2 },
+    });
+    shiftRight(1);
+    await tick();
+    expect(onSelectRange).toHaveBeenLastCalledWith(expect.objectContaining({ start: 0, end: 3 }));
+  });
+
   it("selects a slot with a keyboard Enter", async () => {
     const onSelectRange = vi.fn();
     const target = document.createElement("div");
@@ -770,18 +932,6 @@ describe("ConcurrencyTimeline", () => {
     expect(bars.length).toBe(3);
   });
 
-  it("shades a future region when the range is partial", () => {
-    const r = minuteReport({
-      bucket_count: 3,
-      elapsed_bucket_count: 2,
-      partial: true,
-      as_of: "2026-06-16T00:10:00Z",
-      effective_end: "2026-06-16T00:10:00Z",
-    });
-    render(ConcurrencyTimeline, { report: r });
-    expect(document.querySelector("rect[data-future]")).toBeTruthy();
-  });
-
   it("formats a date-range tooltip for daily buckets", async () => {
     const r = makeReport({
       bucket_unit: "day",
@@ -796,6 +946,8 @@ describe("ConcurrencyTimeline", () => {
           start: "2026-06-15T00:00:00Z",
           end: "2026-06-16T00:00:00Z",
           max_agents: 1,
+          user_messages: 0,
+          assistant_messages: 0,
           agent_minutes: 10,
           output_tokens: 1,
           cost: testMoney(0),
@@ -804,6 +956,8 @@ describe("ConcurrencyTimeline", () => {
           start: "2026-06-16T00:00:00Z",
           end: "2026-06-17T00:00:00Z",
           max_agents: 1,
+          user_messages: 0,
+          assistant_messages: 0,
           agent_minutes: 10,
           output_tokens: 1,
           cost: testMoney(0),
@@ -846,6 +1000,8 @@ describe("ConcurrencyTimeline", () => {
           start: "2026-06-15T00:00:00Z",
           end: "2026-06-22T00:00:00Z",
           max_agents: 2,
+          user_messages: 0,
+          assistant_messages: 0,
           agent_minutes: 20,
           output_tokens: 100,
           cost: testMoney(0),
@@ -922,5 +1078,95 @@ describe("ConcurrencyTimeline", () => {
 
     unmount(c);
     target.remove();
+  });
+  it("merges five-minute buckets into wider bars on a narrow chart", async () => {
+    useChartWidth(700);
+    const onSelectRange = vi.fn();
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    const c = mount(ConcurrencyTimeline, {
+      target,
+      props: { report: fullDayMinuteReport(), onSelectRange },
+    });
+    await tick();
+    // 700px leaves a 652px plot: 5- and 10-minute bars would draw under 5px.
+    const hits = target.querySelectorAll<SVGRectElement>(".slot-hit");
+    expect(hits.length).toBe(96);
+    const drawn = Array.from(target.querySelectorAll(".concurrency-seg")).map((seg) =>
+      Number(seg.getAttribute("width")),
+    );
+    expect(Math.min(...drawn)).toBeGreaterThanOrEqual(5);
+
+    hits[1]!.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
+    await tick();
+    const tip = target.querySelector(".tooltip")!;
+    expect(tip.querySelector(".tooltip-date")?.textContent).toBe("00:15–00:30");
+    const rows = Array.from(tip.querySelectorAll(".tooltip-metrics > div")).map((row) =>
+      row.textContent?.replace(/\s+/g, " ").trim(),
+    );
+    expect(rows).toEqual([
+      "Interactive 2",
+      "Subagents 0",
+      "Automated 3",
+      "Combined peak 5",
+      "Interactive peak 4",
+      "Subagent peak 0",
+      "Automated peak 3",
+      "Agent-min 15",
+      "Uncached Input 0",
+      "Output Tokens 3K",
+      "Cost $0.30",
+    ]);
+
+    // Selections still address the report's own five-minute buckets.
+    await dragRange(target, 1, 2);
+    expect(onSelectRange).toHaveBeenCalledWith({ start: 3, end: 9, label: "00:15–00:45" });
+    unmount(c);
+    target.remove();
+  });
+
+  it("highlights every bar that overlaps a selection of report buckets", async () => {
+    useChartWidth(700);
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    const c = mount(ConcurrencyTimeline, {
+      target,
+      props: { report: fullDayMinuteReport(), selectedRange: { start: 4, end: 7 } },
+    });
+    await tick();
+    const pressed = Array.from(target.querySelectorAll(".slot-hit"))
+      .map((hit, i) => [i, hit.getAttribute("aria-pressed")] as const)
+      .filter(([, value]) => value === "true")
+      .map(([i]) => i);
+    expect(pressed).toEqual([1, 2]);
+    unmount(c);
+    target.remove();
+  });
+
+  it("keeps five-minute bars when the chart is wide enough", async () => {
+    Object.defineProperty(globalThis, "ResizeObserver", {
+      configurable: true,
+      writable: true,
+      value: resizeObserverWithWidth(1900),
+    });
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    const c = mount(ConcurrencyTimeline, {
+      target,
+      props: { report: fullDayMinuteReport() },
+    });
+    await tick();
+    expect(target.querySelectorAll(".slot-hit").length).toBe(288);
+    unmount(c);
+    target.remove();
+  });
+
+  it("labels message bars with the merged interval", async () => {
+    useChartWidth(700);
+    const { container, getByRole } = render(ConcurrencyTimeline, {
+      report: fullDayMinuteReport(),
+    });
+    await fireEvent.click(getByRole("radio", { name: "User messages" }));
+    expect(container.querySelector(".legend")?.textContent).toContain("15 min");
   });
 });

@@ -12,7 +12,7 @@ export type GetApiV1SessionsSidebarIndexParams = {
    */
   exclude_project?: string;
   /**
-   * Filter by machine
+   * Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400.
    */
   machine?: string;
   /**
@@ -71,7 +71,7 @@ export type GetApiV1SessionsSidebarIndexParams = {
    */
   include_children?: boolean;
   /**
-   * Include source file paths
+   * Include available source file path, size, and archive-row update time on /sessions; accepted but ignored by /sessions/sidebar-index
    */
   include_source?: boolean;
   /**
@@ -108,6 +108,14 @@ export type GetApiV1SessionsSidebarIndexParams = {
    * Filter sessions by starred status
    */
   starred?: boolean;
+  /**
+   * Keep sessions carrying this exact label; repeat to require several
+   */
+  label?: string[];
+  /**
+   * Keep sessions linked to a pull request: owner/repo, owner/repo#123, or github.com::owner/repo#123
+   */
+  pr?: string;
   /**
    * Sort order: a comma-separated list of keys, each optionally suffixed :asc or :desc (e.g. messages:desc,started:asc). A key with no suffix uses the descending param, then its natural direction. Valid keys: recent, started, messages, user-messages, output-tokens, peak-context, failures, retries, edit-churn, compactions, context-pressure, health, secrets, id.
    */

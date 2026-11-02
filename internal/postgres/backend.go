@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -21,6 +23,9 @@ var _ storage.Replica = Backend{}
 func (Backend) Name() string { return "pg" }
 
 func (Backend) DisplayName() string { return "PostgreSQL" }
+
+// StoresFriction reports that pushes copy Friction Log findings.
+func (Backend) StoresFriction() bool { return true }
 
 // Targets lists the configured [pg.NAME] sections, default first, or one
 // unnamed default target for a legacy [pg] block or no block at all.
@@ -85,6 +90,14 @@ func (Backend) NewPusher(
 	_ context.Context, target storage.ReplicaTarget, local *db.DB,
 	opts storage.PusherOptions,
 ) (storage.Pusher, error) {
+	// The PostgreSQL push has a fixed batch size, so a requested one would
+	// be silently ignored.
+	if target.PushBatchSize != 0 {
+		return nil, fmt.Errorf(
+			"push_batch_size is a ClickHouse setting; PostgreSQL push does not accept it (got %d)",
+			target.PushBatchSize,
+		)
+	}
 	s, err := New(
 		target.URL, target.Schema, local,
 		target.MachineName, target.AllowInsecure, opts,
@@ -122,21 +135,85 @@ func (Backend) OpenServeStore(
 	return store, nil
 }
 
+// serveSchemaError explains a failed schema check to the serve operator.
+// A role without access to the schema or a table needs grants; recreating
+// the schema would not help and would discard the pushed data.
+func serveSchemaError(err error, schema string) error {
+	if isInsufficientPrivilege(err) {
+		return serveGrantError(err, schema)
+	}
+	return fmt.Errorf(
+		"schema incompatible: %w\n"+
+			"Drop and recreate the PG schema, then run "+
+			"'agentsview replica pg push --full' to repopulate",
+		err,
+	)
+}
+
+// serveGrantError asks for the grants a serve role needs to read the
+// schema. A denial can name the schema itself, which SELECT on its tables
+// does not fix, so the advice names both grants. The serve role usually
+// cannot grant them to itself.
+func serveGrantError(err error, schema string) error {
+	ident, identErr := quoteIdentifier(schema)
+	if identErr != nil {
+		ident = "<schema>"
+	}
+	return fmt.Errorf(
+		"serve role cannot read the schema: %w\n"+
+			"Ask the schema owner or a database administrator to grant the serve role\n"+
+			"USAGE on the schema and SELECT on its tables:\n"+
+			"  GRANT USAGE ON SCHEMA %s TO <serve role>;\n"+
+			"  GRANT SELECT ON ALL TABLES IN SCHEMA %s TO <serve role>;\n"+
+			"then run 'agentsview replica pg serve' again",
+		err, ident, ident,
+	)
+}
+
+var errNoSchemaUsage = errors.New("the role has no USAGE privilege on the schema")
+
+// checkSchemaUsage fails when the role cannot use an existing schema.
+// PostgreSQL leaves such a schema out of the search path, so the schema
+// check would see missing tables and functions and ask for a rebuild. A
+// schema that does not exist passes; the schema check reports it.
+func checkSchemaUsage(ctx context.Context, pg *sql.DB, schema string) error {
+	var usable bool
+	err := pg.QueryRowContext(ctx,
+		`SELECT has_schema_privilege(oid, 'USAGE') FROM pg_namespace WHERE nspname = $1`,
+		schema,
+	).Scan(&usable)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("checking access to the PG schema: %w", err)
+	}
+	if !usable {
+		return errNoSchemaUsage
+	}
+	return nil
+}
+
 func prepareServeStore(ctx context.Context, store *Store, schema string) error {
-	if err := EnsureSchema(ctx, store.DB(), schema); err != nil {
+	pool, err := store.requireOwnedPool()
+	if err != nil {
+		return err
+	}
+	if err := EnsureSchema(ctx, pool, schema); err != nil {
 		if !IsReadOnlyError(err) {
 			return fmt.Errorf("schema migration failed: %w", err)
 		}
 	}
-	if err := CheckSchemaCompat(ctx, store.DB()); err != nil {
-		return fmt.Errorf(
-			"schema incompatible: %w\n"+
-				"Drop and recreate the PG schema, then run "+
-				"'agentsview pg push --full' to repopulate",
-			err,
-		)
+	if err := checkSchemaUsage(ctx, pool, schema); err != nil {
+		if errors.Is(err, errNoSchemaUsage) {
+			return serveGrantError(err, schema)
+		}
+		return err
 	}
-	if err := CheckDataVersionCompat(ctx, store.DB()); err != nil {
+	if err := CheckSchemaCompat(ctx, pool); err != nil {
+		return serveSchemaError(err, schema)
+	}
+	if err := CheckDataVersionCompat(ctx, pool); err != nil {
 		return err
 	}
 	if err := store.DetectInsightGenerationAvailability(ctx); err != nil {
@@ -144,6 +221,7 @@ func prepareServeStore(ctx context.Context, store *Store, schema string) error {
 			"probing insight generation capability: %w", err,
 		)
 	}
+	store.DetectFrictionAvailability(ctx)
 	return nil
 }
 
@@ -172,7 +250,7 @@ func (b Backend) Status(
 	}
 	return storage.ReplicaStatus{Rows: []storage.StatusRow{
 		{Label: "Machine:", Value: status.Machine},
-		{Label: "Last push:", Value: valueOrNever(status.LastPushAt)},
+		{Label: "Last push:", Value: db.ValueOrNever(status.LastPushAt)},
 		{Label: "PG sessions:", Value: strconv.Itoa(status.PGSessions)},
 		{Label: "PG messages:", Value: strconv.Itoa(status.PGMessages)},
 	}}, nil
@@ -193,13 +271,6 @@ func (Backend) LastPushAt(
 	)
 }
 
-func valueOrNever(v string) string {
-	if v == "" {
-		return "never"
-	}
-	return v
-}
-
 // VectorGenerations lists the embedding generations pushed to store, oldest
 // first. A database where pgvector was never installed has no
 // vector_generations table and reports none.
@@ -210,7 +281,11 @@ func (Backend) VectorGenerations(
 	if err != nil {
 		return nil, err
 	}
-	return ListVectorGenerationInfo(ctx, pgStore.DB())
+	pool, err := pgStore.requireOwnedPool()
+	if err != nil {
+		return nil, err
+	}
+	return ListVectorGenerationInfo(ctx, pool)
 }
 
 // OpenVectorSearcher serves the pushed generation matching gen.Fingerprint.
@@ -226,14 +301,18 @@ func (Backend) OpenVectorSearcher(
 	if err != nil {
 		return nil, "", err
 	}
-	genID, dim, ok, err := LookupVectorGeneration(ctx, pgStore.DB(), gen.Fingerprint)
+	pool, err := pgStore.requireOwnedPool()
+	if err != nil {
+		return nil, "", err
+	}
+	genID, dim, ok, err := LookupVectorGeneration(ctx, pool, gen.Fingerprint)
 	if err != nil {
 		return nil, "", fmt.Errorf("looking up PG vector generation: %w", err)
 	}
 	if !ok {
 		return nil, "PostgreSQL has no embedding generation matching fingerprint " + gen.Fingerprint, nil
 	}
-	tableOK, err := VectorChunkTableExists(ctx, pgStore.DB(), genID)
+	tableOK, err := VectorChunkTableExists(ctx, pool, genID)
 	if err != nil {
 		return nil, "", fmt.Errorf("probing PG vector chunk table: %w", err)
 	}
@@ -242,7 +321,7 @@ func (Backend) OpenVectorSearcher(
 			"PG generation %d matches fingerprint %s but its chunk table is "+
 				"missing (interrupted push?)", genID, gen.Fingerprint), nil
 	}
-	return NewVectorSearcher(pgStore.DB(), genID, dim, maxInputChars, encode), "", nil
+	return NewVectorSearcher(pool, genID, dim, maxInputChars, encode), "", nil
 }
 
 // asStore unwraps the concrete PostgreSQL store a replica-neutral caller

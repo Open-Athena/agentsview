@@ -7,6 +7,11 @@ Use **Data** to group sessions under the right project name. Open the Data tab
 in the header to manage [project mapping rules](#rules), which match session
 folders to projects.
 
+For offline original-file retention and moving an archive to another machine,
+see [`agentsview archive`](/docs/commands/#agentsview-archive), available in
+0.46.0 and later. Seed imports use a separate, permanently archive-only data
+directory; keep new local sessions in your normal data directory.
+
 ## Enable the project workspace
 
 Version 0.44.0 includes a project workspace with folder suggestions, transcript

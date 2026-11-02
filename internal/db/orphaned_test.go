@@ -12,6 +12,45 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestCopyOrphanedDataCodexTrashIsNotAReparse(t *testing.T) {
+	for _, trash := range []bool{false, true} {
+		t.Run(fmt.Sprintf("trash=%t", trash), func(t *testing.T) {
+			ctx := t.Context()
+			source := testDB(t)
+			path := "/history/rollout.jsonl"
+			insertSession(t, source, "old", "project", func(s *Session) {
+				s.Agent = "codex"
+				s.FilePath = &path
+			})
+			require.NoError(t, source.InsertMessages(ctx, []Message{{SessionID: "old", Ordinal: 0, Role: "user", Content: "retained history"}}))
+			destination := testDB(t)
+			insertSession(t, destination, "new", "project", func(s *Session) {
+				s.Agent = "codex"
+				s.FilePath = &path
+			})
+			if trash {
+				require.NoError(t, destination.SoftDeleteSession(ctx, "new"))
+			}
+			sourcePath := source.Path()
+			require.NoError(t, source.Close())
+			copied, err := destination.CopyOrphanedDataFrom(sourcePath)
+			require.NoError(t, err)
+			if trash {
+				assert.Equal(t, 1, copied)
+				messages, err := destination.GetAllMessages(ctx, "old")
+				require.NoError(t, err)
+				require.Len(t, messages, 1)
+				assert.Equal(t, "retained history", messages[0].Content)
+			} else {
+				assert.Zero(t, copied)
+				session, err := destination.GetSessionFull(ctx, "old")
+				require.NoError(t, err)
+				assert.Nil(t, session)
+			}
+		})
+	}
+}
+
 func TestCopySyncStateQueuesBothRecordedLocalArtifactIdentities(t *testing.T) {
 	ctx := t.Context()
 	source := testDB(t)
@@ -185,29 +224,6 @@ func TestFullResyncPreservesImportedSessionUsage(t *testing.T) {
 		DedupKey:                 "imported-usage",
 	}}))
 
-	head := ArtifactPeerCheckpointHead{
-		Origin:           origin,
-		Sequence:         3,
-		CheckpointSHA256: strings.Repeat("a", 64),
-		CheckpointSize:   123,
-	}
-	_, err := source.RecordArtifactPeerCheckpointHead(ctx, head)
-	require.NoError(t, err)
-	manifestHash := strings.Repeat("b", 64)
-	require.NoError(t, source.RecordArtifactCheckpointLanding(
-		ctx,
-		ArtifactCheckpointLanding(head),
-		map[string]string{gid: manifestHash},
-	))
-	require.NoError(t, source.RecordArtifactImportedSession(
-		ctx,
-		ArtifactImportedSession{
-			Origin:            origin,
-			GID:               gid,
-			ManifestHash:      manifestHash,
-			ImportedSessionID: gid,
-		},
-	))
 	require.NoError(t, source.Close())
 
 	destination := testDBAtPath(
@@ -238,12 +254,6 @@ func TestFullResyncPreservesImportedSessionUsage(t *testing.T) {
 		OccurredAt:               "2026-07-29T12:00:00Z",
 		DedupKey:                 "imported-usage",
 	}, events[0])
-
-	provenance, err := destination.ArtifactImportedManifestHashes(
-		ctx, origin, []string{gid},
-	)
-	require.NoError(t, err)
-	assert.Equal(t, map[string]string{gid: manifestHash}, provenance)
 }
 
 func TestCopySyncStateAcceptsDatabaseWithoutArtifactImportTables(t *testing.T) {
@@ -263,42 +273,6 @@ func TestCopySyncStateAcceptsDatabaseWithoutArtifactImportTables(t *testing.T) {
 	)
 	defer destination.Close()
 	require.NoError(t, destination.CopySyncStateFrom(sourcePath))
-}
-
-func TestCopySyncStateRejectsEqualLandingWithDifferentMap(t *testing.T) {
-	ctx := t.Context()
-	dir := t.TempDir()
-	sourcePath := filepath.Join(dir, "source.db")
-	source := testDBAtPath(t, sourcePath, "source")
-	head := ArtifactPeerCheckpointHead{
-		Origin:           "peer-a1b2c3",
-		Sequence:         2,
-		CheckpointSHA256: strings.Repeat("a", 64),
-		CheckpointSize:   42,
-	}
-	_, err := source.RecordArtifactPeerCheckpointHead(ctx, head)
-	require.NoError(t, err)
-	require.NoError(t, source.RecordArtifactCheckpointLanding(
-		ctx,
-		ArtifactCheckpointLanding(head),
-		map[string]string{head.Origin + "~source": strings.Repeat("b", 64)},
-	))
-	require.NoError(t, source.Close())
-
-	destination := testDBAtPath(
-		t, filepath.Join(dir, "destination.db"), "destination",
-	)
-	defer destination.Close()
-	_, err = destination.RecordArtifactPeerCheckpointHead(ctx, head)
-	require.NoError(t, err)
-	require.NoError(t, destination.RecordArtifactCheckpointLanding(
-		ctx,
-		ArtifactCheckpointLanding(head),
-		map[string]string{head.Origin + "~destination": strings.Repeat("c", 64)},
-	))
-
-	err = destination.CopySyncStateFrom(sourcePath)
-	require.ErrorIs(t, err, ErrArtifactImportConflict)
 }
 
 func TestCopySyncStateRejectsIncompatibleCheckpointStages(t *testing.T) {
@@ -437,9 +411,12 @@ func stageCheckpointForCopyTest(
 	ctx := t.Context()
 	require.NoError(t, database.BeginArtifactCheckpointStage(ctx, landing, 1))
 	if complete {
-		require.NoError(t, database.StageArtifactCheckpointSessions(
-			ctx, landing, entries,
-		))
+		for start := 0; start < len(entries); start += maxArtifactImportSessionPageSize {
+			end := min(start+maxArtifactImportSessionPageSize, len(entries))
+			require.NoError(t, database.StageArtifactCheckpointSessions(
+				ctx, landing, entries[start:end],
+			))
+		}
 		require.NoError(t, database.CompleteArtifactCheckpointStage(
 			ctx, landing, len(entries),
 		))
@@ -479,6 +456,53 @@ func TestExecWithoutCancelDropsTempTableWithCanceledContext(t *testing.T) {
 			id TEXT PRIMARY KEY
 		)`)
 	require.NoError(t, err, "recreate temp table after cleanup")
+}
+
+func TestCopyOrphanedDataPreservesHermesCronGroups(t *testing.T) {
+	for _, legacySchema := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy schema=%t", legacySchema), func(t *testing.T) {
+			ctx := t.Context()
+			srcPath := filepath.Join(t.TempDir(), "old.db")
+			src := testDBAtPath(t, srcPath, "src")
+			cases := []struct {
+				id, agent, stored string
+			}{
+				{"hermes:cron_job-a_20261009_120000", "hermes", ""},
+				{"augure-desktop:cron_job.b-c_20261009_120000", "augure-desktop", ""},
+				{"imported:hermes:cron_job-a_20261009_120000", "hermes", ""},
+			}
+			if !legacySchema {
+				cases = append(cases, struct{ id, agent, stored string }{
+					"hermes:cron_job-a_20261009_140000", "hermes", "retained-job",
+				}, struct{ id, agent, stored string }{
+					"hermes:20261009_140000_abcdef", "hermes", "retained-job",
+				}, struct{ id, agent, stored string }{
+					"imported:augure-desktop:cron_job-a_20261009_140000", "augure-desktop", "retained-job",
+				})
+			}
+			for _, tc := range cases {
+				require.NoError(t, src.UpsertSession(ctx, Session{ID: tc.id, Agent: tc.agent, Project: "hermes-cron", GroupKey: tc.stored}))
+			}
+			require.NoError(t, src.Close())
+			if legacySchema {
+				conn, err := sql.Open("sqlite3", srcPath)
+				require.NoError(t, err)
+				_, err = conn.ExecContext(ctx, `DROP TRIGGER IF EXISTS artifact_sessions_update_queue; ALTER TABLE sessions DROP COLUMN group_key`)
+				require.NoError(t, err)
+				require.NoError(t, conn.Close())
+			}
+			dst := testDB(t)
+			count, err := dst.CopyOrphanedDataFrom(srcPath)
+			require.NoError(t, err)
+			assert.Equal(t, len(cases), count)
+			for _, tc := range cases {
+				session, err := dst.GetSession(ctx, tc.id)
+				require.NoError(t, err)
+				require.NotNil(t, session)
+				assert.Equal(t, tc.stored, session.GroupKey, tc.id)
+			}
+		})
+	}
 }
 
 func TestCopyOrphanedDataPreservesSessionKindAndPromptSource(t *testing.T) {
@@ -599,6 +623,7 @@ func TestCopyOrphanedDataSanitizesCopiedContent(t *testing.T) {
 		"PRAGMA user_version = %d", sanitizedSourceDataVersion-1,
 	))
 	require.NoError(t, err, "downgrade source data version")
+	require.NoError(t, srcDB.EnableArchiveOnly(ctx))
 	require.NoError(t, srcDB.Close(), "close source")
 
 	dstPath := filepath.Join(dir, "new.db")

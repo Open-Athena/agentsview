@@ -4,6 +4,10 @@
 
 export type GetApiV1UsagePairwiseComparisonParams = {
   /**
+   * Group model aliases in report rows
+   */
+  group_models?: boolean;
+  /**
    * Range start date
    */
   from?: string;
@@ -24,7 +28,11 @@ export type GetApiV1UsagePairwiseComparisonParams = {
    */
   project?: string;
   /**
-   * Filter by machine
+   * Filter by an opaque project key
+   */
+  project_key?: string;
+  /**
+   * Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400.
    */
   machine?: string;
   /**
@@ -85,19 +93,23 @@ export type GetApiV1UsagePairwiseComparisonParams = {
    */
   session_counts?: boolean;
   /**
-   * Left-side comparison dimension
+   * Left-side comparison dimension; omit all four sides for the default pair
    */
-  left_dimension: string;
+  left_dimension?: string;
   /**
    * Left-side comparison value; opaque project key for the project dimension
    */
-  left_value: string;
+  left_value?: string;
   /**
    * Right-side comparison dimension
    */
-  right_dimension: string;
+  right_dimension?: string;
   /**
    * Right-side comparison value; opaque project key for the project dimension
    */
-  right_value: string;
+  right_value?: string;
+  /**
+   * Use the default pair if either supplied side is absent from the scope's cost ranking
+   */
+  fallback_to_default?: boolean;
 };

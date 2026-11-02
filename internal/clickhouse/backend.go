@@ -77,7 +77,15 @@ func ReplicaTarget(ch config.ClickHouseConfig) storage.ReplicaTarget {
 		MachineName:   ch.MachineName,
 		AllowInsecure: ch.AllowInsecure,
 		PushVectors:   ch.PushVectorsEnabled(),
+		PushBatchSize: pushBatchSize(ch),
 	}
+}
+
+func pushBatchSize(ch config.ClickHouseConfig) int {
+	if ch.PushBatchSize == nil {
+		return 0
+	}
+	return *ch.PushBatchSize
 }
 
 func target(t storage.ReplicaTarget) Target {
@@ -99,10 +107,16 @@ func (Backend) NewPusher(
 	if err := CheckTransportSecurity(t.URL, t.AllowInsecure); err != nil {
 		return nil, err
 	}
+	if t.PushBatchSize < 0 {
+		return nil, fmt.Errorf(
+			"clickhouse push_batch_size must be at least 1, got %d", t.PushBatchSize,
+		)
+	}
 	s, err := New(ctx, target(t), local, t.MachineName, opts)
 	if err != nil {
 		return nil, err
 	}
+	s.sessionBatchSize = t.PushBatchSize
 	return s, nil
 }
 
@@ -136,6 +150,11 @@ func (Backend) OpenServeStore(
 	if err != nil {
 		return nil, err
 	}
+	// The kept reports only save work; without them every report is built
+	// on request, so serve starts anyway.
+	if err := store.openActivityReportDisk(target(t)); err != nil {
+		log.Printf("clickhouse: keeping activity reports in memory only: %v", err)
+	}
 	return store, nil
 }
 
@@ -167,7 +186,7 @@ func (Backend) Status(
 	}
 	rows := []storage.StatusRow{
 		{Label: "Machine:", Value: status.Machine},
-		{Label: "Last push:", Value: valueOrNever(status.LastPushAt)},
+		{Label: "Last push:", Value: db.ValueOrNever(status.LastPushAt)},
 		{Label: "Last push machine:", Value: status.LastPushMachine},
 	}
 	if status.Scope != "" {
@@ -203,13 +222,6 @@ func (Backend) LastPushAt(
 		return "", err
 	}
 	return status.LastPushAt, nil
-}
-
-func valueOrNever(v string) string {
-	if v == "" {
-		return "never"
-	}
-	return v
 }
 
 // VectorGenerations lists the embedding generations pushed to store, oldest

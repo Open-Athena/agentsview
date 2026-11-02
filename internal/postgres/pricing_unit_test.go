@@ -204,7 +204,7 @@ func (s *pricingProbeState) unblockNextQuery() {
 }
 
 func TestCustomPricingOverridesPricingMap(t *testing.T) {
-	fallback := fallbackPricingMap()
+	fallback := db.FallbackPricingMap()
 	tests := []struct {
 		name       string
 		dbPrices   []db.ModelPricing
@@ -308,21 +308,20 @@ func TestClonePricingRowsDeepClonesPricingBands(t *testing.T) {
 	assert.Equal(t, 200_000, rows[0].Rates.Bands[0].AboveInputTokens)
 }
 
-func TestPGModelPricingSourceDetectsBandOnlyFallbackMismatch(t *testing.T) {
-	fallback := pgFallbackRateMap()
-	rates, ok := fallback["gpt-5.5"]
+func TestPricingRowsToMapClassifiesBandOnlyFallbackMismatchAsFetched(t *testing.T) {
+	rates, ok := db.FallbackRateMap()["gpt-5.5"]
 	require.True(t, ok)
 	require.NotEmpty(t, rates.Bands)
-	p := db.ModelPricing{
+
+	out := pricingRowsToMap([]db.ModelPricing{{
 		ModelPattern:         "gpt-5.5",
 		InputPerMTok:         rates.InputPerMTok,
 		OutputPerMTok:        rates.OutputPerMTok,
 		CacheCreationPerMTok: rates.CacheWritePerMTok,
 		CacheReadPerMTok:     rates.CacheReadPerMTok,
-	}
+	}})
 
-	assert.Equal(t, export.PricingRowSourceFetched,
-		pgModelPricingSource(p, fallback))
+	assert.Equal(t, export.PricingRowSourceFetched, out["gpt-5.5"].Source)
 }
 
 func TestLoadPricingMapSharesConcurrentDBRows(t *testing.T) {
@@ -672,83 +671,6 @@ func TestPGPricingUpsertStatementBatchesRows(t *testing.T) {
 	assert.Equal(t, "call-time", args[6])
 	assert.Equal(t, "model-b", args[7])
 	assert.Equal(t, "source-time", args[13])
-}
-
-func TestPGPricingFilterMatchesUpsertSemantics(t *testing.T) {
-	existing := []db.ModelPricing{
-		{
-			ModelPattern:         "_fallback_version",
-			InputPerMTok:         money.MustParseDollars("0"),
-			OutputPerMTok:        money.MustParseDollars("0"),
-			CacheCreationPerMTok: money.MustParseDollars("0"),
-			CacheReadPerMTok:     money.MustParseDollars("0"),
-			UpdatedAt:            "v1",
-		},
-		{
-			ModelPattern:         "same-model",
-			InputPerMTok:         money.MustParseDollars("1"),
-			OutputPerMTok:        money.MustParseDollars("2"),
-			CacheCreationPerMTok: money.MustParseDollars("3"),
-			CacheReadPerMTok:     money.MustParseDollars("4"),
-			UpdatedAt:            "old",
-		},
-		{
-			ModelPattern:         "changed-model",
-			InputPerMTok:         money.MustParseDollars("1"),
-			OutputPerMTok:        money.MustParseDollars("2"),
-			CacheCreationPerMTok: money.MustParseDollars("3"),
-			CacheReadPerMTok:     money.MustParseDollars("4"),
-			UpdatedAt:            "old",
-		},
-	}
-	desired := []db.ModelPricing{
-		{
-			ModelPattern:         "_fallback_version",
-			InputPerMTok:         money.MustParseDollars("0"),
-			OutputPerMTok:        money.MustParseDollars("0"),
-			CacheCreationPerMTok: money.MustParseDollars("0"),
-			CacheReadPerMTok:     money.MustParseDollars("0"),
-			UpdatedAt:            "v2",
-		},
-		{
-			ModelPattern:         "same-model",
-			InputPerMTok:         money.MustParseDollars("1"),
-			OutputPerMTok:        money.MustParseDollars("2"),
-			CacheCreationPerMTok: money.MustParseDollars("3"),
-			CacheReadPerMTok:     money.MustParseDollars("4"),
-			UpdatedAt:            "new",
-		},
-		{
-			ModelPattern:         "changed-model",
-			InputPerMTok:         money.MustParseDollars("1"),
-			OutputPerMTok:        money.MustParseDollars("9"),
-			CacheCreationPerMTok: money.MustParseDollars("3"),
-			CacheReadPerMTok:     money.MustParseDollars("4"),
-			UpdatedAt:            "new",
-		},
-		{
-			ModelPattern:         "missing-model",
-			InputPerMTok:         money.MustParseDollars("5"),
-			OutputPerMTok:        money.MustParseDollars("6"),
-			CacheCreationPerMTok: money.MustParseDollars("7"),
-			CacheReadPerMTok:     money.MustParseDollars("8"),
-			UpdatedAt:            "new",
-		},
-	}
-
-	got, changedRows := db.FilterChangedModelPricing(existing, desired)
-
-	assert.Equal(t, db.PricingChangeSummary{
-		Total:     4,
-		Missing:   1,
-		Changed:   2,
-		Unchanged: 1,
-	}, got)
-	require.Len(t, changedRows, 3)
-	assert.Equal(t, "_fallback_version", changedRows[0].ModelPattern,
-		"sentinel rows sync by value")
-	assert.Equal(t, "changed-model", changedRows[1].ModelPattern)
-	assert.Equal(t, "missing-model", changedRows[2].ModelPattern)
 }
 
 func TestPGPricingMetaUpsertStatement(t *testing.T) {

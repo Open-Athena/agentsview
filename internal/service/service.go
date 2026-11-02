@@ -8,7 +8,9 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"io"
+	"strings"
 
+	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/db"
 )
 
@@ -74,15 +76,30 @@ type SessionService interface {
 	List(ctx context.Context, f ListFilter) (*SessionList, error)
 	Messages(ctx context.Context, id string, f MessageFilter) (*MessageList, error)
 	ToolCalls(ctx context.Context, id string) (*ToolCallList, error)
+	// ChildSessions lists the sub-agent and fork sessions whose parent is id.
+	ChildSessions(ctx context.Context, id string) ([]db.Session, error)
+	// RecentEdits pages edited files, newest edit first, with the sessions
+	// whose Edit/Write tool calls touched each file.
+	RecentEdits(ctx context.Context, f RecentEditsFilter) (*db.RecentEditsResult, error)
 	Sync(ctx context.Context, in SyncInput) (*SessionDetail, error)
 	Watch(ctx context.Context, id string) (<-chan Event, error)
 	Stats(ctx context.Context, f StatsFilter) (*SessionStats, error)
 	Search(ctx context.Context, req SearchRequest) (*SessionSearchResult, error)
 	SearchContent(ctx context.Context, req ContentSearchRequest) (*ContentSearchResult, error)
 	UsageSummary(ctx context.Context, req UsageRequest) (*UsageSummaryResult, error)
+	// SessionUsage returns one session's token usage and cost with its
+	// full breakdown, or nil when the session does not exist. It reads the
+	// archive as stored and never refreshes source transcripts.
+	SessionUsage(ctx context.Context, req SessionUsageRequest) (*SessionUsageReport, error)
 	UsagePairwiseComparison(
 		ctx context.Context, req UsagePairwiseComparisonRequest,
 	) (*UsagePairwiseComparisonResponse, error)
+	// ActivityReport returns the Activity report for one range with every
+	// session row in BySession.
+	ActivityReport(ctx context.Context, req ActivityReportRequest) (*activity.Report, error)
+	ToolAnalytics(ctx context.Context, req AnalyticsRequest) (*db.ToolsAnalyticsResponse, error)
+	SignalAnalytics(ctx context.Context, req AnalyticsRequest) (*db.SignalsAnalyticsResponse, error)
+	SignalSessions(ctx context.Context, req SignalSessionsRequest) (*db.SignalSessionsResponse, error)
 	ListRecallEntries(ctx context.Context, f RecallFilter) (*RecallList, error)
 	GetRecallEntry(ctx context.Context, id string) (*db.RecallEntry, error)
 	QueryRecallEntries(ctx context.Context, req RecallQuery) (*RecallQueryResult, error)
@@ -173,6 +190,7 @@ type ContentSearchRequest struct {
 	Project, ExcludeProject, Machine, Agent           string
 	SessionID, GitBranchExact                         string
 	Date, DateFrom, DateTo, Timezone, ActiveSince     string
+	ExcludeActiveSince                                string
 	IncludeChildren, IncludeAutomated, IncludeOneShot bool
 	ExcludeSessionIDs                                 []string
 	// GitBranch is a branchListSep-joined list of opaque (project, branch) tokens (EncodeBranchFilterToken).
@@ -189,10 +207,11 @@ type ContentSearchRequest struct {
 
 // ContentSearchResult mirrors db.ContentSearchPage for transport.
 type ContentSearchResult struct {
-	Matches       []db.ContentMatch `json:"matches"`
-	NextCursor    int               `json:"next_cursor,omitempty"`
-	RevisionBound bool              `json:"revision_bound"`
-	Coverage      MemoryCoverage    `json:"coverage"`
+	ActiveFilterApplied bool              `json:"active_filter_applied"`
+	Matches             []db.ContentMatch `json:"matches"`
+	NextCursor          int               `json:"next_cursor,omitempty"`
+	RevisionBound       bool              `json:"revision_bound"`
+	Coverage            MemoryCoverage    `json:"coverage"`
 }
 
 // RecallFilter mirrors GET /api/v1/recall/entries query parameters.
@@ -323,6 +342,13 @@ type SessionDetail struct {
 	// passes the field through and UnmarshalJSON restores it so the HTTP
 	// backend round-trips it rather than dropping it.
 	DecodeConfidence string `json:"decode_confidence,omitempty"`
+	// PlanUsage is the session's codex-cloud plan usage, nil when the
+	// session has none. It is separate from the token and cost fields,
+	// which stay empty for a session with only plan usage.
+	PlanUsage *db.PlanUsageView `json:"plan_usage,omitempty"`
+	// CaptureCoverage is the session's live token capture coverage, nil
+	// when no live capture saw the session.
+	CaptureCoverage *db.CaptureCoverageView `json:"capture_coverage,omitempty"`
 }
 
 // MarshalJSON preserves the grouped db.Session quality_signals field
@@ -334,16 +360,20 @@ func (d SessionDetail) MarshalJSON() ([]byte, error) {
 	type sessionAlias db.Session
 	return json.Marshal(struct {
 		sessionAlias     `json:",inline"`
-		QualitySignals   *db.QualitySignals `json:"quality_signals,omitempty"`
-		HealthScoreBasis []string           `json:"health_score_basis,omitempty"`
-		HealthPenalties  map[string]int     `json:"health_penalties,omitempty"`
-		DecodeConfidence string             `json:"decode_confidence,omitempty"`
+		QualitySignals   *db.QualitySignals      `json:"quality_signals,omitempty"`
+		HealthScoreBasis []string                `json:"health_score_basis,omitempty"`
+		HealthPenalties  map[string]int          `json:"health_penalties,omitempty"`
+		DecodeConfidence string                  `json:"decode_confidence,omitempty"`
+		PlanUsage        *db.PlanUsageView       `json:"plan_usage,omitempty"`
+		CaptureCoverage  *db.CaptureCoverageView `json:"capture_coverage,omitempty"`
 	}{
 		sessionAlias:     sessionAlias(d.Session),
 		QualitySignals:   d.StoredQualitySignals(),
 		HealthScoreBasis: d.HealthScoreBasis,
 		HealthPenalties:  d.HealthPenalties,
 		DecodeConfidence: d.DecodeConfidence,
+		PlanUsage:        d.PlanUsage,
+		CaptureCoverage:  d.CaptureCoverage,
 	})
 }
 
@@ -354,10 +384,12 @@ func (d *SessionDetail) UnmarshalJSON(data []byte) error {
 	type sessionAlias db.Session
 	var v struct {
 		sessionAlias     `json:",inline"`
-		QualitySignals   *db.QualitySignals `json:"quality_signals"`
-		HealthScoreBasis []string           `json:"health_score_basis"`
-		HealthPenalties  map[string]int     `json:"health_penalties"`
-		DecodeConfidence string             `json:"decode_confidence"`
+		QualitySignals   *db.QualitySignals      `json:"quality_signals"`
+		HealthScoreBasis []string                `json:"health_score_basis"`
+		HealthPenalties  map[string]int          `json:"health_penalties"`
+		DecodeConfidence string                  `json:"decode_confidence"`
+		PlanUsage        *db.PlanUsageView       `json:"plan_usage"`
+		CaptureCoverage  *db.CaptureCoverageView `json:"capture_coverage"`
 	}
 	if err := json.Unmarshal(data, &v); err != nil {
 		return err
@@ -367,6 +399,8 @@ func (d *SessionDetail) UnmarshalJSON(data []byte) error {
 	d.HealthScoreBasis = v.HealthScoreBasis
 	d.HealthPenalties = v.HealthPenalties
 	d.DecodeConfidence = v.DecodeConfidence
+	d.PlanUsage = v.PlanUsage
+	d.CaptureCoverage = v.CaptureCoverage
 	return nil
 }
 
@@ -377,38 +411,63 @@ type SessionList struct {
 	Total      int          `json:"total"`
 }
 
+// SessionAnnotationsAPIVersion is the first daemon API that applies label
+// and pull request filters; older daemons ignore them.
+const SessionAnnotationsAPIVersion = 11
+
 // ListFilter mirrors the HTTP query parameters in handleListSessions.
 // Field names map to HTTP query param names via json tags.
 type ListFilter struct {
-	Project          string `json:"project,omitempty"`
-	ExcludeProject   string `json:"exclude_project,omitempty"`
-	Machine          string `json:"machine,omitempty"`
-	GitBranch        string `json:"git_branch,omitempty"`
-	Agent            string `json:"agent,omitempty"`
-	Date             string `json:"date,omitempty"`
-	DateFrom         string `json:"date_from,omitempty"`
-	DateTo           string `json:"date_to,omitempty"`
-	Timezone         string `json:"timezone,omitempty"`
-	ActiveSince      string `json:"active_since,omitempty"`
-	MinMessages      int    `json:"min_messages,omitempty"`
-	MaxMessages      int    `json:"max_messages,omitempty"`
-	MinUserMessages  int    `json:"min_user_messages,omitempty"`
-	IncludeOneShot   bool   `json:"include_one_shot,omitempty"`
-	IncludeAutomated bool   `json:"include_automated,omitempty"`
-	IncludeChildren  bool   `json:"include_children,omitempty"`
-	IncludeSource    bool   `json:"include_source,omitempty"`
-	Outcome          string `json:"outcome,omitempty"`      // comma-separated
-	HealthGrade      string `json:"health_grade,omitempty"` // comma-separated
-	Termination      string `json:"termination,omitempty"`  // comma-separated
-	MinToolFailures  *int   `json:"min_tool_failures,omitempty"`
-	HasSecret        bool   `json:"has_secret,omitempty"`
-	Starred          bool   `json:"starred,omitempty"`
-	Cursor           string `json:"cursor,omitempty"`
-	Limit            int    `json:"limit,omitempty"`
+	// IDs selects explicit sessions and their host copies; nil uses discovery defaults.
+	IDs []string `json:"ids,omitzero"`
+
+	Project            string `json:"project,omitempty"`
+	ExcludeProject     string `json:"exclude_project,omitempty"`
+	Machine            string `json:"machine,omitempty"`
+	GitBranch          string `json:"git_branch,omitempty"`
+	Agent              string `json:"agent,omitempty"`
+	Date               string `json:"date,omitempty"`
+	DateFrom           string `json:"date_from,omitempty"`
+	DateTo             string `json:"date_to,omitempty"`
+	Timezone           string `json:"timezone,omitempty"`
+	ActiveSince        string `json:"active_since,omitempty"`
+	MinMessages        int    `json:"min_messages,omitempty"`
+	MaxMessages        int    `json:"max_messages,omitempty"`
+	MinUserMessages    int    `json:"min_user_messages,omitempty"`
+	IncludeOneShot     bool   `json:"include_one_shot,omitempty"`
+	OneShotFilterSet   bool   `json:"-"`
+	AutomatedFilterSet bool   `json:"-"`
+	IncludeAutomated   bool   `json:"include_automated,omitempty"`
+	IncludeChildren    bool   `json:"include_children,omitempty"`
+	IncludeSource      bool   `json:"include_source,omitempty"`
+	Outcome            string `json:"outcome,omitempty"`      // comma-separated
+	HealthGrade        string `json:"health_grade,omitempty"` // comma-separated
+	Termination        string `json:"termination,omitempty"`  // comma-separated
+	MinToolFailures    *int   `json:"min_tool_failures,omitempty"`
+	HasSecret          bool   `json:"has_secret,omitempty"`
+	Starred            bool   `json:"starred,omitempty"`
+	// Labels keeps sessions carrying every listed label.
+	Labels []string `json:"label,omitempty"`
+	// PR keeps sessions linked to a pull request: owner/repo,
+	// owner/repo#123.
+	PR     string `json:"pr,omitempty"`
+	Cursor string `json:"cursor,omitempty"`
+	Limit  int    `json:"limit,omitempty"`
 	// OrderBy selects the sort column ("" = recent activity). Descending
 	// overrides the sort key's canonical direction when non-nil.
 	OrderBy    string `json:"order_by,omitempty"`
 	Descending *bool  `json:"descending,omitempty"`
+}
+
+// SessionIDsRequireCSVEncoding reports whether an ID contains a comma or line
+// break that must be preserved by the HTTP sessions-list query encoding.
+func SessionIDsRequireCSVEncoding(ids []string) bool {
+	for _, id := range ids {
+		if strings.ContainsAny(id, ",\r\n") {
+			return true
+		}
+	}
+	return false
 }
 
 // MessageFilter mirrors GET /api/v1/sessions/{id}/messages query params.
@@ -471,6 +530,18 @@ type ToolCall struct {
 	ResultLength      int    `json:"result_length"`
 }
 
+// RecentEditsFilter parameterises RecentEdits. Search matches a
+// case-insensitive file path substring; Limit counts files, not edits.
+type RecentEditsFilter struct {
+	Project string
+	Search  string
+	Limit   int
+	Offset  int
+}
+
+// recentEditsPerFile matches the inline edit cap of GET /api/v1/recent-edits.
+const recentEditsPerFile = 20
+
 // ToolCallList mirrors {tool_calls, count}.
 type ToolCallList struct {
 	ToolCalls []ToolCall `json:"tool_calls"`
@@ -480,9 +551,21 @@ type ToolCallList struct {
 // SyncInput carries the payload for a per-session sync.
 // Exactly one of Path or ID must be set.
 type SyncInput struct {
-	Path      string `json:"path,omitempty"`
-	ID        string `json:"id,omitempty"`
-	Subagents bool   `json:"subagents,omitempty"`
+	Path         string `json:"path,omitempty"`
+	ID           string `json:"id,omitempty"`
+	Subagents    bool   `json:"subagents,omitempty"`
+	UsageRefresh bool   `json:"usage_refresh,omitempty"`
+}
+
+// ErrInvalidUsageRefresh reports a usage refresh without both ID and Subagents.
+var ErrInvalidUsageRefresh = errors.New("sync: usage_refresh requires id and subagents")
+
+// ValidateUsageRefresh checks that a usage refresh targets one combined session.
+func ValidateUsageRefresh(in SyncInput) error {
+	if in.UsageRefresh && (in.ID == "" || !in.Subagents) {
+		return ErrInvalidUsageRefresh
+	}
+	return nil
 }
 
 // Event is the CLI-side NDJSON wrapper for SSE events from

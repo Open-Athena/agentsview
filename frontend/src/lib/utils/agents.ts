@@ -8,6 +8,7 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
   { name: "claude", color: "var(--accent-blue)" },
   { name: "cowork", color: "var(--accent-sky)", label: "Claude Cowork" },
   { name: "codex", color: "var(--accent-green)" },
+  { name: "codex-cloud", color: "var(--accent-red)", label: "Codex Cloud" },
   { name: "traex", color: "var(--accent-coral)", label: "TraeX" },
   { name: "augure-code", color: "var(--accent-lime)", label: "Augure Code" },
   {
@@ -46,6 +47,8 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
     label: "Visual Studio Copilot",
   },
   { name: "pi", color: "var(--accent-indigo)", label: "Pi" },
+  { name: "stepcode", color: "var(--accent-indigo)", label: "StepCode" },
+  { name: "fx", color: "var(--accent-sky)", label: "fx" },
   { name: "tau", color: "var(--accent-amber)", label: "Tau" },
   {
     name: "prime-agent",
@@ -75,6 +78,7 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
     label: "QClaw",
   },
   { name: "iflow", color: "var(--accent-sky)", label: "iFlow" },
+  { name: "junie", color: "var(--accent-lime)", label: "Junie" },
   { name: "kimi", color: "var(--accent-pink)", label: "Kimi" },
   {
     name: "kimi-work",
@@ -116,6 +120,7 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
     color: "var(--accent-coral)",
     label: "Charm Crush",
   },
+  { name: "muse", color: "var(--accent-sky)", label: "Muse Code" },
 ];
 
 const agentColorMap = new Map(KNOWN_AGENTS.map((a) => [a.name, a.color]));
@@ -164,8 +169,15 @@ export function agentLabel(agent: string, override?: string | null): string {
 // non-default entrypoints (sdk-cli, sdk-py, ...) are worth surfacing.
 const DEFAULT_ENTRYPOINT = "cli";
 
+// codex-cloud records where a thread started in the entrypoint; these are
+// the product names for the values it writes ("dot" is already its name).
+const ENTRYPOINT_LABELS: Record<string, string> = {
+  "codex-web": "Codex web",
+  "codex-cloud": "Codex cloud",
+};
+
 export function entrypointBadge(entrypoint?: string | null): string | null {
   const value = entrypoint?.trim();
   if (!value || value === DEFAULT_ENTRYPOINT) return null;
-  return value;
+  return ENTRYPOINT_LABELS[value] ?? value;
 }

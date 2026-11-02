@@ -413,14 +413,9 @@ func TestSearchSessions_Pagination(t *testing.T) {
 
 func TestListSessions_ReturnsRows(t *testing.T) {
 	ts, d := newTestToolset(t)
-	dbtest.SeedSession(t, d, "a-1", "proj-a", func(s *db.Session) {
-		s.MessageCount = 4
-		s.UserMessageCount = 2
-	})
-	dbtest.SeedSession(t, d, "b-1", "proj-b", func(s *db.Session) {
-		s.MessageCount = 4
-		s.UserMessageCount = 2
-	})
+	dbtest.SeedSession(t, d, "a-1", "proj-a", dbtest.WithMessageCounts(4, 2))
+	dbtest.SeedSession(t, d, "b-1", "proj-b", dbtest.WithMessageCounts(4, 2))
+	dbtest.SeedSession(t, d, "single", "proj-a", dbtest.WithMessageCounts(2, 1))
 
 	_, out, err := ts.listSessions(t.Context(), nil, listSessionsIn{
 		Project: "proj-a",
@@ -429,6 +424,14 @@ func TestListSessions_ReturnsRows(t *testing.T) {
 	require.Len(t, out.Sessions, 1)
 	assert.Equal(t, "a-1", out.Sessions[0].SessionID)
 	assert.Equal(t, "proj-a", out.Sessions[0].Project)
+
+	_, out, err = ts.listSessions(t.Context(), nil, listSessionsIn{
+		Project:        "proj-a",
+		IncludeOneShot: new(true),
+	})
+	require.NoError(t, err)
+	assert.Len(t, out.Sessions, 2)
+	assert.Equal(t, 2, out.Total)
 }
 
 func TestQueryRecall_ThreadsVectorModeAndReturnsDistilledEntries(t *testing.T) {
@@ -724,92 +727,6 @@ func TestSearchContent_ContextRedactsSecretByDefault(t *testing.T) {
 	}
 }
 
-// search_content's self-reference guard must exclude matches from sessions
-// that are active now, even when the matching message itself is old. A
-// long-running current session can match on a stale line; excluding by the
-// match timestamp alone would leak it. Exclusion is by session activity,
-// like search_sessions.
-func TestSearchContent_ExcludesActiveSessionWithOldMatch(t *testing.T) {
-	ts, d := newTestToolset(t)
-	// Active session: ended one minute before now, but its matching message
-	// is two hours old.
-	dbtest.SeedSession(t, d, "active", "proj", func(s *db.Session) {
-		s.MessageCount = 3
-		s.UserMessageCount = 2
-		ended := "2024-06-15T11:59:00Z"
-		s.EndedAt = &ended
-	})
-	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{{
-		SessionID: "active", Ordinal: 0, Role: "user",
-		Content: "old needle here", ContentLength: len("old needle here"),
-		Timestamp: "2024-06-15T10:00:00Z",
-	}}))
-	// Idle session: ended two hours before now.
-	dbtest.SeedSession(t, d, "idle", "proj", func(s *db.Session) {
-		s.MessageCount = 3
-		s.UserMessageCount = 2
-		ended := "2024-06-15T10:00:00Z"
-		s.EndedAt = &ended
-	})
-	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{{
-		SessionID: "idle", Ordinal: 0, Role: "user",
-		Content: "idle needle here", ContentLength: len("idle needle here"),
-		Timestamp: "2024-06-15T10:00:00Z",
-	}}))
-
-	// Default (include_active=false): the active session is excluded despite
-	// its old match; only the idle session is returned.
-	_, out, err := ts.searchContent(t.Context(), nil, searchContentIn{
-		Pattern: "needle", Mode: "substring",
-	})
-	require.NoError(t, err)
-	require.Len(t, out.Matches, 1)
-	assert.Equal(t, "idle", out.Matches[0].SessionID)
-	assert.Equal(t, 1, out.ExcludedActive)
-
-	// include_active=true returns both, excluding nothing.
-	_, all, err := ts.searchContent(t.Context(), nil, searchContentIn{
-		Pattern: "needle", Mode: "substring", IncludeActive: true,
-	})
-	require.NoError(t, err)
-	assert.Len(t, all.Matches, 2)
-	assert.Equal(t, 0, all.ExcludedActive)
-}
-
-// A freshly created/synced session can have no parsed ended_at or started_at
-// yet, only created_at. Its activity must fall back to created_at so a
-// current timestampless session is still excluded by the default guard,
-// rather than resolving to an empty timestamp and leaking through. Uses a
-// real clock because created_at is set to now by the DB at insert.
-func TestSearchContent_TimestamplessSessionExcludedByCreatedAt(t *testing.T) {
-	d := dbtest.OpenTestDB(t)
-	ts := &toolset{svc: service.NewDirectBackend(d, nil), now: time.Now}
-	// StartedAt and EndedAt are left nil on purpose; created_at defaults to
-	// now in the schema, so the session is active.
-	dbtest.SeedSession(t, d, "fresh", "proj", func(s *db.Session) {
-		s.MessageCount = 3
-		s.UserMessageCount = 2
-	})
-	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg("fresh", 0, "needle in a fresh session"),
-	}))
-
-	// Default guard excludes the still-active session despite no start/end.
-	_, out, err := ts.searchContent(t.Context(), nil, searchContentIn{
-		Pattern: "needle", Mode: "substring",
-	})
-	require.NoError(t, err)
-	assert.Empty(t, out.Matches)
-	assert.Equal(t, 1, out.ExcludedActive)
-
-	// include_active=true surfaces it.
-	_, all, err := ts.searchContent(t.Context(), nil, searchContentIn{
-		Pattern: "needle", Mode: "substring", IncludeActive: true,
-	})
-	require.NoError(t, err)
-	assert.Len(t, all.Matches, 1)
-}
-
 func TestUsageSummary_EmptyRange(t *testing.T) {
 	ts, _ := newTestToolset(t)
 	_, out, err := ts.usageSummary(t.Context(), nil, usageSummaryIn{
@@ -933,33 +850,6 @@ func TestSearchContent_SessionClassOptIns(t *testing.T) {
 			assert.ElementsMatch(t, tc.want, got)
 		})
 	}
-}
-
-func TestSearchContent_OneShotOptInKeepsActiveGuard(t *testing.T) {
-	ts, d := newTestToolset(t)
-	dbtest.SeedSession(t, d, "active-one", "proj", func(s *db.Session) {
-		s.MessageCount = 1
-		s.UserMessageCount = 1
-		s.EndedAt = new("2024-06-15T11:59:00Z")
-	})
-	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg("active-one", 0, "active one-shot marker"),
-	}))
-
-	_, excluded, err := ts.searchContent(t.Context(), nil, searchContentIn{
-		Pattern: "active one-shot marker", Mode: "substring", IncludeOneShot: true,
-	})
-	require.NoError(t, err)
-	assert.Empty(t, excluded.Matches)
-	assert.Equal(t, 1, excluded.ExcludedActive)
-
-	_, included, err := ts.searchContent(t.Context(), nil, searchContentIn{
-		Pattern: "active one-shot marker", Mode: "substring",
-		IncludeOneShot: true, IncludeActive: true,
-	})
-	require.NoError(t, err)
-	assert.Len(t, included.Matches, 1)
-	assert.Zero(t, included.ExcludedActive)
 }
 
 // search_content must surface the conversation-unit citation fields
@@ -1391,7 +1281,10 @@ func TestServer_EndToEnd(t *testing.T) {
 	}
 	assert.ElementsMatch(t, []string{
 		ToolSearchSessions, ToolQueryRecall, ToolListSessions, ToolGetSessionOverview,
-		ToolGetMessages, ToolGetMemoryStatus, ToolSearchContent, ToolGetUsageSummary,
+		ToolGetMessages, ToolGetMemoryStatus, ToolSearchContent, ToolGetUsageSummary, ToolGetSessionUsage,
+		ToolGetToolCalls, ToolGetRecentEdits, ToolGetChildSessions, ToolCompareUsage,
+		ToolGetActivityReport, ToolGetToolUsage, ToolGetQualitySignals, ToolSearchDocs,
+		ToolGetFrictionDigest, ToolListFrictionPatterns,
 	}, names)
 
 	res, err := ct.CallTool(ctx, callParams("search_sessions", map[string]any{
@@ -1490,6 +1383,22 @@ func TestServer_SearchContentIncludeOneShot(t *testing.T) {
 	}
 	assert.NotContains(t, schema["required"], "include_one_shot")
 	assert.NotContains(t, schema["required"], "include_automated")
+	for name, wantType := range map[string]string{"cursor": "integer", "activity_cutoff": "string"} {
+		property, ok := properties[name].(map[string]any)
+		require.True(t, ok, name)
+		assert.Equal(t, wantType, property["type"])
+		assert.NotContains(t, schema["required"], name)
+	}
+	raw, err = json.Marshal(searchTool.OutputSchema)
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(raw, &schema))
+	properties, ok = schema["properties"].(map[string]any)
+	require.True(t, ok)
+	for name, wantType := range map[string]any{"next_cursor": []any{"null", "integer"}, "activity_cutoff": "string"} {
+		property, ok := properties[name].(map[string]any)
+		require.True(t, ok, name)
+		assert.Equal(t, wantType, property["type"])
+	}
 	assert.Contains(t, searchTool.Description, "One-shot and automated sessions are excluded by default")
 	assert.Contains(t, searchTool.Description, "include_one_shot")
 	assert.Contains(t, searchTool.Description, "include_automated")
@@ -1533,7 +1442,7 @@ func TestSearchContent_SemanticUnavailableMapsToRemediationError(t *testing.T) {
 	ts := &toolset{svc: fake, now: func() time.Time { return fixedNow }}
 
 	_, _, err := ts.searchContent(t.Context(), nil, searchContentIn{
-		Pattern: "how do I configure retries", Mode: "semantic", IncludeActive: true,
+		Pattern: "how do I configure retries", Mode: "semantic",
 	})
 	require.Error(t, err)
 	require.ErrorIs(t, err, service.ErrSemanticUnavailable)
@@ -1634,21 +1543,6 @@ func TestSearchContent_RecallContractMapping(t *testing.T) {
 	require.NotNil(t, out.NextCursor)
 	assert.Equal(t, 50, *out.NextCursor)
 	require.Len(t, out.Matches, 1)
-}
-
-func TestSearchContent_BlankCurrentSessionKeepsRecentActiveGuard(t *testing.T) {
-	fake := &fakeContentSearchService{result: &service.ContentSearchResult{}}
-	ts := &toolset{svc: fake, now: func() time.Time { return fixedNow }}
-	_, out, err := ts.searchContent(t.Context(), nil, searchContentIn{
-		Pattern: "needle", CurrentSessionID: "   ",
-	})
-	require.NoError(t, err)
-	assert.Empty(t, fake.lastReq.ExcludeSessionIDs,
-		"whitespace-only current_session_id excludes nothing")
-	assert.Empty(t, out.Exclusions.CurrentSessionID,
-		"the reported exclusion must be normalized")
-	assert.True(t, out.Exclusions.RecentActive,
-		"a blank current_session_id must not disable the recent-active guard")
 }
 
 func TestSearchContent_OutOfRangeLimitUsesDefault(t *testing.T) {
@@ -2011,4 +1905,108 @@ func TestListSessionsIncludesBrowserLink(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, out.Sessions, 1)
 	assert.Equal(t, server.URL+"/sessions/codex/session-42", out.Sessions[0].WebURL)
+}
+
+func TestListSessionsAnnotationsPreserveAutomatedPresence(t *testing.T) {
+	ts, d := newTestToolset(t)
+	dbtest.SeedSession(t, d, "worker", "proj", func(s *db.Session) {
+		s.MessageCount, s.UserMessageCount, s.IsAutomated = 4, 2, true
+	})
+	_, err := d.SetSessionLabels(t.Context(), "worker", []string{"nightly"})
+	require.NoError(t, err)
+	in := listSessionsIn{Labels: []string{"nightly"}}
+	require.NoError(t, json.Unmarshal([]byte(`{"include_automated":false}`), &in))
+	_, out, err := ts.listSessions(t.Context(), nil, in)
+	require.NoError(t, err)
+	assert.Empty(t, out.Sessions)
+}
+
+func TestListSessionsAnnotationsPreserveOneShotPresence(t *testing.T) {
+	ts, d := newTestToolset(t)
+	for _, row := range []struct {
+		id    string
+		turns int
+	}{{"single", 1}, {"conversation", 2}} {
+		dbtest.SeedSession(t, d, row.id, "proj", func(s *db.Session) {
+			s.MessageCount, s.UserMessageCount = 4, row.turns
+			s.PRLinks = []db.PRLink{{
+				URL: "https://github.com/example/project/pull/7", Host: "github.com",
+				Repository: "example/project", Number: 7,
+			}}
+		})
+		_, err := d.SetSessionLabels(t.Context(), row.id, []string{"nightly"})
+		require.NoError(t, err)
+	}
+	for _, selection := range []struct {
+		name string
+		in   listSessionsIn
+	}{
+		{"label", listSessionsIn{Labels: []string{"nightly"}}},
+		{"pr", listSessionsIn{PR: "example/project#7"}},
+	} {
+		for _, tc := range []struct {
+			name, args string
+			want       []string
+		}{
+			{"omitted", `{}`, []string{"single", "conversation"}},
+			{"false", `{"include_one_shot":false}`, []string{"conversation"}},
+			{"true", `{"include_one_shot":true}`, []string{"single", "conversation"}},
+		} {
+			t.Run(selection.name+"/"+tc.name, func(t *testing.T) {
+				in := selection.in
+				require.NoError(t, json.Unmarshal([]byte(tc.args), &in))
+				_, out, err := ts.listSessions(t.Context(), nil, in)
+				require.NoError(t, err)
+				ids := make([]string, 0, len(out.Sessions))
+				for _, session := range out.Sessions {
+					ids = append(ids, session.SessionID)
+				}
+				assert.ElementsMatch(t, tc.want, ids)
+			})
+		}
+	}
+}
+
+func TestListSessionsOneShotHTTPPresence(t *testing.T) {
+	for _, selection := range []struct {
+		name string
+		in   listSessionsIn
+	}{
+		{"label", listSessionsIn{Labels: []string{"nightly"}}},
+		{"pr", listSessionsIn{PR: "example/project#7"}},
+	} {
+		for _, tc := range []struct {
+			name, args, want string
+		}{
+			{"omitted", `{}`, ""},
+			{"false", `{"include_one_shot":false}`, "false"},
+			{"true", `{"include_one_shot":true}`, "true"},
+		} {
+			t.Run(selection.name+"/"+tc.name, func(t *testing.T) {
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					assert.Equal(t, "/api/v1/sessions", r.URL.Path)
+					assert.Equal(t, tc.want, r.URL.Query().Get("include_one_shot"))
+					assert.Equal(t, selection.in.Labels, r.URL.Query()["label"])
+					assert.Equal(t, selection.in.PR, r.URL.Query().Get("pr"))
+					w.Header().Set("Content-Type", "application/json")
+					fmt.Fprint(w, `{"sessions":[],"total":0}`)
+				}))
+				t.Cleanup(srv.Close)
+				ts := &toolset{svc: servicehttp.NewHTTPBackendForServer(srv.URL, "",
+					servicehttp.HTTPServerCapabilities{APIVersion: service.SessionAnnotationsAPIVersion})}
+				in := selection.in
+				require.NoError(t, json.Unmarshal([]byte(tc.args), &in))
+				_, _, err := ts.listSessions(t.Context(), nil, in)
+				require.NoError(t, err)
+			})
+		}
+	}
+}
+
+func TestListSessionsRejectsUnknownMachine(t *testing.T) {
+	ts, d := newTestToolset(t)
+	require.NoError(t, d.SetSyncState(t.Context(), db.MachineLabelKeyPrefix+"id-a", "host-a.example"))
+	_, _, err := ts.listSessions(t.Context(), nil, listSessionsIn{Machine: "missing.example"})
+	var filterError *db.MachineFilterError
+	require.ErrorAs(t, err, &filterError)
 }

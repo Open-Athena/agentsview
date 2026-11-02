@@ -5,9 +5,11 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"net/http"
 
 	"github.com/spf13/cobra"
 
+	"go.kenn.io/agentsview/internal/apiclient"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 )
@@ -33,18 +35,14 @@ func newConversationChangesCommand() *cobra.Command {
 			if options.Limit < 1 || options.Limit > db.MaxSessionLimit {
 				return fmt.Errorf("--limit must be between 1 and %d", db.MaxSessionLimit)
 			}
-			database, err := openConversationExportDB(command)
-			if err != nil {
-				return err
-			}
-			defer database.Close()
-			result, err := database.ExportConversationChanges(command.Context(), options)
+			result, err := exportConversationChanges(command, options)
 			if err != nil {
 				return writeConversationExportError(command, err)
 			}
 			return json.MarshalEncode(jsontext.NewEncoder(command.OutOrStdout()), result)
 		},
 	}
+	command.Flags().StringVar(&options.TextMode, "text-mode", "stored", "Text selection: stored or visible prose")
 	command.Flags().StringVar(&options.Checkpoint, "checkpoint", "", "Resume after a completed changes walk")
 	command.Flags().StringVar(&options.Cursor, "cursor", "", "Continue an unfinished changes walk")
 	command.Flags().IntVar(&options.Limit, "limit", db.MaxSessionLimit, "Maximum changes in this page")
@@ -76,6 +74,7 @@ func newConversationMessageCommand() *cobra.Command {
 			return json.MarshalEncode(jsontext.NewEncoder(command.OutOrStdout()), result)
 		},
 	}
+	command.Flags().StringVar(&options.TextMode, "text-mode", "stored", "Text selection: stored or visible prose")
 	command.Flags().StringVar(&options.Revision, "revision", "", "Expected message revision from the changes listing")
 	command.Flags().StringVar(&options.DatabaseID, "database-id", "", "Expected archive generation from the changes listing")
 	command.Flags().Int64Var(&options.Offset, "offset", 0, "Starting UTF-8 byte offset from the previous chunk")
@@ -83,13 +82,89 @@ func newConversationMessageCommand() *cobra.Command {
 	return command
 }
 
+// exportConversationChanges lists changes from the read-only archive. The first
+// export of an archive builds its projection through whichever process owns the
+// writer, then reads again.
+func exportConversationChanges(command *cobra.Command, options db.ConversationExportOptions) (db.ConversationExportResult, error) {
+	database, err := openConversationExportDB(command)
+	if err != nil {
+		return db.ConversationExportResult{}, err
+	}
+	result, err := database.ExportConversationChanges(command.Context(), options)
+	database.Close()
+	if !errors.Is(err, db.ErrConversationInitializationRequired) {
+		return result, err
+	}
+	if err := initializeConversationExport(command); err != nil {
+		return db.ConversationExportResult{}, fmt.Errorf("initializing conversation export: %w", err)
+	}
+	database, err = openConversationExportDB(command)
+	if err != nil {
+		return db.ConversationExportResult{}, err
+	}
+	defer database.Close()
+	return database.ExportConversationChanges(command.Context(), options)
+}
+
+// initializeConversationExport asks the daemon that owns the archive to build
+// the projection, or builds it directly when no daemon does. It never starts a
+// daemon, whose startup sync would change what the export reads.
+func initializeConversationExport(command *cobra.Command) error {
+	ctx := command.Context()
+	cfg, err := config.LoadPFlagsFor(command.Flags(), config.ScopeLocal)
+	if err != nil {
+		return fmt.Errorf("loading config: %w", err)
+	}
+	waited, err := waitForBackgroundLaunchBeforeArchiveWrite(ctx, cfg.DataDir, backgroundAutoStartReadyTimeout)
+	if err != nil {
+		return err
+	}
+	if waited && cfg.AuthToken == "" {
+		adoptBackgroundLaunchConfig(&cfg)
+	}
+	tr, err := detectClientTransportContext(ctx, &cfg, backgroundAutoStartReadyTimeout)
+	if err != nil {
+		return err
+	}
+	// A read-only runtime (pg serve, duckdb serve) does not own the SQLite
+	// archive, so it is treated like no daemon; openWriteDB still refuses when
+	// a writable daemon holds the archive.
+	if tr.Mode == transportHTTP && !tr.ReadOnly {
+		api, err := apiclient.NewHTTPClient(tr.URL, cfg.AuthToken, &http.Client{Timeout: 0})
+		if err != nil {
+			return err
+		}
+		resp, err := api.PostAPIV1ExportConversationsInitializeWithResponse(ctx)
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode != http.StatusOK {
+			return errors.New(daemonErrorMessage(resp.StatusCode, resp.Body))
+		}
+		return nil
+	}
+	if tr.DirectIncompatible {
+		return directIncompatibleDaemonError(tr)
+	}
+	if tr.DirectReadOnly {
+		return errLocalDaemonUnreachable
+	}
+	database, lock, err := openWriteDB(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer closeWriteDB(database, lock)
+	_, err = database.EnsureConversationExportInitialized(ctx)
+	return err
+}
+
 func openConversationExportDB(command *cobra.Command) (*db.DB, error) {
-	appConfig, err := config.LoadPFlags(command.Flags())
+	appConfig, err := config.LoadPFlagsFor(command.Flags(), config.ScopeLocal)
 	if err != nil {
 		return nil, fmt.Errorf("loading config: %w", err)
 	}
-	// Exports do not migrate or reparse the archive. The normal writable
-	// database initialization establishes the stored export index.
+	// Exports read without migrating or reparsing the archive. The first
+	// changes call builds a cold archive's index through the writer owner.
 	database, err := openReadOnlyDB(command.Context(), appConfig)
 	if err != nil {
 		return nil, fmt.Errorf("open local archive: %w", err)
@@ -105,12 +180,12 @@ func writeConversationExportError(command *cobra.Command, cause error) error {
 	}{}
 	switch {
 	case errors.Is(cause, db.ErrConversationInitializationRequired):
-		return appendDaemonRestartUpgradeHint(cause)
+		return fmt.Errorf("%w; run `agentsview export conversations changes` first to build the conversation index", cause)
 	case errors.Is(cause, db.ErrConversationReconciliationRequired):
 		code, result.Error = sessionExportCursorResetExitCode, "reconciliation_required"
 		result.Message = "conversation checkpoint belongs to another archive generation; reconcile from a new changes walk"
 	case errors.Is(cause, db.ErrConversationRevisionChanged):
-		code, result.Error = 5, "revision_changed"
+		code, result.Error = conversationRevisionChangedExitCode, "revision_changed"
 		result.Message = "this message revision was superseded; read the next changes cycle for its current state"
 	default:
 		return schemaUpgradeHint(cause)

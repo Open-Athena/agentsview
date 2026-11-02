@@ -18,11 +18,11 @@ import (
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
 	duckdbsync "go.kenn.io/agentsview/internal/duckdb"
 	"go.kenn.io/agentsview/internal/pathutil"
 	"go.kenn.io/agentsview/internal/server"
 	"go.kenn.io/agentsview/internal/storage"
-	syncpkg "go.kenn.io/agentsview/internal/sync"
 )
 
 type DuckDBPushConfig struct {
@@ -42,65 +42,21 @@ type DuckDBPushConfig struct {
 	Automatic bool
 }
 
-// duckDBPusher runs a local engine sync then pushes to the DuckDB mirror.
-// It mirrors pgPusher's watch-loop shape: interval pushes use SyncAll, which
-// never tombstones missed deletions, so deferred scopes rely on the separate
-// unwatched-root poller wired by DuckDBPushWatch.
+// duckDBPusher pushes the archive to the DuckDB mirror from a watch process
+// that owns the archive. Local sync runs separately, so each push sends
+// whatever the archive holds when it starts.
 type duckDBPusher struct {
-	localSync  func(context.Context) error
-	scopedSync func(
-		context.Context, syncpkg.WatchBatch, *syncpkg.WatchRecoveryScope,
-		func() error,
-	) error
-	ensurePricing func(context.Context) error
-	mirrorPush    func(context.Context, bool) (storage.MirrorPushResult, error)
+	mirrorPush func(context.Context, bool) (storage.MirrorPushResult, error)
 }
 
 func (p *duckDBPusher) push(
 	ctx context.Context, reason pushReason, full bool,
 ) error {
-	return p.pushBatch(ctx, reason, full, nil, nil)
-}
-
-func (p *duckDBPusher) pushBatch(
-	ctx context.Context,
-	reason pushReason,
-	full bool,
-	batch *syncpkg.WatchBatch,
-	recovery *syncpkg.WatchRecoveryScope,
-) error {
-	push := func() error { return p.pushAfterSync(ctx, reason, full) }
-	if batch != nil {
-		if p.scopedSync == nil {
-			return errors.New("scoped local sync is unavailable")
-		}
-		return p.scopedSync(ctx, *batch, recovery, push)
-	}
-	if err := p.localSync(ctx); err != nil {
-		return fmt.Errorf("local sync: %w", err)
-	}
-	return push()
-}
-
-func (p *duckDBPusher) pushAfterSync(
-	ctx context.Context, reason pushReason, full bool,
-) error {
-	if p.ensurePricing != nil {
-		if err := p.ensurePricing(ctx); err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
-			log.Printf("warning: pricing refresh failed: %v", err)
-		}
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	res, err := p.mirrorPush(ctx, full)
 	if err != nil {
 		return err
 	}
-	return completeDuckDBWatchPush(res, reason)
+	return completeDuckDBWatchPush(res, reason, full)
 }
 
 type DuckDBQuackServeConfig struct {
@@ -111,12 +67,12 @@ type DuckDBQuackServeConfig struct {
 }
 
 func runDuckDBPush(cfg DuckDBPushConfig) {
-	appCfg, err := config.LoadMinimal()
+	appCfg, err := config.LoadMinimalFor(config.ScopeLocal)
 	if err != nil {
-		log.Fatalf("loading config: %v", err)
+		fatal("loading config: %v", err)
 	}
 	if err := os.MkdirAll(appCfg.DataDir, 0o755); err != nil {
-		log.Fatalf("creating data dir: %v", err)
+		fatal("creating data dir: %v", err)
 	}
 	setupLogFile(appCfg.DataDir)
 
@@ -138,7 +94,11 @@ func runDuckDBPush(cfg DuckDBPushConfig) {
 	)
 	defer stop()
 
-	backend, cleanup, err := resolveArchiveWriteBackend(ctx, appCfg)
+	intent := transportIntentArchiveWrite
+	if cfg.Watch {
+		intent = transportIntentLongLived
+	}
+	backend, cleanup, err := resolveArchiveWriteBackend(ctx, appCfg, intent)
 	if err != nil {
 		fatal("opening writer: %v", err)
 	}
@@ -201,16 +161,12 @@ func writeDuckDBPushPlan(
 }
 
 // writeDuckDBPushDiagnostics prints how the push selected sessions. A
-// rebuild (result.Diagnostics.Full) has no incremental candidate/skip
-// counters to report — pushEverything never populates them — so it gets its
-// own branch that always prints, including the reason a rebuild ran instead
-// of the requested incremental push (see rebuildReason in
-// internal/duckdb/probe.go). Earlier code only printed anything when
-// Diagnostics.Cutoff was non-empty, which incremental pushes always set but
-// rebuilds never do; that made every rebuild-instead-of-incremental case
-// (missing file, schema drift, a live serve holding the mirror locked, ...)
-// silently print nothing here, leaving only the generic "Pushed N
-// sessions..." summary with no indication a full rebuild had just run.
+// rebuild (result.Diagnostics.Full) has no incremental candidate counters,
+// so it gets its own branch that always prints, including the reason a
+// rebuild ran instead of the requested incremental push (see rebuildReason
+// in internal/duckdb/probe.go) and the sessions a resumed rebuild kept from
+// the unfinished one. Rebuilds set no Diagnostics.Cutoff, so keying output
+// on it would print nothing for them.
 func writeDuckDBPushDiagnostics(w io.Writer, result storage.MirrorPushResult) {
 	if result.Diagnostics.Deferred {
 		reason := result.Diagnostics.DeferredReason
@@ -232,6 +188,14 @@ func writeDuckDBPushDiagnostics(w io.Writer, result storage.MirrorPushResult) {
 			formatDuckDBPushSessionCounts(result.Diagnostics.PushedSessions),
 			result.MessagesPushed,
 		)
+		// A fresh rebuild file is empty, so any skipped session is one the
+		// unfinished rebuild already wrote.
+		if kept := result.Diagnostics.SkippedUnchangedSessions; kept.Total > 0 {
+			fmt.Fprintf(
+				w, "DuckDB push kept: sessions %s already written by the unfinished rebuild\n",
+				formatDuckDBPushSessionCounts(kept),
+			)
+		}
 		return
 	}
 	if result.Diagnostics.Cutoff == "" {
@@ -300,12 +264,12 @@ func duckDBLongRunningSignals() []os.Signal {
 }
 
 func runDuckDBStatus() {
-	appCfg, err := config.LoadMinimal()
+	appCfg, err := config.LoadMinimalFor(config.ScopeLocal)
 	if err != nil {
-		log.Fatalf("loading config: %v", err)
+		fatal("loading config: %v", err)
 	}
 	if err := os.MkdirAll(appCfg.DataDir, 0o755); err != nil {
-		log.Fatalf("creating data dir: %v", err)
+		fatal("creating data dir: %v", err)
 	}
 	setupLogFile(appCfg.DataDir)
 
@@ -323,7 +287,7 @@ func runDuckDBStatus() {
 	}
 	if status.MirrorMissing {
 		fmt.Printf(
-			"DuckDB mirror not found at %s; run 'agentsview duckdb push' to create it\n",
+			"DuckDB mirror not found at %s; run 'agentsview replica duckdb push' to create it\n",
 			duckCfg.Path,
 		)
 		return
@@ -337,7 +301,7 @@ func runDuckDBStatus() {
 		scope = "all projects"
 	}
 	fmt.Printf("Machine:         %s\n", machine)
-	fmt.Printf("Last push:       %s\n", valueOrNever(status.LastPushAt))
+	fmt.Printf("Last push:       %s\n", db.ValueOrNever(status.LastPushAt))
 	fmt.Printf("Schema version:  %d\n", status.SchemaVersion)
 	fmt.Printf("Data version:    %d\n", status.DataVersion)
 	fmt.Printf("Scope:           %s\n", scope)
@@ -500,7 +464,7 @@ func openDuckDBServeStore(
 	if schemaErr != nil {
 		if duckCfg.URL == "" {
 			fatal("duckdb serve: schema incompatible: %v\n"+
-				"Run 'agentsview duckdb push --full' to repopulate the mirror.", schemaErr)
+				"Run 'agentsview replica duckdb push --full' to repopulate the mirror.", schemaErr)
 		}
 		fatal("duckdb serve: schema incompatible: %v", schemaErr)
 	}
@@ -541,7 +505,7 @@ func duckDBMirrorServeProbeError(probe duckdbsync.MirrorProbe) error {
 				"that process if it predates the read-only serve change", reason,
 		)
 	}
-	return fmt.Errorf("%s; rebuild with 'agentsview duckdb push --full'", reason)
+	return fmt.Errorf("%s; rebuild with 'agentsview replica duckdb push --full'", reason)
 }
 
 // duckDBMirrorProbeFailureReason reports why probe is not safe to serve
@@ -567,12 +531,12 @@ func duckDBMirrorProbeFailureReason(probe duckdbsync.MirrorProbe) string {
 }
 
 func runDuckDBQuackServe(cfg DuckDBQuackServeConfig) {
-	appCfg, err := config.LoadMinimal()
+	appCfg, err := config.LoadMinimalFor(config.ScopeLocal)
 	if err != nil {
-		log.Fatalf("loading config: %v", err)
+		fatal("loading config: %v", err)
 	}
 	if err := os.MkdirAll(appCfg.DataDir, 0o755); err != nil {
-		log.Fatalf("creating data dir: %v", err)
+		fatal("creating data dir: %v", err)
 	}
 	setupLogFile(appCfg.DataDir)
 

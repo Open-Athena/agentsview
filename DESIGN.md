@@ -63,7 +63,7 @@ control.
 
 Most shared controls come from the `@kenn-io/kit-ui` library (imported as
 `import { ... } from "@kenn-io/kit-ui"`): Button, Chip, CopyButton, EmptyState,
-FilterDropdown, FindBar, IconButton, KbdBadge, Modal, RangePicker,
+FilterDropdown, FindBar, IconButton, KbdBadge, Modal, PageHeader, RangePicker,
 RefreshControl, SegmentedControl, Spinner, StatusBar, StatusDot,
 SettingsLayout/SettingsSection, Table/TableHeaderCell, TextInput/SearchInput,
 Tooltip, TopBar, and Typeahead. Shared components take pre-translated strings as
@@ -126,6 +126,7 @@ the new props through the app wrappers. Do not work around them with unsupported
 props or forked styles.
 
 - `Modal`'s close-X `aria-label` is hardcoded English; needs a label prop.
+- `CodeBlock` forwards `copyLabel` but keeps CopyButton's English "Copied" label.
 - `TopBar` cannot express "no active tab"; on routes that are not tabs
   (settings), the first tab renders as current.
 

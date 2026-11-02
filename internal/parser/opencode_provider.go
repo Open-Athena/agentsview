@@ -8,7 +8,6 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
-	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -1308,6 +1307,15 @@ func SourceUsesOpenCodeCompositeMTime(source SourceRef) bool {
 	}
 }
 
+// OpenCodeCompositeFingerprint returns the complete fingerprint carried by discovery.
+func OpenCodeCompositeFingerprint(source SourceRef) (SourceFingerprint, bool) {
+	digest := sourceCarriedChildDigest(source)
+	if !SourceUsesOpenCodeCompositeMTime(source) || digest == "" {
+		return SourceFingerprint{}, false
+	}
+	return SourceFingerprint{MTimeNS: sourceCarriedMTimeNS(source), Hash: digest}, true
+}
+
 // changedWatermarkSources answers a shared-container change event with only
 // the members whose carried session-row watermark is not already covered by
 // the caller's stored freshness. The watermark listing streams in ascending
@@ -1324,7 +1332,7 @@ func (s openCodeFormatSourceSet) changedWatermarkSources(
 	storageIDs map[string]struct{},
 	freshness StoredMemberFreshnessPager,
 ) ([]SourceRef, error) {
-	cursor := storedMemberFreshnessCursor{pager: freshness}
+	cursor := StoredMemberFreshnessCursor{pager: freshness}
 	var sources []SourceRef
 	err := s.spec.streamSQLiteWatermark(ctx, dbPath, func(meta OpenCodeSessionMeta) error {
 		if _, exists := storageIDs[meta.SessionID]; exists {
@@ -1356,10 +1364,10 @@ func (s openCodeFormatSourceSet) changedWatermarkSources(
 
 const storedMemberFreshnessPageSize = 512
 
-// storedMemberFreshnessCursor advances through the caller's paged stored
+// StoredMemberFreshnessCursor advances through the caller's paged stored
 // freshness in step with an ascending virtual-path stream, retaining one page
 // at a time.
-type storedMemberFreshnessCursor struct {
+type StoredMemberFreshnessCursor struct {
 	pager  StoredMemberFreshnessPager
 	rows   []StoredMemberFreshness
 	index  int
@@ -1368,11 +1376,16 @@ type storedMemberFreshnessCursor struct {
 	failed bool
 }
 
-// covers reports whether the stored side vouches for path at watermarkNS.
-// Paths must arrive in ascending order across calls.
-func (c *storedMemberFreshnessCursor) covers(
-	ctx context.Context, path string, watermarkNS int64,
-) (bool, error) {
+// NewStoredMemberFreshnessCursor joins ascending virtual paths with stored freshness pages.
+func NewStoredMemberFreshnessCursor(pager StoredMemberFreshnessPager) *StoredMemberFreshnessCursor {
+	return &StoredMemberFreshnessCursor{pager: pager}
+}
+
+// Lookup returns the stored row for path, if the stored side has one. Paths
+// must arrive in ascending order across calls.
+func (c *StoredMemberFreshnessCursor) Lookup(
+	ctx context.Context, path string,
+) (StoredMemberFreshness, bool, error) {
 	for {
 		for c.index < len(c.rows) {
 			row := c.rows[c.index]
@@ -1381,16 +1394,16 @@ func (c *storedMemberFreshnessCursor) covers(
 				continue
 			}
 			if row.Path > path {
-				return false, nil
+				return StoredMemberFreshness{}, false, nil
 			}
-			return watermarkNS <= row.CoveredThroughNS, nil
+			return row, true, nil
 		}
 		if c.done {
-			return false, nil
+			return StoredMemberFreshness{}, false, nil
 		}
 		rows, done, err := c.pager(ctx, c.after, storedMemberFreshnessPageSize)
 		if err != nil {
-			return false, err
+			return StoredMemberFreshness{}, false, err
 		}
 		c.rows, c.index, c.done = rows, 0, done
 		if len(rows) > 0 {
@@ -1401,6 +1414,20 @@ func (c *storedMemberFreshnessCursor) covers(
 			c.done = true
 		}
 	}
+}
+
+// covers reports whether the stored side vouches for path at watermarkNS.
+func (c *StoredMemberFreshnessCursor) covers(
+	ctx context.Context, path string, watermarkNS int64,
+) (bool, error) {
+	row, ok, err := c.Lookup(ctx, path)
+	if err != nil || !ok {
+		return false, err
+	}
+	if row.Suppressed {
+		return true, nil
+	}
+	return watermarkNS <= row.CoveredThroughNS, nil
 }
 
 // sqliteSourceRefFromMeta builds a SourceRef for a session row already listed
@@ -1984,20 +2011,6 @@ func (spec openCodeProviderSpec) dbPathForEvent(root, path string) (string, bool
 	return filepath.Join(root, name), true
 }
 
-func sqliteWALHasFrames(path string) bool {
-	info, err := os.Stat(path)
-	if err != nil {
-		// Only a missing WAL is a definitive no-op. Other stat failures fail
-		// open so a real update is synced instead of silently dropped; at
-		// worst that costs one redundant sync.
-		return !errors.Is(err, fs.ErrNotExist)
-	}
-	if info == nil {
-		return false
-	}
-	return info.Mode().IsRegular() && info.Size() > sqliteWALHeaderSize
-}
-
 func (s openCodeFormatSourceSet) sourceForRawID(ctx context.Context, root, sessionID string) (SourceRef, bool) {
 	path := s.spec.find(ctx, root, sessionID)
 	if path == "" {
@@ -2136,6 +2149,7 @@ func openCodeFormatProviderCapabilities() Capabilities {
 		},
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
+			SessionName:          CapabilitySupported,
 			Cwd:                  CapabilitySupported,
 			Relationships:        CapabilitySupported,
 			Thinking:             CapabilitySupported,

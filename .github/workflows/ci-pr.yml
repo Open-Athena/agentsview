@@ -1,12 +1,24 @@
 name: CI
 
-# The PR dispatcher always calls the main-pinned workflow. That workflow
-# runs Linux AMD64 and Windows jobs on Namespace, including fork PRs.
+# Run the workflow from this revision so its steps match the code under test.
 on:
   pull_request:
+  merge_group:
+    types: [checks_requested]
 
 permissions: read-all
 
 jobs:
   run:
-    uses: kenn-io/agentsview/.github/workflows/ci.yml@main
+    cache-mode: read
+    uses: ./.github/workflows/ci.yml
+
+  gate:
+    name: CI gate
+    needs: run
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful CI
+        if: needs.run.result != 'success'
+        run: exit 1

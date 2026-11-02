@@ -48,10 +48,11 @@ The index does not embed every message individually. The embeddable universe —
 - **User documents**: one document per embeddable user message.
 - **Run documents**: a maximal sequence of contiguous embeddable assistant
   messages within one session, bounded by embeddable user rows, session edges,
-  and `is_sidechain` transitions (a contiguous sidechain block forms its own
-  run and never mixes with non-sidechain messages). Member texts are joined in
-  ordinal order with a single blank line (`"\n\n"`); no role labels, markers,
-  or metadata are injected into the embedded text.
+  `is_sidechain` transitions, and a size cap of `4 × max_input_chars` runes. A
+  run closes after the message that reaches the cap; the next message starts a
+  new run keyed by its own first member. Sidechain blocks form separate runs.
+  Member texts are joined in ordinal order with a single blank line (`"\n\n"`);
+  no role labels, markers, or metadata are injected into the embedded text.
 
 The boundary term is deliberately "embeddable user row", not "human turn": user
 rows the system-prefix filter excludes (interruptions, task notifications,
@@ -135,13 +136,15 @@ only affects data parsed before per-message UUIDs existed.
 
 ## Mirror schema versioning
 
-`vector_meta` carries a `mirror_schema_version` key (currently `"3"`). It covers
+`vector_meta` carries a `mirror_schema_version` key (currently `"4"`). It covers
 both the mirror's DDL shape and its document-identity scheme — what one
 `vector_messages` row *means* — and is bumped whenever either changes in a way
 old rows cannot simply be read as-is. History: `"2"` added the
 `ordinal_end`/`subordinate`/`offsets` columns while still holding one row per
 message; `"3"` switched document identity to run-grouped units with no DDL
-change.
+change; `"4"` caps assistant runs. A listed older stamp (`"3"` for the message
+store) is accepted for reads and restamped in place on writable open, preserving
+vectors and generations.
 
 On a mismatch — including the key being absent while any mirror state already
 exists:
@@ -206,6 +209,27 @@ invalidating the generation.
   generation's stored fingerprint no longer matches the fingerprint computed
   from the current `[vector.embeddings]` config.
 
+Builds and the staleness gate compare fingerprints through kit's
+`embedmodel.Descriptor`. Its `Legacy` entry is the agentsview fingerprint above,
+so generations stored before agentsview adopted kit's embedding stack stay
+current and are not re-embedded. kit's own vector-space identity omits the input
+recipe (unit scheme, chunk size, overlap, corpus), so agentsview keeps keying
+new generations by its own fingerprint.
+
+Lifecycle bookkeeping uses kit's `sqlitevec` store: `Coverage` reports each
+generation's embedded and missing documents, and auto-activation calls
+`Activate`, which publishes a generation only when no document is pending and
+retires the previous active and building generations in the same transaction.
+Two operations stay local because kit treats a retired generation as permanent:
+
+- A build whose config returns to a retired generation's fingerprint revives it
+  and tops it up, reusing its stored vectors.
+- `embeddings activate <id>` can reactivate a retired generation, and `--force`
+  activates a generation that still has pending documents.
+
+Both rely on agentsview never calling kit's `Reclaim`, so a retired generation
+keeps its vectors until `vectors.db` is reset.
+
 ## Chunking and anchoring
 
 Unit content is chunked by kit's `Split` with `MaxRunes = max_input_chars`
@@ -255,28 +279,47 @@ instead of being deleted outright, so a same-scan reinsert under the same
 `doc_key` survives via upsert and keeps its `embed_gen` rather than
 re-embedding.
 
+An incremental refresh scans each session newer than the watermark whole. For
+sessions that emit a non-deleted unit, it removes documents the scan did not
+produce. A re-sync that changes an earlier assistant message's length moves
+later run boundaries, and this drops the superseded pieces. Other sessions wait
+for a full refresh or journal reconciliation.
+
+An incremental refresh also reads the archive's session deletion journal from
+the revision stored in `vectors.db`. It removes the documents of permanently
+deleted sessions and rescans reinserted sessions whole, whatever their end time.
+When the stored revision is missing, belongs to another archive, or is ahead of
+the journal, the refresh runs a full reconciliation instead.
+
 ### Fill and skip-and-stamp
 
 Fill embeds every pending document (content changed, or never embedded, for the
 active generation). Within each scan page, up to `concurrency` (the building
 server's config, default 4) documents are split and encoded in parallel; saves
 into `vectors.db` stay serialized on one goroutine, preserving the single-writer
-model. Requests ask for `encoding_format: "base64"` (raw little-endian float32
-bytes, ~4x smaller than JSON float arrays); the encoder accepts either response
-shape, and a server that rejects the field downgrades the encoder to plain float
-requests for its lifetime. A document whose encode call fails with a permanent
-error — a 400, 413, or 422 whose error body describes the input itself, e.g. a
-token/context-length overflow or a content-policy rejection — is not retried in
-that fill or the next one: it's stamped for the generation with no vectors at
-its current `content_hash`, which marks it non-pending. It's logged (doc key
-plus the underlying error) and counted in the build summary's skipped count, but
-there is no separate poison list or periodic retry — the only way it embeds
-again is if the document's content itself changes later (a new `content_hash`,
-so a new pending row). Every other failure — 5xx, network errors, timeouts, 429,
-and any 4xx that looks like an auth, route, model, or media-type problem rather
-than a rejection of this document — aborts the fill and is retried on the next
-scheduled build, so a config mistake can't silently stamp the whole corpus as
-embedded-with-no-vectors.
+model. Requests go through kit's `embedclient`, which applies the role prefix
+and suffix, validates every vector, and retries 408, 429, 5xx, and network
+failures up to `max_retries` attempts. Document builds keep retrying a 429 until
+it clears or the build is canceled; 429s do not use up the `max_retries` budget
+for other failures in the same request.
+
+kit classifies every failed response from its status and the provider's error
+code or message. Only an input that is too long or refused by policy counts as a
+rejection of that document. A 400 kit cannot attribute to the input, such as a
+wrong model or an unsupported `dimensions` field, aborts the fill: documents
+stay pending and the active generation is unchanged. Every other failure — 401,
+403, 404, 5xx, network errors, timeouts, and 429 — also aborts the fill and is
+retried on the next scheduled build.
+
+When a rejection comes back for a request that batched several documents, the
+fill re-sends each document on its own to find the one at fault. A confirmed
+rejection is stamped for the generation with no vectors at its current
+`content_hash`, which marks it non-pending, and later builds of that generation
+do not send it again. It's logged (doc key plus the underlying error) and
+counted in the build summary's skipped count; there is no separate poison list
+or periodic retry. The document is attempted again only when its content changes
+(a new `content_hash`), a full rebuild clears the generation's stamps, or a
+config change creates a generation with a new fingerprint.
 
 ### Scope (`include_automated`)
 
@@ -285,6 +328,12 @@ Whether automated sessions are in the embeddable universe is stored in
 one-off `--include-automated` flag — forces a full mirror *reconciliation*, not
 a re-embed: it inserts or removes rows to match the new scope, but documents
 that stay in scope and are unchanged keep their existing stamps.
+
+The run cap is stored as `run_max_runes` in the store's metadata. A missing or
+changed cap forces one full reconciliation, including idle sessions older than
+the watermark. Only pieces whose text changes re-embed. The key is cleared
+before reshaping and stored after a successful refresh, so an interrupted
+reshape still reconciles fully if the previous cap is restored.
 
 ## Concurrency and locking
 
@@ -402,14 +451,14 @@ uniform. The HTTP response serializes `db.ContentMatch` directly; the MCP
 - **Semantic and hybrid unit rows** carry the embedded unit's span from the
   vectors.db mirror — embedding identity, including build scope.
 - **Lexical rows and hybrid unit-less rows** carry a structurally derived unit
-  computed from the messages/sessions tables only. Deterministic, never
-  depends on whether a vector index exists or is fresh — lexical output must
-  not flicker with index state.
+  computed from the messages/sessions tables only, without the size cap.
+  Deterministic, never depends on whether a vector index exists or is fresh —
+  lexical output must not flicker with index state.
 
-Derived and embedded spans coincide except where embedding scope diverges from
-structure: sessions excluded from the build (`include_automated = false`) and
-messages newer than the last mirror refresh. There is deliberately no provenance
-discriminator field on the wire — the mode implies it.
+Derived and embedded spans differ for capped assistant runs, sessions excluded
+from the build (`include_automated = false`), and messages newer than the last
+mirror refresh. There is deliberately no provenance discriminator field on the
+wire — the mode implies it.
 
 Hybrid unit-less rows (FTS hits whose message resolves to no mirror unit) are
 classified **before** scope filtering and the RRF merge, so `scope` exclusion,
@@ -419,8 +468,9 @@ as top-level.
 
 ### Derived-unit rules
 
-The structural rules mirror `ScanEmbeddableUnits`'s reducer, so derived spans
-equal embedding-unit spans on in-scope data. An **embeddable user row** is
+The structural rules mirror `ScanEmbeddableUnits`'s reducer without its size
+cap, so derived spans equal embedding-unit spans on in-scope data except where
+the index split a long run. An **embeddable user row** is
 `role = 'user' AND is_system = 0` with content not system-prefixed (the dialect
 `SystemPrefixSQL` predicate); an **embeddable assistant row** is the same with
 `role = 'assistant'` — the prefix predicate constrains only user rows, so a
@@ -450,8 +500,8 @@ Automation gating is deliberately ignored: derivation is structural, so matches
 inside automated sessions still get real ranges. The invariant, pinned by the
 reducer-equivalence test in `internal/db/unit_range_test.go`: derivation at any
 member ordinal of any unit produced by
-`ScanEmbeddableUnits(include_automated = true)` returns exactly that unit's
-`[Ordinal, OrdinalEnd]`.
+an uncapped `ScanEmbeddableUnits(include_automated = true)` scan returns
+exactly that unit's `[Ordinal, OrdinalEnd]`.
 
 `subordinate` for derived rows uses the reducer's formula: session-subordinate
 (`relationship_type IN ('subagent','fork')`, or parent-linked with

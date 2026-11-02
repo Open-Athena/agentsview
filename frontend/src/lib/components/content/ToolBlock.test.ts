@@ -7,6 +7,7 @@ import retainedFixtureSource from "../../utils/__fixtures__/retained-tool-image-
 const SMALL_PNG_DATA_URI =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 import ToolBlock from "./ToolBlock.svelte";
+import { ui } from "../../stores/ui.svelte.js";
 
 const copyToClipboardMock = vi.hoisted(() => vi.fn().mockResolvedValue(true));
 const searchState = vi.hoisted(() => ({ active: false, current: "", query: "" }));
@@ -313,6 +314,19 @@ describe("ToolBlock output and controls", () => {
     expect(text(".tool-meta")).toContain(path);
     expect(document.querySelector(`.meta-value[title="${path}"]`)).not.toBeNull();
   });
+  it("reveals a field match and shows the field in full while find runs", async () => {
+    const cwd = "/workspace/" + "nested-directory/".repeat(5) + "service-under-test";
+    searchState.active = true;
+    searchState.current = "7:tool-meta:0.0";
+    searchState.query = "nested-directory";
+    await render({
+      toolCall: call("shell_command", { command: "make test", cwd }, { category: "Bash" }),
+      searchScope: { ordinal: 7, callIdx: 0 },
+    });
+    expect(document.querySelector(".tool-header")?.getAttribute("aria-expanded")).toBe("true");
+    expect(document.querySelector(".tool-meta .meta-value")).toBeNull();
+    expect(text(".tool-meta")).toBe(`cwd: ${cwd}`);
+  });
   it("keeps canonical path metadata accessible without labelling ordinary metadata", async () => {
     const path =
       "/workspace/packages/agentsview/frontend/src/lib/components/content/ToolBlock.svelte";
@@ -388,6 +402,43 @@ describe("ToolBlock output and controls", () => {
     await click(".history-header");
     expect(document.querySelector(".result-history")).toBeNull();
   });
+  it("hides empty timing-only events from result history", async () => {
+    const timing = (event_index: number, status: string, content = "") => ({
+      event_index,
+      status,
+      source: "tool_execution",
+      content,
+      content_length: content.length,
+    });
+    await render({
+      toolCall: call("bash", {}, { result_events: [timing(0, "started"), timing(1, "completed")] }),
+    });
+    await click(".tool-header");
+    expect(document.querySelector(".history-header")).toBeNull();
+  });
+  it("keeps the raw event index on history rows after hiding timing marks", async () => {
+    const timing = (event_index: number, status: string, content = "") => ({
+      event_index,
+      status,
+      source: "tool_execution",
+      content,
+      content_length: content.length,
+    });
+    await render({
+      toolCall: call(
+        "bash",
+        {},
+        { result_events: [timing(0, "started"), timing(1, "completed", "done")] },
+      ),
+      searchScope: { ordinal: 3, callIdx: 0 },
+    });
+    await click(".tool-header");
+    expect(text(".history-header .tool-preview")).toBe("completed: done");
+    await click(".history-header");
+    const rows = Array.from(document.querySelectorAll<HTMLElement>(".history-content"));
+    expect(rows.map((node) => node.textContent)).toEqual(["done"]);
+    expect(rows[0]!.dataset.searchBlock).toBe("3:tool-history:0.1");
+  });
   it("localizes input, output, history and line controls without translating content", async () => {
     setLocale("zh-CN");
     await render({
@@ -424,6 +475,48 @@ describe("ToolBlock output and controls", () => {
 });
 
 describe("ToolBlock input source and copy", () => {
+  it.each([
+    ["exec", "Bash", '  text(await tools.exec_command({cmd: "echo hello"}));\n'],
+    ["apply_patch", "Edit", "*** Begin Patch\n*** Add File: example.txt\n+hello\n*** End Patch\n"],
+    ["exec", "Bash", '<script>throw new Error("must remain text")</script>'],
+    ["exec", "Bash", '"use strict"'],
+    ["exec", "Bash", '["a"]'],
+  ])("renders and copies raw %s input verbatim", async (name, category, input_json) => {
+    await render({ toolCall: call(name, {}, { category, input_json }) });
+    await click('button[aria-label="Copy input"]');
+    expect(copyToClipboardMock).toHaveBeenCalledExactlyOnceWith(input_json);
+    expect(document.querySelector(".tool-content")).toBeNull();
+    await click(".tool-header");
+    expect(text(".tool-content")).toBe(input_json);
+    expect(document.querySelector(".tool-content script")).toBeNull();
+  });
+  it("copies the full raw script while its preview is truncated", async () => {
+    const script =
+      "  // recorded script\n" + "await step();\n".repeat(25) + 'text("final command");\n';
+    await render({ toolCall: call("exec", {}, { category: "Bash", input_json: script }) });
+    await click(".tool-header");
+    expect(text(".tool-content")).toContain("  // recorded script\n");
+    expect(text(".tool-content")).not.toContain("final command");
+    await click('button[aria-label="Copy input"]');
+    expect(copyToClipboardMock).toHaveBeenCalledExactlyOnceWith(script);
+    expect(text(".tool-content")).not.toContain("final command");
+    await click(".show-more-btn");
+    expect(text(".tool-content")).toBe(script);
+    await click(".show-more-btn");
+    expect(text(".tool-content")).not.toContain("final command");
+  });
+  it("reveals the full raw script when search targets text beyond its preview", async () => {
+    const script = "await step();\n".repeat(25) + 'text("final command");';
+    searchState.active = true;
+    searchState.current = "7:tool-input:0";
+    searchState.query = "final command";
+    await render({
+      toolCall: call("exec", {}, { category: "Bash", input_json: script }),
+      searchScope: { ordinal: 7, callIdx: 0 },
+    });
+    expect(document.querySelector(".tool-header")?.getAttribute("aria-expanded")).toBe("true");
+    expect(text(".tool-content")).toBe(script);
+  });
   it("copies a complete task prompt without expanding", async () => {
     const prompt = "Work on this task\nwith all details.";
     await render({ toolCall: call("Task", { subagent_type: "Explore", prompt }) });
@@ -437,7 +530,7 @@ describe("ToolBlock input source and copy", () => {
     await click(".tool-header");
     expect(text(".tool-content")).not.toContain("hidden-line-229");
     await click('button[aria-label="Copy input"]');
-    expect(copyToClipboardMock).toHaveBeenCalledWith(`command: ${command}`);
+    expect(copyToClipboardMock).toHaveBeenCalledWith(command);
     expect(text(".tool-content")).not.toContain("hidden-line-229");
   });
   it.each([
@@ -488,6 +581,42 @@ describe("ToolBlock input source and copy", () => {
     expect(body).toContain(first);
     if (second) expect(body).toContain(second);
   });
+  it("shows a Bash command as code with its working directory as a field", async () => {
+    const command = "/bin/bash -lc \"python - <<'PY'\nprint('hi')\nPY\"";
+    await render({
+      toolCall: call("shell_command", { command, cwd: "/workspace/app" }, { category: "Bash" }),
+    });
+    await click(".tool-header");
+    expect(document.querySelector(".tool-content.tool-command code")?.textContent).toBe(command);
+    expect(text(".tool-meta")).toContain("cwd:");
+    expect(text(".tool-meta")).toContain("/workspace/app");
+    expect(text(".tool-meta")).not.toContain("cmd:");
+    await click('button[aria-label="Copy input"]');
+    expect(copyToClipboardMock).toHaveBeenCalledExactlyOnceWith(command);
+  });
+  it("copies the command when the block shows legacy segment text", async () => {
+    await render({
+      content: "$ make build",
+      toolCall: call("Bash", { command: "make build" }, { category: "Bash" }),
+    });
+    await click('button[aria-label="Copy input"]');
+    expect(copyToClipboardMock).toHaveBeenCalledExactlyOnceWith("make build");
+  });
+  it("names the file in the header and copies the diff of a per-file change", async () => {
+    const diff = "@@ -1 +1 @@\n-old\n+new\n";
+    await render({
+      toolCall: call(
+        "apply_patch",
+        { path: "src/app.go", kind: { type: "update" }, diff },
+        { category: "Edit" },
+      ),
+    });
+    expect(text(".tool-header .tool-preview")).toBe("src/app.go");
+    await click(".tool-header");
+    expect(text(".diff-view")).toContain("+new");
+    await click('button[aria-label="Copy input"]');
+    expect(copyToClipboardMock).toHaveBeenCalledExactlyOnceWith(diff);
+  });
   it("prefers supplied content over synthesized input", async () => {
     await render({ content: "explicit source", toolCall: call("Bash", { command: "fallback" }) });
     await click(".tool-header");
@@ -504,6 +633,8 @@ describe("ToolBlock input source and copy", () => {
     });
     await click(".tool-header");
     expect(text(".tool-content")).toBe("legacy");
+    await click('button[aria-label="Copy input"]');
+    expect(copyToClipboardMock).toHaveBeenCalledExactlyOnceWith("legacy");
   });
   it("handles a tool call without input_json", async () => {
     await render({
@@ -555,7 +686,6 @@ describe("ToolBlock collapsed previews", () => {
   it.each([
     ["Codex cmd", call("Bash", { cmd: "ls -la" }), "ls -la"],
     ["Claude command", call("Bash", { command: "git status" }), "git status"],
-    ["multiline command", call("Bash", { command: "echo first\necho second" }), "echo first"],
     [
       "Edit counts",
       call("Edit", { file_path: "/tmp/test.ts", old_string: "a\nb", new_string: "c\nd\ne" }),
@@ -647,5 +777,143 @@ describe("ToolBlock collapsed previews", () => {
     });
     expect(text(".tool-preview")).toContain("active task");
     expect(text(".tool-preview")).not.toContain("legacy todo");
+  });
+});
+
+describe("ToolBlock result images", () => {
+  const imageResult = JSON.stringify([{ type: "input_image", image_url: SMALL_PNG_DATA_URI }]);
+  const previews = () =>
+    Array.from(document.querySelectorAll<HTMLImageElement>(".tool-images img"), (img) => ({
+      src: img.getAttribute("src"),
+      alt: img.getAttribute("alt"),
+    }));
+
+  it("shows a generated image while collapsed and keeps its payload out of the text", async () => {
+    await render({
+      toolCall: call(
+        "image_generation",
+        { id: "ig_1", status: "completed", revised_prompt: "A teal circle" },
+        {
+          category: "Tool",
+          result_content: imageResult,
+          result_events: [
+            {
+              event_index: 0,
+              status: "completed",
+              source: "image_generation_call",
+              content: imageResult,
+              content_length: imageResult.length,
+            },
+          ],
+        },
+      ),
+    });
+    expect(previews()).toEqual([{ src: SMALL_PNG_DATA_URI, alt: "A teal circle" }]);
+
+    await click(".tool-header");
+    expect(text(".tool-content")).toContain("revised_prompt: A teal circle");
+    expect(text(".tool-content")).not.toContain("base64");
+    expect(text(".output-header .tool-preview")).toMatch(/^\[Image: image\/png, \d+ bytes\]$/);
+    expect(text(".history-header .tool-preview")).toMatch(
+      /^completed: \[Image: image\/png, \d+ bytes\]$/,
+    );
+    expect(previews()).toHaveLength(1);
+  });
+
+  it("shows other tools' images only once the block is expanded", async () => {
+    await render({
+      toolCall: call(
+        "view_image",
+        { path: "/workspace/shot.png" },
+        { result_content: imageResult },
+      ),
+    });
+    expect(previews()).toEqual([]);
+    await click(".tool-header");
+    expect(previews()).toEqual([{ src: SMALL_PNG_DATA_URI, alt: "Image from tool output" }]);
+  });
+
+  it("opens the image at full size and closes it again", async () => {
+    await render({
+      toolCall: call(
+        "image_generation",
+        { revisedPrompt: "A teal circle" },
+        { result_content: imageResult },
+      ),
+    });
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+
+    await click('.tool-images button[aria-label="Show image at full size"]');
+    const dialog = document.querySelector('[role="dialog"]');
+    expect(dialog?.getAttribute("aria-label")).toBe("A teal circle");
+    expect(dialog?.querySelector(".kit-modal-header")).toBeNull();
+    expect(dialog?.querySelector("img")?.getAttribute("src")).toBe(SMALL_PNG_DATA_URI);
+    expect(dialog?.querySelector("img")?.getAttribute("alt")).toBe("A teal circle");
+    expect(document.querySelector(".tool-header")?.getAttribute("aria-expanded")).toBe("false");
+
+    await click('[role="dialog"] button[aria-label="Close full-size image"]');
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(ui.activeModal).toBeNull();
+  });
+
+  it("loads offloaded images in the preview and the full-size view", async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => new Response("image"));
+    vi.stubGlobal("fetch", fetchMock);
+    const createObjectURL = vi
+      .fn()
+      .mockReturnValueOnce("blob:preview")
+      .mockReturnValueOnce("blob:full-size");
+    vi.stubGlobal(
+      "URL",
+      class extends URL {
+        static override createObjectURL = createObjectURL;
+        static override revokeObjectURL = vi.fn();
+      },
+    );
+    const offloaded = JSON.stringify([
+      {
+        type: "agentsview_image",
+        version: 1,
+        text: "![Image: image/png, 3 bytes](asset://abc.png)",
+        image_ref: "asset://abc.png",
+      },
+    ]);
+    await render({ toolCall: call("image_generation", {}, { result_content: offloaded }) });
+
+    await vi.waitFor(() => {
+      expect(previews().map((preview) => preview.src)).toEqual(["blob:preview"]);
+    });
+    await click('.tool-images button[aria-label="Show image at full size"]');
+    await vi.waitFor(() => {
+      expect(document.querySelector('[role="dialog"] img')?.getAttribute("src")).toBe(
+        "blob:full-size",
+      );
+    });
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+      expect.stringMatching(/\/api\/v1\/assets\/abc\.png$/),
+      expect.stringMatching(/\/api\/v1\/assets\/abc\.png$/),
+    ]);
+    ui.activeModal = null;
+  });
+
+  it("holds the app modal slot so Escape closes only the dialog", async () => {
+    await render({ toolCall: call("image_generation", {}, { result_content: imageResult }) });
+    await click('.tool-images button[aria-label="Show image at full size"]');
+    expect(ui.activeModal).toBe("toolImage");
+
+    // The global Escape handler clears the slot before it would leave the session.
+    ui.activeModal = null;
+    await tick();
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it("releases the modal slot when an open viewer unmounts", async () => {
+    await render({ toolCall: call("image_generation", {}, { result_content: imageResult }) });
+    await click('.tool-images button[aria-label="Show image at full size"]');
+    expect(ui.activeModal).toBe("toolImage");
+
+    for (const component of components.splice(0)) await unmount(component);
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(ui.activeModal).toBeNull();
   });
 });

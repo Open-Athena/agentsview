@@ -10,6 +10,7 @@ import {
   SIDEBAR_WIDTH_DEFAULT,
   SIDEBAR_WIDTH_MIN,
   SIDEBAR_WIDTH_STORAGE_MAX,
+  SPLIT_HANDLE_SIZE,
   VITALS_WIDTH_DEFAULT,
   clampSidebarWidthForLayout,
   clampVitalsWidthForLayout,
@@ -31,9 +32,6 @@ const vitalsSnippet = createRawSnippet(() => ({
   render: () => '<div data-testid="vitals-slot">Vitals</div>',
 }));
 
-// Rendered width of kit-ui's .kit-split-resize-handle.
-const RESIZE_HANDLE_WIDTH = 4;
-const SIDEBAR_BORDER_WIDTH = 1;
 const KEYBOARD_RESIZE_STEP = 24;
 
 let component: ReturnType<typeof mount> | undefined;
@@ -87,10 +85,7 @@ function getVitalsPanel() {
 }
 
 function getClampedSidebarWidthForLayout(desiredWidth: number, layoutWidth: number) {
-  return clampSidebarWidthForLayout(
-    desiredWidth,
-    layoutWidth - RESIZE_HANDLE_WIDTH - SIDEBAR_BORDER_WIDTH,
-  );
+  return clampSidebarWidthForLayout(desiredWidth, layoutWidth - SPLIT_HANDLE_SIZE);
 }
 
 function mockLayoutWidth(width: number) {
@@ -193,7 +188,11 @@ describe("ThreeColumnLayout", () => {
     sync.serverVersion = {
       api_version: 1,
       data_version: 1,
+      session_stats_available: false,
+      friction_available: false,
+      friction_build_allowed: false,
       insight_generation_available: false,
+      kata_available: false,
       version: "dev",
       commit: "unknown",
       build_date: "",
@@ -220,7 +219,11 @@ describe("ThreeColumnLayout", () => {
     sync.serverVersion = {
       api_version: 1,
       data_version: 1,
+      session_stats_available: false,
+      friction_available: false,
+      friction_build_allowed: false,
       insight_generation_available: false,
+      kata_available: false,
       version: "dev",
       commit: "unknown",
       build_date: "",
@@ -267,6 +270,47 @@ describe("ThreeColumnLayout", () => {
     data!.click();
     expect(navigate).toHaveBeenCalledWith("data");
     navigate.mockRestore();
+  });
+
+  it("exposes the Friction Log in mobile nav when the server builds digests", async () => {
+    sync.serverVersion = {
+      api_version: 1,
+      data_version: 1,
+      insight_generation_available: false,
+      friction_available: true,
+      friction_build_allowed: true,
+      friction_readable: true,
+      session_stats_available: false,
+      kata_available: false,
+      version: "dev",
+      commit: "unknown",
+      build_date: "",
+      read_only: false,
+    };
+    renderLayout();
+    await tick();
+
+    const navButtons = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(".mobile-nav .mobile-nav-btn"),
+    );
+    const frictionButton = navButtons.find((btn) => btn.textContent?.trim() === m.nav_friction());
+    expect(frictionButton).not.toBeUndefined();
+
+    const navigate = vi.spyOn(router, "navigate").mockImplementation(() => true);
+    frictionButton!.click();
+    expect(navigate).toHaveBeenCalledWith("friction");
+    navigate.mockRestore();
+  });
+
+  it("omits the Friction Log from mobile nav when the server does not report it", async () => {
+    sync.serverVersion = null;
+    renderLayout();
+    await tick();
+
+    const labels = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(".mobile-nav .mobile-nav-btn"),
+    ).map((button) => button.textContent?.trim());
+    expect(labels).not.toContain(m.nav_friction());
   });
 
   it("renders the resize handle at the desktop layout breakpoint", async () => {
@@ -421,7 +465,7 @@ describe("ThreeColumnLayout", () => {
     await tick();
 
     expect(getSidebar().style.width).toBe(`${expectedWidth}px`);
-    expect(layoutWidth - expectedWidth - RESIZE_HANDLE_WIDTH - SIDEBAR_BORDER_WIDTH).toBe(480);
+    expect(layoutWidth - expectedWidth - SPLIT_HANDLE_SIZE).toBe(480);
   });
 
   it("removes the handle and keeps the dragged width when the sidebar closes mid-drag", async () => {
@@ -564,13 +608,10 @@ describe("ThreeColumnLayout", () => {
 
   it("clamps the vitals panel to the layout and keeps a wider stored preference", async () => {
     const layoutWidth = 1100;
-    // Space left of the vitals panel: the sidebar, its handle, and both
-    // 1px pane borders plus the vitals handle.
+    // Space left of the vitals panel: the sidebar, its handle, and the
+    // vitals handle.
     const vitalsAvailable =
-      layoutWidth -
-      (SIDEBAR_WIDTH_DEFAULT + RESIZE_HANDLE_WIDTH + SIDEBAR_BORDER_WIDTH) -
-      RESIZE_HANDLE_WIDTH -
-      SIDEBAR_BORDER_WIDTH;
+      layoutWidth - (SIDEBAR_WIDTH_DEFAULT + SPLIT_HANDLE_SIZE) - SPLIT_HANDLE_SIZE;
     const expectedWidth = clampVitalsWidthForLayout(560, vitalsAvailable);
 
     setViewportWidth(1280);
@@ -611,12 +652,12 @@ describe("ThreeColumnLayout", () => {
 
     await dragHandle(SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_DEFAULT + 400);
 
-    // 1280 minus both 4px handles and both 1px pane borders leaves 990 for
-    // the sidebar clamp once the vitals minimum footprint (280 + 5) is
-    // reserved; the 480 content minimum caps the sidebar at 510 and the
-    // vitals panel yields to 280, keeping the content column at exactly 480.
-    expect(ui.sidebarWidth).toBe(510);
-    expect(getSidebar().style.width).toBe("510px");
+    // 1280 minus both 4px handles leaves 992 for the sidebar clamp once the
+    // vitals minimum footprint (280 + 4) is reserved; the 480 content minimum
+    // caps the sidebar at 512 and the vitals panel yields to 280, keeping the
+    // content column at exactly 480.
+    expect(ui.sidebarWidth).toBe(512);
+    expect(getSidebar().style.width).toBe("512px");
     expect(getVitalsPanel().style.width).toBe("280px");
   });
 
@@ -630,12 +671,12 @@ describe("ThreeColumnLayout", () => {
     renderLayout(true);
     await tick();
 
-    expect(getSidebar().style.width).toBe("510px");
+    expect(getSidebar().style.width).toBe("512px");
     expect(getVitalsPanel().style.width).toBe("280px");
 
     // The separators advertise the layout-effective maxima, not the
     // storage caps the current window cannot grant.
-    expect(getHandle()!.getAttribute("aria-valuemax")).toBe("510");
+    expect(getHandle()!.getAttribute("aria-valuemax")).toBe("512");
     expect(getVitalsHandle()!.getAttribute("aria-valuemax")).toBe("280");
   });
 });

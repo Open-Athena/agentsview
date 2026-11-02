@@ -3,13 +3,19 @@ package parser
 import (
 	"encoding/binary"
 	"os"
-	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// walWithFramesFixture is placeholder WAL content larger than the 32-byte
+// WAL header. Composite-mtime fingerprints ignore WAL siblings at or under
+// header size (readers create those empty), so tests that expect a WAL write
+// to count need content past the header.
+var walWithFramesFixture = strings.Repeat("w", 4096)
 
 // TestSQLiteContainerStateIgnoresSubSecondMtimeChanges pins the state's
 // timestamp contract: mtime participates at whole-second granularity only,
@@ -61,14 +67,13 @@ func TestSQLiteContainerStateRejectsNonSQLiteFiles(t *testing.T) {
 // restored or replaced database landing in the same second with the same
 // size and change counter would be indistinguishable from the original.
 func TestSQLiteContainerStateDetectsFileReplacement(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("file identity is unavailable on Windows")
-	}
 	dbPath, _, db := newTestDB(t)
 	require.NoError(t, db.Close())
 
 	before, ok := StatSQLiteContainerState(dbPath)
 	require.True(t, ok, "state must be readable before replacement")
+	require.NotZero(t, before.DBInode)
+	require.NotZero(t, before.DBDevice)
 
 	raw, err := os.ReadFile(dbPath)
 	require.NoError(t, err, "read container bytes")

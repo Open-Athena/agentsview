@@ -11,7 +11,7 @@ import (
 	"strings"
 	"sync"
 
-	"go.kenn.io/docbank"
+	"go.kenn.io/docbank/docbank"
 	docsqlite "go.kenn.io/docbank/sqlite"
 )
 
@@ -53,6 +53,27 @@ func openRepository(
 	if err != nil {
 		return nil, err
 	}
+	return openRepositoryRoot(ctx, rootPath, driver)
+}
+
+// OpenExistingRepository opens a retained vault at its exact root. Unlike
+// OpenRepository, this never initializes a missing archive directory.
+func OpenExistingRepository(ctx context.Context, root string) (*Repository, error) {
+	rootPath, err := canonicalArtifactPath(root)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(filepath.Join(rootPath, "docbank.db"))
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("existing repository requires a Docbank catalog")
+	}
+	return openRepositoryRoot(ctx, rootPath, nil)
+}
+
+func openRepositoryRoot(ctx context.Context, rootPath string, driver docsqlite.Driver) (*Repository, error) {
 	if err := rejectLegacyRepositoryLayout(rootPath); err != nil {
 		return nil, err
 	}
@@ -157,6 +178,16 @@ func (r *Repository) Content() ArtifactStore {
 		return nil
 	}
 	return r.content
+}
+
+// CreateBackup captures this repository while retaining its exclusive owner.
+func (r *Repository) CreateBackup(ctx context.Context, target *docbank.BackupRepository, opts docbank.BackupOptions) (docbank.BackupSnapshot, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return docbank.BackupSnapshot{}, docbank.ErrClosed
+	}
+	return r.content.vault.CreateBackup(ctx, target, opts)
 }
 
 // Closed reports whether repository ownership has already been released or

@@ -13,6 +13,20 @@ const (
 	recallCorpusRevisionPrefix     = "counter-v1:"
 )
 
+// RecallCorpusRevisionLag reports how many revisions current is ahead of
+// completed when both are counter revisions from RecallCorpusRevision. The
+// lag is negative when completed is ahead. ok is false for any other format,
+// such as the timestamp watermarks of read-only legacy archives, so callers
+// can fall back to an exact comparison.
+func RecallCorpusRevisionLag(completed, current string) (lag int64, ok bool) {
+	c, okC := parseRecallCorpusRevision(completed)
+	w, okW := parseRecallCorpusRevision(current)
+	if !okC || !okW {
+		return 0, false
+	}
+	return w - c, true
+}
+
 // RecallCorpusRevision returns a stable source revision for freshness checks.
 // Current archives maintain a monotonic counter through recall_entries
 // triggers. Read-only archives created before that schema addition fall back
@@ -87,6 +101,12 @@ func (db *DB) ScanRecallEmbeddingUnits(
 	since string,
 	fn func(EmbeddableUnit) error,
 ) (maxUpdated string, err error) {
+	release, err := db.acquireBulkRead(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer release()
+
 	hasChanges, err := db.recallTableExists(ctx, "recall_embedding_changes")
 	if err != nil {
 		return "", err

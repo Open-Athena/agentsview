@@ -84,6 +84,37 @@ func (t *toolset) lookupActivity(
 	return "", false
 }
 
+// resolveSession looks up a session by its full stored ID or by a raw
+// UUID that matches exactly one stored ID. Missing and ambiguous IDs are
+// errors.
+func (t *toolset) resolveSession(
+	ctx context.Context, id string,
+) (*service.SessionDetail, error) {
+	detail, err := t.svc.Get(ctx, id)
+	if err != nil || detail != nil {
+		return detail, err
+	}
+	ids, err := t.svc.FindSessionIDsByRawSuffix(ctx, id, 2)
+	if err != nil {
+		return nil, err
+	}
+	if len(ids) > 1 {
+		return nil, fmt.Errorf(
+			"ambiguous session UUID %q: use a full stored session ID", id,
+		)
+	}
+	if len(ids) == 1 {
+		detail, err = t.svc.Get(ctx, ids[0])
+		if err != nil {
+			return nil, err
+		}
+	}
+	if detail == nil {
+		return nil, fmt.Errorf("session not found: %s", id)
+	}
+	return detail, nil
+}
+
 // --- search_sessions ---
 
 type searchSessionsIn struct {
@@ -119,32 +150,9 @@ func (t *toolset) searchSessions(
 	ctx context.Context, _ *mcp.CallToolRequest, in searchSessionsIn,
 ) (*mcp.CallToolResult, searchSessionsOut, error) {
 	if in.SessionID != "" {
-		detail, err := t.svc.Get(ctx, in.SessionID)
+		detail, err := t.resolveSession(ctx, in.SessionID)
 		if err != nil {
 			return nil, searchSessionsOut{}, err
-		}
-		if detail == nil {
-			ids, err := t.svc.FindSessionIDsByRawSuffix(ctx, in.SessionID, 2)
-			if err != nil {
-				return nil, searchSessionsOut{}, err
-			}
-			if len(ids) > 1 {
-				return nil, searchSessionsOut{}, fmt.Errorf(
-					"ambiguous session UUID %q: use a full stored session ID",
-					in.SessionID,
-				)
-			}
-			if len(ids) == 1 {
-				detail, err = t.svc.Get(ctx, ids[0])
-				if err != nil {
-					return nil, searchSessionsOut{}, err
-				}
-			}
-		}
-		if detail == nil {
-			return nil, searchSessionsOut{}, fmt.Errorf(
-				"session not found: %s", in.SessionID,
-			)
 		}
 		row := toSessionRow(detail.Session)
 		ended := row.EndedAt
@@ -256,32 +264,38 @@ func (t *toolset) queryRecall(
 // --- list_sessions ---
 
 type listSessionsIn struct {
-	Project          string `json:"project,omitempty" jsonschema:"Filter by project name."`
-	Agent            string `json:"agent,omitempty" jsonschema:"Filter by agent (e.g. claude, codex, gemini, antigravity)."`
-	Machine          string `json:"machine,omitempty" jsonschema:"Filter by machine name."`
-	DateFrom         string `json:"date_from,omitempty" jsonschema:"Only sessions on or after this date (YYYY-MM-DD)."`
-	DateTo           string `json:"date_to,omitempty" jsonschema:"Only sessions on or before this date (YYYY-MM-DD)."`
-	ActiveSince      string `json:"active_since,omitempty" jsonschema:"Only sessions active since this RFC3339 timestamp."`
-	IncludeAutomated bool   `json:"include_automated,omitempty" jsonschema:"Include automated (non-interactive) sessions."`
-	Limit            int    `json:"limit,omitempty" jsonschema:"Max results, default 20, max 100."`
-	Cursor           string `json:"cursor,omitempty" jsonschema:"Pagination cursor from a previous next_cursor."`
+	Project          string   `json:"project,omitempty" jsonschema:"Filter by project name."`
+	Agent            string   `json:"agent,omitempty" jsonschema:"Filter by agent (e.g. claude, codex, gemini, antigravity)."`
+	Machine          string   `json:"machine,omitempty" jsonschema:"Exact ID or alias, comma-separated IDs or aliases, or one unique whole display name. IDs and aliases take precedence; unknown or ambiguous selectors return an error."`
+	DateFrom         string   `json:"date_from,omitempty" jsonschema:"Only sessions on or after this date (YYYY-MM-DD)."`
+	DateTo           string   `json:"date_to,omitempty" jsonschema:"Only sessions on or before this date (YYYY-MM-DD)."`
+	ActiveSince      string   `json:"active_since,omitempty" jsonschema:"Only sessions active since this RFC3339 timestamp."`
+	IncludeOneShot   *bool    `json:"include_one_shot,omitempty" jsonschema:"Include one-shot sessions (a single user message). Default false."`
+	IncludeAutomated *bool    `json:"include_automated,omitempty" jsonschema:"Include automated runs identified by roborev tags or matching prompt patterns. Default false."`
+	Labels           []string `json:"labels,omitempty" jsonschema:"Only sessions carrying every one of these exact labels, such as ticket=example."`
+	PR               string   `json:"pr,omitempty" jsonschema:"Only sessions linked to a pull request: owner/repo, owner/repo#123, or github.com::owner/repo#123."`
+	Limit            int      `json:"limit,omitempty" jsonschema:"Max results, default 20, max 100."`
+	Cursor           string   `json:"cursor,omitempty" jsonschema:"Pagination cursor from a previous next_cursor."`
 }
 
 type sessionRow struct {
-	WebURL           string `json:"web_url,omitempty" jsonschema:"Browser URL for this session; use this URL when linking to it."`
-	SessionID        string `json:"session_id"`
-	Project          string `json:"project,omitempty"`
-	Machine          string `json:"machine,omitempty"`
-	Agent            string `json:"agent"`
-	Name             string `json:"name"`
-	StartedAt        string `json:"started_at"`
-	EndedAt          string `json:"ended_at"`
-	MessageCount     int    `json:"message_count" jsonschema:"Total stored messages for the session across all roles, including system messages. get_messages always drops system messages, so no roles filter makes its returned count match this; reconcile instead via message_count = returned + filtered summed over a full get_messages pagination sweep."`
-	UserMessageCount int    `json:"user_message_count" jsonschema:"Stored user-role messages, excluding those flagged as system-injected."`
-	OutputTokens     int64  `json:"output_tokens,omitempty"`
-	Outcome          string `json:"outcome,omitempty"`
-	HealthGrade      string `json:"health_grade,omitempty"`
-	GitBranch        string `json:"git_branch,omitempty"`
+	WebURL           string      `json:"web_url,omitempty" jsonschema:"Browser URL for this session; use this URL when linking to it."`
+	SessionID        string      `json:"session_id"`
+	Project          string      `json:"project,omitempty"`
+	Machine          string      `json:"machine,omitempty"`
+	Agent            string      `json:"agent"`
+	Name             string      `json:"name"`
+	StartedAt        string      `json:"started_at"`
+	EndedAt          string      `json:"ended_at"`
+	MessageCount     int         `json:"message_count" jsonschema:"Total stored messages for the session across all roles, including system messages. get_messages always drops system messages, so no roles filter makes its returned count match this; reconcile instead via message_count = returned + filtered summed over a full get_messages pagination sweep."`
+	UserMessageCount int         `json:"user_message_count" jsonschema:"Stored user-role messages, excluding those flagged as system-injected."`
+	OutputTokens     int64       `json:"output_tokens,omitempty"`
+	Outcome          string      `json:"outcome,omitempty"`
+	HealthGrade      string      `json:"health_grade,omitempty"`
+	GitBranch        string      `json:"git_branch,omitempty"`
+	ParentSessionID  string      `json:"parent_session_id,omitempty"`
+	Labels           []string    `json:"labels,omitempty"`
+	PullRequests     []db.PRLink `json:"pull_requests,omitempty" jsonschema:"Pull or merge requests the session's transcript linked to."`
 }
 
 type listSessionsOut struct {
@@ -294,15 +308,20 @@ func (t *toolset) listSessions(
 	ctx context.Context, _ *mcp.CallToolRequest, in listSessionsIn,
 ) (*mcp.CallToolResult, listSessionsOut, error) {
 	res, err := t.svc.List(ctx, service.ListFilter{
-		Project:          in.Project,
-		Agent:            in.Agent,
-		Machine:          in.Machine,
-		DateFrom:         in.DateFrom,
-		DateTo:           in.DateTo,
-		ActiveSince:      in.ActiveSince,
-		IncludeAutomated: in.IncludeAutomated,
-		Cursor:           in.Cursor,
-		Limit:            clampLimit(in.Limit, defaultListLimit, maxListLimit),
+		Project:            in.Project,
+		Agent:              in.Agent,
+		Machine:            in.Machine,
+		DateFrom:           in.DateFrom,
+		DateTo:             in.DateTo,
+		ActiveSince:        in.ActiveSince,
+		IncludeOneShot:     in.IncludeOneShot != nil && *in.IncludeOneShot,
+		OneShotFilterSet:   in.IncludeOneShot != nil,
+		IncludeAutomated:   in.IncludeAutomated != nil && *in.IncludeAutomated,
+		AutomatedFilterSet: in.IncludeAutomated != nil,
+		Labels:             in.Labels,
+		PR:                 in.PR,
+		Cursor:             in.Cursor,
+		Limit:              clampLimit(in.Limit, defaultListLimit, maxListLimit),
 	})
 	if err != nil {
 		return nil, listSessionsOut{}, err
@@ -339,6 +358,9 @@ func toSessionRow(s db.Session) sessionRow {
 		Outcome:          s.Outcome,
 		HealthGrade:      strval(s.HealthGrade),
 		GitBranch:        s.GitBranch,
+		ParentSessionID:  strval(s.ParentSessionID),
+		Labels:           s.Labels,
+		PullRequests:     s.PRLinks,
 	}
 }
 
@@ -710,7 +732,7 @@ func (t *toolset) getMessageBodyContinuation(
 // --- search_content ---
 
 type searchContentIn struct {
-	Pattern          string `json:"pattern" jsonschema:"Natural-language query for semantic/hybrid, whitespace-separated literals for terms, or exact substring/regex for lexical search across message text and tool inputs/results."`
+	Pattern          string `json:"pattern" jsonschema:"Natural-language query for semantic/hybrid, whitespace-separated literals for terms, or exact substring/regex for lexical search across message text, thinking, and tool inputs/results."`
 	Mode             string `json:"mode,omitempty" jsonschema:"substring (default), regex, terms, semantic, or hybrid. Prefer hybrid or semantic for contextual questions when a vector search index is configured."`
 	Scope            string `json:"scope,omitempty" jsonschema:"Semantic/hybrid/terms result scope: top, all, or subordinate (default all)."`
 	Project          string `json:"project,omitempty" jsonschema:"Restrict to one project."`
@@ -721,7 +743,8 @@ type searchContentIn struct {
 	DateFrom         string `json:"date_from,omitempty" jsonschema:"Only sessions on or after this date (YYYY-MM-DD)."`
 	DateTo           string `json:"date_to,omitempty" jsonschema:"Only sessions on or before this date (YYYY-MM-DD)."`
 	Limit            int    `json:"limit,omitempty" jsonschema:"Max matches, default 10, max 50."`
-	Cursor           int    `json:"cursor,omitempty" jsonschema:"Pagination cursor from a previous next_cursor."`
+	Cursor           int    `json:"cursor,omitempty" jsonschema:"Pagination cursor from a previous next_cursor; also pass activity_cutoff when the recent-activity heuristic applies."`
+	ActivityCutoff   string `json:"activity_cutoff,omitempty" jsonschema:"RFC3339 cutoff returned by the previous page. Required with a positive cursor when the recent-activity heuristic applies."`
 	IncludeActive    bool   `json:"include_active,omitempty" jsonschema:"Include matches from sessions active in the last 10 minutes. Default false: the conversation you are in right now is also recorded, so without this exclusion you would find yourself."`
 	IncludeOneShot   bool   `json:"include_one_shot,omitempty" jsonschema:"Include one-shot sessions. Default false."`
 	IncludeAutomated bool   `json:"include_automated,omitempty" jsonschema:"Include automated sessions. Default false."`
@@ -755,7 +778,7 @@ type contentMatch struct {
 	SessionID       string   `json:"session_id"`
 	Project         string   `json:"project,omitempty"`
 	Agent           string   `json:"agent"`
-	Location        string   `json:"location" jsonschema:"Where the match occurred: one of message, tool_input, or tool_result."`
+	Location        string   `json:"location" jsonschema:"Where the match occurred: one of message, thinking, tool_input, or tool_result."`
 	Role            string   `json:"role,omitempty"`
 	Ordinal         int      `json:"ordinal"`
 	Timestamp       string   `json:"timestamp"`
@@ -777,6 +800,7 @@ type contentMatch struct {
 type searchContentOut struct {
 	Matches        []contentMatch `json:"matches"`
 	NextCursor     *int           `json:"next_cursor,omitempty"`
+	ActivityCutoff string         `json:"activity_cutoff,omitempty" jsonschema:"Effective RFC3339 activity cutoff; pass it unchanged with next_cursor as cursor to continue."`
 	ExcludedActive int            `json:"excluded_active,omitempty"`
 	// EffectiveMode and EffectiveScope report the defaults the search
 	// resolved, which the caller cannot see in its own request.
@@ -835,39 +859,56 @@ func (t *toolset) searchContent(
 	if err := validateSearchDates(in.DateFrom, in.DateTo); err != nil {
 		return nil, searchContentOut{}, err
 	}
+	var cutoffTime time.Time
+	if in.ActivityCutoff != "" {
+		var err error
+		cutoffTime, err = time.Parse(time.RFC3339, in.ActivityCutoff)
+		if err != nil {
+			return nil, searchContentOut{}, errors.New("invalid activity_cutoff: use RFC3339")
+		}
+	}
 	currentSession := strings.TrimSpace(in.CurrentSessionID)
 	excludeSessions := db.NormalizeExcludeSessionIDs([]string{currentSession})
-	res, err := t.svc.SearchContent(ctx, service.ContentSearchRequest{
-		Pattern:           in.Pattern,
-		Mode:              in.Mode,
-		Scope:             in.Scope,
-		Project:           in.Project,
-		Agent:             in.Agent,
-		SessionID:         in.SessionID,
-		GitBranchExact:    in.GitBranch,
-		DateFrom:          in.DateFrom,
-		DateTo:            in.DateTo,
-		Limit:             clampLimit(in.Limit, defaultSearchLimit, maxContentSearchLimit),
-		Cursor:            in.Cursor,
-		Context:           in.Context,
-		IncludeOneShot:    in.IncludeOneShot,
-		IncludeAutomated:  in.IncludeAutomated,
-		ExcludeSessionIDs: excludeSessions,
-	})
+	cutoff := ""
+	if currentSession == "" && !in.IncludeActive {
+		cutoff = in.ActivityCutoff
+		if cutoff == "" {
+			if in.Cursor > 0 {
+				return nil, searchContentOut{}, errors.New("activity_cutoff is required with a positive cursor: restart search_content without a cursor, then pass both next_cursor as cursor and activity_cutoff")
+			}
+			cutoffTime = t.clock().Add(-activeExclusionWindow)
+			cutoff = cutoffTime.UTC().Format(time.RFC3339Nano)
+		} else if cutoffTime.After(t.clock().Add(-activeExclusionWindow)) {
+			return nil, searchContentOut{}, errors.New("activity_cutoff must not be later than the recent-activity boundary: restart search_content without a cursor or activity_cutoff")
+		}
+	}
+	req := service.ContentSearchRequest{
+		Pattern:            in.Pattern,
+		Mode:               in.Mode,
+		Scope:              in.Scope,
+		Project:            in.Project,
+		Agent:              in.Agent,
+		SessionID:          in.SessionID,
+		GitBranchExact:     in.GitBranch,
+		DateFrom:           in.DateFrom,
+		DateTo:             in.DateTo,
+		Limit:              clampLimit(in.Limit, defaultSearchLimit, maxContentSearchLimit),
+		Cursor:             in.Cursor,
+		Context:            in.Context,
+		IncludeOneShot:     in.IncludeOneShot,
+		IncludeAutomated:   in.IncludeAutomated,
+		ExcludeSessionIDs:  excludeSessions,
+		ExcludeActiveSince: cutoff,
+	}
+	res, err := t.svc.SearchContent(ctx, req)
 	if err != nil {
 		return nil, searchContentOut{}, err
 	}
-	now := t.clock()
-	// The self-reference guard excludes matches from sessions active in the
-	// last 10 minutes. A match carries only its own timestamp, but a
-	// long-running session can match on an old message while still being
-	// active now, so exclude by the session's activity (ended_at, falling
-	// back to started_at) like search_sessions does -- not by the match
-	// timestamp. Activity is looked up once per session and cached.
-	activity := make(map[string]string, len(res.Matches))
+	legacy := cutoff != "" && !res.ActiveFilterApplied
 	out := searchContentOut{
-		Matches:       make([]contentMatch, 0, len(res.Matches)),
-		EffectiveMode: cmp.Or(in.Mode, "substring"),
+		Matches:        make([]contentMatch, 0, len(res.Matches)),
+		ActivityCutoff: cutoff,
+		EffectiveMode:  cmp.Or(in.Mode, "substring"),
 		Exclusions: searchContentExclusions{
 			CurrentSessionID: currentSession,
 			RecentActive:     currentSession == "" && !in.IncludeActive,
@@ -879,15 +920,14 @@ func (t *toolset) searchContent(
 	if db.ContentSearchModeSupportsScope(in.Mode) {
 		out.EffectiveScope = cmp.Or(in.Scope, "all")
 	}
+	activity := make(map[string]string)
 	for _, m := range res.Matches {
-		if currentSession == "" && !in.IncludeActive {
+		if legacy {
 			ts, ok := t.lookupActivity(ctx, m.SessionID, activity)
 			if !ok {
-				// Lookup failed: fall back to the match timestamp so the
-				// guard degrades to its prior behavior rather than erroring.
 				ts = m.Timestamp
 			}
-			if isActiveSince(ts, now) {
+			if isActiveSince(ts, cutoffTime.Add(activeExclusionWindow)) {
 				out.ExcludedActive++
 				continue
 			}
@@ -918,7 +958,7 @@ type usageSummaryIn struct {
 	To      string `json:"to,omitempty" jsonschema:"Range end date (YYYY-MM-DD)."`
 	Project string `json:"project,omitempty" jsonschema:"Filter by project."`
 	Agent   string `json:"agent,omitempty" jsonschema:"Filter by agent."`
-	Machine string `json:"machine,omitempty" jsonschema:"Filter by machine."`
+	Machine string `json:"machine,omitempty" jsonschema:"Exact ID or alias, comma-separated IDs or aliases, or one unique whole display name. IDs and aliases take precedence; unknown or ambiguous selectors return an error."`
 }
 
 func (t *toolset) usageSummary(

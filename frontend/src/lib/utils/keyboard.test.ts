@@ -5,13 +5,17 @@ import { sessions } from "../stores/sessions.svelte.js";
 import { starred } from "../stores/starred.svelte.js";
 import { router } from "../stores/router.svelte.js";
 import { messages } from "../stores/messages.svelte.js";
+import { sync } from "../stores/sync.svelte.js";
 import { inSessionSearch } from "../stores/inSessionSearch.svelte.js";
-import { SessionsService } from "../api/generated/index";
+import { SessionsService, SyncService } from "../api/generated/index";
 import { copyToClipboard } from "../utils/clipboard.js";
 import AppHeader from "../components/layout/AppHeader.svelte";
 import SidebarToggleButton from "../components/layout/SidebarToggleButton.svelte";
 import { registerShortcuts } from "./keyboard.js";
 import { registerSessionList } from "./arrow-target.js";
+import { reportTelemetry } from "./telemetry.js";
+
+vi.mock("./telemetry.js", () => ({ reportTelemetry: vi.fn() }));
 
 vi.mock("../utils/clipboard.js", () => ({
   copyToClipboard: vi.fn().mockResolvedValue(true),
@@ -64,6 +68,22 @@ describe("registerShortcuts", () => {
     document.body.innerHTML = "";
     vi.restoreAllMocks();
     vi.clearAllMocks();
+  });
+
+  it("hides sync and ignores r for an archive-only server", async () => {
+    sync.serverVersion = { archive_only: true } as NonNullable<typeof sync.serverVersion>;
+    const request = vi.spyOn(SyncService, "postApiV1Sync");
+    const header = mount(AppHeader, { target: document.body });
+    try {
+      await tick();
+      expect(document.querySelector(".sync-btn")).toBeNull();
+      fireKey("r");
+      expect(request).not.toHaveBeenCalled();
+      expect(sync.syncing).toBe(false);
+    } finally {
+      unmount(header);
+      sync.serverVersion = null;
+    }
   });
 
   describe("remote c copy", () => {
@@ -1020,17 +1040,15 @@ describe("go to session shortcut", () => {
     },
   );
 
-  it.each([
-    { shiftKey: true },
-    { altKey: true },
-    { isComposing: true },
-    { keyCode: 229 },
-  ])("leaves the browser default for a guarded event %j", (options) => {
-    const event = fireCancelableKey("g", { ctrlKey: true, ...options });
+  it.each([{ shiftKey: true }, { altKey: true }, { isComposing: true }, { keyCode: 229 }])(
+    "leaves the browser default for a guarded event %j",
+    (options) => {
+      const event = fireCancelableKey("g", { ctrlKey: true, ...options });
 
-    expect(event.defaultPrevented).toBe(false);
-    expect(ui.activeModal).toBeNull();
-  });
+      expect(event.defaultPrevented).toBe(false);
+      expect(ui.activeModal).toBeNull();
+    },
+  );
 
   it("leaves an already-consumed event alone", () => {
     const event = new KeyboardEvent("keydown", {
@@ -1055,19 +1073,16 @@ describe("go to session shortcut", () => {
     expect(ui.activeModal).toBe("shortcuts");
   });
 
-  it.each(["input", "textarea", "select"])(
-    "leaves Ctrl+G available to a focused %s",
-    (tag) => {
-      const input = document.createElement(tag);
-      document.body.appendChild(input);
-      input.focus();
+  it.each(["input", "textarea", "select"])("leaves Ctrl+G available to a focused %s", (tag) => {
+    const input = document.createElement(tag);
+    document.body.appendChild(input);
+    input.focus();
 
-      const event = fireCancelableKey("g", { ctrlKey: true });
+    const event = fireCancelableKey("g", { ctrlKey: true });
 
-      expect(event.defaultPrevented).toBe(false);
-      expect(ui.activeModal).toBeNull();
-    },
-  );
+    expect(event.defaultPrevented).toBe(false);
+    expect(ui.activeModal).toBeNull();
+  });
 
   it("leaves Ctrl+G available to a focused contenteditable", () => {
     const editor = document.createElement("div");
@@ -1108,5 +1123,22 @@ describe("go to session shortcut", () => {
     expect(next).toHaveBeenCalledExactlyOnceWith();
     expect(prev).toHaveBeenCalledExactlyOnceWith();
     expect(ui.activeModal).toBeNull();
+  });
+});
+
+describe("export shortcut telemetry", () => {
+  it("reports export_run html when e opens the active session's export", () => {
+    vi.mocked(reportTelemetry).mockClear();
+    vi.spyOn(window, "open").mockReturnValue(null);
+    const cleanup = registerShortcuts({ navigateMessage: vi.fn(), navigateUserPrompt: vi.fn() });
+    sessions.activeSessionId = "session-1";
+    try {
+      fireKey("e");
+      expect(reportTelemetry).toHaveBeenCalledExactlyOnceWith("export_run", { format: "html" });
+    } finally {
+      cleanup();
+      sessions.activeSessionId = null;
+      vi.restoreAllMocks();
+    }
   });
 });

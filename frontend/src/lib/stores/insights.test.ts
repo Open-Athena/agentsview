@@ -103,6 +103,7 @@ beforeEach(() => {
   insights.setCannedKind("prompt_maturity_review");
   insights.setProject("");
   insights.setAgent("claude");
+  insights.agentChosen = false;
   insights.setSessionAgent("");
   insights.setAutomatedScope("human");
   insights.promptText = "";
@@ -173,43 +174,7 @@ describe("load", () => {
   });
 });
 
-describe("setDateFrom / setDateTo", () => {
-  it("updates dateFrom without reloading", () => {
-    insights.setDateFrom("2025-02-01");
-
-    expect(insights.dateFrom).toBe("2025-02-01");
-    expect(api.listInsights).not.toHaveBeenCalled();
-  });
-
-  it("updates dateTo without reloading", () => {
-    insights.setDateTo("2025-02-07");
-
-    expect(insights.dateTo).toBe("2025-02-07");
-    expect(api.listInsights).not.toHaveBeenCalled();
-  });
-});
-
-describe("setType", () => {
-  it("updates type without reloading", () => {
-    insights.setType("agent_analysis");
-
-    expect(insights.type).toBe("agent_analysis");
-    expect(api.listInsights).not.toHaveBeenCalled();
-  });
-});
-
 describe("date range mode switching", () => {
-  it("syncs dateTo = dateFrom for single-day mode", () => {
-    insights.setDateFrom("2025-01-13");
-    insights.setDateTo("2025-01-17");
-    expect(insights.dateTo).toBe("2025-01-17");
-
-    // Simulate switching to single-day mode
-    insights.setDateTo(insights.dateFrom);
-    expect(insights.dateFrom).toBe("2025-01-13");
-    expect(insights.dateTo).toBe("2025-01-13");
-  });
-
   it("generates with range dates when set", async () => {
     insights.setDateFrom("2025-01-13");
     insights.setDateTo("2025-01-17");
@@ -232,37 +197,6 @@ describe("date range mode switching", () => {
       expect.any(Function),
       expect.any(Function),
     );
-  });
-
-  it("generates with same date when synced", async () => {
-    insights.setDateFrom("2025-01-15");
-    insights.setDateTo("2025-01-15");
-
-    const mockHandle = {
-      abort: vi.fn(),
-      done: Promise.resolve(makeInsight({ id: 1 })),
-    };
-    vi.mocked(api.generateInsight).mockReturnValueOnce(mockHandle);
-
-    insights.generate();
-
-    expect(api.generateInsight).toHaveBeenCalledWith(
-      expect.objectContaining({
-        date_from: "2025-01-15",
-        date_to: "2025-01-15",
-      }),
-      expect.any(Function),
-      expect.any(Function),
-    );
-  });
-});
-
-describe("setProject", () => {
-  it("updates project without reloading", () => {
-    insights.setProject("my-app");
-
-    expect(insights.project).toBe("my-app");
-    expect(api.listInsights).not.toHaveBeenCalled();
   });
 });
 
@@ -300,6 +234,26 @@ describe("selectedItem", () => {
 });
 
 describe("generate (multi-task)", () => {
+  it.each(["daily_activity", "llm_canned", "agent_analysis"] as const)(
+    "leaves the %s agent to the server until the user chooses one",
+    (type) => {
+      api.generateInsight.mockReturnValue({ abort: vi.fn(), done: new Promise(() => {}) });
+      insights.setType(type);
+      if (type === "agent_analysis") {
+        insights.generateForSession(makeSession());
+      } else {
+        insights.generate();
+      }
+
+      expect(api.generateInsight).toHaveBeenCalledOnce();
+      expect(api.generateInsight.mock.lastCall?.[0].agent).toBeUndefined();
+
+      insights.setAgent("gemini");
+      insights.generate();
+      expect(api.generateInsight.mock.lastCall?.[0].agent).toBe("gemini");
+    },
+  );
+
   it("starts independent report and session tasks without crypto.randomUUID", () => {
     // Non-localhost HTTP origins do not expose crypto.randomUUID.
     vi.stubGlobal("crypto", {});
@@ -444,6 +398,38 @@ describe("generate (multi-task)", () => {
     expect(insights.selectedTaskId).toBe(insights.tasks[0]?.clientId);
   });
 
+  it("generates and retries a tool-effectiveness report for a single session", async () => {
+    vi.mocked(api.generateInsight)
+      .mockReturnValueOnce({
+        abort: vi.fn(),
+        done: Promise.reject(new Error("report failed validation")),
+      })
+      .mockReturnValueOnce({ abort: vi.fn(), done: new Promise(() => {}) });
+
+    insights.generateForSession(makeSession(), "tool_effectiveness");
+    const expected = expect.objectContaining({
+      type: "tool_effectiveness",
+      date_from: "2026-07-05",
+      date_to: "2026-07-05",
+      session_id: "run:session-1",
+    });
+    expect(api.generateInsight).toHaveBeenLastCalledWith(
+      expected,
+      expect.any(Function),
+      expect.any(Function),
+    );
+
+    const clientId = insights.tasks[0]!.clientId;
+    await vi.waitFor(() => expect(insights.tasks[0]!.status).not.toBe("generating"));
+    insights.retryTask(clientId);
+    expect(api.generateInsight).toHaveBeenCalledTimes(2);
+    expect(api.generateInsight).toHaveBeenLastCalledWith(
+      expected,
+      expect.any(Function),
+      expect.any(Function),
+    );
+  });
+
   it("sends only visible session scope for canned recommendations", async () => {
     insights.setType("llm_canned");
     insights.setCannedKind("prompt_maturity_review");
@@ -554,6 +540,7 @@ describe("generate (multi-task)", () => {
     expect(failedTask.status).toBe("error");
 
     insights.promptText = "A different current focus";
+    insights.setAgent("gemini");
     insights.setSessionAgent("claude");
     insights.retryTask(failedTask.clientId);
 
@@ -779,12 +766,25 @@ describe("deleteItem", () => {
   });
 });
 
-describe("setAgent", () => {
-  it("updates agent without reloading", () => {
-    insights.setAgent("codex");
-
+describe("applyDefaultAgent", () => {
+  it("adopts the configured default until the picker chooses an agent", () => {
+    insights.applyDefaultAgent("codex");
     expect(insights.agent).toBe("codex");
-    expect(api.listInsights).not.toHaveBeenCalled();
+
+    insights.applyDefaultAgent("gemini");
+    expect(insights.agent).toBe("gemini");
+
+    insights.setAgent("kiro");
+    insights.applyDefaultAgent("codex");
+    expect(insights.agent).toBe("kiro");
+  });
+
+  it("keeps the current agent for unknown or absent values", () => {
+    insights.applyDefaultAgent("claude-code");
+    expect(insights.agent).toBe("claude");
+
+    insights.applyDefaultAgent(undefined);
+    expect(insights.agent).toBe("claude");
   });
 });
 

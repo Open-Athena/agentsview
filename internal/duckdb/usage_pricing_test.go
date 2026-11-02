@@ -8,6 +8,7 @@ import (
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/money"
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
 	"go.kenn.io/agentsview/internal/storage"
@@ -181,7 +182,7 @@ func TestDailyUsageKimiFixedK26AliasPricing(t *testing.T) {
 
 func TestDailyUsageGPTReserveLunaPricing(t *testing.T) {
 	ctx := t.Context()
-	local := newLocalDB(t)
+	local := dbtest.OpenTestDB(t)
 
 	tokenUsage := jsontext.Value(
 		`{"input_tokens":1000000,"output_tokens":0}`)
@@ -510,6 +511,8 @@ func TestPriceModelCasePreservesQualifiedBedrockModels(t *testing.T) {
 		{"openai.gpt-5.4", "bedrock_mantle/openai.gpt-5.4"},
 		{"bedrock_mantle/us-gov-west-1/openai.gpt-5.4", "bedrock_mantle/us-gov-west-1/openai.gpt-5.4"},
 		{"openai/gpt-reserve", "gpt-5.6-luna"},
+		{"codex-auto-review", "gpt-5.6-luna"},
+		{"openai/codex-auto-review", "gpt-5.6-luna"},
 		{"daimon/k2d6-agent", "moonshot/kimi-k2.6"},
 	} {
 		t.Run(tt.model, func(t *testing.T) {

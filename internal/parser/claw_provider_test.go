@@ -1,10 +1,13 @@
 package parser
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -13,6 +16,147 @@ import (
 func TestOpenClawProviderSourceMethods(t *testing.T) {
 	spec := openClawProviderTestSpec()
 	assertClawProviderSourceMethods(t, spec)
+}
+
+func TestOpenClawLegacyDiscoveryStopsBeforeNextEntry(t *testing.T) {
+	for _, members := range []int{2, 200} {
+		for _, cancelDiscovery := range []bool{false, true} {
+			t.Run(strconv.Itoa(members)+"/cancel="+strconv.FormatBool(cancelDiscovery), func(t *testing.T) {
+				root := t.TempDir()
+				sessionsDir := filepath.Join(root, "main", "sessions")
+				for i := range members {
+					id := "session-" + strconv.Itoa(i)
+					writeSourceFile(t, filepath.Join(sessionsDir, id+".jsonl"), clawProviderFixture(id, "hello"))
+				}
+				laterRoot := t.TempDir()
+				laterDir := filepath.Join(laterRoot, "main", "sessions")
+				writeSourceFile(t, filepath.Join(laterDir, "later.jsonl"), clawProviderFixture("later", "later"))
+				provider, ok := NewProvider(AgentOpenClaw, ProviderConfig{Roots: []string{root, laterRoot}})
+				require.True(t, ok)
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				visited, opened, laterOpened := 0, 0, 0
+				ctx = withStreamingDirectoryReader(ctx, func(ctx context.Context, dir string, yield func(os.DirEntry) error) error {
+					if dir == sessionsDir {
+						opened++
+					}
+					if dir == laterDir {
+						laterOpened++
+					}
+					return streamDirectoryEntriesDirect(ctx, dir, func(entry os.DirEntry) error {
+						if dir == sessionsDir {
+							visited++
+						}
+						return yield(entry)
+					})
+				})
+				consumerErr := DiscoveryIncompleteError{Provider: AgentOpenClaw, Reason: "consumer stopped"}
+				yielded := 0
+				err := provider.(StreamingDiscoverer).DiscoverEach(ctx, func(SourceRef) error {
+					yielded++
+					if cancelDiscovery {
+						cancel()
+						return ctx.Err()
+					}
+					return consumerErr
+				})
+				if cancelDiscovery {
+					require.ErrorIs(t, err, context.Canceled)
+				} else {
+					require.Equal(t, consumerErr, err)
+				}
+				assert.Equal(t, 1, yielded)
+				assert.Equal(t, 1, opened)
+				assert.Zero(t, laterOpened)
+				assert.Equal(t, 1, visited, "discovery must stop before visiting the rest of the archive")
+			})
+		}
+	}
+}
+
+func TestOpenClawLegacyLookupUsesDiscoveryRanking(t *testing.T) {
+	for _, tc := range []struct {
+		name, firstName, secondName string
+		symlink                     bool
+	}{
+		{"live over archive", "duplicate.jsonl.deleted.2026-01-01T00-00-00.000Z", "duplicate.jsonl", false},
+		{"newer live copy", "duplicate.jsonl", "duplicate.jsonl", false},
+		{"newer archive", "duplicate.jsonl.deleted.2026-01-01T00-00-00.000Z", "duplicate.jsonl.deleted.2026-02-01T00-00-00.000Z", false},
+		{"newer symlink to older transcript", "duplicate.jsonl", "duplicate.jsonl", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			first, second := t.TempDir(), t.TempDir()
+			older := filepath.Join(first, "main", "sessions", tc.firstName)
+			newer := filepath.Join(second, "main", "sessions", tc.secondName)
+			writeSourceFile(t, older, clawProviderFixture("duplicate", "old copy"))
+			writeSourceFile(t, newer, clawProviderFixture("duplicate", "current copy"))
+			oldTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+			newTime := oldTime.Add(time.Hour)
+			require.NoError(t, os.Chtimes(older, oldTime, oldTime))
+			require.NoError(t, os.Chtimes(newer, newTime, newTime))
+			if tc.symlink {
+				target := filepath.Join(t.TempDir(), "transcript.jsonl")
+				require.NoError(t, os.Rename(newer, target))
+				targetTime := oldTime.Add(-time.Hour)
+				require.NoError(t, os.Chtimes(target, targetTime, targetTime))
+				if err := os.Symlink(target, newer); err != nil {
+					t.Skipf("symlink not supported: %v", err)
+				}
+			}
+			for _, roots := range [][]string{{first, second}, {second, first}} {
+				provider, ok := NewProvider(AgentOpenClaw, ProviderConfig{Roots: roots})
+				require.True(t, ok)
+				sources, err := provider.Discover(t.Context())
+				require.NoError(t, err)
+				require.Len(t, sources, 1)
+				assert.Equal(t, newer, sources[0].DisplayPath)
+				found, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
+					RawSessionID: "main:duplicate",
+				})
+				require.NoError(t, err)
+				require.True(t, ok)
+				assert.Equal(t, newer, found.DisplayPath)
+			}
+		})
+	}
+}
+
+func TestOpenClawLegacyLookupValidatesStoredHintIdentity(t *testing.T) {
+	root := t.TempDir()
+	wanted := filepath.Join(root, "main", "sessions", "wanted.jsonl")
+	other := filepath.Join(root, "main", "sessions", "other.jsonl")
+	archive := wanted + ".deleted.2026-01-01T00-00-00.000Z"
+	writeSourceFile(t, wanted, clawProviderFixture("wanted", "current question"))
+	writeSourceFile(t, other, clawProviderFixture("other", "other question"))
+	writeSourceFile(t, archive, clawProviderFixture("wanted", "archived question"))
+	provider, ok := NewProvider(AgentOpenClaw, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	for _, field := range []string{"StoredFilePath", "FingerprintKey"} {
+		for _, tc := range []struct {
+			name, hint string
+			prefer     bool
+			want       string
+		}{
+			{"mismatched", other, false, wanted},
+			{"preferred mismatched", other, true, wanted},
+			{"matching", archive, false, wanted},
+			{"preferred matching", archive, true, archive},
+		} {
+			t.Run(field+"/"+tc.name, func(t *testing.T) {
+				req := FindSourceRequest{RawSessionID: "main:wanted", PreferStoredSource: tc.prefer}
+				if field == "StoredFilePath" {
+					req.StoredFilePath = tc.hint
+				} else {
+					req.FingerprintKey = tc.hint
+				}
+				source, found, err := provider.FindSource(t.Context(), req)
+				require.NoError(t, err)
+				require.True(t, found)
+				assert.Equal(t, "main:wanted", source.Key)
+				assert.Equal(t, tc.want, source.DisplayPath)
+			})
+		}
+	}
 }
 
 func TestQClawProviderSourceMethods(t *testing.T) {
@@ -200,7 +344,13 @@ func assertClawProviderSourceMethods(t *testing.T, spec clawProviderTestSpec) {
 	require.Len(t, plan.Roots, 1)
 	assert.Equal(t, root, plan.Roots[0].Path)
 	assert.True(t, plan.Roots[0].Recursive)
-	assert.Equal(t, []string{"*.jsonl", "*.jsonl.*"}, plan.Roots[0].IncludeGlobs)
+	wantGlobs := []string{"*.jsonl", "*.jsonl.*"}
+	if spec.agent == AgentOpenClaw {
+		wantGlobs = append(wantGlobs,
+			"openclaw-agent.sqlite", "openclaw-agent.sqlite-*",
+		)
+	}
+	assert.ElementsMatch(t, wantGlobs, plan.Roots[0].IncludeGlobs)
 
 	discovered, err := provider.Discover(t.Context())
 	require.NoError(t, err)

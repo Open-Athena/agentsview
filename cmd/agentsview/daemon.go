@@ -55,14 +55,18 @@ func defaultDaemonLaunchWaitDeps() daemonLaunchWaitDeps {
 		acquireLaunchLock:  acquireBackgroundLaunchLockWithError,
 		loadReadOnlyConfig: config.LoadReadOnly,
 		writableRecords:    writableDaemonRecords,
-		confirmed:          stopTargetConfirmed,
-		probe:              daemonRecordPingConfirmed,
-		isStarting:         IsDaemonStarting,
-		readStartupState:   readStartupState,
-		now:                time.Now,
-		sleep:              time.Sleep,
-		timeout:            backgroundServeReadyTimeout,
-		tick:               startProbeTick(),
+		// Discovery may reuse a reachable daemon in another PID namespace.
+		// Only signaling requires a confirmed local process identity.
+		confirmed: func(rec daemon.RuntimeRecord, authToken string) bool {
+			return daemonRecordPingConfirmed(rec, authToken) || processIdentityConfirmed(rec)
+		},
+		probe:            daemonRecordPingConfirmed,
+		isStarting:       IsDaemonStarting,
+		readStartupState: readStartupState,
+		now:              time.Now,
+		sleep:            time.Sleep,
+		timeout:          backgroundServeReadyTimeout,
+		tick:             startProbeTick(),
 	}
 }
 
@@ -117,10 +121,30 @@ func defaultDaemonCommandDeps() daemonCommandDeps {
 }
 
 func newDaemonCommand() *cobra.Command {
-	return newDaemonCommandWithDeps(defaultDaemonCommandDeps())
+	deps := defaultDaemonCommandDeps()
+	clientDeps := deps
+	clientDeps.loadConfig = func() (config.Config, error) {
+		cfg, err := config.LoadMinimalFor(config.ScopeLocal)
+		if err == nil {
+			err = cfg.ApplyDeploymentAuth()
+		}
+		return cfg, err
+	}
+	clientDeps.loadReadOnlyConfig = func() (config.Config, error) {
+		cfg, err := config.LoadReadOnlyFor(config.ScopeLocal)
+		if err == nil {
+			err = cfg.ApplyDeploymentAuth()
+		}
+		return cfg, err
+	}
+	return newDaemonCommandWithClientDeps(deps, clientDeps)
 }
 
 func newDaemonCommandWithDeps(deps daemonCommandDeps) *cobra.Command {
+	return newDaemonCommandWithClientDeps(deps, deps)
+}
+
+func newDaemonCommandWithClientDeps(deps, clientDeps daemonCommandDeps) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "daemon",
 		Short: "Manage the background server",
@@ -130,7 +154,7 @@ func newDaemonCommandWithDeps(deps daemonCommandDeps) *cobra.Command {
 			"`daemon start` runs it in the background without opening a browser.\n" +
 			"Stopping it also stops the web UI and sync. These commands also manage\n" +
 			"a writable server started by `serve` or automatically by a CLI command.\n\n" +
-			"Read-only `pg serve` and `duckdb serve` processes are managed separately.",
+			"Read-only `replica pg serve` and `replica duckdb serve` processes are managed separately.",
 		GroupID:      groupCore,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
@@ -151,14 +175,14 @@ func newDaemonCommandWithDeps(deps daemonCommandDeps) *cobra.Command {
 			Use: "status", Short: "Show background server status",
 			SilenceUsage: true, Args: cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
-				return runDaemonStatus(cmd.OutOrStdout(), deps)
+				return runDaemonStatus(cmd.OutOrStdout(), clientDeps)
 			},
 		},
 		&cobra.Command{
 			Use: "stop", Short: "Stop the background server",
 			SilenceUsage: true, Args: cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
-				return runDaemonStop(cmd.OutOrStdout(), deps)
+				return runDaemonStop(cmd.OutOrStdout(), clientDeps)
 			},
 		},
 		&cobra.Command{
@@ -838,10 +862,10 @@ func daemonStatusRecords(
 		if rec.Service != "" && rec.Service != daemonService {
 			continue
 		}
-		if !daemon.ProcessAlive(rec.PID) {
+		if !daemon.RuntimeProcessAlive(rec) {
 			continue
 		}
-		state := processCreateTimeStateForPID(rec.PID, rec.Metadata[runtimeCreateTime])
+		state := runtimeRecordIdentityState(rec)
 		if state == processCreateTimeMismatch {
 			if rec.SourcePath != "" {
 				if err := os.Remove(rec.SourcePath); err != nil && !errors.Is(err, os.ErrNotExist) {

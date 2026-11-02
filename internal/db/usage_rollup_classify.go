@@ -199,7 +199,7 @@ func classifyUsageRollupFacts(
 	for _, index := range plain {
 		survivors = append(survivors, usageRollupSurvivor{Fact: facts[index]})
 	}
-	for _, key := range usageSortedMapKeys(snapshots) {
+	for _, key := range SortedKeys(snapshots) {
 		members := snapshots[key]
 		if len(members) == 0 {
 			continue
@@ -212,7 +212,7 @@ func classifyUsageRollupFacts(
 		}
 		survivors = append(survivors, rankSafeSnapshotGroup(facts, members))
 	}
-	for _, key := range usageSortedMapKeys(generals) {
+	for _, key := range SortedKeys(generals) {
 		members := generals[key]
 		if len(members) == 0 {
 			continue
@@ -393,7 +393,7 @@ func usageFactIdentitiesForSessions(
 ) (usageDedupIdentitySet, error) {
 	set := newUsageDedupIdentitySet()
 	err := queryChunked(sessionIDs, func(chunk []string) error {
-		placeholders, args := inPlaceholders(chunk)
+		placeholders, args := InPlaceholders(chunk)
 		return scanUsageIdentityFactRows(ctx, runner, `SELECT DISTINCT
 			f.claude_message_id, f.claude_request_id, f.source_uuid,
 			f.usage_dedup_key
@@ -403,25 +403,6 @@ func usageFactIdentitiesForSessions(
 	})
 	if err != nil {
 		return set, fmt.Errorf("collecting cached usage identities: %w", err)
-	}
-	return set, nil
-}
-
-// usageSpoolIdentitiesForSessions returns the distinct dedup identities the
-// attached fill spool carries for the given source sessions.
-func usageSpoolIdentitiesForSessions(
-	ctx context.Context, runner usageCacheStatementRunner, sessionIDs []string,
-) (usageDedupIdentitySet, error) {
-	set := newUsageDedupIdentitySet()
-	err := queryChunked(sessionIDs, func(chunk []string) error {
-		placeholders, args := inPlaceholders(chunk)
-		return scanUsageIdentityFactRows(ctx, runner, `SELECT DISTINCT
-			claude_message_id, claude_request_id, source_uuid, usage_dedup_key
-			FROM usage_fill_spool.facts
-			WHERE session_id IN `+placeholders, args, set)
-	})
-	if err != nil {
-		return set, fmt.Errorf("collecting spooled usage identities: %w", err)
 	}
 	return set, nil
 }
@@ -453,9 +434,9 @@ func scanUsageIdentityFactRows(
 func invalidateUsageDedupSharers(
 	ctx context.Context, runner usageCacheStatementRunner,
 	changed usageDedupIdentitySet, excluded map[string]bool,
-) error {
+) ([]string, error) {
 	if changed.isEmpty() {
-		return nil
+		return nil, nil
 	}
 	if _, err := runner.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS
 		usage_changed_identities(
@@ -463,7 +444,7 @@ func invalidateUsageDedupSharers(
 			PRIMARY KEY (kind, first, second)
 		) WITHOUT ROWID;
 		DELETE FROM usage_changed_identities`); err != nil {
-		return fmt.Errorf("preparing changed usage identities: %w", err)
+		return nil, fmt.Errorf("preparing changed usage identities: %w", err)
 	}
 	rows := make([][3]any, 0,
 		len(changed.snapshot)+len(changed.sourceUUID)+len(changed.usageKey))
@@ -486,7 +467,7 @@ func invalidateUsageDedupSharers(
 			args = append(args, row[0], row[1], row[2])
 		}
 		if _, err := runner.ExecContext(ctx, query, args...); err != nil {
-			return fmt.Errorf("recording changed usage identities: %w", err)
+			return nil, fmt.Errorf("recording changed usage identities: %w", err)
 		}
 	}
 	sharerRows, err := runner.QueryContext(ctx, `
@@ -509,7 +490,7 @@ func invalidateUsageDedupSharers(
 			AND f.usage_dedup_key = c.first AND f.usage_dedup_key != ''
 		JOIN usage_cached_sessions cs ON cs.id = f.cached_session_id`)
 	if err != nil {
-		return fmt.Errorf("finding usage dedup sharers: %w", err)
+		return nil, fmt.Errorf("finding usage dedup sharers: %w", err)
 	}
 	defer sharerRows.Close()
 	var sharers []string
@@ -517,20 +498,20 @@ func invalidateUsageDedupSharers(
 		var sessionID string
 		if err := sharerRows.Scan(&sessionID); err != nil {
 			_ = sharerRows.Close()
-			return err
+			return nil, err
 		}
 		if !excluded[sessionID] {
 			sharers = append(sharers, sessionID)
 		}
 	}
 	if err := sharerRows.Close(); err != nil {
-		return err
+		return nil, err
 	}
 	if err := sharerRows.Err(); err != nil {
-		return err
+		return nil, err
 	}
-	return queryChunked(sharers, func(chunk []string) error {
-		placeholders, args := inPlaceholders(chunk)
+	err = queryChunked(sharers, func(chunk []string) error {
+		placeholders, args := InPlaceholders(chunk)
 		if _, err := runner.ExecContext(ctx,
 			`DELETE FROM usage_rollup_installs WHERE session_id IN `+placeholders,
 			args...); err != nil {
@@ -538,4 +519,5 @@ func invalidateUsageDedupSharers(
 		}
 		return nil
 	})
+	return sharers, err
 }

@@ -24,6 +24,7 @@ import (
 
 	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/pricing/catalog"
+	"go.kenn.io/kit/atomicfile"
 )
 
 var defaultOutputPath = filepath.FromSlash(
@@ -39,12 +40,14 @@ func mustRate(dollars string) money.Money {
 }
 
 const (
-	defaultSnapshotRef      = "9b749891c4e15f302ffec7cd30029bbe5774cf84"
-	defaultSnapshotSHA256   = "f899bb4d8f99cf19e4c63b929d8ba17eafef27e231c000af13bd3d0c8ba6e3d9"
+	defaultSnapshotRef      = "8ebb4aa694bf544c465d6c78aa2c465b4cd14ef5"
+	defaultSnapshotSHA256   = "75097ea1199a3f53590ccbf6ec61aa05a0c471ffc2f44018925d4a895ab5a3e8"
 	defaultSnapshotBranch   = "litellm-pricing-snapshot"
 	defaultSnapshotFile     = "litellm_snapshot.json.gz"
 	defaultSnapshotBaseURL  = "https://raw.githubusercontent.com/kenn-io/agentsview"
-	defaultLiteLLMSourceRef = "418c7c6012d7c39a9d4a28c72cabe1995595ad2b"
+	defaultLiteLLMSourceRef = "7d50a31eb5b080c29438f97be7701e117938ce88"
+	// Retain retired catalog keys so older archived usage stays priceable.
+	retainedLiteLLMSourceRef = "418c7c6012d7c39a9d4a28c72cabe1995595ad2b"
 )
 
 var immutableGitRefPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
@@ -56,9 +59,10 @@ const (
 )
 
 type snapshotBundle struct {
-	Version   string                 `json:"version"`
-	SourceRef string                 `json:"source_ref"`
-	Models    []catalog.ModelPricing `json:"models"`
+	Version           string                 `json:"version"`
+	SourceRef         string                 `json:"source_ref"`
+	RetainedSourceRef string                 `json:"retained_source_ref,omitempty"`
+	Models            []catalog.ModelPricing `json:"models"`
 }
 
 func main() {
@@ -111,7 +115,11 @@ func main() {
 		panic(err)
 	}
 
-	prices = appendModelOverlay(prices)
+	retained, err := catalog.FetchLiteLLMPricingAtRef(ctx, retainedLiteLLMSourceRef)
+	if err != nil {
+		panic(err)
+	}
+	prices = appendModelOverlay(retainMissingModels(prices, retained))
 	sort.Slice(prices, func(i, j int) bool {
 		return prices[i].ModelPattern < prices[j].ModelPattern
 	})
@@ -123,9 +131,10 @@ func main() {
 
 	version := computeVersion(modelsJSON)
 	bundle := snapshotBundle{
-		Version:   version,
-		SourceRef: *litellmSourceRef,
-		Models:    prices,
+		Version:           version,
+		SourceRef:         *litellmSourceRef,
+		RetainedSourceRef: retainedLiteLLMSourceRef,
+		Models:            prices,
 	}
 
 	raw, err := json.Marshal(bundle)
@@ -201,6 +210,9 @@ func validateSnapshotFile(path string) error {
 	}
 	if !immutableGitRefPattern.MatchString(snapshot.SourceRef) {
 		return errors.New("missing immutable LiteLLM source ref")
+	}
+	if snapshot.RetainedSourceRef != "" && !immutableGitRefPattern.MatchString(snapshot.RetainedSourceRef) {
+		return errors.New("invalid immutable retained LiteLLM source ref")
 	}
 	if len(snapshot.Models) == 0 {
 		return errors.New("missing snapshot models")
@@ -301,11 +313,11 @@ func restoreSnapshotFile(ctx context.Context,
 		return fmt.Errorf("validating restored snapshot: %w", err)
 	}
 
-	if err := os.Rename(tmp, outPath); err != nil {
+	if err := atomicfile.Replace(tmp, outPath); err != nil {
 		if removeErr := os.Remove(outPath); removeErr != nil && !os.IsNotExist(removeErr) {
 			return fmt.Errorf("replacing existing snapshot: %w", removeErr)
 		}
-		if renameErr := os.Rename(tmp, outPath); renameErr != nil {
+		if renameErr := atomicfile.Replace(tmp, outPath); renameErr != nil {
 			return fmt.Errorf("moving snapshot into place: %w", renameErr)
 		}
 	}
@@ -448,6 +460,22 @@ func readLimitedSnapshotJSON(reader io.Reader, limit int64) ([]byte, error) {
 		return nil, fmt.Errorf("decompressed snapshot exceeds %d bytes", limit)
 	}
 	return raw, nil
+}
+
+func retainMissingModels(current, retained []catalog.ModelPricing) []catalog.ModelPricing {
+	out := slices.Clone(current)
+	present := make(map[string]struct{}, len(current))
+	for _, price := range current {
+		present[price.ModelPattern] = struct{}{}
+	}
+	for _, price := range retained {
+		if _, ok := present[price.ModelPattern]; ok {
+			continue
+		}
+		out = append(out, price)
+		present[price.ModelPattern] = struct{}{}
+	}
+	return out
 }
 
 func appendModelOverlay(models []catalog.ModelPricing) []catalog.ModelPricing {

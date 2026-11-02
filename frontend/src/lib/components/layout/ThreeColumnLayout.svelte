@@ -10,6 +10,7 @@
     SIDEBAR_WIDTH_DEFAULT,
     SIDEBAR_WIDTH_MIN,
     SIDEBAR_WIDTH_STORAGE_MAX,
+    SPLIT_HANDLE_SIZE,
     VITALS_WIDTH_DEFAULT,
     VITALS_WIDTH_MIN,
     VITALS_WIDTH_STORAGE_MAX,
@@ -21,6 +22,7 @@
   import { router } from "../../stores/router.svelte.js";
   import type { Route } from "../../stores/router.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
+  import { sync } from "../../stores/sync.svelte.js";
   import {
     ActivityIcon,
     ChartColumnIcon,
@@ -32,6 +34,7 @@
     PencilIcon,
     PinIcon,
     TrashIcon,
+    TriangleAlertIcon,
   } from "../../icons.js";
 
   interface Props {
@@ -39,10 +42,6 @@
     content: Snippet;
     vitals?: Snippet;
   }
-
-  // Rendered width of kit-ui's .kit-split-resize-handle.
-  const RESIZE_HANDLE_WIDTH = 4;
-  const SIDEBAR_BORDER_WIDTH = 1;
 
   let { sidebar, content, vitals }: Props = $props();
   let layoutElement = $state<HTMLElement | null>(null);
@@ -73,15 +72,12 @@
   // and the vitals clamp yields whatever the actual sidebar leaves over.
   function sidebarLayoutWidth(layoutWidthNow: number): number {
     const vitalsReservedWidth = vitalsVisible
-      ? VITALS_WIDTH_MIN + RESIZE_HANDLE_WIDTH + SIDEBAR_BORDER_WIDTH
+      ? VITALS_WIDTH_MIN + SPLIT_HANDLE_SIZE
       : 0;
 
     return Math.max(
       0,
-      layoutWidthNow -
-        RESIZE_HANDLE_WIDTH -
-        SIDEBAR_BORDER_WIDTH -
-        vitalsReservedWidth,
+      layoutWidthNow - SPLIT_HANDLE_SIZE - vitalsReservedWidth,
     );
   }
   const sidebarWidth = $derived(
@@ -116,19 +112,16 @@
     ),
   );
 
-  // Width left for the content column and vitals panel once the sidebar,
-  // its handle, and the pane borders are spoken for.
+  // Width left for the content column and vitals panel once the sidebar and
+  // both handles are spoken for.
   function vitalsLayoutWidth(layoutWidthNow: number): number {
     const sidebarTotalWidth = ui.sidebarOpen
-      ? sidebarWidth + RESIZE_HANDLE_WIDTH + SIDEBAR_BORDER_WIDTH
+      ? sidebarWidth + SPLIT_HANDLE_SIZE
       : 0;
 
     return Math.max(
       0,
-      layoutWidthNow -
-        sidebarTotalWidth -
-        RESIZE_HANDLE_WIDTH -
-        SIDEBAR_BORDER_WIDTH,
+      layoutWidthNow - sidebarTotalWidth - SPLIT_HANDLE_SIZE,
     );
   }
   function handleBackdropClick() {
@@ -288,6 +281,16 @@
         <LogsIcon size="12" strokeWidth="2" aria-hidden="true" />
         {m.nav_quality()}
       </button>
+      {#if sync.serverVersion?.friction_readable === true}
+        <button
+          class="mobile-nav-btn"
+          class:active={router.route === "friction"}
+          onclick={() => mobileNav("friction")}
+        >
+          <TriangleAlertIcon size="12" strokeWidth="2" aria-hidden="true" />
+          {m.nav_friction()}
+        </button>
+      {/if}
       <button
         class="mobile-nav-btn"
         class:active={router.route === "trash"}
@@ -361,7 +364,6 @@
   .sidebar {
     width: 260px;
     flex-shrink: 0;
-    border-right: 1px solid var(--border-default);
     overflow: hidden;
     display: flex;
     flex-direction: column;
@@ -382,7 +384,6 @@
 
   .vitals {
     flex-shrink: 0;
-    border-left: 1px solid var(--border-default);
     overflow: hidden;
     display: flex;
     flex-direction: column;
@@ -406,6 +407,8 @@
       bottom: var(--status-bar-height, 24px);
       left: 0;
       width: 280px;
+      /* The drawer has no resize handle, so it keeps its own edge. */
+      border-right: 1px solid var(--border-default);
       z-index: 50;
       box-shadow: var(--shadow-lg);
       display: flex;

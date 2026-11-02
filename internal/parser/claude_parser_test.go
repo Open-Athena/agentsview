@@ -238,6 +238,11 @@ func TestParseClaudeSession_SkippedMessages(t *testing.T) {
 		sess, _ := runClaudeParserTest(t, "test.jsonl", content)
 		assert.Equal(t, 1, sess.MessageCount)
 		assert.Equal(t, "real question", sess.FirstMessage)
+		path := createTestFile(t, "meta.jsonl", content)
+		appended, _, _, _, err := claudeParseSessionFrom(path, 0, claudeIncrementalScan{})
+		require.NoError(t, err)
+		require.Len(t, appended, 1)
+		assert.Equal(t, "real question", appended[0].Content)
 	})
 
 	t.Run("persists isCompactSummary as system message", func(t *testing.T) {
@@ -724,6 +729,65 @@ func TestParseClaudeSession_QueuedSystemMessagesDoNotCount(t *testing.T) {
 	require.Len(t, systems, 2)
 	assert.Equal(t, "task_notification", systems[0].SourceSubtype)
 	assert.Equal(t, "task_notification", systems[1].SourceSubtype)
+}
+
+// A message another Claude Code session sends arrives as a queued_command
+// attachment marked isMeta, with origin.kind "peer" and a
+// <cross-session-message> prompt. It stays in the transcript with its
+// sender attributes but is not a user prompt, so it cannot become the
+// first message or raise the user-message count. Full and incremental
+// parses must agree.
+func TestParseClaudeSession_QueuedPeerMessagesDoNotCount(t *testing.T) {
+	content := loadFixture(t, "claude/queued_peer_messages.jsonl")
+
+	assertMessages := func(t *testing.T, msgs []ParsedMessage) {
+		t.Helper()
+		require.Len(t, msgs, 5)
+
+		peer := msgs[0]
+		assert.True(t, peer.IsSystem)
+		assert.Equal(t, RoleUser, peer.Role)
+		assert.Equal(t, "system", peer.SourceType)
+		assert.Equal(t, "peer_message", peer.SourceSubtype)
+		assert.Contains(t, peer.Content, `from-name="synthetic-peer"`)
+		assert.Contains(t, peer.Content,
+			"Synthetic peer request: please review the fixture.")
+
+		assert.Equal(t, RoleAssistant, msgs[1].Role)
+
+		typed := msgs[2]
+		assert.False(t, typed.IsSystem)
+		assert.Equal(t, "user", typed.SourceType)
+		assert.Equal(t, "queued_command", typed.SourceSubtype)
+		assert.Equal(t,
+			"Synthetic user follow-up typed during the review.", typed.Content)
+
+		assert.True(t, msgs[3].IsSystem)
+		assert.Equal(t, "task_notification", msgs[3].SourceSubtype)
+
+		assert.Equal(t, RoleAssistant, msgs[4].Role)
+		for _, m := range msgs {
+			assert.NotContains(t, m.Content, "Cross-session delivery notice",
+				"isMeta harness notices stay out of the transcript")
+		}
+	}
+
+	t.Run("full parse", func(t *testing.T) {
+		sess, msgs := runClaudeParserTest(t, "test.jsonl", content)
+		assertMessages(t, msgs)
+		assert.Equal(t, 5, sess.MessageCount)
+		assert.Equal(t, 1, sess.UserMessageCount)
+		assert.Equal(t,
+			"Synthetic user follow-up typed during the review.",
+			sess.FirstMessage)
+	})
+
+	t.Run("incremental parse", func(t *testing.T) {
+		path := createTestFile(t, "test.jsonl", content)
+		msgs, _, _, err := callParseClaudeSessionFrom(path, 0, 0, "")
+		require.NoError(t, err)
+		assertMessages(t, msgs)
+	})
 }
 
 func TestParseClaudeSession_LeadingSystemReminderKeepsRealPrompt(t *testing.T) {
@@ -2889,7 +2953,7 @@ func TestExtractTextContent_ReturnsThinkingText(t *testing.T) {
 			{"type":"thinking","thinking":"second thought"},
 			{"type":"text","text":"reply B"}
 		]`)
-		text, thinking, hasThinking, _, _, _ := ExtractTextContent(t.Context(), content)
+		text, thinking, _, hasThinking, _, _, _ := ExtractTextContent(t.Context(), content)
 		assert.True(t, hasThinking)
 		assert.Equal(t, "first thought\n\nsecond thought", thinking)
 		assert.Contains(t, text, "[Thinking]\nfirst thought\n[/Thinking]")
@@ -2902,7 +2966,7 @@ func TestExtractTextContent_ReturnsThinkingText(t *testing.T) {
 			{"type":"thinking","thinking":""},
 			{"type":"thinking","thinking":"real thought"}
 		]`)
-		_, thinking, _, _, _, _ := ExtractTextContent(t.Context(), content)
+		_, thinking, _, _, _, _, _ := ExtractTextContent(t.Context(), content)
 		assert.Equal(t, "real thought", thinking)
 	})
 }
@@ -3088,5 +3152,136 @@ func TestParseClaudeSession_SkipClearEffortFirstMessage(t *testing.T) {
 		)
 		sess, _ := runClaudeParserTest(t, "test.jsonl", content)
 		assert.Equal(t, "follow-up", sess.FirstMessage)
+	})
+}
+
+func TestParseClaudeSession_PersistedOutputUnresolvedOnlyOnUnresolvedOccurrence(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	sessionDir := filepath.Join(dir, "project", "parent-session")
+	resolvedPath := filepath.Join(sessionDir, "tool-results", "resolved.txt")
+	missingPath := filepath.Join(sessionDir, "tool-results", "gone.txt")
+	require.NoError(t, os.MkdirAll(filepath.Dir(resolvedPath), 0o755))
+	fullOutput := "full persisted output\n"
+	require.NoError(t, os.WriteFile(resolvedPath, []byte(fullOutput), 0o644))
+
+	resolvedPlaceholder := "Full output saved to: " + resolvedPath
+	missingPlaceholder := "Full output saved to: " + missingPath
+
+	content := strings.Join([]string{
+		`{"type":"user","timestamp":"2024-01-01T00:00:00Z","uuid":"u1","message":{"content":"run it"},"cwd":"/tmp/project"}`,
+		`{"type":"assistant","timestamp":"2024-01-01T00:00:01Z","uuid":"a1","parentUuid":"u1","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"make logs"}}]}}`,
+		`{"type":"user","timestamp":"2024-01-01T00:00:02Z","uuid":"u2","parentUuid":"a1","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":` + mustJSONString(t, resolvedPlaceholder) + `,"is_error":false}]},"toolUseResult":{"persistedOutputPath":` + mustJSONString(t, resolvedPath) + `}}`,
+		`{"type":"assistant","timestamp":"2024-01-01T00:00:03Z","uuid":"a2","parentUuid":"u2","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"make logs"}}]}}`,
+		`{"type":"user","timestamp":"2024-01-01T00:00:04Z","uuid":"u3","parentUuid":"a2","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":` + mustJSONString(t, missingPlaceholder) + `,"is_error":false}]},"toolUseResult":{"persistedOutputPath":` + mustJSONString(t, missingPath) + `}}`,
+	}, "\n")
+	sessionPath := filepath.Join(dir, "project", "parent-session.jsonl")
+	require.NoError(t, os.WriteFile(sessionPath, []byte(content), 0o644))
+
+	results, err := parseClaudeSession(sessionPath, "project", "local")
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Len(t, results[0].Messages, 5)
+	require.Len(t, results[0].Messages[2].ToolResults, 1)
+	require.Len(t, results[0].Messages[4].ToolResults, 1)
+
+	resolved := results[0].Messages[2].ToolResults[0]
+	assert.False(t, resolved.PersistedOutputUnresolved)
+	assert.Equal(t, fullOutput, DecodeContent(resolved.ContentRaw))
+
+	unresolved := results[0].Messages[4].ToolResults[0]
+	assert.True(t, unresolved.PersistedOutputUnresolved)
+	assert.Equal(t, missingPlaceholder, DecodeContent(unresolved.ContentRaw))
+}
+
+func TestParseClaudeSession_GenuineOutputMatchingTagShapeStaysUnflagged(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	genuine := "<persisted-output>\nfound this tag while grepping transcripts\n</persisted-output>"
+
+	content := strings.Join([]string{
+		`{"type":"user","timestamp":"2024-01-01T00:00:00Z","uuid":"u1","message":{"content":"run it"},"cwd":"/tmp/project"}`,
+		`{"type":"assistant","timestamp":"2024-01-01T00:00:01Z","uuid":"a1","parentUuid":"u1","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"make logs"}},{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file_path":"README.md"}}]}}`,
+		`{"type":"user","timestamp":"2024-01-01T00:00:02Z","uuid":"u2","parentUuid":"a1","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":` + mustJSONString(t, genuine) + `,"is_error":false},{"type":"tool_result","tool_use_id":"toolu_2","content":"other result","is_error":false}]}}`,
+	}, "\n")
+	sessionPath := filepath.Join(dir, "project", "parent-session.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(sessionPath), 0o755))
+	require.NoError(t, os.WriteFile(sessionPath, []byte(content), 0o644))
+
+	results, err := parseClaudeSession(sessionPath, "project", "local")
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Len(t, results[0].Messages, 3)
+	require.Len(t, results[0].Messages[2].ToolResults, 2)
+
+	got := results[0].Messages[2].ToolResults[0]
+	assert.False(t, got.PersistedOutputUnresolved)
+	assert.Equal(t, genuine, DecodeContent(got.ContentRaw))
+}
+
+// TestParseClaudeSession_BlankThinkingKeepsUsage covers an assistant
+// response whose only content is an empty thinking block with an opaque
+// signature. The record renders no text, but its usage belongs to a
+// distinct provider response and must survive as a hidden row.
+func TestParseClaudeSession_BlankThinkingKeepsUsage(t *testing.T) {
+	content := loadFixture(t, "claude/blank_thinking_usage.jsonl")
+
+	assertBlankUsageRow := func(t *testing.T, msgs []ParsedMessage) {
+		t.Helper()
+		require.Len(t, msgs, 3)
+		blank := msgs[1]
+		assert.Equal(t, RoleAssistant, blank.Role)
+		assert.True(t, blank.IsSystem, "blank usage row must stay out of the transcript")
+		assert.Empty(t, blank.Content)
+		assert.Equal(t, "a1", blank.SourceUUID)
+		assert.Equal(t, "msg_blank", blank.ClaudeMessageID)
+		assert.Equal(t, 41, blank.ContextTokens)
+		assert.Equal(t, 7, blank.OutputTokens)
+		assert.JSONEq(t,
+			`{"input_tokens":11,"output_tokens":7,"cache_creation_input_tokens":13,"cache_read_input_tokens":17}`,
+			string(blank.TokenUsage))
+		assert.Equal(t, "msg_answer", msgs[2].ClaudeMessageID)
+		assert.False(t, msgs[2].IsSystem)
+	}
+
+	t.Run("full parse", func(t *testing.T) {
+		sess, msgs := runClaudeParserTest(t, "test.jsonl", content)
+		assertBlankUsageRow(t, msgs)
+		assert.Equal(t, 10, sess.TotalOutputTokens)
+	})
+
+	t.Run("incremental parse", func(t *testing.T) {
+		path := createTestFile(t, "test.jsonl", content)
+		msgs, _, _, err := callParseClaudeSessionFrom(path, 0, 0, "")
+		require.NoError(t, err)
+		assertBlankUsageRow(t, msgs)
+	})
+
+	t.Run("blank thinking chunk merges into its answer", func(t *testing.T) {
+		sameResponse := testjsonl.JoinJSONL(
+			`{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-01-10T11:00:00Z","message":{"role":"user","content":"prompt"}}`,
+			`{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"2026-01-10T11:00:01Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"opaque"}],"id":"msg_one","model":"claude-sonnet-4-6","usage":{"input_tokens":2,"output_tokens":3}}}`,
+			`{"type":"assistant","uuid":"a2","parentUuid":"a1","timestamp":"2026-01-10T11:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"answer"}],"id":"msg_one","model":"claude-sonnet-4-6","usage":{"input_tokens":2,"output_tokens":3},"stop_reason":"end_turn"}}`,
+		)
+		_, msgs := runClaudeParserTest(t, "test.jsonl", sameResponse)
+		require.Len(t, msgs, 2)
+		assert.Equal(t, "answer", msgs[1].Content)
+		assert.False(t, msgs[1].IsSystem)
+	})
+
+	t.Run("blank record without usage is still skipped", func(t *testing.T) {
+		noUsage := testjsonl.JoinJSONL(
+			`{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-01-10T11:00:00Z","message":{"role":"user","content":"prompt"}}`,
+			`{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"2026-01-10T11:00:01Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"opaque"}],"id":"msg_blank","usage":{"input_tokens":0,"output_tokens":0}}}`,
+		)
+		_, msgs := runClaudeParserTest(t, "test.jsonl", noUsage)
+		require.Len(t, msgs, 1)
+		assert.Equal(t, RoleUser, msgs[0].Role)
 	})
 }

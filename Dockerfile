@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM node:24-bookworm AS frontend-build
+FROM --platform=$BUILDPLATFORM node:24.22.1-bookworm AS frontend-build
 
 WORKDIR /src/frontend
 
@@ -11,9 +11,12 @@ COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 
 COPY frontend/ ./
+COPY internal/importer/claude_ai_requests.txt /src/internal/importer/claude_ai_requests.txt
 RUN npm run build
 
-FROM golang:1.27.0-bookworm AS build
+FROM golang:1.27.3-bookworm AS build
+
+ENV GOPROXY="https://proxy.golang.org|direct"
 
 # The Go Bookworm image already includes the C/C++ toolchain and CA bundle.
 
@@ -56,14 +59,17 @@ FROM debian:bookworm-slim
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 RUN mkdir -p /data /agents
 
-ENV AGENTSVIEW_DATA_DIR=/data
+ENV AGENTSVIEW_DATA_DIR=/data \
+    AGENTSVIEW_MODE=serve \
+    AGENTSVIEW_HOST=0.0.0.0 \
+    AGENTSVIEW_REQUIRE_AUTH=true \
+    AGENTSVIEW_NO_BROWSER=true
 
 COPY --from=build /out/agentsview /usr/local/bin/agentsview
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-RUN chmod +x /usr/local/bin/agentsview /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/agentsview
 
 EXPOSE 8080
 
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-CMD ["--host", "0.0.0.0", "--no-browser"]
+ENTRYPOINT ["/usr/local/bin/agentsview"]
+CMD []

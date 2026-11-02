@@ -1,8 +1,11 @@
 package servicehttp
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -12,16 +15,20 @@ import (
 	"go.kenn.io/agentsview/internal/service"
 )
 
-func TestNewHTTPBackendUsesLongRunningClient(t *testing.T) {
-	t.Parallel()
-	svc := NewHTTPBackend("http://example.test", "", false, "")
-	backend, ok := svc.(*httpBackend)
-	require.True(t, ok)
-	require.NotNil(t, backend.client)
-	require.NotNil(t, backend.longRunningClient)
-
-	assert.Equal(t, 30*time.Second, backend.client.Timeout)
-	assert.Zero(t, backend.longRunningClient.Timeout)
+func TestWatchFiltersSessionReady(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/sessions/session-a/watch", r.URL.Path)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: session_ready\ndata: session-a\n\nevent: session_updated\ndata: session-a\n\nevent: heartbeat\ndata: tick\n\n")
+	}))
+	t.Cleanup(srv.Close)
+	events, err := NewHTTPBackend(srv.URL, "", false, "").Watch(t.Context(), "session-a")
+	require.NoError(t, err)
+	var got []service.Event
+	for event := range events {
+		got = append(got, event)
+	}
+	assert.Equal(t, []service.Event{{Event: "session_updated", Data: "session-a"}, {Event: "heartbeat", Data: "tick"}}, got)
 }
 
 func TestHTTPBackendRecallCapabilityRespectsReadOnlyMode(t *testing.T) {
@@ -159,6 +166,41 @@ func TestUsageSummaryUsesLongRunningClient(t *testing.T) {
 	})
 }
 
+// TestStatsUsesLongRunningClient pins that `agentsview stats` can outlast the
+// 30-second default client. Git and GitHub aggregation shells out to `git log`
+// and `gh pr list` once per repository, so the operation routinely runs for
+// minutes; the flags that request it are offered by the command, so the command
+// has to be able to wait for the answer.
+func TestStatsUsesLongRunningClient(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		srv := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "/api/v1/session-stats", r.URL.Path)
+			assert.Equal(t, "true", r.URL.Query().Get("include_github_outcomes"))
+			time.Sleep(50 * time.Millisecond)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(
+				`{"generated_at":"2026-09-01T00:00:00Z",` +
+					`"outcome_stats":{"repos_active":2,"commits":7}}`,
+			))
+		}))
+		transport := srv.Client().Transport
+		backend := NewHTTPBackend(srv.URL, "", false, "").(*httpBackend)
+		backend.client.Transport = transport
+		backend.longRunningClient.Transport = transport
+		backend.client.Timeout = 10 * time.Millisecond
+		result, err := backend.Stats(t.Context(), service.StatsFilter{
+			Since:                 "30d",
+			IncludeGitOutcomes:    true,
+			IncludeGitHubOutcomes: true,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		require.NotNil(t, result.OutcomeStats)
+		assert.Equal(t, 2, result.OutcomeStats.ReposActive)
+		assert.Equal(t, 7, result.OutcomeStats.Commits)
+	})
+}
+
 func TestUsagePairwiseComparisonUsesLongRunningClient(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		srv := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -211,6 +253,89 @@ func TestQueryRecallSemanticModesUseLongRunningClient(t *testing.T) {
 				assert.Equal(t, tt.wantMode, result.Mode)
 				assert.Empty(t, result.RecallEntries)
 			})
+		})
+	}
+}
+
+func TestListForwardsSessionIDs(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		ids     []string
+		present bool
+		want    string
+	}{
+		{"omitted", nil, false, ""},
+		{"batch", []string{"codex:shared", "node-a~codex:shared"}, true, "codex:shared,node-a~codex:shared"},
+		{"quoted comma and quote", []string{`openclaw:main:part,"quoted"`}, true, `"openclaw:main:part,""quoted"""`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, tt.present, r.URL.Query().Has("ids"))
+				assert.Equal(t, tt.want, r.URL.Query().Get("ids"))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"sessions":[]}`))
+			}))
+			t.Cleanup(srv.Close)
+			_, err := NewHTTPBackend(srv.URL, "", false, "").List(t.Context(), service.ListFilter{IDs: tt.ids})
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestListRejectsCRLFSessionIDsBeforeRequest(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"sessions":[]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	_, err := NewHTTPBackend(srv.URL, "", false, "").List(
+		t.Context(), service.ListFilter{IDs: []string{"openclaw:main:part\r\npart"}},
+	)
+	require.ErrorContains(t, err, "CRLF")
+	assert.Zero(t, requests.Load())
+}
+
+func TestListEmptySessionSelectionReturnsEmptyWithoutRequest(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"sessions":[]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	page, err := NewHTTPBackend(srv.URL, "", false, "").List(
+		t.Context(), service.ListFilter{IDs: []string{}},
+	)
+	require.NoError(t, err)
+	require.NotNil(t, page)
+	assert.Empty(t, page.Sessions)
+	assert.Zero(t, page.Total)
+	assert.Zero(t, requests.Load())
+}
+
+func TestUsageModelGroupsQuery(t *testing.T) {
+	for _, grouped := range []bool{false, true} {
+		t.Run(strconv.FormatBool(grouped), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, grouped, r.URL.Query().Has("group_models"))
+				if grouped {
+					assert.Equal(t, "true", r.URL.Query().Get("group_models"))
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"model_aliases":{"model-a":"group"}}`))
+			}))
+			t.Cleanup(srv.Close)
+			backend := NewHTTPBackend(srv.URL, "", false, "")
+			req := service.UsageRequest{GroupModels: grouped}
+			summary, err := backend.UsageSummary(t.Context(), req)
+			require.NoError(t, err)
+			assert.Equal(t, map[string]string{"model-a": "group"}, summary.ModelAliases)
+			_, err = backend.UsagePairwiseComparison(t.Context(), service.UsagePairwiseComparisonRequest{UsageRequest: req})
+			require.NoError(t, err)
 		})
 	}
 }

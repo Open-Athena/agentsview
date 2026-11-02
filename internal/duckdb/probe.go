@@ -3,7 +3,6 @@ package duckdb
 import (
 	"context"
 	"database/sql"
-	"encoding/json/v2"
 	"fmt"
 	"os"
 	"sort"
@@ -12,7 +11,7 @@ import (
 
 // MirrorProbe summarizes a DuckDB mirror file's shape and push-scope
 // metadata without mutating it. ProbeMirror is the read-only counterpart to
-// rebuildMirror: callers use it to decide whether a mirror is safe to serve
+// buildMirror: callers use it to decide whether a mirror is safe to serve
 // as-is or needs a full rebuild.
 type MirrorProbe struct {
 	FileExists bool
@@ -51,7 +50,7 @@ type MirrorProbe struct {
 	// SourceArchiveID is the provenance id stamped onto mirror rows. "" on
 	// mirrors written before the id was recorded.
 	SourceArchiveID  string
-	Scope            string // canonical scope string, see canonicalPushScope
+	Scope            string // canonical scope string, see db.CanonicalPushScope
 	LastPushCutoff   string
 	LastPushAt       string
 	LastPushMachine  string
@@ -226,7 +225,7 @@ func mirrorShapeIssueFromColumns(existing map[string]map[string]bool) string {
 }
 
 // NeedsRebuild reports whether the probed mirror can serve scope/
-// sourceDataVersion as-is, or must be rebuilt with rebuildMirror. A missing
+// sourceDataVersion as-is, or must be rebuilt with buildMirror. A missing
 // file, a shape problem, a schema version mismatch in either direction, a
 // stale source data version, or a different push scope all require a
 // rebuild; there is no in-place migration path for the mirror schema.
@@ -314,37 +313,4 @@ func rebuildReason(
 	default:
 		return ""
 	}
-}
-
-// canonicalPushScope renders a push's project filters into a deterministic
-// string suitable for storing in mirror metadata and comparing across runs.
-// Unfiltered pushes (no include/exclude projects) canonicalize to "" so the
-// common case never round-trips through JSON.
-func canonicalPushScope(projects, excludeProjects []string) string {
-	if len(projects) == 0 && len(excludeProjects) == 0 {
-		return ""
-	}
-	scope := struct {
-		Projects []string `json:"projects,omitempty"`
-		Exclude  []string `json:"exclude,omitempty"`
-	}{
-		Projects: sortedCopy(projects),
-		Exclude:  sortedCopy(excludeProjects),
-	}
-	data, err := json.Marshal(scope)
-	if err != nil {
-		// json.Marshal only fails on unsupported types; []string always
-		// marshals, so this is unreachable in practice.
-		return ""
-	}
-	return string(data)
-}
-
-func sortedCopy(values []string) []string {
-	if len(values) == 0 {
-		return nil
-	}
-	out := append([]string(nil), values...)
-	sort.Strings(out)
-	return out
 }

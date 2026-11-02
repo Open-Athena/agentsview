@@ -299,13 +299,13 @@ func TestParseDevinSession(t *testing.T) {
 	assert.Equal(t, RoleUser, carrier.Role)
 	assert.Empty(t, carrier.Content)
 	require.Len(t, carrier.ToolResults, 1)
-	assert.Equal(t, ParsedToolResult{ToolUseID: "tool-top-1", ContentLength: len("file1\nfile2"), ContentRaw: `"file1\nfile2"`}, carrier.ToolResults[0])
+	assert.Equal(t, ParsedToolResult{ToolUseID: "tool-top-1", Source: "tool_result", ContentLength: len("file1\nfile2"), ContentRaw: `"file1\nfile2"`}, carrier.ToolResults[0])
 
 	standalone := msgs[4]
 	assert.Equal(t, RoleTool, standalone.Role)
 	assert.Empty(t, standalone.Content)
 	require.Len(t, standalone.ToolResults, 1)
-	assert.Equal(t, ParsedToolResult{ToolUseID: "tool-top-2", ContentLength: len("patch applied"), ContentRaw: `[{"type":"text","text":"patch applied"}]`}, standalone.ToolResults[0])
+	assert.Equal(t, ParsedToolResult{ToolUseID: "tool-top-2", Source: "tool_result", ContentLength: len("patch applied"), ContentRaw: `[{"type":"text","text":"patch applied"}]`}, standalone.ToolResults[0])
 }
 
 func TestParseDevinSessionStepMetricsPopulateTokenUsage(t *testing.T) {
@@ -525,6 +525,7 @@ func TestParseDevinSessionMissingTranscriptFallsBackToMessageNodes(t *testing.T)
 	require.Len(t, msgs[1].ToolCalls, 1)
 	assert.Equal(t, ParsedToolCall{ToolUseID: "call-1", ToolName: "read_file", Category: "Read", InputJSON: `{"file_path":"main.go"}`, Rendering: "[Read: main.go]"}, msgs[1].ToolCalls[0])
 	assert.Equal(t, RoleTool, msgs[2].Role)
+	assert.Equal(t, new(""), msgs[2].DialogueText)
 	require.Len(t, msgs[2].ToolResults, 1)
 	assert.Equal(t, ParsedToolResult{ToolUseID: "call-1", ContentLength: len("package main\n"), ContentRaw: `"package main\n"`}, msgs[2].ToolResults[0])
 }

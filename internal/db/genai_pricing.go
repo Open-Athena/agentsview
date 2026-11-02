@@ -6,6 +6,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+
+	pricingpkg "go.kenn.io/agentsview/internal/pricing"
 )
 
 const (
@@ -120,7 +122,9 @@ func (db *DB) writeGenAIPricing(
 				OR genai_pricing.source_ref IS NOT excluded.source_ref
 				OR genai_pricing.data_json IS NOT excluded.data_json)`
 	}
-	db.mu.Lock()
+	if err := db.lockWriterCtx(ctx); err != nil {
+		return err
+	}
 	defer db.mu.Unlock()
 	_, err := db.getWriter().ExecContext(ctx, `
 		INSERT INTO genai_pricing
@@ -136,4 +140,14 @@ func (db *DB) writeGenAIPricing(
 		return fmt.Errorf("writing GenAI pricing document: %w", err)
 	}
 	return nil
+}
+
+// EmbeddedGenAIPricingDocument returns the GenAI pricing snapshot built into
+// the binary.
+func EmbeddedGenAIPricingDocument() GenAIPricingDocument {
+	embedded := pricingpkg.EmbeddedGenAIDocument()
+	return GenAIPricingDocument{
+		Version: embedded.Version, SourceRef: embedded.SourceRef,
+		Source: GenAIPricingSourceEmbedded, Data: embedded.RawJSON(),
+	}
 }

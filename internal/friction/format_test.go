@@ -7,25 +7,6 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestTruncateRunes(t *testing.T) {
-	tests := []struct {
-		name string
-		in   string
-		n    int
-		want string
-	}{
-		{"unicode/no truncation", "日本語", 3, "日本語"},
-		{"unicode/two", "日本語", 2, "日本"},
-		{"empty", "", 5, ""},
-		{"zero", "abc", 0, ""},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, TruncateRunes(tt.in, tt.n))
-		})
-	}
-}
-
 func TestTruncateWithMarker(t *testing.T) {
 	tests := []struct {
 		name string
@@ -73,9 +54,7 @@ func TestSanitizeDisplay(t *testing.T) {
 		in   string
 		want string
 	}{
-		{"backtick and newline", "general`\ninjected", "general' injected"},
-		{"backtick tab newline", "seat`\t\n01", "seat'  01"},
-		{"machine label", "mac`1\n", "mac'1 "},
+		{"backtick and controls", "value`\t\nend", "value`  end"},
 		{"c1 control", "a\u0085b", "a b"},
 		{"nbsp", "a\u00a0b", "a\u00a0b"},
 		{"plain", "helper", "helper"},

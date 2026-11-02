@@ -3,10 +3,9 @@
  */
 
 export interface ConfigRemoteHost {
+  destination?: string;
   host: string;
   interval?: number;
-  port?: number;
   transport?: string;
   url?: string;
-  user?: string;
 }

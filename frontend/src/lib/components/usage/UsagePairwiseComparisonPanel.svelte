@@ -1,11 +1,19 @@
 <script lang="ts">
-  import { Card, Typeahead, type TypeaheadOption } from "@kenn-io/kit-ui";
+  import { errorTelemetry } from "../../utils/error-telemetry.js";
+  import { Card, Table, Typeahead, type TypeaheadOption } from "@kenn-io/kit-ui";
   import { usage } from "../../stores/usage.svelte.js";
   import { m } from "../../i18n/index.js";
   import type { UsagePairwiseDimension } from "../../api/types/usage.js";
   import type { Money } from "../../money.js";
   import { formatMoney, formatSignedMoney } from "../../money.js";
   import { sumSelectedTokens } from "../../stores/usageTokenTypes.js";
+
+  const loadingPickers = $derived(
+    !usage.summary ||
+      (usage.loading.pairwise &&
+        !usage.pairwiseSelection.left.value &&
+        !usage.pairwiseSelection.right.value),
+  );
 
   function fmtCount(value: number): string {
     return String(value);
@@ -163,7 +171,7 @@
           ratio: fmtRatio(perSessionRatio),
         },
         {
-          label: m.usage_input_tokens(),
+          label: m.usage_uncached_input(),
           left: fmtTokens(comparison.left.inputTokens),
           right: fmtTokens(comparison.right.inputTokens),
           delta: fmtSignedTokens(comparison.deltas.inputTokensDelta),
@@ -216,7 +224,7 @@
         ratio: fmtRatio(comparison.deltas.tokensPerSessionRatio),
       },
       {
-        label: m.usage_input_tokens(),
+        label: m.usage_uncached_input(),
         left: fmtTokens(comparison.left.inputTokens),
         right: fmtTokens(comparison.right.inputTokens),
         delta: fmtSignedTokens(comparison.deltas.inputTokensDelta),
@@ -249,6 +257,7 @@
           <span>{m.usage_pairwise_dimension()}</span>
           <div class="pairwise-typeahead">
             <Typeahead
+              disabled={loadingPickers}
               options={dimensionOptions}
               value={usage.pairwiseSelection.left.dimension}
               fallbackLabel={dimensionLabel(usage.pairwiseSelection.left.dimension)}
@@ -273,7 +282,7 @@
               placeholder={m.usage_pairwise_left_value()}
               title={m.usage_pairwise_left_value()}
               emptyLabel={m.usage_pairwise_no_matching_values()}
-              disabled={optionsFor(usage.pairwiseSelection.left.dimension).length === 0}
+              disabled={loadingPickers || optionsFor(usage.pairwiseSelection.left.dimension).length === 0}
               onselect={(value) =>
                 usage.setPairwiseSide("left", {
                   value,
@@ -291,6 +300,7 @@
           <span>{m.usage_pairwise_dimension()}</span>
           <div class="pairwise-typeahead">
             <Typeahead
+              disabled={loadingPickers}
               options={dimensionOptions}
               value={usage.pairwiseSelection.right.dimension}
               fallbackLabel={dimensionLabel(usage.pairwiseSelection.right.dimension)}
@@ -315,7 +325,7 @@
               placeholder={m.usage_pairwise_right_value()}
               title={m.usage_pairwise_right_value()}
               emptyLabel={m.usage_pairwise_no_matching_values()}
-              disabled={optionsFor(usage.pairwiseSelection.right.dimension).length === 0}
+              disabled={loadingPickers || optionsFor(usage.pairwiseSelection.right.dimension).length === 0}
               onselect={(value) =>
                 usage.setPairwiseSide("right", {
                   value,
@@ -329,7 +339,7 @@
 
   {#if usage.errors.pairwise}
     <Card level="default" padding="none" class="error-bar">
-      <span>{usage.errors.pairwise}</span>
+      <span {@attach errorTelemetry("analytics")}>{usage.errors.pairwise}</span>
       <button
         class="retry-btn"
         onclick={() => usage.fetchAll({ preserveTimeRange: true })}
@@ -337,15 +347,15 @@
         {m.shared_retry()}
       </button>
     </Card>
+  {:else if usage.loading.pairwise && rows.length === 0}
+    <Card level="default" padding="none" class="pairwise-note">{m.shared_refresh()}</Card>
   {:else if !hasSelection}
     <Card level="default" padding="none" class="pairwise-note">
       {m.usage_pairwise_not_enough_data()}
     </Card>
-  {:else if usage.loading.pairwise && rows.length === 0}
-    <Card level="default" padding="none" class="pairwise-note">{m.shared_refresh()}</Card>
   {:else if rows.length > 0}
     <div class="table-wrap">
-      <table>
+      <Table bare unsorted>
         <thead>
           <tr>
             <th>{m.usage_pairwise_metric()}</th>
@@ -367,7 +377,7 @@
         <tbody>
           {#each rows as row}
             <tr>
-              <th>{row.label}</th>
+              <th scope="row">{row.label}</th>
               <td>{row.left}</td>
               <td>{row.right}</td>
               <td>
@@ -379,7 +389,7 @@
             </tr>
           {/each}
         </tbody>
-      </table>
+      </Table>
     </div>
   {/if}
 </section>
@@ -449,7 +459,7 @@
     overflow-x: auto;
   }
 
-  table {
+  .table-wrap :global(table) {
     width: 100%;
     border-collapse: collapse;
     font-size: 12px;

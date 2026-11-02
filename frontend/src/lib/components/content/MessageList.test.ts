@@ -1,16 +1,26 @@
 // @vitest-environment jsdom
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { reportErrorShown } from "../../utils/telemetry.js";
+vi.mock("../../utils/telemetry.js", () => ({ reportErrorShown: vi.fn() }));
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
-import type { DbMessage as Message } from "../../api/generated/index.js";
+import { Virtualizer, type VirtualizerOptions } from "@tanstack/virtual-core";
+import { controlFrames } from "../../test/frames.js";
+import { realVirtualizer } from "../../test/virtualizer.js";
+import { SessionsService, type DbMessage as Message } from "../../api/generated/index.js";
+import { ApiError } from "../../api/runtime.js";
+import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
 import { messages } from "../../stores/messages.svelte.js";
 import { readProgress } from "../../stores/read-progress.svelte.js";
 import { sessions } from "../../stores/sessions.svelte.js";
-import { ui } from "../../stores/ui.svelte.js";
+import { ui, type ScrollCall } from "../../stores/ui.svelte.js";
+import { toolCallFingerprint } from "../../utils/tool-call-fingerprint.js";
 import { setLocale } from "../../i18n/index.js";
 
 const virtualizerMock = vi.hoisted(() => ({
+  real: undefined as Virtualizer<HTMLElement, HTMLElement> | undefined,
   options: { count: 0 },
   scrollOffset: 0,
+  notify: () => {},
   scrollRect: { height: 200 },
   getVirtualItems: vi.fn<
     () => Array<{
@@ -23,18 +33,66 @@ const virtualizerMock = vi.hoisted(() => ({
   getTotalSize: vi.fn(() => 120),
   measureElement: vi.fn(),
   scrollToIndex: vi.fn(),
+  cancelScroll: vi.fn(),
   scrollToOffset: vi.fn(),
   getOffsetForIndex: vi.fn(),
 }));
 
-vi.mock("../../virtual/createVirtualizer.svelte.js", () => ({
-  createVirtualizer: (optsFn: () => { count: number }) => ({
-    get instance() {
-      virtualizerMock.options.count = optsFn().count;
-      return virtualizerMock;
+vi.mock("../../virtual/createVirtualizer.svelte.js", async (importOriginal) => {
+  const original =
+    await importOriginal<typeof import("../../virtual/createVirtualizer.svelte.js")>();
+  const { createSubscriber } = await import("svelte/reactivity");
+  return {
+    ...original,
+    createVirtualizer: (optsFn: Parameters<typeof original.createVirtualizer>[0]) => {
+      if (virtualizerMock.real) {
+        const instance = virtualizerMock.real;
+        const {
+          getScrollElement,
+          observeElementRect,
+          observeElementOffset,
+          scrollToFn,
+          measureElement,
+        } = instance.options;
+        return original.createVirtualizer(() => ({
+          ...optsFn(),
+          getScrollElement,
+          observeElementRect,
+          observeElementOffset,
+          scrollToFn,
+          measureElement,
+        }));
+      }
+      const subscribe = createSubscriber((update) => {
+        virtualizerMock.notify = update;
+      });
+      return {
+        get instance() {
+          subscribe();
+          virtualizerMock.options.count = optsFn().count;
+          return virtualizerMock;
+        },
+      };
     },
-  }),
-}));
+  };
+});
+
+vi.mock("@tanstack/virtual-core", async (importOriginal) => {
+  const original = await importOriginal<typeof import("@tanstack/virtual-core")>();
+  return {
+    ...original,
+    Virtualizer: class extends original.Virtualizer<HTMLElement, HTMLElement> {
+      constructor(options: VirtualizerOptions<HTMLElement, HTMLElement>) {
+        super(options);
+        if (virtualizerMock.real) {
+          // Let the component own the same real instance whose scroll element the test observes.
+          virtualizerMock.real.setOptions(options);
+          return virtualizerMock.real;
+        }
+      }
+    },
+  };
+});
 
 // @ts-ignore
 import MessageList from "./MessageList.svelte";
@@ -80,15 +138,36 @@ function setVirtualRows(count: number) {
   );
 }
 
+function realJumpScroll() {
+  const fixture = realVirtualizer(Virtualizer, {
+    count: messages.messages.length,
+    onChange: () => virtualizerMock.notify(),
+  });
+  virtualizerMock.real = fixture.instance;
+  return fixture;
+}
+
+async function flushScrollUpdates() {
+  await tick();
+  if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(0);
+  else await new Promise((resolve) => setTimeout(resolve, 0));
+  await tick();
+}
+
 describe("MessageList follow cancellation", () => {
   let component: ReturnType<typeof mount> | undefined;
   let rafSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     vi.clearAllMocks();
+    virtualizerMock.getOffsetForIndex.mockReset();
     virtualizerMock.scrollOffset = 0;
+    virtualizerMock.scrollToIndex.mockReset();
     virtualizerMock.scrollRect.height = 200;
+    inSessionSearch.close();
+    inSessionSearch.clearQuery();
     messages.clear();
+    sessions.activeSessionNotFound = false;
     sessions.activeSessionId = "s1";
     messages.sessionId = "s1";
     messages.messages = [makeMessage(10)];
@@ -113,18 +192,326 @@ describe("MessageList follow cancellation", () => {
       });
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     setLocale("en");
     if (component) {
-      unmount(component);
+      await unmount(component);
       component = undefined;
     }
+    virtualizerMock.real?._didMount()();
+    virtualizerMock.real = undefined;
+    vi.useRealTimers();
     rafSpy.mockRestore();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    inSessionSearch.close();
+    inSessionSearch.clearQuery();
     messages.clear();
     sessions.activeSessionId = null;
     ui.followLatest = false;
     readProgress.reset();
     document.body.innerHTML = "";
+  });
+
+  it("opens a collapsed empty row when a jump targets a message inside it", async () => {
+    ui.followLatest = false;
+    const empty = (ordinal: number) => ({
+      ...makeMessage(ordinal),
+      content: "",
+      content_length: 0,
+    });
+    messages.messages = [makeMessage(10), empty(11), empty(12), makeMessage(13)];
+    setVirtualRows(3);
+    component = mount(MessageList, { target: document.body });
+    await flushScrollUpdates();
+    const row = document.querySelector<HTMLDetailsElement>("details.empty-run")!;
+    expect(row.open).toBe(false);
+    expect(row.querySelectorAll(".role-label")).toHaveLength(0);
+
+    component.scrollToOrdinal(12);
+    await flushScrollUpdates();
+
+    expect(row.open).toBe(true);
+    expect([...row.querySelectorAll(".role-label")].map((el) => el.textContent)).toEqual([
+      "Assistant",
+      "User",
+    ]);
+  });
+
+  it("selects the clicked card inside an open empty row", async () => {
+    ui.followLatest = false;
+    const empty = (ordinal: number, role: string) => ({
+      ...makeMessage(ordinal),
+      role,
+      content: "",
+      content_length: 0,
+    });
+    messages.messages = [makeMessage(10), empty(11, "assistant"), empty(12, "user")];
+    setVirtualRows(2);
+    component = mount(MessageList, { target: document.body });
+    await flushScrollUpdates();
+    component.scrollToOrdinal(11);
+    await flushScrollUpdates();
+
+    const userCard = document.querySelector<HTMLElement>('[data-message-ordinal="12"]')!;
+    userCard.querySelector<HTMLElement>(".role-label")!.click();
+    expect(ui.selectedOrdinal).toBe(12);
+  });
+
+  it("lands a jump on the target card of an open empty row", async () => {
+    ui.followLatest = false;
+    const empty = (ordinal: number) => ({
+      ...makeMessage(ordinal),
+      content: "",
+      content_length: 0,
+    });
+    messages.messages = [makeMessage(10), empty(11), empty(12)];
+    setVirtualRows(2);
+    virtualizerMock.getOffsetForIndex.mockReturnValue([100, "start"]);
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: Element,
+    ) {
+      const top = this.matches('[data-message-ordinal="12"]')
+        ? 260
+        : this.matches(".virtual-row")
+          ? 40
+          : 0;
+      return DOMRect.fromRect({ x: 0, y: top, width: 400, height: 100 });
+    });
+    component = mount(MessageList, { target: document.body });
+    await flushScrollUpdates();
+
+    component.scrollToOrdinal(12);
+
+    await vi.waitFor(() => {
+      expect(virtualizerMock.scrollToOffset).toHaveBeenCalledWith(320);
+    });
+  });
+
+  it("keeps an ordinal jump on its message through an older load past five seconds", async () => {
+    const { flushFrames } = controlFrames();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let now = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    ui.followLatest = false;
+    messages.messages = [makeMessage(10), makeMessage(11)];
+    const { element } = realJumpScroll();
+    component = mount(MessageList, { target: document.body });
+    await flushScrollUpdates();
+
+    component.scrollToOrdinal(11);
+    expect(element.scrollTop).toBe(120);
+    flushFrames();
+    await flushScrollUpdates();
+    messages.loadingOlder = true;
+    await flushScrollUpdates();
+    now = 6000;
+    await vi.advanceTimersByTimeAsync(6000);
+    messages.messages = [makeMessage(8), makeMessage(9), ...messages.messages];
+    messages.loadingOlder = false;
+    await flushScrollUpdates();
+
+    flushFrames();
+    await flushScrollUpdates();
+    expect(element.scrollTop).toBe(300);
+  });
+
+  it.each([false, true])(
+    "corrects an upward ordinal jump when an already measured preceding row grows with loadingOlder=%s",
+    async (loadingOlder) => {
+      const { flushFrames } = controlFrames();
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      ui.followLatest = false;
+      messages.messages = Array.from({ length: 10 }, (_, index) => makeMessage(index));
+      const { instance, element, measureRow } = realJumpScroll();
+      component = mount(MessageList, { target: document.body });
+      await flushScrollUpdates();
+      measureRow(0, 110);
+      element.scrollTop = 500;
+      await vi.advanceTimersByTimeAsync(0);
+      await flushScrollUpdates();
+      component.scrollToOrdinal(1);
+      flushFrames();
+      await flushScrollUpdates();
+      flushFrames();
+      expect(element.scrollTop).toBe(110);
+      expect(instance.scrollDirection).toBe("backward");
+
+      messages.loadingOlder = loadingOlder;
+      await flushScrollUpdates();
+      measureRow(0, 300);
+      instance.getVirtualItems();
+      await flushScrollUpdates();
+
+      expect(element.scrollTop).toBe(300);
+    },
+  );
+
+  it.each([125, 450])(
+    "ends the hold when scrolling to %s without a preceding input event",
+    async (offset) => {
+      const { flushFrames } = controlFrames();
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      ui.followLatest = false;
+      messages.hasOlder = false;
+      messages.messages = Array.from({ length: 10 }, (_, index) => makeMessage(index));
+      const { instance, element, measureRow } = realJumpScroll();
+      component = mount(MessageList, { target: document.body });
+      await flushScrollUpdates();
+      // The fixture owns geometry; forward its scrolling to the component's real event handler.
+      const container = document.querySelector<HTMLElement>(".message-list-scroll")!;
+      Object.defineProperty(container, "scrollTop", { get: () => element.scrollTop });
+      element.addEventListener("scroll", () => container.dispatchEvent(new Event("scroll")));
+      component.scrollToOrdinal(1);
+      flushFrames();
+      await flushScrollUpdates();
+      flushFrames();
+      await flushScrollUpdates();
+      expect(element.scrollTop).toBe(100);
+
+      element.scrollTop = offset;
+      await flushScrollUpdates();
+      flushFrames();
+      expect(element.scrollTop).toBe(offset);
+
+      // Isolate the expired hold from TanStack's normal compensation for row growth.
+      instance.shouldAdjustScrollPositionOnItemSizeChange = () => false;
+      measureRow(0, 300);
+      instance.getVirtualItems();
+      await flushScrollUpdates();
+      flushFrames();
+      expect(element.scrollTop).toBe(offset);
+    },
+  );
+
+  it("cancels reconciliation when the jump expires between newest-first appends", async () => {
+    const { flushFrames } = controlFrames();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let now = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    ui.followLatest = false;
+    ui.sortNewestFirst = true;
+    messages.messages = [makeMessage(10), makeMessage(11), makeMessage(12), makeMessage(13)];
+    const { instance, element, measureRow } = realJumpScroll();
+    component = mount(MessageList, { target: document.body });
+    await flushScrollUpdates();
+    measureRow(0, 200);
+    measureRow(1, 300);
+    measureRow(2, 100);
+    measureRow(3, 150);
+    component.scrollToOrdinal(11);
+    flushFrames();
+    await flushScrollUpdates();
+    flushFrames();
+    expect(element.scrollTop).toBe(500);
+
+    now = 4999;
+    await vi.advanceTimersByTimeAsync(4999);
+    messages.messages = [...messages.messages, makeMessage(14)];
+    await flushScrollUpdates();
+    measureRow(0, 300);
+    await flushScrollUpdates();
+    expect(element.scrollTop).toBe(800);
+    now = 5000;
+    await vi.advanceTimersByTimeAsync(1);
+    messages.messages = [...messages.messages, makeMessage(15)];
+    await flushScrollUpdates();
+    instance.getVirtualItems();
+    flushFrames();
+    await flushScrollUpdates();
+    flushFrames();
+
+    expect(element.scrollTop).toBe(800);
+  });
+
+  it.each(["search closes", "match disappears", "ordinal target is hidden"])(
+    "ends scrolling when the %s",
+    async (change) => {
+      const { frames, flushFrames } = controlFrames();
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      ui.followLatest = false;
+      messages.hasOlder = false;
+      const ordinalJump = change === "ordinal target is hidden";
+      const ordinal = ordinalJump ? 4 : 11;
+      const offset = ordinalJump ? 400 : 1200;
+      messages.messages = Array.from({ length: ordinalJump ? 12 : 40 }, (_, index) => ({
+        ...makeMessage(index),
+        content: index === 11 ? "needle" : `msg ${index}`,
+      }));
+      const { instance, element, measureRow } = realJumpScroll();
+      const scrollSpy = vi.spyOn(instance, "scrollToIndex");
+      const offsetSpy = vi.spyOn(instance, "scrollToOffset");
+      component = mount(MessageList, { target: document.body });
+      await flushScrollUpdates();
+      if (ordinalJump) {
+        ui.selectedOrdinal = ordinal;
+        component.scrollToOrdinal(ordinal);
+      } else {
+        measureRow(0, 200);
+        inSessionSearch.open();
+        inSessionSearch.query = "needle";
+        await vi.advanceTimersByTimeAsync(200);
+        expect(inSessionSearch.resolvedCurrent?.ordinal).toBe(ordinal);
+      }
+      await flushScrollUpdates();
+      expect(element.scrollTop).toBe(offset);
+      expect(frames.size).toBeGreaterThan(0);
+      expect(ui.selectedOrdinal).toBe(ordinal);
+
+      if (change === "search closes") inSessionSearch.close();
+      else ui.setBlockVisible(ordinalJump ? "user" : "assistant", false);
+      await flushScrollUpdates();
+      scrollSpy.mockClear();
+      offsetSpy.mockClear();
+      // Isolate queued index correction from ordinary size anchoring.
+      instance.shouldAdjustScrollPositionOnItemSizeChange = () => false;
+      measureRow(0, ordinalJump ? 300 : 500);
+      instance.getVirtualItems();
+      flushFrames();
+      await flushScrollUpdates();
+      flushFrames();
+      if (change === "search closes") {
+        await vi.advanceTimersByTimeAsync(100);
+        expect(scrollSpy).not.toHaveBeenCalled();
+        expect(offsetSpy).not.toHaveBeenCalled();
+      }
+
+      expect(element.scrollTop).toBe(offset);
+      expect(ui.selectedOrdinal).toBe(ordinal);
+    },
+  );
+
+  it("counts a missing session once through a failed Retry, then again after recovery", async () => {
+    const previousSessions = sessions.sessions;
+    onTestFinished(() => {
+      sessions.sessions = previousSessions;
+    });
+    const session = { id: "s1" } as NonNullable<typeof sessions.activeSession>;
+    sessions.sessions = [session];
+    const request = vi
+      .spyOn(SessionsService, "getApiV1SessionsById")
+      .mockRejectedValue(new ApiError(404, "Missing"));
+    await sessions.refreshActiveSession();
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    expect(reportErrorShown).not.toHaveBeenCalled();
+    messages.messages = [];
+    messages.loading = true;
+    await tick();
+    expect(reportErrorShown).not.toHaveBeenCalled();
+    messages.loading = false;
+    await tick();
+    expect(reportErrorShown).toHaveBeenCalledExactlyOnceWith("session");
+    document.querySelector<HTMLButtonElement>("button")!.click();
+    await tick();
+    await tick();
+    expect(reportErrorShown).toHaveBeenCalledTimes(1);
+    request.mockResolvedValueOnce(session);
+    document.querySelector<HTMLButtonElement>("button")!.click();
+    await vi.waitFor(() => expect(document.querySelector("button")).toBeNull());
+    await sessions.refreshActiveSession();
+    await tick();
+    expect(reportErrorShown).toHaveBeenCalledTimes(2);
   });
 
   it("renders empty and loading states in Simplified Chinese", async () => {
@@ -180,6 +567,329 @@ describe("MessageList follow cancellation", () => {
     expect(virtualizerMock.scrollToIndex).toHaveBeenCalledWith(0, {
       align: "start",
     });
+  });
+
+  function withCall(message: Message, toolUseId: string, inputJson?: string): Message {
+    return {
+      ...message,
+      tool_calls: [
+        { tool_name: "Grep", category: "Search", tool_use_id: toolUseId, input_json: inputJson },
+      ],
+    } as Message;
+  }
+
+  type JumpList = ReturnType<typeof mount> & {
+    scrollToOrdinal: (ordinal: number, call?: ScrollCall) => void;
+  };
+
+  it("cancels a queued jump before the first frame of a new session", async () => {
+    const { frames, flushFrames } = controlFrames();
+    ui.followLatest = false;
+    messages.messages = Array.from({ length: 40 }, (_, index) => makeMessage(index));
+    const { instance, element, measureRow } = realJumpScroll();
+    component = mount(MessageList, { target: document.body });
+    await flushScrollUpdates();
+    expect(instance.getVirtualItems().some((item) => item.index === 30)).toBe(false);
+    ui.selectedOrdinal = 30;
+    component.scrollToOrdinal(30);
+    expect(element.scrollTop).toBeGreaterThan(0);
+    expect(frames.size).toBeGreaterThan(0);
+
+    sessions.activeSessionId = "s2";
+    messages.sessionId = "s2";
+    messages.messages = Array.from({ length: 40 }, (_, index) => ({
+      ...makeMessage(index),
+      session_id: "s2",
+    }));
+    await flushScrollUpdates();
+    expect(element.scrollTop).toBe(0);
+    expect(instance.options.getItemKey(30)).toBe("s2-m-30");
+    measureRow(0, 300);
+    instance.getVirtualItems();
+    flushFrames();
+    // Check before the staged jump's promise resumes and can cancel itself.
+    expect(element.scrollTop).toBe(0);
+    await flushScrollUpdates();
+    flushFrames();
+    expect(element.scrollTop).toBe(0);
+    expect(ui.selectedOrdinal).toBe(30);
+  });
+
+  it("keeps following latest when the previous tool target is rewritten", async () => {
+    const { flushFrames } = controlFrames();
+    ui.followLatest = false;
+    messages.messages = [makeMessage(10), withCall(makeMessage(11), "grep-call"), makeMessage(12)];
+    const { instance, element, measureRow } = realJumpScroll();
+    component = mount(MessageList, { target: document.body });
+    await flushScrollUpdates();
+    component.scrollToOrdinal(11, { index: 0, toolUseId: "grep-call" });
+    await flushScrollUpdates();
+    expect(element.scrollTop).toBe(100);
+
+    component.scrollToLatest();
+    messages.messages = [makeMessage(10), withCall(makeMessage(11), "other-call"), makeMessage(12)];
+    await flushScrollUpdates();
+    measureRow(0, 300);
+    instance.getVirtualItems();
+    await flushScrollUpdates();
+    flushFrames();
+    await flushScrollUpdates();
+    flushFrames();
+
+    expect(element.scrollTop).toBe(400);
+  });
+
+  it.each([
+    "tool rewrite",
+    "manual scroll",
+    "new ordinal request",
+    "tool rewrite with newer selection",
+    "tool rewrite between estimate frames",
+  ])("cancels a queued jump after a %s", async (change) => {
+    const { frames, flushFrames } = controlFrames();
+    // Advance the staged wait while leaving TanStack's earlier reconciliation queued.
+    const flushEstimateFrame = () => {
+      const [id, callback] = [...frames.entries()].at(-1)!;
+      frames.delete(id);
+      callback(0);
+    };
+    ui.followLatest = false;
+    messages.messages = [makeMessage(10), withCall(makeMessage(11), "grep-call")];
+    const { instance, element, measureRow } = realJumpScroll();
+    component = mount(MessageList, { target: document.body });
+    await flushScrollUpdates();
+
+    if (change === "tool rewrite between estimate frames") {
+      instance.setOptions({ ...instance.options, overscan: 0 });
+      expect(instance.getVirtualItems().some((item) => item.index === 1)).toBe(false);
+    }
+    ui.selectedOrdinal = 11;
+    component.scrollToOrdinal(11, { index: 0, toolUseId: "grep-call" });
+    await flushScrollUpdates();
+    expect(element.scrollTop).toBe(change === "tool rewrite between estimate frames" ? 120 : 100);
+
+    if (change === "tool rewrite between estimate frames") {
+      flushEstimateFrame();
+      await flushScrollUpdates();
+    }
+    const loaded = deferred<void>();
+    if (change.startsWith("tool rewrite")) {
+      if (change === "tool rewrite with newer selection") ui.selectedOrdinal = 10;
+      messages.messages = [makeMessage(10), withCall(makeMessage(11), "other-call")];
+    } else if (change === "manual scroll") {
+      document
+        .querySelector<HTMLElement>(".message-list-scroll")!
+        .dispatchEvent(new Event("wheel"));
+    } else {
+      vi.spyOn(messages, "ensureOrdinalLoaded").mockReturnValue(loaded.promise);
+      component.scrollToOrdinal(0);
+      expect(messages.ensureOrdinalLoaded).toHaveBeenCalledWith(0);
+    }
+    await flushScrollUpdates();
+    if (change === "tool rewrite between estimate frames") {
+      flushEstimateFrame();
+      await flushScrollUpdates();
+    }
+    // At the top, default size anchoring cannot mask a stale index reconcile.
+    instance.options.scrollToFn(0, {}, instance);
+    measureRow(0, 300);
+    instance.getVirtualItems();
+    await flushScrollUpdates();
+    flushFrames();
+    await flushScrollUpdates();
+    flushFrames();
+
+    expect(element.scrollTop).toBe(0);
+    expect(ui.selectedOrdinal).toBe(
+      change.startsWith("tool rewrite")
+        ? change === "tool rewrite with newer selection"
+          ? 10
+          : null
+        : 11,
+    );
+    loaded.resolve();
+    await flushScrollUpdates();
+    flushFrames();
+    await flushScrollUpdates();
+    flushFrames();
+    await flushScrollUpdates();
+  });
+
+  it.each([
+    { newestFirst: false, align: "end" },
+    { newestFirst: true, align: "start" },
+  ])("follows the latest row with newest-first=$newestFirst", async ({ newestFirst, align }) => {
+    const { flushFrames } = controlFrames();
+    ui.sortNewestFirst = newestFirst;
+    messages.messages = [makeMessage(10), makeMessage(11), makeMessage(12), makeMessage(13)];
+    const { instance } = realJumpScroll();
+    const scrollSpy = vi.spyOn(instance, "scrollToIndex");
+    component = mount(MessageList, { target: document.body });
+    await flushScrollUpdates();
+    flushFrames();
+    await flushScrollUpdates();
+    flushFrames();
+    await flushScrollUpdates();
+
+    expect(scrollSpy.mock.lastCall?.[1]?.align).toBe(align);
+  });
+
+  it("drops a jump to a tool call once its ordinal holds a different message", async () => {
+    vi.spyOn(messages, "ensureOrdinalLoaded").mockImplementation(async () => {
+      // A resync renumbered the transcript, so ordinal 0 now holds another call.
+      messages.messages = [withCall(makeMessage(0), "other-call"), makeMessage(10)];
+    });
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+
+    ui.setFollowLatest(false);
+    ui.selectedOrdinal = 0;
+    (component as JumpList).scrollToOrdinal(0, { index: 0, toolUseId: "grep-call" });
+    await vi.waitFor(() => expect(ui.selectedOrdinal).toBeNull());
+    expect(virtualizerMock.scrollToIndex).not.toHaveBeenCalled();
+  });
+
+  // Roo Code builds tool IDs from the tool name and message ordinal, so a rewrite can reuse one for another call.
+  it("drops a jump when a rewrite reuses the tool ID for a call with other input", async () => {
+    vi.spyOn(messages, "ensureOrdinalLoaded").mockImplementation(async () => {
+      messages.messages = [
+        withCall(makeMessage(0), "roocode:Grep:0", '{"pattern":"other"}'),
+        makeMessage(10),
+      ];
+    });
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+
+    ui.setFollowLatest(false);
+    ui.selectedOrdinal = 0;
+    (component as JumpList).scrollToOrdinal(0, {
+      index: 0,
+      toolUseId: "roocode:Grep:0",
+      fingerprint: toolCallFingerprint("Grep", '{"pattern":"config"}'),
+    });
+    await vi.waitFor(() => expect(ui.selectedOrdinal).toBeNull());
+    expect(virtualizerMock.scrollToIndex).not.toHaveBeenCalled();
+  });
+
+  it("keeps a fingerprinted jump to the same call after messages are appended", async () => {
+    messages.loadedRevision = "r2";
+    vi.spyOn(messages, "ensureOrdinalLoaded").mockImplementation(async () => {
+      messages.messages = [
+        withCall(makeMessage(0), "roocode:Grep:0", '{"pattern":"config"}'),
+        makeMessage(10),
+      ];
+    });
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+
+    ui.setFollowLatest(false);
+    ui.selectedOrdinal = 0;
+    (component as JumpList).scrollToOrdinal(0, {
+      index: 0,
+      toolUseId: "roocode:Grep:0",
+      fingerprint: toolCallFingerprint("Grep", '{"pattern":"config"}'),
+    });
+    await vi.waitFor(() => {
+      expect(virtualizerMock.scrollToIndex).toHaveBeenCalledWith(0, { align: "start" });
+    });
+    expect(ui.selectedOrdinal).toBe(0);
+  });
+
+  it("drops a jump to a call with no tool ID once a rewrite moves the transcript revision", async () => {
+    messages.loadedRevision = "r1";
+    vi.spyOn(messages, "ensureOrdinalLoaded").mockImplementation(async () => {
+      // A resync replaced the call at this position with another one that also has no tool ID.
+      messages.messages = [withCall(makeMessage(0), ""), makeMessage(10)];
+      messages.loadedRevision = "r2";
+    });
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+
+    ui.setFollowLatest(false);
+    ui.selectedOrdinal = 0;
+    (component as JumpList).scrollToOrdinal(0, { index: 0, toolUseId: "", revision: "r1" });
+    await vi.waitFor(() => expect(ui.selectedOrdinal).toBeNull());
+    expect(virtualizerMock.scrollToIndex).not.toHaveBeenCalled();
+  });
+
+  it("drops a jump to a whole message once a rewrite moves the transcript revision", async () => {
+    messages.loadedRevision = "r1";
+    vi.spyOn(messages, "ensureOrdinalLoaded").mockImplementation(async () => {
+      messages.messages = [makeMessage(0), makeMessage(10)];
+      messages.loadedRevision = "r2";
+    });
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+
+    ui.setFollowLatest(false);
+    ui.selectedOrdinal = 0;
+    (component as JumpList).scrollToOrdinal(0, { toolUseId: "", revision: "r1" });
+    await vi.waitFor(() => expect(ui.selectedOrdinal).toBeNull());
+    expect(virtualizerMock.scrollToIndex).not.toHaveBeenCalled();
+  });
+
+  it("keeps a jump to a whole message while the revision still matches", async () => {
+    messages.loadedRevision = "r1";
+    vi.spyOn(messages, "ensureOrdinalLoaded").mockImplementation(async () => {
+      messages.messages = [makeMessage(0), makeMessage(10)];
+    });
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+
+    ui.setFollowLatest(false);
+    ui.selectedOrdinal = 0;
+    (component as JumpList).scrollToOrdinal(0, { toolUseId: "", revision: "r1" });
+    await vi.waitFor(() => {
+      expect(virtualizerMock.scrollToIndex).toHaveBeenCalledWith(0, { align: "start" });
+    });
+    expect(ui.selectedOrdinal).toBe(0);
+  });
+
+  it("keeps a jump to a call with no tool ID while the revision still matches", async () => {
+    messages.loadedRevision = "r1";
+    vi.spyOn(messages, "ensureOrdinalLoaded").mockImplementation(async () => {
+      messages.messages = [withCall(makeMessage(0), ""), makeMessage(10)];
+    });
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+
+    ui.setFollowLatest(false);
+    ui.selectedOrdinal = 0;
+    (component as JumpList).scrollToOrdinal(0, { index: 0, toolUseId: "", revision: "r1" });
+    await vi.waitFor(() => {
+      expect(virtualizerMock.scrollToIndex).toHaveBeenCalledWith(0, { align: "start" });
+    });
+    expect(ui.selectedOrdinal).toBe(0);
+  });
+
+  it("keeps a jump to a tool call when new messages arrive under it", async () => {
+    messages.loadedRevision = "r1";
+    vi.spyOn(messages, "ensureOrdinalLoaded").mockImplementation(async () => {
+      messages.messages = [withCall(makeMessage(0), "grep-call"), makeMessage(10)];
+      // A sync appends a message while the list re-renders the loaded page.
+      requestAnimationFrame(() => {
+        messages.messages = [...messages.messages, makeMessage(11)];
+        messages.loadedRevision = "r2";
+      });
+    });
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+
+    ui.setFollowLatest(false);
+    ui.selectedOrdinal = 0;
+    (component as JumpList).scrollToOrdinal(0, { index: 0, toolUseId: "grep-call" });
+    await vi.waitFor(() => {
+      expect(virtualizerMock.scrollToIndex).toHaveBeenCalledWith(0, { align: "start" });
+    });
+    expect(ui.selectedOrdinal).toBe(0);
   });
 
   it("renders an unknown revision divider at the earliest message", async () => {
@@ -360,6 +1070,57 @@ describe("MessageList follow cancellation", () => {
     await new Promise((resolve) => window.setTimeout(resolve, 20));
 
     expect(readProgress.get("s1")?.token).toBe("current");
+  });
+
+  it("leaves cards of an open empty row unread until they are on screen", async () => {
+    const empty = (ordinal: number, role: string) => ({
+      ...makeMessage(ordinal),
+      role,
+      content: "",
+      content_length: 0,
+    });
+    messages.messages = [makeMessage(0), empty(1, "assistant"), empty(2, "user")];
+    messages.messageCount = 3;
+    messages.activeSessionToken = "current";
+    ui.followLatest = false;
+    const rows = (emptyRowStart: number) => [
+      { index: 0, key: "row-0", start: 0, end: 100 },
+      { index: 1, key: "row-1", start: emptyRowStart, end: emptyRowStart + 100 },
+    ];
+    // The empty row starts below the 200px viewport.
+    virtualizerMock.getVirtualItems.mockReturnValue(rows(300));
+    readProgress.baseline("s1", "previous", 0);
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: Element,
+    ) {
+      if (this.matches(".message-list-scroll")) {
+        return DOMRect.fromRect({ x: 0, y: 0, width: 400, height: 200 });
+      }
+      const top = this.matches('[data-message-ordinal="1"]')
+        ? 120
+        : this.matches('[data-message-ordinal="2"]')
+          ? 260
+          : 0;
+      return DOMRect.fromRect({ x: 0, y: top, width: 400, height: 60 });
+    });
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+    expect(readProgress.get("s1")?.token).toBe("previous");
+
+    const row = document.querySelector<HTMLDetailsElement>("details.empty-run")!;
+    row.querySelector("summary")!.click();
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    await tick();
+    expect(row.open).toBe(true);
+
+    // Scroll so the open row's first card is on screen and its second is not.
+    virtualizerMock.getVirtualItems.mockReturnValue(rows(100));
+    document.querySelector(".message-list-scroll")!.dispatchEvent(new Event("scroll"));
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(readProgress.get("s1")?.token).toBe("previous");
   });
 
   it("rechecks visible progress when filters change after mounting", async () => {

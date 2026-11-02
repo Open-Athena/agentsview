@@ -20,6 +20,7 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/shellquote"
 )
 
 // resumeRequest is the JSON body for POST /api/v1/sessions/{id}/resume.
@@ -61,6 +62,14 @@ var resumeAgents = map[string]string{
 const syntheticModel = "<synthetic>"
 
 func resumeCommand(agent, tmpl, rawID, model string) string {
+	if parser.SharesSessionIDs(parser.AgentType(agent)) {
+		// A second file sharing a session id is stored under a derived id; the CLI resumes the original.
+		rawID = parser.BaseSessionID(rawID)
+	}
+	if agent == "codex" || agent == "traex" || agent == "augure-code" {
+		// Codex stores a revert page as <thread>_<rollout>; the CLI resumes the thread.
+		rawID = parser.CodexThreadIDFromSessionKey(rawID)
+	}
 	cmd := fmt.Sprintf(tmpl, shellQuote(rawID))
 	if !resumeAgentNeedsModel(agent) {
 		return cmd
@@ -220,23 +229,19 @@ func claudeMessagePointWindowsScript(
 	b.WriteString("try { ")
 	if cwd != "" {
 		b.WriteString("Set-Location -LiteralPath ")
-		b.WriteString(powerShellSingleQuote(cwd))
+		b.WriteString(shellquote.PowerShell(cwd))
 		b.WriteString("; ")
 	}
 	b.WriteString("Get-Content -Raw -Encoding UTF8 -LiteralPath ")
-	b.WriteString(powerShellSingleQuote(promptPath))
+	b.WriteString(shellquote.PowerShell(promptPath))
 	b.WriteString(" | & 'claude'")
 	if skipPermissions {
 		b.WriteString(" --dangerously-skip-permissions")
 	}
 	b.WriteString(" } finally { Remove-Item -LiteralPath ")
-	b.WriteString(powerShellSingleQuote(promptPath))
+	b.WriteString(shellquote.PowerShell(promptPath))
 	b.WriteString(" -Force -ErrorAction SilentlyContinue }")
 	return b.String()
-}
-
-func powerShellSingleQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
 func powerShellEncodedCommand(script string) string {

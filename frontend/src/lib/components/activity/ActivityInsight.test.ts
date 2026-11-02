@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+import { reportErrorShown } from "../../utils/telemetry.js";
+vi.mock("../../utils/telemetry.js", () => ({ reportErrorShown: vi.fn() }));
 import { describe, it, expect, vi, beforeEach } from "vite-plus/test";
 import { render, screen, fireEvent } from "@testing-library/svelte";
 import { tick } from "svelte";
@@ -13,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   setAgent: vi.fn(),
   navigate: vi.fn(),
   agent: "claude" as string,
+  requestAgent: undefined as string | undefined,
   serverVersion: {
     read_only: false,
   } as {
@@ -46,6 +49,9 @@ vi.mock("../../stores/insights.svelte.js", () => ({
     get agent() {
       return mocks.agent;
     },
+    get requestAgent() {
+      return mocks.requestAgent;
+    },
   },
 }));
 vi.mock("../../stores/router.svelte.js", () => ({
@@ -75,6 +81,7 @@ beforeEach(() => {
   }
   mocks.serverVersion = { read_only: false };
   mocks.agent = "claude";
+  mocks.requestAgent = undefined;
   mocks.getInsights.mockResolvedValue({ insights: [] });
 });
 
@@ -83,6 +90,17 @@ function settle() {
 }
 
 describe("ActivityInsight", () => {
+  it("reports the insight kind when generation fails", async () => {
+    mocks.generateInsight.mockImplementation(() => ({
+      abort: vi.fn(),
+      done: Promise.reject(new Error("Generation failed")),
+    }));
+    render(ActivityInsight, { dateFrom: "2026-06-15", dateTo: "2026-06-21" });
+    await settle();
+    await fireEvent.click(screen.getByRole("button", { name: /generate/i }));
+    await vi.waitFor(() => expect(reportErrorShown).toHaveBeenCalledExactlyOnceWith("insight"));
+  });
+
   it("fetches insights with both date bounds (full identity)", async () => {
     render(ActivityInsight, { dateFrom: "2026-06-15", dateTo: "2026-06-21" });
     await settle();
@@ -115,7 +133,7 @@ describe("ActivityInsight", () => {
     expect(screen.getByRole("button", { name: /generate/i })).toBeTruthy();
   });
 
-  it("generates for the current range", async () => {
+  it("generates for the current range using the server's default agent", async () => {
     mocks.generateInsight.mockReturnValue({
       abort: vi.fn(),
       done: new Promise(() => {}),
@@ -128,7 +146,7 @@ describe("ActivityInsight", () => {
         type: "daily_activity",
         date_from: "2026-06-15",
         date_to: "2026-06-21",
-        agent: "claude",
+        agent: undefined,
       }),
       expect.any(Function),
     );
@@ -146,6 +164,7 @@ describe("ActivityInsight", () => {
 
   it("generates with the selected agent, not a hardcoded one", async () => {
     mocks.agent = "codex";
+    mocks.requestAgent = "codex";
     mocks.generateInsight.mockReturnValue({
       abort: vi.fn(),
       done: new Promise(() => {}),

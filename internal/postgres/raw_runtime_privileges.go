@@ -10,17 +10,20 @@ import (
 )
 
 // These are the grants used by Project, SettlePendingSignals, generation
-// selection/rollout and supported raw/legacy curation. Cascading session deletes
-// do not require DELETE on child payload tables. Row locks on raw_session_groups
-// require UPDATE even though its immutable group identity is never rewritten.
+// selection/rollout and supported raw/legacy curation. Friction rows are replaced
+// when their rule version is stale; other child payload deletes follow the
+// sessions foreign key. Row locks on raw_session_groups require UPDATE even
+// though its immutable group identity is never rewritten.
 var hostedProjectionPrivileges = []struct{ table, privileges string }{
 	{"sessions", "SELECT,INSERT,UPDATE,DELETE"},
 	{"messages", "SELECT,INSERT"},
 	{"tool_calls", "SELECT,INSERT"},
 	{"tool_result_events", "SELECT,INSERT"},
 	{"usage_events", "SELECT,INSERT"},
+	{"session_plan_usage", "SELECT,INSERT"},
 	{"secret_findings", "SELECT,INSERT"},
-	{"excluded_sessions", "SELECT,INSERT"},
+	{"friction_findings", "SELECT,INSERT,DELETE"},
+	{"excluded_sessions", "SELECT,INSERT,UPDATE"},
 	{"session_aliases", "SELECT"},
 	{"starred_sessions", "SELECT,INSERT,DELETE"},
 	{"pinned_messages", "SELECT,INSERT,UPDATE,DELETE"},
@@ -28,6 +31,7 @@ var hostedProjectionPrivileges = []struct{ table, privileges string }{
 	{"raw_projection_generations", "SELECT,INSERT"},
 	{"raw_session_groups", "SELECT,INSERT,UPDATE"},
 	{"raw_content_revisions", "SELECT,INSERT,UPDATE"},
+	{"raw_message_dialogue", "SELECT,INSERT,UPDATE,DELETE"},
 	{"raw_session_branches", "SELECT,INSERT,UPDATE"},
 	{"session_sources", "SELECT,INSERT,UPDATE,DELETE"},
 	{"raw_source_contributions", "SELECT,INSERT"},
@@ -62,6 +66,24 @@ func CheckHostedRuntimeWritable(ctx context.Context, database *sql.DB, schema st
 		if err = checkHostedTablePrivileges(ctx, database, schema, grant.table, grant.privileges); err != nil {
 			return err
 		}
+	}
+	// Missing columns count as missing grants: a runtime started before owner
+	// provisioning adds them gets the provisioning message, not a SQL error.
+	var observationsWritable bool
+	err = database.QueryRowContext(ctx, `SELECT count(*) = 3 AND COALESCE(bool_and(has_column_privilege(a.attrelid, a.attnum, 'UPDATE')), false) FROM pg_attribute a WHERE a.attrelid = to_regclass(format('%I.tool_calls', $1::text)) AND a.attname IN ('observed_outcome', 'observed_repeat', 'sequence_ending') AND NOT a.attisdropped`, schema).Scan(&observationsWritable)
+	if err != nil {
+		return fmt.Errorf("checking tool_calls observation privileges: %w", err)
+	}
+	if !observationsWritable {
+		return errors.New("hosted runtime cannot update tool_calls observed_outcome, observed_repeat, and sequence_ending; owner provisioning required")
+	}
+	var dialogueWritable bool
+	err = database.QueryRowContext(ctx, `SELECT COALESCE(bool_and(has_column_privilege(a.attrelid, a.attnum, 'UPDATE')), false) FROM pg_attribute a WHERE a.attrelid = to_regclass(format('%I.messages', $1::text)) AND a.attname = 'dialogue_text' AND NOT a.attisdropped`, schema).Scan(&dialogueWritable)
+	if err != nil {
+		return fmt.Errorf("checking message dialogue privileges: %w", err)
+	}
+	if !dialogueWritable {
+		return errors.New("hosted runtime cannot update messages.dialogue_text; owner provisioning required")
 	}
 	// nextval accepts USAGE or UPDATE. GENERATED AS IDENTITY does not require
 	// sequence privileges; neither does a provisioned sequence-free ID default.

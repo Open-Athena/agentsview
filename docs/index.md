@@ -10,12 +10,12 @@ sessions. A background server imports recorded sessions into a SQLite database
 on your machine. The web interface, desktop app, command line, and APIs read
 that archive.
 
-New here? The [product overview](/) explains what AgentsView is for, and the
-[five-minute guide](/guide/) walks the whole loop with screenshots. The pages
+New here? The [product overview](/){target=_self} explains what AgentsView is for, and the
+[five-minute guide](/guide/){target=_self} walks the whole loop with screenshots. The pages
 here explain how to use and maintain each feature.
 
 These guides follow `main` and may include changes newer than the latest
-release, **v0.44.0**. Check the [changelog](/docs/changelog/) for what each
+release, **v0.46.1**. Check the [changelog](/docs/changelog/) for what each
 release includes.
 
 <p class="hero-actions">
@@ -36,7 +36,10 @@ release includes.
 | Score session health and outcomes                 | [Session Intelligence](/docs/session-intelligence/)                                                                                                                                                        |
 | Browse extracted, provenance-linked knowledge     | [Recall](/docs/recall/)                                                                                                                                                                                    |
 | Give agents and scripts access to the archive     | [MCP Server](/docs/mcp/) and [Session API](/docs/session-api/)                                                                                                                                             |
-| Share sessions across machines                    | [Hosted Raw Sync](/docs/hosted-raw-sync/), [PostgreSQL Sync](/docs/pg-sync/), [ClickHouse Sync](/docs/clickhouse-sync/), [DuckDB Mirror](/docs/duckdb/), [Filesystem Session Sync](/docs/filesystem-sync/) |
+| Share sessions across machines                    | [Local Session Archive](https://agentsview.io/docs/commands/#agentsview-archive), [Hosted Raw Sync](/docs/hosted-raw-sync/), [PostgreSQL Sync](/docs/pg-sync/), [ClickHouse Sync](/docs/clickhouse-sync/), [DuckDB Mirror](/docs/duckdb/), [Filesystem Session Sync](/docs/filesystem-sync/) |
+| Sync Claude.ai or import chat exports | [Chat Import](/docs/chat-import/) |
+| Fetch Codex cloud chats | [Codex Cloud](/docs/configuration/#codex-cloud) |
+| Sync a remote machine over SSH | [SSH Remote Sync](/docs/remote-access/#ssh-remote-sync) |
 | Configure discovery, paths, and settings          | [Configuration](/docs/configuration/)                                                                                                                                                                      |
 | Look up a command or flag                         | [CLI Reference](/docs/commands/)                                                                                                                                                                           |
 
@@ -52,7 +55,9 @@ commands can read the archive directly. See
 with full-text indexes. Optional backends extend it:
 [PostgreSQL](/docs/pg-sync/) or [ClickHouse](/docs/clickhouse-sync/) for a
 remote read-only copy and [DuckDB](/docs/duckdb/) for analytical reads. All
-three are mirrors pushed from SQLite, never the source of truth.
+three can receive mirrors pushed from SQLite. Alternatively,
+[hosted raw sync](/docs/hosted-raw-sync/) can retain original provider files and
+parse them into PostgreSQL without a local SQLite archive or a separate push.
 
 <img src="/docs/assets/static/architecture.svg" alt="AgentsView architecture: agent sessions sync into SQLite with FTS5 search, served via REST API, SSE events, and embedded Svelte SPA" style="width: 100%; max-width: 960px; margin: 1.5rem auto; display: block;" />
 
@@ -66,8 +71,9 @@ Session data stays on your machine by default. The server binds to `127.0.0.1`
 unless you explicitly configure [remote access](/docs/remote-access/). Data
 leaves the machine only for features you choose, such as hosted raw sync, a
 PostgreSQL or ClickHouse target, remote DuckDB access, Generated Insights, or
-publishing a session to GitHub. An anonymous, content-free daemon liveness ping
-is the only telemetry, and `AGENTSVIEW_TELEMETRY_ENABLED=0` disables it.
+publishing a session to GitHub. Telemetry is an anonymous, content-free daemon
+liveness ping plus app-open and core-action events the web UI reports through
+the server, and `AGENTSVIEW_TELEMETRY_ENABLED=0` disables all of them.
 
 ## Human and machine-readable pages
 

@@ -105,6 +105,20 @@ func (db *DB) stripStoredToolResultRows(
 	})
 }
 
+func soleProjectedToolResultContent(contents []string) (string, bool) {
+	var sole string
+	for _, content := range contents {
+		if content == "" {
+			continue
+		}
+		if sole != "" {
+			return "", false
+		}
+		sole = content
+	}
+	return sole, sole != ""
+}
+
 // rewriteStoredToolResultRows rewrites both stored tool-result tables in one
 // transaction using the given projection. Direct row updates preserve event
 // coordinates and metadata. The projection is called once per stored content
@@ -221,8 +235,8 @@ func (db *DB) rewriteStoredToolResultRows(
 		if calls[i].content == "" {
 			continue
 		}
-		eventsForCall := eventContents[calls[i].key]
-		if len(eventsForCall) == 1 && calls[i].content == eventsForCall[0] {
+		sole, ok := soleProjectedToolResultContent(eventContents[calls[i].key])
+		if ok && calls[i].content == sole {
 			calls[i].length = len(calls[i].content)
 			calls[i].content = ""
 		}
@@ -232,11 +246,11 @@ func (db *DB) rewriteStoredToolResultRows(
 		callIndexes[calls[i].id] = i
 	}
 	for _, call := range allCalls {
-		eventsForCall := eventContents[call.key]
-		if call.content != "" || len(eventsForCall) != 1 {
+		sole, ok := soleProjectedToolResultContent(eventContents[call.key])
+		if call.content != "" || !ok {
 			continue
 		}
-		length := len(eventsForCall[0])
+		length := len(sole)
 		if call.length == length {
 			continue
 		}
@@ -266,6 +280,11 @@ func (db *DB) rewriteStoredToolResultRows(
 			SET content = ?, content_length = ?
 			WHERE rowid = ?`, update.content, update.length, update.id); err != nil {
 			return false, fmt.Errorf("updating orphaned tool result event: %w", err)
+		}
+	}
+	for _, update := range events {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tool_call_occurrence_agent_state WHERE session_id=? AND message_ordinal=? AND call_index=?`, sessionID, update.key.messageOrdinal, update.key.callIndex); err != nil {
+			return false, fmt.Errorf("invalidating tool result coordinates: %w", err)
 		}
 	}
 	if err := bumpTranscriptRevisionTx(tx, sessionID); err != nil {

@@ -4,6 +4,9 @@ import { ApiError } from "../api/runtime.js";
 import type { SearchResponse } from "../api/generated/index.js";
 import type { DbContentMatch, ServiceContentSearchResult } from "../api/generated/index.js";
 import { SEARCH_MODE_STORAGE_KEY, createSearchStore, type SearchMode } from "./search.svelte.js";
+import { reportErrorShown, reportTelemetry } from "../utils/telemetry.js";
+
+vi.mock("../utils/telemetry.js", () => ({ reportTelemetry: vi.fn(), reportErrorShown: vi.fn() }));
 
 vi.mock("../api/generated/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/generated/index.js")>();
@@ -22,6 +25,7 @@ const DEBOUNCE_MS = 300;
 function contentResult(matches: DbContentMatch[]): ServiceContentSearchResult {
   return {
     matches,
+    active_filter_applied: false,
     revision_bound: false,
     coverage: {
       status: "ready",
@@ -47,6 +51,7 @@ function fullTextResponse(query: string, count = 1): SearchResponse {
     results: Array.from({ length: count }, (_, index) => ({
       session_id: `full-${index}`,
       project: "alpha",
+      machine: "node-a",
       agent: "codex",
       name: `Result ${index}`,
       ordinal: index + 2,
@@ -61,6 +66,8 @@ function contentMatch(sessionId: string, ordinal: number, score: number): DbCont
   return {
     session_id: sessionId,
     project: "semantic-project",
+    machine: "node-a",
+    display_name: null,
     agent: "claude",
     location: "message",
     role: "user",
@@ -319,7 +326,7 @@ describe("SearchStore", () => {
   it.each([
     [
       501,
-      "Semantic search is unavailable: run agentsview embeddings build",
+      "Semantic search is unavailable: run agentsview index embeddings build",
       "semantic-unavailable",
     ],
     [503, "Embedding provider is temporarily unavailable; retry shortly", "generic"],
@@ -331,8 +338,13 @@ describe("SearchStore", () => {
     await runDebounce();
 
     expect(store.error).toEqual({ detail, kind });
+    expect(reportErrorShown).toHaveBeenCalledExactlyOnceWith("search");
     expect(store.results).toEqual([]);
     expect(store.isSearching).toBe(false);
+    searchService.getApiV1SearchContent.mockRejectedValueOnce(generatedApiError(status, detail));
+    store.retry();
+    await flushMicrotasks();
+    expect(vi.mocked(reportErrorShown).mock.calls).toEqual([["search"], ["search"]]);
   });
 
   it("keeps a full-text 501 generic: setup guidance only applies to semantic modes", async () => {
@@ -457,7 +469,7 @@ describe("SearchStore", () => {
     expect(store.isSearching).toBe(false);
   });
 
-  it("stale requests cannot overwrite newer results, loading, or error", async () => {
+  it.each(["empty", "error"])("ignores stale %s responses", async (outcome) => {
     const store = createSearchStore(memoryStorage());
     const stale = deferred<SearchResponse>();
     searchService.getApiV1Search.mockReturnValueOnce(stale.promise as never);
@@ -470,9 +482,13 @@ describe("SearchStore", () => {
     store.setMode("semantic");
     await flushMicrotasks();
 
-    stale.reject(new Error("late stale failure"));
+    if (outcome === "empty") stale.resolve(fullTextResponse("stale", 0));
+    else stale.reject(new Error("late stale failure"));
     await flushMicrotasks();
 
+    store.endSession();
+    expect(reportTelemetry).not.toHaveBeenCalledWith("search_empty");
+    expect(reportErrorShown).not.toHaveBeenCalled();
     expect(store.results.map((result) => result.session_id)).toEqual(["newer"]);
     expect(store.error).toBeNull();
     expect(store.isSearching).toBe(false);
@@ -499,13 +515,108 @@ describe("SearchStore", () => {
 
     store.search("cancel me");
     await runDebounce();
-    store.clear();
     completeRequest(fullTextResponse("cancel me", 2));
+    store.clear();
     await flushMicrotasks();
 
     expect(wasCancelled).toBe(true);
     expect(store.results).toEqual([]);
     expect(store.query).toBe("");
     expect(store.isSearching).toBe(false);
+  });
+});
+
+describe("SearchStore telemetry", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.mocked(reportTelemetry).mockClear();
+    vi.mocked(reportErrorShown).mockClear();
+    searchService.getApiV1Search.mockResolvedValue(fullTextResponse("needle"));
+    searchService.getApiV1SearchContent.mockResolvedValue(
+      contentResult([contentMatch("match", 1, 1)]),
+    );
+  });
+
+  it("counts a palette open once when it ends on an accepted empty result", async () => {
+    const store = createSearchStore(null);
+    const emptyCount = () =>
+      vi.mocked(reportTelemetry).mock.calls.filter(([event]) => event === "search_empty").length;
+    const run = async (query: string, results: number) => {
+      searchService.getApiV1Search.mockResolvedValue(fullTextResponse(query, results));
+      store.search(query);
+      await runDebounce();
+    };
+
+    await run("missing", 0);
+    await run("missing more", 0);
+    expect(emptyCount()).toBe(0);
+    store.endSession();
+    expect(emptyCount()).toBe(1);
+
+    await run("missing", 0);
+    await run("found", 1);
+    store.endSession();
+    await run("missing", 0);
+    store.search("still typing");
+    store.endSession();
+    await run("missing", 0);
+    store.clear();
+    store.endSession();
+    searchService.getApiV1Search.mockRejectedValueOnce(new Error("failed"));
+    store.search("failure");
+    await runDebounce();
+    store.endSession();
+    expect(emptyCount()).toBe(1);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("reports each search mode once per palette open", async () => {
+    const store = createSearchStore(memoryStorage());
+    store.search("foo");
+    await runDebounce();
+    store.search("foo bar");
+    await runDebounce();
+    store.setSort("recency");
+    store.setMode("semantic");
+    store.setMode("hybrid");
+    store.setMode("fulltext");
+    store.setMode("semantic");
+    store.clear();
+    store.search("another query");
+    await runDebounce();
+    expect(vi.mocked(reportTelemetry).mock.calls).toEqual([
+      ["search_run", { query_type: "text" }],
+      ["search_run", { query_type: "semantic" }],
+      ["search_run", { query_type: "hybrid" }],
+    ]);
+
+    store.endSession();
+    store.search("needle");
+    await runDebounce();
+    expect(reportTelemetry).toHaveBeenLastCalledWith("search_run", { query_type: "semantic" });
+    expect(reportTelemetry).toHaveBeenCalledTimes(4);
+  });
+
+  it("does not report another search when semantic setup retries the same mode", async () => {
+    const store = createSearchStore(memoryStorage());
+    store.search("needle");
+    await runDebounce();
+    searchService.getApiV1SearchContent.mockRejectedValueOnce(
+      generatedApiError(501, "Semantic search is unavailable"),
+    );
+    store.setMode("semantic");
+    await flushMicrotasks();
+    expect(store.error?.kind).toBe("semantic-unavailable");
+
+    store.retry();
+    await flushMicrotasks();
+    expect(store.error).toBeNull();
+    expect(vi.mocked(reportTelemetry).mock.calls).toEqual([
+      ["search_run", { query_type: "text" }],
+      ["search_run", { query_type: "semantic" }],
+    ]);
   });
 });

@@ -39,15 +39,57 @@ actions:
       x-go-type-import:
         path: go.kenn.io/agentsview/internal/db
         name: db
+  - target: $.components.schemas.DbRecentEditsResult
+    update:
+      x-go-type: db.RecentEditsResult
+      x-go-type-import:
+        path: go.kenn.io/agentsview/internal/db
+        name: db
   - target: $.components.schemas.DbSearchResult
     update:
       x-go-type: db.SearchResult
       x-go-type-import:
         path: go.kenn.io/agentsview/internal/db
         name: db
+  - target: $.components.schemas.DbSession
+    update:
+      x-go-type: db.Session
+      x-go-type-import:
+        path: go.kenn.io/agentsview/internal/db
+        name: db
+  - target: $.components.schemas.DbSignalSessionsResponse
+    update:
+      x-go-type: db.SignalSessionsResponse
+      x-go-type-import:
+        path: go.kenn.io/agentsview/internal/db
+        name: db
+  - target: $.components.schemas.DbSignalsAnalyticsResponse
+    update:
+      x-go-type: db.SignalsAnalyticsResponse
+      x-go-type-import:
+        path: go.kenn.io/agentsview/internal/db
+        name: db
+  - target: $.components.schemas.DbSessionExternalParent
+    update:
+      x-go-type: db.SessionExternalParent
+      x-go-type-import:
+        path: go.kenn.io/agentsview/internal/db
+        name: db
+  - target: $.components.schemas.DbSessionLabels
+    update:
+      x-go-type: db.SessionLabels
+      x-go-type-import:
+        path: go.kenn.io/agentsview/internal/db
+        name: db
   - target: $.components.schemas.DbSessionStats
     update:
       x-go-type: db.SessionStats
+      x-go-type-import:
+        path: go.kenn.io/agentsview/internal/db
+        name: db
+  - target: $.components.schemas.DbToolsAnalyticsResponse
+    update:
+      x-go-type: db.ToolsAnalyticsResponse
       x-go-type-import:
         path: go.kenn.io/agentsview/internal/db
         name: db
@@ -111,6 +153,12 @@ actions:
       x-go-type-import:
         path: go.kenn.io/agentsview/internal/vector
         name: vector
+  - target: $.components.schemas.KataStatus
+    update:
+      x-go-type: kata.Status
+      x-go-type-import:
+        path: go.kenn.io/agentsview/internal/kata
+        name: kata
   - target: $.components.schemas.VectorGenerationInfo
     update:
       x-go-type: vector.GenerationInfo
@@ -132,6 +180,18 @@ actions:
   - target: $.components.schemas.DbDailyUsageEntry
     update:
       x-go-type: db.DailyUsageEntry
+      x-go-type-import:
+        path: go.kenn.io/agentsview/internal/db
+        name: db
+  - target: $.components.schemas.DbPlanUsageView
+    update:
+      x-go-type: db.PlanUsageView
+      x-go-type-import:
+        path: go.kenn.io/agentsview/internal/db
+        name: db
+  - target: $.components.schemas.DbCaptureCoverageView
+    update:
+      x-go-type: db.CaptureCoverageView
       x-go-type-import:
         path: go.kenn.io/agentsview/internal/db
         name: db

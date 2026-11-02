@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,17 +23,6 @@ func loadPGServeConfigForTest(t *testing.T, args ...string) (config.Config, stri
 		return config.Config{}, "", err
 	}
 	return loadReplicaServeConfig(cmd)
-}
-
-func restoreTestLogger(t *testing.T) {
-	t.Helper()
-	oldWriter := log.Writer()
-	t.Cleanup(func() {
-		if file, ok := log.Writer().(*os.File); ok && file != os.Stderr && file != os.Stdout {
-			_ = file.Close()
-		}
-		log.SetOutput(oldWriter)
-	})
 }
 
 func clearConfiguredAgentEnvVars(t *testing.T) {
@@ -146,7 +134,7 @@ func TestRunPGPush_IgnoresBrokenUnselectedTarget(t *testing.T) {
 	t.Setenv("AGENTSVIEW_NO_DAEMON", "1")
 	clearConfiguredAgentEnvVars(t)
 	isolateDefaultAgentDirs(t, dataDir)
-	restoreTestLogger(t)
+	restoreTestLogOutput(t)
 	restoreUnsetEnv(t, "BROKEN_WORK_TARGET")
 	writeTestConfig(t, dataDir, `
 default_pg = "archive"
@@ -175,7 +163,7 @@ func TestRunPGStatus_IgnoresBrokenUnselectedTarget(t *testing.T) {
 	t.Setenv("AGENTSVIEW_DATA_DIR", dataDir)
 	clearConfiguredAgentEnvVars(t)
 	isolateDefaultAgentDirs(t, dataDir)
-	restoreTestLogger(t)
+	restoreTestLogOutput(t)
 	restoreUnsetEnv(t, "BROKEN_WORK_TARGET")
 	writeTestConfig(t, dataDir, `
 default_pg = "archive"
@@ -201,7 +189,7 @@ func TestRunPGStatus_IgnoresUnreadableLocalWatermark(t *testing.T) {
 	t.Setenv("AGENTSVIEW_DATA_DIR", dataDir)
 	clearConfiguredAgentEnvVars(t)
 	isolateDefaultAgentDirs(t, dataDir)
-	restoreTestLogger(t)
+	restoreTestLogOutput(t)
 	writeTestConfig(t, dataDir, `
 default_pg = "archive"
 
@@ -228,7 +216,7 @@ func TestRunPGPushAll_AggregatesTargetFailures(t *testing.T) {
 	t.Setenv("AGENTSVIEW_NO_DAEMON", "1")
 	clearConfiguredAgentEnvVars(t)
 	isolateDefaultAgentDirs(t, dataDir)
-	restoreTestLogger(t)
+	restoreTestLogOutput(t)
 	restoreUnsetEnv(t, "BROKEN_WORK_TARGET")
 	writeTestConfig(t, dataDir, `
 default_pg = "work"
@@ -254,7 +242,7 @@ func TestRunPGStatusAll_AggregatesTargetFailures(t *testing.T) {
 	t.Setenv("AGENTSVIEW_DATA_DIR", dataDir)
 	clearConfiguredAgentEnvVars(t)
 	isolateDefaultAgentDirs(t, dataDir)
-	restoreTestLogger(t)
+	restoreTestLogOutput(t)
 	restoreUnsetEnv(t, "BROKEN_WORK_TARGET")
 	writeTestConfig(t, dataDir, `
 default_pg = "work"
@@ -281,7 +269,7 @@ func TestPGPushCommandPrefixesErrors(t *testing.T) {
 	t.Setenv("AGENTSVIEW_NO_DAEMON", "1")
 	clearConfiguredAgentEnvVars(t)
 	isolateDefaultAgentDirs(t, dataDir)
-	restoreTestLogger(t)
+	restoreTestLogOutput(t)
 	writeTestConfig(t, dataDir, `
 default_pg = "archive"
 
@@ -305,7 +293,7 @@ func TestPGStatusCommandPrefixesErrors(t *testing.T) {
 	t.Setenv("AGENTSVIEW_DATA_DIR", dataDir)
 	clearConfiguredAgentEnvVars(t)
 	isolateDefaultAgentDirs(t, dataDir)
-	restoreTestLogger(t)
+	restoreTestLogOutput(t)
 	writeTestConfig(t, dataDir, `
 default_pg = "archive"
 
@@ -376,7 +364,7 @@ func TestRunPGServeHelperProcess(t *testing.T) {
 	require.NoError(t, cmd.Flags().Parse(args[sep+1:]))
 	cfg, basePath, err := loadReplicaServeConfig(cmd)
 	require.NoError(t, err)
-	runReplicaServe(pgReplica{}, cfg, basePath)
+	runReplicaServe(pgReplica{}, cfg, basePath, nil)
 }
 
 func TestWritePGPushSummaryIncludesSkippedConflicts(t *testing.T) {
@@ -394,6 +382,61 @@ func TestWritePGPushSummaryIncludesSkippedConflicts(t *testing.T) {
 		"Pushed 3 sessions, 9 messages, skipped 2 ownership conflict(s) in 1.5s")
 	assert.Contains(t, got,
 		"Warning: skipped 2 session(s) owned by another PostgreSQL push marker")
+}
+
+// A resumed full push reports the sessions the unfinished run already
+// pushed apart from sessions that were simply unchanged.
+func TestWritePGPushSummaryReportsResumedSessions(t *testing.T) {
+	var out bytes.Buffer
+
+	writeReplicaPushSummary(&out, "PostgreSQL", storage.PushResult{
+		SessionsPushed: 1,
+		SkippedResumed: 7,
+		Duration:       time.Second,
+	})
+
+	assert.Contains(t, out.String(),
+		"Skipped 7 session(s) already pushed by the unfinished full push")
+}
+
+// Ownership conflicts must not hide how many sessions the unfinished full
+// push already finished.
+func TestWritePGPushSummaryReportsResumedSessionsWithConflicts(t *testing.T) {
+	var out bytes.Buffer
+
+	writeReplicaPushSummary(&out, "PostgreSQL", storage.PushResult{
+		SessionsPushed:   1,
+		SkippedConflicts: 2,
+		SkippedResumed:   7,
+		Duration:         time.Second,
+	})
+
+	got := out.String()
+	assert.Contains(t, got,
+		"Warning: skipped 2 session(s) owned by another PostgreSQL push marker")
+	assert.Contains(t, got,
+		"Skipped 7 session(s) already pushed by the unfinished full push")
+}
+
+// A full push prints why it ran, so a requested full push that discarded an
+// unfinished one says so on the console rather than only in the log.
+func TestWritePGPushSummaryReportsFullPushReason(t *testing.T) {
+	var discarded bytes.Buffer
+	writeReplicaPushSummary(&discarded, "PostgreSQL", storage.PushResult{
+		SessionsPushed: 3,
+		Full:           true,
+		FullReason:     "requested; discarded an unfinished full push",
+		Duration:       time.Second,
+	})
+	assert.Contains(t, discarded.String(),
+		"PostgreSQL push mode: full (requested; discarded an unfinished full push)")
+
+	var incremental bytes.Buffer
+	writeReplicaPushSummary(&incremental, "PostgreSQL", storage.PushResult{
+		SessionsPushed: 3,
+		Duration:       time.Second,
+	})
+	assert.NotContains(t, incremental.String(), "push mode")
 }
 
 func TestWritePGPushSummaryVectorPhase(t *testing.T) {

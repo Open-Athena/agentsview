@@ -138,6 +138,9 @@ class ActivityStore {
   sessionsSort: ActivitySessionSort = $state("agent_minutes");
   sessionsDirection: "asc" | "desc" = $state("desc");
   sessionsBucketRange: ActivityBucketRange | null = $state(null);
+  // Bumped whenever report.by_session is replaced by a first page instead of
+  // extended by a cursor page, so the sessions table can scroll back to top.
+  sessionsListVersion = $state(0);
   // Epoch ms of the last successful report fetch, powering the "Updated Xm ago"
   // refresh label. null until the first load completes.
   lastUpdatedAt: number | null = $state(null);
@@ -271,6 +274,7 @@ class ActivityStore {
       this.sessionsBucketRange = null;
       this.report = res;
       this.reportGeneration++;
+      this.sessionsListVersion++;
       this.lastUpdatedAt = Date.now();
       const finishedAt = performance.now();
       this.lastQueryDurationMs = finishedAt - startedAt;
@@ -280,14 +284,15 @@ class ActivityStore {
     } catch (e) {
       if (isAbortError(e) || v !== this.loadVersion || !this.reportRead.isCurrent(signal))
         return false;
-      // A failed background refresh keeps the last good report on screen so a
+      // A temporary background failure keeps the last good report on screen so a
       // transient blip never blanks the report-first dashboard; the growing
       // "Updated Xm ago" label signals the staleness. With no report yet (a
       // first load still failing, or a refresh firing before one lands) there
       // is nothing to preserve, so fall through and surface the error rather
       // than leave a misleading empty state. First loads and range/filter
       // changes are always foreground and clear on error.
-      if (background && this.report !== null) return false;
+      const invalidMachine = e instanceof ApiError && e.code === "invalid_machine_filter";
+      if (background && this.report !== null && !invalidMachine) return false;
       this.report = null;
       this.error = e instanceof Error ? e.message : m.activity_report_load_failed();
       return false;
@@ -332,6 +337,7 @@ class ActivityStore {
       if (page.refresh_required && page.report) {
         this.report = page.report;
         this.reportGeneration++;
+        this.sessionsListVersion++;
         this.sessionsSort = "agent_minutes";
         this.sessionsDirection = "desc";
         this.sessionsBucketRange = null;
@@ -345,10 +351,12 @@ class ActivityStore {
       this.sessionsSort = sort;
       this.sessionsDirection = direction;
       this.sessionsBucketRange = bucketRange ? { ...bucketRange } : null;
+      // A cursor continues the loaded list; anything else starts a new one.
+      if (!options.cursor) this.sessionsListVersion++;
       this.report = {
         ...report,
         report_id: page.report_id,
-        by_session: page.sessions,
+        by_session: options.cursor ? [...report.by_session, ...page.sessions] : page.sessions,
         sessions_next_cursor: page.next_cursor,
         sessions_total: page.total,
       };
@@ -399,6 +407,7 @@ class ActivityStore {
     if (this.#filterOptionsPromise) return this.#filterOptionsPromise;
     const ver = this.#filterOptionsVersion;
     const signal = this.filterOptionsRead.begin();
+    const machine = this.machine;
     const opts = { include_one_shot: true, include_automated: true };
     let request!: Promise<boolean>;
     request = (async () => {
@@ -420,12 +429,31 @@ class ActivityStore {
         ok = false;
       }
       try {
-        const res = await MetadataService.getApiV1Machines(opts, { signal });
-        if (ver === this.#filterOptionsVersion && this.filterOptionsRead.isCurrent(signal))
+        const res = await MetadataService.getApiV1Machines(
+          { ...opts, machine: machine || undefined },
+          { signal },
+        );
+        if (ver === this.#filterOptionsVersion && this.filterOptionsRead.isCurrent(signal)) {
           this.machines = res.machines;
+          if (machine && this.machine === machine && res.resolved_machines?.length) {
+            this.machine = [...new Set(res.resolved_machines)].join(",");
+            this.writeUrl();
+          }
+        }
       } catch (e) {
         if (isAbortError(e) || !this.filterOptionsRead.isCurrent(signal)) return false;
         ok = false;
+        if (e instanceof ApiError && e.code === "invalid_machine_filter") {
+          const catalog = await MetadataService.getApiV1Machines(opts, { signal }).catch(
+            () => null,
+          );
+          if (
+            catalog &&
+            ver === this.#filterOptionsVersion &&
+            this.filterOptionsRead.isCurrent(signal)
+          )
+            this.machines = catalog.machines;
+        }
       }
       const current =
         ver === this.#filterOptionsVersion && this.filterOptionsRead.isCurrent(signal);
@@ -473,6 +501,7 @@ class ActivityStore {
     this.hydrateFromUrl(router.params);
     const onPop = () => {
       this.hydrateFromUrl(router.params);
+      void this.loadFilterOptions();
       void this.load();
     };
     window.addEventListener("popstate", onPop);
@@ -511,7 +540,9 @@ class ActivityStore {
     this.bucket = params.bucket ?? "";
     this.project = params.project ?? "";
     this.agent = params.agent ?? "";
-    this.machine = params.machine ?? "";
+    const machine = params.machine ?? "";
+    if (this.machine !== machine) this.invalidateFilterOptions();
+    this.machine = machine;
     this.automation = AUTOMATIONS.has(params.automation ?? "")
       ? (params.automation as Automation)
       : "all";

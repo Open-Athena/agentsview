@@ -13,7 +13,7 @@ import (
 	"go.kenn.io/agentsview/internal/parser"
 )
 
-var findCodexS3ParentSessionURI = parser.FindCodexS3ParentSessionURI
+var findCodexS3ParentSessionURIs = parser.FindCodexS3ParentSessionURIs
 
 func s3SessionIDPrefix(machine string) string {
 	if machine == "" {
@@ -131,6 +131,11 @@ func localCodexSessionIndexPath(sessionPath string) string {
 	return ""
 }
 
+// hydrateS3CodexParent downloads every rollout of a fork's replay parent (the
+// thread's own rollout and its revert pages) next to the child, so the parser
+// can recognize replayed turns. A partial set would end the replay early, so
+// any failed download removes the files already written and leaves the parent
+// unresolved.
 func hydrateS3CodexParent(
 	tempDir, childPath, configuredRoot, childURI string,
 	p parser.S3Provider,
@@ -139,39 +144,55 @@ func hydrateS3CodexParent(
 	if !resolutionNeeded {
 		return false
 	}
-	parentURI, ok := findCodexS3ParentSessionURI(
+	var written []string
+	for _, parentURI := range findCodexS3ParentSessionURIs(
 		configuredRoot, childURI, parentID,
-	)
-	if !ok || parentURI == childURI {
-		return false
+	) {
+		if parentURI == childURI {
+			continue
+		}
+		parentPath, ok := hydrateS3CodexParentObject(tempDir, parentURI, p)
+		if !ok {
+			for _, path := range written {
+				_ = os.Remove(path)
+			}
+			return false
+		}
+		written = append(written, parentPath)
 	}
+	return len(written) > 0
+}
+
+func hydrateS3CodexParentObject(
+	tempDir, parentURI string, p parser.S3Provider,
+) (string, bool) {
 	relPath, err := safeS3TempRelPath(parser.DiscoveredFile{
 		Agent: parser.AgentCodex,
 		Path:  parentURI,
 	}, p)
 	if err != nil {
-		return false
+		return "", false
 	}
 	rc, err := fetchS3Object(parentURI)
 	if err != nil {
-		return false
+		return "", false
 	}
 	defer rc.Close()
 	parentPath := filepath.Join(tempDir, filepath.Base(relPath))
 	if err := os.MkdirAll(filepath.Dir(parentPath), 0o755); err != nil {
-		return false
+		return "", false
 	}
 	out, err := os.Create(parentPath)
 	if err != nil {
-		return false
+		return "", false
 	}
 	_, copyErr := io.Copy(out, rc)
 	closeErr := out.Close()
 	if copyErr != nil || closeErr != nil {
 		_ = os.Remove(parentPath)
-		return false
+		return "", false
 	}
-	return true
+	return parentPath, true
 }
 
 // processS3Session reads a session JSONL directly from object
@@ -185,8 +206,9 @@ func (e *Engine) processS3Session(
 ) processResult {
 	idPrefix := s3SessionIDPrefix(file.Machine)
 	sourceFingerprint := s3SourceFingerprint(file)
-	sourceChanged := e.s3SourceMetadataChangedFromInfo(ctx,
-		file, p,
+	storedID, lookupErr := e.s3StoredSessionID(ctx, file, p)
+	sourceChanged := lookupErr != nil || storedID == "" || e.s3SourceMetadataChangedFromInfo(ctx,
+		file, storedID,
 		sourceInfo.Size(),
 		sourceInfo.ModTime().UnixNano(),
 		sourceFingerprint,
@@ -267,14 +289,12 @@ func (e *Engine) processS3Session(
 			}
 		}
 	default:
-		rawID := p.S3SessionID(file.Path)
-		if rawID != "" {
-			fullID := applyIDPrefixToID(idPrefix, rawID)
+		fullID := storedID
+		if fullID != "" {
 			if !e.forceParseRequested(file) && !sourceChanged &&
 				e.shouldSkipFileWithPrefix(ctx,
-					idPrefix, rawID, sourceInfo, sourceFingerprint,
-				) &&
-				e.db.GetSessionFilePath(ctx, fullID) == file.Path {
+					"", fullID, sourceInfo, sourceFingerprint,
+				) {
 				sess, _ := e.db.GetSession(ctx, fullID)
 				if sess != nil &&
 					sess.Project != "" &&
@@ -364,16 +384,28 @@ func (e *Engine) processS3Session(
 			retentionLease: lease,
 		}
 	}
-	res, err := e.parseMaterializedS3Source(ctx, file, dir, tmp)
+	if sizer, ok := p.(parser.ParseSourceSizer); ok && file.Agent == parser.AgentCodex {
+		sourceBytes, err = sizer.ParseSourceSize(ctx, parser.SourceRef{
+			Provider: file.Agent, Opaque: parser.MaterializedFileSource{Path: tmp},
+		})
+		if err != nil {
+			return processResult{err: err, noCacheSkip: true, retentionLease: lease}
+		}
+		// Release the download lease before acquiring a larger parse lease;
+		// several workers upgrading while holding their old leases can deadlock.
+		lease.Release()
+		lease, err = e.retentionBudget().acquire(ctx, sourceBytes)
+		if err != nil {
+			return processResult{err: err, noCacheSkip: true}
+		}
+	}
+	res, err := e.parseMaterializedS3Source(ctx, file, dir, tmp, sourceBytes)
 	if err != nil {
 		return processResult{err: err, noCacheSkip: true, retentionLease: lease}
 	}
-	// Record the real s3:// source on each parsed session rather than the
-	// transient temp path (which is deleted on return), so the stored source
-	// pointer reflects where the session actually came from.
+	// Persist object metadata instead of transient materialization metadata.
 	for i := range res.results {
 		applyIDPrefixToParsedResult(idPrefix, &res.results[i])
-		res.results[i].Session.File.Path = file.Path
 		res.results[i].Session.File.Size = sourceInfo.Size()
 		res.results[i].Session.File.Mtime = sourceInfo.ModTime().UnixNano()
 		if sourceFingerprint != "" {
@@ -393,7 +425,7 @@ func (e *Engine) processS3Session(
 	res.excludedSessionIDs = applyIDPrefixToIDs(
 		idPrefix, res.excludedSessionIDs,
 	)
-	res.sourceBytes = sourceBytes
+	res.sourceBytes = max(sourceBytes, 0)
 	switch file.Agent {
 	case parser.AgentClaude:
 		missing, err := e.claudeSourceMissingSessionOwnershipsForCompleteResult(
@@ -454,15 +486,17 @@ func (e *Engine) parseMaterializedS3Source(
 	ctx context.Context,
 	file parser.DiscoveredFile,
 	tempDir, tempPath string,
+	sourceBytes int64,
 ) (processResult, error) {
 	machine := e.machine
 	if file.Machine != "" {
 		machine = file.Machine // the s3 source machine overrides the host
 	}
-	provider, ok := parser.NewProvider(file.Agent, parser.ProviderConfig{
+	providerConfig := parser.ProviderConfig{
 		Roots:   []string{tempDir},
 		Machine: machine,
-	})
+	}
+	provider, ok := parser.NewProvider(file.Agent, providerConfig)
 	if !ok {
 		return processResult{}, fmt.Errorf(
 			"no provider for s3 agent %s", file.Agent,
@@ -476,11 +510,36 @@ func (e *Engine) parseMaterializedS3Source(
 		ProjectHint:    file.Project,
 		Opaque:         parser.MaterializedFileSource{Path: tempPath},
 	}
-	outcome, err := provider.Parse(ctx, parser.ParseRequest{
-		Source:     source,
-		Machine:    machine,
-		ForceParse: true,
-	})
+	var outcome parser.ParseOutcome
+	var err error
+	var staged processResult
+	defer func() { staged.releaseStaged() }()
+	if file.Agent == parser.AgentCodex && !e.forceParse &&
+		(sourceBytes < 0 || sourceBytes > e.stagedCodexMin) {
+		staged.staged, err = newCodexStagingSink(ctx,
+			e.stagedCodexDir, e.blockedResultCategories, max(sourceBytes, 0),
+		)
+		if err != nil {
+			return processResult{}, err
+		}
+		staged.staged.toolResultImages = e.toolResultImages
+		staged.staged.database = e.db
+		staged.staged.idPrefix = s3SessionIDPrefix(file.Machine)
+		if !strings.HasPrefix(staged.staged.idPrefix, e.idPrefix) {
+			staged.staged.idPrefix = e.idPrefix + staged.staged.idPrefix
+		}
+		staged.staged.disableSignals = e.disableSignalRecompute
+		staged.stagedGCRelease = beginStagedColdSync()
+		outcome, err = stagedCodexParseOutcome(ctx, providerConfig, source,
+			parser.SourceFingerprint{}, staged.staged,
+		)
+	} else {
+		outcome, err = provider.Parse(ctx, parser.ParseRequest{
+			Source:     source,
+			Machine:    machine,
+			ForceParse: true,
+		})
+	}
 	if err != nil {
 		return processResult{}, err
 	}
@@ -508,7 +567,7 @@ func (e *Engine) parseMaterializedS3Source(
 	// still carry ExcludedSessionIDs (a Claude /usage probe parses to no live
 	// session but excludes its ID), and the caller needs those IDs to drop the
 	// previously-archived row on resync. ForceReplace must survive too.
-	return processResult{
+	res := processResult{
 		results:                  parseOutcomeResults(outcome.Results),
 		excludedSessionIDs:       append([]string(nil), outcome.ExcludedSessionIDs...),
 		forceReplace:             outcome.ForceReplace,
@@ -518,5 +577,14 @@ func (e *Engine) parseMaterializedS3Source(
 		providerWideFailureCount: providerWideFailureCount,
 		noCacheSkip:              !providerOutcomeAllowsCleanSkipCache(outcome),
 		deferredCount:            deferredCount,
-	}, nil
+	}
+	for i := range res.results {
+		res.results[i].Session.File.Path = file.Path
+	}
+	if collisionPolicyApplies(provider) {
+		e.applyProviderFilePathPolicies(ctx, provider, file.Agent, file.Path, &res, s3SessionIDPrefix(file.Machine))
+	}
+	res.staged, res.stagedGCRelease = staged.staged, staged.stagedGCRelease
+	staged.staged, staged.stagedGCRelease = nil, nil
+	return res, nil
 }

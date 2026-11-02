@@ -30,10 +30,11 @@ func newCursorIDEProviderFactory(def AgentDef) ProviderFactory {
 				WithChangedPathClassifier(cursorIDEClassifyPath),
 				WithMemberLookup(cursorIDEFindMember),
 				WithContextFingerprint(cursorIDEFingerprintSource),
-				WithContextContainerParse(cursorIDEParseContainer),
+				WithContextContainerParseEach(cursorIDEParseContainerEach),
 				WithContextMemberParse(cursorIDEParseMember),
 				WithMemberPresence(cursorIDEMemberPresent),
 				WithBatchMemberPresence(cursorIDEBatchMemberPresent),
+				WithMemberChangeTokens(cursorIDEMemberTokens, cursorIDEStoredComposerToken),
 			)
 		},
 	)
@@ -159,7 +160,10 @@ func cursorIDEFingerprintSource(
 // data pages: the 100-byte main header (whose change counter, schema cookie,
 // and version-valid-for fields move on rollback-journal commits) and the WAL
 // sibling's size plus 32-byte header (which grows per WAL-mode commit and
-// whose salts are re-randomized on every WAL reset). The skip cache keys on
+// whose salts are re-randomized on every WAL reset). An empty WAL is skipped:
+// read-only connections, this process's own scans included, create one on
+// open and delete it on close, and folding it in made each scan invalidate
+// the next one. The skip cache keys on
 // it (FingerprintHashInCacheKey), so a rewrite that leaves the database's
 // size and mtime unchanged still misses the cache and reparses, without the
 // full-file hashing this provider deliberately avoids.
@@ -184,7 +188,7 @@ func cursorIDESQLiteStateHash(dbPath string) (string, error) {
 	}
 	_, _ = h.Write(header[:n])
 	walPath := dbPath + "-wal"
-	if info, err := os.Stat(walPath); err == nil {
+	if info, err := os.Stat(walPath); err == nil && SQLiteWALInfoHasFrames(info) {
 		_, _ = fmt.Fprintf(h, "|wal:%d|", info.Size())
 		if wal, err := os.Open(walPath); err == nil {
 			walHeader := make([]byte, 32)
@@ -250,6 +254,25 @@ func cursorIDEBatchMemberPresent(ctx context.Context,
 	return present
 }
 
+// cursorIDEMemberTokens lists composers for the base's changed-path merge.
+func cursorIDEMemberTokens(
+	ctx context.Context, src multiSessionSource,
+	yield func(multiSessionMemberToken) error,
+) error {
+	conn, err := openCursorIDEDB(src.Container)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return listCursorIDEComposerTokens(ctx, conn, func(id, token string) error {
+		return yield(multiSessionMemberToken{
+			Path:     VirtualSourcePath(src.Container, id),
+			MemberID: id,
+			Token:    token,
+		})
+	})
+}
+
 func cursorIDEParseMember(
 	ctx context.Context, src multiSessionSource, req ParseRequest,
 ) (*ParseResult, error) {
@@ -273,42 +296,46 @@ func cursorIDEParseMember(
 	)
 }
 
-func cursorIDEParseContainer(
+// cursorIDEParseContainerEach yields each composer as it is parsed, so the
+// provider holds one transcript at a time.
+func cursorIDEParseContainerEach(
 	ctx context.Context, src multiSessionSource, req ParseRequest,
-) ([]ParseResult, error) {
+	yield func(ParseResult) error,
+) error {
 	dbInfo, err := os.Stat(src.Container)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil
 		}
-		return nil, err
+		return err
 	}
 	conn, err := openCursorIDEDB(src.Container)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer conn.Close()
 	ids, err := listCursorIDEComposerIDs(ctx, conn)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	results := make([]ParseResult, 0, len(ids))
 	for _, id := range ids {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return err
 		}
 		result, err := parseCursorIDEComposer(
 			ctx, conn, src.Container, id, req.Machine, dbInfo,
 		)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if result == nil {
 			continue
 		}
-		results = append(results, *result)
+		if err := yield(*result); err != nil {
+			return err
+		}
 	}
-	return results, nil
+	return nil
 }
 
 // parseCursorIDEVirtualPath splits a Cursor IDE virtual source path into its
@@ -331,6 +358,8 @@ func cursorIDEProviderCapabilities() Capabilities {
 		CapabilitySupported,
 	)
 	source.PersistentArchive = CapabilitySupported
+	// Watcher events parse only composers whose document changed; PeriodicReconcile catches the rest.
+	source.StoredMemberFreshnessListing = CapabilitySupported
 	return Capabilities{
 		Source: source,
 		Content: ContentCapabilities{

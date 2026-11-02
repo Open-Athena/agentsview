@@ -6,11 +6,10 @@ import (
 	"strings"
 )
 
-// messageScopeFilter adapts the model/day/hour parts of an AnalyticsFilter into
-// the pure ScopeFilter.
-func (f AnalyticsFilter) messageScopeFilter() ScopeFilter {
+// MessageScopeFilter adapts analytics model and time filters for message reduction.
+func (f AnalyticsFilter) MessageScopeFilter() ScopeFilter {
 	models := make(map[string]struct{})
-	for _, m := range csvFilterValues(f.Model) {
+	for _, m := range CSVFilterValues(f.Model) {
 		models[m] = struct{}{}
 	}
 	return ScopeFilter{
@@ -20,11 +19,21 @@ func (f AnalyticsFilter) messageScopeFilter() ScopeFilter {
 	}
 }
 
-// messageScope holds the matched messages for a model-filtered analytics
-// request, grouped by session. It is a pure value; all DB work happens during
-// resolution.
-type messageScope struct {
-	bySession map[string][]ScopedMessage
+// MessageScope groups model-matched messages by session. Nil means no model filter.
+type MessageScope map[string][]ScopedMessage
+
+// UniqueAnalyticsIDs returns IDs in first-seen order, including a non-nil empty result.
+func UniqueAnalyticsIDs(ids []string) []string {
+	seen := make(map[string]struct{}, len(ids))
+	unique := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	return unique
 }
 
 // resolveAnalyticsMessageScope streams candidate messages for sessionIDs and
@@ -36,24 +45,16 @@ func (db *DB) resolveAnalyticsMessageScope(
 	sessionIDs []string,
 	f AnalyticsFilter,
 	includeContent bool,
-) (*messageScope, error) {
+) (MessageScope, error) {
 	if strings.TrimSpace(f.Model) == "" {
 		return nil, nil
 	}
 
-	seen := make(map[string]struct{}, len(sessionIDs))
-	unique := make([]string, 0, len(sessionIDs))
-	for _, id := range sessionIDs {
-		if _, ok := seen[id]; ok {
-			continue
-		}
-		seen[id] = struct{}{}
-		unique = append(unique, id)
-	}
+	unique := UniqueAnalyticsIDs(sessionIDs)
 
-	flt := f.messageScopeFilter()
+	flt := f.MessageScopeFilter()
 	loc := f.location()
-	bySession := make(map[string][]ScopedMessage, len(unique))
+	bySession := make(MessageScope, len(unique))
 	emit := func(m ScopedMessage) {
 		bySession[m.SessionID] = append(bySession[m.SessionID], m)
 	}
@@ -65,7 +66,7 @@ func (db *DB) resolveAnalyticsMessageScope(
 
 	if err := queryChunked(unique, func(chunk []string) error {
 		reducer := NewScopeReducer(flt, emit)
-		ph, args := inPlaceholders(chunk)
+		ph, args := InPlaceholders(chunk)
 		rows, err := db.getReader().QueryContext(ctx, `
 			SELECT session_id, ordinal, role, COALESCE(source_subtype, ''), is_system, COALESCE(model, ''),
 				has_thinking, has_tool_use, COALESCE(timestamp, ''),
@@ -93,7 +94,7 @@ func (db *DB) resolveAnalyticsMessageScope(
 			); err != nil {
 				return fmt.Errorf("scanning analytics candidate message: %w", err)
 			}
-			parsed, has := localTime(ts, loc)
+			parsed, has := LocalTime(ts, loc)
 			if err := reducer.Push(MessageInput{
 				SessionID:       sessionID,
 				Ordinal:         ordinal,
@@ -122,27 +123,22 @@ func (db *DB) resolveAnalyticsMessageScope(
 		return nil, err
 	}
 
-	return &messageScope{bySession: bySession}, nil
-}
-
-// MessagesBySession returns the matched rows per session.
-func (s *messageScope) MessagesBySession() map[string][]ScopedMessage {
-	return s.bySession
+	return bySession, nil
 }
 
 // StatsBySession aggregates matched rows per session.
-func (s *messageScope) StatsBySession() map[string]MessageStats {
-	out := make(map[string]MessageStats, len(s.bySession))
-	for id, rows := range s.bySession {
+func (s MessageScope) StatsBySession() map[string]MessageStats {
+	out := make(map[string]MessageStats, len(s))
+	for id, rows := range s {
 		out[id] = ScopeStats(rows)
 	}
 	return out
 }
 
 // TimingBySession projects matched rows into the velocity timing view.
-func (s *messageScope) TimingBySession() map[string][]TimingMessage {
-	out := make(map[string][]TimingMessage, len(s.bySession))
-	for id, rows := range s.bySession {
+func (s MessageScope) TimingBySession() map[string][]TimingMessage {
+	out := make(map[string][]TimingMessage, len(s))
+	for id, rows := range s {
 		out[id] = ScopeTiming(rows)
 	}
 	return out

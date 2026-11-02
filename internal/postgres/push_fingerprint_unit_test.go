@@ -68,29 +68,87 @@ func TestBatchedDependencyFingerprintMatchesPerSession(t *testing.T) {
 	pinID, err := local.PinMessage(ctx, "dep-a", pinned.ID, &note)
 	require.NoError(t, err)
 	require.NotZero(t, pinID)
+	require.NoError(t, local.ReplaceSessionPlanUsage(ctx, "dep-a", &db.SessionPlanUsage{
+		HasPlanUsage: true, DataStatus: "complete", WeeklyPercent: new(4.5),
+	}))
+
+	require.NoError(t, local.ReplaceSessionUsageEvents(ctx, "dep-a",
+		[]db.UsageEvent{
+			{
+				SessionID: "dep-a", Source: "session", Model: "claude-test",
+				InputTokens: 4, OccurredAt: "2026-07-01T12:00:00.000Z",
+			},
+			{
+				SessionID: "dep-a", Source: "session", Model: "claude-test",
+				InputTokens: 3, OccurredAt: "2026-07-01T12:00:00.123456789Z",
+			},
+		}))
 
 	ids := []string{"dep-a", "dep-empty", "dep-missing"}
-	usageFPs, err := local.UsageEventFingerprints(ids)
+	usageFPs, err := local.SortedUsageEventFingerprints(
+		ctx, ids, pgUsageEventTimestampFingerprintText,
+	)
 	require.NoError(t, err)
 
 	state, err := readLocalPushDependencyState(ctx, local, ids)
 	require.NoError(t, err)
 
 	for _, id := range ids {
+		byUsageKnown := map[bool]string{}
 		for _, usageKnown := range []bool{true, false} {
 			want, err := localSessionDependencyPushFingerprint(
 				ctx, local, id, usageFPs[id], usageKnown,
 			)
 			require.NoError(t, err, id)
 			got, err := state.dependencyFingerprint(
-				local, id, usageFPs[id], usageKnown,
+				ctx, local, id, usageFPs[id], usageKnown,
 			)
 			require.NoError(t, err, id)
 			assert.Equal(t, want, got,
 				"dependency fingerprint %s (usageKnown=%t)", id, usageKnown)
+			byUsageKnown[usageKnown] = got
 		}
+		assert.Equal(t, byUsageKnown[true], byUsageKnown[false],
+			"usage fallback must match the prefetched fingerprint for %s", id)
 	}
 
 	assert.NotEmpty(t, state.contentHashFP["dep-a"],
 		"fixture must exercise the message fingerprint maps")
+	assert.NotEmpty(t, usageFPs["dep-a"],
+		"fixture must exercise the usage fingerprint")
+}
+
+// TestDependencyFingerprintTracksPlanUsage pins both halves of the plan
+// usage fingerprint contract: a session without plan usage keeps the
+// fingerprint it had before plan usage existed, so upgrading re-pushes
+// nothing, and any plan usage change makes the session a push candidate.
+func TestDependencyFingerprintTracksPlanUsage(t *testing.T) {
+	local, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
+	require.NoError(t, err)
+	defer local.Close()
+	ctx := t.Context()
+	require.NoError(t, local.UpsertSession(ctx, db.Session{
+		ID: "plan", Project: "alpha", Machine: "m1", Agent: "codex-cloud",
+	}))
+	fingerprint := func() string {
+		t.Helper()
+		fp, err := localSessionDependencyPushFingerprint(ctx, local, "plan", "", true)
+		require.NoError(t, err)
+		return fp
+	}
+
+	// Recorded before session_plan_usage existed.
+	const withoutPlanUsage = "9869668d5601a43b76d8540fccf8a43afc244c5fe0dde6020df855a49c76dc12"
+	assert.Equal(t, withoutPlanUsage, fingerprint())
+
+	require.NoError(t, local.ReplaceSessionPlanUsage(ctx, "plan", &db.SessionPlanUsage{
+		HasPlanUsage: true, DataStatus: "partial", WeeklyPercent: new(1.0),
+	}))
+	partial := fingerprint()
+	assert.NotEqual(t, withoutPlanUsage, partial)
+
+	require.NoError(t, local.ReplaceSessionPlanUsage(ctx, "plan", &db.SessionPlanUsage{
+		HasPlanUsage: true, DataStatus: "partial", WeeklyPercent: new(2.0),
+	}))
+	assert.NotEqual(t, partial, fingerprint())
 }

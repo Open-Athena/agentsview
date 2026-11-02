@@ -7,9 +7,9 @@ import (
 	"context"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
+	"encoding/xml"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/tidwall/gjson"
+	"go.kenn.io/agentsview/internal/ctxio"
 	"go.kenn.io/agentsview/internal/stringutil"
 )
 
@@ -33,6 +34,13 @@ var (
 	xmlCmdStripRe             = regexp.MustCompile(`<command-(?:name|message|args)>[^<]*</command-(?:name|message|args)>`)
 	persistedToolResultPathRe = regexp.MustCompile(`(?m)Full output saved to:\s*(.+)$`)
 )
+
+// persistedOutputUnresolvedKey marks a tool_result block, within the line
+// resolveClaudePersistedToolResultsContext rewrites, whose persistedOutputPath
+// side file genuinely failed to resolve. parseToolResult reads it to set
+// ParsedToolResult.PersistedOutputUnresolved and it never reaches ContentRaw,
+// since it sits beside "content" on the block, not inside it.
+const persistedOutputUnresolvedKey = "_persistedOutputUnresolved"
 
 const (
 	initialScanBufSize         = 64 * 1024        // 64KB
@@ -55,7 +63,9 @@ type dagEntry struct {
 // claudeQueuedCommand is a user message Claude Code persisted as
 // type=attachment with attachment.type=queued_command — i.e. a
 // prompt the user typed while a tool call was still running.
-// These records have no uuid/parentUuid, so we collect them out
+// Claude Code also uses this shape for task notifications and for
+// messages another session sent, which queuedCommandMessage
+// classifies as system rows. These records have no uuid/parentUuid, so we collect them out
 // of band and splice them into the message stream by timestamp
 // after DAG processing completes.
 type claudeQueuedCommand struct {
@@ -133,6 +143,7 @@ func claudeParseFile(
 		agentLabel       string
 		entrypoint       string
 		sessionKind      string
+		prLinks          prLinkCollector
 		foundParentSID   bool
 		uploadSessionID  string
 		uploadRoot       bool
@@ -199,16 +210,6 @@ func claudeParseFile(
 					gjson.GetBytes(lineBytes, "aiTitle").Str,
 				); value != "" {
 					compatibleAI = strings.Clone(value)
-				}
-			}
-		}
-		if opts.compatibleTitleEvents {
-			switch entryType {
-			case "custom-title":
-				if value := strings.TrimSpace(
-					gjson.GetBytes(lineBytes, "customTitle").Str,
-				); value != "" {
-					compatibleCustom = strings.Clone(value)
 				}
 			}
 		}
@@ -290,6 +291,27 @@ func claudeParseFile(
 			if qc, ok := extractQueuedCommand(string(lineBytes)); ok {
 				qc.prompt = strings.Clone(qc.prompt)
 				queuedCommands = append(queuedCommands, qc)
+			}
+			continue
+		}
+
+		if entryType == "pr-link" {
+			if link, ok := claudePRLink(lineBytes); ok {
+				prLinks.add(link)
+			}
+			continue
+		}
+
+		// Current Claude Code records /rename as a custom-title
+		// record and repeats it after later turns. It rejects empty
+		// names, so an empty value is not a clear.
+		if entryType == "custom-title" {
+			if value := strings.TrimSpace(
+				gjson.GetBytes(lineBytes, "customTitle").Str,
+			); value != "" {
+				displayName = strings.Clone(value)
+				compatibleCustom = displayName
+				renameSeen = true
 			}
 			continue
 		}
@@ -439,6 +461,7 @@ func claudeParseFile(
 		agentLabel:      agentLabel,
 		entrypoint:      entrypoint,
 		sessionKind:     sessionKind,
+		prLinks:         prLinks.result(),
 		malformedLines:  malformedLines,
 		isTruncated:     isTruncated,
 	}
@@ -493,6 +516,10 @@ func claudeParseFile(
 	// "awaiting_user" can be distinguished from a generic clean
 	// termination.
 	for i := range results {
+		results[i].Session.RelationshipType = PromoteParentlessWorker(
+			results[i].Session.ParentSessionID, results[i].Session.RelationshipType,
+			claudeWorkerMessages(results[i].Session.Entrypoint, results[i].Session.SessionKind, results[i].Messages),
+		)
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
@@ -501,6 +528,7 @@ func claudeParseFile(
 			lastAssistantStopReason(results[i].Messages),
 			lastLineFailed,
 		)
+		results[i].Session.claudeRenameSeen = renameSeen
 	}
 
 	// Drop content-free /usage probe sessions (e.g. CodexBar's
@@ -561,6 +589,7 @@ func compactClaudeEntry(line []byte) string {
 		{name: "isMeta"},
 		{name: "requestId"},
 		{name: "promptSource"},
+		{name: "turnOrigin"},
 		{name: "effort"},
 	}
 	messageFields := []claudeCompactField{
@@ -573,6 +602,7 @@ func compactClaudeEntry(line []byte) string {
 	snapshotFields := []claudeCompactField{
 		{name: "timestamp"},
 	}
+	originFields := []claudeCompactField{{name: "kind"}}
 	// searchCount is how many billed server-side web searches a
 	// WebSearch tool result performed; it is the only surviving record
 	// of them in a Claude Code transcript.
@@ -587,7 +617,7 @@ func compactClaudeEntry(line []byte) string {
 	// scan per field made it the dominant per-line parse cost. Only the
 	// first occurrence of a key is kept, matching gjson.Get's
 	// duplicate-key behavior.
-	var seenMessage, seenSnapshot, seenToolResult bool
+	var seenMessage, seenSnapshot, seenToolResult, seenOrigin bool
 	gjson.Parse(string(line)).ForEach(func(key, value gjson.Result) bool {
 		switch key.Str {
 		case "message":
@@ -605,6 +635,11 @@ func compactClaudeEntry(line []byte) string {
 				seenToolResult = true
 				setClaudeCompactFields(toolResultFields, value)
 			}
+		case "origin":
+			if !seenOrigin {
+				seenOrigin = true
+				setClaudeCompactFields(originFields, value)
+			}
 		default:
 			setClaudeCompactField(topFields, key.Str, value)
 		}
@@ -613,7 +648,7 @@ func compactClaudeEntry(line []byte) string {
 
 	var b strings.Builder
 	b.Grow(compactClaudeEntrySize(
-		topFields, snapshotFields, messageFields, toolResultFields,
+		topFields, snapshotFields, messageFields, toolResultFields, originFields,
 	))
 	b.WriteByte('{')
 	first := true
@@ -621,6 +656,7 @@ func compactClaudeEntry(line []byte) string {
 	writeClaudeCompactObject(&b, &first, "snapshot", snapshotFields)
 	writeClaudeCompactObject(&b, &first, "message", messageFields)
 	writeClaudeCompactObject(&b, &first, "toolUseResult", toolResultFields)
+	writeClaudeCompactObject(&b, &first, "origin", originFields)
 	b.WriteByte('}')
 	return b.String()
 }
@@ -744,6 +780,8 @@ type ClaudeSubagentLink struct {
 	SubagentSessionID string
 	ResultContentRaw  string
 	ResultContentLen  int
+	ResultStatus      string
+	ResultTimestamp   time.Time
 	HasResult         bool
 }
 
@@ -784,10 +822,12 @@ type claudeIncrementalScan struct {
 	// storedSessionName is the session_name already persisted for this
 	// session ("" when the row carries none), or nil when the call site
 	// cannot supply it. An appended ai-title can only change the stored
-	// session while that name is still empty, so a session that already
-	// carries its title keeps repeated title records on the incremental
-	// path. nil keeps the append incremental.
+	// session while that name is still empty, and an appended custom-title
+	// only when it differs from that name, so repeated title records stay on
+	// the incremental path. nil keeps the append incremental.
 	storedSessionName *string
+	// storedPRLinks contains the normalized pull request URLs already persisted.
+	storedPRLinks map[string]struct{}
 }
 
 func claudeParseSessionFrom(
@@ -810,6 +850,8 @@ func claudeParseSessionFrom(
 		sawRename              bool
 		sawAITitle             bool
 		sawSessionIdentityEdit bool
+		appendedCustomTitle    string
+		sawNewPRLink           bool
 	)
 
 	consumed, err := readJSONLFrom(
@@ -828,6 +870,14 @@ func claudeParseSessionFrom(
 				strings.TrimSpace(gjson.Get(line, "aiTitle").Str) != "" {
 				sawAITitle = true
 			}
+			if entryType == "custom-title" {
+				if value := strings.TrimSpace(
+					gjson.Get(line, "customTitle").Str,
+				); value != "" {
+					appendedCustomTitle = value
+				}
+				return
+			}
 			if entryType == "system" {
 				if _, ok := extractRenameName(
 					gjson.Get(line, "content").Str,
@@ -837,6 +887,14 @@ func claudeParseSessionFrom(
 				return
 			}
 			if entryType == "agent-setting" {
+				return
+			}
+			if entryType == "pr-link" {
+				if link, ok := claudePRLink([]byte(line)); ok {
+					if _, stored := scan.storedPRLinks[link.URL]; !stored {
+						sawNewPRLink = true
+					}
+				}
 				return
 			}
 			if entryType == "attachment" {
@@ -929,7 +987,16 @@ func claudeParseSessionFrom(
 		*scan.storedSessionName == "" {
 		return nil, nil, time.Time{}, 0, ErrClaudeIncrementalNeedsFullParse
 	}
+	// Claude Code repeats the custom-title record after later turns, so
+	// escalate only when the appended name differs from the stored one.
+	if appendedCustomTitle != "" && scan.storedSessionName != nil &&
+		*scan.storedSessionName != appendedCustomTitle {
+		return nil, nil, time.Time{}, 0, ErrClaudeIncrementalNeedsFullParse
+	}
 	if sawSessionIdentityEdit {
+		return nil, nil, time.Time{}, 0, ErrClaudeIncrementalNeedsFullParse
+	}
+	if sawNewPRLink {
 		return nil, nil, time.Time{}, 0, ErrClaudeIncrementalNeedsFullParse
 	}
 
@@ -1038,16 +1105,37 @@ func claudeSessionIdentityUpdate(line string, stored claudeStoredIdentity) bool 
 		strings.TrimSpace(gjson.Get(line, "sessionKind").Str) != ""
 }
 
+func isHiddenClaudeMeta(line string) bool {
+	return gjson.Get(line, "isMeta").Bool() &&
+		gjson.Get(line, "origin.kind").Str != "channel"
+}
+
+func claudeSDKPrompt(line string) bool {
+	return gjson.Get(line, "turnOrigin").Str == "sdk" &&
+		gjson.Get(line, "origin.kind").Str != "human"
+}
+
+func claudeWorkerMessages(entrypoint, kind string, messages []ParsedMessage) bool {
+	if entrypoint != "sdk-cli" || kind != "" {
+		return false
+	}
+	for _, message := range messages {
+		if isRealClaudeUserMessage(message) {
+			return message.claudeSDKOrigin
+		}
+	}
+	return false
+}
+
 // collectClaudeUnmatchedToolResults returns result links for appended
 // tool_result blocks whose tool_use lives outside the appended window.
 // In-append results pair at write time and agentId-linked results are
 // already carried by collectClaudeSubagentLinks. Only result-bearing
 // links suppress a late result: a queue/progress mapping for the same
 // tool_use carries no content, so its result still has to be copied
-// here. isMeta carriers are skipped: the full parser drops those lines
-// entirely, so their result content never reaches the stored tool call
-// there either. Results
-// whose tool_use id is unknown to the store no-op at apply time,
+// here. isMeta carriers remain excluded from tool-result linkage, even when
+// their channel text is visible in the transcript. Results whose tool_use id
+// is unknown to the store no-op at apply time,
 // matching the full parser's unpaired-result behavior.
 func collectClaudeUnmatchedToolResults(
 	entries []dagEntry, agentLinks []ClaudeSubagentLink,
@@ -1102,6 +1190,8 @@ func collectClaudeUnmatchedToolResults(
 				ToolUseID:        result.ToolUseID,
 				ResultContentRaw: result.ContentRaw,
 				ResultContentLen: result.ContentLength,
+				ResultStatus:     result.Status,
+				ResultTimestamp:  parseTimestamp(gjson.Get(e.line, "timestamp").Str),
 				HasResult:        true,
 			})
 			return true
@@ -1123,6 +1213,8 @@ func collectClaudeSubagentLinks(entries []dagEntry) []ClaudeSubagentLink {
 		if gjson.Get(entry.line, "isMeta").Bool() {
 			link.ResultContentRaw = ""
 			link.ResultContentLen = 0
+			link.ResultStatus = ""
+			link.ResultTimestamp = time.Time{}
 			link.HasResult = false
 		}
 		links = append(links, link)
@@ -1275,13 +1367,14 @@ func extractMessagesFrom(
 		}
 
 		if e.entryType == "user" {
-			if gjson.Get(e.line, "isMeta").Bool() {
+			if isHiddenClaudeMeta(e.line) {
 				continue
 			}
 		}
 
 		content := gjson.Get(e.line, "message.content")
-		text, thinkingText, hasThinking, hasToolUse, tcs, trs := ExtractTextContent(context.Background(), content)
+		text, thinkingText, dialogueText, hasThinking, hasToolUse, tcs, trs := ExtractTextContent(context.Background(), content)
+		originalContent := text
 
 		// Convert command/skill invocation XML into readable
 		// text (e.g. "/roborev-fix 450"). If the content
@@ -1296,6 +1389,10 @@ func extractMessagesFrom(
 		}
 
 		if strings.TrimSpace(text) == "" && len(trs) == 0 {
+			if msg, ok := claudeBlankUsageMessage(e, ordinal); ok {
+				messages = append(messages, msg)
+				ordinal++
+			}
 			continue
 		}
 
@@ -1352,10 +1449,14 @@ func extractMessagesFrom(
 			}
 		}
 
+		if e.entryType == "user" && text != originalContent {
+			dialogueText = text
+		}
 		msg := ParsedMessage{
 			Ordinal:            ordinal,
 			Role:               RoleType(e.entryType),
 			Content:            text,
+			DialogueText:       new(dialogueText),
 			ThinkingText:       thinkingText,
 			Timestamp:          e.timestamp,
 			HasThinking:        hasThinking,
@@ -1369,6 +1470,8 @@ func extractMessagesFrom(
 			IsSidechain:        gjson.Get(e.line, "isSidechain").Bool(),
 			PromptSource:       gjson.Get(e.line, "promptSource").Str,
 			tokenPresenceKnown: e.entryType == "assistant",
+
+			claudeChannelOrigin: gjson.Get(e.line, "origin.kind").Str == "channel",
 		}
 
 		if e.entryType == "assistant" {
@@ -1397,6 +1500,7 @@ type claudeSessionMeta struct {
 	agentLabel      string
 	entrypoint      string
 	sessionKind     string
+	prLinks         []PRLink
 	malformedLines  int
 	isTruncated     bool
 }
@@ -1411,6 +1515,7 @@ func (m claudeSessionMeta) applyTo(sess *ParsedSession) {
 	sess.AgentLabel = m.agentLabel
 	sess.Entrypoint = m.entrypoint
 	sess.SessionKind = m.sessionKind
+	sess.PRLinks = slices.Clone(m.prLinks)
 	sess.MalformedLines = m.malformedLines
 	sess.IsTruncated = m.isTruncated
 }
@@ -1559,7 +1664,7 @@ func parseDAG(
 			}
 
 			// Fork point: count user turns on first child's branch.
-			firstChildTurns, err := countUserTurnsContext(
+			firstChildTurns, channelTurns, err := countUserTurnsContext(
 				ctx, entries, children, kids[0],
 			)
 			if err != nil {
@@ -1569,9 +1674,13 @@ func parseDAG(
 				// Small-gap retry: follow the last child.
 				current = kids[len(kids)-1]
 			} else {
-				// Large-gap fork: follow first child on main,
-				// collect other children as fork branches.
-				for _, kid := range kids[1:] {
+				mainKid, forkKids := kids[0], kids[1:]
+				if firstChildTurns-channelTurns <= forkThreshold {
+					// Newly visible channel turns retain the discarded branch
+					// as a fork; the stored retry keeps its existing identity.
+					mainKid, forkKids = kids[len(kids)-1], kids[:len(kids)-1]
+				}
+				for _, kid := range forkKids {
 					forkSID := sessionID + "-" +
 						entries[kid].uuid
 					forkPath, err := walkBranch(kid, forkSID)
@@ -1586,7 +1695,7 @@ func parseDAG(
 						},
 					)
 				}
-				current = kids[0]
+				current = mainKid
 			}
 		}
 
@@ -1733,6 +1842,8 @@ func extractToolResultAgentIDLink(line string) (ClaudeSubagentLink, bool) {
 		SubagentSessionID: sessionID,
 		ResultContentRaw:  toolResult.ContentRaw,
 		ResultContentLen:  toolResult.ContentLength,
+		ResultStatus:      toolResult.Status,
+		ResultTimestamp:   parseTimestamp(gjson.Get(line, "timestamp").Str),
 		HasResult:         true,
 	}, true
 }
@@ -2327,7 +2438,7 @@ func resolveClaudePersistedToolResultsContext(
 		}
 		path := persistedOutputPathFromContent(content)
 		if path == "" && (toolResultCount == 1 ||
-			isPersistedToolResultPlaceholder(content)) {
+			containsPersistedOutputTag(content)) {
 			path = persistedPath
 		}
 		if path == "" {
@@ -2345,6 +2456,15 @@ func resolveClaudePersistedToolResultsContext(
 			return "", err
 		}
 		if !ok {
+			block[persistedOutputUnresolvedKey] = jsontext.Value("true")
+			marked, err := json.Marshal(block, json.Deterministic(true))
+			if err != nil {
+				// Marking failed; leave this block as the parser's own
+				// original text rather than fail the whole line.
+				continue
+			}
+			blocks[i] = marked
+			changed = true
 			continue
 		}
 		contentData, err := json.Marshal(output)
@@ -2392,7 +2512,7 @@ func countClaudeToolResultBlocks(blocks []jsontext.Value) int {
 	return count
 }
 
-func isPersistedToolResultPlaceholder(content string) bool {
+func containsPersistedOutputTag(content string) bool {
 	return strings.Contains(content, "<persisted-output>")
 }
 
@@ -2434,9 +2554,7 @@ func readClaudePersistedToolResultContext(
 		if err != nil {
 			return "", false, nil //nolint:nilerr // Optional persisted-output enrichment preserves the original transcript on failure.
 		}
-		b, readErr := io.ReadAll(io.LimitReader(
-			checkedContextReader{ctx: ctx, reader: f}, maxPersistedToolResultSize+1,
-		))
+		b, readErr := readPersistedToolResultBytes(ctxio.Reader{Context: ctx, Reader: f})
 		closeErr := f.Close()
 		if errors.Is(readErr, context.Canceled) ||
 			errors.Is(readErr, context.DeadlineExceeded) {
@@ -2445,11 +2563,7 @@ func readClaudePersistedToolResultContext(
 		if readErr != nil || closeErr != nil {
 			return "", false, nil //nolint:nilerr // Optional persisted-output enrichment preserves the original transcript on failure.
 		}
-		if len(b) > maxPersistedToolResultSize {
-			return stringutil.SafeTruncate(string(b), maxPersistedToolResultSize) +
-				"\n\n[agentsview: persisted tool result truncated at 16 MiB]", true, nil
-		}
-		return string(b), true, nil
+		return persistedToolResultText(b), true, nil
 	}
 	return "", false, nil
 }
@@ -2491,33 +2605,36 @@ func countUserTurnsContext(
 	entries []dagEntry,
 	children map[string][]int,
 	startIdx int,
-) (int, error) {
-	count := 0
+) (int, int, error) {
+	count, channelCount := 0, 0
 	stack := []int{startIdx}
 	visited := 0
 	for len(stack) > 0 {
 		if err := contextErrEvery(ctx, visited); err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 		visited++
 		current := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 		if isCountedClaudeUserTurn(ctx, entries[current]) {
 			count++
+			if gjson.Get(entries[current].line, "isMeta").Bool() {
+				channelCount++
+			}
 		}
 		stack = append(stack, children[entries[current].uuid]...)
 	}
-	return count, ctx.Err()
+	return count, channelCount, ctx.Err()
 }
 
 func isCountedClaudeUserTurn(ctx context.Context, entry dagEntry) bool {
 	if entry.entryType != "user" ||
-		gjson.Get(entry.line, "isMeta").Bool() ||
+		isHiddenClaudeMeta(entry.line) ||
 		gjson.Get(entry.line, "isCompactSummary").Bool() {
 		return false
 	}
 	content := gjson.Get(entry.line, "message.content")
-	text, _, _, _, _, _ := ExtractTextContent(ctx, content)
+	text, _, _, _, _, _, _ := ExtractTextContent(ctx, content)
 	text, skip := preprocessClaudeUserText(text)
 	if skip || strings.TrimSpace(text) == "" {
 		return false
@@ -2582,13 +2699,14 @@ func extractMessagesContext(
 
 		// Tier 1: skip system-injected user entries.
 		if e.entryType == "user" {
-			if gjson.Get(e.line, "isMeta").Bool() {
+			if isHiddenClaudeMeta(e.line) {
 				continue
 			}
 		}
 
 		content := gjson.Get(e.line, "message.content")
-		text, thinkingText, hasThinking, hasToolUse, tcs, trs := ExtractTextContent(ctx, content)
+		text, thinkingText, dialogueText, hasThinking, hasToolUse, tcs, trs := ExtractTextContent(ctx, content)
+		originalContent := text
 
 		// Convert command/skill invocation XML into readable
 		// text (e.g. "/roborev-fix 450"). If the content
@@ -2603,6 +2721,10 @@ func extractMessagesContext(
 		}
 
 		if strings.TrimSpace(text) == "" && len(trs) == 0 {
+			if msg, ok := claudeBlankUsageMessage(e, ordinal); ok {
+				messages = append(messages, msg)
+				ordinal++
+			}
 			continue
 		}
 
@@ -2657,10 +2779,14 @@ func extractMessagesContext(
 			}
 		}
 
+		if e.entryType == "user" && text != originalContent {
+			dialogueText = text
+		}
 		msg := ParsedMessage{
 			Ordinal:            ordinal,
 			Role:               RoleType(e.entryType),
 			Content:            text,
+			DialogueText:       new(dialogueText),
 			ThinkingText:       thinkingText,
 			Timestamp:          e.timestamp,
 			HasThinking:        hasThinking,
@@ -2673,7 +2799,10 @@ func extractMessagesContext(
 			SourceParentUUID:   e.parentUuid,
 			IsSidechain:        gjson.Get(e.line, "isSidechain").Bool(),
 			PromptSource:       gjson.Get(e.line, "promptSource").Str,
+			claudeSDKOrigin:    claudeSDKPrompt(e.line),
 			tokenPresenceKnown: e.entryType == "assistant",
+
+			claudeChannelOrigin: gjson.Get(e.line, "origin.kind").Str == "channel",
 		}
 
 		if e.entryType == "assistant" {
@@ -2695,6 +2824,35 @@ func extractMessagesContext(
 		return nil, time.Time{}, time.Time{}, err
 	}
 	return messages, startedAt, endedAt, nil
+}
+
+// claudeBlankUsageMessage keeps the token usage of an assistant record
+// that renders no transcript text, such as a response whose only block
+// is an empty thinking block with an opaque signature. Chunks of one
+// response are merged by message.id before extraction, so a record that
+// is still blank here is its own response and its usage would otherwise
+// be lost. The row is flagged as system so the transcript hides it.
+func claudeBlankUsageMessage(e dagEntry, ordinal int) (ParsedMessage, bool) {
+	if e.entryType != "assistant" {
+		return ParsedMessage{}, false
+	}
+	msg := ParsedMessage{
+		Ordinal:            ordinal,
+		Role:               RoleAssistant,
+		Timestamp:          e.timestamp,
+		IsSystem:           true,
+		SourceType:         e.entryType,
+		SourceUUID:         e.uuid,
+		SourceParentUUID:   e.parentUuid,
+		IsSidechain:        gjson.Get(e.line, "isSidechain").Bool(),
+		tokenPresenceKnown: true,
+	}
+	extractClaudeTokenFields(&msg, e.line)
+	if msg.ContextTokens == 0 && msg.OutputTokens == 0 {
+		return ParsedMessage{}, false
+	}
+	msg.StopReason = gjson.Get(e.line, "message.stop_reason").Str
+	return msg, true
 }
 
 // extractClaudeTokenFields populates Model, TokenUsage,
@@ -2884,6 +3042,19 @@ func truncate(s string, maxLen int) string {
 	return stringutil.TruncateRunes(strings.TrimSpace(s), maxLen, "...")
 }
 
+// claudePRLink decodes a Claude Code pr-link record:
+//
+//	{"type":"pr-link","prNumber":123,
+//	 "prUrl":"https://github.com/owner/repo/pull/123",
+//	 "prRepository":"owner/repo","timestamp":"..."}
+func claudePRLink(line []byte) (PRLink, bool) {
+	return NewPRLink(
+		gjson.GetBytes(line, "prUrl").Str,
+		gjson.GetBytes(line, "prRepository").Str,
+		int(gjson.GetBytes(line, "prNumber").Int()),
+	)
+}
+
 // extractRenameName returns the argument of a Claude Code /rename
 // command envelope. The bool is true when content is a /rename
 // invocation (including an empty argument, which clears the name) and
@@ -3042,21 +3213,48 @@ func firstMessageAndUserCountContext(
 		if err := contextErrEvery(ctx, i); err != nil {
 			return "", 0, err
 		}
-		if m.IsSystem {
-			continue
-		}
-		if m.Role != RoleUser || m.Content == "" {
+		if !isRealClaudeUserMessage(m) {
 			continue
 		}
 		userCount++
 		if firstMsg == "" &&
 			!IsSkippablePreviewCommand(m.Content) {
+			preview := m.Content
+			if m.claudeChannelOrigin {
+				preview = claudeChannelPreview(preview)
+			}
 			firstMsg = truncate(
-				strings.ReplaceAll(m.Content, "\n", " "), 300,
+				strings.ReplaceAll(preview, "\n", " "), 300,
 			)
 		}
 	}
 	return firstMsg, userCount, ctx.Err()
+}
+
+// claudeChannelPreview parses opening tags only: channel bodies are user text,
+// so XML characters in a question must remain literal.
+func claudeChannelPreview(text string) string {
+	remaining := strings.TrimSpace(text)
+	var bodies []string
+	for remaining != "" {
+		decoder := xml.NewDecoder(strings.NewReader(remaining))
+		token, err := decoder.Token()
+		opening, ok := token.(xml.StartElement)
+		if err != nil || !ok || opening.Name.Local != "channel" || opening.Name.Space != "" {
+			return text
+		}
+		body, tail, ok := strings.Cut(remaining[decoder.InputOffset():], "</channel>")
+		if !ok {
+			return text
+		}
+		bodies = append(bodies, strings.TrimSpace(body))
+		remaining = strings.TrimSpace(tail)
+	}
+	return strings.Join(bodies, " ")
+}
+
+func isRealClaudeUserMessage(m ParsedMessage) bool {
+	return !m.IsSystem && m.Role == RoleUser && m.Content != ""
 }
 
 // isUsageProbeSession reports whether a parsed session's only real
@@ -3069,7 +3267,7 @@ func firstMessageAndUserCountContext(
 func isUsageProbeSession(messages []ParsedMessage) bool {
 	sawUsage := false
 	for _, m := range messages {
-		if m.IsSystem || m.Role != RoleUser || m.Content == "" {
+		if !isRealClaudeUserMessage(m) {
 			continue
 		}
 		if strings.TrimSpace(m.Content) != "/usage" {
@@ -3132,6 +3330,11 @@ func classifyClaudeSystemMessage(content string) string {
 		return "interrupted"
 	case strings.HasPrefix(trimmed, "<task-notification>"):
 		return "task_notification"
+	case strings.HasPrefix(trimmed, "<cross-session-message"):
+		// Another Claude Code session sent this message. Claude Code
+		// persists it as a queued_command whose prompt keeps the
+		// sender attributes in this wrapper.
+		return "peer_message"
 	case strings.HasPrefix(trimmed, "Stop hook feedback:"):
 		return "stop_hook"
 	case strings.HasPrefix(trimmed, "<system-reminder>"):

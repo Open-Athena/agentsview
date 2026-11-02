@@ -1,7 +1,8 @@
 import type { EventSource } from "eventsource";
 import { triggerResync, triggerSync, watchSession, type SyncHandle } from "../api/client.js";
 import { MetadataService, SyncService } from "../api/generated/index";
-import { ApiError, isRemoteConnection } from "../api/runtime.js";
+import { ApiError, isAbortError, isRemoteConnection } from "../api/runtime.js";
+import { reportSyncFailed } from "../utils/telemetry.js";
 import { events } from "./events.svelte.js";
 import type {
   SyncProgress,
@@ -13,6 +14,21 @@ import type { DbSessionTiming as SessionTiming } from "../api/generated/index.js
 import { SNAPSHOT } from "../utils/snapshot.js";
 
 type SyncCompleteListener = () => void;
+
+/**
+ * Sync, or rebuild the archive when the server says a plain sync cannot bring
+ * it current. A daemon with a stale archive answers /sync with 409 until the
+ * required full rebuild runs.
+ */
+function syncOrRebuild(onProgress?: (p: SyncProgress) => void): SyncHandle {
+  let current = triggerSync(onProgress);
+  const done = current.done.catch((err: unknown) => {
+    if (!(err instanceof ApiError && err.status === 409)) throw err;
+    current = triggerResync(onProgress);
+    return current.done;
+  });
+  return { abort: () => current.abort(), done };
+}
 
 const POLL_INTERVAL_MS = 10_000;
 
@@ -32,7 +48,11 @@ export function commitsDisagree(a: string | undefined, b: string | undefined): b
 }
 
 class SyncStore {
+  archiveStale: boolean = $state(false);
   syncing: boolean = $state(false);
+  // Message from the last sync or resync that failed, cleared when one
+  // succeeds. The header Sync button has no other place to report it.
+  lastSyncError: string | null = $state(null);
   progress: SyncProgress | null = $state(null);
   lastSync: string | null = $state(null);
   lastSyncStats: SyncStats | null = $state(null);
@@ -58,7 +78,12 @@ class SyncStore {
     return this.serverVersion?.read_only === true;
   }
 
+  get archiveOnly(): boolean {
+    return this.serverVersion?.archive_only === true;
+  }
+
   private watchEventSource: EventSource | null = null;
+  private watchVisibilityHandler: (() => void) | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private lastStatsParams: {
     include_one_shot?: boolean;
@@ -129,6 +154,7 @@ class SyncStore {
       const changed = newLastSync !== null && newLastSync !== this.lastSync;
       this.lastSync = newLastSync;
       this.lastSyncStats = status.stats ?? null;
+      this.archiveStale = status.archive_stale === true;
       const statusProgress = status.progress ?? null;
       let statusProgressCompleted = false;
       if (statusProgress) {
@@ -229,14 +255,18 @@ class SyncStore {
   }
 
   triggerSync(onComplete?: () => void) {
+    if (this.archiveOnly) return;
     if (this.readOnly) {
       void this.refreshReadOnly(onComplete);
       return;
     }
-    this.runSync(triggerSync, onComplete);
+    // A stale archive only becomes current through a full rebuild, which a
+    // plain sync does not run on a daemon with a sync engine.
+    this.runSync(this.archiveStale ? triggerResync : syncOrRebuild, onComplete);
   }
 
   triggerResync(onComplete?: () => void, onError?: (err: Error) => void): boolean {
+    if (this.archiveOnly) return false;
     if (this.readOnly) {
       onError?.(new Error("Full resync is unavailable for read-only backends."));
       return false;
@@ -282,19 +312,20 @@ class SyncStore {
 
     handle.done
       .then((s: SyncStats) => {
+        this.lastSyncError = null;
         this.lastSyncStats = s;
-        this.loadStats();
+        void this.loadStats();
         finalizeSync();
         this.notifySyncComplete();
         // Hydrate the authoritative server timestamp.
         // pendingHydration suppresses the notification so
         // the poll path won't double-fire.
         this.pendingHydration = true;
-        this.loadStatus();
+        void this.loadStatus();
         onComplete?.();
       })
       .catch((err: unknown) => {
-        if (err instanceof DOMException && err.name === "AbortError") {
+        if (isAbortError(err)) {
           return;
         }
         finalizeSync();
@@ -305,15 +336,51 @@ class SyncStore {
         }
       });
 
+    handle.done.catch((err: unknown) => {
+      if (isAbortError(err)) return;
+      this.lastSyncError = err instanceof Error ? err.message : "Sync failed";
+      reportSyncFailed(err);
+    });
+
     return true;
   }
 
   watchSession(sessionId: string, onUpdate: () => void, onTiming?: (t: SessionTiming) => void) {
     this.unwatchSession();
-    this.watchEventSource = watchSession(sessionId, onUpdate, onTiming);
+    const open = () => {
+      this.watchEventSource = watchSession(sessionId, onUpdate, onTiming);
+      const es = this.watchEventSource;
+      es.addEventListener("session_ready", () => {
+        if (this.watchEventSource !== es) return;
+        onUpdate();
+      });
+    };
+    if (typeof document === "undefined") {
+      open();
+      return;
+    }
+    this.watchVisibilityHandler = () => {
+      if (document.hidden) {
+        this.closeSessionStream();
+      } else if (!this.watchEventSource || this.watchEventSource.readyState === 2) {
+        open();
+        // A rejected reconnect, such as a deleted session's 404, never sends session_ready.
+        onUpdate();
+      }
+    };
+    document.addEventListener("visibilitychange", this.watchVisibilityHandler);
+    if (!document.hidden) open();
   }
 
   unwatchSession() {
+    if (this.watchVisibilityHandler) {
+      document.removeEventListener("visibilitychange", this.watchVisibilityHandler);
+      this.watchVisibilityHandler = null;
+    }
+    this.closeSessionStream();
+  }
+
+  private closeSessionStream() {
     if (this.watchEventSource) {
       this.watchEventSource.close();
       this.watchEventSource = null;

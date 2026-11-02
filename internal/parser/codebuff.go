@@ -2,20 +2,18 @@
 // ABOUTME: structured session data. Both agents share the same on-disk layout
 // ABOUTME: under ~/.config/manicode/projects/<project>/chats/<timestamp>/.
 // ABOUTME: The agent type (codebuff vs freebuff) is determined from the
-// ABOUTME: agentType field in run-state.json, and agentType is also
-// ABOUTME: surfaced as the session's UsageEvent.Model so the daily usage
-// ABOUTME: report can bucket similar sessions by template while leaving the literal
-// LLM (server-selected and not persisted on disk) unknown.
+// ABOUTME: agentType field in run-state.json. Usage events carry the model a
+// ABOUTME: turn ran when the run state records one, else the agent template.
 package parser
 
 import (
 	"context"
 	"encoding/json/v2"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,42 +30,67 @@ type codebuffSessionDir struct {
 }
 
 // parseCodebuffSession parses a single codebuff/freebuff session directory
-// and returns the parsed session with messages.
+// and returns the parsed session with messages, plus one linked child result
+// per nested subagent (see codebuffSubagentResults).
 func parseCodebuffSession(
 	dir string,
 	projectHint string,
 	machine string,
-) (*ParsedSession, []ParsedMessage, error) {
-	chatMessagesPath := filepath.Join(dir, "chat-messages.json")
-	runStatePath := filepath.Join(dir, "run-state.json")
-	chatMetaPath := filepath.Join(dir, "chat-meta.json")
+) (*ParsedSession, []ParsedMessage, []ParseResult, error) {
+	chatMessagesPath := filepath.Join(dir, codebuffPrimaryTranscriptName)
+	runStatePath := filepath.Join(dir, codebuffRunStateName)
+	chatMetaPath := filepath.Join(dir, codebuffChatMetaName)
 
 	// Read run-state.json for model, token, agent-type, and skills data.
 	rs, err := readCodebuffRunState(runStatePath)
 	if err != nil && !os.IsNotExist(err) {
-		return nil, nil, fmt.Errorf("read run-state %s: %w", runStatePath, err)
-	}
-
-	// Read chat-meta.json for session name and timing hints.
-	meta := readCodebuffChatMeta(chatMetaPath)
-
-	// Read and parse the chat messages.
-	data, err := os.ReadFile(chatMessagesPath)
-	if err != nil {
-		return nil, nil, fmt.Errorf("read chat-messages %s: %w", chatMessagesPath, err)
-	}
-	if !gjson.ValidBytes(data) {
-		return nil, nil, fmt.Errorf("decode %s: invalid json", chatMessagesPath)
+		return nil, nil, nil, fmt.Errorf("read run-state %s: %w", runStatePath, err)
 	}
 
 	// Session ID is the timestamp directory name (ISO 8601).
 	sessionID := filepath.Base(dir)
 	sessionDate := parseCodebuffSessionDate(sessionID)
 
-	msgs, startedAt, endedAt, err := parseCodebuffMessages(data, sessionDate)
-	if err != nil {
-		return nil, nil, fmt.Errorf("parse chat-messages %s: %w", chatMessagesPath, err)
+	// Determine agent type from run-state agentType field.
+	// Sessions with "free" in the agentType are Freebuff, others are Codebuff.
+	// Both share the same on-disk layout; the parser splits them by type
+	// so the UI can filter each agent independently.
+	agent := AgentCodebuff
+	agentLabel := "Codebuff"
+	if strings.Contains(strings.ToLower(rs.AgentType), "free") {
+		agent = AgentFreebuff
+		agentLabel = "Freebuff"
 	}
+
+	// Use projectHint (the storage directory name) for the session ID
+	// to ensure stability. The cwd-derived project name can change if
+	// the git root changes, which would break source lookup and cause
+	// session ID instability.
+	projectID := projectHint
+	if projectID == "" {
+		projectID = "unknown"
+	}
+	fullID := string(agent) + ":" + projectID + ":" + sessionID
+
+	// Stream the transcript: each AI message embeds the full project context
+	// in metadata.runState, so the file grows quadratically with the
+	// conversation.
+	f, err := os.Open(chatMessagesPath)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("read chat-messages %s: %w", chatMessagesPath, err)
+	}
+	transcript, err := decodeCodebuffMessages(f, sessionDate, fullID)
+	closeErr := f.Close()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("parse chat-messages %s: %w", chatMessagesPath, err)
+	}
+	if closeErr != nil {
+		return nil, nil, nil, fmt.Errorf("close chat-messages %s: %w", chatMessagesPath, closeErr)
+	}
+	msgs := transcript.Messages
+	turnFacts := transcript.TurnFacts
+	startedAt := transcript.StartedAt
+	endedAt := transcript.EndedAt
 
 	// Enrich tool calls with skill names by matching against the skills
 	// catalog available to this session (run-state.json.fileContext.skills).
@@ -76,6 +99,9 @@ func parseCodebuffSession(
 	// call is attributed to a skill when its name or input references a
 	// known skill from the catalog.
 	codebuffAttachSkillNames(msgs, rs.Skills)
+
+	// Read chat-meta.json for session name and timing hints.
+	meta := readCodebuffChatMeta(chatMetaPath)
 
 	// Build session name from first user prompt.
 	firstMsg := ""
@@ -107,17 +133,6 @@ func parseCodebuffSession(
 		} else {
 			sessionName = projectHint
 		}
-	}
-
-	// Determine agent type from run-state agentType field.
-	// Sessions with "free" in the agentType are Freebuff, others are Codebuff.
-	// Both share the same on-disk layout; the parser splits them by type
-	// so the UI can filter each agent independently.
-	agent := AgentCodebuff
-	agentLabel := "Codebuff"
-	if strings.Contains(strings.ToLower(rs.AgentType), "free") {
-		agent = AgentFreebuff
-		agentLabel = "Freebuff"
 	}
 
 	// Count user messages.
@@ -160,16 +175,6 @@ func parseCodebuffSession(
 		fileInfo.Mtime = info.ModTime().UnixNano()
 	}
 
-	// Use projectHint (the storage directory name) for the session ID
-	// to ensure stability. The cwd-derived project name can change if
-	// the git root changes, which would break source lookup and cause
-	// session ID instability.
-	projectID := projectHint
-	if projectID == "" {
-		projectID = "unknown"
-	}
-	fullID := string(agent) + ":" + projectID + ":" + sessionID
-
 	// Derive display project from run-state cwd for UI display.
 	// Use ExtractProjectFromCwd (git-root aware) rather than
 	// GetProjectName because rs.Cwd is a full absolute path, not
@@ -203,6 +208,7 @@ func parseCodebuffSession(
 		Agent:               agent,
 		AgentLabel:          agentLabel,
 		Cwd:                 rs.Cwd,
+		GitBranch:           rs.GitBranch,
 		FirstMessage:        firstMsg,
 		SessionName:         sessionName,
 		StartedAt:           startedAt,
@@ -220,49 +226,96 @@ func parseCodebuffSession(
 	// the true peak, so we cannot reliably derive PeakContextTokens from
 	// this value. Leave peak context unavailable.
 
-	// Emit usage event for reported credits. The actual LLM is
-	// unknown (selected server-side, can change mid-session), so we
-	// attribute the cost to the agent template (e.g. "base2-deepseek",
-	// "base2-free-minimax-m3") rather than the agent name. The
-	// template is granular enough to bucket similar sessions
-	// separately in the daily model breakdown of the usage report
-	// while remaining non-empty so the ue.model != '' eligibility
-	// filter accepts the row. Skip emitting when the template is
-	// missing so sessions with empty agentType don't surface as
-	// empty-model rows. Freebuff vs codebuff distinction is kept in
-	// the agent breakdown via sess.Agent. One codebuff credit =
-	// $0.01 = 10_000 microdollars, rounded to the nearest microdollar
-	// with halves away from zero.
-	if rs.CreditsUsed > 0 && rs.AgentType != "" {
-		cost, costErr := money.FromFloatDollars(rs.CreditsUsed * 0.01)
-		if costErr != nil {
-			cost = money.Money{}
-		}
-		// Determine occurred_at: prefer message timestamps, then fall
-		// back to the session directory timestamp, then source mtime.
-		occurredAt := startedAt
-		if !endedAt.IsZero() {
-			occurredAt = endedAt
-		}
-		if occurredAt.IsZero() && !sessionDate.IsZero() {
-			occurredAt = sessionDate
-		}
-		if occurredAt.IsZero() && fileInfo.Mtime > 0 {
-			occurredAt = time.Unix(0, fileInfo.Mtime)
-		}
-		sess.UsageEvents = []ParsedUsageEvent{{
-			SessionID:  fullID,
-			Source:     "session",
-			Model:      rs.AgentType,
-			OccurredAt: occurredAt.Format(time.RFC3339Nano),
-			Cost:       &cost,
-			CostStatus: "reported",
-			CostSource: "session",
-			DedupKey:   "session:" + fullID,
-		}}
+	// Determine occurred_at: prefer message timestamps, then fall
+	// back to the session directory timestamp, then source mtime.
+	occurredAt := startedAt
+	if !endedAt.IsZero() {
+		occurredAt = endedAt
 	}
+	if occurredAt.IsZero() && !sessionDate.IsZero() {
+		occurredAt = sessionDate
+	}
+	if occurredAt.IsZero() && fileInfo.Mtime > 0 {
+		occurredAt = time.Unix(0, fileInfo.Mtime)
+	}
+	sess.UsageEvents = codebuffUsageEvents(fullID, turnFacts, rs, occurredAt)
 
-	return sess, msgs, nil
+	// The format records no stop reason, so the classifier can only report
+	// an unresolved final tool call or a clean ending.
+	sess.TerminationStatus = Classify(msgs, "", false)
+
+	children := codebuffSubagentResults(sess, transcript.Subagents, rs.Skills)
+	return sess, msgs, children, nil
+}
+
+// codebuffSubagentResults turns the decoder's nested subagents into linked
+// child sessions. Each child inherits the parent's project, machine, agent,
+// working directory, branch, and source file (one chat-messages.json holds
+// the whole tree, as a Claude transcript holds its forks); ParentSessionID
+// names the session whose transcript held the agent block. Usage events stay
+// on the parent: upstream bills credits per top-level AI message, not per
+// subagent.
+func codebuffSubagentResults(
+	parent *ParsedSession, subs []codebuffSubagent, skills []codebuffSkill,
+) []ParseResult {
+	if len(subs) == 0 {
+		return nil
+	}
+	out := make([]ParseResult, 0, len(subs))
+	for _, sub := range subs {
+		msgs := sub.Messages
+		codebuffAttachSkillNames(msgs, skills)
+
+		firstMsg := ""
+		userCount := 0
+		for _, msg := range msgs {
+			if msg.Role == RoleUser && !msg.IsSystem &&
+				strings.TrimSpace(msg.Content) != "" {
+				userCount++
+				if firstMsg == "" {
+					firstMsg = truncate(
+						strings.ReplaceAll(msg.Content, "\n", " "), 300,
+					)
+				}
+			}
+		}
+		name := sub.AgentName
+		if name == "" {
+			name = sub.AgentType
+		}
+		if name == "" {
+			name = "subagent"
+		}
+		startedAt := sub.Timestamp
+		if startedAt.IsZero() {
+			startedAt = parent.StartedAt
+		}
+		out = append(out, ParseResult{
+			Session: ParsedSession{
+				ID:                sub.ID,
+				Project:           parent.Project,
+				Machine:           parent.Machine,
+				Agent:             parent.Agent,
+				AgentLabel:        parent.AgentLabel,
+				Cwd:               parent.Cwd,
+				GitBranch:         parent.GitBranch,
+				ParentSessionID:   sub.ParentID,
+				RelationshipType:  RelSubagent,
+				FirstMessage:      firstMsg,
+				SessionName:       "Subagent: " + name,
+				StartedAt:         startedAt,
+				EndedAt:           startedAt,
+				MessageCount:      len(msgs),
+				UserMessageCount:  userCount,
+				SourceSessionID:   sub.AgentID,
+				SourceVersion:     parent.SourceVersion,
+				File:              parent.File,
+				TerminationStatus: Classify(msgs, "", false),
+			},
+			Messages: msgs,
+		})
+	}
+	return out
 }
 
 // codebuffRunState holds extracted fields from run-state.json.
@@ -271,7 +324,11 @@ type codebuffRunState struct {
 	ContextTokenCount int
 	CreditsUsed       float64
 	Cwd               string
+	GitBranch         string
 	Skills            []codebuffSkill
+	// Wire is the typed view used for model resolution; nil when the file
+	// is absent or does not decode.
+	Wire *codebuffWireRunState
 }
 
 // codebuffSkill is a single skill entry from the session's skill catalog
@@ -300,8 +357,18 @@ func readCodebuffRunState(path string) (codebuffRunState, error) {
 		CreditsUsed:       mas.Get("creditsUsed").Float(),
 		Cwd: gjson.GetBytes(data,
 			"sessionState.fileContext.cwd").Str,
+		// branch is optional upstream (ProjectFileContext.gitChanges) and
+		// absent when git is unavailable or the project is not a
+		// repository; leave it empty there rather than substituting the
+		// project name.
+		GitBranch: gjson.GetBytes(data,
+			"sessionState.fileContext.gitChanges.branch").Str,
 	}
 	rs.Skills = parseCodebuffSkills(data)
+	var wire codebuffWireRunState
+	if err := json.Unmarshal(data, &wire); err == nil {
+		rs.Wire = &wire
+	}
 	return rs, nil
 }
 
@@ -462,6 +529,122 @@ func readCodebuffChatMeta(path string) codebuffChatMeta {
 	}
 }
 
+// codebuffTurnModel resolves the model a billed turn ran. Each run state is
+// checked in turn (the message's metadata.runState, then run-state.json) for
+// a BYOK inference.model, then agentTemplates[agentType].model. When neither
+// names a model, the first agentType seen (a template id) is used.
+func codebuffTurnModel(runStates ...*codebuffWireRunState) string {
+	fallback := ""
+	for _, rs := range runStates {
+		if rs == nil {
+			continue
+		}
+		if inf := rs.Inference; inf != nil && inf.Source == "byok" && inf.Model != "" {
+			return inf.Model
+		}
+		ss := rs.SessionState
+		if ss == nil || ss.MainAgentState == nil || ss.MainAgentState.AgentType == "" {
+			continue
+		}
+		agentType := ss.MainAgentState.AgentType
+		if ss.FileContext != nil {
+			if model := ss.FileContext.AgentTemplates[agentType].Model; model != "" {
+				return model
+			}
+		}
+		if fallback == "" {
+			fallback = agentType
+		}
+	}
+	return fallback
+}
+
+// codebuffTurnCost converts a raw JSON credits number into a reported cost
+// (one credit is $0.01). It returns nil for anything that is not a positive
+// number, including JSON strings and null.
+func codebuffTurnCost(creditsRaw string) *money.Money {
+	if creditsRaw == "" || strings.HasPrefix(creditsRaw, "-") {
+		return nil
+	}
+	microdollars, err := money.ParseScaledDecimal(creditsRaw+"e-2", 6)
+	if err != nil || microdollars <= 0 {
+		return nil
+	}
+	cost := money.Money{Microdollars: microdollars}
+	return &cost
+}
+
+// codebuffUsageEvents builds the session's reported-cost rows. Each AI
+// message with positive credits emits one row bound to that message. Only
+// when no AI message carries a credits field at all (older CLIs) is one row
+// emitted from run-state.json's creditsUsed. That field holds only the last
+// prompt's spend, so it is never added on top of per-message rows. A turn
+// whose model cannot be resolved emits nothing, since usage reports drop
+// empty-model rows.
+func codebuffUsageEvents(
+	sessionID string,
+	turns []codebuffTurnFact,
+	rs codebuffRunState,
+	fallbackOccurredAt time.Time,
+) []ParsedUsageEvent {
+	var events []ParsedUsageEvent
+	for _, turn := range turns {
+		cost := codebuffTurnCost(turn.CreditsRaw)
+		if cost == nil {
+			continue
+		}
+		model := codebuffTurnModel(turn.RunState, rs.Wire)
+		if model == "" {
+			continue
+		}
+		occurredAt := turn.Timestamp
+		if occurredAt.IsZero() {
+			occurredAt = fallbackOccurredAt
+		}
+		ordinal := turn.Ordinal
+		events = append(events, ParsedUsageEvent{
+			SessionID:      sessionID,
+			MessageOrdinal: &ordinal,
+			Source:         "session",
+			Model:          model,
+			OccurredAt:     occurredAt.Format(time.RFC3339Nano),
+			Cost:           cost,
+			CostStatus:     "reported",
+			CostSource:     "session",
+			DedupKey:       "turn:" + sessionID + ":" + codebuffTurnKey(turn),
+		})
+	}
+	if len(turns) > 0 || rs.CreditsUsed <= 0 {
+		return events
+	}
+
+	model := codebuffTurnModel(rs.Wire)
+	cost := codebuffTurnCost(strconv.FormatFloat(rs.CreditsUsed, 'f', -1, 64))
+	if model == "" || cost == nil {
+		return nil
+	}
+	return []ParsedUsageEvent{{
+		SessionID:  sessionID,
+		Source:     "session",
+		Model:      model,
+		OccurredAt: fallbackOccurredAt.Format(time.RFC3339Nano),
+		Cost:       cost,
+		CostStatus: "reported",
+		CostSource: "session",
+		DedupKey:   "session:" + sessionID,
+	}}
+}
+
+// codebuffTurnKey derives the stable per-turn identity for the dedup key.
+// The message's own id is preferred because it is stable across reparses;
+// the ordinal is the fallback for messages that never carried an id.
+func codebuffTurnKey(turn codebuffTurnFact) string {
+	if turn.MessageID != "" {
+		return turn.MessageID
+	}
+	return strconv.Itoa(turn.Ordinal)
+}
+
 // IsCodebuffTimestamp reports whether s matches one of the
 // on-disk session-directory timestamp shapes that parseCodebuffSession
 // treats as the bare session ID suffix of the canonical
@@ -509,481 +692,15 @@ func parseCodebuffSessionDate(sessionID string) time.Time {
 	return time.Time{}
 }
 
-// parseCodebuffMessages parses chat-messages.json data into ParsedMessages.
-// sessionDate provides the date context for time-only timestamps. Message
-// Model stays empty: the LLM is selected server-side per agentType template
-// and is not persisted in the on-disk format.
-func parseCodebuffMessages(
-	data []byte, sessionDate time.Time,
-) ([]ParsedMessage, time.Time, time.Time, error) {
-	root := gjson.ParseBytes(data)
-	if !root.IsArray() {
-		return nil, time.Time{}, time.Time{},
-			errors.New("chat-messages.json root is not an array")
-	}
-
-	var (
-		messages  []ParsedMessage
-		startedAt time.Time
-		endedAt   time.Time
-		ordinal   int
-		// Track the current date for cross-midnight sessions. Start with
-		// the session directory date and advance when time-of-day wraps
-		// past midnight.
-		currentDate = sessionDate
-		prevHour    = -1
-	)
-	// Seed the rollover state from the session creation time-of-day so
-	// the first time-only message can roll past midnight. A session
-	// created late in the local evening (directory
-	// 2026-07-17T06-58-00.000Z = 23:58 July 16 in UTC-7) whose first
-	// message reads "12:01 AM" belongs to the next local calendar day;
-	// without the seed, prevHour stays -1 until the second message and
-	// the first message would be stamped ~24h before the session
-	// started, skewing StartedAt.
-	if !sessionDate.IsZero() {
-		prevHour = sessionDate.Hour()
-	}
-
-	root.ForEach(func(_, msg gjson.Result) bool {
-		variant := msg.Get("variant").Str
-		ts := parseCodebuffTimestamp(
-			msg.Get("timestamp").Str, currentDate,
-		)
-
-		// Detect midnight rollover for time-only timestamps only.
-		// RFC3339 timestamps retain their timezone, so their hours
-		// should not be compared with local time-only timestamps.
-		rawTS := strings.TrimSpace(msg.Get("timestamp").Str)
-		isTimeOnly := !strings.Contains(rawTS, "T") &&
-			!strings.Contains(rawTS, "-") &&
-			strings.Contains(rawTS, ":")
-		if !ts.IsZero() && prevHour >= 0 && isTimeOnly {
-			if ts.Hour() < prevHour {
-				currentDate = currentDate.AddDate(0, 0, 1)
-				// Re-parse with the advanced date.
-				ts = parseCodebuffTimestamp(
-					msg.Get("timestamp").Str, currentDate,
-				)
-			}
-		}
-		// Only track prevHour for time-only timestamps to avoid
-		// incorrect rollover when formats are mixed. Reset prevHour
-		// when a non-time-only timestamp is encountered, and also
-		// anchor currentDate to the absolute timestamp's local
-		// calendar date so subsequent time-only messages don't get
-		// assigned to the previous session directory date across
-		// midnight.
-		if !ts.IsZero() {
-			if isTimeOnly {
-				prevHour = ts.Hour()
-			} else {
-				prevHour = -1
-				tsLocal := ts.In(currentDate.Location())
-				tsDate := time.Date(
-					tsLocal.Year(), tsLocal.Month(), tsLocal.Day(),
-					0, 0, 0, 0, currentDate.Location(),
-				)
-				if !tsDate.Equal(currentDate) {
-					currentDate = tsDate
-				}
-			}
-		}
-
-		if !ts.IsZero() {
-			if startedAt.IsZero() || ts.Before(startedAt) {
-				startedAt = ts
-			}
-			if ts.After(endedAt) {
-				endedAt = ts
-			}
-		}
-
-		switch variant {
-		case "user":
-			content := strings.TrimSpace(msg.Get("content").Str)
-			// User messages can also carry blocks (e.g. images).
-			// Collect image references from blocks to append to content.
-			if blocks := msg.Get("blocks"); blocks.IsArray() {
-				blocks.ForEach(func(_, block gjson.Result) bool {
-					if block.Get("type").Str == "image" {
-						filename := block.Get("filename").Str
-						if filename != "" {
-							content += "\n[Image: " + filename + "]"
-						} else {
-							content += "\n[Image attached]"
-						}
-					}
-					return true
-				})
-				content = strings.TrimSpace(content)
-			}
-			if content == "" {
-				return true
-			}
-			messages = append(messages, ParsedMessage{
-				Ordinal:       ordinal,
-				Role:          RoleUser,
-				Content:       content,
-				Timestamp:     ts,
-				ContentLength: len(content),
-			})
-			ordinal++
-
-		case "ai":
-			parsed := parseCodebuffAIMessage(msg, ts)
-			if len(parsed) == 0 {
-				return true
-			}
-			for i := range parsed {
-				parsed[i].Ordinal = ordinal
-				ordinal++
-			}
-			messages = append(messages, parsed...)
-
-		case "error":
-			// Error messages from the upstream CLI (API failures, rate
-			// limits, country blocks). Emit as a system message so the
-			// error is visible in the transcript.
-			content := strings.TrimSpace(msg.Get("content").Str)
-			if content == "" {
-				return true
-			}
-			messages = append(messages, ParsedMessage{
-				Ordinal:       ordinal,
-				Role:          RoleSystem,
-				Content:       content,
-				Timestamp:     ts,
-				ContentLength: len(content),
-				IsSystem:      true,
-			})
-			ordinal++
-		}
-
-		return true
-	})
-
-	return messages, startedAt, endedAt, nil
-}
-
-// parseCodebuffAIMessage parses an AI-variant message into one or more
-// ParsedMessages. AI messages contain blocks: text (reasoning or regular),
-// tool calls, and subagent invocations. Blocks are processed sequentially
-// to preserve the interleaving order of text, tools, and results.
-func parseCodebuffAIMessage(
-	msg gjson.Result,
-	ts time.Time,
-) []ParsedMessage {
-	blocks := msg.Get("blocks")
-	if !blocks.IsArray() {
-		return nil
-	}
-
-	// textEntry tracks a text block with its type to preserve interleaving.
-	type textEntry struct {
-		content  string
-		isReason bool
-	}
-	var (
-		out         []ParsedMessage
-		textBuf     []textEntry
-		toolCalls   []ParsedToolCall
-		toolResults []ParsedToolResult
-	)
-
-	// flushText emits accumulated text entries in order, grouping
-	// consecutive entries of the same type.
-	flushText := func() {
-		if len(textBuf) == 0 {
-			return
-		}
-		// Group consecutive entries of the same type.
-		var thinkingParts, regularParts []string
-		for _, entry := range textBuf {
-			if entry.isReason {
-				// Flush regular text before starting a thinking block.
-				if len(regularParts) > 0 {
-					text := strings.Join(regularParts, "\n\n")
-					out = append(out, ParsedMessage{
-						Role:          RoleAssistant,
-						Content:       text,
-						Timestamp:     ts,
-						ContentLength: len(text),
-					})
-					regularParts = nil
-				}
-				thinkingParts = append(thinkingParts, entry.content)
-			} else {
-				// Flush thinking before starting regular text.
-				if len(thinkingParts) > 0 {
-					thinkingText := strings.Join(thinkingParts, "\n\n")
-					out = append(out, ParsedMessage{
-						Role:          RoleAssistant,
-						Content:       "[Thinking]\n" + thinkingText + "\n[/Thinking]",
-						ThinkingText:  thinkingText,
-						HasThinking:   true,
-						Timestamp:     ts,
-						ContentLength: len(thinkingText),
-					})
-					thinkingParts = nil
-				}
-				regularParts = append(regularParts, entry.content)
-			}
-		}
-		// Flush any remaining.
-		if len(thinkingParts) > 0 {
-			thinkingText := strings.Join(thinkingParts, "\n\n")
-			out = append(out, ParsedMessage{
-				Role:          RoleAssistant,
-				Content:       "[Thinking]\n" + thinkingText + "\n[/Thinking]",
-				ThinkingText:  thinkingText,
-				HasThinking:   true,
-				Timestamp:     ts,
-				ContentLength: len(thinkingText),
-			})
-		}
-		if len(regularParts) > 0 {
-			text := strings.Join(regularParts, "\n\n")
-			out = append(out, ParsedMessage{
-				Role:          RoleAssistant,
-				Content:       text,
-				Timestamp:     ts,
-				ContentLength: len(text),
-			})
-		}
-		textBuf = nil
-	}
-
-	// flushTools emits accumulated tool calls as a single assistant message,
-	// then emits each tool result as a user message.
-	flushTools := func() {
-		if len(toolCalls) > 0 {
-			out = append(out, ParsedMessage{
-				Role:       RoleAssistant,
-				Timestamp:  ts,
-				HasToolUse: true,
-				ToolCalls:  toolCalls,
-			})
-			toolCalls = nil
-		}
-		for _, tr := range toolResults {
-			out = append(out, ParsedMessage{
-				Role:          RoleUser,
-				Timestamp:     ts,
-				ToolResults:   []ParsedToolResult{tr},
-				ContentLength: tr.ContentLength,
-			})
-		}
-		toolResults = nil
-	}
-
-	// Track whether we're currently accumulating tool calls to batch
-	// consecutive tool blocks together.
-	inToolRun := false
-
-	blocks.ForEach(func(_, block gjson.Result) bool {
-		blockType := block.Get("type").Str
-		isTool := blockType == "tool" || blockType == "agent"
-
-		// Flush on transition away from a tool run.
-		if inToolRun && !isTool {
-			flushText()
-			flushTools()
-			inToolRun = false
-		}
-
-		switch blockType {
-		case "text":
-			// Flush accumulated tools before text to preserve ordering.
-			if len(toolCalls) > 0 {
-				flushTools()
-			}
-			textType := block.Get("textType").Str
-			content := block.Get("content").Str
-			if strings.TrimSpace(content) == "" {
-				return true
-			}
-			isReason := textType == "reasoning"
-			textBuf = append(textBuf, textEntry{content: content, isReason: isReason})
-
-		case "tool":
-			if !inToolRun {
-				flushText()
-				inToolRun = true
-			}
-			tc := parseCodebuffToolCall(block)
-			if tc != nil {
-				toolCalls = append(toolCalls, *tc)
-				if output := block.Get("output"); output.Exists() {
-					toolResults = append(toolResults, ParsedToolResult{
-						ToolUseID:     tc.ToolUseID,
-						ContentRaw:    output.Raw,
-						ContentLength: len(output.Raw),
-					})
-				}
-			}
-
-		case "agent":
-			if !inToolRun {
-				flushText()
-				inToolRun = true
-			}
-
-			agentType := block.Get("agentType").Str
-			agentName := block.Get("agentName").Str
-			agentID := block.Get("agentId").Str
-			agentStatus := block.Get("status").Str
-
-			inputParts := map[string]any{
-				"agentType": agentType,
-				"agentName": agentName,
-			}
-			if params := block.Get("params"); params.Exists() &&
-				params.Raw != "null" {
-				inputParts["params"] = params.Value()
-			}
-			if prompt := block.Get("initialPrompt"); prompt.Exists() &&
-				prompt.Str != "" {
-				inputParts["prompt"] = prompt.Str
-			}
-			// The agent's lifecycle status (spawned, complete, ...) used to
-			// be rendered in the assistant text for the block; now that
-			// agent output is emitted as a linked ParsedToolResult, carry
-			// the status in the tool-call input so it stays visible in the
-			// parsed session.
-			status := agentStatus
-			if status == "" {
-				status = "spawned"
-			}
-			inputParts["status"] = status
-
-			inputJSON, _ := json.Marshal(inputParts, json.Deterministic(true))
-
-			tc := ParsedToolCall{
-				ToolUseID: agentID,
-				ToolName:  agentType,
-				Category:  "Task",
-				InputJSON: string(inputJSON),
-			}
-			toolCalls = append(toolCalls, tc)
-
-			// Emit agent output as a linked ParsedToolResult rather
-			// than an ordinary assistant text message. Representing
-			// the output as a tool result lets the configured result-
-			// content blocking system (BlockedResultCategories)
-			// strip it when the Task category is blocked. Without
-			// this, agent-block output stored as ordinary assistant
-			// text survives blocking and retains content the operator
-			// explicitly configured agentsview not to store.
-			if output := block.Get("content"); output.Exists() && output.Str != "" {
-				toolResults = append(toolResults, ParsedToolResult{
-					ToolUseID:     agentID,
-					ContentRaw:    output.Raw,
-					ContentLength: len(output.Raw),
-				})
-			}
-
-		case "mode-divider":
-			flushText()
-			flushTools()
-			mode := block.Get("mode").Str
-			if mode != "" {
-				// Emit system blocks immediately, not deferred.
-				out = append(out, ParsedMessage{
-					Role:          RoleSystem,
-					Content:       "[Mode: " + mode + "]",
-					Timestamp:     ts,
-					ContentLength: len("[Mode: " + mode + "]"),
-					IsSystem:      true,
-				})
-			}
-
-		case "plan":
-			flushText()
-			flushTools()
-			content := block.Get("content").Str
-			if strings.TrimSpace(content) != "" {
-				// Emit system blocks immediately, not deferred.
-				out = append(out, ParsedMessage{
-					Role:          RoleSystem,
-					Content:       "[Plan]\n" + content,
-					Timestamp:     ts,
-					ContentLength: len("[Plan]\n" + content),
-					IsSystem:      true,
-				})
-			}
-
-		case "ask-user":
-			flushText()
-			flushTools()
-			questions := block.Get("questions")
-			if questions.IsArray() {
-				var parts []string
-				questions.ForEach(func(_, q gjson.Result) bool {
-					questionText := q.Get("question").Str
-					if strings.TrimSpace(questionText) != "" {
-						parts = append(parts, "[Agent asked] "+questionText)
-					}
-					return true
-				})
-				if len(parts) > 0 {
-					content := strings.Join(parts, "\n")
-					out = append(out, ParsedMessage{
-						Role:          RoleSystem,
-						Content:       content,
-						Timestamp:     ts,
-						ContentLength: len(content),
-						IsSystem:      true,
-					})
-				}
-			}
-
-		case "image":
-			if block.Get("filename").Str != "" {
-				textBuf = append(textBuf, textEntry{
-					content:  "[Image: " + block.Get("filename").Str + "]",
-					isReason: false,
-				})
-			} else {
-				textBuf = append(textBuf, textEntry{
-					content:  "[Image attached]",
-					isReason: false,
-				})
-			}
-		}
-		return true
-	})
-
-	// Flush any remaining accumulated content.
-	flushText()
-	flushTools()
-
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
-
-// parseCodebuffToolCall extracts a ParsedToolCall from a tool block.
-func parseCodebuffToolCall(block gjson.Result) *ParsedToolCall {
-	toolName := block.Get("toolName").Str
-	if toolName == "" {
-		return nil
-	}
-	toolCallID := block.Get("toolCallId").Str
-	input := block.Get("input")
-
-	inputJSON := ""
-	if input.Exists() && input.Raw != "" && input.Raw != "null" {
-		inputJSON = input.Raw
-	}
-
-	return &ParsedToolCall{
-		ToolUseID: toolCallID,
-		ToolName:  toolName,
-		Category:  NormalizeToolCategory(toolName),
-		InputJSON: inputJSON,
-	}
+// codebuffTurnFact is one AI message that carried a credits field. Upstream
+// stamps each completed AI message with its prompt's credits and a
+// metadata.runState snapshot (cli/src/hooks/helpers/send-message.ts).
+type codebuffTurnFact struct {
+	MessageID  string
+	Ordinal    int
+	Timestamp  time.Time
+	CreditsRaw string
+	RunState   *codebuffWireRunState
 }
 
 // parseCodebuffTimestamp parses a timestamp string. Codebuff/freebuff
@@ -1056,7 +773,7 @@ func codebuffDiscoverEach(
 				return nil
 			}
 			dir := filepath.Join(chatsDir, sessionEntry.Name())
-			chatPath := filepath.Join(dir, "chat-messages.json")
+			chatPath := filepath.Join(dir, codebuffPrimaryTranscriptName)
 			if !IsRegularFile(chatPath) {
 				return nil
 			}

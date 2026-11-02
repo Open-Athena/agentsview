@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"slices"
 	"time"
 
 	"go.kenn.io/agentsview/internal/parser"
@@ -51,9 +50,12 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 	plan ChangedPathPlan,
 	options ChangedPathSyncOptions,
 	onProgress ProgressFunc,
-) (ChangedPathSyncResult, error) {
+) (result ChangedPathSyncResult, retErr error) {
+	if e.sourceSyncErr != nil {
+		return ChangedPathSyncResult{}, e.sourceSyncErr
+	}
 	ctx = e.parsePolicyContext(ctx)
-	result := ChangedPathSyncResult{
+	result = ChangedPathSyncResult{
 		CachedSourceKeys:        make(map[string]struct{}),
 		CachedFallbackProviders: make(map[parser.AgentType]int),
 	}
@@ -61,12 +63,13 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 		return result, nil
 	}
 
-	fallbackFiles, fallbackCounts, err := e.discoverChangedPathFallbackProviders(
+	fallback, err := e.discoverChangedPathFallbackProviders(
 		ctx, plan.FallbackProviders,
 	)
 	if err != nil {
 		return result, err
 	}
+	fallbackFiles := fallback.files
 	forceSourceKeys := make(map[string]struct{}, len(options.ForceFullParse.Files))
 	for _, file := range options.ForceFullParse.Files {
 		forceSourceKeys[changedPathSourceKey(file)] = struct{}{}
@@ -91,7 +94,7 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 			fallbackFiles[i].ForceFullParse = true
 		}
 	}
-	for _, count := range fallbackCounts {
+	for _, count := range fallback.counts {
 		result.FallbackSources += count
 	}
 	exactKeys := make(map[string]struct{}, len(plan.Files))
@@ -109,11 +112,26 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 		planFiles, fallbackFiles...,
 	))
 	result.FilesDiscovered = len(files)
+	changedPaths := make([]string, 0, len(plan.attribution))
+	for path := range plan.attribution {
+		changedPaths = append(changedPaths, path)
+	}
 	if len(files) == 0 {
-		return result, ctx.Err()
+		// A title store change alone plans no session files.
+		e.syncMu.Lock()
+		e.invalidateNativeTitleCache(changedPaths)
+		e.reconcileNativeTitlesLocked(ctx, &result.Stats)
+		e.recordNativeTitleUpdates(result.Stats)
+		e.syncMu.Unlock()
+		fallback.applyFailures(&result.Stats)
+		if result.Stats.TitlesUpdated > 0 {
+			e.emit("sessions")
+		}
+		return result, errors.Join(ctx.Err(), errors.Join(fallback.incomplete...))
 	}
 
 	e.syncMu.Lock()
+	e.invalidateNativeTitleCache(changedPaths)
 	var stats SyncStats
 	defer func() {
 		if stats.hasSessionChanges() {
@@ -124,18 +142,29 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 	defer e.clearCurrentProgress()
 	e.resetS3CodexIndexCache()
 	e.anomalies.reset()
-	var processErr error
+	processErr := errors.Join(fallback.incomplete...)
 
 	physicalPaths := make([]string, 0, len(files))
 	for _, file := range files {
-		physicalPaths = append(physicalPaths, file.Path)
+		physicalPaths = append(physicalPaths, parser.ResolveSourceFilePath(file.Path))
 	}
+	ctx, closeProviderCache, err := e.withProviderFingerprintCache(ctx, physicalPaths)
+	if err != nil {
+		result.Stats = SyncStats{Aborted: true}
+		return result, err
+	}
+	defer func() { retErr = errors.Join(retErr, closeProviderCache()) }()
 	preContainerStates := e.captureSQLiteContainerStates(physicalPaths)
+	if err := e.prepareSQLiteContainerVerification(ctx, preContainerStates); err != nil {
+		result.Stats = SyncStats{Aborted: true}
+		return result, err
+	}
 	e.beginSQLiteContainerPass(files, preContainerStates)
 	processingCtx := context.WithValue(ctx, deferGlobalLinkContextKey{}, true)
 	processingCtx = parser.WithProjectRootMemo(processingCtx)
+	processingCtx = parser.WithCodexParentInventoryBatch(processingCtx)
 	results := e.startWorkers(processingCtx, files)
-	affectedSessionIDs := make(map[string]struct{})
+	affectedSessionIDs := make(changedSessionLinks)
 	stats = e.collectAndBatchWithOptions(
 		processingCtx, results, len(files), len(files), func(progress Progress) {
 			progress.FallbackProviders = len(plan.FallbackProviders)
@@ -146,15 +175,7 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 		}, syncWriteDefault, collectAndBatchOptions{
 			observeResult: func(job syncJob) {
 				result.FilesProcessed++
-				if job.incremental != nil {
-					affectedSessionIDs[job.incremental.sessionID] = struct{}{}
-				}
-				for _, parsed := range job.results {
-					affectedSessionIDs[applyIDPrefixToID(e.idPrefix, parsed.Session.ID)] = struct{}{}
-				}
-				for _, id := range job.excludedSessionIDs {
-					affectedSessionIDs[applyIDPrefixToID(e.idPrefix, id)] = struct{}{}
-				}
+				affectedSessionIDs.observe(job, e.idPrefix)
 				if !job.cachedSkip {
 					return
 				}
@@ -171,21 +192,11 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 			},
 		},
 	)
-	if len(affectedSessionIDs) > 0 && !stats.Aborted {
-		ids := make([]string, 0, len(affectedSessionIDs))
-		for id := range affectedSessionIDs {
-			ids = append(ids, id)
-		}
-		slices.Sort(ids)
-		if err := e.db.LinkSubagentSessionsForSessions(ctx, ids); err != nil {
-			stats.RecordFailed()
-			processErr = errors.Join(processErr,
-				fmt.Errorf("link affected subagent sessions: %w", err))
-			if queueErr := e.db.QueueSubagentParentRepairs(ctx, ids); queueErr != nil {
-				processErr = errors.Join(processErr,
-					fmt.Errorf("queue affected subagent parent repairs: %w", queueErr))
-			}
-		}
+	fallback.applyFailures(&stats)
+	processErr = errors.Join(processErr, e.finishCodexParentInventoryBatch(processingCtx, &stats))
+	if err := affectedSessionIDs.link(ctx, e, &stats); err != nil {
+		stats.RecordFailed()
+		processErr = errors.Join(processErr, err)
 	}
 	e.anomalies.applyTo(&stats)
 	// Pass-level failures cannot be attributed to one container, so they
@@ -194,10 +205,12 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 	if ctx.Err() != nil || processErr != nil || !stats.ProcessingComplete() {
 		e.poisonSQLiteContainerPass()
 	}
-	e.finishSQLiteContainerPass(true, false)
+	e.finishSQLiteContainerPass(ctx, true, false)
 	if !e.ephemeral {
 		e.persistSkipCache(ctx)
 	}
+	processingComplete := stats.ProcessingComplete()
+	e.reconcileNativeTitlesLocked(ctx, &stats)
 	e.mu.Lock()
 	e.lastSync = time.Now()
 	e.lastSyncStats = stats
@@ -210,7 +223,7 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
-	if !stats.ProcessingComplete() {
+	if !processingComplete {
 		return result, errors.Join(processErr, fmt.Errorf(
 			"changed-path plan sync incomplete: %d source or archive failures",
 			stats.Failed,

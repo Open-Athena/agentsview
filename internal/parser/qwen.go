@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"cmp"
 	"encoding/json/v2"
 	"fmt"
 	"os"
@@ -45,6 +46,8 @@ func parseQwenSession(
 		sessionID    string
 		cwd          string
 		firstMessage string
+		userTitle    string
+		autoTitle    string
 		startedAt    time.Time
 		endedAt      time.Time
 		ordinal      int
@@ -88,6 +91,23 @@ func parseQwenSession(
 		}
 
 		switch root.Get("type").Str {
+		case "system":
+			// /rename and the title generator append custom_title
+			// records. The latest user title wins over the latest
+			// generated one; records written before titleSource
+			// existed are user renames.
+			if root.Get("subtype").Str != "custom_title" {
+				continue
+			}
+			title := strings.TrimSpace(
+				root.Get("systemPayload.customTitle").Str,
+			)
+			if root.Get("systemPayload.titleSource").Str == "auto" {
+				autoTitle = title
+			} else {
+				userTitle = title
+			}
+
 		case "user":
 			if root.Get("message.role").Str != "user" {
 				continue
@@ -172,6 +192,11 @@ func parseQwenSession(
 		project = ExtractProjectFromCwd(cwd)
 	}
 
+	sessionName := cmp.Or(userTitle, autoTitle)
+	if firstMessage == "" {
+		firstMessage = truncate(sessionName, 300)
+	}
+
 	sess := &ParsedSession{
 		ID:               "qwen:" + sessionID,
 		Project:          project,
@@ -179,6 +204,7 @@ func parseQwenSession(
 		Agent:            AgentQwen,
 		Cwd:              cwd,
 		FirstMessage:     firstMessage,
+		SessionName:      sessionName,
 		StartedAt:        startedAt,
 		EndedAt:          endedAt,
 		MessageCount:     len(messages),

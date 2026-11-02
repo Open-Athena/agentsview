@@ -46,11 +46,26 @@ func newReplicaPushCommand(backend storage.Replica) *cobra.Command {
 			if len(args) == 1 {
 				targetName = args[0]
 			}
+			if cfg.Embed && cfg.NoVectors {
+				return fmt.Errorf("%s push: %w", name,
+					errors.New("--embed cannot be combined with --no-vectors"))
+			}
+			if cfg.Embed && cfg.AllTargets {
+				return fmt.Errorf("%s push: %w", name,
+					errors.New("--embed cannot be combined with --all"))
+			}
+			if cfg.Embed && cfg.NoStartDaemon {
+				return fmt.Errorf("%s push: %w", name,
+					errors.New("--embed cannot be combined with --no-start-daemon"))
+			}
 			if cfg.AllTargets && cfg.Watch {
 				return fmt.Errorf(
 					"%s push --watch: %w", name,
 					errors.New("--all cannot be combined with --watch"),
 				)
+			}
+			if cfg.NoStartDaemon && !cfg.Watch {
+				return fmt.Errorf("%s push: --no-start-daemon requires --watch", name)
 			}
 			if cfg.Watch {
 				if err := runReplicaPushWatch(backend, cfg, targetName); err != nil {
@@ -75,9 +90,17 @@ func newReplicaPushCommand(backend storage.Replica) *cobra.Command {
 	cmd.Flags().StringVar(&cfg.ExcludeProjects, "exclude-projects", "", "Comma-separated list of projects to exclude from push")
 	cmd.Flags().BoolVar(&cfg.AllProjects, "all-projects", false, "Ignore configured project filters for this run")
 	cmd.Flags().BoolVar(&cfg.Watch, "watch", false, "Run continuously, pushing on change plus a periodic floor")
+	cmd.Flags().BoolVar(&cfg.NoStartDaemon, "no-start-daemon", false, "With --watch, require a running writable daemon and exit if unavailable")
 	cmd.Flags().DurationVar(&cfg.Debounce, "debounce", defaultWatchDebounce, "Coalesce window after a change before pushing (--watch only)")
 	cmd.Flags().DurationVar(&cfg.Interval, "interval", defaultWatchInterval, "Periodic floor push interval (--watch only)")
 	cmd.Flags().BoolVar(&cfg.NoVectors, "no-vectors", false, "Skip pushing semantic-search vectors")
+	if name == "pg" {
+		cmd.Flags().BoolVar(&cfg.Embed, "embed", false,
+			"Push sessions, then build and push embeddings in the same push; "+
+				"--full repairs vectors too; with --watch, build after syncs in "+
+				"the background and push vectors on the next interval (uses "+
+				"[vector] or a published PostgreSQL recipe)")
+	}
 	return cmd
 }
 
@@ -105,6 +128,7 @@ func newReplicaStatusCommand(backend storage.Replica) *cobra.Command {
 	cmd.Flags().StringVar(&cfg.ProjectsFlag, "projects", "", "Comma-separated list of projects whose push status to show")
 	cmd.Flags().StringVar(&cfg.ExcludeProjects, "exclude-projects", "", "Comma-separated list of excluded projects whose push status to show")
 	cmd.Flags().BoolVar(&cfg.AllProjects, "all-projects", false, "Ignore configured project filters for this status")
+	cmd.Flags().DurationVar(&cfg.MaxStale, "max-stale", 0, "Exit non-zero when the push watcher has stalled for longer than this (for example 10m)")
 	return cmd
 }
 
@@ -114,12 +138,17 @@ func newReplicaServeCommand(backend storage.Replica) *cobra.Command {
 		Short:        "Serve from " + backend.DisplayName() + " (read-only)",
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
+		PreRunE:      func(cmd *cobra.Command, args []string) error { return validateReplicaServeWatchFlags(cmd) },
 		Run: func(cmd *cobra.Command, args []string) {
 			appCfg, basePath, err := loadReplicaServeConfig(cmd)
 			if err != nil {
 				fatal("%v", err)
 			}
-			runReplicaServe(backend, appCfg, basePath)
+			watch, err := loadReplicaServeWatch(cmd, appCfg)
+			if err != nil {
+				fatal("%v", err)
+			}
+			runReplicaServe(backend, appCfg, basePath, watch)
 		},
 	}
 	cmd.Flags().String(
@@ -127,6 +156,13 @@ func newReplicaServeCommand(backend storage.Replica) *cobra.Command {
 		"",
 		"URL prefix for reverse-proxy subpath (e.g. /agentsview)",
 	)
+	if backend.Name() == "pg" {
+		cmd.Short = "Serve from PostgreSQL (read-only API; --push-watch also ingests)"
+		cmd.Flags().Bool("push-watch", false, "Ingest and continuously push a local archive in this process")
+		cmd.Flags().Bool("embed", false, "Build embeddings in the local push watcher")
+		cmd.Flags().Duration("debounce", defaultWatchDebounce, "Coalesce window before pushing (--push-watch only)")
+		cmd.Flags().Duration("interval", defaultWatchInterval, "Periodic floor push interval (--push-watch only)")
+	}
 	config.RegisterServePFlags(cmd.Flags())
 	return cmd
 }

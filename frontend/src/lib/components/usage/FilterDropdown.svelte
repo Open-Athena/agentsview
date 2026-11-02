@@ -13,10 +13,12 @@
     id?: string;
     name: string;
     count?: number;
+    description?: string;
   }
 
   interface Props {
     label: string;
+    selectedLabel?: string;
     items: FilterItem[];
     /** Comma-separated list of excluded item IDs. */
     excludedCsv: string;
@@ -31,6 +33,7 @@
 
   let {
     label,
+    selectedLabel = "",
     items,
     excludedCsv,
     onToggle,
@@ -67,6 +70,7 @@
   );
 
   const buttonLabel = $derived.by(() => {
+    if (selectedLabel) return `${label}: ${selectedLabel}`;
     if (filteredCount === 0) return m.usage_filter_all({ label });
     if (mode === "include") {
       if (filteredCount === 1) return `${label}: ${excludedCsv}`;
@@ -106,6 +110,7 @@
       return {
         id,
         label: item.name,
+        description: item.description,
         active: included,
         count: item.count,
         color: color?.(item.name),
@@ -131,7 +136,7 @@
 
 <FilterDropdown
   label={buttonLabel}
-  active={filteredCount > 0}
+  active={filteredCount > 0 || selectedLabel !== ""}
   showBadge={false}
   sections={[{ items: dropdownItems }]}
   searchable={items.length > 8}

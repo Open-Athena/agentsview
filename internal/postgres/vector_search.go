@@ -69,41 +69,49 @@ func (v *vectorSearcher) resolveExtSchema(ctx context.Context) (string, error) {
 	return v.extSchema, nil
 }
 
-// SemanticSearch embeds query, runs chunk-level KNN over the generation's
-// chunk table, rolls chunks up to one hit per document (best chunk wins,
-// score order preserved), truncates to limit documents, and hydrates each
-// against vector_documents. It mirrors vector.Index.Search + searcherAdapter:
-// an encoder failure is wrapped in db.ErrSemanticTransient; a document that
-// vanished (or was parked at a negative-ordinal tombstone) between KNN and
-// hydration is dropped rather than erroring.
-func (v *vectorSearcher) SemanticSearch(
-	ctx context.Context, query string, limit int,
-) ([]db.VectorHit, error) {
+// PrepareSemanticSearch implements db.VectorSearcher. It embeds query once.
+// Each page call runs chunk-level KNN over the generation's chunk table,
+// rolls chunks up to one hit per document (best chunk wins, score order
+// preserved), truncates to limit documents, and hydrates each against
+// vector_documents. It mirrors the SQLite searcherAdapter: an encoder failure
+// is wrapped in db.ErrSemanticTransient; a document that vanished (or was
+// parked at a negative-ordinal tombstone) between KNN and hydration is
+// dropped rather than erroring.
+func (v *vectorSearcher) PrepareSemanticSearch(
+	ctx context.Context, query string,
+) (db.VectorSearchPage, int, error) {
 	vec, err := v.encode(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", db.ErrSemanticTransient, err)
+		return nil, 0, fmt.Errorf("%w: %w", db.ErrSemanticTransient, err)
 	}
 	if len(vec) != v.dimension {
-		return nil, fmt.Errorf(
+		return nil, 0, fmt.Errorf(
 			"query embedding has %d dimensions, generation expects %d",
 			len(vec), v.dimension)
 	}
 	extSchema, err := v.resolveExtSchema(ctx)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	chunks, err := v.knnChunks(ctx, vec, extSchema, limit)
-	if err != nil {
-		return nil, err
-	}
-	docs := kitvec.RollupByDocument(chunks)
-	if limit >= 0 && len(docs) > limit {
-		docs = docs[:limit]
-	}
-	if len(docs) == 0 {
-		return nil, nil
-	}
-	return v.hydrateHits(ctx, docs)
+	return func(ctx context.Context, limit int) ([]db.VectorHit, bool, error) {
+		chunks, err := v.knnChunks(ctx, vec, extSchema, limit)
+		if err != nil {
+			return nil, false, err
+		}
+		exhausted := len(chunks) < limit
+		docs, err := kitvec.RollupByDocument(chunks)
+		if err != nil {
+			return nil, false, fmt.Errorf("rolling up vector hits: %w", err)
+		}
+		if limit >= 0 && len(docs) > limit {
+			docs = docs[:limit]
+		}
+		if len(docs) == 0 {
+			return nil, exhausted, nil
+		}
+		hits, err := v.hydrateHits(ctx, docs)
+		return hits, exhausted, err
+	}, 0, nil
 }
 
 // chunkHit is one chunk-level KNN neighbor: the document it belongs to, which
@@ -292,9 +300,11 @@ func (v *vectorSearcher) lookupDocs(
 		return docs, nil
 	}
 	rows, err := v.pg.QueryContext(ctx, `
-SELECT doc_key, session_id, ordinal, ordinal_end, subordinate, offsets, content
-  FROM vector_documents
- WHERE ordinal >= 0 AND doc_key = ANY($1)`, docKeys)
+SELECT d.doc_key, d.session_id, d.ordinal, d.ordinal_end,
+       d.subordinate OR `+db.SubordinateSessionSQL("s")+`, d.offsets, d.content
+  FROM vector_documents d
+  LEFT JOIN sessions s ON s.id = d.session_id
+ WHERE d.ordinal >= 0 AND d.doc_key = ANY($1)`, docKeys)
 	if err != nil {
 		return nil, fmt.Errorf("looking up search hit documents: %w", err)
 	}
@@ -336,10 +346,12 @@ func (v *vectorSearcher) ResolveMessageUnits(
 		return out, nil
 	}
 	stmt, err := v.pg.PrepareContext(ctx, `
-SELECT doc_key, ordinal, ordinal_end, subordinate
-  FROM vector_documents
- WHERE session_id = $1 AND ordinal >= 0 AND ordinal <= $2
- ORDER BY ordinal DESC LIMIT 1`)
+SELECT d.doc_key, d.ordinal, d.ordinal_end,
+       d.subordinate OR `+db.SubordinateSessionSQL("s")+`
+  FROM vector_documents d
+  LEFT JOIN sessions s ON s.id = d.session_id
+ WHERE d.session_id = $1 AND d.ordinal >= 0 AND d.ordinal <= $2
+ ORDER BY d.ordinal DESC LIMIT 1`)
 	if err != nil {
 		return nil, fmt.Errorf("resolve message units: %w", err)
 	}
@@ -369,25 +381,25 @@ SELECT doc_key, ordinal, ordinal_end, subordinate
 // SetVectorSearcher wires (or, with nil, clears) the PG semantic search
 // backend. Safe to call concurrently with SearchContent/HasSemantic.
 func (s *Store) SetVectorSearcher(searcher db.VectorSearcher) {
-	s.vectorMu.Lock()
-	defer s.vectorMu.Unlock()
-	s.vectorSearcher = searcher
+	s.runtimeState().vectorMu.Lock()
+	defer s.runtimeState().vectorMu.Unlock()
+	s.runtimeState().vectorSearcher = searcher
 }
 
 // getVectorSearcher returns the currently wired PG vector searcher, or nil.
 func (s *Store) getVectorSearcher() db.VectorSearcher {
-	s.vectorMu.RLock()
-	defer s.vectorMu.RUnlock()
-	return s.vectorSearcher
+	s.runtimeState().vectorMu.RLock()
+	defer s.runtimeState().vectorMu.RUnlock()
+	return s.runtimeState().vectorSearcher
 }
 
 // SetSemanticUnavailableReason records a human explanation for why semantic
 // search could not be wired (extension missing, no matching generation, stale
 // build), surfaced by semanticUnavailableError. Safe to call concurrently.
 func (s *Store) SetSemanticUnavailableReason(reason string) {
-	s.vectorMu.Lock()
-	defer s.vectorMu.Unlock()
-	s.semanticUnavailableReason = reason
+	s.runtimeState().vectorMu.Lock()
+	defer s.runtimeState().vectorMu.Unlock()
+	s.runtimeState().semanticUnavailableReason = reason
 }
 
 // semanticUnavailableError wraps db.ErrSemanticUnavailable with the recorded
@@ -395,9 +407,9 @@ func (s *Store) SetSemanticUnavailableReason(reason string) {
 // can explain why semantic search is off; without a reason it returns the
 // bare sentinel.
 func (s *Store) semanticUnavailableError() error {
-	s.vectorMu.RLock()
-	reason := s.semanticUnavailableReason
-	s.vectorMu.RUnlock()
+	s.runtimeState().vectorMu.RLock()
+	reason := s.runtimeState().semanticUnavailableReason
+	s.runtimeState().vectorMu.RUnlock()
 	if reason == "" {
 		return db.ErrSemanticUnavailable
 	}
@@ -405,16 +417,16 @@ func (s *Store) semanticUnavailableError() error {
 }
 
 // SemanticReadiness reports the already-negotiated PG semantic capability.
-// PG serve wires a searcher only after finding a compatible generation, so no
-// query or archive scan is required here.
+// PG serve wires a searcher after finding a compatible generation, without
+// measuring archive coverage, so coverage counts remain unavailable.
 func (s *Store) SemanticReadiness(ctx context.Context) (db.SemanticReadiness, error) {
 	_ = ctx
-	s.vectorMu.RLock()
-	searcher := s.vectorSearcher
-	reason := s.semanticUnavailableReason
-	s.vectorMu.RUnlock()
+	s.runtimeState().vectorMu.RLock()
+	searcher := s.runtimeState().vectorSearcher
+	reason := s.runtimeState().semanticUnavailableReason
+	s.runtimeState().vectorMu.RUnlock()
 	if searcher != nil {
-		return db.SemanticReadiness{State: "ready"}, nil
+		return db.SemanticReadiness{State: "ready", Reason: "counts_unavailable"}, nil
 	}
 	if reason == "" {
 		reason = "not_configured"

@@ -114,11 +114,16 @@ func TestWriteSessionIncrementalPreservesRawResultContract(t *testing.T) {
 		wantSummary string
 		wantLength  int
 		wantCount   int
+		wantUnknown bool
 	}{
-		{"whitespace", []string{"useful", " \t"}, false, "useful", 6, 2},
-		{"control_identity", []string{"x\x01", "x\x02"}, false, "x", 1, 2},
-		{"blocked_identity", []string{"yy", "zz"}, true, "", 2, 2},
-		{"blocked_whitespace", []string{"useful", " \t"}, true, "", 6, 2},
+		{"image_then_sanitized", []string{"[image]", "\x00"}, false, "", 0, 2, true},
+		{"whitespace", []string{"useful", " \t"}, false, "useful", 6, 2, false},
+		{"first_participant", []string{" \t", "useful", " "}, false, "useful", 6, 3, false},
+		{"all_blank", []string{" ", "\t"}, false, "", 0, 2, false},
+		{"sanitized_participant", []string{"\x00", "text"}, false, "text", 4, 2, false},
+		{"control_identity", []string{"x\x01", "x\x02"}, false, "x", 1, 2, false},
+		{"blocked_identity", []string{"yy", "zz"}, true, "", 2, 2, false},
+		{"blocked_whitespace", []string{"useful", " \t"}, true, "", 6, 2, false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			d := testDB(t)
@@ -149,6 +154,13 @@ func TestWriteSessionIncrementalPreservesRawResultContract(t *testing.T) {
 			assert.Equal(t, tt.wantSummary, call.ResultContent)
 			assert.Equal(t, tt.wantLength, call.ResultContentLength)
 			assert.Len(t, call.ResultEvents, tt.wantCount)
+			tx, err := d.getWriter().Begin(t.Context())
+			require.NoError(t, err)
+			facts, err := (signalTxQuery{tx: tx, sessionID: "s1"}).ToolCallsByPosition(t.Context(), []ToolCallPosition{{}})
+			require.NoError(t, err)
+			require.Len(t, facts, 1)
+			assert.Equal(t, tt.wantUnknown, facts[0].ResultContentUnknown)
+			require.NoError(t, tx.Rollback())
 		})
 	}
 }
@@ -199,6 +211,10 @@ func TestLateResultRequiresMetadataForArchivedEvents(t *testing.T) {
 	missing, err = d.HasMissingToolResultMetadata(t.Context(), "s1", []ToolCallPosition{{MessageOrdinal: 1}})
 	require.NoError(t, err)
 	assert.False(t, missing, "other call occurrences do not force a reparse")
+	tx, err := d.getWriter().Begin(t.Context())
+	require.NoError(t, err)
+	require.NoError(t, ensureToolCallAgentStateTx(t.Context(), tx, "s1", ToolCallPosition{}))
+	require.NoError(t, tx.Commit())
 	_, err = d.WriteSessionIncremental(t.Context(), "s1", nil, IncrementalSessionUpdate{
 		MsgCount: 1, NextOrdinal: 1,
 		ToolCallResultUpdates: []ToolCallResultUpdate{{
@@ -258,4 +274,56 @@ func TestLateResultIdentitySurvivesTranscriptReplacement(t *testing.T) {
 	require.Len(t, msgs[0].ToolCalls, 1)
 	assert.Len(t, msgs[0].ToolCalls[0].ResultEvents, 2, "raw identity survives sanitation, archive loading, and no-op replacement")
 	assert.Equal(t, "x", msgs[0].ToolCalls[0].ResultContent)
+}
+
+func TestRepeatedResultFillsMissingSubagentIdentity(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "parent", "project-a")
+	events := []ToolResultEvent{
+		{Content: "done", Source: "tool_result", EventIndex: 0},
+		{Content: "done", Source: "tool_result", EventIndex: 1},
+		{Content: "done", Source: "tool_result", EventIndex: 2, SubagentSessionID: "agent-other"},
+	}
+	for i := range events {
+		PrepareToolResultEvent(&events[i])
+	}
+	insertMessages(t, d, Message{
+		SessionID: "parent", Ordinal: 0, Role: "assistant",
+		ToolCalls: []ToolCall{{
+			ToolUseID: "call", ToolName: "Agent", Category: "Task", ResultEvents: events,
+		}},
+	})
+	before, err := d.TranscriptRevision(t.Context(), "parent")
+	require.NoError(t, err)
+	for _, step := range []struct {
+		child   string
+		changed bool
+	}{{"", false}, {"agent-child", true}, {"agent-child", false}} {
+		_, err = d.WriteSessionIncremental(t.Context(), "parent", nil, IncrementalSessionUpdate{
+			MsgCount: 1, NextOrdinal: 1,
+			ToolCallResultUpdates: []ToolCallResultUpdate{{
+				ToolUseID: "call", Events: []ToolResultEvent{{
+					Content: "done", Source: "tool_result", SubagentSessionID: step.child,
+				}},
+			}},
+		})
+		require.NoError(t, err)
+		messages, err := d.GetAllMessages(t.Context(), "parent")
+		require.NoError(t, err)
+		require.Len(t, messages, 1)
+		require.Len(t, messages[0].ToolCalls, 1)
+		call := messages[0].ToolCalls[0]
+		require.Len(t, call.ResultEvents, 3, "link updates must not add result events")
+		assert.Equal(t, step.child, call.ResultEvents[0].SubagentSessionID)
+		assert.Equal(t, step.child, call.ResultEvents[1].SubagentSessionID)
+		assert.Equal(t, "agent-other", call.ResultEvents[2].SubagentSessionID)
+		after, err := d.TranscriptRevision(t.Context(), "parent")
+		require.NoError(t, err)
+		if step.changed {
+			assert.NotEqual(t, before, after, "metadata-only updates refresh exports")
+		} else {
+			assert.Equal(t, before, after, "replay without new identity is a no-op")
+		}
+		before = after
+	}
 }

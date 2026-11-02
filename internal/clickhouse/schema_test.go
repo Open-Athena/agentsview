@@ -73,6 +73,34 @@ func TestSessionFingerprintCoversEveryMirroredColumn(t *testing.T) {
 		"sessionFingerprintFields and sessionFingerprintColumns must stay parallel")
 }
 
+// Labels and PR links live only on the session row, so a change to either
+// alone must change the fingerprint or the push would skip the session.
+func TestSnapshotFingerprintTracksLabelsAndPRLinks(t *testing.T) {
+	s := &Sync{machine: "m"}
+	fingerprint := func(sess db.Session) string {
+		t.Helper()
+		fp, err := s.snapshotFingerprint(&db.SessionMirrorSnapshot{Session: sess})
+		require.NoError(t, err)
+		return fp
+	}
+	base := db.Session{ID: "s", CreatedAt: "2026-01-01T00:00:00Z"}
+	labeled := base
+	labeled.Labels = []string{"ticket-1"}
+	linked := base
+	linked.PRLinks = []db.PRLink{{
+		URL: "https://github.com/acme/widgets/pull/1", Host: "github.com",
+		Repository: "acme/widgets", Number: 1,
+	}}
+	cleared := base
+	cleared.Labels = []string{}
+
+	baseFP := fingerprint(base)
+	assert.NotEqual(t, baseFP, fingerprint(labeled), "label-only change")
+	assert.NotEqual(t, baseFP, fingerprint(linked), "pr-link-only change")
+	assert.Equal(t, baseFP, fingerprint(cleared),
+		"no labels and an emptied label set write the same row")
+}
+
 func tableColumn(spec tableSpec, name string) (columnSpec, bool) {
 	for _, c := range spec.columns {
 		if c.name == name {
@@ -86,10 +114,12 @@ func tableColumn(spec tableSpec, name string) (columnSpec, bool) {
 // schema edit without a matching row edit fails here, not on a live
 // server.
 func TestRowBuildersMatchInsertColumns(t *testing.T) {
-	sess := db.Session{ID: "s", CreatedAt: "2026-01-01T00:00:00Z"}
+	sess := db.Session{ID: "s", GroupKey: "job-a", CreatedAt: "2026-01-01T00:00:00Z"}
 	msg := db.Message{ID: 7, SessionID: "s", Ordinal: 1, Timestamp: "2026-01-01T00:00:00Z"}
 	tc := db.ToolCall{ToolName: "read", ResultEvents: []db.ToolResultEvent{{Content: "x"}}}
 	s := &Sync{machine: "m", archiveID: "a"}
+	planUsage, err := planUsageRow("s", &db.SessionPlanUsage{}, 1)
+	require.NoError(t, err)
 	rows := map[string][]any{
 		"sessions":           s.sessionRow(sessionPayload{session: sess, messages: []db.Message{msg}}, "fp", 1),
 		"messages":           messageRow(msg, 1),
@@ -98,11 +128,22 @@ func TestRowBuildersMatchInsertColumns(t *testing.T) {
 		"usage_events":       usageEventRow(db.UsageEvent{SessionID: "s"}, 1),
 		"secret_findings":    secretFindingRow(db.SecretFinding{SessionID: "s"}, 0, 1),
 		"pinned_messages":    pinnedMessageRow(db.PinnedMessage{SessionID: "s"}, 1),
+		"session_plan_usage": planUsage,
 	}
 	for table, row := range rows {
 		spec, ok := tableByName(table)
 		require.True(t, ok, table)
 		assert.Len(t, row, len(spec.columns)+1, "%s row width", table)
+		if table == "sessions" {
+			groupColumn := -1
+			for i, column := range spec.columns {
+				if column.name == "group_key" {
+					groupColumn = i
+				}
+			}
+			require.GreaterOrEqual(t, groupColumn, 0)
+			assert.Equal(t, "job-a", row[groupColumn])
+		}
 		assert.Equal(t, uint64(1), row[len(row)-1], "%s push_version is last", table)
 	}
 }
@@ -123,10 +164,4 @@ func TestLastMessageAtAndTimeValue(t *testing.T) {
 	require.NotNil(t, latest)
 	assert.Equal(t, "2026-01-10T00:03:00Z", latest.Format("2006-01-02T15:04:05Z"))
 	assert.Nil(t, lastMessageAt(nil))
-}
-
-func TestCanonicalPushScope(t *testing.T) {
-	assert.Empty(t, canonicalPushScope(nil, nil))
-	assert.Equal(t, canonicalPushScope([]string{"b", "a"}, nil), canonicalPushScope([]string{"a", "b"}, nil))
-	assert.NotEqual(t, canonicalPushScope([]string{"a"}, nil), canonicalPushScope(nil, []string{"a"}))
 }

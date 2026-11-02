@@ -2,6 +2,8 @@ package parser
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"strings"
@@ -32,6 +34,7 @@ const (
 	AgentCursor         AgentType = "cursor"
 	AgentCursorIDE      AgentType = "cursor-ide"
 	AgentIflow          AgentType = "iflow"
+	AgentJunie          AgentType = "junie"
 	AgentAmp            AgentType = "amp"
 	AgentZencoder       AgentType = "zencoder"
 	AgentVSCodeCopilot  AgentType = "vscode-copilot"
@@ -40,8 +43,11 @@ const (
 	AgentVSCopilot      AgentType = "visualstudio-copilot"
 	AgentPi             AgentType = "pi"
 	AgentTau            AgentType = "tau"
+	AgentFx             AgentType = "fx"
 	AgentPrimeAgent     AgentType = "prime-agent"
 	AgentOMP            AgentType = "omp"
+	AgentOMO            AgentType = "omo"
+	AgentStepCode       AgentType = "stepcode"
 	AgentQwen           AgentType = "qwen"
 	AgentCommandCode    AgentType = "commandcode"
 	AgentDeepSeekTUI    AgentType = "deepseek-tui"
@@ -86,9 +92,12 @@ const (
 	AgentCodebuff       AgentType = "codebuff"
 	AgentFreebuff       AgentType = "freebuff"
 	AgentCrush          AgentType = "crush"
+	AgentMuse           AgentType = "muse"
 )
 
 const AgentDeepSeekHarness AgentType = "deepseek-harness"
+
+const AgentCodexCloud AgentType = "codex-cloud"
 
 // AgentDef describes a supported coding agent's filesystem
 // layout, configuration keys, and session ID conventions.
@@ -125,6 +134,17 @@ type AgentDef struct {
 	// with secrets or state that cannot be copied safely; each artifact
 	// seam checks it so exclusion fails closed.
 	RemoteSyncExcluded bool
+
+	// RemoteHostSyncExcluded keeps the agent's roots out of remote host
+	// sync only. Raw capture may still ship them to a hub. Set for roots
+	// that hold local state files beside transcripts that are safe to
+	// capture one file at a time.
+	RemoteHostSyncExcluded bool
+
+	// DataDirRoot is the agent's only root, relative to the AgentsView
+	// data directory in slash form, for sources AgentsView writes itself. Such an agent
+	// has no user-configurable directories.
+	DataDirRoot string
 
 	// WatchRootsFunc resolves the directories to watch for live
 	// updates under a configured root, for agents whose watch
@@ -385,6 +405,10 @@ var Registry = []AgentDef{
 		// encryption keys. Remote sync stays disabled until there is an
 		// allowlisted export schema, matching Omnigent's chat.db precedent.
 		RemoteSyncExcluded: true,
+		// Watcher events parse only composers whose composerData document
+		// changed, so bubble-only edits rely on the scheduled
+		// fingerprint-gated container reparse.
+		PeriodicReconcile: true,
 	},
 	{
 		Type:        AgentAmp,
@@ -394,6 +418,18 @@ var Registry = []AgentDef{
 		DefaultDirs: []string{".local/share/amp/threads"},
 		IDPrefix:    "amp:",
 		FileBased:   true,
+	},
+	{
+		Type:              AgentJunie,
+		DisplayName:       "Junie",
+		EnvVar:            "JUNIE_DIR",
+		DefaultRootEnvVar: "JUNIE_HOME",
+		DefaultRootDir:    ".junie",
+		ConfigKey:         "junie_dirs",
+		HomesSupported:    true,
+		DefaultDirs:       []string{".junie/sessions"},
+		IDPrefix:          "junie:",
+		FileBased:         true,
 	},
 	{
 		Type:        AgentZencoder,
@@ -531,6 +567,16 @@ var Registry = []AgentDef{
 		FileBased:         true,
 	},
 	{
+		Type:        AgentFx,
+		DisplayName: "fx",
+		EnvVar:      "FX_SESSIONS_DIR",
+		ConfigKey:   "fx_dirs",
+		DefaultDirs: []string{".fx/sessions"},
+		IDPrefix:    "fx:",
+		FileBased:   true,
+		Usage:       UsageCapabilities{NoPerMessageTokenData: true},
+	},
+	{
 		Type:        AgentTau,
 		DisplayName: "Tau",
 		EnvVar:      "TAU_SESSIONS_DIR",
@@ -556,6 +602,31 @@ var Registry = []AgentDef{
 		DefaultDirs: []string{".omp/agent/sessions"},
 		IDPrefix:    "omp:",
 		FileBased:   true,
+	},
+	{
+		Type:        AgentOMO,
+		DisplayName: "OMO",
+		EnvVar:      "OMO_DIR",
+		ConfigKey:   "omo_dirs",
+		DefaultDirs: []string{".omo/agent/sessions"},
+		IDPrefix:    "omo:",
+		FileBased:   true,
+	},
+	{
+		// StepCode packages the Pi harness as a product, so its transcripts
+		// use Pi's JSONL format and layout verbatim and go through the Pi
+		// provider. It keeps its own agent root, so a Pi default root would
+		// otherwise never see StepCode sessions.
+		Type:              AgentStepCode,
+		DisplayName:       "StepCode",
+		EnvVar:            "STEPCODE_DIR",
+		NativeEnvVar:      "STEP_CODING_AGENT_SESSION_DIR",
+		DefaultRootEnvVar: "STEP_CODING_AGENT_DIR",
+		DefaultRootDir:    ".stepcode/agent",
+		ConfigKey:         "stepcode_dirs",
+		DefaultDirs:       []string{".stepcode/agent/sessions"},
+		IDPrefix:          "stepcode:",
+		FileBased:         true,
 	},
 	{
 		Type:        AgentQwen,
@@ -599,6 +670,14 @@ var Registry = []AgentDef{
 		DefaultDirs:       []string{".dsh/sessions"},
 		IDPrefix:          "deepseek-harness:",
 		FileBased:         true,
+	},
+	{
+		Type:                   AgentCodexCloud,
+		DisplayName:            "Codex Cloud",
+		IDPrefix:               "codex-cloud:",
+		FileBased:              true,
+		DataDirRoot:            "sources/codex-cloud",
+		RemoteHostSyncExcluded: true,
 	},
 	{
 		Type:        AgentOpenClaw,
@@ -888,7 +967,11 @@ var Registry = []AgentDef{
 		DisplayName: "Antigravity",
 		EnvVar:      "ANTIGRAVITY_DIR",
 		ConfigKey:   "antigravity_dirs",
-		DefaultDirs: []string{".gemini/antigravity"},
+		// The IDE variant writes to .gemini/antigravity-ide, its own standard
+		// directory, in the same layout. .gemini/antigravity-backup is
+		// deliberately not a default: it is a copy, so every conversation it
+		// holds would be stored twice.
+		DefaultDirs: []string{".gemini/antigravity", ".gemini/antigravity-ide"},
 		IDPrefix:    "antigravity:",
 		WatchSubdirs: []string{
 			"conversations",
@@ -1100,6 +1183,8 @@ var Registry = []AgentDef{
 		EnvVar:            "CODEBUFF_DIR",
 		ConfigKey:         "codebuff_dirs",
 		DefaultDirs:       []string{".config/manicode/projects"},
+		DefaultRootEnvVar: "FREEBUFF_CONFIG_DIR",
+		DefaultRootDir:    ".config/manicode",
 		IDPrefix:          "codebuff:",
 		FileBased:         true,
 		PeriodicReconcile: true,
@@ -1127,6 +1212,18 @@ var Registry = []AgentDef{
 		// registry and schema churn.
 		PeriodicReconcile: true,
 	},
+	{
+		// Muse Code (Meta) keeps its data under
+		// ${XDG_DATA_HOME:-~/.local/share}/muse on every platform.
+		Type:              AgentMuse,
+		DisplayName:       "Muse Code",
+		EnvVar:            "MUSE_SESSIONS_DIR",
+		DefaultRootEnvVar: "XDG_DATA_HOME",
+		DefaultRootDir:    ".local/share",
+		DefaultDirs:       []string{".local/share/muse/sessions"},
+		IDPrefix:          "muse:",
+		FileBased:         true,
+	},
 }
 
 // AgentByType returns the AgentDef for the given type.
@@ -1143,7 +1240,13 @@ func AgentByType(t AgentType) (AgentDef, bool) {
 // stay out of every remote sync artifact. Unknown agents are not excluded.
 func RemoteSyncExcludedAgent(agent AgentType) bool {
 	def, ok := AgentByType(agent)
-	return ok && def.RemoteSyncExcluded
+	return ok && def.RemoteHostSyncBlocked()
+}
+
+// RemoteHostSyncBlocked reports whether remote host sync must leave the
+// agent's roots behind.
+func (d AgentDef) RemoteHostSyncBlocked() bool {
+	return d.RemoteSyncExcluded || d.RemoteHostSyncExcluded
 }
 
 // AgentHasPostAnswerToolWork reports whether the agent may continue calling
@@ -1239,6 +1342,17 @@ func StripHostPrefix(id string) (host, rawID string) {
 	return "", id
 }
 
+// ProviderStoredAgents returns the session agent labels a provider may store.
+// Codebuff relabels free-tier sessions as Freebuff while discovery, caches, and
+// the provider_freshness table stay keyed on Codebuff, so both labels belong to
+// the Codebuff provider. Every other provider stores its own label.
+func ProviderStoredAgents(agent AgentType) []AgentType {
+	if agent == AgentCodebuff {
+		return []AgentType{AgentCodebuff, AgentFreebuff}
+	}
+	return []AgentType{agent}
+}
+
 // AgentByPrefix returns the AgentDef whose IDPrefix matches
 // the session ID. For Claude (empty prefix), the match
 // succeeds only when no other prefix matches and the ID
@@ -1281,6 +1395,31 @@ const (
 	RelSubagent     RelationshipType = "subagent"
 	RelFork         RelationshipType = "fork"
 )
+
+// altSessionMarker joins a session id to the source-path hash of a second
+// file that resolved to the same id. "~" is reserved for host prefixes.
+const altSessionMarker = "_alt-"
+
+// AltSessionID returns the id under which the source file at path is stored
+// when another file already owns id.
+func AltSessionID(id, path string) string {
+	sum := sha256.Sum256([]byte(path))
+	return id + altSessionMarker + hex.EncodeToString(sum[:8])
+}
+
+// BaseSessionID strips an AltSessionID suffix, returning the id the agent
+// itself recorded. Only agents whose provider declares SharedSessionIDs have
+// derived ids; their native ids never end in the suffix.
+func BaseSessionID(id string) string {
+	i := strings.LastIndex(id, altSessionMarker)
+	if i < 0 || len(id)-i != len(altSessionMarker)+16 {
+		return id
+	}
+	if _, err := hex.DecodeString(id[i+len(altSessionMarker):]); err != nil {
+		return id
+	}
+	return id[:i]
+}
 
 // RoleType identifies the role of a message sender.
 type RoleType string
@@ -1348,8 +1487,13 @@ type ParsedSession struct {
 	RelationshipType RelationshipType
 	Cwd              string
 	GitBranch        string
-	SourceSessionID  string
-	SourceVersion    string
+	// GitRemote is the sanitized repository URL recorded by the provider.
+	// It remains evidence when the original checkout is no longer available.
+	GitRemote          string
+	SourceSessionID    string
+	SourceVersion      string
+	GroupKey           string `json:"group_key,omitempty"`
+	KeepStoredGroupKey bool   `json:"keep_stored_group_key,omitempty"`
 	// TranscriptFidelity classifies how complete a stored transcript is
 	// relative to the agent's full session data: "full" when the
 	// high-resolution source was used, "summary" for a degraded/fallback
@@ -1367,15 +1511,20 @@ type ParsedSession struct {
 	FirstMessage            string
 	SessionName             string
 	// SessionNamePresent distinguishes an explicitly present provider title
-	// (including a blank title) from no title signal. Codex needs this because
-	// current releases may omit session_index.jsonl entirely, while an older
-	// index entry with a blank thread_name explicitly clears a stored title.
+	// (including a blank title) from no title signal. Codex, Antigravity,
+	// and Qoder keep titles outside the transcript, so a missing or
+	// unreadable title source keeps the stored title while an explicit
+	// blank clears it. Qoder's app database leaves a blank title unset, so
+	// it keeps the stored title too.
 	SessionNamePresent bool
-	StartedAt          time.Time
-	EndedAt            time.Time
-	MessageCount       int
-	UserMessageCount   int
-	File               FileInfo
+	// PRLinks lists the pull or merge requests the source associated with
+	// this session, deduplicated by URL in first-appearance order.
+	PRLinks          []PRLink
+	StartedAt        time.Time
+	EndedAt          time.Time
+	MessageCount     int
+	UserMessageCount int
+	File             FileInfo
 
 	// TerminationStatus describes how the session appears to have
 	// ended. Empty string = unknown (parser did not classify, or
@@ -1389,6 +1538,12 @@ type ParsedSession struct {
 	// linear-bound sessions. Only set by the Claude parser; nil for
 	// all other agents.
 	ClaudeLinearParse *bool
+	// ClaudeSubagentSources records the files that contributed to this full
+	// parse. Sync keeps this local provenance with the archived messages.
+	ClaudeSubagentSources []string
+	// claudeRenameSeen preserves explicit title precedence when combining
+	// transcripts, including a /rename command that cleared the title.
+	claudeRenameSeen bool
 
 	TotalOutputTokens    int
 	PeakContextTokens    int
@@ -1400,6 +1555,16 @@ type ParsedSession struct {
 	// (e.g. VSCode Copilot). The sync engine forwards these into
 	// the usage_events table for catalog-based cost pricing.
 	UsageEvents []ParsedUsageEvent
+
+	// CaptureCoverage reports how much of a live-captured session's token
+	// usage was seen. Only Codex cloud sessions with token records set it.
+	CaptureCoverage *ParsedCaptureCoverage
+
+	// PlanUsage is the session's latest plan usage report and outcome.
+	// Only Codex cloud sessions set it. It is empty, meaning plan usage is
+	// not checked yet, for a session with neither plan usage records nor
+	// token records.
+	PlanUsage *ParsedPlanUsage
 
 	// CountsAuthoritative marks parsers that own MessageCount and
 	// UserMessageCount even when they intentionally emit no transcript rows.
@@ -1469,8 +1634,15 @@ type ParsedMessageTokenUsageUpdate struct {
 // user message (the response to a prior tool_use).
 type ParsedToolResult struct {
 	ToolUseID     string
+	Source        string
+	Status        string
 	ContentLength int
 	ContentRaw    string // raw JSON of the content field; decode with DecodeContent
+	// PersistedOutputUnresolved is set, transiently and parse-time only, when
+	// this block genuinely referenced a Claude or iCodeMate
+	// persistedOutputPath side file that failed to resolve. It is never
+	// derived from ContentRaw's shape, only from that resolution attempt.
+	PersistedOutputUnresolved bool
 }
 
 // ParsedToolResultEvent is a canonical chronological update attached
@@ -1493,6 +1665,7 @@ type ParsedMessage struct {
 	Ordinal       int
 	Role          RoleType
 	Content       string
+	DialogueText  *string
 	ThinkingText  string // concatenated text of all thinking blocks; "" if none
 	Timestamp     time.Time
 	HasThinking   bool
@@ -1504,8 +1677,8 @@ type ParsedMessage struct {
 
 	Model           string
 	ReasoningEffort string
-	// ProviderID identifies the billing provider for this response, such as
-	// Posit Assistant's "positai" managed service or BYO "anthropic".
+	// ProviderID carries the billing identity for this response, including Codex
+	// service tiers, Posit Assistant's "positai" service, or BYO "anthropic".
 	ProviderID       string
 	TokenUsage       jsontext.Value
 	ContextTokens    int
@@ -1527,11 +1700,16 @@ type ParsedMessage struct {
 	// on user turns (e.g. "typed", "queued", "system", "sdk"); empty
 	// on older transcripts that predate the field and for agents that
 	// do not emit it.
-	PromptSource      string
+	PromptSource string
+	// claudeSDKOrigin records this line's SDK origin; merged queued prompts default to false.
+	claudeSDKOrigin   bool
 	SourceUUID        string
 	SourceParentUUID  string
 	IsSidechain       bool
 	IsCompactBoundary bool
+
+	// claudeChannelOrigin limits preview unwrapping to channel entries.
+	claudeChannelOrigin bool
 
 	// StopReason is the reason the assistant stopped generating
 	// (Claude: "end_turn", "tool_use", "max_tokens", "stop_sequence";
@@ -1543,6 +1721,47 @@ type ParsedMessage struct {
 	// tokenPresenceKnown marks per-message token coverage as
 	// parser-owned and authoritative.
 	tokenPresenceKnown bool
+}
+
+// ParsedCaptureCoverage summarizes live token capture for one session:
+// when the newest token record was observed and how many finished turns
+// no token record covers.
+type ParsedCaptureCoverage struct {
+	LastCaptureAt   *time.Time
+	UncapturedTurns int
+}
+
+// ParsedPlanUsage is a session's plan usage: OpenAI's latest report of
+// the thread's share of the plan's limits and its credits, and the newest
+// outcome record written after that report. The report fields are empty
+// when no row exists or a newer "counted under" outcome cleared them.
+// Credits stay decimal strings as OpenAI sent them.
+type ParsedPlanUsage struct {
+	DataAsOf        *time.Time
+	DataStatus      string
+	UsageSource     string
+	WeeklyPercent   *float64
+	FiveHourPercent *float64
+	Credits         *string
+	Groups          []ParsedPlanUsageGroup
+	Final           bool
+	OutcomeKind     string
+	OutcomeAt       *time.Time
+	// CountedUnder is the usage root's session ID when this thread is a
+	// descendant whose usage counts toward the root.
+	CountedUnder string
+}
+
+// ParsedPlanUsageGroup is a plan usage row's figures for one model,
+// reasoning effort, and speed.
+type ParsedPlanUsageGroup struct {
+	Model             string
+	ReasoningEffort   string
+	Speed             string
+	ProductExperience string
+	WeeklyPercent     *float64
+	FiveHourPercent   *float64
+	Credits           *string
 }
 
 // ParsedUsageEvent records session-level usage emitted by parsers
@@ -1605,18 +1824,16 @@ func accumulateMessageTokenUsageContext(
 // applyUsageEventTokenTotals recomputes session token totals from the
 // usage-event set whenever events exist. Callers must only use it when
 // events are a superset of per-message token metadata — true for the
-// Antigravity gen_metadata parsers, where every token-bearing message
-// derives from a gen row that also emits an event and undecodable
-// steps emit events with no message. Deriving totals from events
-// therefore covers transcripts that dropped steps (sidecar wins,
-// undecodable rows) without double counting. Message-derived totals
-// are kept where the events are silent.
+// Antigravity gen_metadata and Junie model-usage parsers. Deriving totals
+// from events covers token-bearing steps without normalized messages
+// (sidecar wins, undecodable rows) without double counting. Message-derived
+// totals are kept where the events are silent.
 //
 // Peak context counts the full context window per event: fresh input
 // plus cache-creation and cache-read tokens. That keeps event-derived
 // session totals consistent with per-message ContextTokens attribution
-// (input + cacheRead) from parsers whose events carry cache fields,
-// such as the Antigravity CLI sidecar parser.
+// (input + cacheRead) from parsers whose events carry cache fields, such as
+// Antigravity and Junie.
 func applyUsageEventTokenTotals(
 	sess *ParsedSession,
 	events []ParsedUsageEvent,
@@ -1784,6 +2001,14 @@ type ParseResult struct {
 	// checkpoint so it never re-reads the source after a full parse.
 	CheckpointHashState    []byte
 	CheckpointAnchorDigest string
+}
+
+// PromoteParentlessWorker classifies workers without an existing parent or relationship.
+func PromoteParentlessWorker(parent string, rel RelationshipType, worker bool) RelationshipType {
+	if parent == "" && rel == RelNone && worker {
+		return RelSubagent
+	}
+	return rel
 }
 
 // InferRelationshipTypes sets RelationshipType on results that have

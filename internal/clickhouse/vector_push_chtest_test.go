@@ -5,6 +5,7 @@ package clickhouse
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -13,6 +14,7 @@ import (
 	"go.kenn.io/agentsview/internal/clickhouse/chtest"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/storage"
 )
 
@@ -41,6 +43,9 @@ type fakeVectorSource struct {
 	// notReadyUnscoped makes a generation-wide export report the local index
 	// as not ready, the state a promoted scoped push can run into.
 	notReadyUnscoped bool
+	// onSessionDocs, when set, runs before a session's docs are exported and
+	// can fail the export.
+	onSessionDocs func(sessionID string) error
 }
 
 func (f *fakeVectorSource) BeginExport(
@@ -79,6 +84,11 @@ func (e *fakeVectorExport) SessionDocHashes(
 func (e *fakeVectorExport) SessionDocs(
 	_ context.Context, id string,
 ) ([]storage.VectorPushDoc, string, error) {
+	if e.source.onSessionDocs != nil {
+		if err := e.source.onSessionDocs(id); err != nil {
+			return nil, "", err
+		}
+	}
 	return e.source.docs[id], e.source.hashes[id], nil
 }
 
@@ -193,6 +203,108 @@ func TestVectorPushRoundTripDeltaAndEviction(t *testing.T) {
 		"a full re-push replaces rows instead of duplicating them")
 }
 
+// TestVectorPushBatchReplacesEachSessionsRows pins that one flush covering
+// several sessions removes each session's stale rows without touching what
+// the other sessions still hold, whether the sessions share a flush or not.
+func TestVectorPushBatchReplacesEachSessionsRows(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		batchSessions int
+	}{
+		{name: "one flush", batchSessions: 0},
+		{name: "one flush per session", batchSessions: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			local, target := seedFixture(t)
+			source := newFixtureVectorSource()
+			s := newTestSync(t, local, target, storage.PusherOptions{VectorSource: source})
+			s.vectorBatchSessions = tc.batchSessions
+			conn := chtest.Open(t, target.URL, target.Database)
+
+			_, err := s.Push(ctx, false, nil)
+			require.NoError(t, err)
+			// Another generation embedded both alpha docs. Its chunks for a
+			// doc alpha still holds survive; those for a vanished doc go.
+			require.NoError(t, insertRows(ctx, conn, "vector_chunks", [][]any{
+				{"fp-other-gen", "alpha-d0", int64(0), fixtureAlphaID, vecAlpha0a, uint64(1)},
+				{"fp-other-gen", "alpha-d1", int64(0), fixtureAlphaID, vecAlpha1, uint64(1)},
+			}))
+
+			// alpha drops a doc and re-embeds the survivor with one chunk;
+			// beta gains a doc.
+			source.hashes[fixtureAlphaID] = "alpha-v2"
+			source.docs[fixtureAlphaID] = []storage.VectorPushDoc{
+				vdoc(fixtureAlphaID, "alpha-d0", 0, "alpha first", "h-a0b", vecAlpha0a),
+			}
+			source.hashes[fixtureBetaID] = "beta-v2"
+			source.docs[fixtureBetaID] = []storage.VectorPushDoc{
+				vdoc(fixtureBetaID, "beta-d0", 0, "beta first", "h-b0", vecBeta0),
+				vdoc(fixtureBetaID, "beta-d1", 1, "beta second", "h-b1", vecChild0),
+			}
+			res, err := s.Push(ctx, false, nil)
+			require.NoError(t, err)
+			assert.Equal(t, 2, res.Vectors.SessionsPushed)
+			assert.Equal(t, 3, res.Vectors.DocsPushed)
+			assert.Equal(t, 3, res.Vectors.ChunksPushed)
+
+			assert.Equal(t, 1, chtest.Count(t, conn, "vector_documents", "session_id = ?", fixtureAlphaID))
+			assert.Equal(t, 0, chtest.Count(t, conn, "vector_documents", "doc_key = ?", "alpha-d1"))
+			assert.Equal(t, 1, chtest.Count(t, conn, "vector_chunks",
+				"session_id = ? AND generation_fingerprint = ?", fixtureAlphaID, vectorFixtureFP))
+			assert.Equal(t, 0, chtest.Count(t, conn, "vector_chunks", "doc_key = ?", "alpha-d1"))
+			assert.Equal(t, 1, chtest.Count(t, conn, "vector_chunks",
+				"doc_key = ? AND generation_fingerprint = ?", "alpha-d0", "fp-other-gen"))
+			assert.Equal(t, 2, chtest.Count(t, conn, "vector_documents", "session_id = ?", fixtureBetaID))
+			assert.Equal(t, 2, chtest.Count(t, conn, "vector_chunks", "session_id = ?", fixtureBetaID))
+			assert.Equal(t, 1, chtest.Count(t, conn, "vector_push_state",
+				"session_id = ? AND doc_agg_hash = ?", fixtureAlphaID, "alpha-v2"))
+			assert.Equal(t, 1, chtest.Count(t, conn, "vector_push_state",
+				"session_id = ? AND doc_agg_hash = ?", fixtureBetaID, "beta-v2"))
+		})
+	}
+}
+
+// TestVectorPushFailedFlushKeepsSessionsStale pins that a flush failing
+// after its rows land records no push state for any of its sessions, so the
+// next push repeats them instead of trusting the half-finished write.
+func TestVectorPushFailedFlushKeepsSessionsStale(t *testing.T) {
+	ctx := context.Background()
+	local, target := seedFixture(t)
+	source := newFixtureVectorSource()
+	s := newTestSync(t, local, target, storage.PusherOptions{VectorSource: source})
+	conn := chtest.Open(t, target.URL, target.Database)
+
+	_, err := s.Push(ctx, false, nil)
+	require.NoError(t, err)
+
+	source.hashes[fixtureAlphaID] = "alpha-v2"
+	source.hashes[fixtureBetaID] = "beta-v2"
+	var flushed []string
+	boom := errors.New("injected vector state failure")
+	s.hooks = &pushHooks{beforeVectorState: func(ids []string) error {
+		flushed = append(flushed, ids...)
+		return boom
+	}}
+	_, err = s.Push(ctx, false, nil)
+	require.ErrorIs(t, err, boom)
+	assert.ElementsMatch(t, []string{fixtureAlphaID, fixtureBetaID}, flushed,
+		"both changed sessions share one flush")
+	assert.Equal(t, 1, chtest.Count(t, conn, "vector_push_state",
+		"session_id = ? AND doc_agg_hash = ?", fixtureAlphaID, "alpha-v1"))
+	assert.Equal(t, 1, chtest.Count(t, conn, "vector_push_state",
+		"session_id = ? AND doc_agg_hash = ?", fixtureBetaID, "beta-v1"))
+
+	s.hooks = nil
+	res, err := s.Push(ctx, false, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 2, res.Vectors.SessionsPushed, "the failed flush's sessions are repeated")
+	assert.Equal(t, 1, chtest.Count(t, conn, "vector_push_state",
+		"session_id = ? AND doc_agg_hash = ?", fixtureAlphaID, "alpha-v2"))
+	assert.Equal(t, 1, chtest.Count(t, conn, "vector_push_state",
+		"session_id = ? AND doc_agg_hash = ?", fixtureBetaID, "beta-v2"))
+}
+
 func TestVectorPushSkipsWithoutSourceOrGeneration(t *testing.T) {
 	ctx := context.Background()
 	local, target := seedFixture(t)
@@ -248,8 +360,9 @@ func TestVectorPushFollowsMirrorResidency(t *testing.T) {
 // TestVectorPushScopedPromotesUntilArchiveCompletes pins the watch-mode
 // contract: a change-scoped push reconciles generation-wide until this
 // archive has recorded a clean generation-wide pass, then reads only its
-// changed sessions. Losing the marker (an interrupted pass) promotes again
-// even though the generation row itself is registered.
+// changed sessions. The first push is full, so it ignores the scope. Losing
+// the marker (an interrupted pass) promotes a scoped push again even though
+// the generation row itself is registered.
 func TestVectorPushScopedPromotesUntilArchiveCompletes(t *testing.T) {
 	ctx := context.Background()
 	local, target := seedFixture(t)
@@ -260,9 +373,8 @@ func TestVectorPushScopedPromotesUntilArchiveCompletes(t *testing.T) {
 	res, err := s.PushWithOptions(ctx, storage.PushOptions{ScopeVectorsToChangedSessions: true}, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 2, res.Vectors.SessionsPushed)
-	require.Len(t, source.genScopes, 2, "scoped export, then promoted generation-wide export")
-	assert.NotNil(t, source.genScopes[0])
-	assert.Nil(t, source.genScopes[1])
+	require.Len(t, source.genScopes, 1, "a full push exports generation-wide")
+	assert.Nil(t, source.genScopes[0])
 	assert.Nil(t, source.hashScopes[len(source.hashScopes)-1])
 
 	appendMessage(t, local, fixtureBetaID, "beta again", "2026-01-11T00:10:00.000Z")
@@ -295,8 +407,18 @@ func TestVectorPushPromotedExportNotReady(t *testing.T) {
 	ctx := context.Background()
 	local, target := seedFixture(t)
 	source := newFixtureVectorSource()
-	source.notReadyUnscoped = true
 	s := newTestSync(t, local, target, storage.PusherOptions{VectorSource: source})
+	_, err := s.Push(ctx, false, nil)
+	require.NoError(t, err)
+	// Dropping the completion marker makes the next scoped push promote.
+	conn := chtest.Open(t, target.URL, target.Database)
+	_, err = conn.ExecContext(ctx,
+		`DELETE FROM vector_push_state WHERE source_archive_id = ? AND session_id = ''`, s.archiveID)
+	require.NoError(t, err)
+	appendMessage(t, local, fixtureBetaID, "beta again", "2026-01-11T00:10:00.000Z")
+	source.hashes[fixtureBetaID] = "beta-v2"
+	source.notReadyUnscoped = true
+	source.genScopes = nil
 
 	res, err := s.PushWithOptions(ctx, storage.PushOptions{ScopeVectorsToChangedSessions: true}, nil)
 	require.NoError(t, err)
@@ -467,7 +589,7 @@ func TestVectorSearcherServesSemanticAndHybrid(t *testing.T) {
 	}, gens)
 
 	searcher := NewVectorSearcher(store.DB(), vectorFixtureFP, vectorFixtureDim, 20, fixedEncoder(vecAlpha0a))
-	hits, err := searcher.SemanticSearch(ctx, "alpha", 10)
+	hits, err := dbtest.SemanticSearch(ctx, searcher, "alpha", 10)
 	require.NoError(t, err)
 	require.Len(t, hits, 4, "one hit per document: both alpha chunks roll up to alpha-d0")
 	assert.Equal(t, fixtureAlphaID, hits[0].SessionID)
@@ -475,6 +597,26 @@ func TestVectorSearcherServesSemanticAndHybrid(t *testing.T) {
 	assert.InDelta(t, 1.0, hits[0].Score, 1e-5)
 	assert.Equal(t, "alpha first", hits[0].Snippet)
 	assert.Greater(t, hits[0].Score, hits[1].Score)
+
+	t.Run("prepared expansion and exhaustion", func(t *testing.T) {
+		encodes := 0
+		prepared := NewVectorSearcher(store.DB(), vectorFixtureFP, vectorFixtureDim, 20, func(_ context.Context, query string) ([]float32, error) {
+			encodes++
+			assert.Equal(t, "alpha", query)
+			return vecAlpha0a, nil
+		})
+		search, _, err := prepared.PrepareSemanticSearch(ctx, "alpha")
+		require.NoError(t, err)
+		for _, tc := range []struct {
+			k         int
+			exhausted bool
+		}{{1, false}, {200, true}} {
+			_, exhausted, err := search(ctx, tc.k)
+			require.NoError(t, err)
+			assert.Equal(t, tc.exhausted, exhausted)
+			assert.Equal(t, 1, encodes)
+		}
+	})
 
 	units, err := searcher.ResolveMessageUnits(ctx, []db.MessageRef{
 		{SessionID: fixtureAlphaID, Ordinal: 1},
@@ -500,6 +642,9 @@ func TestVectorSearcherServesSemanticAndHybrid(t *testing.T) {
 	assert.Equal(t, [2]int{0, 0}, top.OrdinalRange)
 	assert.Equal(t, "message", top.Location)
 	assert.Equal(t, "alpha", top.Project)
+	assert.Equal(t, fixtureMachine, top.Machine)
+	require.NotNil(t, top.DisplayName)
+	assert.Equal(t, "Alpha Saved Title", *top.DisplayName)
 	require.NotNil(t, top.Score)
 	assert.Contains(t, top.Snippet, "alpha first")
 
@@ -532,6 +677,13 @@ func TestVectorSearcherServesSemanticAndHybrid(t *testing.T) {
 	require.NotEmpty(t, hybrid.Matches)
 	var sawBeta bool
 	for _, m := range hybrid.Matches {
+		assert.Equal(t, fixtureMachine, m.Machine)
+		if m.SessionID == fixtureAlphaID {
+			require.NotNil(t, m.DisplayName)
+			assert.Equal(t, "Alpha Saved Title", *m.DisplayName)
+		} else {
+			assert.Nil(t, m.DisplayName)
+		}
 		if m.SessionID == fixtureBetaID && m.Ordinal == 0 {
 			sawBeta = true
 			assert.Contains(t, m.Snippet, "beta first")
@@ -544,4 +696,20 @@ func TestVectorSearcherServesSemanticAndHybrid(t *testing.T) {
 	_, err = store.SearchContent(ctx, db.ContentSearchFilter{Pattern: "x", Mode: "semantic", Limit: 5})
 	require.ErrorIs(t, err, db.ErrSemanticUnavailable)
 	assert.Contains(t, err.Error(), "test reason")
+}
+
+func TestVectorPushRepairsNamedSessions(t *testing.T) {
+	ctx := context.Background()
+	local, target := seedFixture(t)
+	source := newFixtureVectorSource()
+	s := newTestSync(t, local, target, storage.PusherOptions{VectorSource: source})
+
+	_, err := s.Push(ctx, false, nil)
+	require.NoError(t, err)
+	repair, err := s.PushWithOptions(ctx, storage.PushOptions{
+		FullVectorSessions: []string{fixtureAlphaID},
+	}, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, repair.Vectors.SessionsPushed, "the named session is re-sent")
+	assert.Equal(t, 1, repair.Vectors.SessionsUnchanged, "other sessions keep the hash skip")
 }

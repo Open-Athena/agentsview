@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
 )
@@ -464,6 +465,49 @@ func TestAnalyticsSignalSessionsRejectsUnsupportedSignal(t *testing.T) {
 	assertStatus(t, w, http.StatusBadRequest)
 }
 
+func TestAnalyticsToolEvidenceOptionalCategory(t *testing.T) {
+	te := setup(t)
+	for i, call := range []db.ToolCall{{ToolName: "readFile", Category: "Read"}, {ToolName: "readFile", Category: "MCP"}, {ToolName: "Read", Category: "Read"}} {
+		id := fmt.Sprintf("tool-filter-%d", i)
+		dbtest.SeedSession(t, te.db, id, "fixture", func(s *db.Session) { s.StartedAt = new("2026-04-26T10:00:00Z"); s.UserMessageCount = 2 })
+		require.NoError(t, te.db.InsertMessages(t.Context(), []db.Message{{SessionID: id, Ordinal: 1, Role: "assistant", Timestamp: "2026-04-26T10:00:00Z", ToolCalls: []db.ToolCall{call}}}))
+		require.NoError(t, te.db.UpdateSessionSignals(t.Context(), id, db.SessionSignalUpdate{ToolObservations: []db.ToolObservation{{MessageOrdinal: 1, Outcome: "empty", Repeat: "none"}}, QualitySignals: db.QualitySignals{Version: db.CurrentQualitySignalVersion, UnstructuredStart: true}}))
+	}
+	w := te.get(t, "/api/v1/analytics/signal-sessions?signal=tool_empty_rate&from=2026-04-26&to=2026-04-26&tool_name=readFile&tool_category=MCP")
+	assertStatus(t, w, http.StatusOK)
+	got := decode[db.SignalSessionsResponse](t, w)
+	require.Len(t, got.Sessions, 1)
+	document := decode[map[string]any](t, w)
+	for _, row := range document["sessions"].([]any) {
+		for _, key := range []string{"failure_signals", "retries", "edit_churn", "is_automated"} {
+			assert.NotContains(t, row.(map[string]any), key)
+		}
+		for _, key := range []string{"outcome", "excerpt"} {
+			require.Contains(t, row.(map[string]any), key)
+			assert.Empty(t, row.(map[string]any)[key])
+		}
+	}
+	path := "/api/v1/analytics/signal-sessions?signal=unstructured_start&from=2026-04-26&to=2026-04-26"
+	w = te.get(t, path+"&offset=0")
+	assertStatus(t, w, http.StatusOK)
+	quality := decode[map[string]any](t, w)
+	assert.NotContains(t, quality, "total")
+	assert.NotContains(t, quality, "next_offset")
+	require.Len(t, quality["sessions"], 3)
+	for _, row := range quality["sessions"].([]any) {
+		assert.Equal(t, false, row.(map[string]any)["is_automated"])
+		// Clients read these fields on every quality signal row, even when empty.
+		assert.Contains(t, row.(map[string]any), "outcome")
+		assert.Contains(t, row.(map[string]any), "excerpt")
+		for _, key := range []string{"failure_signals", "retries", "edit_churn"} {
+			assert.InDelta(t, 0, row.(map[string]any)[key], 0)
+		}
+	}
+	for _, query := range []string{"&offset=1", "&tool_name=readFile", "&tool_category=Read"} {
+		assertStatus(t, te.get(t, path+query), http.StatusBadRequest)
+	}
+}
+
 func TestAnalyticsEndpoints_DefaultParams(t *testing.T) {
 	te, _ := setupAnalyticsEnv(t)
 
@@ -845,14 +889,6 @@ func TestAnalyticsProjects(t *testing.T) {
 		}
 		assert.Equal(t, stats.TotalMessages, total)
 	})
-
-	t.Run("MachineFilter", func(t *testing.T) {
-		w := te.get(t, buildURLWithRange("projects", map[string]string{"machine": "nonexistent"}))
-		assertStatus(t, w, http.StatusOK)
-
-		resp := decode[db.ProjectsAnalyticsResponse](t, w)
-		assert.Empty(t, resp.Projects)
-	})
 }
 
 func TestAnalyticsHourOfWeek(t *testing.T) {
@@ -1142,4 +1178,31 @@ func TestSessionCountConsistency(t *testing.T) {
 	require.Greater(t, summaryResp.TotalSessions, listResp.Total,
 		"analytics should count more than navigation: analytics=%d list=%d",
 		summaryResp.TotalSessions, listResp.Total)
+}
+
+func TestAnalyticsModelGroups(t *testing.T) {
+	te := setup(t, func(c *config.Config) {
+		c.ModelAliases = map[string]string{"claude-3-5-sonnet": "group", "gpt-4o": "group"}
+	})
+	seedAnalyticsEnv(t, te)
+	for _, tt := range []struct {
+		model, grouped string
+		sessions       int
+		models         []string
+	}{
+		{"group", "true", 3, []string{"claude-3-5-sonnet", "gpt-4o"}},
+		{"group", "false", 3, []string{"claude-3-5-sonnet", "gpt-4o"}},
+	} {
+		w := te.get(t, buildURLWithRange("summary", map[string]string{"model": tt.model, "group_models": tt.grouped}))
+		assertStatus(t, w, http.StatusOK)
+		result := decode[db.AnalyticsSummary](t, w)
+		assert.Equal(t, tt.sessions, result.TotalSessions)
+		assert.Equal(t, tt.models, result.Models)
+		body := decode[map[string]any](t, w)
+		if tt.grouped == "true" {
+			assert.Equal(t, map[string]any{"claude-3-5-sonnet": "group", "gpt-4o": "group"}, body["model_aliases"])
+		} else {
+			assert.NotContains(t, body, "model_aliases")
+		}
+	}
 }

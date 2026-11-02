@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json/v2"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -30,6 +31,7 @@ import (
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/remotesync"
 	"go.kenn.io/agentsview/internal/server"
+	"go.kenn.io/agentsview/internal/sshremote"
 	agentsync "go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/testjsonl"
 	"go.kenn.io/kit/daemon"
@@ -77,7 +79,7 @@ func TestPreparedHTTPRebuildLeaseCLIForwardsCommitOnce(t *testing.T) {
 func TestStartupWorkerDoesNotAddBlankLineForNonTerminalProgress(t *testing.T) {
 	cfg := config.Config{DataDir: t.TempDir()}
 	restore := stubLaunchSyncWorker(t, func(
-		_ context.Context, _ config.Config, _ string, onLine func(workerLine),
+		_ context.Context, _ config.Config, _ syncWorkerRequest, onLine func(workerLine),
 	) (workerResult, error) {
 		onLine(workerLine{Progress: &agentsync.Progress{
 			Phase:         agentsync.PhaseSyncing,
@@ -127,33 +129,6 @@ func newDirectSyncFixture(t *testing.T) (config.Config, *db.DB) {
 	return cfg, database
 }
 
-func TestRunRemoteSyncTransportWarnsOnceForDeprecatedSSH(t *testing.T) {
-	logs := captureLogOutput(t)
-	originalOnce := sshRemoteSyncDeprecationWarningOnce
-	sshRemoteSyncDeprecationWarningOnce = new(stdsync.Once)
-	t.Cleanup(func() { sshRemoteSyncDeprecationWarningOnce = originalOnce })
-
-	originalSSH := runSSHRemoteSync
-	runSSHRemoteSync = func(
-		context.Context, config.Config, *db.DB, config.RemoteHost, bool,
-	) (remotesync.SyncStats, error) {
-		return remotesync.SyncStats{}, nil
-	}
-	t.Cleanup(func() { runSSHRemoteSync = originalSSH })
-
-	for range 2 {
-		_, err := runRemoteSyncTransport(
-			t.Context(), config.Config{}, nil,
-			config.RemoteHost{Host: "legacy-host"}, false,
-		)
-		require.NoError(t, err)
-	}
-
-	const warning = "SSH remote sync is deprecated"
-	assert.Equal(t, 1, strings.Count(logs.String(), warning))
-	assert.Contains(t, logs.String(), "use HTTP remote sync instead")
-}
-
 func isolateDirectCLISources(t *testing.T) {
 	t.Helper()
 	root := t.TempDir()
@@ -168,13 +143,12 @@ func isolateDirectCLISources(t *testing.T) {
 	}
 }
 
-func TestDoSyncConfiguredFullUsesUnifiedHTTPContributorBeforeSSH(t *testing.T) {
+func TestDoSyncConfiguredFullUsesUnifiedHTTPContributor(t *testing.T) {
 	cfg, database := newDirectSyncFixture(t)
 	httpHost := config.RemoteHost{
 		Host: "http-box", Transport: config.RemoteTransportHTTP,
 		URL: "http://127.0.0.1:1", Token: "token",
 	}
-	sshHost := config.RemoteHost{Host: "ssh-box"}
 	var order []string
 	prepared := &fakeCLIPreparedHTTPRebuild{options: agentsync.RebuildOptions{
 		Contributors: []agentsync.RebuildContributor{{
@@ -187,7 +161,7 @@ func TestDoSyncConfiguredFullUsesUnifiedHTTPContributorBeforeSSH(t *testing.T) {
 	}}
 	originalPrepare := prepareHTTPRebuildCLI
 	prepareHTTPRebuildCLI = func(
-		_ context.Context, syncs []remotesync.HTTPSync,
+		_ context.Context, syncs []remotesync.RemoteSync,
 	) (preparedHTTPRebuildCLI, error) {
 		require.Len(t, syncs, 1)
 		assert.Equal(t, remotesync.FullImportExplicit, syncs[0].FullReason)
@@ -195,33 +169,22 @@ func TestDoSyncConfiguredFullUsesUnifiedHTTPContributorBeforeSSH(t *testing.T) {
 		return prepared, nil
 	}
 	t.Cleanup(func() { prepareHTTPRebuildCLI = originalPrepare })
-	originalSSH := runSSHRemoteSync
-	runSSHRemoteSync = func(
-		_ context.Context, _ config.Config, _ *db.DB,
-		rh config.RemoteHost, full bool,
-	) (remotesync.SyncStats, error) {
-		order = append(order, "ssh")
-		assert.Equal(t, sshHost, rh)
-		assert.True(t, full)
-		return remotesync.SyncStats{}, nil
-	}
-	t.Cleanup(func() { runSSHRemoteSync = originalSSH })
 
 	didResync, failures, err := runConfiguredLocalAndRemotes(
 		t.Context(), cfg, database,
-		[]config.RemoteHost{sshHost, httpHost}, true, nil,
+		[]config.RemoteHost{httpHost}, true, nil,
 	)
 
 	require.NoError(t, err)
 	assert.True(t, didResync)
 	assert.Empty(t, failures)
-	assert.Equal(t, []string{"prepare", "http contributor", "ssh"}, order)
+	assert.Equal(t, []string{"prepare", "http contributor"}, order)
 	assert.Equal(t, 1, prepared.closed)
 	assert.True(t, prepared.closeReleased,
 		"contributor borrow must release before prepared sources close")
 }
 
-func TestDoSyncConfiguredFullIgnoresSSHHistoryDuringUnifiedSafetyCheck(t *testing.T) {
+func TestDoSyncConfiguredFullPreservesArchivedRemoteSessions(t *testing.T) {
 	cfg, database := newDirectSyncFixture(t)
 	for _, roots := range cfg.AgentDirs {
 		for _, root := range roots {
@@ -245,87 +208,25 @@ func TestDoSyncConfiguredFullIgnoresSSHHistoryDuringUnifiedSafetyCheck(t *testin
 	}}
 	originalPrepare := prepareHTTPRebuildCLI
 	prepareHTTPRebuildCLI = func(
-		context.Context, []remotesync.HTTPSync,
+		context.Context, []remotesync.RemoteSync,
 	) (preparedHTTPRebuildCLI, error) {
 		return prepared, nil
 	}
 	t.Cleanup(func() { prepareHTTPRebuildCLI = originalPrepare })
-	sshCalls := 0
-	originalSSH := runSSHRemoteSync
-	runSSHRemoteSync = func(
-		_ context.Context, _ config.Config, database *db.DB,
-		rh config.RemoteHost, full bool,
-	) (remotesync.SyncStats, error) {
-		sshCalls++
-		assert.Equal(t, "ssh-box", rh.Host)
-		assert.True(t, full)
-		preserved, err := database.GetSession(
-			t.Context(), "preserved-ssh-session",
-		)
-		require.NoError(t, err)
-		if err != nil {
-			return remotesync.SyncStats{}, err
-		}
-		assert.NotNil(t, preserved,
-			"SSH pass must observe its archived session after the unified swap")
-		return remotesync.SyncStats{}, nil
-	}
-	t.Cleanup(func() { runSSHRemoteSync = originalSSH })
 
 	didResync, failures, err := runConfiguredLocalAndRemotes(
 		t.Context(), cfg, database,
 		[]config.RemoteHost{
 			{Host: "http-box", Transport: config.RemoteTransportHTTP, Token: "token"},
-			{Host: "ssh-box"},
 		}, true, nil,
 	)
 
 	require.NoError(t, err)
 	assert.True(t, didResync)
 	assert.Empty(t, failures)
-	assert.Equal(t, 1, sshCalls,
-		"SSH synchronization must run after an empty local/HTTP rebuild")
-}
-
-func TestDoSyncConfiguredFullSSHOnlyFallsBackBeforeRemoteImport(t *testing.T) {
-	cfg, database := newDirectSyncFixture(t)
-	for _, roots := range cfg.AgentDirs {
-		for _, root := range roots {
-			require.NoError(t, os.RemoveAll(root))
-		}
-	}
-	missingPath := filepath.Join(t.TempDir(), "missing-remote.jsonl")
-	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
-		ID: "preserved-ssh-session", Project: "archive", Machine: "ssh-box",
-		Agent: "claude", FilePath: &missingPath, MessageCount: 1,
-	}))
-	sshHost := config.RemoteHost{Host: "ssh-box"}
-	sshCalls := 0
-	originalSSH := runSSHRemoteSync
-	runSSHRemoteSync = func(
-		_ context.Context, _ config.Config, _ *db.DB,
-		rh config.RemoteHost, full bool,
-	) (remotesync.SyncStats, error) {
-		sshCalls++
-		assert.Equal(t, sshHost, rh)
-		assert.True(t, full)
-		return remotesync.SyncStats{}, nil
-	}
-	t.Cleanup(func() { runSSHRemoteSync = originalSSH })
-
-	didResync, failures, err := runConfiguredLocalAndRemotes(
-		t.Context(), cfg, database,
-		[]config.RemoteHost{sshHost}, true, nil,
-	)
-
-	require.NoError(t, err)
-	assert.True(t, didResync)
-	assert.Empty(t, failures)
-	assert.Equal(t, 1, sshCalls,
-		"SSH import must run after the legacy local fallback")
 	preserved, err := database.GetSession(t.Context(), "preserved-ssh-session")
 	require.NoError(t, err)
-	assert.NotNil(t, preserved)
+	assert.NotNil(t, preserved, "the rebuild must preserve previously imported remote sessions")
 }
 
 func TestDoSyncAutomaticResyncUsesUnifiedHTTPContributor(t *testing.T) {
@@ -345,7 +246,7 @@ func TestDoSyncAutomaticResyncUsesUnifiedHTTPContributor(t *testing.T) {
 	prepareCalls := 0
 	originalPrepare := prepareHTTPRebuildCLI
 	prepareHTTPRebuildCLI = func(
-		_ context.Context, syncs []remotesync.HTTPSync,
+		_ context.Context, syncs []remotesync.RemoteSync,
 	) (preparedHTTPRebuildCLI, error) {
 		require.Len(t, syncs, 1)
 		assert.Equal(t, remotesync.FullImportDataRebuild, syncs[0].FullReason)
@@ -369,7 +270,7 @@ func TestDoSyncAutomaticResyncUsesUnifiedHTTPContributor(t *testing.T) {
 	assert.False(t, database.NeedsResync())
 }
 
-func TestDoSyncPreparationFailureMapsRemoteAndSkipsSSH(t *testing.T) {
+func TestDoSyncPreparationFailureMapsRemote(t *testing.T) {
 	cfg, database := newDirectSyncFixture(t)
 	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 		ID: "preserved", Project: "archive", Machine: "local", Agent: "codex",
@@ -378,22 +279,13 @@ func TestDoSyncPreparationFailureMapsRemoteAndSkipsSSH(t *testing.T) {
 	prepared := &fakeCLIPreparedHTTPRebuild{}
 	originalPrepare := prepareHTTPRebuildCLI
 	prepareHTTPRebuildCLI = func(
-		context.Context, []remotesync.HTTPSync,
+		context.Context, []remotesync.RemoteSync,
 	) (preparedHTTPRebuildCLI, error) {
 		return prepared, &remotesync.HostError{
 			Host: "http-box", Operation: "prepare", Err: prepCause,
 		}
 	}
 	t.Cleanup(func() { prepareHTTPRebuildCLI = originalPrepare })
-	sshCalls := 0
-	originalSSH := runSSHRemoteSync
-	runSSHRemoteSync = func(
-		context.Context, config.Config, *db.DB, config.RemoteHost, bool,
-	) (remotesync.SyncStats, error) {
-		sshCalls++
-		return remotesync.SyncStats{}, nil
-	}
-	t.Cleanup(func() { runSSHRemoteSync = originalSSH })
 
 	didResync, failures, err := runConfiguredLocalAndRemotes(
 		t.Context(), cfg, database, []config.RemoteHost{
@@ -401,7 +293,6 @@ func TestDoSyncPreparationFailureMapsRemoteAndSkipsSSH(t *testing.T) {
 				Host: "http-box", Transport: config.RemoteTransportHTTP,
 				URL: "http://127.0.0.1:1", Token: "token",
 			},
-			{Host: "ssh-box"},
 		}, true, nil,
 	)
 
@@ -410,7 +301,6 @@ func TestDoSyncPreparationFailureMapsRemoteAndSkipsSSH(t *testing.T) {
 	require.Len(t, failures, 1)
 	assert.Equal(t, "http-box", failures[0].Host.Host)
 	require.ErrorIs(t, failures[0].Err, prepCause)
-	assert.Equal(t, 0, sshCalls)
 	assert.Equal(t, 1, prepared.closed,
 		"partial preparation ownership must be closed on failure")
 	preserved, getErr := database.GetSession(t.Context(), "preserved")
@@ -418,7 +308,7 @@ func TestDoSyncPreparationFailureMapsRemoteAndSkipsSSH(t *testing.T) {
 	assert.NotNil(t, preserved, "failed preparation must not swap")
 }
 
-func TestDoSyncContributorFailureMapsRemotePreservesCauseAndSkipsSSH(t *testing.T) {
+func TestDoSyncContributorFailureMapsRemotePreservesCause(t *testing.T) {
 	cfg, database := newDirectSyncFixture(t)
 	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 		ID: "preserved", Project: "archive", Machine: "local", Agent: "codex",
@@ -432,20 +322,11 @@ func TestDoSyncContributorFailureMapsRemotePreservesCauseAndSkipsSSH(t *testing.
 	}}
 	originalPrepare := prepareHTTPRebuildCLI
 	prepareHTTPRebuildCLI = func(
-		context.Context, []remotesync.HTTPSync,
+		context.Context, []remotesync.RemoteSync,
 	) (preparedHTTPRebuildCLI, error) {
 		return prepared, nil
 	}
 	t.Cleanup(func() { prepareHTTPRebuildCLI = originalPrepare })
-	sshCalls := 0
-	originalSSH := runSSHRemoteSync
-	runSSHRemoteSync = func(
-		context.Context, config.Config, *db.DB, config.RemoteHost, bool,
-	) (remotesync.SyncStats, error) {
-		sshCalls++
-		return remotesync.SyncStats{}, nil
-	}
-	t.Cleanup(func() { runSSHRemoteSync = originalSSH })
 
 	didResync, failures, err := runConfiguredLocalAndRemotes(
 		t.Context(), cfg, database, []config.RemoteHost{
@@ -453,7 +334,6 @@ func TestDoSyncContributorFailureMapsRemotePreservesCauseAndSkipsSSH(t *testing.
 				Host: "http-box", Transport: config.RemoteTransportHTTP,
 				URL: "http://127.0.0.1:1", Token: "token",
 			},
-			{Host: "ssh-box"},
 		}, true, nil,
 	)
 
@@ -462,7 +342,6 @@ func TestDoSyncContributorFailureMapsRemotePreservesCauseAndSkipsSSH(t *testing.
 	require.Len(t, failures, 1)
 	assert.Equal(t, "http-box", failures[0].Host.Host)
 	require.ErrorIs(t, failures[0].Err, cause)
-	assert.Equal(t, 0, sshCalls)
 	preserved, getErr := database.GetSession(t.Context(), "preserved")
 	require.NoError(t, getErr)
 	assert.NotNil(t, preserved, "failed contributor must not swap")
@@ -473,7 +352,7 @@ func TestDoSyncUnknownCoordinatorFailureRemainsLocalError(t *testing.T) {
 	cause := errors.New("temporary database unavailable")
 	originalPrepare := prepareHTTPRebuildCLI
 	prepareHTTPRebuildCLI = func(
-		context.Context, []remotesync.HTTPSync,
+		context.Context, []remotesync.RemoteSync,
 	) (preparedHTTPRebuildCLI, error) {
 		return nil, cause
 	}
@@ -769,7 +648,7 @@ func TestDoSyncConfiguredFullUnifiedHTTPUsesManifestDeltaAndOrderedProgress(
 		previous = position
 	}
 	assert.Contains(t, progressOutput,
-		"Swapping rebuilt database into place completed in")
+		"Swapping rebuilt database into place: 1ms elapsed")
 
 	_, failures, err = runConfiguredLocalAndRemotes(
 		t.Context(), cfg, database, []config.RemoteHost{host},
@@ -790,14 +669,14 @@ func TestDoSyncIncrementalKeepsOrdinaryRemotePath(t *testing.T) {
 	prepareCalls := 0
 	originalPrepare := prepareHTTPRebuildCLI
 	prepareHTTPRebuildCLI = func(
-		context.Context, []remotesync.HTTPSync,
+		context.Context, []remotesync.RemoteSync,
 	) (preparedHTTPRebuildCLI, error) {
 		prepareCalls++
 		return &fakeCLIPreparedHTTPRebuild{}, nil
 	}
 	t.Cleanup(func() { prepareHTTPRebuildCLI = originalPrepare })
 	activeCalls := 0
-	restore := stubHTTPRemoteSyncForTest(t, func(
+	restore := stubRemoteHostSyncForTest(t, func(
 		_ context.Context, got config.RemoteHost, full bool,
 	) (remotesync.SyncStats, error) {
 		activeCalls++
@@ -824,7 +703,7 @@ func TestDoSyncIncrementalReportsSkippedOfflineHTTPHost(t *testing.T) {
 		Host: "offline", Transport: config.RemoteTransportHTTP,
 		URL: "http://offline.invalid", Token: "token",
 	}
-	restore := stubHTTPRemoteSyncForTest(t, func(
+	restore := stubRemoteHostSyncForTest(t, func(
 		context.Context, config.RemoteHost, bool,
 	) (remotesync.SyncStats, error) {
 		return remotesync.SyncStats{}, syscall.ETIMEDOUT
@@ -860,7 +739,7 @@ token = "remote-token"
 	))
 	originalPrepare := prepareHTTPRebuildCLI
 	prepareHTTPRebuildCLI = func(
-		context.Context, []remotesync.HTTPSync,
+		context.Context, []remotesync.RemoteSync,
 	) (preparedHTTPRebuildCLI, error) {
 		return nil, &remotesync.HostError{
 			Host: "http-box", Operation: "prepare", Err: errors.New("offline"),
@@ -896,7 +775,7 @@ token = "remote-token"
 	}}
 	originalPrepare := prepareHTTPRebuildCLI
 	prepareHTTPRebuildCLI = func(
-		context.Context, []remotesync.HTTPSync,
+		context.Context, []remotesync.RemoteSync,
 	) (preparedHTTPRebuildCLI, error) {
 		return prepared, nil
 	}
@@ -960,45 +839,106 @@ token = "remote-token"
 	os.Exit(0)
 }
 
+func TestDoSyncUnknownHostFailsBeforeDaemonStartup(t *testing.T) {
+	if os.Getenv("AGENTSVIEW_UNKNOWN_HOST_HELPER") == "1" {
+		newSyncCLIEnv(t)
+		t.Setenv("AGENTSVIEW_NO_DAEMON", "")
+		stubStartBackgroundServeForTransport(t, func(
+			context.Context, *config.Config, time.Duration, bool,
+		) (*DaemonRuntime, error) {
+			return nil, errors.New("unexpected daemon startup")
+		})
+		doSync(SyncConfig{Host: "missing"})
+		return
+	}
+	cmd := exec.CommandContext(t.Context(), os.Args[0],
+		"-test.run=^TestDoSyncUnknownHostFailsBeforeDaemonStartup$")
+	cmd.Env = append(os.Environ(), "AGENTSVIEW_UNKNOWN_HOST_HELPER=1")
+	out, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	require.ErrorAs(t, err, &exitErr)
+	assert.Equal(t, 1, exitErr.ExitCode())
+	assert.Contains(t, string(out), `unknown remote host "missing"`)
+	assert.Contains(t, string(out), "add an entry in [[remote_hosts]]")
+}
+
 func TestDoSyncSingleHostFullStaysOnActiveArchivePath(t *testing.T) {
-	newSyncCLIEnv(t)
+	env := newSyncCLIEnv(t)
+	require.NoError(t, os.WriteFile(filepath.Join(env.DataDir, "config.toml"), []byte(`[[remote_hosts]]
+host = "other-box"
+url = "https://other.example.test"
+token = "other-token"
+[[remote_hosts]]
+host = "one-box"
+url = "https://one.example.test"
+token = "remote-token"
+`), 0o600))
 	t.Setenv("AGENTSVIEW_NO_DAEMON", "1")
 	prepareCalls := 0
 	originalPrepare := prepareHTTPRebuildCLI
 	prepareHTTPRebuildCLI = func(
-		context.Context, []remotesync.HTTPSync,
+		context.Context, []remotesync.RemoteSync,
 	) (preparedHTTPRebuildCLI, error) {
 		prepareCalls++
 		return nil, nil
 	}
 	t.Cleanup(func() { prepareHTTPRebuildCLI = originalPrepare })
-	sshCalls := 0
-	originalSSH := runSSHRemoteSync
-	runSSHRemoteSync = func(
+	httpCalls := 0
+	originalHTTP := runRemoteHostSync
+	runRemoteHostSync = func(
 		_ context.Context, _ config.Config, _ *db.DB,
 		rh config.RemoteHost, full bool,
 	) (remotesync.SyncStats, error) {
-		sshCalls++
-		assert.Equal(t, "one-box", rh.Host)
+		httpCalls++
+		assert.Equal(t, config.RemoteHost{Host: "one-box", URL: "https://one.example.test", Token: "remote-token"}, rh)
 		assert.True(t, full)
 		return remotesync.SyncStats{}, nil
 	}
-	t.Cleanup(func() { runSSHRemoteSync = originalSSH })
+	t.Cleanup(func() { runRemoteHostSync = originalHTTP })
 
 	hadRemoteFailures := doSync(SyncConfig{Host: "one-box", Full: true})
 
 	assert.False(t, hadRemoteFailures)
 	assert.Equal(t, 0, prepareCalls)
-	assert.Equal(t, 1, sshCalls)
+	assert.Equal(t, 1, httpCalls)
+}
+
+func TestDoSyncSingleHTTPHostFailureReportsErrorAndReleasesArchive(t *testing.T) {
+	env := newSyncCLIEnv(t)
+	t.Setenv("AGENTSVIEW_NO_DAEMON", "1")
+	requests := 0
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		assert.Equal(t, "Bearer remote-token", r.Header.Get("Authorization"))
+		remotesync.SetProtocolHeader(w.Header())
+		http.Error(w, "remote-token rejected", http.StatusUnauthorized)
+	}))
+	t.Cleanup(remote.Close)
+	require.NoError(t, os.WriteFile(filepath.Join(env.DataDir, "config.toml"), []byte(fmt.Sprintf(`[[remote_hosts]]
+host = "devbox"
+url = %q
+token = "remote-token"
+`, remote.URL)), 0o600))
+
+	var failed bool
+	stderr := captureStderr(t, func() {
+		failed = doSync(SyncConfig{Host: "devbox"})
+	})
+
+	assert.True(t, failed)
+	assert.Equal(t, 1, requests)
+	assert.Contains(t, stderr, "devbox: HTTP remote sync failed: remote daemon rejected the sync token (401 Unauthorized)")
+	assert.NotContains(t, stderr, "remote-token")
+	requireWriteOwnerLockReleased(t, env.DataDir, "failed direct sync must release the archive")
 }
 
 func TestRunRemoteHosts_AttemptsAllAndCollectsFailures(t *testing.T) {
 	hosts := []config.RemoteHost{
 		{Host: "alpha"},
-		{Host: "beta", User: "u", Port: 2222},
+		{Host: "beta", URL: "https://beta.example.test", Token: "token"},
 		{Host: "gamma"},
 	}
-	failBeta := errors.New("ssh down")
+	failBeta := errors.New("remote import failed")
 
 	var attempted []config.RemoteHost
 	failures, blocked := runRemoteHosts(hosts, true, nil, func(rh config.RemoteHost, full bool) error {
@@ -1013,7 +953,7 @@ func TestRunRemoteHosts_AttemptsAllAndCollectsFailures(t *testing.T) {
 
 	// Every host attempted, in declared order, even after a failure.
 	require.Equal(t, hosts, attempted)
-	// Only beta failed; its full RemoteHost (user/port) is preserved.
+	// Only beta failed; its full remote configuration is preserved.
 	require.Len(t, failures, 1)
 	assert.Equal(t, hosts[1], failures[0].Host)
 	assert.Equal(t, failBeta, failures[0].Err)
@@ -1066,7 +1006,7 @@ func TestRunRemoteHostsSkipsOfflineConfiguredHTTPHost(t *testing.T) {
 
 func TestRunRemoteSyncOnceDispatchesHTTP(t *testing.T) {
 	var called config.RemoteHost
-	restore := stubHTTPRemoteSyncForTest(t, func(
+	restore := stubRemoteHostSyncForTest(t, func(
 		_ context.Context,
 		rh config.RemoteHost,
 		full bool,
@@ -1086,14 +1026,73 @@ func TestRunRemoteSyncOnceDispatchesHTTP(t *testing.T) {
 	assert.Equal(t, "http://devbox:8080", called.URL)
 }
 
-func TestRunHTTPRemoteSyncRequiresExplicitHTTPToken(t *testing.T) {
+func TestDoSyncSingleSSHHostReachesRemoteHostSync(t *testing.T) {
+	env := newSyncCLIEnv(t)
+	require.NoError(t, os.WriteFile(filepath.Join(env.DataDir, "config.toml"), []byte(`[[remote_hosts]]
+host = "ssh-box"
+transport = "ssh"
+destination = "user@ssh-box.example.test"
+`), 0o600))
+	t.Setenv("AGENTSVIEW_NO_DAEMON", "1")
+	var got []config.RemoteHost
+	restore := stubRemoteHostSyncForTest(t, func(
+		_ context.Context, rh config.RemoteHost, _ bool,
+	) (remotesync.SyncStats, error) {
+		got = append(got, rh)
+		return remotesync.SyncStats{}, nil
+	})
+	defer restore()
+
+	hadRemoteFailures := doSync(SyncConfig{Host: "ssh-box"})
+
+	assert.False(t, hadRemoteFailures)
+	assert.Equal(t, []config.RemoteHost{{
+		Host:        "ssh-box",
+		Transport:   config.RemoteTransportSSH,
+		Destination: "user@ssh-box.example.test",
+	}}, got)
+}
+
+func TestRunRemoteSyncTransportRejectsUnknownTransportBeforeSync(t *testing.T) {
+	_, err := runRemoteSyncTransport(
+		t.Context(), config.Config{DataDir: t.TempDir()}, nil,
+		config.RemoteHost{Host: "devbox", Transport: "sftp"}, false,
+	)
+
+	require.EqualError(t, err, `invalid remote transport "sftp"; use http or ssh`)
+}
+
+func TestPrepareConfiguredRemoteHostsBuildsSSHSourceWithoutToken(t *testing.T) {
+	var prepared []remotesync.RemoteSync
+	originalPrepare := prepareHTTPRebuildCLI
+	prepareHTTPRebuildCLI = func(
+		_ context.Context, syncs []remotesync.RemoteSync,
+	) (preparedHTTPRebuildCLI, error) {
+		prepared = syncs
+		return nil, nil
+	}
+	t.Cleanup(func() { prepareHTTPRebuildCLI = originalPrepare })
+
+	_, err := prepareConfiguredRemoteHosts(
+		t.Context(), config.Config{DataDir: t.TempDir()}, nil,
+		[]config.RemoteHost{{Host: "ssh-box", Transport: config.RemoteTransportSSH}},
+		remotesync.FullImportExplicit, nil,
+	)
+
+	require.NoError(t, err)
+	require.Len(t, prepared, 1)
+	assert.Equal(t, "ssh-box", prepared[0].Host)
+	assert.IsType(t, &sshremote.Source{}, prepared[0].Source)
+}
+
+func TestRunRemoteHostSyncHTTPRequiresExplicitHTTPToken(t *testing.T) {
 	called := false
 	ts := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		called = true
 	}))
 	t.Cleanup(ts.Close)
 
-	_, err := runHTTPRemoteSync(
+	_, err := runRemoteHostSync(
 		t.Context(),
 		config.Config{AuthToken: "collector-token"},
 		nil,
@@ -1110,13 +1109,13 @@ func TestRunHTTPRemoteSyncRequiresExplicitHTTPToken(t *testing.T) {
 	assert.False(t, called, "collector auth_token must not be sent to remote")
 }
 
-func stubHTTPRemoteSyncForTest(
+func stubRemoteHostSyncForTest(
 	t *testing.T,
 	fn func(context.Context, config.RemoteHost, bool) (remotesync.SyncStats, error),
 ) func() {
 	t.Helper()
-	orig := runHTTPRemoteSync
-	runHTTPRemoteSync = func(
+	orig := runRemoteHostSync
+	runRemoteHostSync = func(
 		ctx context.Context,
 		_ config.Config,
 		_ *db.DB,
@@ -1125,7 +1124,7 @@ func stubHTTPRemoteSyncForTest(
 	) (remotesync.SyncStats, error) {
 		return fn(ctx, rh, full)
 	}
-	return func() { runHTTPRemoteSync = orig }
+	return func() { runRemoteHostSync = orig }
 }
 
 func TestRunRemoteSyncTransportRetainsFailedHTTPCleanupUntilReleased(t *testing.T) {
@@ -1141,7 +1140,7 @@ func TestRunRemoteSyncTransportRetainsFailedHTTPCleanupUntilReleased(t *testing.
 		},
 	}
 	runs := 0
-	restore := stubHTTPRemoteSyncForTest(t, func(
+	restore := stubRemoteHostSyncForTest(t, func(
 		context.Context, config.RemoteHost, bool,
 	) (remotesync.SyncStats, error) {
 		runs++
@@ -1186,7 +1185,7 @@ func TestRunRemoteHostsStopsOnPendingHTTPCleanupWithoutMisattribution(t *testing
 		},
 	}
 	var callbacks []string
-	restore := stubHTTPRemoteSyncForTest(t, func(
+	restore := stubRemoteHostSyncForTest(t, func(
 		_ context.Context, rh config.RemoteHost, _ bool,
 	) (remotesync.SyncStats, error) {
 		callbacks = append(callbacks, rh.Host)
@@ -1481,7 +1480,8 @@ func TestRemoteProgressPrinterStaysLineOrientedOnNonTerminalFile(t *testing.T) {
 	assert.Contains(t, out, "Processing sessions...")
 	assert.Contains(t, out, "Synced 2 sessions")
 	assert.Contains(t, out, "Skipped offline host")
-	assert.Contains(t, out, "Processing sessions completed in")
+	assert.Contains(t, out, "Processing sessions:")
+	assert.Contains(t, out, " elapsed\n")
 }
 
 func TestIsTerminalWriterClassifiesDestinations(t *testing.T) {
@@ -1548,8 +1548,44 @@ func TestNonTerminalProgressOutputIsBounded(t *testing.T) {
 	assert.NotContains(t, out.String(), "\r")
 	assert.NotContains(t, out.String(), "\x1b[K")
 	assert.Equal(t, 1, strings.Count(out.String(), "Processing sessions..."))
-	assert.Equal(t, 1, strings.Count(out.String(), "Processing sessions completed in"))
+	assert.Equal(t, 1, strings.Count(out.String(), "Processing sessions: 0s elapsed"))
 	assert.NotContains(t, out.String(), "after finish")
+}
+
+func TestResyncProgressPrinterShowsRepairCounts(t *testing.T) {
+	for _, terminal := range []bool{false, true} {
+		t.Run(fmt.Sprintf("terminal=%t", terminal), func(t *testing.T) {
+			var out bytes.Buffer
+			now := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)
+			printer := newResyncProgressPrinter(&out, func() time.Time { return now })
+			printer.terminal = terminal
+			p := agentsync.Progress{
+				Phase: agentsync.PhaseFinalizing, Resync: true,
+				Detail: "Finalizing sync: repairing subagent relationships",
+			}
+			printer.Print(p)
+			p.SessionsTotal = 1000
+			printer.Print(p)
+			p.SessionsDone = 250
+			printer.Print(p)
+			now = now.Add(5 * time.Second)
+			p.SessionsDone = 500
+			printer.Print(p)
+			assert.Equal(t, "Finalizing sync: repairing subagent relationships: 500/1000 sessions checked (50%)", startupProgressDetail(p))
+			p.SessionsDone = 1000
+			printer.Print(p)
+			printer.Finish()
+			assert.Contains(t, out.String(), "0/1000 sessions checked (0%)")
+			assert.Contains(t, out.String(), "500/1000 sessions checked (50%)")
+			assert.Contains(t, out.String(), "1000/1000 sessions checked (100%)")
+			assert.NotContains(t, out.String(), "messages")
+			assert.Equal(t, 1, strings.Count(out.String(), "completed in"))
+			if !terminal {
+				assert.NotContains(t, out.String(), "250/1000")
+				assert.NotContains(t, out.String(), "\r")
+			}
+		})
+	}
 }
 
 func TestResyncProgressPrinterWritesPhaseTimingsOnNewLines(t *testing.T) {
@@ -1691,11 +1727,11 @@ func TestRemoteProgressPrinterWritesTimedStepLines(t *testing.T) {
 
 	got := out.String()
 	assert.Contains(t, got, "  Resolving agent directories on devbox...\n")
-	assert.Contains(t, got, "  Resolving agent directories on devbox completed in 150ms\n")
+	assert.Contains(t, got, "  Resolving agent directories on devbox: 150ms elapsed\n")
 	assert.Contains(t, got, "  Downloading session data from devbox (3 agents)...\n")
-	assert.Contains(t, got, "  Downloading session data from devbox (3 agents) completed in 2s\n")
+	assert.Contains(t, got, "  Downloading session data from devbox (3 agents): 2s elapsed\n")
 	assert.Contains(t, got, "\r  Processing sessions from devbox: 10/10 sessions (100%) · 100 messages\x1b[K")
-	assert.Contains(t, got, "\n  Processing sessions from devbox completed in 3.35s\n")
+	assert.Contains(t, got, "\n  Processing sessions from devbox: 3.35s elapsed\n")
 	assert.Contains(t, got, "  Synced 10 sessions from devbox (1 unchanged)\n")
 	assert.Contains(t, got, "  Skipped offline remote host laptop\n")
 	assert.NotContains(t, got, "Skipped offline remote host laptop completed")
@@ -1732,10 +1768,10 @@ func TestRemoteProgressPrinterRendersByteProgressInPlace(t *testing.T) {
 	assert.Contains(t, got,
 		"\r  Downloading session archive from devbox: 4.0 MB/4.0 MB (100%)\x1b[K")
 	assert.Contains(t, got,
-		"\n  Downloading session archive from devbox completed in 150ms\n")
+		"\n  Downloading session archive from devbox: 150ms elapsed\n")
 	assert.Contains(t, got, "  Extracting session archive from devbox...\n")
 	assert.Contains(t, got,
-		"  Extracting session archive from devbox completed in 850ms\n")
+		"  Extracting session archive from devbox: 850ms elapsed\n")
 }
 
 func TestRemoteProgressPrinterRendersLocalSyncProgressWithoutDetail(t *testing.T) {
@@ -1765,7 +1801,7 @@ func TestRemoteProgressPrinterRendersLocalSyncProgressWithoutDetail(t *testing.T
 	got := out.String()
 	assert.Contains(t, got, "\r  Syncing local sessions: 4/10 sessions (40%) · 40 messages\x1b[K")
 	assert.Contains(t, got, "\r  Syncing local sessions: 10/10 sessions (100%) · 100 messages\x1b[K")
-	assert.Contains(t, got, "\n  Syncing local sessions completed in 250ms\n")
+	assert.Contains(t, got, "\n  Syncing local sessions: 250ms elapsed\n")
 	assert.Contains(t, got, "  Resolving agent directories on devbox...\n")
 }
 
@@ -1796,7 +1832,7 @@ func TestRemoteProgressPrinterKeepsResyncLabelOnDoneProgress(t *testing.T) {
 	got := out.String()
 	assert.Contains(t, got, "\r  Syncing sessions into rebuilt database: 10/10 sessions (100%) · 100 messages\x1b[K")
 	assert.NotContains(t, got, "\r  Syncing local sessions: 10/10 sessions (100%) · 100 messages\x1b[K")
-	assert.Contains(t, got, "\n  Syncing sessions into rebuilt database completed in 250ms\n")
+	assert.Contains(t, got, "\n  Syncing sessions into rebuilt database: 250ms elapsed\n")
 }
 
 func TestRunLocalSyncUsesCallerContextForResync(t *testing.T) {
@@ -1908,7 +1944,7 @@ func TestDoSyncPrintsStatusBeforeWaitingForDaemonStartup(t *testing.T) {
 		}
 	})
 	stubStartBackgroundServeForTransport(t, func(
-		context.Context, *config.Config, time.Duration,
+		context.Context, *config.Config, time.Duration, bool,
 	) (*DaemonRuntime, error) {
 		close(startupEntered)
 		<-releaseStartup
@@ -1953,7 +1989,7 @@ func TestDoSyncFullSkipsRedundantDaemonInitialSync(t *testing.T) {
 	endpoint := serverEndpoint(t, ts)
 	var skipInitialSync bool
 	stubStartBackgroundServeForTransport(t, func(
-		_ context.Context, cfg *config.Config, _ time.Duration,
+		_ context.Context, cfg *config.Config, _ time.Duration, _ bool,
 	) (*DaemonRuntime, error) {
 		skipInitialSync = cfg.SkipInitialSync
 		return &DaemonRuntime{Host: endpoint.Host, Port: endpoint.Port}, nil
@@ -1977,7 +2013,7 @@ func TestDoSyncSkipsRedundantDaemonInitialSync(t *testing.T) {
 	endpoint := serverEndpoint(t, ts)
 	var skipInitialSync bool
 	stubStartBackgroundServeForTransport(t, func(
-		_ context.Context, cfg *config.Config, _ time.Duration,
+		_ context.Context, cfg *config.Config, _ time.Duration, _ bool,
 	) (*DaemonRuntime, error) {
 		skipInitialSync = cfg.SkipInitialSync
 		return &DaemonRuntime{Host: endpoint.Host, Port: endpoint.Port}, nil
@@ -1992,12 +2028,21 @@ func TestDoSyncSkipsRedundantDaemonInitialSync(t *testing.T) {
 
 func TestDoSyncRemoteHostKeepsDaemonInitialLocalSync(t *testing.T) {
 	env := newSyncCLIEnv(t)
+	require.NoError(t, os.WriteFile(filepath.Join(env.DataDir, "config.toml"), []byte(`[[remote_hosts]]
+host = "other-box"
+url = "https://other.example.test"
+token = "other-token"
+[[remote_hosts]]
+host = "host-a.example"
+url = "https://peer.example.test"
+token = "remote-token"
+`), 0o600))
 	got, handler := captureRemoteSyncRequest(t)
 	ts := remoteSyncRouteTestServer(t, handler)
 	endpoint := serverEndpoint(t, ts)
 	var skipInitialSync bool
 	stubStartBackgroundServeForTransport(t, func(
-		_ context.Context, cfg *config.Config, _ time.Duration,
+		_ context.Context, cfg *config.Config, _ time.Duration, _ bool,
 	) (*DaemonRuntime, error) {
 		skipInitialSync = cfg.SkipInitialSync
 		return &DaemonRuntime{Host: endpoint.Host, Port: endpoint.Port}, nil
@@ -2143,6 +2188,15 @@ func TestRunDaemonSyncDetectsResyncRequired(t *testing.T) {
 
 func TestDoSyncRemoteHostUsesDaemonRouteWhenWritableDaemonRunning(t *testing.T) {
 	env := newSyncCLIEnv(t)
+	require.NoError(t, os.WriteFile(filepath.Join(env.DataDir, "config.toml"), []byte(`[[remote_hosts]]
+host = "other-box"
+url = "https://other.example.test"
+token = "other-token"
+[[remote_hosts]]
+host = "devbox"
+url = "https://peer.example.test"
+token = "remote-token"
+`), 0o600))
 
 	got, handler := captureRemoteSyncRequest(t)
 	ts := remoteSyncRouteTestServer(t, handler)
@@ -2150,8 +2204,6 @@ func TestDoSyncRemoteHostUsesDaemonRouteWhenWritableDaemonRunning(t *testing.T) 
 
 	hadFailures := doSync(SyncConfig{
 		Host: "devbox",
-		User: "alice",
-		Port: 2222,
 		Full: true,
 	})
 
@@ -2161,14 +2213,22 @@ func TestDoSyncRemoteHostUsesDaemonRouteWhenWritableDaemonRunning(t *testing.T) 
 	require.Len(t, got.Hosts, 1)
 	assert.Equal(t, config.RemoteHost{
 		Host: "devbox",
-		User: "alice",
-		Port: 2222,
+		URL:  "https://peer.example.test",
 	}, got.Hosts[0])
 	env.assertNoLocalDB(t)
 }
 
 func TestDoSyncRemoteHostPrintsDaemonProgress(t *testing.T) {
 	env := newSyncCLIEnv(t)
+	require.NoError(t, os.WriteFile(filepath.Join(env.DataDir, "config.toml"), []byte(`[[remote_hosts]]
+host = "other-box"
+url = "https://other.example.test"
+token = "other-token"
+[[remote_hosts]]
+host = "devbox"
+url = "https://peer.example.test"
+token = "remote-token"
+`), 0o600))
 
 	ts := remoteSyncRouteTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if !assert.Equal(t, "/api/v1/sync/remotes", r.URL.Path) {
@@ -2200,6 +2260,50 @@ func TestDoSyncRemoteHostPrintsDaemonProgress(t *testing.T) {
 	assert.Contains(t, out, "Resolving agent directories on devbox")
 	assert.True(t, strings.HasSuffix(out, "\n"), "progress output should finish on a newline")
 	env.assertNoLocalDB(t)
+}
+
+func TestDoSyncRemoteHostReportsDaemonFailure(t *testing.T) {
+	for _, format := range []string{"json", "sse"} {
+		t.Run(format, func(t *testing.T) {
+			env := newSyncCLIEnv(t)
+			require.NoError(t, os.WriteFile(filepath.Join(env.DataDir, "config.toml"), []byte(`[[remote_hosts]]
+host = "devbox"
+url = "https://peer.example.test"
+token = "remote-token"
+`), 0o600))
+			const failure = `{"failures":[{"host":{"host":"devbox"},"error":"HTTP remote sync failed: cannot resolve the remote host name; check the url in this [[remote_hosts]] entry"}]}`
+			ts := remoteSyncRouteTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "/api/v1/sync/remotes", r.URL.Path)
+				if format == "sse" {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, err := io.WriteString(w, "event: progress\ndata: {\"detail\":\"Resolving agent directories on devbox\"}\n\nevent: done\ndata: "+failure+"\n\n")
+					assert.NoError(t, err)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, err := io.WriteString(w, failure)
+				assert.NoError(t, err)
+			})
+			registerSyncRouteTestRuntime(t, env.DataDir, ts.URL)
+
+			var hadFailures bool
+			var stdout string
+			stderr := captureStderr(t, func() {
+				stdout = captureStdout(t, func() {
+					hadFailures = doSync(SyncConfig{Host: "devbox"})
+				})
+			})
+
+			assert.True(t, hadFailures)
+			assert.Contains(t, stderr, "devbox: HTTP remote sync failed: cannot resolve the remote host name; check the url in this [[remote_hosts]] entry")
+			if format == "sse" {
+				assert.Contains(t, stdout, "Resolving agent directories on devbox:")
+				assert.Contains(t, stdout, " elapsed\n")
+				assert.NotContains(t, stdout, "completed")
+			}
+			env.assertNoLocalDB(t)
+		})
+	}
 }
 
 func TestRunDaemonRemoteSyncTrimsBaseURLTrailingSlash(t *testing.T) {
@@ -2422,7 +2526,8 @@ func TestDoSyncConfiguredRemoteHostsUsesDaemonRouteWithLocalSync(
 		filepath.Join(env.DataDir, "config.toml"),
 		[]byte(`[[remote_hosts]]
 host = "alpha"
-user = "robot"
+url = "https://alpha.example.test"
+token = "remote-token"
 `),
 		0o600,
 	))
@@ -2437,7 +2542,7 @@ user = "robot"
 	assert.True(t, got.IncludeLocal)
 	require.Len(t, got.Hosts, 1)
 	assert.Equal(t, "alpha", got.Hosts[0].Host)
-	assert.Equal(t, "robot", got.Hosts[0].User)
+	assert.Equal(t, "https://alpha.example.test", got.Hosts[0].URL)
 	env.assertNoLocalDB(t)
 }
 
@@ -2601,67 +2706,7 @@ func tsURL(t *testing.T, r *http.Request) string {
 	return "http://" + r.Host
 }
 
-func TestRemoteFailureDisplaySanitizesHTTPErrors(t *testing.T) {
-	tests := []struct {
-		name       string
-		failure    remoteHostFailure
-		want       string
-		wantAbsent []string
-	}{
-		{
-			name: "http status failure uses sanitized summary",
-			failure: remoteHostFailure{
-				Host: config.RemoteHost{
-					Host:      "devbox",
-					Transport: config.RemoteTransportHTTP,
-				},
-				Err: &remotesync.StatusError{
-					Code:   401,
-					Status: "401 Unauthorized",
-					Detail: "bearer secret-token-123 rejected",
-				},
-			},
-			want: "HTTP remote sync failed: remote daemon rejected " +
-				"the sync token (401 Unauthorized); the token for " +
-				"this host in [[remote_hosts]] must match the remote " +
-				"daemon's auth_token",
-			wantAbsent: []string{"secret-token-123"},
-		},
-		{
-			name: "http transport collapses unknown raw errors",
-			failure: remoteHostFailure{
-				Host: config.RemoteHost{
-					Host:      "devbox",
-					Transport: config.RemoteTransportHTTP,
-				},
-				Err: errors.New(
-					`Get "http://devbox.tailnet.ts.net:8080": token=abc rejected`,
-				),
-			},
-			want:       "HTTP remote sync failed",
-			wantAbsent: []string{"tailnet.ts.net", "token=abc"},
-		},
-		{
-			name: "ssh transport keeps the raw error",
-			failure: remoteHostFailure{
-				Host: config.RemoteHost{Host: "buildbox"},
-				Err:  errors.New("ssh: permission denied"),
-			},
-			want: "ssh: permission denied",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := remoteFailureDisplay(tt.failure)
-			assert.Equal(t, tt.want, got)
-			for _, absent := range tt.wantAbsent {
-				assert.NotContains(t, got, absent)
-			}
-		})
-	}
-}
-
-func TestRunHTTPRemoteSyncReachesMirrorPath(t *testing.T) {
+func TestRunRemoteSyncWithOmittedTransportReachesHTTPMirrorPath(t *testing.T) {
 	manifestRequests := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		remotesync.SetProtocolHeader(w.Header())
@@ -2680,15 +2725,14 @@ func TestRunHTTPRemoteSyncReachesMirrorPath(t *testing.T) {
 	t.Cleanup(ts.Close)
 	database := dbtest.OpenTestDB(t)
 
-	_, err := runHTTPRemoteSync(
+	_, err := runRemoteSyncTransport(
 		t.Context(),
 		config.Config{DataDir: t.TempDir()},
 		database,
 		config.RemoteHost{
-			Host:      "devbox",
-			Transport: config.RemoteTransportHTTP,
-			URL:       ts.URL,
-			Token:     "remote-token",
+			Host:  "devbox",
+			URL:   ts.URL,
+			Token: "remote-token",
 		},
 		false,
 	)

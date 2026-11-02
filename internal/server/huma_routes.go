@@ -104,11 +104,17 @@ func configureHuma() {
 			}
 		}
 		huma.NewErrorWithContext = func(
-			_ huma.Context,
+			ctx huma.Context,
 			status int,
 			message string,
 			errs ...error,
 		) huma.StatusError {
+			for _, err := range errs {
+				if errors.Is(err, db.ErrWriterClosed) {
+					server, ok := ctx.Context().Value(ctxKeyHumaServer).(*Server)
+					return writerClosedResponse(ctx.AppendHeader, ok && server.archiveStale())
+				}
+			}
 			return huma.NewError(status, message, errs...)
 		}
 	})
@@ -172,21 +178,25 @@ func optionalBoolValue(p optionalBoolParam) *bool {
 	return &p.Value
 }
 
-const ctxKeyHumaRequestInfo contextKey = 100
+const (
+	ctxKeyHumaRequestInfo contextKey = 100
+	ctxKeyHumaServer      contextKey = 101
+)
 
-func humaRequestInfoMiddleware(ctx huma.Context, next func(huma.Context)) {
+func (s *Server) humaRequestInfoMiddleware(ctx huma.Context, next func(huma.Context)) {
 	info := requestInfo{
 		RemoteAddr: ctx.RemoteAddr(),
 		Forwarded: ctx.Header("X-Forwarded-For") != "" ||
 			ctx.Header("X-Real-IP") != "" ||
 			ctx.Header("Forwarded") != "",
 	}
+	ctx = huma.WithValue(ctx, ctxKeyHumaServer, s)
 	next(huma.WithValue(ctx, ctxKeyHumaRequestInfo, info))
 }
 
 func isLocalhostContext(ctx context.Context) bool {
 	info, _ := ctx.Value(ctxKeyHumaRequestInfo).(requestInfo)
-	if info.Forwarded {
+	if restrictedIngress(ctx) || info.Forwarded {
 		return false
 	}
 	host, _, err := net.SplitHostPort(info.RemoteAddr)
@@ -492,21 +502,29 @@ func handleHumaReadOnly(err error) error {
 		return apiError(http.StatusNotImplemented, "not available in remote mode")
 	}
 	if errors.Is(err, db.ErrWriterClosed) {
-		return writerClosedError()
+		return err
 	}
 	return nil
 }
 
 // writerClosedError is the 503 + Retry-After response for a write rejected while
 // the archive writer is closed for a maintenance pass.
-func writerClosedError() error {
-	return huma.ErrorWithHeaders(
-		apiError(
-			http.StatusServiceUnavailable,
-			"archive is briefly read-only for a maintenance pass; retry shortly",
-		),
-		http.Header{"Retry-After": []string{writerClosedRetryAfterSeconds}},
-	)
+func writerClosedError(stale bool) error {
+	headers := http.Header{}
+	response := writerClosedResponse(headers.Add, stale)
+	return huma.ErrorWithHeaders(response, headers)
+}
+
+func writerClosedResponse(appendHeader func(string, string), stale bool) *apiResponseError {
+	appendHeader("Retry-After", writerClosedRetryAfterSeconds)
+	message := "archive is briefly read-only for a maintenance pass; retry shortly"
+	if stale {
+		message = "archive is read-only while it rebuilds"
+	}
+	return &apiResponseError{
+		Status:  http.StatusServiceUnavailable,
+		Message: message,
+	}
 }
 
 // rejectWriterClosedWrite fails a write endpoint before its stream body opens
@@ -515,17 +533,17 @@ func writerClosedError() error {
 // 500 (mirrors the push handlers' pre-stream gate).
 func (s *Server) rejectWriterClosedWrite() error {
 	if local, ok := s.db.(*db.DB); ok && local.WriterClosed() {
-		return writerClosedError()
+		return writerClosedError(s.archiveStale())
 	}
 	return nil
 }
 
-// serializeArchiveWrite runs work under the daemon engine's exclusive lock —
+// SerializeArchiveWrite runs work under the daemon engine's exclusive lock —
 // the same mutex a worker pass holds while the writer is closed — so a write
 // that passed the pre-stream writer gate cannot race a maintenance pass
 // closing the writer mid-operation. Local servers without a daemon engine
 // share the on-demand sync engine's lock.
-func (s *Server) serializeArchiveWrite(ctx context.Context, work func() error) error {
+func (s *Server) SerializeArchiveWrite(ctx context.Context, work func() error) error {
 	if s.engine != nil {
 		return s.engine.RunExclusive(work)
 	}
@@ -538,7 +556,7 @@ func (s *Server) serializeArchiveWrite(ctx context.Context, work func() error) e
 // tryArchiveWrite runs user-triggered archive maintenance under the daemon
 // engine's exclusive lock without waiting for it, which is the barrier
 // newForegroundCompactRunner puts compaction behind. Background work keeps
-// serializeArchiveWrite so scheduled obligations are not lost. Local servers
+// SerializeArchiveWrite so scheduled obligations are not lost. Local servers
 // without a daemon engine share the on-demand sync engine's lock.
 func (s *Server) tryArchiveWrite(ctx context.Context, work func() error) error {
 	if s.engine != nil {
@@ -550,7 +568,17 @@ func (s *Server) tryArchiveWrite(ctx context.Context, work func() error) error {
 	return work()
 }
 
+func machineFilterHTTPError(err error) error {
+	if _, ok := errors.AsType[*db.MachineFilterError](err); ok {
+		return apiErrorWithCode(http.StatusBadRequest, "invalid_machine_filter", err.Error())
+	}
+	return nil
+}
+
 func serverError(err error) error {
+	if handled := machineFilterHTTPError(err); handled != nil {
+		return handled
+	}
 	if handled := hostedIdentityHTTPError(err); handled != nil {
 		return handled
 	}
@@ -560,10 +588,16 @@ func serverError(err error) error {
 	if handled := handleHumaContextError(err); handled != nil {
 		return handled
 	}
+	if errors.Is(err, db.ErrWriterClosed) {
+		return err
+	}
 	return apiError(http.StatusInternalServerError, err.Error())
 }
 
 func internalError(logPrefix string, err error) error {
+	if handled := machineFilterHTTPError(err); handled != nil {
+		return handled
+	}
 	if handled := hostedIdentityHTTPError(err); handled != nil {
 		return handled
 	}
@@ -575,6 +609,9 @@ func internalError(logPrefix string, err error) error {
 	}
 	if err != nil {
 		log.Printf("%s: %v", logPrefix, err)
+	}
+	if errors.Is(err, db.ErrWriterClosed) {
+		return err
 	}
 	return apiError(http.StatusInternalServerError, "internal error")
 }

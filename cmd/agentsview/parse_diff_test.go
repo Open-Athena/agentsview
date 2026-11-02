@@ -17,6 +17,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/importer"
 	"go.kenn.io/agentsview/internal/parser"
@@ -79,9 +80,53 @@ func TestGeminiAppsImportDispatchesDirectAndZipSources(t *testing.T) {
 	assert.Empty(t, formatImportFailureSummary(importer.ImportStats{}))
 }
 
-// isolateParseDiffEnv points the data dir, HOME, and every per-agent
-// directory override at empty temp dirs so end-to-end runs never
-// discover the developer machine's real session files.
+// claudeAIExportFile writes a one-conversation Claude.ai export with n messages.
+func claudeAIExportFile(t *testing.T, n int) string {
+	t.Helper()
+	msgs := make([]string, n)
+	for i := range msgs {
+		msgs[i] = fmt.Sprintf(`{"uuid":"m%d","text":"turn %d","sender":"human","content":[{"type":"text","text":"turn %d"}],"created_at":"2026-03-01T10:0%d:00.000000Z"}`, i, i, i, i)
+	}
+	path := filepath.Join(t.TempDir(), "conversations.json")
+	require.NoError(t, os.WriteFile(path, []byte(`[{"uuid":"replace-001","name":"Replace",`+
+		`"created_at":"2026-03-01T10:00:00.000000Z","updated_at":"2026-03-01T10:05:00.000000Z",`+
+		`"chat_messages":[`+strings.Join(msgs, ",")+`]}]`), 0o644))
+	return path
+}
+
+func TestImportSessionsReplace(t *testing.T) {
+	testDataDir(t)
+	require.NoError(t, importSessions(ImportConfig{Type: "claude-ai", Path: claudeAIExportFile(t, 2)}))
+	require.NoError(t, importSessions(ImportConfig{
+		Type: "claude-ai", Path: claudeAIExportFile(t, 1), Replace: []string{"claude-ai:replace-001"},
+	}))
+
+	cfg, err := config.LoadMinimal()
+	require.NoError(t, err)
+	database, err := openDB(t.Context(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	msgs, err := database.GetAllMessages(t.Context(), "claude-ai:replace-001")
+	require.NoError(t, err)
+	assert.Len(t, msgs, 1)
+	trashed, err := database.ListTrashedSessions(t.Context())
+	require.NoError(t, err)
+	require.Len(t, trashed, 1)
+	assert.True(t, strings.HasPrefix(trashed[0].ID, "claude-ai:replace-001:replaced:"), trashed[0].ID)
+}
+
+func TestImportSessionsRejectsReplaceForGeminiApps(t *testing.T) {
+	dataDir := testDataDir(t)
+	err := importSessions(ImportConfig{
+		Type: "gemini-apps", Path: filepath.Join(t.TempDir(), "missing.html"),
+		Replace: []string{"x"},
+	})
+	require.ErrorContains(t, err, "--replace is not supported for gemini-apps imports")
+	entries, err := os.ReadDir(dataDir)
+	require.NoError(t, err)
+	assert.Empty(t, entries, "the rejection must not create a database")
+}
+
 func isolateParseDiffEnv(t *testing.T) {
 	t.Helper()
 	testDataDir(t)
@@ -95,18 +140,11 @@ func isolateParseDiffEnv(t *testing.T) {
 	}
 }
 
-func TestParseDiff_RegisteredInRootHelp(t *testing.T) {
-	help, err := executeCommand(newRootCommand(), "--help")
-	require.NoError(t, err, "Execute")
-	assert.Contains(t, help, "parse-diff",
-		"root help should list the parse-diff command")
-}
-
 func TestParseDiff_UnknownAgentListsSupported(t *testing.T) {
 	testDataDir(t)
 
 	_, err := executeCommand(newRootCommand(),
-		"parse-diff", "--agent", "definitely-not-an-agent")
+		"archive", "diff", "--agent", "definitely-not-an-agent")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(),
 		`unknown agent "definitely-not-an-agent"`)
@@ -143,7 +181,7 @@ func TestParseDiff_RejectsAgentsWithoutOnDiskSource(t *testing.T) {
 			testDataDir(t)
 
 			_, err := executeCommand(newRootCommand(),
-				"parse-diff", "--agent", tc.agent)
+				"archive", "diff", "--agent", tc.agent)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), fmt.Sprintf(
 				"agent %q is not supported by parse-diff", tc.agent))
@@ -155,7 +193,7 @@ func TestParseDiff_RejectsNegativeLimit(t *testing.T) {
 	testDataDir(t)
 
 	_, err := executeCommand(newRootCommand(),
-		"parse-diff", "--limit", "-1")
+		"archive", "diff", "--limit", "-1")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "--limit must be >= 0")
 }
@@ -286,7 +324,7 @@ func TestParseDiffSupportedAgentsIncludesProviderAuthoritativeAgents(t *testing.
 func TestParseDiff_EmptyArchiveRunsClean(t *testing.T) {
 	isolateParseDiffEnv(t)
 
-	out, err := executeCommand(newRootCommand(), "parse-diff")
+	out, err := executeCommand(newRootCommand(), "archive", "diff")
 	require.NoError(t, err)
 	assert.Contains(t, out, "Parse diff: 0 files re-parsed (all agents)")
 	assert.Contains(t, out, "Summary")
@@ -299,7 +337,7 @@ func TestParseDiff_EmptyArchiveRunsClean(t *testing.T) {
 func TestParseDiff_JSONShape(t *testing.T) {
 	isolateParseDiffEnv(t)
 
-	out, err := executeCommand(newRootCommand(), "parse-diff", "--json")
+	out, err := executeCommand(newRootCommand(), "archive", "diff", "--json")
 	require.NoError(t, err)
 
 	var got map[string]any
@@ -904,7 +942,7 @@ func TestRenderParseDiffReport_PendingResyncVerbose(t *testing.T) {
 func TestParseDiff_JSONSessionsAndDBPath(t *testing.T) {
 	isolateParseDiffEnv(t)
 
-	out, err := executeCommand(newRootCommand(), "parse-diff", "--json")
+	out, err := executeCommand(newRootCommand(), "archive", "diff", "--json")
 	require.NoError(t, err)
 
 	var got map[string]jsontext.Value

@@ -23,165 +23,24 @@ type pricingLoad struct {
 	err     error
 }
 
-func fallbackPricingRows() []db.ModelPricing {
-	src := pricing.FallbackPricing()
-	out := make([]db.ModelPricing, len(src))
-	for i, p := range src {
-		bands := make([]db.PricingBand, len(p.Bands))
-		for j, band := range p.Bands {
-			bands[j] = db.PricingBand{
-				AboveInputTokens:       band.AboveInputTokens,
-				InputPerMTok:           band.InputPerMTok,
-				OutputPerMTok:          band.OutputPerMTok,
-				CacheCreationPerMTok:   band.CacheCreationPerMTok,
-				CacheCreation1hPerMTok: band.CacheCreation1hPerMTok,
-				CacheReadPerMTok:       band.CacheReadPerMTok,
-			}
-		}
-		out[i] = db.ModelPricing{
-			ModelPattern:           p.ModelPattern,
-			InputPerMTok:           p.InputPerMTok,
-			OutputPerMTok:          p.OutputPerMTok,
-			CacheCreationPerMTok:   p.CacheCreationPerMTok,
-			CacheCreation1hPerMTok: p.CacheCreation1hPerMTok,
-			CacheReadPerMTok:       p.CacheReadPerMTok,
-			Bands:                  bands,
-		}
-	}
-	return out
+// A borrowed view loads pricing synchronously on its existing connection.
+// It never waits for detached work that could need another pool slot, and
+// neither the transaction nor these immutable rows escape the operation.
+type pricingSnapshot struct {
+	loaded bool
+	rows   []export.EffectivePricingRow
 }
 
 func pricingRowsToMap(prices []db.ModelPricing) map[string]export.ModelRates {
-	fallback := pgFallbackRateMap()
+	fallback := db.FallbackRateMap()
 	out := make(map[string]export.ModelRates, len(prices))
 	for _, p := range prices {
 		if strings.HasPrefix(p.ModelPattern, "_") {
 			continue
 		}
-		rates := pgModelPricingRates(p)
-		rates.Source = pgModelPricingSource(p, fallback)
+		rates := db.ModelPricingRates(p)
+		rates.Source = db.ModelPricingSource(p.ModelPattern, rates, fallback)
 		out[p.ModelPattern] = rates
-	}
-	return out
-}
-
-func pgFallbackRateMap() map[string]export.ModelRates {
-	src := pricing.FallbackPricing()
-	out := make(map[string]export.ModelRates, len(src))
-	for _, p := range src {
-		out[p.ModelPattern] = export.ModelRates{
-			InputPerMTok:        p.InputPerMTok,
-			OutputPerMTok:       p.OutputPerMTok,
-			CacheWritePerMTok:   p.CacheCreationPerMTok,
-			CacheWrite1hPerMTok: p.CacheCreation1hPerMTok,
-			CacheReadPerMTok:    p.CacheReadPerMTok,
-			Source:              export.PricingRowSourceEmbedded,
-			Bands:               pgCatalogPricingBands(p.Bands),
-		}
-	}
-	return out
-}
-
-func pgModelPricingRates(p db.ModelPricing) export.ModelRates {
-	var updatedAt *time.Time
-	if p.UpdatedAt != "" {
-		if parsed, err := time.Parse(time.RFC3339Nano, p.UpdatedAt); err == nil {
-			t := parsed.UTC()
-			updatedAt = &t
-		}
-	}
-	return export.ModelRates{
-		InputPerMTok:        p.InputPerMTok,
-		OutputPerMTok:       p.OutputPerMTok,
-		CacheWritePerMTok:   p.CacheCreationPerMTok,
-		CacheWrite1hPerMTok: p.CacheCreation1hPerMTok,
-		CacheReadPerMTok:    p.CacheReadPerMTok,
-		UpdatedAt:           updatedAt,
-		Bands:               pgStoredPricingBands(p.Bands),
-	}
-}
-
-func pgCatalogPricingBands(bands []pricing.PricingBand) []export.PricingBand {
-	out := make([]export.PricingBand, len(bands))
-	for i, band := range bands {
-		out[i] = export.PricingBand{
-			AboveInputTokens:    band.AboveInputTokens,
-			InputPerMTok:        band.InputPerMTok,
-			OutputPerMTok:       band.OutputPerMTok,
-			CacheWritePerMTok:   band.CacheCreationPerMTok,
-			CacheWrite1hPerMTok: band.CacheCreation1hPerMTok,
-			CacheReadPerMTok:    band.CacheReadPerMTok,
-		}
-	}
-	return out
-}
-
-func pgStoredPricingBands(bands []db.PricingBand) []export.PricingBand {
-	out := make([]export.PricingBand, len(bands))
-	for i, band := range bands {
-		var updatedAt *time.Time
-		if parsed, err := time.Parse(time.RFC3339Nano, band.UpdatedAt); err == nil {
-			t := parsed.UTC()
-			updatedAt = &t
-		}
-		out[i] = export.PricingBand{
-			AboveInputTokens:    band.AboveInputTokens,
-			InputPerMTok:        band.InputPerMTok,
-			OutputPerMTok:       band.OutputPerMTok,
-			CacheWritePerMTok:   band.CacheCreationPerMTok,
-			CacheWrite1hPerMTok: band.CacheCreation1hPerMTok,
-			CacheReadPerMTok:    band.CacheReadPerMTok,
-			UpdatedAt:           updatedAt,
-		}
-	}
-	return out
-}
-
-func pgModelPricingSource(
-	p db.ModelPricing, fallback map[string]export.ModelRates,
-) export.PricingRowSource {
-	if rates, ok := fallback[p.ModelPattern]; ok &&
-		rates.InputPerMTok == p.InputPerMTok &&
-		rates.OutputPerMTok == p.OutputPerMTok &&
-		rates.CacheWritePerMTok == p.CacheCreationPerMTok &&
-		rates.CacheWrite1hPerMTok == p.CacheCreation1hPerMTok &&
-		rates.CacheReadPerMTok == p.CacheReadPerMTok &&
-		pgPricingBandsEqual(rates.Bands, pgStoredPricingBands(p.Bands)) {
-		return export.PricingRowSourceEmbedded
-	}
-	return export.PricingRowSourceFetched
-}
-
-func pgPricingBandsEqual(a, b []export.PricingBand) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i].AboveInputTokens != b[i].AboveInputTokens ||
-			a[i].InputPerMTok != b[i].InputPerMTok ||
-			a[i].OutputPerMTok != b[i].OutputPerMTok ||
-			a[i].CacheWritePerMTok != b[i].CacheWritePerMTok ||
-			a[i].CacheWrite1hPerMTok != b[i].CacheWrite1hPerMTok ||
-			a[i].CacheReadPerMTok != b[i].CacheReadPerMTok {
-			return false
-		}
-	}
-	return true
-}
-
-func fallbackPricingMap() map[string]export.ModelRates {
-	return pricingRowsToMap(fallbackPricingRows())
-}
-
-func pricingMapRows(
-	in map[string]export.ModelRates,
-) []export.EffectivePricingRow {
-	out := make([]export.EffectivePricingRow, 0, len(in))
-	for pattern, rates := range in {
-		out = append(out, export.EffectivePricingRow{
-			ModelPattern: pattern,
-			Rates:        rates,
-		})
 	}
 	return out
 }
@@ -201,17 +60,13 @@ type pgGenAIPricingQuerier interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
-func embeddedPGGenAIPricingDocument() db.GenAIPricingDocument {
-	embedded := pricing.EmbeddedGenAIDocument()
-	return db.GenAIPricingDocument{
-		Version: embedded.Version, SourceRef: embedded.SourceRef,
-		Source: db.GenAIPricingSourceEmbedded, Data: embedded.RawJSON(),
-	}
-}
-
 func loadPGGenAIPricing(
 	ctx context.Context, q pgGenAIPricingQuerier,
 ) (*db.GenAIPricingDocument, error) {
+	return queryPGGenAIPricing(ctx, q, true)
+}
+
+func queryPGGenAIPricing(ctx context.Context, q pgGenAIPricingQuerier, allowMissing bool) (*db.GenAIPricingDocument, error) {
 	var document db.GenAIPricingDocument
 	err := q.QueryRowContext(ctx, `
 		SELECT version, source_ref, source, data_json, updated_at
@@ -219,13 +74,29 @@ func loadPGGenAIPricing(
 		&document.Version, &document.SourceRef, &document.Source,
 		&document.Data, &document.UpdatedAt,
 	)
-	if err == sql.ErrNoRows || isUndefinedTable(err) {
+	if err == sql.ErrNoRows || allowMissing && isUndefinedTable(err) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("reading pg GenAI pricing document: %w", err)
 	}
 	return &document, nil
+}
+
+// Optional-table fallbacks must not issue a failing statement in a transaction:
+// PostgreSQL keeps that transaction aborted even when its error is handled.
+func pricingTablesPresent(ctx context.Context, q pgGenAIPricingQuerier, tables ...string) (bool, error) {
+	pb := &paramBuilder{}
+	checks := make([]string, len(tables))
+	for i, table := range tables {
+		checks[i] = "to_regclass(" + pb.add(table) + ") IS NOT NULL"
+	}
+	var present bool
+	err := q.QueryRowContext(ctx, "SELECT "+strings.Join(checks, " AND "), pb.args...).Scan(&present)
+	if err != nil {
+		return false, fmt.Errorf("checking optional pg pricing tables: %w", err)
+	}
+	return present, nil
 }
 
 func pgGenAIEffectivePricingRow(
@@ -269,6 +140,17 @@ func (s *Store) loadPricingMap(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if s.readTx != nil {
+		if !s.pricingSnapshot.loaded {
+			rows, err := s.readPricingMap(ctx)
+			if err != nil {
+				return nil, err
+			}
+			s.pricingSnapshot.rows = rows
+			s.pricingSnapshot.loaded = true
+		}
+		return clonePricingRows(s.pricingSnapshot.rows), nil
+	}
 	load := s.startPricingLoad()
 	defer s.leavePricingLoad(load)
 
@@ -284,11 +166,11 @@ func (s *Store) loadPricingMap(
 }
 
 func (s *Store) startPricingLoad() *pricingLoad {
-	s.pricingLoadMu.Lock()
-	defer s.pricingLoadMu.Unlock()
-	if s.pricingLoad != nil {
-		s.pricingLoad.waiters++
-		return s.pricingLoad
+	s.runtimeState().pricingLoadMu.Lock()
+	defer s.runtimeState().pricingLoadMu.Unlock()
+	if s.runtimeState().pricingLoad != nil {
+		s.runtimeState().pricingLoad.waiters++
+		return s.runtimeState().pricingLoad
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -297,26 +179,46 @@ func (s *Store) startPricingLoad() *pricingLoad {
 		cancel:  cancel,
 		waiters: 1,
 	}
-	s.pricingLoad = load
+	s.runtimeState().pricingLoad = load
 	go s.runPricingLoad(ctx, load)
 	return load
 }
 
 func (s *Store) runPricingLoad(ctx context.Context, load *pricingLoad) {
 	defer load.cancel()
+	prices, err := s.readPricingMap(ctx)
+	s.runtimeState().pricingLoadMu.Lock()
+	defer s.runtimeState().pricingLoadMu.Unlock()
+	load.err = err
+	load.prices = prices
+	if s.runtimeState().pricingLoad == load {
+		s.runtimeState().pricingLoad = nil
+	}
+	close(load.done)
+}
+
+func (s *Store) readPricingMap(ctx context.Context) ([]export.EffectivePricingRow, error) {
 	out := map[string]export.ModelRates{}
 	dbRows, err := s.mergeDBPricing(ctx, out)
 	if err == nil && dbRows == 0 {
-		out = fallbackPricingMap()
+		out = db.FallbackPricingMap()
 	}
 	var prices []export.EffectivePricingRow
 	if err == nil {
-		s.pricingMu.Lock()
+		s.runtimeState().pricingMu.Lock()
 		s.applyCustomPricing(out)
-		s.pricingMu.Unlock()
-		prices = pricingMapRows(out)
+		s.runtimeState().pricingMu.Unlock()
+		prices = db.PricingMapRows(out)
 		var document *db.GenAIPricingDocument
-		document, err = loadPGGenAIPricing(ctx, s.pg)
+		if s.readTx == nil {
+			document, err = loadPGGenAIPricing(ctx, s.pg)
+		} else {
+			var present bool
+			present, err = pricingTablesPresent(ctx, s.pg, "genai_pricing")
+			if err == nil && present {
+				document, err = queryPGGenAIPricing(ctx, s.pg, false)
+			}
+		}
 		if err == nil {
 			var row export.EffectivePricingRow
 			row, err = pgGenAIEffectivePricingRow(document)
@@ -326,34 +228,27 @@ func (s *Store) runPricingLoad(ctx context.Context, load *pricingLoad) {
 		}
 	}
 
-	s.pricingLoadMu.Lock()
-	defer s.pricingLoadMu.Unlock()
-	load.err = err
-	load.prices = prices
-	if s.pricingLoad == load {
-		s.pricingLoad = nil
-	}
-	close(load.done)
+	return prices, err
 }
 
 func (s *Store) leavePricingLoad(load *pricingLoad) {
 	var cancel context.CancelFunc
-	s.pricingLoadMu.Lock()
+	s.runtimeState().pricingLoadMu.Lock()
 	load.waiters--
-	if load.waiters == 0 && s.pricingLoad == load {
-		s.pricingLoad = nil
+	if load.waiters == 0 && s.runtimeState().pricingLoad == load {
+		s.runtimeState().pricingLoad = nil
 		cancel = load.cancel
 	}
-	s.pricingLoadMu.Unlock()
+	s.runtimeState().pricingLoadMu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
 }
 
 func (s *Store) forgetPricingLoad() {
-	s.pricingLoadMu.Lock()
-	defer s.pricingLoadMu.Unlock()
-	s.pricingLoad = nil
+	s.runtimeState().pricingLoadMu.Lock()
+	defer s.runtimeState().pricingLoadMu.Unlock()
+	s.runtimeState().pricingLoad = nil
 }
 
 // mergeDBPricing layers rows from the PG model_pricing table onto
@@ -363,12 +258,18 @@ func (s *Store) forgetPricingLoad() {
 func (s *Store) mergeDBPricing(
 	ctx context.Context, out map[string]export.ModelRates,
 ) (int, error) {
+	if s.readTx != nil {
+		present, err := pricingTablesPresent(ctx, s.pg, "model_pricing", "model_pricing_bands")
+		if err != nil || !present {
+			return 0, err
+		}
+	}
 	rows, err := s.pg.QueryContext(
 		ctx,
 		pgModelPricingSelect,
 	)
 	if err != nil {
-		if isUndefinedTable(err) {
+		if s.readTx == nil && isUndefinedTable(err) {
 			return 0, nil
 		}
 		return 0, fmt.Errorf("querying pg pricing: %w", err)
@@ -379,14 +280,14 @@ func (s *Store) mergeDBPricing(
 	if err != nil {
 		return 0, err
 	}
-	fallback := pgFallbackRateMap()
+	fallback := db.FallbackRateMap()
 	usableRows := 0
 	for _, p := range prices {
 		if strings.HasPrefix(p.ModelPattern, "_") {
 			continue
 		}
-		rates := pgModelPricingRates(p)
-		rates.Source = pgModelPricingSource(p, fallback)
+		rates := db.ModelPricingRates(p)
+		rates.Source = db.ModelPricingSource(p.ModelPattern, rates, fallback)
 		out[p.ModelPattern] = rates
 		usableRows++
 	}
@@ -398,7 +299,7 @@ func (s *Store) mergeDBPricing(
 // model. Kept separate from loadPricingMap so unit tests can exercise
 // the override step without a live PostgreSQL connection.
 func (s *Store) applyCustomPricing(out map[string]export.ModelRates) {
-	for model, cp := range s.customPricing {
+	for model, cp := range s.runtimeState().customPricing {
 		rates := export.ModelRates{
 			InputPerMTok: money.Money{
 				Microdollars: cp.InputMicrodollarsPerMTok,
@@ -416,13 +317,9 @@ func (s *Store) applyCustomPricing(out map[string]export.ModelRates) {
 				Microdollars: cp.CacheReadMicrodollarsPerMTok,
 			},
 		}
-		rates.Source = pgCustomPricingSource()
+		rates.Source = export.PricingRowSourceCustom
 		out[model] = rates
 	}
-}
-
-func pgCustomPricingSource() export.PricingRowSource {
-	return export.PricingRowSourceCustom
 }
 
 const pricingUpsertBatch = 100
@@ -863,28 +760,6 @@ func upsertPGModelPricing(
 // for the life of its transaction.
 const pricingSyncLockKey = "model_pricing_sync_lock"
 
-// lockPGModelPricing serializes concurrent pricing syncs by locking a
-// dedicated sync_metadata row until tx ends. A row lock is used instead
-// of pg_advisory_xact_lock because supported CockroachDB versions do not
-// implement advisory locks, and sync_metadata lives in the target
-// schema, so the lock is schema-scoped on both engines.
-func lockPGModelPricing(ctx context.Context, tx *sql.Tx) error {
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO sync_metadata (key, value) VALUES ($1, '')
-		 ON CONFLICT (key) DO NOTHING`,
-		pricingSyncLockKey,
-	); err != nil {
-		return fmt.Errorf("creating pg model pricing lock row: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx,
-		`SELECT value FROM sync_metadata WHERE key = $1 FOR UPDATE`,
-		pricingSyncLockKey,
-	); err != nil {
-		return fmt.Errorf("locking pg model pricing: %w", err)
-	}
-	return nil
-}
-
 func upsertPGGenAIPricing(
 	ctx context.Context, tx *sql.Tx, document db.GenAIPricingDocument,
 ) error {
@@ -913,14 +788,14 @@ func (s *Sync) syncModelPricing(ctx context.Context) error {
 		return fmt.Errorf("listing local model pricing: %w", err)
 	}
 	if len(prices) == 0 {
-		prices = fallbackPricingRows()
+		prices = db.FallbackMirrorPricingRows("")
 	}
 	localGenAI, err := s.local.GetGenAIPricing(ctx)
 	if err != nil {
 		return fmt.Errorf("reading local GenAI pricing document: %w", err)
 	}
 	if localGenAI == nil {
-		embedded := embeddedPGGenAIPricingDocument()
+		embedded := db.EmbeddedGenAIPricingDocument()
 		localGenAI = &embedded
 	}
 	tx, err := s.pg.BeginTx(ctx, nil)
@@ -932,8 +807,8 @@ func (s *Sync) syncModelPricing(ctx context.Context) error {
 	// each write a merged copy, so read, plan, and write are serialized
 	// under one lock; otherwise a slower push could overwrite ownership a
 	// faster one recorded and leave its rows untracked.
-	if err := lockPGModelPricing(ctx, tx); err != nil {
-		return err
+	if err := lockSyncMetadataRow(ctx, tx, pricingSyncLockKey); err != nil {
+		return fmt.Errorf("locking pg model pricing: %w", err)
 	}
 	existing, err := listPGModelPricing(ctx, tx)
 	if err != nil {

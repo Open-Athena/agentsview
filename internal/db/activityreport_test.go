@@ -40,6 +40,128 @@ func dayQuery(t *testing.T, date, tz string) activity.Query {
 	return q
 }
 
+func TestGetActivityReportAutomatedSubagentPrecedence(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "root", "project-a")
+	insertSession(t, d, "deleted-root", "project-a")
+	for _, tc := range []struct {
+		id     string
+		parent *string
+	}{
+		{"task", Ptr("root")},
+		{"worker", nil},
+		{"dangling-task", Ptr("deleted-root")},
+	} {
+		insertSession(t, d, tc.id, "project-a", func(s *Session) {
+			s.ParentSessionID = tc.parent
+			s.RelationshipType = "subagent"
+			if tc.id == "dangling-task" {
+				s.Entrypoint = "sdk-cli"
+			}
+			if tc.id == "worker" {
+				s.SessionKind = "non-interactive"
+			}
+			s.FirstMessage = Ptr("You are a code reviewer. Review this change.")
+			s.UserMessageCount = 1
+			s.StartedAt = Ptr("2026-06-14T10:00:00Z")
+			s.EndedAt = Ptr("2026-06-14T10:01:00Z")
+		})
+		seedMessage(t, d, tc.id, 0, "assistant", "2026-06-14T10:00:00Z", "")
+	}
+	require.NoError(t, d.DeleteSession(t.Context(), "deleted-root"))
+	_, err := d.getWriter().Exec(t.Context(), clearDanglingSubagentParentQuery("(?)"), "dangling-task")
+	require.NoError(t, err)
+	dangling, err := d.GetSession(t.Context(), "dangling-task")
+	require.NoError(t, err)
+	require.NotNil(t, dangling)
+	require.Nil(t, dangling.ParentSessionID)
+	require.Equal(t, "subagent", dangling.RelationshipType)
+	require.True(t, dangling.IsAutomated)
+	report, err := d.GetActivityReport(t.Context(), AnalyticsFilter{Timezone: "UTC"}, dayQuery(t, "2026-06-14", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, 3, report.Totals.SubagentSessions)
+	assert.Zero(t, report.Totals.AutomatedSessions)
+	assert.Zero(t, report.Totals.InteractiveSessions)
+}
+
+func TestActivityReportMessageCounts(t *testing.T) {
+	d := testDB(t)
+	for _, id := range []string{"conversation", "lone", "automated", "subagent", "other-project"} {
+		insertSession(t, d, id, "project-a", func(s *Session) {
+			s.StartedAt = Ptr("2026-06-14T09:00:00Z")
+			s.EndedAt = Ptr("2026-06-14T11:00:00Z")
+			if id == "automated" {
+				s.IsAutomated = true
+			}
+			if id == "subagent" {
+				s.RelationshipType = "subagent"
+			}
+			if id == "other-project" {
+				s.Project = "project-b"
+			}
+		})
+	}
+	messages := []Message{
+		{Role: "user", Timestamp: "2026-06-14T09:59:59Z"},
+		{Role: "user", Timestamp: "2026-06-14T10:00:00Z"},
+		{Role: "assistant", Timestamp: "2026-06-14T10:04:59.999999Z"},
+		{Role: "user", Timestamp: "2026-06-14T10:05:00Z"},
+		{Role: "assistant", Timestamp: "2026-06-14T10:10:00Z"},
+		{Role: "assistant", Timestamp: "2026-06-14T10:10:30.499Z"},
+		{Role: "assistant", Timestamp: "2026-06-14T10:10:30.500Z"},
+		{Role: "user"},
+		{Role: "user", Timestamp: "2026-06-14T10:01:00Z", SourceSubtype: "tool_result"},
+		{Role: "assistant", Timestamp: "2026-06-14T10:02:00Z", IsSystem: true},
+		{Role: "user", Timestamp: "2026-06-14T10:03:00Z", IsSystem: true},
+		{Role: "tool", Timestamp: "2026-06-14T10:04:00Z"},
+		{Role: "user", Timestamp: "2026-06-14T10:invalid"},
+	}
+	for i := range messages {
+		messages[i].SessionID = "conversation"
+		messages[i].Ordinal = i
+		messages[i].Content = "message"
+	}
+	insertMessages(t, d, messages...)
+	seedMessage(t, d, "lone", 0, "user", "2026-06-14T10:08:00Z", "")
+	seedMessage(t, d, "other-project", 0, "user", "2026-06-14T10:00:00Z", "")
+	for _, id := range []string{"automated", "subagent"} {
+		seedMessage(t, d, id, 0, "user", "2026-06-14T10:00:00Z", "")
+		seedMessage(t, d, id, 1, "assistant", "2026-06-14T10:00:00Z", "")
+	}
+	q, err := activity.ResolveQuery(activity.QueryInput{
+		Preset: "custom", Timezone: "UTC", BucketOverride: "5m",
+		From: "2026-06-14T10:00:00Z", To: "2026-06-14T10:15:00Z",
+	}, time.Date(2026, 6, 14, 10, 10, 30, 500_000_000, time.UTC))
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		name            string
+		filter          AnalyticsFilter
+		user, assistant []int
+	}{
+		{"all", AnalyticsFilter{}, []int{2, 2, 0}, []int{3, 0, 2}},
+		{"project", AnalyticsFilter{Project: "project-a"}, []int{1, 2, 0}, []int{3, 0, 2}},
+		{"interactive", AnalyticsFilter{Project: "project-a", ExcludeAutomated: true}, []int{1, 2, 0}, []int{2, 0, 2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			artifacts, err := d.BuildActivityReportArtifacts(t.Context(), tc.filter, q, nil)
+			require.NoError(t, err)
+			var user, assistant []int
+			for _, bucket := range artifacts.Report.Buckets {
+				user = append(user, bucket.UserMessages)
+				assistant = append(assistant, bucket.AssistantMessages)
+			}
+			assert.Equal(t, tc.user, user)
+			assert.Equal(t, tc.assistant, assistant)
+			page, err := activity.PageSessions(artifacts.Sessions, artifacts.Membership,
+				activity.SessionPageOptions{BucketRange: &activity.BucketRange{Start: 1, End: 2}})
+			require.NoError(t, err)
+			assert.Contains(t, reportSessionIDs(page.Sessions), "lone")
+			assert.False(t, artifacts.Membership["lone"].Contains(0))
+		})
+	}
+}
+
 func seedMessage(
 	t *testing.T, d *DB, sid string, ordinal int, role, ts, model string,
 ) {
@@ -206,8 +328,8 @@ func TestGetActivityReport_ToolCompletionAfterRangeClosesFinalMessage(t *testing
 }
 
 func BenchmarkSQLiteActivityReportCandidateSource100K(b *testing.B) {
-	d, ids, q := seedSQLiteActivityReportBenchmark(b)
-	source := d.activityReportCandidateSource(ids, q)
+	d, ids, q := seedSQLiteActivityReportCandidateBenchmark(b)
+	source := d.activityReportCandidateSQL(ids, q)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
@@ -217,8 +339,63 @@ func BenchmarkSQLiteActivityReportCandidateSource100K(b *testing.B) {
 			return nil
 		})
 		require.NoError(b, err)
-		require.Equal(b, 90_000, count)
+		require.Equal(b, 100_000, count)
 	}
+}
+
+func BenchmarkSQLiteActivityReportCandidateSourceWarm100K(b *testing.B) {
+	d, ids, q := seedSQLiteActivityReportCandidateBenchmark(b)
+	source := d.activityReportCandidateSource(ids, q)
+	reads := activityMemoPairingReads(b, d)
+	count := 0
+	require.NoError(b, source(b.Context(), func(activity.IntervalCandidate) error { count++; return nil }))
+	require.Equal(b, 100_000, count)
+	require.Len(b, d.activityMemo.entries, len(ids))
+	require.Equal(b, 100_000, d.activityMemo.rows)
+	require.NotEmpty(b, reads)
+	clear(reads)
+	require.NoError(b, source(b.Context(), func(activity.IntervalCandidate) error { return nil }))
+	require.Empty(b, reads)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		count := 0
+		require.NoError(b, source(b.Context(), func(activity.IntervalCandidate) error { count++; return nil }))
+		require.Equal(b, 100_000, count)
+	}
+}
+
+func seedSQLiteActivityReportCandidateBenchmark(b *testing.B) (*DB, []string, activity.Query) {
+	b.Helper()
+	d := testDB(b)
+	const sessionCount = 1_000
+	_, err := d.getWriter().Exec(b.Context(), `
+		WITH RECURSIVE n(i) AS (
+			VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < ?
+		)
+		INSERT INTO sessions(id, project, started_at, ended_at, message_count)
+		SELECT printf('bench-%06d', i), 'bench',
+			'2026-07-01T10:00:00Z', '2026-07-01T11:40:00Z', 101
+		FROM n`, sessionCount)
+	require.NoError(b, err)
+	_, err = d.getWriter().Exec(b.Context(), `
+		WITH RECURSIVE n(i) AS (
+			VALUES(0) UNION ALL SELECT i + 1 FROM n WHERE i < 100
+		)
+		INSERT INTO messages(session_id, ordinal, role, content, timestamp, model)
+		SELECT s.id, n.i, 'assistant', 'x',
+			strftime('%Y-%m-%dT%H:%M:%SZ', '2026-07-01T10:00:00Z', printf('+%d minutes', n.i)), 'model'
+		FROM sessions s CROSS JOIN n`)
+	require.NoError(b, err)
+	ids := make([]string, sessionCount)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("bench-%06d", i+1)
+	}
+	q, err := activity.ResolveQuery(activity.QueryInput{
+		Preset: "month", Date: "2026-07-01", Timezone: "UTC",
+	}, time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC))
+	require.NoError(b, err)
+	return d, ids, q
 }
 
 // BenchmarkSQLiteActivityReportCandidateSourceLongSession covers the opposite
@@ -269,7 +446,7 @@ func BenchmarkSQLiteActivityReportCandidateSourceLongSession(b *testing.B) {
 		{name: "narrow-3900", q: narrow, want: 3900},
 	} {
 		b.Run(benchmark.name, func(b *testing.B) {
-			source := d.activityReportCandidateSource([]string{"bench-long"}, benchmark.q)
+			source := d.activityReportCandidateSQL([]string{"bench-long"}, benchmark.q)
 			b.ReportAllocs()
 			for range b.N {
 				count := 0
@@ -588,7 +765,7 @@ func TestLoadActivityReportUsageCandidatesBoundsFilteredWorkingSet(t *testing.T)
 		"idx_messages_claude_snapshot (claude_message_id=? AND claude_request_id=?)")
 }
 
-func TestGetSessionUsageRowsPrefersCompleteClaudeSnapshotAcrossSessions(
+func TestGetSessionUsageRowsPricesCanonicalClaudeSnapshotAcrossSessions(
 	t *testing.T,
 ) {
 	d := testDB(t)
@@ -632,19 +809,7 @@ func TestGetSessionUsageRowsPrefersCompleteClaudeSnapshotAcrossSessions(
 	rowSet, err := d.GetSessionUsageRows(ctx, []string{"root", "child"})
 	require.NoError(t, err)
 	require.Len(t, rowSet.Rows, 1)
-	assert.Equal(t, "root", rowSet.Rows[0].SessionID)
-	assert.Equal(t, "child", rowSet.Rows[0].SourceSessionID)
-	assert.Equal(t, 631, rowSet.Rows[0].OutputTokens)
-	assert.Equal(t, map[string]int{"root": 5, "child": 631},
-		rowSet.RawOutputTokensBySession)
-	assert.Equal(t, map[string]int{"root": 5, "child": 631},
-		rowSet.DeduplicatedOutputTokens)
-	assert.Equal(t, map[string]struct{}{"root": {}, "child": {}},
-		rowSet.DiscardedContributingSessions)
-	assert.Equal(t, map[string]activity.SessionTokenCoverage{
-		"root":  {OutputTokens: 631, PeakContextTokens: 2},
-		"child": {OutputTokens: 631, PeakContextTokens: 2},
-	}, rowSet.CanonicalTokenCoverageBySession)
+	assert.Equal(t, money.Money{Microdollars: 631}, rowSet.Rows[0].Cost)
 }
 
 func TestSQLiteSessionUsageRowLessEquivalentInstantUsesSessionOrder(t *testing.T) {
@@ -665,10 +830,10 @@ func TestSQLiteSessionUsageRowLessEquivalentInstantUsesSessionOrder(t *testing.T
 		ts:      instant,
 		validTS: true,
 	}
-	sessionOrder := map[string]int{"a-parent": 0, "z-child": 1}
+	sessionOrder := map[string]int{"z-child": 0, "a-parent": 1}
 
-	assert.True(t, sqliteSessionUsageRowLess(parent, child, sessionOrder))
-	assert.False(t, sqliteSessionUsageRowLess(child, parent, sessionOrder))
+	assert.False(t, sqliteSessionUsageRowLess(parent, child, sessionOrder))
+	assert.True(t, sqliteSessionUsageRowLess(child, parent, sessionOrder))
 }
 
 func TestSQLiteActivityReportRowStatusCanonicalizesKimiAliasByTimestamp(t *testing.T) {
@@ -855,7 +1020,6 @@ func TestGetActivityReport_PricingModelsOnlyIncludeDedupSurvivors(t *testing.T) 
 		s.Agent = "claude"
 		s.StartedAt = Ptr("2026-06-16T10:31:00Z")
 		s.EndedAt = Ptr("2026-06-16T10:31:00Z")
-		s.IsAutomated = true
 	})
 	insertMessages(t, d, Message{
 		SessionID: "later", Ordinal: 0, Role: "assistant", Content: "x",
@@ -868,17 +1032,6 @@ func TestGetActivityReport_PricingModelsOnlyIncludeDedupSurvivors(t *testing.T) 
 	r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},
 		dayQuery(t, "2026-06-16", "UTC"))
 	require.NoError(t, err)
-	assert.Equal(t, 900, r.Totals.OutputTokens)
-	assert.Equal(t, r.Totals.Cost, r.Totals.InteractiveCost)
-	assert.Zero(t, r.Totals.AutomatedCost.Microdollars)
-	bySession := make(map[string]activity.SessionRow, len(r.BySession))
-	for _, session := range r.BySession {
-		bySession[session.SessionID] = session
-	}
-	require.Contains(t, bySession, "earlier")
-	require.Contains(t, bySession, "later")
-	assert.Equal(t, 900, bySession["earlier"].OutputTokens)
-	assert.Zero(t, bySession["later"].OutputTokens)
 	require.NotNil(t, r.Pricing)
 	assert.Contains(t, r.Pricing.Models, "complete-model")
 	assert.NotContains(t, r.Pricing.Models, "partial-model")
@@ -1181,145 +1334,56 @@ func TestGetActivityReport_HourlyRange(t *testing.T) {
 	assert.True(t, found, "the 2026-06-17T10:00 hourly bucket must be present")
 }
 
-// TestGetActivityReport_UsageDedupSubSecondOrder confirms the SQLite usage
-// stream is ordered by the PARSED instant, not the RFC3339 text. A
-// resumed/forked pair shares one source UUID fallback dedup
-// key in the same second: one whole-second instant ("...00Z", 500 output
-// tokens) and one fractional ("...00.123Z", 9000). Lexically "...00.123Z"
-// sorts before "...00Z" ('.' < 'Z'), so a TEXT sort would keep the 9000 row;
-// chronologically the whole-second row is first. First-seen-wins dedup must
-// keep the 500 row, matching PostgreSQL/DuckDB which order on the parsed time.
-func TestGetActivityReport_UsageDedupSubSecondOrder(t *testing.T) {
-	d := testDB(t)
-	ctx := t.Context()
-	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
-		ModelPattern:  "claude-sonnet-4-20250514",
-		InputPerMTok:  money.MustParseDollars("3.0"),
-		OutputPerMTok: money.MustParseDollars("15.0"),
-	}}), "UpsertModelPricing")
+// TestGetActivityReport_UsageDedupOrdering checks parsed time and session-ID ties before source UUID deduplication.
+func TestGetActivityReport_UsageDedupOrdering(t *testing.T) {
+	for _, tc := range []struct {
+		name, firstID, secondID, secondTimestamp string
+		firstOutput, secondOutput, wantOutput    int
+	}{
+		{"parsed time", "z-earlier", "a-later", "2026-06-16T10:30:00.123Z", 500, 9000, 500},
+		{"equal instant uses session ID before token payload", "z-session", "a-session", "2026-06-16T05:30:00-05:00", 500, 9000, 9000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDB(t)
+			ctx := t.Context()
+			require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
+				ModelPattern:  "claude-sonnet-4-20250514",
+				InputPerMTok:  money.MustParseDollars("3.0"),
+				OutputPerMTok: money.MustParseDollars("15.0"),
+			}}), "UpsertModelPricing")
 
-	insertSession(t, d, "earlier", "proj1", func(s *Session) {
-		s.Agent = "claude"
-		s.StartedAt = Ptr("2026-06-16T10:30:00Z")
-		s.EndedAt = Ptr("2026-06-16T10:30:00Z")
-	})
-	insertMessages(t, d, Message{
-		SessionID: "earlier", Ordinal: 0, Role: "assistant", Content: "x",
-		Timestamp:       "2026-06-16T10:30:00Z",
-		Model:           "claude-sonnet-4-20250514",
-		ClaudeMessageID: "m-dup", SourceUUID: "src-dup",
-		TokenUsage: jsontext.Value(`{"input_tokens":1000,"output_tokens":500}`),
-	})
-	insertSession(t, d, "later", "proj2", func(s *Session) {
-		s.Agent = "claude"
-		s.StartedAt = Ptr("2026-06-16T10:30:00Z")
-		s.EndedAt = Ptr("2026-06-16T10:30:00Z")
-	})
-	insertMessages(t, d, Message{
-		SessionID: "later", Ordinal: 0, Role: "assistant", Content: "x",
-		Timestamp:       "2026-06-16T10:30:00.123Z",
-		Model:           "claude-sonnet-4-20250514",
-		ClaudeMessageID: "m-dup", SourceUUID: "src-dup",
-		TokenUsage: jsontext.Value(`{"input_tokens":1000,"output_tokens":9000}`),
-	})
+			insertSession(t, d, tc.firstID, "proj1", func(s *Session) {
+				s.Agent = "claude"
+				s.StartedAt = Ptr("2026-06-16T10:30:00Z")
+				s.EndedAt = Ptr("2026-06-16T10:30:00Z")
+			})
+			insertMessages(t, d, Message{
+				SessionID: tc.firstID, Ordinal: 0, Role: "assistant", Content: "x",
+				Timestamp:       "2026-06-16T10:30:00Z",
+				Model:           "claude-sonnet-4-20250514",
+				ClaudeMessageID: "m-dup", SourceUUID: "src-dup",
+				TokenUsage: jsontext.Value(fmt.Sprintf(`{"input_tokens":1000,"output_tokens":%d}`, tc.firstOutput)),
+			})
+			insertSession(t, d, tc.secondID, "proj2", func(s *Session) {
+				s.Agent = "claude"
+				s.StartedAt = Ptr("2026-06-16T10:30:00Z")
+				s.EndedAt = Ptr("2026-06-16T10:30:00Z")
+			})
+			insertMessages(t, d, Message{
+				SessionID: tc.secondID, Ordinal: 0, Role: "assistant", Content: "x",
+				Timestamp:       tc.secondTimestamp,
+				Model:           "claude-sonnet-4-20250514",
+				ClaudeMessageID: "m-dup", SourceUUID: "src-dup",
+				TokenUsage: jsontext.Value(fmt.Sprintf(`{"input_tokens":1000,"output_tokens":%d}`, tc.secondOutput)),
+			})
 
-	r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},
-		dayQuery(t, "2026-06-16", "UTC"))
-	require.NoError(t, err)
-	assert.Equal(t, 500, r.Totals.OutputTokens,
-		"first-seen dedup keeps the chronologically earlier whole-second row")
-}
-
-func TestGetActivityReport_UsageDedupEqualInstantUsesSessionOrder(t *testing.T) {
-	d := testDB(t)
-	ctx := t.Context()
-	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
-		ModelPattern:  "claude-sonnet-4-20250514",
-		InputPerMTok:  money.MustParseDollars("3.0"),
-		OutputPerMTok: money.MustParseDollars("15.0"),
-	}}), "UpsertModelPricing")
-
-	insertSession(t, d, "a-session", "project a", func(s *Session) {
-		s.Agent = "claude"
-		s.StartedAt = Ptr("2026-06-16T10:30:00Z")
-		s.EndedAt = Ptr("2026-06-16T10:30:00Z")
-	})
-	insertMessages(t, d, Message{
-		SessionID: "a-session", Ordinal: 0, Role: "assistant", Content: "x",
-		Timestamp:       "2026-06-16T10:30:00Z",
-		Model:           "claude-sonnet-4-20250514",
-		ClaudeMessageID: "m-equal", SourceUUID: "src-equal",
-		TokenUsage: jsontext.Value(`{"input_tokens":1000,"output_tokens":500}`),
-	})
-	insertSession(t, d, "z-session", "project z", func(s *Session) {
-		s.Agent = "claude"
-		s.StartedAt = Ptr("2026-06-16T10:30:00Z")
-		s.EndedAt = Ptr("2026-06-16T10:30:00Z")
-	})
-	insertMessages(t, d, Message{
-		SessionID: "z-session", Ordinal: 0, Role: "assistant", Content: "x",
-		Timestamp:       "2026-06-16T05:30:00-05:00",
-		Model:           "claude-sonnet-4-20250514",
-		ClaudeMessageID: "m-equal", SourceUUID: "src-equal",
-		TokenUsage: jsontext.Value(`{"input_tokens":1000,"output_tokens":9000}`),
-	})
-
-	r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},
-		dayQuery(t, "2026-06-16", "UTC"))
-	require.NoError(t, err)
-	assert.Equal(t, 500, r.Totals.OutputTokens,
-		"equal parsed instants fall through to session ID ordering")
-}
-
-func TestGetActivityReport_UsageDedupFallsBackToSourceUUID(t *testing.T) {
-	d := testDB(t)
-	ctx := t.Context()
-	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{
-		ModelPattern:  "claude-sonnet-4-20250514",
-		InputPerMTok:  money.MustParseDollars("3.0"),
-		OutputPerMTok: money.MustParseDollars("15.0"),
-	}}), "UpsertModelPricing")
-
-	insertSession(t, d, "earlier", "proj1", func(s *Session) {
-		s.Agent = "claude"
-		s.StartedAt = Ptr("2026-06-16T10:30:00Z")
-		s.EndedAt = Ptr("2026-06-16T10:30:00Z")
-	})
-	insertMessages(t, d, Message{
-		SessionID:       "earlier",
-		Ordinal:         0,
-		Role:            "assistant",
-		Content:         "x",
-		Timestamp:       "2026-06-16T10:30:00Z",
-		Model:           "claude-sonnet-4-20250514",
-		ClaudeMessageID: "m-dup",
-		ClaudeRequestID: "",
-		SourceUUID:      "src-dup",
-		TokenUsage:      jsontext.Value(`{"input_tokens":1000,"output_tokens":500}`),
-	})
-	insertSession(t, d, "later", "proj2", func(s *Session) {
-		s.Agent = "claude"
-		s.StartedAt = Ptr("2026-06-16T10:30:01Z")
-		s.EndedAt = Ptr("2026-06-16T10:30:01Z")
-	})
-	insertMessages(t, d, Message{
-		SessionID:       "later",
-		Ordinal:         0,
-		Role:            "assistant",
-		Content:         "x",
-		Timestamp:       "2026-06-16T10:30:01Z",
-		Model:           "claude-sonnet-4-20250514",
-		ClaudeMessageID: "m-dup",
-		ClaudeRequestID: "",
-		SourceUUID:      "src-dup",
-		TokenUsage:      jsontext.Value(`{"input_tokens":1000,"output_tokens":900}`),
-	})
-
-	r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},
-		dayQuery(t, "2026-06-16", "UTC"))
-	require.NoError(t, err)
-	assert.Equal(t, 500, r.Totals.OutputTokens,
-		"incomplete Claude pairs fall back to source_uuid dedup in activity reports")
+			r, err := d.GetActivityReport(ctx, AnalyticsFilter{Timezone: "UTC"},
+				dayQuery(t, "2026-06-16", "UTC"))
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantOutput, r.Totals.OutputTokens,
+				"first-seen dedup follows parsed time, then session ID")
+		})
+	}
 }
 
 // TestGetActivityReport_TitleSkipsEmptyDisplayName confirms the Title fallback
@@ -1492,9 +1556,9 @@ func forceReaderVarLimit(t *testing.T, d *DB, limit int) {
 	require.NoError(t, err)
 	defer func() { require.NoError(t, conn.Close()) }()
 	require.NoError(t, conn.Raw(func(dc any) error {
-		sc, ok := dc.(*sqlite3.SQLiteConn)
+		sc, ok := dc.(interface{ SetLimit(int, int) int })
 		if !ok {
-			return fmt.Errorf("reader conn is %T, want *sqlite3.SQLiteConn", dc)
+			return fmt.Errorf("reader conn is %T, want SetLimit capability", dc)
 		}
 		sc.SetLimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, limit)
 		return nil
@@ -1516,7 +1580,7 @@ func TestGetActivityReport_ManySessionsWithinSQLiteVarLimit(t *testing.T) {
 
 	// Guard: prove the lowered limit is live on the pool, so a setup that
 	// failed to constrain it cannot mask the regression checked below.
-	overLimitPh, overLimitArgs := inPlaceholders(make([]string, 1001))
+	overLimitPh, overLimitArgs := InPlaceholders(make([]string, 1001))
 	var probe int
 	probeErr := d.getReader().QueryRowContext(
 		ctx, "SELECT 1 WHERE '' IN "+overLimitPh, overLimitArgs...).Scan(&probe)

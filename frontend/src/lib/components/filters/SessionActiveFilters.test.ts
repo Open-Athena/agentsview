@@ -10,21 +10,22 @@ afterEach(() => {
   component = undefined;
   document.body.innerHTML = "";
   sessions.filters.project = "";
+  sessions.filters.labels = [];
+  sessions.filters.pr = "";
   vi.restoreAllMocks();
 });
 
 describe("SessionActiveFilters clear all", () => {
-  it("invokes every usage-level clear hook", () => {
-    vi.spyOn(sessions, "clearSessionFilters").mockImplementation(() => {});
+  it("clears usage filters while preserving hidden session filters", () => {
     vi.spyOn(sessions, "load").mockResolvedValue();
     sessions.filters.project = "alpha";
+    sessions.filters.labels = ["ticket=example"];
+    sessions.filters.pr = "acme/widgets#42";
     const onClearProjects = vi.fn();
-    const onClearModels = vi.fn();
-    const onClearAgents = vi.fn();
 
     component = mount(SessionActiveFilters, {
       target: document.body,
-      props: { onClearProjects, onClearModels, onClearAgents },
+      props: { onClearProjects },
     });
     flushSync();
 
@@ -34,7 +35,8 @@ describe("SessionActiveFilters clear all", () => {
     flushSync();
 
     expect(onClearProjects).toHaveBeenCalledOnce();
-    expect(onClearModels).toHaveBeenCalledOnce();
-    expect(onClearAgents).toHaveBeenCalledOnce();
+    expect(sessions.filters.project).toBe("");
+    expect(sessions.filters.labels).toEqual(["ticket=example"]);
+    expect(sessions.filters.pr).toBe("acme/widgets#42");
   });
 });

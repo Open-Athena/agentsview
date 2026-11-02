@@ -4,11 +4,14 @@ package clickhouse
 
 import (
 	"context"
+	"database/sql"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/agentsview/internal/clickhouse/chtest"
 	"go.kenn.io/agentsview/internal/db"
 )
 
@@ -99,6 +102,11 @@ func TestStoreSessionsMessagesAndSearch(t *testing.T) {
 		require.NotNil(t, sess)
 		assert.Equal(t, "alpha", sess.Project)
 
+		children, err := store.GetChildSessions(ctx, fixtureAlphaID)
+		require.NoError(t, err)
+		require.Len(t, children, 1)
+		assert.Equal(t, fixtureChildID, children[0].ID)
+
 		ids, err := store.FindSessionIDsByPartial(ctx, "ch-sync-alpha", 5)
 		require.NoError(t, err)
 		assert.Contains(t, ids, fixtureAlphaID)
@@ -134,6 +142,12 @@ func TestStoreSessionsMessagesAndSearch(t *testing.T) {
 		timing, err := store.GetSessionTiming(ctx, fixtureAlphaID)
 		require.NoError(t, err)
 		require.NotNil(t, timing)
+
+		activity, err := store.GetSessionActivity(ctx, fixtureAlphaID)
+		require.NoError(t, err)
+		require.NotNil(t, activity)
+		assert.Equal(t, 2, activity.TotalMessages)
+		assert.NotEmpty(t, activity.Buckets)
 	})
 
 	t.Run("search_and_secrets", func(t *testing.T) {
@@ -141,6 +155,7 @@ func TestStoreSessionsMessagesAndSearch(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, page.Results, 1)
 		assert.Equal(t, fixtureAlphaID, page.Results[0].SessionID)
+		assert.Equal(t, fixtureMachine, page.Results[0].Machine)
 
 		content, err := store.SearchContent(ctx, db.ContentSearchFilter{
 			Pattern:        "clickhouse result",
@@ -152,6 +167,9 @@ func TestStoreSessionsMessagesAndSearch(t *testing.T) {
 		require.NotEmpty(t, content.Matches)
 		assert.Equal(t, "tool_result", content.Matches[0].Location)
 		assert.Equal(t, fixtureAlphaID, content.Matches[0].SessionID)
+		assert.Equal(t, fixtureMachine, content.Matches[0].Machine)
+		require.NotNil(t, content.Matches[0].DisplayName)
+		assert.Equal(t, "Alpha Saved Title", *content.Matches[0].DisplayName)
 
 		findings, err := store.ListSecretFindings(ctx, db.SecretFindingFilter{
 			Project: "alpha", Limit: 10,
@@ -211,6 +229,13 @@ func TestStoreSessionsMessagesAndSearch(t *testing.T) {
 		require.Len(t, pins, 1)
 		require.NotNil(t, pins[0].Note)
 		assert.Equal(t, "pin alpha", *pins[0].Note)
+
+		projectPins, err := store.ListPinnedMessages(ctx, "", "alpha")
+		require.NoError(t, err)
+		require.Len(t, projectPins, 1)
+		assert.Equal(t, fixtureAlphaID, projectPins[0].SessionID)
+		require.NotNil(t, projectPins[0].Content)
+		assert.Equal(t, "alpha first", *projectPins[0].Content)
 	})
 
 	t.Run("writes_are_read_only", func(t *testing.T) {
@@ -234,6 +259,38 @@ func TestStoreSessionsMessagesAndSearch(t *testing.T) {
 		_, err = store.InsertInsight(t.Context(), db.Insight{})
 		require.ErrorIs(t, err, db.ErrReadOnly)
 	})
+}
+
+func TestSearchContentExcludeActiveSince(t *testing.T) {
+	store, _, _ := newPushedStore(t)
+	for _, mode := range []string{"substring", "regex", "fts"} {
+		t.Run(mode, func(t *testing.T) {
+			page, err := store.SearchContent(t.Context(), db.ContentSearchFilter{
+				Pattern: "first", Mode: mode, Limit: 1, IncludeOneShot: true,
+				ExcludeActiveSince: time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC),
+			})
+			require.NoError(t, err)
+			require.Len(t, page.Matches, 1)
+			assert.Equal(t, fixtureAlphaID, page.Matches[0].SessionID)
+		})
+	}
+	store.SetVectorSearcher(&activityVectorSearcher{hits: []db.VectorHit{
+		{SessionID: fixtureBetaID},
+		{SessionID: fixtureAlphaID},
+	}})
+	for _, mode := range []string{"semantic", "hybrid"} {
+		t.Run(mode, func(t *testing.T) {
+			filter := db.ContentSearchFilter{Pattern: "absent keyword", Mode: mode, Limit: 1, IncludeOneShot: true, ExcludeActiveSince: time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)}
+			page, err := store.SearchContent(t.Context(), filter)
+			require.NoError(t, err)
+			require.Len(t, page.Matches, 1)
+			assert.Equal(t, fixtureAlphaID, page.Matches[0].SessionID)
+			filter.ExcludeActiveSince = time.Unix(0, 0)
+			page, err = store.SearchContent(t.Context(), filter)
+			require.NoError(t, err)
+			assert.Empty(t, page.Matches)
+		})
+	}
 }
 
 func TestSearchTreatsUnderscoreAsLiteral(t *testing.T) {
@@ -289,6 +346,11 @@ func TestStoreGetSessionHidesTrash(t *testing.T) {
 	require.NotNil(t, full)
 	require.NotNil(t, full.DeletedAt)
 	assert.Equal(t, fixtureBetaID, full.ID)
+
+	trash, err := store.ListTrashedSessions(ctx)
+	require.NoError(t, err)
+	require.Len(t, trash, 1)
+	assert.Equal(t, fixtureBetaID, trash[0].ID)
 }
 
 func TestStoreGetSessionVersionChangesAfterPush(t *testing.T) {
@@ -343,4 +405,73 @@ func TestStoreMessageWindowReportsRevisionWithRows(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, msgs)
 	assert.Empty(t, revision, "no rows means no revision to describe them")
+}
+
+type activityVectorSearcher struct {
+	hits []db.VectorHit
+}
+
+func (s *activityVectorSearcher) PrepareSemanticSearch(context.Context, string) (db.VectorSearchPage, int, error) {
+	return func(_ context.Context, k int) ([]db.VectorHit, bool, error) {
+		return s.hits[:min(k, len(s.hits))], len(s.hits) < k, nil
+	}, 0, nil
+}
+
+func (s *activityVectorSearcher) ResolveMessageUnits(_ context.Context, refs []db.MessageRef) ([]db.UnitRef, error) {
+	return make([]db.UnitRef, len(refs)), nil
+}
+
+func TestStoreSessionVersionTracksPushedAnnotations(t *testing.T) {
+	ctx := t.Context()
+	store, syncer, local := newPushedStore(t)
+	for _, tt := range []struct {
+		name  string
+		write func() error
+	}{
+		{"parent set", func() error { _, err := local.SetSessionExternalParent(ctx, fixtureBetaID, fixtureAlphaID); return err }},
+		{"parent clear", func() error { _, err := local.ClearSessionExternalParent(ctx, fixtureBetaID); return err }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			require.NoError(t, local.Update(ctx, func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(ctx, `UPDATE sessions SET sync_marker = '2000-01-01T00:00:00Z' WHERE id = ?`, fixtureBetaID)
+				return err
+			}))
+			_, err := syncer.Push(ctx, true, nil)
+			require.NoError(t, err)
+			count, before, ok := store.GetSessionVersion(ctx, fixtureBetaID)
+			require.True(t, ok)
+			require.NoError(t, tt.write())
+			res, err := syncer.Push(ctx, false, nil)
+			require.NoError(t, err)
+			assert.Equal(t, 1, res.SessionsPushed)
+			afterCount, after, ok := store.GetSessionVersion(ctx, fixtureBetaID)
+			require.True(t, ok)
+			assert.Equal(t, count, afterCount)
+			assert.NotEqual(t, before, after)
+		})
+	}
+}
+
+func TestMachineSelectorLookupIncludesUnmergedIdentity(t *testing.T) {
+	ctx := t.Context()
+	dsn, database := chtest.FreshDatabase(t)
+	conn := chtest.Open(t, dsn, database)
+	require.NoError(t, EnsureSchemaOn(ctx, conn))
+	// Keep both versions in separate parts to exercise FINAL semantics.
+	for _, query := range []string{
+		`SYSTEM STOP MERGES sessions`,
+		`INSERT INTO sessions (id, machine, push_version) VALUES ('updated', 'retired-host', 1)`,
+	} {
+		_, err := conn.ExecContext(ctx, query)
+		require.NoError(t, err)
+	}
+	// Only the newest version owns the session identity.
+	_, err := conn.ExecContext(ctx, `INSERT INTO sessions (id, machine, push_version) VALUES ('updated', 'current-host', 2)`)
+	require.NoError(t, err)
+	ids, err := NewStoreFromDB(conn).GetMatchingMachineIDs(ctx, []string{"retired-host"})
+	require.NoError(t, err)
+	assert.Empty(t, ids)
+	ids, err = NewStoreFromDB(conn).GetMatchingMachineIDs(ctx, []string{"current-host"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"current-host"}, ids)
 }

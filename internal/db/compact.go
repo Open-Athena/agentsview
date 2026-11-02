@@ -16,6 +16,9 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/cenkalti/backoff/v7"
+	"go.kenn.io/kit/atomicfile"
 )
 
 const (
@@ -601,31 +604,28 @@ func (db *DB) vacuumIntoCandidate(ctx context.Context, candidatePath string) err
 // checkpointWALTruncateConn retries a truncate checkpoint on conn so
 // short-lived readers can release their pinned pages.
 func checkpointWALTruncateConn(ctx context.Context, conn *sql.DB) error {
-	var lastErr error
-	for i := range walCheckpointAttempts {
+	_, err := backoff.Retry(ctx, func() (struct{}, error) {
 		var busy, logPages, checkpointedPages int
 		err := conn.QueryRowContext(
 			ctx, "PRAGMA wal_checkpoint(TRUNCATE)",
 		).Scan(&busy, &logPages, &checkpointedPages)
 		if err != nil {
-			return err
+			return struct{}{}, backoff.Permanent(err)
 		}
-		if busy == 0 {
-			return nil
+		if busy != 0 {
+			return struct{}{}, ErrWALCheckpointBusy
 		}
-		lastErr = ErrWALCheckpointBusy
-		if i == walCheckpointAttempts-1 {
-			break
-		}
-		timer := time.NewTimer(walCheckpointRetryDelay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
+		return struct{}{}, nil
+	}, backoff.WithBackOff(backoff.NewConstantBackOff(walCheckpointRetryDelay)),
+		backoff.WithMaxTries(walCheckpointAttempts), backoff.WithMaxElapsedTime(0))
+	if err == nil {
+		return nil
 	}
-	return lastErr
+	retryErr := backoff.AsRetryError(err)
+	if errors.Is(retryErr.Cause, backoff.ErrPermanent) || errors.Is(retryErr.Cause, backoff.ErrExhausted) {
+		return retryErr.LastErr
+	}
+	return ctx.Err()
 }
 
 // installCompactCandidate performs the short exclusive swap: close and drain
@@ -1157,6 +1157,15 @@ func compactManifestPath(databasePath string) string {
 	return filepath.Join(filepath.Dir(databasePath), compactManifestName)
 }
 
+// CompactRecoveryPending reports whether startup must settle an interrupted swap.
+func CompactRecoveryPending(databasePath string) (bool, error) {
+	_, err := os.Lstat(compactManifestPath(databasePath))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 func writeCompactManifest(path string, manifest compactManifest) error {
 	data, err := json.Marshal(manifest, jsontext.WithIndent("  "))
 	if err != nil {
@@ -1181,7 +1190,7 @@ func writeCompactManifest(path string, manifest compactManifest) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := atomicfile.Replace(tmp, path); err != nil {
 		return err
 	}
 	return syncDirectory(filepath.Dir(path))
@@ -1358,7 +1367,7 @@ func reinstateSidelinedOriginal(databasePath, expectedHash string) (bool, error)
 	if err := removeIfExists(databasePath); err != nil {
 		return false, err
 	}
-	if err := os.Rename(databasePath+".failed", databasePath); err != nil {
+	if err := atomicfile.Replace(databasePath+".failed", databasePath); err != nil {
 		return false, fmt.Errorf("reinstate sidelined archive: %w", err)
 	}
 	return true, syncDirectory(filepath.Dir(databasePath))

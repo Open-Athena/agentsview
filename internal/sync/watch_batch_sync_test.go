@@ -199,7 +199,7 @@ func seedWatchBatchUnrelatedSessions(
 	root := t.TempDir()
 	// These rows supply archive cardinality while changed-source ingestion stays real.
 	require.NoError(t, database.Update(t.Context(), func(tx *sql.Tx) error {
-		stmt, err := tx.PrepareContext(t.Context(), `INSERT INTO sessions (id, agent, project, machine, file_path, message_count, user_message_count) VALUES (?, 'claude', 'cold', 'local', ?, 1, 1)`)
+		stmt, err := tx.PrepareContext(t.Context(), `INSERT INTO sessions (id, agent, project, machine, file_path, message_count, user_message_count, parser_relationship_type) VALUES (?, 'claude', 'cold', 'local', ?, 1, 1, '')`)
 		if err != nil {
 			return err
 		}
@@ -361,7 +361,7 @@ func TestSyncWatchBatchThenRunChangedPathCardinalityAndSerialization(t *testing.
 			select {
 			case err := <-secondDone:
 				require.Failf(t, "concurrent sync entered callback critical section", "%v", err)
-			case <-time.After(25 * time.Millisecond):
+			case <-time.After(25 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; the held callback keeps the second sync out
 			}
 			close(releaseCallback)
 			require.NoError(t, <-firstDone)

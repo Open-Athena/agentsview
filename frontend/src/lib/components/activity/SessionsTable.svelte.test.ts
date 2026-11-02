@@ -1,0 +1,432 @@
+// @vitest-environment jsdom
+import { reportErrorShown } from "../../utils/telemetry.js";
+vi.mock("../../utils/telemetry.js", () => ({ reportErrorShown: vi.fn() }));
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { flushSync, mount, tick, unmount } from "svelte";
+import SessionsTable from "./SessionsTable.svelte";
+import { m } from "../../i18n/index.js";
+import { router } from "../../stores/router.svelte.js";
+import type { Report } from "../../api/types.js";
+import type { ActivitySessionRow } from "../../api/generated/index";
+import { testMoney } from "../../test/money.js";
+
+function makeRow(overrides: Partial<ActivitySessionRow> = {}): ActivitySessionRow {
+  return {
+    session_id: "sess",
+    title: "Session",
+    project: "proj",
+    project_key: "pl1:sha256:proj",
+    agent: "claude",
+    primary_model: "opus",
+    models: ["opus"],
+    agent_minutes: 10,
+    cost: testMoney(1),
+    output_tokens: 0,
+    first_active: "2026-06-16T08:00:00Z",
+    last_active: "2026-06-16T09:00:00Z",
+    timing_quality: "high",
+    is_automated: false,
+    is_subagent: false,
+    ...overrides,
+  };
+}
+
+function makeReport(rows: ActivitySessionRow[]): Report {
+  return {
+    peak: { agents: 0, at: null },
+    interactive_peak: { agents: 0, at: null },
+    subagent_peak: { agents: 0, at: null },
+    automated_peak: { agents: 0, at: null },
+    totals: {
+      active_minutes: 0,
+      idle_minutes: 0,
+      agent_minutes: 0,
+      sessions: rows.length,
+      untimed_sessions: 0,
+      distinct_projects: 0,
+      distinct_models: 0,
+      output_tokens: 0,
+      cost: testMoney(0),
+    },
+    partial: false,
+    as_of: null,
+    timezone: "UTC",
+    range_start: "2026-06-16T00:00:00Z",
+    range_end: "2026-06-17T00:00:00Z",
+    bucket_unit: "hour",
+    effective_end: "2026-06-17T00:00:00Z",
+    bucket_seconds: 10800,
+    bucket_count: 8,
+    elapsed_bucket_count: 8,
+    buckets: null,
+    by_project: null,
+    by_model: null,
+    by_agent: null,
+    by_session: rows,
+    sessions_total: rows.length,
+    projects: {},
+  } as unknown as Report;
+}
+
+// Two timed rows with distinct agent_minutes/cost orderings plus
+// one untimed row, so default (minutes) and cost sorts differ and
+// the untimed row's placement is observable.
+function fixtureRows(): ActivitySessionRow[] {
+  return [
+    makeRow({
+      session_id: "high-min",
+      title: "High minutes low cost",
+      agent_minutes: 40,
+      cost: testMoney(1),
+    }),
+    makeRow({
+      session_id: "low-min",
+      title: "Low minutes high cost",
+      agent_minutes: 5,
+      cost: testMoney(9),
+    }),
+    makeRow({
+      session_id: "untimed",
+      title: "Untimed",
+      agent_minutes: null,
+      cost: testMoney(4),
+      first_active: null,
+      last_active: null,
+    }),
+  ];
+}
+
+function rowOrder(): string[] {
+  return [...document.querySelectorAll(".session-row")].map(
+    (el) => el.getAttribute("data-session-id") ?? "",
+  );
+}
+
+function minutesCells(): string[] {
+  return [...document.querySelectorAll(".session-row .col-minutes")].map(
+    (el) => el.textContent?.trim() ?? "",
+  );
+}
+
+describe("SessionsTable", () => {
+  afterEach(() => {
+    document.body.innerHTML = "";
+    vi.restoreAllMocks();
+  });
+
+  it("defaults to agent-minutes desc with untimed rows last", async () => {
+    const report = makeReport(fixtureRows());
+    const c = mount(SessionsTable, {
+      target: document.body,
+      props: { report },
+    });
+    await tick();
+
+    expect(rowOrder()).toEqual(["high-min", "low-min", "untimed"]);
+
+    await unmount(c);
+  });
+
+  it("renders an em dash for an untimed row's minutes cell", async () => {
+    const report = makeReport(fixtureRows());
+    const c = mount(SessionsTable, {
+      target: document.body,
+      props: { report },
+    });
+    await tick();
+
+    // Third row (untimed) shows the placeholder; timed rows show numbers.
+    const cells = minutesCells();
+    expect(cells[2]).toBe("—");
+    expect(cells[0]).not.toBe("—");
+
+    await unmount(c);
+  });
+
+  it.each([
+    ["cost", "desc", "agent_minutes", "desc"],
+    ["session", "asc", "agent_minutes", "desc"],
+    ["model", "asc", "agent_minutes", "desc"],
+    ["session", "desc", "session", "asc"],
+  ] as const)("requests %s %s from the server", async (key, direction, sortKey, sortDir) => {
+    const onSort = vi.fn();
+    const report = makeReport(fixtureRows());
+    const c = mount(SessionsTable, {
+      target: document.body,
+      props: { report, onSort, sortKey, sortDir },
+    });
+    await tick();
+
+    const header = document.querySelector(`th.sort-${key} button`) as HTMLElement | null;
+    expect(header).toBeTruthy();
+    header!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await tick();
+
+    expect(onSort).toHaveBeenCalledWith(key, direction);
+    expect(rowOrder()).toEqual(["high-min", "low-min", "untimed"]);
+
+    await unmount(c);
+  });
+
+  it("intercepts a plain left-click on a session link for SPA navigation", async () => {
+    const navSpy = vi.spyOn(router, "navigateToSession").mockImplementation(() => {});
+    const report = makeReport(fixtureRows());
+    const c = mount(SessionsTable, {
+      target: document.body,
+      props: { report },
+    });
+    await tick();
+
+    // Default order is high-min first, so the first link is its row.
+    const link = document.querySelector(".session-row .session-link") as HTMLAnchorElement | null;
+    expect(link).toBeTruthy();
+
+    // Real browser clicks are cancelable; preventDefault is a no-op
+    // (and defaultPrevented stays false) on a non-cancelable event.
+    const click = new MouseEvent("click", {
+      bubbles: true,
+      cancelable: true,
+      button: 0,
+    });
+    link!.dispatchEvent(click);
+    await tick();
+
+    expect(navSpy).toHaveBeenCalledWith("high-min");
+    expect(click.defaultPrevented).toBe(true);
+
+    await unmount(c);
+  });
+
+  it("renders the server-filtered bucket page and its total", async () => {
+    const report = makeReport([fixtureRows()[0]!]);
+    report.sessions_total = 1;
+    const c = mount(SessionsTable, {
+      target: document.body,
+      props: { report, filterActive: true, filterLabel: "06:00–09:00" },
+    });
+    await tick();
+
+    expect(rowOrder()).toEqual(["high-min"]);
+    expect(document.querySelector(".count")?.textContent).toContain("1 total");
+
+    await unmount(c);
+  });
+
+  it("shows a dismissible filter badge that calls onClearFilter", async () => {
+    const onClearFilter = vi.fn();
+    const report = makeReport(fixtureRows());
+    const c = mount(SessionsTable, {
+      target: document.body,
+      props: {
+        report,
+        filterActive: true,
+        filterLabel: "06:00–09:00",
+        onClearFilter,
+      },
+    });
+    await tick();
+
+    const badge = document.querySelector(".filter-badge") as HTMLButtonElement | null;
+    expect(badge).toBeTruthy();
+    expect(badge!.textContent).toContain("06:00–09:00");
+    badge!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await tick();
+    expect(onClearFilter).toHaveBeenCalledTimes(1);
+
+    await unmount(c);
+  });
+
+  it("shows a filter-aware empty message for a slot with no matches", async () => {
+    const report = makeReport([]);
+    report.sessions_total = 0;
+    const c = mount(SessionsTable, {
+      target: document.body,
+      props: { report, filterActive: true, filterLabel: "12:00–15:00" },
+    });
+    await tick();
+
+    expect(document.querySelectorAll(".session-row").length).toBe(0);
+    expect(document.querySelector(".empty")?.textContent).toContain(
+      m.activity_no_sessions_selected_range(),
+    );
+    expect(document.querySelector(".filter-badge")).toBeTruthy();
+
+    await unmount(c);
+  });
+
+  it("labels subagents before automation and leaves interactive sessions unbadged", async () => {
+    const report = makeReport([
+      makeRow({ session_id: "human", title: "Human", is_automated: false }),
+      makeRow({ session_id: "robot", title: "Robot", is_automated: true }),
+      makeRow({ session_id: "child", title: "Child", is_subagent: true, is_automated: true }),
+    ]);
+    const c = mount(SessionsTable, {
+      target: document.body,
+      props: { report },
+    });
+    await tick();
+
+    expect(document.querySelectorAll(".auto-badge").length).toBe(1);
+    const robotRow = document.querySelector('.session-row[data-session-id="robot"]');
+    const humanRow = document.querySelector('.session-row[data-session-id="human"]');
+    expect(robotRow?.querySelector(".auto-badge")).toBeTruthy();
+    expect(humanRow?.querySelector(".auto-badge")).toBeNull();
+    const child = document.querySelector('.session-row[data-session-id="child"]');
+    expect(child?.querySelector(".subagent-badge")?.textContent).toBe("Subagent");
+    expect(child?.querySelector(".auto-badge")).toBeNull();
+
+    await unmount(c);
+  });
+
+  describe("infinite scroll", () => {
+    // jsdom does no layout; give the scroll box and its rows a fixed geometry
+    // so the distance to the bottom, 2000 - 360 - scrollTop px, depends only
+    // on scrollTop.
+    let rowHeight = 20;
+    beforeEach(() => {
+      rowHeight = 20;
+      vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(2000);
+      vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(360);
+      vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(() => rowHeight);
+    });
+
+    function pagedReport(cursor: string | undefined): Report {
+      const report = makeReport(fixtureRows());
+      report.sessions_next_cursor = cursor;
+      report.sessions_total = 500;
+      return report;
+    }
+
+    function scrollTo(top: number): HTMLElement {
+      const scroller = document.querySelector<HTMLElement>(".table-scroll")!;
+      scroller.scrollTop = top;
+      scroller.dispatchEvent(new Event("scroll"));
+      flushSync();
+      return scroller;
+    }
+
+    it("requests the next page once 15 rows or fewer remain below the view", async () => {
+      const onLoadMore = vi.fn();
+      const c = mount(SessionsTable, {
+        target: document.body,
+        props: { report: pagedReport("page-2"), onLoadMore },
+      });
+      await tick();
+
+      // 310 px (15.5 rows of 20 px) left, then 300 px (15 rows).
+      scrollTo(1330);
+      expect(onLoadMore).not.toHaveBeenCalled();
+
+      scrollTo(1340);
+      expect(onLoadMore).toHaveBeenCalledExactlyOnceWith("page-2");
+
+      await unmount(c);
+    });
+
+    it("keeps the same row lead when rows are taller", async () => {
+      const onLoadMore = vi.fn();
+      const c = mount(SessionsTable, {
+        target: document.body,
+        props: { report: pagedReport("page-2"), onLoadMore },
+      });
+      await tick();
+
+      // 500 px left is 25 rows of 20 px but only 12.5 rows of 40 px, as when
+      // the interface is zoomed to 200%.
+      scrollTo(1140);
+      expect(onLoadMore).not.toHaveBeenCalled();
+
+      rowHeight = 40;
+      scrollTo(1140);
+      expect(onLoadMore).toHaveBeenCalledExactlyOnceWith("page-2");
+
+      await unmount(c);
+    });
+
+    it("waits for an in-flight page, then continues if still at the bottom", async () => {
+      const onLoadMore = vi.fn();
+      const props = $state({ report: pagedReport("page-2"), loading: true, onLoadMore });
+      const c = mount(SessionsTable, { target: document.body, props });
+      await tick();
+
+      scrollTo(1640);
+      expect(onLoadMore).not.toHaveBeenCalled();
+      const table = document.querySelector("[aria-busy]")!;
+      expect(table.getAttribute("aria-busy")).toBe("true");
+
+      props.loading = false;
+      flushSync();
+      expect(table.getAttribute("aria-busy")).toBe("false");
+      expect(onLoadMore).toHaveBeenCalledExactlyOnceWith("page-2");
+
+      await unmount(c);
+    });
+
+    it("stops at the end of the list", async () => {
+      const onLoadMore = vi.fn();
+      const c = mount(SessionsTable, {
+        target: document.body,
+        props: { report: pagedReport(undefined), onLoadMore },
+      });
+      await tick();
+
+      scrollTo(1640);
+      expect(onLoadMore).not.toHaveBeenCalled();
+
+      await unmount(c);
+    });
+
+    it("pauses after a failed request until the user retries", async () => {
+      const onLoadMore = vi.fn();
+      const onRetry = vi.fn();
+      const c = mount(SessionsTable, {
+        target: document.body,
+        props: { report: pagedReport("page-2"), error: "server down", onLoadMore, onRetry },
+      });
+      await tick();
+
+      scrollTo(1640);
+      expect(onLoadMore).not.toHaveBeenCalled();
+
+      const error = document.querySelector(".page-error")!;
+      expect(error.textContent).toContain("server down");
+      expect(reportErrorShown).toHaveBeenCalledExactlyOnceWith("analytics");
+      error.querySelector("button")!.click();
+      expect(onRetry).toHaveBeenCalledOnce();
+      expect(onLoadMore).not.toHaveBeenCalled();
+
+      await unmount(c);
+    });
+
+    it("returns to the top without paging when the list is replaced", async () => {
+      const onLoadMore = vi.fn();
+      const props = $state({ report: pagedReport("page-2"), listVersion: 1, onLoadMore });
+      const c = mount(SessionsTable, { target: document.body, props });
+      await tick();
+
+      const scroller = scrollTo(1640);
+      expect(onLoadMore).toHaveBeenCalledExactlyOnceWith("page-2");
+
+      props.report = pagedReport("cost-page-2");
+      props.listVersion = 2;
+      flushSync();
+      expect(scroller.scrollTop).toBe(0);
+      expect(onLoadMore).toHaveBeenCalledOnce();
+
+      await unmount(c);
+    });
+  });
+
+  it("renders no filter badge when no slot filter is active", async () => {
+    const report = makeReport(fixtureRows());
+    const c = mount(SessionsTable, {
+      target: document.body,
+      props: { report },
+    });
+    await tick();
+
+    expect(document.querySelector(".filter-badge")).toBeNull();
+
+    await unmount(c);
+  });
+});

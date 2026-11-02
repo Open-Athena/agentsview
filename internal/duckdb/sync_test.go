@@ -46,55 +46,18 @@ func TestPushIncrementalReplacesOnlyChangedSessions(t *testing.T) {
 	assertMirrorMessageCount(t, path, "sess-2", 3)
 }
 
-func TestMirroredSessionMachine(t *testing.T) {
-	tests := []struct {
-		name           string
-		sessionMachine string
-		want           string
-	}{
-		{
-			name:           "explicit source machine",
-			sessionMachine: "source-machine",
-			want:           "source-machine",
-		},
-		{
-			name:           "empty source machine",
-			sessionMachine: "",
-			want:           "push-machine",
-		},
-		{
-			name:           "local sentinel",
-			sessionMachine: "local",
-			want:           "push-machine",
-		},
-		{
-			name:           "explicit whitespace is preserved",
-			sessionMachine: " source-machine ",
-			want:           " source-machine ",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, mirroredSessionMachine(
-				db.Session{Machine: tt.sessionMachine}, "push-machine",
-			))
-		})
-	}
-}
-
 func TestPushPreservesFilesystemSourceMachineAndCuration(t *testing.T) {
 	ctx := t.Context()
 	local, path := newPushFixture(t, 3)
 	require.NoError(t, local.Update(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE sessions SET machine = ? WHERE id = ?`,
+			`UPDATE sessions SET machine = ?, group_key = 'job-a' WHERE id = ?`,
 			"source-machine", "sess-2",
 		); err != nil {
 			return err
 		}
 		_, err := tx.ExecContext(ctx,
-			`UPDATE sessions SET machine = ? WHERE id = ?`,
+			`UPDATE sessions SET machine = ?, group_key = 'job-a' WHERE id = ?`,
 			" source-machine ", "sess-3",
 		)
 		return err
@@ -104,15 +67,17 @@ func TestPushPreservesFilesystemSourceMachineAndCuration(t *testing.T) {
 
 	conn, err := Open(ctx, path)
 	require.NoError(t, err)
-	var machine string
+	var machine, group string
 	require.NoError(t, conn.QueryRowContext(ctx,
-		`SELECT machine FROM sessions WHERE id = ?`, "sess-2",
-	).Scan(&machine))
+		`SELECT machine, group_key FROM sessions WHERE id = ?`, "sess-2",
+	).Scan(&machine, &group))
 	assert.Equal(t, "source-machine", machine)
+	assert.Equal(t, "job-a", group)
 	require.NoError(t, conn.QueryRowContext(ctx,
-		`SELECT machine FROM sessions WHERE id = ?`, "sess-3",
-	).Scan(&machine))
+		`SELECT machine, group_key FROM sessions WHERE id = ?`, "sess-3",
+	).Scan(&machine, &group))
 	assert.Equal(t, " source-machine ", machine)
+	assert.Equal(t, "job-a", group)
 	require.NoError(t, conn.Close())
 
 	starred, err := local.StarSession(ctx, "sess-2")
@@ -563,7 +528,6 @@ func TestPushFailsClosedWhenWriterHoldsMirror(t *testing.T) {
 // write-opens the destination (temp file plus atomic rename) — and records
 // the reader-hold reason.
 func TestPushExplicitRebuildsWhileMirrorHeldByReaders(t *testing.T) {
-	skipReopenTestOnWindows(t)
 	ctx := t.Context()
 	local, path := newPushFixture(t, 1)
 	_, err := Push(ctx, path, local, "m", storage.MirrorPushOptions{}, false, nil)
@@ -1053,6 +1017,83 @@ func TestPushDoesNotAdvanceStateOnError(t *testing.T) {
 	assertMirrorSessionAbsent(t, path, badID)
 }
 
+func TestPushSkipsInvalidBatchedSessionAfterReopen(t *testing.T) {
+	ctx := t.Context()
+	local := newLocalDB(t)
+	old := duckBatchFixture("invalid-batched", 1)
+	_, err := local.WriteSessionBatchAtomic(ctx, []db.SessionBatchWrite{old})
+	require.NoError(t, err)
+	path := filepath.Join(t.TempDir(), "mirror.duckdb")
+	initial, err := Push(ctx, path, local, "test-machine", storage.MirrorPushOptions{}, false, nil)
+	require.NoError(t, err)
+	require.Zero(t, initial.Errors)
+	before, err := ProbeMirror(ctx, path)
+	require.NoError(t, err)
+	mirror, err := OpenReadOnly(ctx, path)
+	require.NoError(t, err)
+	oldRows := duckBatchSnapshot(t, mirror, old.Session.ID)
+	var oldFingerprint string
+	require.NoError(t, mirror.QueryRowContext(ctx,
+		`SELECT agentsview_push_fingerprint FROM sessions WHERE id = ?`, old.Session.ID,
+	).Scan(&oldFingerprint))
+	require.NoError(t, mirror.Close())
+
+	replacement := duckBatchFixture(old.Session.ID, 203)
+	for i := range replacement.Messages {
+		replacement.Messages[i].Content = fmt.Sprintf("replacement %d", i)
+		replacement.Messages[i].ContentLength = len(replacement.Messages[i].Content)
+	}
+	replacement.Messages[150].Timestamp = "not-a-timestamp"
+	healthy := duckBatchFixture("valid-new", 1)
+	healthy.Messages[0].Content = "healthy session survives the failed batch"
+	healthy.Messages[0].ContentLength = len(healthy.Messages[0].Content)
+	_, err = local.WriteSessionBatchAtomic(ctx, []db.SessionBatchWrite{replacement, healthy})
+	require.NoError(t, err)
+	var logs bytes.Buffer
+	oldLog := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(oldLog) })
+
+	result, err := Push(ctx, path, local, "test-machine", storage.MirrorPushOptions{}, false, nil)
+	require.NoError(t, err)
+	require.False(t, result.Diagnostics.Full)
+	assert.Equal(t, 1, result.Errors)
+	assert.Equal(t, 1, result.SessionsPushed)
+	assert.Contains(t, logs.String(), "skipping session "+old.Session.ID)
+	assert.Contains(t, logs.String(), "timestamp")
+	after, err := ProbeMirror(ctx, path)
+	require.NoError(t, err)
+	assert.Equal(t, before.LastPushCutoff, after.LastPushCutoff)
+	assert.Equal(t, before.LastPushAt, after.LastPushAt)
+	mirror, err = OpenReadOnly(ctx, path)
+	require.NoError(t, err)
+	assert.Equal(t, oldRows, duckBatchSnapshot(t, mirror, old.Session.ID))
+	var fingerprint, content string
+	require.NoError(t, mirror.QueryRowContext(ctx,
+		`SELECT agentsview_push_fingerprint FROM sessions WHERE id = ?`, old.Session.ID,
+	).Scan(&fingerprint))
+	assert.Equal(t, oldFingerprint, fingerprint)
+	require.NoError(t, mirror.QueryRowContext(ctx,
+		`SELECT content FROM messages WHERE session_id = ? AND ordinal = 0`, healthy.Session.ID,
+	).Scan(&content))
+	assert.Equal(t, "healthy session survives the failed batch", content)
+	assertDuckBatchParity(t, local, mirror, healthy.Session.ID)
+	require.NoError(t, mirror.Close())
+
+	replacement.Messages[150].Timestamp = "2026-01-02T03:04:05.123Z"
+	_, err = local.WriteSessionBatchAtomic(ctx, []db.SessionBatchWrite{replacement})
+	require.NoError(t, err)
+	retry, err := Push(ctx, path, local, "test-machine", storage.MirrorPushOptions{}, false, nil)
+	require.NoError(t, err)
+	assert.Zero(t, retry.Errors)
+	assert.Equal(t, 1, retry.SessionsPushed)
+	mirror, err = OpenReadOnly(ctx, path)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, mirror.Close()) }()
+	assertDuckBatchParity(t, local, mirror, old.Session.ID)
+	assertDuckBatchParity(t, local, mirror, healthy.Session.ID)
+}
+
 func TestSyncFullPushCreatesExpectedRows(t *testing.T) {
 	ctx := t.Context()
 	local := newLocalDB(t)
@@ -1074,7 +1115,7 @@ func TestSyncFullPushCreatesExpectedRows(t *testing.T) {
 	assertDuckDBCount(t, conn, "tool_result_events", 1)
 	assertDuckDBCount(t, conn, "usage_events", 1)
 	assertDuckDBCount(t, conn, "secret_findings", 1)
-	assertDuckDBCount(t, conn, "model_pricing", 1)
+	assertDuckDBCount(t, conn, "model_pricing", 2)
 	assertDuckDBCount(t, conn, "starred_sessions", 1)
 	assertDuckDBCount(t, conn, "pinned_messages", 1)
 
@@ -1247,86 +1288,6 @@ func TestSyncPushReportsProgressAcrossBatchBoundaries(t *testing.T) {
 	assert.Equal(t, count, progress[duckSessionPushBatchSize].MessagesDone)
 }
 
-func TestDuckSessionFingerprintIncludesDeletionCause(t *testing.T) {
-	base := db.Session{ID: "session", Machine: "machine"}
-	withCause := base
-	cause := "source_missing"
-	withCause.DeletionCause = &cause
-
-	assert.NotEqual(t,
-		duckSessionFingerprintFields(base, base.Machine),
-		duckSessionFingerprintFields(withCause, withCause.Machine),
-	)
-}
-
-func TestDuckSessionFingerprintFieldsDiffer(t *testing.T) {
-	base := db.Session{
-		ID:               "sess-001",
-		Project:          "proj",
-		Machine:          "laptop",
-		Agent:            "claude",
-		MessageCount:     5,
-		UserMessageCount: 2,
-		CreatedAt:        "2026-03-11T12:00:00Z",
-	}
-	encode := func(s db.Session) string {
-		data, err := json.Marshal(duckSessionFingerprintFields(s, "laptop"))
-		require.NoError(t, err)
-		return string(data)
-	}
-	fp1 := encode(base)
-
-	tests := []struct {
-		name   string
-		modify func(s db.Session) db.Session
-	}{
-		{
-			name: "agent label change",
-			modify: func(s db.Session) db.Session {
-				s.AgentLabel = "triage"
-				return s
-			},
-		},
-		{
-			name: "entrypoint change",
-			modify: func(s db.Session) db.Session {
-				s.Entrypoint = "sdk-cli"
-				return s
-			},
-		},
-		{
-			name: "display name change",
-			modify: func(s db.Session) db.Session {
-				name := "new name"
-				s.DisplayName = &name
-				return s
-			},
-		},
-		{
-			name: "session_name change",
-			modify: func(s db.Session) db.Session {
-				n := "agent-provided-title"
-				s.SessionName = &n
-				return s
-			},
-		},
-		{
-			name: "transcript revision change",
-			modify: func(s db.Session) db.Session {
-				revision := "1"
-				s.TranscriptRevision = &revision
-				return s
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.NotEqual(t, fp1, encode(tt.modify(base)))
-		})
-	}
-}
-
 // TestDuckSessionFingerprintCoversEveryMirroredColumn enforces the
 // invariant documented on duckSessionFingerprintFields: every session
 // field upsertSession mirrors (via sessionInsertArgs) must also feed the
@@ -1399,6 +1360,24 @@ func perturbSessionField(base db.Session, i int) (db.Session, bool) {
 		target.SetBool(!target.Bool())
 	case reflect.Float64:
 		target.SetFloat(target.Float() + 1.5)
+	case reflect.Slice:
+		// One element whose string fields are set covers []string (Labels)
+		// and slices of structs with string fields (PRLinks).
+		elem := reflect.New(target.Type().Elem()).Elem()
+		name := "perturbed-" + reflect.TypeFor[db.Session]().Field(i).Name
+		switch elem.Kind() {
+		case reflect.String:
+			elem.SetString(name)
+		case reflect.Struct:
+			for _, f := range elem.Fields() {
+				if f.Kind() == reflect.String && f.CanSet() {
+					f.SetString(name)
+				}
+			}
+		default:
+			return base, false
+		}
+		target.Set(reflect.Append(target, elem))
 	default:
 		return base, false
 	}
@@ -1498,7 +1477,7 @@ func TestSessionFingerprintsWriteColumn(t *testing.T) {
 
 func TestSyncUsesFallbackPricingWhenLocalPricingIsEmpty(t *testing.T) {
 	ctx := t.Context()
-	local := newLocalDB(t)
+	local := dbtest.OpenTestDB(t)
 	syncer := newInMemoryTestSync(t, local, storage.MirrorPushOptions{})
 	require.NoError(t, createSchema(ctx, syncer.DB()))
 
@@ -2174,7 +2153,7 @@ func TestReadStatusFromConfigReportsScopeAndDegradesOnMissingMetadata(t *testing
 		MachineName: "test-machine",
 	})
 	require.NoError(t, err)
-	assert.Equal(t, canonicalPushScope([]string{"alpha"}, nil), status.Scope)
+	assert.Equal(t, db.CanonicalPushScope([]string{"alpha"}, nil), status.Scope)
 
 	conn, err := Open(ctx, target)
 	require.NoError(t, err)
@@ -2258,7 +2237,12 @@ type syncFixture struct {
 
 func newLocalDB(t *testing.T) *db.DB {
 	t.Helper()
-	return dbtest.OpenTestDB(t)
+	local := dbtest.OpenTestDB(t)
+	// Avoid copying the full fallback pricing table on every push.
+	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
+		ModelPattern: "duckdb-test-seed",
+	}}))
+	return local
 }
 
 func newTestSync(

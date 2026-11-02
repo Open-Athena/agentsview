@@ -5,9 +5,13 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +24,7 @@ import (
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/secrets"
 )
 
@@ -58,6 +63,18 @@ func seedSession(t *testing.T, d *db.DB, id string, msgs []db.Message, mutate fu
 		msgs[i].Ordinal = i
 	}
 	seedSessionRows(t, d, s, msgs)
+}
+
+// endedAgo backdates a fixture session's end time. The backlog is walked
+// newest ended first, so a test that inspects whichever session a pass
+// reaches first states which one that is by ending it most recently, instead
+// of resting on the session-id tiebreak between equal end times.
+func endedAgo(ago time.Duration) func(*db.Session) {
+	return func(s *db.Session) {
+		ended := time.Now().Add(-ago).UTC().
+			Format("2006-01-02T15:04:05.000Z")
+		s.EndedAt = &ended
+	}
 }
 
 // seedSessionRows stores the session and its message rows keeping the
@@ -238,16 +255,46 @@ func turnMessages(pairs ...string) []db.Message {
 	return msgs
 }
 
+// callLog records each distillation call's unit text, decoded request, and
+// raw request body.
 type callLog struct {
-	mu    sync.Mutex
-	texts []string
+	mu       sync.Mutex
+	texts    []string
+	requests []map[string]any
+	bodies   [][]byte
 }
 
-func (c *callLog) add(text string) int {
+func (c *callLog) add(text string, request map[string]any, body []byte) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.texts = append(c.texts, text)
+	c.requests = append(c.requests, request)
+	c.bodies = append(c.bodies, body)
 	return len(c.texts)
+}
+
+func (c *callLog) all() []map[string]any {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.requests)
+}
+
+// byUserText returns the one recorded request whose unit text contains
+// marker, with its raw body.
+func (c *callLog) byUserText(t *testing.T, marker string) (map[string]any, []byte) {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var found map[string]any
+	var body []byte
+	for i, text := range c.texts {
+		if strings.Contains(text, marker) {
+			require.Nil(t, found, "more than one request carries %q", marker)
+			found, body = c.requests[i], c.bodies[i]
+		}
+	}
+	require.NotNil(t, found, "no request carries %q", marker)
+	return found, body
 }
 
 func (c *callLog) count() int {
@@ -280,19 +327,27 @@ func modelServer(
 	log := &callLog{}
 	server := httptest.NewServer(http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				assert.Failf(t, "test failed", "reading request: %v", err)
+			}
 			var payload struct {
 				Messages []struct {
 					Content string `json:"content"`
 				} `json:"messages"`
 			}
-			if err := json.UnmarshalRead(r.Body, &payload); err != nil {
+			if err := json.Unmarshal(body, &payload); err != nil {
+				assert.Failf(t, "test failed", "decoding request: %v", err)
+			}
+			var request map[string]any
+			if err := json.Unmarshal(body, &request); err != nil {
 				assert.Failf(t, "test failed", "decoding request: %v", err)
 			}
 			text := payload.Messages[len(payload.Messages)-1].Content
-			call := log.add(text)
-			status, body := respond(text, call)
+			call := log.add(text, request, body)
+			status, reply := respond(text, call)
 			w.WriteHeader(status)
-			_, _ = w.Write([]byte(body))
+			_, _ = w.Write([]byte(reply))
 		}))
 	t.Cleanup(server.Close)
 	return server, log
@@ -705,6 +760,17 @@ func TestManagerExtractsBenignHighEntropyAssistantToken(t *testing.T) {
 // one transcript message. The budget caps the recovery and fails the
 // session closed instead.
 func TestManagerBoundsOversizedUnitSplitWork(t *testing.T) {
+	// The assistant row is a zero-tool action unit, so its leaves go out
+	// restricted through the same shared call budget.
+	for _, role := range []string{"user", "assistant"} {
+		t.Run(role, func(t *testing.T) {
+			testManagerBoundsOversizedUnitSplitWork(t, role)
+		})
+	}
+}
+
+func testManagerBoundsOversizedUnitSplitWork(t *testing.T, role string) {
+	t.Helper()
 	d := newTestArchive(t)
 	server, log := modelServer(t, func(text string, _ int) (int, string) {
 		if utf8.RuneCountInString(text) > 120 {
@@ -715,7 +781,7 @@ func TestManagerBoundsOversizedUnitSplitWork(t *testing.T) {
 	})
 	big := strings.Repeat("word ", 6000)
 	seedSession(t, d, "sess-1",
-		[]db.Message{{Role: "user", Content: big}}, nil)
+		[]db.Message{{Role: role, Content: big}}, nil)
 	m := newManager(t, d, server.URL, func(cfg *ManagerConfig) {
 		cfg.Segmenter = TurnsV1{MaxWindowChars: 400}
 	})
@@ -2076,8 +2142,8 @@ func TestManagerChangedDoneSessionBlocksActivation(t *testing.T) {
 	d := newTestArchive(t)
 	ctx := t.Context()
 	server, _ := modelServer(t, alwaysEntries(t, "x"))
-	seedSession(t, d, "sess-1", turnMessages("a", "b"), nil)
-	seedSession(t, d, "sess-2", turnMessages("c", "d"), nil)
+	seedSession(t, d, "sess-1", turnMessages("a", "b"), endedAgo(time.Hour))
+	seedSession(t, d, "sess-2", turnMessages("c", "d"), endedAgo(2*time.Hour))
 	m := newManager(t, d, server.URL, nil)
 
 	result, err := m.RunPass(ctx, PassOptions{Limit: 1})
@@ -2087,6 +2153,10 @@ func TestManagerChangedDoneSessionBlocksActivation(t *testing.T) {
 	if result.Sessions != 1 || result.Activated {
 		require.FailNowf(t, "test failed", "result = %+v, want 1 session and no activation", result)
 	}
+	progress, ok, err := d.ExtractProgress(ctx, "sess-1", m.Fingerprint())
+	require.NoError(t, err)
+	require.True(t, ok, "sess-1 must be extracted before its transcript changes")
+	require.Equal(t, db.ExtractProgressDone, progress.State)
 
 	// The completed session's transcript changes: its extracted corpus is
 	// stale, so the generation is not actually covered.
@@ -2271,8 +2341,10 @@ func TestManagerAbortsPassOnEndpointScopedRejection(t *testing.T) {
 	server, log := modelServer(t, func(_ string, _ int) (int, string) {
 		return http.StatusUnauthorized, `{"error":"bad api key"}`
 	})
-	seedSession(t, d, "sess-a", turnMessages("fix the bug", "done"), nil)
-	seedSession(t, d, "sess-b", turnMessages("ship it", "shipped"), nil)
+	seedSession(t, d, "sess-a", turnMessages("fix the bug", "done"),
+		endedAgo(time.Hour))
+	seedSession(t, d, "sess-b", turnMessages("ship it", "shipped"),
+		endedAgo(2*time.Hour))
 	m := newManager(t, d, server.URL, nil)
 
 	_, err := m.RunPass(ctx, PassOptions{})
@@ -2307,8 +2379,10 @@ func TestManagerAbortsPassOnSchemaViolation(t *testing.T) {
 	server, log := modelServer(t, func(_ string, _ int) (int, string) {
 		return http.StatusOK, completionBody(t, `{"wrong":"shape"}`)
 	})
-	seedSession(t, d, "sess-a", turnMessages("fix the bug", "done"), nil)
-	seedSession(t, d, "sess-b", turnMessages("ship it", "shipped"), nil)
+	seedSession(t, d, "sess-a", turnMessages("fix the bug", "done"),
+		endedAgo(time.Hour))
+	seedSession(t, d, "sess-b", turnMessages("ship it", "shipped"),
+		endedAgo(2*time.Hour))
 	m := newManager(t, d, server.URL, nil)
 
 	_, err := m.RunPass(ctx, PassOptions{})
@@ -2539,8 +2613,10 @@ func TestManagerAbortsPassOnExhaustedTransientFailures(t *testing.T) {
 	server, log := modelServer(t, func(_ string, _ int) (int, string) {
 		return http.StatusInternalServerError, `{"error":"upstream down"}`
 	})
-	seedSession(t, d, "sess-a", turnMessages("fix the bug", "done"), nil)
-	seedSession(t, d, "sess-b", turnMessages("ship it", "shipped"), nil)
+	seedSession(t, d, "sess-a", turnMessages("fix the bug", "done"),
+		endedAgo(time.Hour))
+	seedSession(t, d, "sess-b", turnMessages("ship it", "shipped"),
+		endedAgo(2*time.Hour))
 	m := newManager(t, d, server.URL, nil)
 
 	_, err := m.RunPass(ctx, PassOptions{})
@@ -2605,8 +2681,10 @@ func TestManagerScheduledPassSkipsSessionReendedWithinQuietPeriod(t *testing.T) 
 		}
 		return http.StatusOK, completionBody(t, entriesJSON(t, "x"))
 	})
-	seedSession(t, d, "sess-a", turnMessages("fix the bug", "done"), nil)
-	seedSession(t, d, "sess-b", turnMessages("ship it", "shipped"), nil)
+	seedSession(t, d, "sess-a", turnMessages("fix the bug", "done"),
+		endedAgo(time.Hour))
+	seedSession(t, d, "sess-b", turnMessages("ship it", "shipped"),
+		endedAgo(2*time.Hour))
 	m := newManager(t, d, server.URL, nil)
 
 	result, err := m.RunPass(ctx, PassOptions{})
@@ -2645,8 +2723,10 @@ func TestManagerBadRequestStaysSessionScoped(t *testing.T) {
 		}
 		return http.StatusOK, completionBody(t, entriesJSON(t, "x"))
 	})
-	seedSession(t, d, "sess-a", turnMessages("fix the bug", "done"), nil)
-	seedSession(t, d, "sess-b", turnMessages("ship it", "shipped"), nil)
+	seedSession(t, d, "sess-a", turnMessages("fix the bug", "done"),
+		endedAgo(time.Hour))
+	seedSession(t, d, "sess-b", turnMessages("ship it", "shipped"),
+		endedAgo(2*time.Hour))
 	m := newManager(t, d, server.URL, nil)
 
 	result, err := m.RunPass(ctx, PassOptions{})
@@ -2798,9 +2878,12 @@ func TestManagerScheduledPassSkipsSessionsTrashedAfterSelection(t *testing.T) {
 		}
 		return http.StatusOK, completionBody(t, entriesJSON(t, "x"))
 	})
-	seedSession(t, d, "sess-a", turnMessages("fix the bug", "done"), nil)
-	seedSession(t, d, "sess-b", turnMessages("ship it", "shipped"), nil)
-	seedSession(t, d, "sess-c", turnMessages("try this", "tried"), nil)
+	seedSession(t, d, "sess-a", turnMessages("fix the bug", "done"),
+		endedAgo(time.Hour))
+	seedSession(t, d, "sess-b", turnMessages("ship it", "shipped"),
+		endedAgo(2*time.Hour))
+	seedSession(t, d, "sess-c", turnMessages("try this", "tried"),
+		endedAgo(3*time.Hour))
 	m := newManager(t, d, server.URL, nil)
 
 	result, err := m.RunPass(ctx, PassOptions{})
@@ -2823,11 +2906,15 @@ func TestManagerScheduledPassSkipsSessionsTrashedAfterSelection(t *testing.T) {
 	}
 }
 
-// TestManagerExplicitActivateRefusesUncoveredSessions pins the reviewer
-// scenario for the in-tx discovery gate: extracting one session by hand and
-// then activating must not retire the served corpus while other eligible
-// sessions were never extracted.
-func TestManagerExplicitActivateRefusesUncoveredSessions(t *testing.T) {
+// TestManagerExplicitActivateServesFirstPartialCorpus pins the operator
+// scenario the first corpus exists for: on a large archive the whole backlog
+// takes a long time to distill, and while no generation is active nothing is
+// being served, so an explicit activation may start serving what has been
+// extracted so far instead of waiting for complete coverage. Extraction is
+// unaffected — the rest of the backlog is still distilled, and once the
+// generation is active those entries are written straight to served, which is
+// why one early activation is the whole mechanism.
+func TestManagerExplicitActivateServesFirstPartialCorpus(t *testing.T) {
 	d := newTestArchive(t)
 	ctx := t.Context()
 	server, _ := modelServer(t, alwaysEntries(t, "x"))
@@ -2835,21 +2922,84 @@ func TestManagerExplicitActivateRefusesUncoveredSessions(t *testing.T) {
 	seedSession(t, d, "sess-2", turnMessages("c", "d"), nil)
 	m := newManager(t, d, server.URL, nil)
 
-	if _, err := m.RunPass(ctx, PassOptions{SessionID: "sess-1"}); err != nil {
-		require.FailNowf(t, "test failed", "single-session RunPass: %v", err)
-	}
-	err := m.Activate(ctx)
-	if !errors.Is(err, db.ErrExtractActivationBlocked) {
-		require.FailNowf(t, "test failed", "Activate = %v, want ErrExtractActivationBlocked: sess-2 "+
-			"is eligible and was never extracted", err)
-	}
+	_, err := m.RunPass(ctx, PassOptions{SessionID: "sess-1"})
+	require.NoError(t, err, "single-session RunPass")
+	served, err := d.ListRecallEntries(ctx, db.RecallQuery{Limit: 50})
+	require.NoError(t, err)
+	require.Empty(t, served, "a building generation stages its entries")
 
+	require.NoError(t, m.Activate(ctx),
+		"with nothing serving, the first corpus may activate on partial "+
+			"coverage: sess-2 is still eligible and not yet extracted")
+	served, err = d.ListRecallEntries(ctx, db.RecallQuery{Limit: 50})
+	require.NoError(t, err)
+	assert.Len(t, served, 2,
+		"both entries of the one extracted session must start serving")
+
+	// The backlog is not abandoned by activating early, and a later pass's
+	// output needs no second activation to appear.
+	status, err := m.Status(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, status.EligibleBacklog,
+		"sess-2 must still be waiting to be extracted")
 	result, err := m.RunPass(ctx, PassOptions{})
-	if err != nil {
-		require.FailNowf(t, "test failed", "full RunPass: %v", err)
+	require.NoError(t, err, "pass after activation")
+	assert.Equal(t, 1, result.Sessions)
+	served, err = d.ListRecallEntries(ctx, db.RecallQuery{Limit: 50})
+	require.NoError(t, err)
+	assert.Len(t, served, 4,
+		"an active generation's later entries serve as they are produced")
+	staged, err := d.ListRecallEntries(ctx,
+		db.RecallQuery{Status: "archived", Limit: 50})
+	require.NoError(t, err)
+	assert.Empty(t, staged)
+}
+
+// TestManagerExplicitActivateRefusesUncoveredReplacement pins the other half:
+// once a corpus is serving, an explicit activation of a replacement
+// generation must not retire it while eligible sessions were never extracted
+// under the replacement.
+func TestManagerExplicitActivateRefusesUncoveredReplacement(t *testing.T) {
+	d := newTestArchive(t)
+	ctx := t.Context()
+	server, _ := modelServer(t, alwaysEntries(t, "x"))
+	seedSession(t, d, "sess-1", turnMessages("a", "b"), nil)
+	m := newManager(t, d, server.URL, nil)
+
+	// A complete, serving first corpus.
+	result, err := m.RunPass(ctx, PassOptions{})
+	require.NoError(t, err)
+	require.True(t, result.Activated, "full coverage must activate")
+
+	// A second generation, differing only in a fingerprint input, covers one
+	// of the two eligible sessions.
+	seedSession(t, d, "sess-2", turnMessages("c", "d"), nil)
+	replacement := newManager(t, d, server.URL, func(cfg *ManagerConfig) {
+		cfg.Identity = ModelIdentity{Model: "test-model", Deployment: "next"}
+		cfg.Client.Model = "test-model"
+	})
+	require.NotEqual(t, m.Fingerprint(), replacement.Fingerprint())
+	_, err = replacement.RunPass(ctx, PassOptions{SessionID: "sess-2"})
+	require.NoError(t, err, "single-session RunPass")
+
+	err = replacement.Activate(ctx)
+	require.ErrorIs(t, err, db.ErrExtractActivationBlocked,
+		"sess-1 is eligible and was never extracted under the replacement")
+	served, err := d.ListRecallEntries(ctx, db.RecallQuery{Limit: 50})
+	require.NoError(t, err)
+	require.NotEmpty(t, served,
+		"a refused activation must leave the served corpus in place")
+	for _, entry := range served {
+		assert.Equal(t, m.Fingerprint(), entry.SourceRunID,
+			"only the complete generation may serve")
 	}
-	if !result.Activated {
-		require.FailNowf(t, "test failed", "result = %+v; full coverage must activate", result)
+	staged, err := d.ListRecallEntries(ctx,
+		db.RecallQuery{Status: "archived", Limit: 50})
+	require.NoError(t, err)
+	require.NotEmpty(t, staged)
+	for _, entry := range staged {
+		assert.Equal(t, replacement.Fingerprint(), entry.SourceRunID,
+			"the refused generation's entries stay staged")
 	}
 }
 
@@ -3132,5 +3282,538 @@ func TestManagerArchiveContentBeforeModelCall(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// coveredSessions reports which of ids have a progress row under the
+// manager's generation, in the order given, so a pass's reach can be read
+// without depending on how far each session got.
+func coveredSessions(
+	t *testing.T, d *db.DB, fingerprint string, ids ...string,
+) []string {
+	t.Helper()
+	var covered []string
+	for _, id := range ids {
+		_, ok, err := d.ExtractProgress(t.Context(), id, fingerprint)
+		require.NoError(t, err)
+		if ok {
+			covered = append(covered, id)
+		}
+	}
+	return covered
+}
+
+// TestManagerNewestFirstPassesLeaveNoOlderSessionBehind pins newest-first
+// ordering against the discovery watermark, which is the one interaction
+// that could strand work: the watermark bounds discovery to sessions written
+// at or after it, and if it advanced from the rows a pass happened to
+// process, walking the archive newest-first would move it past the older
+// sessions the pass had not reached and they would never be extracted. It
+// advances from the pass start instead, and only on a pass that took
+// everything it found, so bounded passes eat the backlog from the recent end
+// while the oldest session still gets extracted. A session that arrives
+// afterwards with an old ended_at is discovered on its write time, not its
+// end time, so it is not stranded either.
+func TestManagerNewestFirstPassesLeaveNoOlderSessionBehind(t *testing.T) {
+	d := newTestArchive(t)
+	ctx := t.Context()
+	server, _ := modelServer(t, alwaysEntries(t, "x"))
+	seedSession(t, d, "sess-newest", turnMessages("a", "b"), endedAgo(time.Hour))
+	seedSession(t, d, "sess-middle", turnMessages("c", "d"), endedAgo(2*time.Hour))
+	seedSession(t, d, "sess-oldest", turnMessages("e", "f"), endedAgo(3*time.Hour))
+	// A zero quiet period puts the watermark at each completed pass's start,
+	// so it actually bounds the next pass's discovery against these fixtures.
+	m := newManager(t, d, server.URL, func(cfg *ManagerConfig) {
+		cfg.QuietPeriod = 0
+	})
+	all := []string{"sess-newest", "sess-middle", "sess-oldest"}
+
+	result, err := m.RunPass(ctx, PassOptions{Limit: 1})
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.Sessions)
+	assert.Equal(t, []string{"sess-newest"},
+		coveredSessions(t, d, m.Fingerprint(), all...),
+		"a bounded pass takes the newest end of the backlog first")
+
+	result, err = m.RunPass(ctx, PassOptions{Limit: 1})
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.Sessions)
+	assert.Equal(t, []string{"sess-newest", "sess-middle"},
+		coveredSessions(t, d, m.Fingerprint(), all...),
+		"a bounded pass must not advance the watermark past what it skipped")
+
+	result, err = m.RunPass(ctx, PassOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.Sessions)
+	assert.Equal(t, all, coveredSessions(t, d, m.Fingerprint(), all...),
+		"the oldest session is reached even though it is ordered last")
+	assert.True(t, result.Activated,
+		"full coverage activates the generation as it always did")
+	status, err := m.Status(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, status.EligibleBacklog)
+
+	// The unlimited pass advanced the watermark. A session written now but
+	// ended before every session already extracted is still discovered:
+	// discovery is bounded by write time, which the newest-first ordering
+	// does not touch.
+	seedSession(t, d, "sess-late-arrival",
+		turnMessages("g", "h"), endedAgo(10*time.Hour))
+	settleSessionWrite(t, d)
+
+	result, err = m.RunPass(ctx, PassOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.Sessions)
+	assert.Equal(t, []string{"sess-late-arrival"},
+		coveredSessions(t, d, m.Fingerprint(), "sess-late-arrival"),
+		"a late-arriving old session must not be stranded by the watermark")
+}
+
+// requestText returns the content of the request message with role.
+func requestText(t *testing.T, request map[string]any, role string) string {
+	t.Helper()
+	messages, ok := request["messages"].([]any)
+	require.True(t, ok, "request has no messages array")
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		require.True(t, ok, "request message is not an object")
+		if message["role"] == role {
+			content, ok := message["content"].(string)
+			require.True(t, ok, "request message content is not a string")
+			return content
+		}
+	}
+	require.FailNowf(t, "test failed", "request has no %s message", role)
+	return ""
+}
+
+// requestEntryTypes returns the entry type enum the request schema offers.
+func requestEntryTypes(t *testing.T, request map[string]any) []string {
+	t.Helper()
+	node := any(request)
+	for _, key := range []string{
+		"response_format", "json_schema", "schema", "properties", "entries",
+		"items", "properties", "type",
+	} {
+		object, ok := node.(map[string]any)
+		require.True(t, ok, "request schema has no object at %q", key)
+		node = object[key]
+	}
+	object, ok := node.(map[string]any)
+	require.True(t, ok, "request schema has no type property")
+	raw, ok := object["enum"].([]any)
+	require.True(t, ok, "type property has no enum")
+	types := make([]string, 0, len(raw))
+	for _, value := range raw {
+		name, ok := value.(string)
+		require.True(t, ok, "enum value %v is not a string", value)
+		types = append(types, name)
+	}
+	return types
+}
+
+var (
+	allEntryTypesLiteral = []string{
+		"fact", "decision", "procedure", "warning", "preference", "open_question",
+	}
+	unexecutedEntryTypesLiteral = []string{
+		"fact", "decision", "warning", "preference", "open_question",
+	}
+)
+
+func toolUnitSession() []db.Message {
+	return []db.Message{
+		{Role: "user", Content: "tool-unit marker: set up CI for this repo"},
+		{Role: "assistant", Content: "I'll look at the existing workflows first."},
+		{
+			Role:    "assistant",
+			Content: "Listing the workflow directory.\n[Bash: ls .github/workflows]",
+			ToolCalls: []db.ToolCall{{
+				ToolName:  "Bash",
+				Category:  "Bash",
+				ToolUseID: "call-1",
+				InputJSON: `{"command":"ls .github/workflows"}`,
+			}},
+		},
+		{Role: "assistant", Content: "There is no deploy workflow yet. I suggest adding " +
+			".github/workflows/deploy.yml with staging and production jobs."},
+	}
+}
+
+// TestManagerUnexecutedActionUnitRequest reproduces the issue: a proposal-only
+// assistant turn with no stored tool call must not be offered 'procedure',
+// while a tool-using unit and the intent unit keep today's request.
+func TestManagerUnexecutedActionUnitRequest(t *testing.T) {
+	fixture, err := os.ReadFile(filepath.Join("testdata", "proposal_only.txt"))
+	require.NoError(t, err)
+	d := newTestArchive(t)
+	server, log := modelServer(t, func(string, int) (int, string) {
+		return http.StatusOK, completionBody(t, `{"entries":[]}`)
+	})
+	seedSession(t, d, "sess-proposal", []db.Message{
+		{Role: "user", Content: "proposal marker: how should CI deploy?"},
+		{Role: "assistant", Content: string(fixture)},
+	}, nil)
+	seedSession(t, d, "sess-tool", toolUnitSession(), nil)
+	m := newManager(t, d, server.URL, nil)
+
+	_, err = m.RunPass(t.Context(), PassOptions{})
+	require.NoError(t, err)
+
+	action, _ := log.byUserText(t, "Here's what I'd suggest for CI.")
+	assert.Equal(t, unexecutedEntryTypesLiteral, requestEntryTypes(t, action))
+	system := requestText(t, action, "system")
+	assert.True(t, strings.HasPrefix(system, "No tool ran in this segment"),
+		"system prompt = %q", system)
+	assert.True(t, strings.HasSuffix(system, "\n\naction prompt"), "system prompt = %q", system)
+
+	intent, _ := log.byUserText(t, "proposal marker")
+	assert.Equal(t, "intent prompt", requestText(t, intent, "system"))
+	assert.Equal(t, allEntryTypesLiteral, requestEntryTypes(t, intent))
+
+	_, body := log.byUserText(t, "Listing the workflow directory.")
+	golden, err := os.ReadFile(filepath.Join("testdata", "tool_unit_request.golden.json"))
+	require.NoError(t, err)
+	var want, got map[string]any
+	require.NoError(t, json.Unmarshal(golden, &want))
+	require.NoError(t, json.Unmarshal(body, &got))
+	assert.Equal(t, want["messages"], got["messages"])
+	assert.Equal(t, want["response_format"], got["response_format"])
+	assert.ElementsMatch(t, slices.Collect(maps.Keys(want)), slices.Collect(maps.Keys(got)))
+}
+
+func TestManagerToolEvidenceIsWindowLocal(t *testing.T) {
+	fixture, err := os.ReadFile(filepath.Join("testdata", "proposal_only.txt"))
+	require.NoError(t, err)
+	cases := []struct {
+		name      string
+		toolText  string
+		proposals []db.Message
+		marker    string
+	}{
+		{
+			name: "oversized proposal", toolText: "tool marker: listed workflows",
+			proposals: []db.Message{{Role: "assistant", Content: string(fixture)}},
+			marker:    "Here's what I'd suggest for CI.",
+		},
+		{
+			name: "ordinary packed proposal", toolText: "tool marker: " + strings.Repeat("x", 65),
+			proposals: []db.Message{
+				{Role: "assistant", Content: "proposal marker: add CI"},
+				{Role: "assistant", Content: "Use a deploy job."},
+			},
+			marker: "proposal marker",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newTestArchive(t)
+			server, log := modelServer(t, func(string, int) (int, string) {
+				return http.StatusOK, completionBody(t, `{"entries":[]}`)
+			})
+			messages := []db.Message{{
+				Role: "assistant", Content: tc.toolText,
+				ToolCalls: []db.ToolCall{{ToolName: "Bash", Category: "Bash"}},
+			}}
+			messages = append(messages, tc.proposals...)
+			seedSession(t, d, "sess-1", messages, nil)
+			m := newManager(t, d, server.URL, func(cfg *ManagerConfig) {
+				cfg.Segmenter = TurnsV1{MaxWindowChars: 100}
+			})
+
+			_, err := m.RunPass(t.Context(), PassOptions{})
+			require.NoError(t, err)
+			require.Len(t, log.all(), 2)
+			tool, _ := log.byUserText(t, "tool marker")
+			assert.Equal(t, allEntryTypesLiteral, requestEntryTypes(t, tool))
+			assert.Equal(t, "action prompt", requestText(t, tool, "system"))
+			proposal, _ := log.byUserText(t, tc.marker)
+			assert.Equal(t, unexecutedEntryTypesLiteral, requestEntryTypes(t, proposal))
+			assert.Equal(t, unexecutedActionPreamble+"\n\naction prompt", requestText(t, proposal, "system"))
+		})
+	}
+}
+
+// TestManagerToolResultRowsKeepRequest pins that tool output stored without
+// a call, inside the run or as a visible user row just before it, keeps the
+// action unit on today's request.
+func TestManagerToolResultRowsKeepRequest(t *testing.T) {
+	cases := []struct {
+		name       string
+		messages   []db.Message
+		marker     string
+		restricted bool
+	}{
+		{
+			name: "assistant tool-result row in the run",
+			messages: []db.Message{
+				{Role: "user", Content: "add retries"},
+				{Role: "assistant", Content: "I will add retries to the client."},
+				{
+					Role: "assistant", Content: "ran tests\nok",
+					SourceSubtype: parser.SourceSubtypeToolResult,
+				},
+			},
+			marker: "I will add retries",
+		},
+		{
+			name: "assistant row with only the tool-use flag",
+			messages: []db.Message{
+				{Role: "user", Content: "check the build"},
+				{Role: "assistant", Content: "I suggest running the build.", HasToolUse: true},
+			},
+			marker: "I suggest running the build.",
+		},
+		{
+			name: "empty tool-role row after a proposal block",
+			messages: []db.Message{
+				{Role: "user", Content: "check the build"},
+				{Role: "assistant", Content: "I suggest running the build."},
+				{Role: string(parser.RoleTool), Content: ""},
+			},
+			marker: "I suggest running the build.",
+		},
+		{
+			name: "system tool-result row between proposal and narration",
+			messages: []db.Message{
+				{Role: "user", Content: "run the tests"},
+				{Role: "assistant", Content: "I will run the tests."},
+				{
+					Role: "user", Content: "ok", IsSystem: true,
+					SourceSubtype: parser.SourceSubtypeToolResult,
+				},
+				{Role: "assistant", Content: "Tests pass."},
+			},
+			marker: "Tests pass.",
+		},
+		{
+			name: "user tool-result row before the narration",
+			messages: []db.Message{
+				{Role: "user", Content: "add the config"},
+				{
+					Role: "assistant", Content: "Writing the config.",
+					ToolCalls: []db.ToolCall{{ToolName: "Write", Category: "Write"}},
+				},
+				{
+					Role: "user", Content: "[1 tool result(s)]",
+					SourceSubtype: parser.SourceSubtypeToolResult,
+				},
+				{Role: "assistant", Content: "Done, I added the config."},
+			},
+			marker: "Done, I added the config.",
+		},
+		{
+			name: "ordinary user message before the narration",
+			messages: []db.Message{
+				{Role: "user", Content: "add the config"},
+				{
+					Role: "assistant", Content: "Writing the config.",
+					ToolCalls: []db.ToolCall{{ToolName: "Write", Category: "Write"}},
+				},
+				{Role: "user", Content: "thanks"},
+				{Role: "assistant", Content: "Done, I added the config."},
+			},
+			marker:     "Done, I added the config.",
+			restricted: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newTestArchive(t)
+			server, log := modelServer(t, func(string, int) (int, string) {
+				return http.StatusOK, completionBody(t, `{"entries":[]}`)
+			})
+			seedSession(t, d, "sess-1", tc.messages, nil)
+			m := newManager(t, d, server.URL, nil)
+
+			_, err := m.RunPass(t.Context(), PassOptions{})
+			require.NoError(t, err)
+
+			request, _ := log.byUserText(t, tc.marker)
+			system := requestText(t, request, "system")
+			if tc.restricted {
+				assert.Equal(t, unexecutedEntryTypesLiteral, requestEntryTypes(t, request))
+				assert.Equal(t, unexecutedActionPreamble+"\n\naction prompt", system)
+				return
+			}
+			assert.Equal(t, allEntryTypesLiteral, requestEntryTypes(t, request))
+			assert.Equal(t, "action prompt", system)
+		})
+	}
+}
+
+// TestManagerUnexecutedPreambleWrapsOverride pins that the preamble prepends
+// to whatever action prompt resolution produced, including an override.
+func TestManagerUnexecutedPreambleWrapsOverride(t *testing.T) {
+	d := newTestArchive(t)
+	server, log := modelServer(t, func(string, int) (int, string) {
+		return http.StatusOK, completionBody(t, `{"entries":[]}`)
+	})
+	seedSession(t, d, "sess-1", []db.Message{
+		{Role: "assistant", Content: "I suggest adding a cache."},
+	}, nil)
+	m := newManager(t, d, server.URL, func(cfg *ManagerConfig) {
+		cfg.Prompts[RoleAction] = "custom override"
+	})
+
+	_, err := m.RunPass(t.Context(), PassOptions{})
+	require.NoError(t, err)
+
+	requests := log.all()
+	require.Len(t, requests, 1)
+	assert.Equal(t, unexecutedActionPreamble+"\n\ncustom override",
+		requestText(t, requests[0], "system"))
+}
+
+// TestManagerRestrictedProcedureFailsOnlyItsSession pins that a server which
+// ignores the narrowed enum fails the offending session behind its backoff
+// while the pass continues through the rest of the backlog.
+func TestManagerRestrictedProcedureFailsOnlyItsSession(t *testing.T) {
+	d := newTestArchive(t)
+	ctx := t.Context()
+	server, log := modelServer(t, func(text string, _ int) (int, string) {
+		if strings.Contains(text, "deploy.yml") {
+			return http.StatusOK, completionBody(t, `{"entries":[{"type":"procedure",`+
+				`"title":"Added deploy.yml","body":"Added the workflow.","entities":[]}]}`)
+		}
+		return http.StatusOK, completionBody(t, entriesJSON(t, "cache idea"))
+	})
+	seedSession(t, d, "sess-a", []db.Message{
+		{Role: "assistant", Content: "I suggest adding .github/workflows/deploy.yml."},
+	}, endedAgo(time.Hour))
+	seedSession(t, d, "sess-b", []db.Message{
+		{Role: "assistant", Content: "I suggest adding a cache."},
+	}, endedAgo(2*time.Hour))
+	m := newManager(t, d, server.URL, nil)
+
+	result, err := m.RunPass(ctx, PassOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.Failed)
+	assert.Len(t, log.all(), 2, "the pass must continue past the rejected unit")
+	entry, readErr := d.GetRecallEntry(ctx, EntryID(m.Fingerprint(), "sess-a", 0, 0))
+	require.NoError(t, readErr)
+	assert.Nil(t, entry)
+
+	progress, found, err := d.ExtractProgress(ctx, "sess-a", m.Fingerprint())
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, db.ExtractProgressFailed, progress.State)
+	assert.Equal(t, 0, progress.UnitCursor)
+	assert.Contains(t, progress.LastError, "does not allow")
+	progress, found, err = d.ExtractProgress(ctx, "sess-b", m.Fingerprint())
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, db.ExtractProgressDone, progress.State)
+}
+
+// TestManagerUnexecutedActionUnitAcceptsEmpty pins that an empty response
+// still completes a restricted unit.
+func TestManagerUnexecutedActionUnitAcceptsEmpty(t *testing.T) {
+	d := newTestArchive(t)
+	ctx := t.Context()
+	server, log := modelServer(t, func(string, int) (int, string) {
+		return http.StatusOK, completionBody(t, `{"entries":[]}`)
+	})
+	seedSession(t, d, "sess-1", []db.Message{
+		{Role: "assistant", Content: "I suggest adding a cache."},
+	}, nil)
+	m := newManager(t, d, server.URL, nil)
+
+	result, err := m.RunPass(ctx, PassOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.Sessions)
+	assert.Equal(t, 0, result.Failed)
+	assert.Equal(t, 0, result.Entries)
+	require.Len(t, log.all(), 1)
+	progress, found, err := d.ExtractProgress(ctx, "sess-1", m.Fingerprint())
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, db.ExtractProgressDone, progress.State)
+}
+
+// TestManagerSplitCarriesToolUse pins that every leaf of a split restricted
+// unit is sent restricted.
+func TestManagerSplitCarriesToolUse(t *testing.T) {
+	d := newTestArchive(t)
+	server, log := modelServer(t, func(text string, _ int) (int, string) {
+		if utf8.RuneCountInString(text) > 80 {
+			return http.StatusBadRequest,
+				`{"error":{"code":"context_length_exceeded","message":"too long"}}`
+		}
+		return http.StatusOK, completionBody(t, entriesJSON(t, "leaf"))
+	})
+	seedSession(t, d, "sess-1", []db.Message{
+		{Role: "assistant", Content: strings.Repeat("abcde ", 30)},
+	}, nil)
+	m := newManager(t, d, server.URL, func(cfg *ManagerConfig) {
+		cfg.Segmenter = TurnsV1{MaxWindowChars: 400}
+	})
+
+	result, err := m.RunPass(t.Context(), PassOptions{})
+	require.NoError(t, err)
+	require.Equal(t, 0, result.Failed)
+	requests := log.all()
+	require.Greater(t, len(requests), 2, "the unit must split into several leaves")
+	for i, request := range requests {
+		assert.Equal(t, unexecutedEntryTypesLiteral, requestEntryTypes(t, request), "request %d", i)
+		assert.Equal(t, unexecutedActionPreamble+"\n\naction prompt",
+			requestText(t, request, "system"), "request %d", i)
+	}
+}
+
+func TestUnitsDigestCoversToolUse(t *testing.T) {
+	units := func(toolUse bool) []Unit {
+		return []Unit{
+			{Role: RoleIntent, Text: "ask", OrdinalStart: 0, OrdinalEnd: 0},
+			{Role: RoleAction, Text: "did it", OrdinalStart: 1, OrdinalEnd: 1, ToolUse: toolUse},
+		}
+	}
+	without, with := unitsDigest(units(false)), unitsDigest(units(true))
+	assert.Equal(t, without, unitsDigest(units(false)))
+	assert.Equal(t, with, unitsDigest(units(true)))
+	assert.NotEqual(t, without, with)
+}
+
+// TestUnexecutedActionUnitsLive runs the issue's proposal-only fixture through
+// a real manager pass against a configured model, so the extractSession gate
+// decides the request. It asserts only the schema guarantee; wording is left
+// to review of the logged entries. Opt in with AGENTSVIEW_RECALL_TEST_ENDPOINT
+// and AGENTSVIEW_RECALL_TEST_MODEL (optional AGENTSVIEW_RECALL_TEST_API_KEY).
+func TestUnexecutedActionUnitsLive(t *testing.T) {
+	endpoint := strings.TrimSpace(os.Getenv("AGENTSVIEW_RECALL_TEST_ENDPOINT"))
+	model := strings.TrimSpace(os.Getenv("AGENTSVIEW_RECALL_TEST_MODEL"))
+	if endpoint == "" || model == "" {
+		t.Skip("set AGENTSVIEW_RECALL_TEST_ENDPOINT and AGENTSVIEW_RECALL_TEST_MODEL")
+	}
+	profile, err := ResolveProfile("", model)
+	require.NoError(t, err)
+	fixture, err := os.ReadFile(filepath.Join("testdata", "proposal_only.txt"))
+	require.NoError(t, err)
+
+	d := newTestArchive(t)
+	ctx := t.Context()
+	seedSession(t, d, "sess-live", []db.Message{
+		{Role: "assistant", Content: string(fixture)},
+	}, nil)
+	m := newManager(t, d, endpoint, func(cfg *ManagerConfig) {
+		cfg.Client.APIKey = os.Getenv("AGENTSVIEW_RECALL_TEST_API_KEY")
+		cfg.Client.Model = model
+		cfg.Client.Request = profile.Request
+		cfg.Prompts = PromptsFor(profile, nil)
+		cfg.Identity = ModelIdentity{Model: model}
+		cfg.MaxAttempts = 1
+	})
+
+	result, err := m.RunPass(ctx, PassOptions{})
+	require.NoError(t, err)
+	require.Equal(t, 0, result.Failed, "the model returned an entry type the request did not allow")
+	for i := range maxResponseEntries {
+		entry, err := d.GetRecallEntry(ctx, EntryID(m.Fingerprint(), "sess-live", 0, i))
+		require.NoError(t, err)
+		if entry == nil {
+			break
+		}
+		t.Logf("model=%s entry=%d type=%s title=%q body=%q", model, i, entry.Type, entry.Title, entry.Body)
+		assert.NotEqual(t, "procedure", entry.Type)
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/rawcheckpoint"
 	"go.kenn.io/agentsview/internal/rawsync"
+	"go.kenn.io/kit/atomicfile"
 )
 
 type fileOperations struct {
@@ -153,7 +154,7 @@ func (s *capturePlanScope) MatchesRoots(plan parser.RawCapturePlan) bool {
 
 func defaultFileOperations() fileOperations {
 	return fileOperations{
-		openRoot: (*os.Root).Open, stat: os.Stat, rename: os.Rename, remove: os.Remove,
+		openRoot: (*os.Root).Open, stat: os.Stat, rename: atomicfile.Replace, remove: os.Remove,
 		removeAll: os.RemoveAll, syncDir: syncDirectory,
 	}
 }
@@ -282,7 +283,7 @@ func (c *Capturer) captureAppendFile(
 	if !before.Mode().IsRegular() || !stableFileInfo(observed.info, before) ||
 		before.Size() <= base.Length ||
 		beforeIdentity == "" || beforeIdentity != observed.identity ||
-		beforeIdentity != base.FileIdentity {
+		captureCheckpointIdentity(observed) != base.FileIdentity {
 		return rawcheckpoint.CapturedEntry{}, false, ErrSourceChanged
 	}
 	temporary, err := os.CreateTemp(c.store.CaptureTempDir(), "capture-append-*")
@@ -388,7 +389,7 @@ func (c *Capturer) captureReusedFile(
 	}
 	identity := stableFileIdentity(file, before)
 	if !before.Mode().IsRegular() || before.Size() != base.Length ||
-		identity == "" || identity != observed.identity || identity != base.FileIdentity {
+		identity == "" || identity != observed.identity || captureCheckpointIdentity(observed) != base.FileIdentity {
 		return rawcheckpoint.CapturedEntry{}, ErrSourceChanged
 	}
 	hash := sha256.New()

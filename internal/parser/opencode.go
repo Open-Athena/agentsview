@@ -1403,16 +1403,21 @@ func finishOpenCodeSessionContext(
 	if len(parsed) == 0 {
 		return nil, nil, nil
 	}
+	// session.title holds both /rename names and generated titles; the
+	// placeholder OpenCode assigns before generating one is not a title.
+	sessionName := strings.TrimSpace(s.title)
+	if isOpenCodeDefaultTitle(sessionName) {
+		sessionName = ""
+	}
 	firstMsg := ""
-	if s.title != "" && !isOpenCodeDefaultTitle(s.title) {
-		firstMsg = truncate(s.title, 300)
-	} else {
-		for _, m := range parsed {
-			if m.Role == RoleUser && !m.IsSystem {
-				firstMsg = truncate(strings.ReplaceAll(m.Content, "\n", " "), 300)
-				break
-			}
+	for _, m := range parsed {
+		if m.Role == RoleUser && !m.IsSystem {
+			firstMsg = truncate(strings.ReplaceAll(m.Content, "\n", " "), 300)
+			break
 		}
+	}
+	if firstMsg == "" {
+		firstMsg = truncate(sessionName, 300)
 	}
 
 	project := ExtractProjectFromCwdWithBranchContext(ctx, projectWorktree, "")
@@ -1443,6 +1448,7 @@ func finishOpenCodeSessionContext(
 		Cwd:              cwd,
 		ParentSessionID:  parentID,
 		FirstMessage:     firstMsg,
+		SessionName:      sessionName,
 		StartedAt:        startedAt,
 		EndedAt:          endedAt,
 		MessageCount:     len(parsed),
@@ -1681,11 +1687,17 @@ type openCodeToolData struct {
 type openCodeToolState struct {
 	Input    jsontext.Value `json:"input"`
 	Metadata jsontext.Value `json:"metadata"`
+	Status   string         `json:"status"`
+	Time     struct {
+		Start int64 `json:"start"`
+		End   int64 `json:"end"`
+	} `json:"time"`
 }
 
 // openCodeToolMetadata holds the optional metadata from a tool state.
 type openCodeToolMetadata struct {
-	Exit int `json:"exit"`
+	Exit        int  `json:"exit"`
+	Interrupted bool `json:"interrupted"`
 }
 
 func extractOpenCodeToolCall(data, cwd string) ParsedToolCall {
@@ -1695,12 +1707,16 @@ func extractOpenCodeToolCall(data, cwd string) ParsedToolCall {
 	}
 
 	var (
-		inputJSON string
-		isFailure bool
+		inputJSON     string
+		isFailure     bool
+		state         openCodeToolState
+		stateValid    bool
+		metadata      openCodeToolMetadata
+		metadataValid bool
 	)
 	if len(d.State) > 0 {
-		var state openCodeToolState
 		if err := json.Unmarshal(d.State, &state); err == nil {
+			stateValid = true
 			if len(state.Input) > 0 {
 				inputJSON = string(state.Input)
 			}
@@ -1708,10 +1724,12 @@ func extractOpenCodeToolCall(data, cwd string) ParsedToolCall {
 			// state metadata. On Windows the output text carries
 			// no "exit status N" marker, so metadata.exit is the
 			// only reliable failure signal.
-			if d.ToolName == "bash" && len(state.Metadata) > 0 {
-				var m openCodeToolMetadata
-				if err := json.Unmarshal(state.Metadata, &m); err == nil && m.Exit > 0 {
-					isFailure = true
+			if len(state.Metadata) > 0 {
+				if err := json.Unmarshal(state.Metadata, &metadata); err == nil {
+					metadataValid = true
+					if d.ToolName == "bash" && metadata.Exit > 0 {
+						isFailure = true
+					}
 				}
 			}
 		}
@@ -1744,7 +1762,32 @@ func extractOpenCodeToolCall(data, cwd string) ParsedToolCall {
 		isFailure = true
 	}
 
-	if isFailure {
+	terminal := stateValid && (state.Status == "completed" || state.Status == "error")
+	started := state.Time.Start > 0
+	ordered := state.Time.End >= state.Time.Start
+	interrupted := metadataValid && metadata.Interrupted
+	syntheticInterrupted := state.Status == "error" && interrupted && state.Time.Start == state.Time.End
+	// Interrupted calls can carry equal synthetic bounds without running.
+	if terminal && started && ordered && !syntheticInterrupted {
+		status := "completed"
+		if state.Status == "error" || isFailure {
+			status = "errored"
+		}
+		tc.ResultEvents = append(tc.ResultEvents,
+			ParsedToolResultEvent{
+				ToolUseID: d.CallID,
+				Source:    "tool_execution",
+				Status:    "started",
+				Timestamp: millisToTime(state.Time.Start),
+			},
+			ParsedToolResultEvent{
+				ToolUseID: d.CallID,
+				Source:    "tool_execution",
+				Status:    status,
+				Timestamp: millisToTime(state.Time.End),
+			},
+		)
+	} else if isFailure {
 		tc.ResultEvents = append(tc.ResultEvents, ParsedToolResultEvent{
 			ToolUseID: d.CallID,
 			Status:    "errored",

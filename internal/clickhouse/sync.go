@@ -3,10 +3,8 @@ package clickhouse
 import (
 	"context"
 	"database/sql"
-	"encoding/json/v2"
 	"errors"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,10 +12,6 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/storage"
 )
-
-// localSyncTimestampLayout is the layout ListSessionsForMirrorWindow
-// compares sync_marker against.
-const localSyncTimestampLayout = "2006-01-02T15:04:05.000Z"
 
 // Sync pushes the SQLite archive into one ClickHouse mirror. Push is
 // one-way: it never reads content back into SQLite.
@@ -29,6 +23,9 @@ type Sync struct {
 	excludeProjects []string
 	// vectorSource, when non-nil, enables the vector push phase.
 	vectorSource storage.VectorPushSource
+	// sessionBatchSize is how many sessions share one set of insert blocks
+	// and delete statements. Zero selects sessionPushBatchSize.
+	sessionBatchSize int
 
 	connMu sync.Mutex
 	conn   *sql.DB
@@ -43,8 +40,20 @@ type Sync struct {
 	// snapshot syncUsagePrices loaded.
 	pricer *usagePricer
 
+	// fullRunRecorded reports that the current push recorded its full push
+	// run, so a later failure can resume it.
+	fullRunRecorded bool
+
+	// unownedPruned records that this Sync already removed this machine's
+	// mirror sessions without an archive id that the archive no longer
+	// holds. Pushes always record their archive, so no new ones appear.
+	unownedPruned bool
+
 	// hooks is nil in production; tests inject failures at push boundaries.
 	hooks *pushHooks
+	// vectorBatchSessions overrides the vector flush session bound when
+	// positive; tests lower it to cover several flushes in one push.
+	vectorBatchSessions int
 
 	closeOnce sync.Once
 	closeErr  error
@@ -57,6 +66,9 @@ type pushHooks struct {
 	// its stale rows deleted, before the session rows (and fingerprints)
 	// land.
 	beforeSessionRows func(batch []db.Session) error
+	// beforeVectorState runs after a vector batch's documents and chunks are
+	// written and its stale rows deleted, before its push state rows land.
+	beforeVectorState func(sessionIDs []string) error
 }
 
 // SyncStatus summarizes a mirror from its own metadata.
@@ -151,33 +163,7 @@ func (s *Sync) isFiltered() bool {
 }
 
 func (s *Sync) scopeString() string {
-	return canonicalPushScope(s.projects, s.excludeProjects)
-}
-
-// canonicalPushScope renders the project filters so a scope change is
-// detectable across pushes. Unfiltered is the empty string.
-func canonicalPushScope(projects, excludeProjects []string) string {
-	if len(projects) == 0 && len(excludeProjects) == 0 {
-		return ""
-	}
-	scope := struct {
-		Projects []string `json:"projects,omitempty"`
-		Exclude  []string `json:"exclude,omitempty"`
-	}{Projects: sortedCopy(projects), Exclude: sortedCopy(excludeProjects)}
-	data, err := json.Marshal(scope)
-	if err != nil {
-		return ""
-	}
-	return string(data)
-}
-
-func sortedCopy(values []string) []string {
-	if len(values) == 0 {
-		return nil
-	}
-	out := append([]string(nil), values...)
-	sort.Strings(out)
-	return out
+	return db.CanonicalPushScope(s.projects, s.excludeProjects)
 }
 
 // Status reads this archive's push state and the mirror's row counts.

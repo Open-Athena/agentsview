@@ -40,6 +40,18 @@ func TestToolCallResultSummaryStorage(t *testing.T) {
 			wantLoaded:    "total 4\ndrwxr-xr-x",
 		},
 		{
+			name: "timed event summary is not stored",
+			call: ToolCall{
+				ToolName: "Bash", Category: "Bash", ToolUseID: "call_timed",
+				ResultContent: "output", ResultContentLength: len("output"),
+				ResultEvents: []ToolResultEvent{
+					{ToolUseID: "call_timed", Source: "tool_execution", Status: "started"},
+					{ToolUseID: "call_timed", Source: "tool_execution", Status: "completed", Content: "output", ContentLength: len("output")},
+				},
+			},
+			wantStored: "", wantStoredLen: len("output"), wantLoaded: "output",
+		},
+		{
 			name: "multi event summary is stored",
 			call: ToolCall{
 				ToolName:            "Task",
@@ -174,6 +186,13 @@ func TestToolCallResultSummaryStorage(t *testing.T) {
 				"loaded ToolCall.ResultContent")
 			assert.Len(t, msgs[0].ToolCalls[0].ResultEvents,
 				len(call.ResultEvents), "result events survive")
+			tx, err := d.getWriter().Begin(t.Context())
+			require.NoError(t, err)
+			defer func() { require.NoError(t, tx.Rollback()) }()
+			facts, err := (signalTxQuery{tx: tx, sessionID: "s-dedup"}).TrailingToolCalls(t.Context(), 1)
+			require.NoError(t, err)
+			require.Len(t, facts, 1)
+			assert.Equal(t, tt.wantLoaded, facts[0].ResultContent, "signal SQL result content")
 		})
 	}
 }
@@ -196,13 +215,16 @@ func TestSearchSessionFindsDedupedResultContent(t *testing.T) {
 			ToolUseID:           "call_find",
 			ResultContent:       "needle in the output",
 			ResultContentLength: len("needle in the output"),
-			ResultEvents: []ToolResultEvent{{
-				ToolUseID:     "call_find",
-				Source:        "function_call_output",
-				Status:        "completed",
-				Content:       "needle in the output",
-				ContentLength: len("needle in the output"),
-			}},
+			ResultEvents: []ToolResultEvent{
+				{ToolUseID: "call_find", Source: "tool_execution", Status: "started"},
+				{
+					ToolUseID:     "call_find",
+					Source:        "tool_execution",
+					Status:        "completed",
+					Content:       "needle in the output",
+					ContentLength: len("needle in the output"),
+				},
+			},
 		}},
 	}}))
 
@@ -231,6 +253,14 @@ func TestRestoreToolCallResultContent(t *testing.T) {
 			call: ToolCall{
 				ResultContentLength: 5,
 				ResultEvents:        []ToolResultEvent{{Content: "event"}},
+			},
+			want: "event",
+		},
+		{
+			name: "timed event refills a cleared summary",
+			call: ToolCall{
+				ResultContentLength: 5,
+				ResultEvents:        []ToolResultEvent{{Status: "started"}, {Status: "completed", Content: "event"}},
 			},
 			want: "event",
 		},
@@ -266,6 +296,46 @@ func TestRestoreToolCallResultContent(t *testing.T) {
 	}
 }
 
+func TestSubagentLinkResultEventInheritsChild(t *testing.T) {
+	for _, tt := range []struct {
+		name, storedChild, linkedChild, eventChild, want string
+	}{
+		{"new link", "", "imported:agent-child", "", "imported:agent-child"},
+		{"existing link", "imported:agent-child", "", "", "imported:agent-child"},
+		{"explicit event link", "imported:agent-child", "", "imported:agent-other", "imported:agent-other"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDB(t)
+			insertSession(t, d, "parent", "project")
+			require.NoError(t, d.InsertMessages(t.Context(), []Message{{
+				SessionID: "parent", Ordinal: 0, Role: "assistant",
+				ToolCalls: []ToolCall{{
+					ToolUseID: "call-1", ToolName: "Agent", Category: "Task",
+					SubagentSessionID: tt.storedChild,
+				}},
+			}}))
+			_, err := d.WriteSessionIncremental(t.Context(), "parent", nil, IncrementalSessionUpdate{
+				MsgCount: 1, NextOrdinal: 1,
+				SubagentLinks: []ToolCallSubagentLink{{
+					ToolUseID: "call-1", SubagentSessionID: tt.linkedChild, HasResult: true,
+					ResultEvents: []ToolResultEvent{{
+						Source: "tool_result", Content: "done", SubagentSessionID: tt.eventChild,
+					}},
+				}},
+			})
+			require.NoError(t, err)
+			messages, err := d.GetAllMessages(t.Context(), "parent")
+			require.NoError(t, err)
+			require.Len(t, messages, 1)
+			require.Len(t, messages[0].ToolCalls, 1)
+			call := messages[0].ToolCalls[0]
+			assert.Equal(t, "imported:agent-child", call.SubagentSessionID)
+			require.Len(t, call.ResultEvents, 1)
+			assert.Equal(t, tt.want, call.ResultEvents[0].SubagentSessionID)
+		})
+	}
+}
+
 // TestSubagentLinkKeepsDedupedSummary pins the incremental link path: a
 // linked result that repeats the call's single stored event must not
 // re-inflate result_content, while a summary the event does not carry is
@@ -286,15 +356,10 @@ func TestSubagentLinkKeepsDedupedSummary(t *testing.T) {
 			ToolUseID:           "call_link",
 			ResultContent:       "agent finished",
 			ResultContentLength: len("agent finished"),
-			// The event carries no ToolUseID of its own; the insert path
-			// copies the call's id onto it, so the link path could find it
-			// either way. The test pins the stored shape, not the key.
-			ResultEvents: []ToolResultEvent{{
-				Source:        "subagent_notification",
-				Status:        "completed",
-				Content:       "agent finished",
-				ContentLength: len("agent finished"),
-			}},
+			ResultEvents: []ToolResultEvent{
+				{Source: "tool_execution", Status: "started"},
+				{Source: "subagent_notification", Status: "completed", Content: "agent finished", ContentLength: len("agent finished")},
+			},
 		}},
 	}}))
 

@@ -18,13 +18,6 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 )
 
-// TestStoreHasSemanticFalse pins that the PostgreSQL store reports no
-// semantic search capability until it gets its own VectorSearcher seam.
-func TestStoreHasSemanticFalse(t *testing.T) {
-	s := &Store{}
-	assert.False(t, s.HasSemantic(), "PostgreSQL HasSemantic")
-}
-
 // TestStoreSearchContentSemanticModesUnavailable pins that "semantic" and
 // "hybrid" are rejected with db.ErrSemanticUnavailable before any query runs
 // -- a zero-value Store (no live *sql.DB) is enough to prove that.
@@ -73,28 +66,6 @@ func TestStoreSearchContentSemanticInvalidInputReturns400Before501(t *testing.T)
 	}
 }
 
-// TestStripFTSQuotes pins the de-quoting behavior the PostgreSQL Search path
-// relies on. The canonical implementation lives in the db package and is
-// shared with the SQLite and HTTP paths so the backends stay in parity.
-func TestStripFTSQuotes(t *testing.T) {
-	tests := []struct {
-		input string
-		want  string
-	}{
-		{`"hello world"`, "hello world"},
-		{`hello`, "hello"},
-		{`"error" "401"`, "error 401"},
-		{`"error-401"`, "error-401"},
-		{`""`, ""},
-		{`"a"`, "a"},
-		{`already unquoted`, "already unquoted"},
-	}
-	for _, tt := range tests {
-		assert.Equal(t, tt.want, db.StripFTSQuotes(tt.input),
-			"input=%q", tt.input)
-	}
-}
-
 func TestEscapeLike(t *testing.T) {
 	tests := []struct {
 		input string
@@ -110,24 +81,6 @@ func TestEscapeLike(t *testing.T) {
 		assert.Equal(t, tt.want, escapeLike(tt.input),
 			"input=%q", tt.input)
 	}
-}
-
-func TestPGMessagesBranchFTSRequiresAllTerms(t *testing.T) {
-	pb := &paramBuilder{}
-	branch := pgMessagesBranch(
-		db.ContentSearchFilter{
-			Pattern: "quick fox",
-			Mode:    "fts",
-		},
-		escapeLike("quick fox"),
-		pb,
-	)
-
-	assert.Contains(t, branch,
-		"m.content ILIKE '%'||$1||'%' ESCAPE E'\\\\'")
-	assert.Contains(t, branch,
-		"m.content ILIKE '%'||$2||'%' ESCAPE E'\\\\'")
-	assert.Equal(t, []any{"quick", "fox"}, pb.args)
 }
 
 func TestPGSubstringSnippetFTSModeCentersOnFirstTerm(t *testing.T) {
@@ -373,7 +326,7 @@ func (c *emptyTrashProbeConn) QueryContext(
 	}
 	return &emptyTrashProbeRows{
 		columns: []string{
-			"id", "alias_id", "session_id", "alias_id",
+			"id", "alias_id", "session_id", "alias_id", "trash_includes_codex_pages",
 		},
 		values: values,
 	}, nil
@@ -412,7 +365,7 @@ func (s *emptyTrashProbeState) trashedSessionAliasRowsLocked(
 		if len(reverseAliases) == 0 {
 			for _, aliasID := range directAliases {
 				values = append(values, []driver.Value{
-					id, nullableDriverString(aliasID), nil, nil,
+					id, nullableDriverString(aliasID), nil, nil, false,
 				})
 			}
 			continue
@@ -423,7 +376,7 @@ func (s *emptyTrashProbeState) trashedSessionAliasRowsLocked(
 					id,
 					nullableDriverString(aliasID),
 					reverseAlias[0],
-					nullableDriverString(reverseAlias[1]),
+					nullableDriverString(reverseAlias[1]), false,
 				})
 			}
 		}

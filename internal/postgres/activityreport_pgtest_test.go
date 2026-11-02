@@ -281,6 +281,9 @@ func TestPGGetActivityReportIncludesSubagentUsage(t *testing.T) {
 			 '2026-06-16T10:05:00Z'::timestamptz,
 			 '2026-06-16T10:06:00Z'::timestamptz, 1, 1, 'root', 'fork')`)
 	require.NoError(t, err, "insert sessions")
+	_, err = store.DB().ExecContext(ctx, `UPDATE sessions SET is_automated = true WHERE id = 'agent-sub'`)
+	require.NoError(t, err)
+
 	_, err = store.DB().ExecContext(ctx, `
 		INSERT INTO messages (
 			session_id, ordinal, role, content, timestamp,
@@ -319,6 +322,12 @@ func TestPGGetActivityReportIncludesSubagentUsage(t *testing.T) {
 	// Cost = root (1000*3+500*15)/1e6 + subagent (2000*3+700*15)/1e6; the
 	// fork's duplicate row contributes nothing.
 	assert.Equal(t, money.MustParseDollars("0.027"), r.Totals.Cost)
+	_, err = store.DB().ExecContext(ctx, `UPDATE sessions SET entrypoint = 'sdk-cli', parent_session_id = NULL WHERE id = 'agent-sub'`)
+	require.NoError(t, err)
+	r, err = store.GetActivityReport(ctx, db.AnalyticsFilter{Timezone: "UTC"}, pgDayQuery(t, "2026-06-16", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, 1, r.Totals.SubagentSessions)
+	assert.Zero(t, r.Totals.AutomatedSessions)
 }
 
 func TestPGGetActivityReportPricingModelsOnlyIncludeDedupSurvivors(t *testing.T) {
@@ -582,8 +591,8 @@ func TestPGGetActivityReportDedupUsesChronologicalOrder(t *testing.T) {
 	ids := []string{"dup-b", "dup-a"}
 
 	q := pgDayQuery(t, "2026-06-16", "UTC")
-	lower := paddedUTCBound(q.RangeStart.UTC().Format(time.RFC3339), -14)
-	upper := paddedUTCBound(q.RangeEnd.UTC().Format(time.RFC3339), 14)
+	lower := db.PaddedUTCBound(q.RangeStart.UTC().Format(time.RFC3339), -14)
+	upper := db.PaddedUTCBound(q.RangeEnd.UTC().Format(time.RFC3339), 14)
 	usage, _, err := store.activityReportUsage(ctx, ids, lower, upper, q)
 	require.NoError(t, err)
 
@@ -682,53 +691,6 @@ func TestPGGetActivityReportDeduplicatesAfterProjectFilter(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 631, report.Totals.OutputTokens,
 		"an excluded duplicate must not suppress included usage")
-}
-
-func TestPGGetActivityReportUsageDedupFallsBackToSourceUUID(t *testing.T) {
-	_, store := prepareUsageSchema(t, "agentsview_daily_report_sourceuuid_test")
-	ctx := context.Background()
-
-	_, err := store.DB().ExecContext(ctx, `
-		INSERT INTO model_pricing (
-			model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
-			cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok, updated_at
-		) VALUES ('claude-sonnet-4-20250514', 3000000, 15000000, 0, 0, 'seed')`)
-	require.NoError(t, err, "insert pricing")
-
-	_, err = store.DB().ExecContext(ctx, `
-		INSERT INTO sessions (
-			id, machine, project, agent, started_at, ended_at,
-			message_count, user_message_count
-		) VALUES
-			('earlier', 'test-machine', 'proj1', 'claude',
-			 '2026-06-16T10:30:00Z'::timestamptz,
-			 '2026-06-16T10:30:00Z'::timestamptz, 1, 1),
-			('later', 'test-machine', 'proj2', 'claude',
-			 '2026-06-16T10:30:01Z'::timestamptz,
-			 '2026-06-16T10:30:01Z'::timestamptz, 1, 1)`)
-	require.NoError(t, err, "insert sessions")
-	_, err = store.DB().ExecContext(ctx, `
-		INSERT INTO messages (
-			session_id, ordinal, role, content, timestamp,
-			content_length, model, token_usage,
-			claude_message_id, source_uuid
-		) VALUES
-			('earlier', 0, 'assistant', 'x',
-			 '2026-06-16T10:30:00Z'::timestamptz, 1,
-			 'claude-sonnet-4-20250514',
-			 '{"input_tokens":1000,"output_tokens":500}', 'M1', 'SRC1'),
-			('later', 0, 'assistant', 'x',
-			 '2026-06-16T10:30:01Z'::timestamptz, 1,
-			 'claude-sonnet-4-20250514',
-			 '{"input_tokens":1000,"output_tokens":900}', 'M1', 'SRC1')`)
-	require.NoError(t, err, "insert messages")
-
-	r, err := store.GetActivityReport(
-		ctx, db.AnalyticsFilter{Timezone: "UTC"},
-		pgDayQuery(t, "2026-06-16", "UTC"))
-	require.NoError(t, err)
-	assert.Equal(t, 500, r.Totals.OutputTokens,
-		"incomplete Claude pairs fall back to source_uuid dedup in activity reports")
 }
 
 // TestPGGetActivityReportAutomationFilterAndSessionSplit confirms the shared

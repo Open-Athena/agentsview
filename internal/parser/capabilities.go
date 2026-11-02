@@ -40,6 +40,19 @@ const (
 type ProviderSyncSemantics struct {
 	FingerprintHashInCacheKey           bool
 	FingerprintHashRequiredForFreshness bool
+	// BatchFingerprintCache shares member fingerprint reads within a sync pass.
+	BatchFingerprintCache bool
+	// PartialDiscovery means discovery and changed-path resolution can
+	// return usable sources together with DiscoveryIncompleteError. The
+	// engine syncs those sources and still reports the failure.
+	PartialDiscovery bool
+	// MemberFreshnessOverridesFileForce means one physical file expands into
+	// per-session member sources, and each member's own freshness check
+	// decides whether it is rewritten. A file-level ForceFullParse, such as
+	// a remote import marking a fetched database, does not force every
+	// member to be rewritten. The provider's standalone sources, which are
+	// physical files themselves, keep the force.
+	MemberFreshnessOverridesFileForce bool
 	// SkipCacheFreshWithoutStoredRow permits a matching skip-cache entry to
 	// remain fresh before this provider has persisted a row for the source.
 	SkipCacheFreshWithoutStoredRow bool
@@ -61,6 +74,10 @@ type SourceCapabilities struct {
 	CompositeFingerprint CapabilitySupport
 	IncrementalAppend    CapabilitySupport
 	MultiSessionSource   CapabilitySupport
+	// AppOwnedStore means the stored file_path can be the app's shared
+	// state.db, so prune leaves it in place. OwnsAppStore recognizes only
+	// state.db stores; a provider with another store layout must extend it.
+	AppOwnedStore CapabilitySupport
 	// SharedContainerSource means streaming discovery emits multiple logical
 	// virtual members from one physical container and exact reconciliation
 	// rehydration is required to avoid reopening or rescanning that container.
@@ -95,6 +112,20 @@ type SourceCapabilities struct {
 	// they opt in; the sync engine uses the flag instead of a hardcoded
 	// Claude/Codex whitelist.
 	S3Discovery CapabilitySupport
+	// SharedSessionIDs means two of the provider's files can carry the same
+	// session id as separate sessions (Gemini CLI chat segments, Cursor
+	// transcripts copied between projects). The sync engine then keeps the
+	// stored file on the id and stores the other under parser.AltSessionID.
+	SharedSessionIDs CapabilitySupport
+	// StoredMemberFreshnessListing means the provider answers a changed-path
+	// event for a shared container with only the members whose change marker
+	// ChangedPathRequest.StoredMemberFreshnessPage does not cover, and resolves
+	// that container through ResolveStoredMemberFreshnessContainer. The listing
+	// must read one database snapshot: the engine skips its post-listing
+	// re-list for these providers, since a commit during the listing arrives as
+	// its own watcher event. The OpenCode family receives the pager through its
+	// own engine route; other providers receive it only by declaring this.
+	StoredMemberFreshnessListing CapabilitySupport
 }
 
 // ContentCapabilities declares optional normalized content fields a provider

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"go.kenn.io/agentsview/internal/db"
 )
@@ -48,6 +49,8 @@ func (s *Store) searchContentSemantic(
 			SessionID:       h.SessionID,
 			Project:         info.project,
 			Agent:           info.agent,
+			Machine:         info.machine,
+			DisplayName:     info.displayName,
 			Location:        "message",
 			Role:            info.role,
 			Ordinal:         h.Ordinal,
@@ -74,44 +77,10 @@ func (s *Store) searchContentSemantic(
 func (s *Store) survivingVectorHits(
 	ctx context.Context, f db.ContentSearchFilter, searcher db.VectorSearcher, k int,
 ) ([]db.VectorHit, error) {
-	hits, err := searcher.SemanticSearch(ctx, f.Pattern, k)
-	if err != nil {
-		return nil, err
-	}
-	if len(hits) == 0 {
-		return nil, nil
-	}
-	ids := make([]string, 0, len(hits))
-	for _, h := range hits {
-		ids = append(ids, h.SessionID)
-	}
-	allowed, err := s.semanticAllowedSessionIDs(ctx, f, uniqueIDs(ids))
-	if err != nil {
-		return nil, err
-	}
-	surviving := make([]db.VectorHit, 0, len(hits))
-	for _, h := range hits {
-		if allowed[h.SessionID] && !db.ScopeExcludes(f.Scope, h.Subordinate) {
-			surviving = append(surviving, h)
-		}
-	}
-	return surviving, nil
+	return db.SelectSurvivingVectorHits(ctx, f, searcher, k, s.semanticAllowedSessionIDs)
 }
 
-// semanticSessionFilter is the content-search session scope for the
-// semantic and hybrid modes: the shared db.ContentSessionFilter mapping plus
-// the child one-shot exemption, so child sessions are not dropped by the
-// one-shot gate while top-level one-shots keep their exclusion. Both modes
-// build their SQL with db.BuildSessionBaseFilterSQL, never the sidebar
-// filter: unit visibility for child sessions is governed by f.Scope, which
-// supersedes IncludeChildren, matching the SQLite and PostgreSQL paths.
-func semanticSessionFilter(f db.ContentSearchFilter) db.SessionFilter {
-	sf := db.ContentSessionFilter(f)
-	sf.ChildExemptOneShot = true
-	return sf
-}
-
-// semanticAllowedSessionIDs returns the subset of ids whose session passes
+// semanticAllowedSessionIDs returns activity eligibility for ids passing
 // the filter's metadata scope, reusing the shared session filter SQL so this
 // path cannot drift from the substring and regex scope.
 func (s *Store) semanticAllowedSessionIDs(
@@ -121,13 +90,21 @@ func (s *Store) semanticAllowedSessionIDs(
 	if len(ids) == 0 {
 		return allowed, nil
 	}
-	scopeWhere, scopeArgs := db.BuildSessionBaseFilterSQL(semanticSessionFilter(f), db.ClickHouseQueryDialect())
+	sessionFilter := db.SemanticContentSessionFilter(f)
+	sessionFilter.ExcludeActiveSince = time.Time{}
+	b := db.NewQueryBuilder(db.ClickHouseQueryDialect(), 0)
+	activity := "1"
+	if !f.ExcludeActiveSince.IsZero() {
+		activity = b.ExcludeActiveSincePredicate(f.ExcludeActiveSince)
+	}
+	scopeWhere, scopeArgs := db.BuildSessionBaseFilterSQL(sessionFilter, db.ClickHouseQueryDialect())
 	scopeWhere, scopeArgs = db.AppendExcludeSessionIDs(scopeWhere, scopeArgs, "id", f.ExcludeSessionIDs)
+	scopeArgs = append(b.Args(), scopeArgs...)
 	for batch := range idBatches(ids) {
 		placeholders, args := inArgs(batch)
 		if err := func() error {
 			rows, err := s.queryContext(ctx,
-				"SELECT id FROM sessions WHERE "+scopeWhere+" AND id IN ("+placeholders+")",
+				"SELECT id, "+activity+" FROM sessions WHERE "+scopeWhere+" AND id IN ("+placeholders+")",
 				append(append([]any{}, scopeArgs...), args...)...)
 			if err != nil {
 				return fmt.Errorf("clickhouse semantic search session scope: %w", err)
@@ -135,10 +112,11 @@ func (s *Store) semanticAllowedSessionIDs(
 			defer rows.Close()
 			for rows.Next() {
 				var id string
-				if err := rows.Scan(&id); err != nil {
+				var activityAllowed uint8
+				if err := rows.Scan(&id, &activityAllowed); err != nil {
 					return fmt.Errorf("scanning clickhouse semantic session id: %w", err)
 				}
-				allowed[id] = true
+				allowed[id] = activityAllowed != 0
 			}
 			return rows.Err()
 		}(); err != nil {
@@ -153,6 +131,8 @@ func (s *Store) semanticAllowedSessionIDs(
 // so secret redaction sees the same whole-body context the lexical paths do.
 type semanticHitInfo struct {
 	project, agent, role, timestamp, content string
+	machine                                  string
+	displayName                              *string
 	relationshipType, parentSessionID        string
 	isSidechain                              bool
 }
@@ -194,7 +174,7 @@ func (s *Store) enrichSemanticHitChunk(
 	}
 	rows, err := s.queryContext(ctx, `
 		WITH refs AS (`+strings.Join(parts, " UNION ALL ")+`)
-		SELECT m.session_id, s.project, s.agent, m.role, m.ordinal,
+		SELECT m.session_id, s.project, s.agent, s.machine, COALESCE(s.display_name, s.session_name), m.role, m.ordinal,
 			m.timestamp, m.content,
 			COALESCE(s.relationship_type, ''), COALESCE(s.parent_session_id, ''),
 			m.is_sidechain
@@ -210,7 +190,7 @@ func (s *Store) enrichSemanticHitChunk(
 		var info semanticHitInfo
 		var ordinal int64
 		var ts any
-		if err := rows.Scan(&ref.SessionID, &info.project, &info.agent,
+		if err := rows.Scan(&ref.SessionID, &info.project, &info.agent, &info.machine, &info.displayName,
 			&info.role, &ordinal, &ts, &info.content,
 			&info.relationshipType, &info.parentSessionID,
 			&info.isSidechain); err != nil {

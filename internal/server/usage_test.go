@@ -1,17 +1,20 @@
 package server_test
 
 import (
+	"database/sql"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"net/http"
-	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/server"
 	"go.kenn.io/agentsview/internal/service"
@@ -433,18 +436,36 @@ func TestHandleUsagePairwiseComparisonJSONShape(t *testing.T) {
 	assert.Equal(t, 1, resp.Right.SessionCount)
 }
 
+func TestHandleUsagePairwiseComparisonEmptyDefault(t *testing.T) {
+	te := setup(t)
+	w := te.get(t, buildPathURL("/api/v1/usage/pairwise-comparison", map[string]string{
+		"from": "2024-06-01", "to": "2024-06-01", "timezone": "UTC",
+	}))
+	assertStatus(t, w, http.StatusOK)
+	var raw struct {
+		Left  map[string]jsontext.Value `json:"left"`
+		Right map[string]jsontext.Value `json:"right"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &raw))
+	assert.NotContains(t, raw.Left, "dimension")
+	assert.NotContains(t, raw.Left, "value")
+	assert.NotContains(t, raw.Right, "dimension")
+	assert.NotContains(t, raw.Right, "value")
+}
+
 func TestHandleUsagePairwiseComparisonValidation(t *testing.T) {
 	te := setup(t)
 
 	cases := []map[string]string{
 		{
-			"from":            "2024-06-01",
-			"to":              "2024-06-01",
-			"timezone":        "UTC",
-			"left_dimension":  "model",
-			"left_value":      "claude-sonnet-4-20250514",
-			"right_dimension": "machine",
-			"right_value":     "beta",
+			"from":                "2024-06-01",
+			"to":                  "2024-06-01",
+			"timezone":            "UTC",
+			"left_dimension":      "model",
+			"left_value":          "claude-sonnet-4-20250514",
+			"right_dimension":     "machine",
+			"right_value":         "beta",
+			"fallback_to_default": "true",
 		},
 		{
 			"from":            "2024-06-01",
@@ -483,24 +504,89 @@ func TestUsageSummaryErrorRedaction(t *testing.T) {
 	assertStatus(t, w, http.StatusInternalServerError)
 }
 
-// Verify the route is actually registered by checking we
-// don't get a 404 for usage endpoints.
-func TestUsageRoutesRegistered(t *testing.T) {
+func TestHandleUsageTopSessionsGroupsByProjectKey(t *testing.T) {
 	te := setup(t)
+	conn, err := sql.Open("sqlite3", te.db.Path())
+	require.NoError(t, err)
+	defer conn.Close()
+	dbtest.SeedUsageGroups(t, conn)
+	catalog, err := te.db.BuildProjectIdentityMap(t.Context(), []string{"hermes-cron"})
+	require.NoError(t, err)
+	key := catalog["hermes-cron"].ProjectKey
+	require.NotEmpty(t, key)
+	params := map[string]string{"from": "2026-10-07", "to": "2026-10-10", "timezone": "UTC", "include_automated": "true", "group_by": "group", "project_key": key, "project": "hermes-cron", "sort": "tokens", "limit": "1"}
+	w := te.get(t, buildPathURL("/api/v1/usage/top-sessions", params))
+	assertStatus(t, w, http.StatusOK)
+	var response []map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.NotEmpty(t, response)
+	assert.Equal(t, "job-a", response[0]["groupKey"])
+}
 
-	endpoints := []string{
-		"/api/v1/usage/summary",
-		"/api/v1/usage/pairwise-comparison",
-		"/api/v1/usage/top-sessions",
-	}
-	for _, ep := range endpoints {
-		t.Run(ep, func(t *testing.T) {
-			req := httptest.NewRequestWithContext(t.Context(),
-				http.MethodGet, ep, nil,
-			)
-			w := httptest.NewRecorder()
-			te.handler.ServeHTTP(w, req)
-			assert.NotEqual(t, http.StatusNotFound, w.Code, "%s returned 404", ep)
+func TestUsageSummaryModelGroups(t *testing.T) {
+	te := setup(t, func(c *config.Config) {
+		c.ModelAliases = map[string]string{"claude-sonnet-4-20250514": "group", "gpt-4o": "group"}
+	})
+	seedUsagePairwiseEnv(t, te)
+	for _, tt := range []struct {
+		name, grouped, suffix string
+	}{
+		{"raw", "", ""},
+		{"grouped", "true", ""},
+		{"grouped stream", "true", "/stream"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			w := te.get(t, buildPathURL("/api/v1/usage/summary"+tt.suffix, map[string]string{
+				"from": "2024-06-01", "to": "2024-06-01", "timezone": "UTC",
+				"group_models": tt.grouped,
+			}))
+			assertStatus(t, w, http.StatusOK)
+			payload := w.Body.String()
+			if tt.suffix == "/stream" {
+				_, done, ok := strings.Cut(payload, "event: done\ndata: ")
+				require.True(t, ok, "no done event in %s", payload)
+				payload, _, _ = strings.Cut(done, "\n")
+			}
+			var body map[string]jsontext.Value
+			require.NoError(t, json.Unmarshal([]byte(payload), &body))
+			if tt.grouped == "true" {
+				assert.JSONEq(t, `{"claude-sonnet-4-20250514":"group","gpt-4o":"group"}`, string(body["model_aliases"]))
+				assert.NotContains(t, body, "pricing")
+				assert.NotContains(t, body, "schema_version")
+			} else {
+				assert.NotContains(t, body, "model_aliases")
+				assert.Contains(t, body, "pricing")
+				assert.Contains(t, body, "schema_version")
+			}
 		})
 	}
+}
+
+func TestUsageTopSessionsModelGroup(t *testing.T) {
+	te := setup(t, func(c *config.Config) {
+		c.ModelAliases = map[string]string{"claude-sonnet-4-20250514": "group", "gpt-4o": "group"}
+	})
+	seedUsagePairwiseEnv(t, te)
+	started := "2024-06-01T11:00:00Z"
+	te.seedSession(t, "unrelated-model", "gamma", 2, func(sess *db.Session) {
+		sess.StartedAt, sess.EndedAt = &started, &started
+		sess.UserMessageCount = 1
+	})
+	te.seedMessages(t, "unrelated-model", 2, func(_ int, m *db.Message) {
+		m.Timestamp = started
+		if m.Role == "assistant" {
+			m.Model = "unrelated"
+			m.TokenUsage = tokenUsageJSON
+		}
+	})
+	w := te.get(t, buildPathURL("/api/v1/usage/top-sessions", map[string]string{
+		"from": "2024-06-01", "to": "2024-06-01", "timezone": "UTC", "model": "group",
+	}))
+	assertStatus(t, w, http.StatusOK)
+	entries := decode[[]db.TopSessionEntry](t, w)
+	ids := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		ids = append(ids, entry.SessionID)
+	}
+	assert.ElementsMatch(t, []string{"pairwise-alpha-sonnet", "pairwise-beta-gpt"}, ids)
 }

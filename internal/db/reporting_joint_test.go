@@ -17,7 +17,7 @@ func TestReportingJointCellsPreserveTimeAndDimensions(t *testing.T) {
 	seedJointReporting(t, d)
 	opts := ReportingExportOptions{
 		Date: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC),
-		Now:  time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC), SchemaVersion: 4,
+		Now:  time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC), SchemaVersion: export.ReportingJointSchemaVersion,
 	}
 	day, err := d.ExportReportingDay(t.Context(), opts)
 	require.NoError(t, err)
@@ -94,6 +94,10 @@ func TestReportingJointSubagentsTakePrecedenceOverAutomation(t *testing.T) {
 			s.IsAutomated = session.automated
 			if session.subagent {
 				s.ParentSessionID = new("root")
+				if session.id == "automated-child" {
+					s.ParentSessionID = nil
+					s.Entrypoint = "sdk-cli"
+				}
 				s.RelationshipType = "subagent"
 			}
 		})
@@ -107,7 +111,7 @@ func TestReportingJointSubagentsTakePrecedenceOverAutomation(t *testing.T) {
 	}
 	day, err := d.ExportReportingDay(t.Context(), ReportingExportOptions{
 		Date: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC),
-		Now:  time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC), SchemaVersion: 4,
+		Now:  time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC), SchemaVersion: export.ReportingJointSchemaVersion,
 	})
 	require.NoError(t, err)
 	hour := day.Hours[12]
@@ -152,6 +156,7 @@ func TestReportingJointUsageOnlySubagentRetainsClassification(t *testing.T) {
 				s.Agent = "agent-a"
 				s.StartedAt, s.EndedAt = new("2026-07-27T08:00:00Z"), new("2026-07-27T08:01:00Z")
 				s.RelationshipType = "subagent"
+				s.ParentSessionID = new("parent")
 				s.IsAutomated = tc.automated
 			})
 			cost := money.MustParseDollars("0.003")
@@ -162,7 +167,7 @@ func TestReportingJointUsageOnlySubagentRetainsClassification(t *testing.T) {
 			}}))
 			day, err := d.ExportReportingDay(t.Context(), ReportingExportOptions{
 				Date: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC),
-				Now:  time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC), SchemaVersion: 4,
+				Now:  time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC), SchemaVersion: export.ReportingJointSchemaVersion,
 			})
 			require.NoError(t, err)
 			hour := day.Hours[9]
@@ -184,7 +189,7 @@ func TestReportingJointCorrectionsReplaceCellsWithinSnapshot(t *testing.T) {
 	seedJointReporting(t, d)
 	opts := ReportingExportOptions{
 		Date: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC),
-		Now:  time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC), SchemaVersion: 4,
+		Now:  time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC), SchemaVersion: export.ReportingJointSchemaVersion,
 	}
 	before, err := d.ExportReportingDay(t.Context(), opts)
 	require.NoError(t, err)
@@ -244,7 +249,7 @@ func TestReportingJointProjectScopeRequiresNewVersion(t *testing.T) {
 		Now:           time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC),
 		SchemaVersion: export.ReportingSchemaVersion, ProjectKeys: []string{"project-key"},
 	})
-	assert.ErrorContains(t, err, "project scope requires reporting schema 4")
+	assert.ErrorContains(t, err, "project scope requires reporting schema 5")
 }
 
 func TestReportingJointScopeDoesNotRechargeDuplicateUsage(t *testing.T) {
@@ -268,7 +273,7 @@ func TestReportingJointScopeDoesNotRechargeDuplicateUsage(t *testing.T) {
 	)
 	opts := ReportingExportOptions{
 		Date: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC),
-		Now:  time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC), SchemaVersion: 4,
+		Now:  time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC), SchemaVersion: export.ReportingJointSchemaVersion,
 	}
 	all, err := d.ExportReportingDay(t.Context(), opts)
 	require.NoError(t, err)
@@ -308,7 +313,7 @@ func TestReportingJointUnpricedTokensRetainKnownSearchFees(t *testing.T) {
 	})
 	day, err := d.ExportReportingDay(t.Context(), ReportingExportOptions{
 		Date: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC),
-		Now:  time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC), SchemaVersion: 4,
+		Now:  time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC), SchemaVersion: export.ReportingJointSchemaVersion,
 	})
 	require.NoError(t, err)
 	require.Len(t, day.Hours[12].Joint.Cells, 1)
@@ -333,7 +338,7 @@ func TestReportingJointStandaloneUsageDoesNotInheritEmptyLabelProject(t *testing
 	}}))
 	opts := ReportingExportOptions{
 		Date: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC),
-		Now:  time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC), SchemaVersion: 4,
+		Now:  time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC), SchemaVersion: export.ReportingJointSchemaVersion,
 	}
 	all, err := d.ExportReportingDay(t.Context(), opts)
 	require.NoError(t, err)

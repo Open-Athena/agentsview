@@ -26,9 +26,16 @@ type fakeVectorSearcher struct {
 	calls      int
 }
 
-func (f *fakeVectorSearcher) SemanticSearch(
-	_ context.Context, _ string, limit int,
-) ([]VectorHit, error) {
+func (f *fakeVectorSearcher) PrepareSemanticSearch(
+	context.Context, string,
+) (VectorSearchPage, int, error) {
+	return func(_ context.Context, limit int) ([]VectorHit, bool, error) {
+		hits, err := f.page(limit)
+		return hits, len(f.hits) < limit, err
+	}, 0, nil
+}
+
+func (f *fakeVectorSearcher) page(limit int) ([]VectorHit, error) {
 	f.calls++
 	if f.err != nil {
 		return nil, f.err
@@ -85,17 +92,6 @@ func TestSearchContentSemanticNoSearcherUnavailable(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrSemanticUnavailable,
 		"expected ErrSemanticUnavailable, got %v", err)
-}
-
-func TestHasSemanticFlipsWithSetVectorSearcher(t *testing.T) {
-	d := testDB(t)
-	require.False(t, d.HasSemantic(), "HasSemantic before SetVectorSearcher")
-
-	d.SetVectorSearcher(&fakeVectorSearcher{})
-	assert.True(t, d.HasSemantic(), "HasSemantic after SetVectorSearcher")
-
-	d.SetVectorSearcher(nil)
-	assert.False(t, d.HasSemantic(), "HasSemantic after clearing the searcher")
 }
 
 func TestSearchContentSemanticRoutesAndPreservesRank(t *testing.T) {

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { errorTelemetry } from "../../utils/error-telemetry.js";
   import { Card } from "@kenn-io/kit-ui";
   import { usage } from "../../stores/usage.svelte.js";
   import { m } from "../../i18n/index.js";
@@ -44,6 +45,11 @@
 
   const cacheReadTokens = $derived(
     usage.summary?.totals.cacheReadTokens ?? 0,
+  );
+
+  // Everything the model read: uncached input plus cache writes and reads.
+  const totalInputTokens = $derived(
+    inputTokens + cacheCreationTokens + cacheReadTokens,
   );
 
   const totalTokens = $derived(
@@ -128,7 +134,7 @@
     }
     switch (usage.selectedTokenTypes[0]) {
       case "input":
-        return m.usage_summary_input_tokens();
+        return m.usage_uncached_input();
       case "cache_write":
         return m.usage_cache_writes();
       case "cache_read":
@@ -178,7 +184,11 @@
           featured: true,
         },
         {
-          label: () => m.usage_summary_input_tokens(),
+          label: () => m.usage_summary_total_input(),
+          value: () => fmtTokens(totalInputTokens),
+        },
+        {
+          label: () => m.usage_uncached_input(),
           value: () => fmtTokens(inputTokens),
           sub: () =>
             cachedTokens > 0
@@ -230,7 +240,7 @@
         sub: () => vsPrior ?? "",
         featured: true,
       },
-      ...(usage.timeSeriesSummary?.totals.copilotAICredits
+      ...(usage.colorSummary?.totals.copilotAICredits
         ? [
             {
               label: () => m.usage_summary_copilot_ai_credits(),
@@ -239,7 +249,11 @@
           ]
         : []),
       {
-        label: () => m.usage_summary_input_tokens(),
+        label: () => m.usage_summary_total_input(),
+        value: () => fmtTokens(totalInputTokens),
+      },
+      {
+        label: () => m.usage_uncached_input(),
         value: () => fmtTokens(inputTokens),
         sub: () =>
           cachedTokens > 0
@@ -313,11 +327,11 @@
 </div>
 
 {#if usage.errors.summary}
-  <div class="error-bar">
+  <div class="error-bar" {@attach errorTelemetry("analytics")}>
     <span>{usage.errors.summary}</span>
     <button
       class="retry-btn"
-      onclick={() => usage.fetchSummary()}
+      onclick={() => usage.fetchAll({ preserveTimeRange: true })}
     >
       {m.shared_retry()}
     </button>
@@ -334,7 +348,7 @@
   .summary-cards :global(.card) {
     flex: 1;
     min-width: 120px;
-    height: 90px;
+    min-height: 90px;
     padding: 12px;
     display: flex;
     flex-direction: column;

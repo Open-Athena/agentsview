@@ -77,11 +77,11 @@ func (e *Engine) planOneChangedPath(
 	claimed := false
 	agents := e.sortedAuthoritativeProviderAgents()
 	for _, agent := range agents {
-		roots := e.agentDirs[agent]
+		roots := e.sources().agentDirs[agent]
 		if len(roots) == 0 {
 			continue
 		}
-		factory := e.providerFactories[agent]
+		factory := e.sources().providerFactories[agent]
 		if factory == nil {
 			continue
 		}
@@ -92,7 +92,7 @@ func (e *Engine) planOneChangedPath(
 		}
 		provider := factory.NewProvider(parser.ProviderConfig{
 			Roots: roots, Machine: e.machine,
-			SourceMachines: e.sourceMachines[agent], PathRewriter: e.pathRewriter,
+			SourceMachines: e.sources().sourceMachines[agent], PathRewriter: e.pathRewriter,
 		})
 		watchRoots, err := e.providerChangedPathWatchRoots(ctx, agent, provider, roots)
 		if err != nil {
@@ -118,6 +118,11 @@ func (e *Engine) planOneChangedPath(
 			attribution.files = append(
 				attribution.files, e.classifyCodexIndexPath(ctx, path)...,
 			)
+			continue
+		}
+		if agent == parser.AgentAntigravity &&
+			strings.TrimSuffix(filepath.Base(path), "-wal") == parser.AntigravitySummariesDBName {
+			// The title store holds no transcripts; titles reconcile after the plan runs.
 			continue
 		}
 		matchingWatchRoots := matchingChangedPathRoots(path, watchRoots)
@@ -272,14 +277,14 @@ func (e *Engine) expandAffectedClaudeDuplicateCandidates(
 ) ([]parser.DiscoveredFile, error) {
 	providers := make(map[parser.AgentType]parser.Provider)
 	for _, agent := range []parser.AgentType{parser.AgentClaude, parser.AgentIcodemate} {
-		factory := e.providerFactories[agent]
-		roots := e.agentDirs[agent]
+		factory := e.sources().providerFactories[agent]
+		roots := e.sources().agentDirs[agent]
 		if factory == nil || len(roots) == 0 {
 			continue
 		}
 		providers[agent] = factory.NewProvider(parser.ProviderConfig{
 			Roots: roots, Machine: e.machine,
-			SourceMachines: e.sourceMachines[agent],
+			SourceMachines: e.sources().sourceMachines[agent],
 			PathRewriter:   e.pathRewriter,
 		})
 	}
@@ -365,8 +370,8 @@ func (e *Engine) expandAffectedClaudeDuplicateCandidates(
 }
 
 func (e *Engine) sortedAuthoritativeProviderAgents() []parser.AgentType {
-	agents := make([]parser.AgentType, 0, len(e.providerFactories))
-	for agent := range e.providerFactories {
+	agents := make([]parser.AgentType, 0, len(e.sources().providerFactories))
+	for agent := range e.sources().providerFactories {
 		if e.providerMigrationModes[agent] == parser.ProviderMigrationProviderAuthoritative {
 			agents = append(agents, agent)
 		}
@@ -579,33 +584,51 @@ func normalizeChangedPathSet(paths map[string]struct{}) map[string]struct{} {
 	return normalized
 }
 
+type changedPathFallbackDiscovery struct {
+	files      []parser.DiscoveredFile
+	counts     map[parser.AgentType]int
+	incomplete []error
+}
+
+func (discovery changedPathFallbackDiscovery) applyFailures(stats *SyncStats) {
+	stats.providerFailures += len(discovery.incomplete)
+	for _, err := range discovery.incomplete {
+		stats.RecordFailed()
+		stats.Warnings = append(stats.Warnings, err.Error())
+	}
+}
+
 func (e *Engine) discoverChangedPathFallbackProviders(
 	ctx context.Context,
 	agents []parser.AgentType,
-) ([]parser.DiscoveredFile, map[parser.AgentType]int, error) {
+) (changedPathFallbackDiscovery, error) {
 	selected := append([]parser.AgentType(nil), agents...)
 	slices.SortFunc(selected, func(a, b parser.AgentType) int {
 		return strings.Compare(string(a), string(b))
 	})
 	selected = slices.Compact(selected)
-	var files []parser.DiscoveredFile
-	counts := make(map[parser.AgentType]int, len(selected))
+	discovery := changedPathFallbackDiscovery{counts: make(map[parser.AgentType]int, len(selected))}
 	for _, agent := range selected {
 		if e.providerMigrationModes[agent] != parser.ProviderMigrationProviderAuthoritative {
-			return nil, nil, fmt.Errorf("fallback provider %s is not authoritative", agent)
+			return changedPathFallbackDiscovery{}, fmt.Errorf("fallback provider %s is not authoritative", agent)
 		}
-		factory := e.providerFactories[agent]
-		roots := e.agentDirs[agent]
+		factory := e.sources().providerFactories[agent]
+		roots := e.sources().agentDirs[agent]
 		if factory == nil || len(roots) == 0 {
-			return nil, nil, fmt.Errorf("fallback provider %s is not configured", agent)
+			return changedPathFallbackDiscovery{}, fmt.Errorf("fallback provider %s is not configured", agent)
 		}
 		provider := factory.NewProvider(parser.ProviderConfig{
 			Roots: roots, Machine: e.machine, PathRewriter: e.pathRewriter,
-			SourceMachines: e.sourceMachines[agent],
+			SourceMachines: e.sources().sourceMachines[agent],
 		})
 		sources, err := provider.Discover(ctx)
 		if err != nil {
-			return nil, nil, fmt.Errorf("discover fallback provider %s: %w", agent, err)
+			wrapped := fmt.Errorf("discover fallback provider %s: %w", agent, err)
+			_, incomplete := errors.AsType[parser.DiscoveryIncompleteError](err)
+			if !incomplete || ctx.Err() != nil || !provider.Capabilities().Sync.PartialDiscovery {
+				return changedPathFallbackDiscovery{}, wrapped
+			}
+			discovery.incomplete = append(discovery.incomplete, wrapped)
 		}
 		var providerFiles []parser.DiscoveredFile
 		for _, source := range sources {
@@ -616,8 +639,9 @@ func (e *Engine) discoverChangedPathFallbackProviders(
 		providerFiles = sortAndDedupeChangedPathFiles(providerFiles)
 		providerFiles = e.dedupeClaudeDiscoveredFiles(ctx, providerFiles)
 		providerFiles = sortAndDedupeChangedPathFiles(providerFiles)
-		counts[agent] = len(providerFiles)
-		files = append(files, providerFiles...)
+		discovery.counts[agent] = len(providerFiles)
+		discovery.files = append(discovery.files, providerFiles...)
 	}
-	return sortAndDedupeChangedPathFiles(files), counts, nil
+	discovery.files = sortAndDedupeChangedPathFiles(discovery.files)
+	return discovery, nil
 }

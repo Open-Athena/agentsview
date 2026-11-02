@@ -53,14 +53,16 @@ links use `/recall?tab=generated&insight=<id>`.
 ![Generated insights](/docs/assets/generated/screenshots/recall-generated-insights.png)
 
 Generated insights use the configured OpenAI-compatible endpoint when
-`[insights]` has both an `endpoint` and `model`; when `[insights]` is absent,
-they use the selected agent CLI on your machine. Partial endpoint configuration
-is rejected during configuration validation. Endpoint mode sends one
-non-streaming `POST /chat/completions` request with the generated prompt as a
-user message. It accepts the first choice's `assistant` message with string
-`message.content` and optional response `model`. It does not support streaming,
-`/responses`, legacy completions, tool calls, or content-part arrays. An
-endpoint failure returns an error and does not retry through a CLI.
+`[insights]` has both an `endpoint` and `model`; when neither is set, they use
+the selected agent CLI on your machine. See
+[Choosing the default agent](#choosing-the-default-agent) to set the initial
+selection. Partial endpoint configuration is rejected during configuration
+validation. Endpoint mode sends one non-streaming `POST /chat/completions`
+request with the generated prompt as a user message. It accepts the first
+choice's `assistant` message with string `message.content` and optional response
+`model`. It does not support streaming, `/responses`, legacy completions, tool
+calls, or content-part arrays. An endpoint failure returns an error and does not
+retry through a CLI.
 
 ```toml
 [insights]
@@ -68,6 +70,7 @@ endpoint = "http://127.0.0.1:11434/v1"
 model = "llama3.1"
 api_key_env = "OPENAI_API_KEY" # optional; the value is read at runtime
 # allow_http = true            # required for non-loopback HTTP endpoints
+# default_agent = "codex"      # generator used when no endpoint is configured
 ```
 
 Loopback HTTP endpoints are allowed for local models. Remote endpoints must use
@@ -83,6 +86,30 @@ report under the same endpoint and model.
 
 Generated insights can also be listed, fetched, and generated from the CLI with
 `agentsview insight`; see the [CLI reference](/docs/commands/).
+
+### Tool effectiveness reports
+
+From a session's actions menu, **Analyze tool effectiveness** generates a report
+on that one session: which tool calls helped and which wasted turns. Conclusions
+are marked **Helped**, **Did not help**, or **Unclear**. Each conclusion names
+the calls it cites, and clicking one shows those calls with a link to their
+message. The session's observed tool sequences and a note on anything cut from
+the model's input follow the conclusions.
+
+The report sends each tool call's input and result to the insight agent, up to
+256 KiB of that text per run, so it costs more tokens than Agent Analysis and
+sends whatever the commands printed, secrets included. When a reply cites a
+message or call the model was never shown, the server asks once more and saves
+nothing if that reply fails too.
+
+![Analyze tool effectiveness in the session actions menu](/docs/assets/generated/screenshots/tool-effectiveness-action.png)
+
+![Tool effectiveness assessment with cited calls](/docs/assets/generated/screenshots/tool-effectiveness-report.png)
+
+Saved reports live under **Recall > Generated insights** and have shareable
+local links. If the transcript changes after generation, the report warns that
+its observed facts may differ from what the model assessed. For rates across
+projects and dates, use [Tool Usage](/docs/usage/#tool-usage).
 
 ### Configuring agent binaries
 
@@ -101,6 +128,22 @@ binary = "/usr/local/bin/gemini"
 Each known agent has an independent override. This setting affects report
 generation only; session discovery continues to read the configured session
 directories.
+
+### Choosing the default agent
+
+Select the agent a new report starts with through `[insights]`:
+
+```toml
+[insights]
+default_agent = "codex"
+```
+
+The Web UI picker and requests that do not name an agent use this value when it
+is set, and `claude` when it is not. `default_agent` accepts `claude`, `codex`,
+`copilot`, `gemini`, or `kiro`; another value fails configuration validation at
+startup. An explicit picker choice overrides the default until you switch
+servers. `default_agent` has no effect while `[insights]` also sets an
+`endpoint` and `model`, because endpoint mode never invokes an agent CLI.
 
 Reviewed JSONL import is a guarded laboratory inlet, not a stable or recommended
 end-user workflow. Use an isolated `AGENTSVIEW_DATA_DIR` for experiments. The
@@ -133,6 +176,8 @@ Both decisions are durable human states and are not reversed by later
 extraction-generation changes. This surface deliberately has no entry editing,
 bulk review, or undo action.
 
+![Review controls on an extracted Recall entry](/docs/assets/generated/screenshots/recall-review.png)
+
 Recall requires SQLite FTS5, which all standard builds include. Writable open
 upgrades the previous review-state schema when present and converts any old FTS4
 Recall search indexes to FTS5 in the same transaction. Index conversion also
@@ -152,7 +197,7 @@ Recall uses the same `[vector]` model and embeddings servers as session semantic
 search, but it has an independent index generation. Build it explicitly with:
 
 ```bash
-agentsview embeddings build --store recall
+agentsview index embeddings build --store recall
 ```
 
 Automatic Recall embedding requires separate consent because accepted entries
@@ -168,9 +213,23 @@ accepted Recall entry titles, bodies, and triggers to the configured embeddings
 endpoint. It is off by default; manually running the build command is treated as
 one-time consent for that invocation.
 
-Vector and hybrid queries fail closed when the active Recall corpus is newer
-than its last completed vector build. Rebuild the Recall store, or continue
-using lexical mode while an automatic refresh catches up. See
+Vector and hybrid queries keep working while the Recall index trails the corpus
+by a few entries, which is normal while extraction is writing them. Each insert,
+delete, accept, reject, or text edit of an accepted entry is one corpus
+revision, and the index may trail by up to `[vector] recall_max_revision_lag`
+revisions (default 256):
+
+```toml
+[vector]
+recall_max_revision_lag = 256   # 0 requires the index to match the corpus exactly
+```
+
+Entries newer than the index are missing only from the vector ranking. Hybrid
+search still finds them through its lexical ranking, which runs after the query
+is encoded. Results come from the entries as the query reads them, so one
+deleted or rejected since the last build drops out. Past the bound, vector and
+hybrid queries fail closed until the Recall store is rebuilt, by hand or by the
+automatic refresh when it is enabled; lexical mode keeps working meanwhile. See
 [Semantic Search](/docs/semantic-search/#enabling-vector) for the shared
 embedding configuration and endpoint privacy considerations.
 
@@ -218,9 +277,18 @@ Optional keys: `deployment` (labels which serving instance produced the corpus),
 — how long a session must have been ended before extraction),
 `backstop_interval` (default `"1h"`), `failure_backoff` (default `"1h"`),
 `max_window_chars` (default 50000), `max_tokens`, `candidate_findings`
-(`"block"` default, or `"allow"` — see below), per-server `api_key_env`, a
-`[recall.extract.prompts]` table (`profile`, `dir`), and a
-`[recall.extract.request]` table (`temperature`, `extra_body`).
+(`"block"` default, or `"allow"` — see below), per-server `api_key_env`,
+per-server `concurrency` (default 1 — see below), a `[recall.extract.prompts]`
+table (`profile`, `dir`), and a `[recall.extract.request]` table (`temperature`,
+`extra_body`).
+
+`concurrency` sets how many sessions a pass distills at once against that
+server; each session's units are still sent one at a time, in order. Raise it
+for hosted endpoints or servers that batch concurrent requests, where a
+one-session pass leaves the endpoint mostly idle between round trips. Keep the
+default of 1 for a single local model: parallel requests divide the same compute
+instead of adding throughput. Each in-flight session holds its transcript in
+memory, and a hosted endpoint's rate limits still apply.
 
 Non-loopback endpoints must use HTTPS: extraction sends transcript content to
 the endpoint, and plaintext HTTP off the machine could be intercepted. A server
@@ -253,8 +321,22 @@ fingerprinted as a *generation*; changing the configuration builds a new corpus
 rather than mixing outputs, and one generation is active at a time.
 `recall extract status` shows coverage, `run` executes a manual pass,
 `activate`/`retire` manage generations, and `doctor` validates the configuration
-with a single probe call. See `docs/internal/recall-extraction.md` for the
-design contracts.
+with a single probe call.
+
+When no generation is active, you can start serving the first collection before
+the full backlog finishes:
+
+```bash
+agentsview recall extract status
+agentsview recall extract activate
+```
+
+At least one session must be complete and usable entries must exist. Extraction
+works on recent sessions first, and later passes add entries to the active
+collection. Replacing an existing active generation still requires complete
+eligible coverage so the replacement does not remove older knowledge. Automatic
+activation also waits for that coverage. See the
+[extraction commands](/docs/commands/#agentsview-recall) for the controls.
 
 ## Evidence and trust
 

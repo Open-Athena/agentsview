@@ -1,6 +1,7 @@
 <!-- ABOUTME: Expandable inline view of a subagent's conversation.
      ABOUTME: Lazily loads and renders subagent messages within a parent ToolBlock. -->
 <script lang="ts">
+  import { errorTelemetry } from "../../utils/error-telemetry.js";
   import type { Session } from "../../api/types.js";
 import type { DbMessage as Message } from "../../api/generated/index.js";
 import type { ServiceMessageList as MessagesResponse } from "../../api/generated/index.js";
@@ -34,7 +35,7 @@ import type { ServiceMessageList as MessagesResponse } from "../../api/generated
   const nestedRead = new LatestRead();
 
   $effect(() => {
-    sessionId;
+    void sessionId;
     nestedRead.cancel();
     expanded = false;
     messages = null;
@@ -168,7 +169,7 @@ import type { ServiceMessageList as MessagesResponse } from "../../api/generated
       {#if loading}
         <div class="subagent-status">{m.subagent_inline_loading()}</div>
       {:else if error}
-        <div class="subagent-status subagent-error">{error}</div>
+        <div class="subagent-status subagent-error" {@attach errorTelemetry("session")}>{error}</div>
       {:else if messages && messages.length > 0}
         {#each messages as message}
           <MessageContent
@@ -284,6 +285,8 @@ import type { ServiceMessageList as MessagesResponse } from "../../api/generated
 
   .subagent-messages {
     border-left: 3px solid var(--accent-green);
+    border-start-start-radius: 0;
+    border-end-start-radius: 0;
     margin: 0 0 4px 10px;
     display: flex;
     flex-direction: column;

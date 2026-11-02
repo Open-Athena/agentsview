@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -305,32 +306,142 @@ func TestConversationExportResyncKeepsIdentityAndOrphans(t *testing.T) {
 		assert.Equal(t, change.MessageID, bySession[change.SessionID].MessageID)
 	}
 	assert.Equal(t, "identity_unavailable", bySession["legacy"].Gap)
+	for session, text := range map[string]string{"chat": "Question", "orphan": "Retained"} {
+		change := bySession[session]
+		body, err := destination.GetConversationMessage(ctx, ConversationMessageOptions{DatabaseID: rebuilt.DatabaseID, SessionID: session, MessageID: change.MessageID, Revision: change.Revision})
+		require.NoError(t, err)
+		require.NotNil(t, body.Text)
+		assert.Equal(t, text, *body.Text)
+	}
 	_, err = destination.ExportConversationChanges(ctx, ConversationExportOptions{Checkpoint: initial.Checkpoint})
 	require.ErrorIs(t, err, ErrConversationReconciliationRequired)
 }
 
-func TestConversationExportCopiedUsagePolicyDropsBody(t *testing.T) {
+func TestConversationExportReadsTextFromArchivedMessage(t *testing.T) {
+	d := testDB(t)
 	ctx := t.Context()
-	source := testDB(t)
-	require.NoError(t, source.UpsertSession(t.Context(), Session{ID: "orphan", Project: "sample", Machine: "local", Agent: "claude"}))
-	require.NoError(t, source.InsertMessages(t.Context(), []Message{{SessionID: "orphan", Role: "assistant", Content: "Do not retain", SourceUUID: "one"}}))
-	destination := testDB(t)
-	destination.SetArchiveContent(config.ArchiveContentUsage)
-	_, err := destination.CopyOrphanedDataFrom(source.Path())
+	require.NoError(t, d.UpsertSession(ctx, Session{ID: "chat", Project: "sample", Machine: "local", Agent: "claude"}))
+	// The database API stores content as given; export text is the sanitized form.
+	require.NoError(t, d.InsertMessages(ctx, []Message{{SessionID: "chat", Role: "assistant", Content: "Reply\x00 with\x01 noise", SourceUUID: "one"}}))
+	page, err := d.ExportConversationChanges(ctx, ConversationExportOptions{})
 	require.NoError(t, err)
-	result, err := destination.ExportConversationChanges(ctx, ConversationExportOptions{})
+	require.Len(t, page.Changes, 1)
+	ref := page.Changes[0]
+	assert.Equal(t, int64(len("Reply with noise")), ref.TextBytes)
+	body, err := d.GetConversationMessage(ctx, ConversationMessageOptions{DatabaseID: page.DatabaseID, SessionID: "chat", MessageID: ref.MessageID, Revision: ref.Revision})
 	require.NoError(t, err)
-	require.Len(t, result.Changes, 2)
-	assert.Equal(t, "session", result.Changes[1].Type)
-	assert.Equal(t, "archive_content_excluded", result.Changes[1].Gap)
-	change := result.Changes[0]
-	reader, err := OpenReadOnly(ctx, destination.Path())
+	require.NotNil(t, body.Text)
+	assert.Equal(t, "Reply with noise", *body.Text)
+	// Reading at the end with the largest budget returns an empty, non-nil chunk.
+	end, err := d.GetConversationMessage(ctx, ConversationMessageOptions{DatabaseID: page.DatabaseID, SessionID: "chat", MessageID: ref.MessageID, Revision: ref.Revision, Offset: ref.TextBytes, MaxBytes: math.MaxInt})
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, reader.Close()) })
-	body, err := reader.GetConversationMessage(ctx, ConversationMessageOptions{DatabaseID: result.DatabaseID, SessionID: "orphan", MessageID: change.MessageID, Revision: change.Revision})
+	require.NotNil(t, end.Text)
+	assert.Empty(t, *end.Text)
+	assert.Equal(t, ref.TextBytes, end.NextOffset)
+	var stored sql.NullString
+	require.NoError(t, d.Update(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `SELECT body FROM conversation_messages WHERE session_id='chat'`).Scan(&stored)
+	}))
+	assert.False(t, stored.Valid, "the projection must not keep a second copy of the text")
+	// Text that no longer matches the published digest is not served under that revision.
+	require.NoError(t, d.Update(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE messages SET content='edited behind the projection' WHERE session_id='chat'`)
+		return err
+	}))
+	_, err = d.GetConversationMessage(ctx, ConversationMessageOptions{DatabaseID: page.DatabaseID, SessionID: "chat", MessageID: ref.MessageID, Revision: ref.Revision})
+	require.ErrorIs(t, err, ErrConversationRevisionChanged)
+}
+
+func TestConversationExportUpgradeRetiresStoredBodies(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	require.NoError(t, d.UpsertSession(ctx, Session{ID: "chat", Project: "sample", Machine: "local", Agent: "claude"}))
+	msgs := []Message{{SessionID: "chat", Ordinal: 0, Role: "user", Content: "Question", SourceUUID: "one"}, {SessionID: "chat", Ordinal: 1, Role: "assistant", Content: "Reply", SourceUUID: "two"}}
+	require.NoError(t, d.InsertMessages(ctx, msgs))
+	initial, err := d.ExportConversationChanges(ctx, ConversationExportOptions{})
 	require.NoError(t, err)
-	assert.Nil(t, body.Text)
-	assert.Equal(t, "archive_content_excluded", body.Gap)
+	require.Len(t, initial.Changes, 2)
+	// Model an archive written before bodies left the projection.
+	require.NoError(t, d.Update(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE conversation_messages SET body=(SELECT content FROM messages m WHERE m.session_id=conversation_messages.session_id AND m.ordinal=conversation_messages.ordinal);
+		 DROP TRIGGER conversation_messages_revise;
+		 CREATE TRIGGER conversation_messages_update
+		 AFTER UPDATE OF ordinal,role,timestamp,source_id,body,digest,text_bytes,gap,deleted,removed ON conversation_messages
+		 WHEN OLD.body IS NOT NEW.body OR OLD.digest IS NOT NEW.digest
+		 BEGIN
+		  INSERT INTO archive_metadata(key,value) VALUES ('conversation_publication_revision','1')
+		  ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT);
+		  UPDATE conversation_messages SET revision=(SELECT CAST(value AS INTEGER) FROM archive_metadata WHERE key='conversation_publication_revision')
+		  WHERE session_id=NEW.session_id AND message_id=NEW.message_id;
+		 END`)
+		return err
+	}))
+	path := d.Path()
+	require.NoError(t, d.Close())
+	d, err = OpenIsolated(ctx, path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, d.Close()) })
+	// An unchanged rewrite publishes nothing even though the stored bodies differ from NULL.
+	require.NoError(t, d.ReplaceSessionMessages(ctx, "chat", msgs))
+	same, err := d.ExportConversationChanges(ctx, ConversationExportOptions{Checkpoint: initial.Checkpoint})
+	require.NoError(t, err)
+	assert.Empty(t, same.Changes)
+	assert.Equal(t, initial.Checkpoint, same.Checkpoint)
+	body, err := d.GetConversationMessage(ctx, ConversationMessageOptions{DatabaseID: initial.DatabaseID, SessionID: "chat", MessageID: initial.Changes[1].MessageID, Revision: initial.Changes[1].Revision})
+	require.NoError(t, err)
+	require.NotNil(t, body.Text)
+	assert.Equal(t, "Reply", *body.Text)
+	// A real change publishes that one message and drops its stored copy.
+	msgs[1].Content = "Revised"
+	require.NoError(t, d.ReplaceSessionMessages(ctx, "chat", msgs))
+	changed, err := d.ExportConversationChanges(ctx, ConversationExportOptions{Checkpoint: same.Checkpoint})
+	require.NoError(t, err)
+	require.Len(t, changed.Changes, 1)
+	assert.Equal(t, initial.Changes[1].MessageID, changed.Changes[0].MessageID)
+	var stored int
+	require.NoError(t, d.Update(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM conversation_messages WHERE session_id='chat' AND body IS NOT NULL`).Scan(&stored)
+	}))
+	assert.Equal(t, 1, stored, "only the untouched row keeps its legacy copy")
+}
+
+func TestConversationExportCopiedUsagePolicyDropsBody(t *testing.T) {
+	// A rebuild takes its source's cold or active state before copying.
+	for _, sourceExported := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sourceExported=%t", sourceExported), func(t *testing.T) {
+			ctx := t.Context()
+			source := testDB(t)
+			require.NoError(t, source.UpsertSession(t.Context(), Session{ID: "orphan", Project: "sample", Machine: "local", Agent: "claude"}))
+			require.NoError(t, source.InsertMessages(t.Context(), []Message{{SessionID: "orphan", Role: "assistant", Content: "Do not retain", SourceUUID: "one"}}))
+			if sourceExported {
+				_, err := source.ExportConversationChanges(ctx, ConversationExportOptions{})
+				require.NoError(t, err)
+			}
+			destination := testDB(t)
+			require.NoError(t, destination.CopyArchiveIdentityFrom(source.Path()))
+			destination.SetArchiveContent(config.ArchiveContentUsage)
+			_, err := destination.CopyOrphanedDataFrom(source.Path())
+			require.NoError(t, err)
+			result, err := destination.ExportConversationChanges(ctx, ConversationExportOptions{})
+			require.NoError(t, err)
+			messages := map[string]ConversationChange{}
+			for _, change := range result.Changes {
+				assert.Equal(t, "archive_content_excluded", change.Gap, "%s %s", change.Type, change.SessionID)
+				if change.Type == "message" {
+					messages[change.SessionID] = change
+				}
+			}
+			require.Len(t, messages, 1)
+			change := messages["orphan"]
+			reader, err := OpenReadOnly(ctx, destination.Path())
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, reader.Close()) })
+			body, err := reader.GetConversationMessage(ctx, ConversationMessageOptions{DatabaseID: result.DatabaseID, SessionID: "orphan", MessageID: change.MessageID, Revision: change.Revision})
+			require.NoError(t, err)
+			assert.Nil(t, body.Text)
+			assert.Equal(t, "archive_content_excluded", body.Gap)
+		})
+	}
 }
 
 func TestConversationExportUsesFinalCopiedContent(t *testing.T) {
@@ -349,6 +460,7 @@ func TestConversationExportUsesFinalCopiedContent(t *testing.T) {
 				require.NoError(t, source.SoftDeleteSession(t.Context(), "chat"))
 			}
 			destination := testDB(t)
+			require.NoError(t, destination.CopyArchiveIdentityFrom(source.Path()))
 			destination.SetArchiveContent(config.ArchiveContentTranscripts)
 			_, err = destination.CopyTrashedDataFrom(source.Path())
 			require.NoError(t, err)
@@ -371,6 +483,59 @@ func TestConversationExportUsesFinalCopiedContent(t *testing.T) {
 				require.NoError(t, err)
 				require.NotNil(t, body.Text)
 				assert.Equal(t, "Checking.\n[Bash]", *body.Text)
+			}
+			assert.Equal(t, 1, messageCount)
+		})
+	}
+}
+
+func TestConversationExportCopyRefreshesSanitizedMessages(t *testing.T) {
+	for _, trashed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("trashed=%t", trashed), func(t *testing.T) {
+			source := testDB(t)
+			insertSession(t, source, "chat", "sample")
+			insertMessages(t, source, Message{SessionID: "chat", Role: "assistant", Content: "Before", SourceUUID: "reply"})
+			initial, err := source.ExportConversationChanges(t.Context(), ConversationExportOptions{})
+			require.NoError(t, err)
+			require.Len(t, initial.Changes, 1)
+			// A pre-sanitization archive can contain bytes that its copied
+			// projection must no longer describe after resync cleans them.
+			_, err = source.getWriter().Exec(t.Context(), `UPDATE messages SET content=?`, "After\x00cleanup")
+			require.NoError(t, err)
+			_, err = source.getWriter().Exec(t.Context(), fmt.Sprintf("PRAGMA user_version=%d", sanitizedSourceDataVersion-1))
+			require.NoError(t, err)
+			if trashed {
+				require.NoError(t, source.SoftDeleteSession(t.Context(), "chat"))
+			}
+			path := source.Path()
+			require.NoError(t, source.Close())
+			destination := testDB(t)
+			require.NoError(t, destination.CopyArchiveIdentityFrom(path))
+			if trashed {
+				_, err = destination.CopyTrashedDataFrom(path)
+			} else {
+				_, err = destination.CopyOrphanedDataFrom(path)
+			}
+			require.NoError(t, err)
+			if trashed {
+				_, err = destination.RestoreSession(t.Context(), "chat")
+				require.NoError(t, err)
+			}
+			changes, err := destination.ExportConversationChanges(t.Context(), ConversationExportOptions{})
+			require.NoError(t, err)
+			messageCount := 0
+			for _, change := range changes.Changes {
+				if change.Type != "message" {
+					continue
+				}
+				messageCount++
+				assert.Equal(t, initial.Changes[0].MessageID, change.MessageID)
+				body, err := destination.GetConversationMessage(t.Context(), ConversationMessageOptions{
+					DatabaseID: changes.DatabaseID, SessionID: "chat", MessageID: change.MessageID, Revision: change.Revision,
+				})
+				require.NoError(t, err)
+				require.NotNil(t, body.Text)
+				assert.Equal(t, "Aftercleanup", *body.Text)
 			}
 			assert.Equal(t, 1, messageCount)
 		})
@@ -788,7 +953,7 @@ func TestConversationExportReplacesUnconditionalInsertTrigger(t *testing.T) {
 		triggers, err = scanStrings(rows)
 		return err
 	}))
-	assert.Equal(t, []string{"conversation_messages_revision", "conversation_messages_update"}, triggers)
+	assert.Equal(t, []string{"conversation_messages_revise", "conversation_messages_revision"}, triggers)
 	require.NoError(t, d.UpsertSession(t.Context(), Session{ID: "later", Project: "sample", Machine: "local", Agent: "claude"}))
 	require.NoError(t, d.InsertMessages(t.Context(), []Message{
 		{SessionID: "later", Ordinal: 0, Role: "user", Content: "First", SourceUUID: "a"},
@@ -860,30 +1025,45 @@ func TestConversationExportInitializationBatchesAcrossSessions(t *testing.T) {
 }
 
 func TestConversationExportResyncRetainsHardDeletion(t *testing.T) {
-	source := testDB(t)
-	for _, id := range []string{"chat", "empty"} {
-		require.NoError(t, source.UpsertSession(t.Context(), Session{ID: id, Project: "sample", Machine: "local", Agent: "claude"}))
+	// A message deleted before its archive ever exported was never published,
+	// so only an active archive carries its tombstone into the rebuild.
+	for _, exported := range []bool{false, true} {
+		t.Run(fmt.Sprintf("exported=%t", exported), func(t *testing.T) {
+			source := testDB(t)
+			for _, id := range []string{"chat", "empty"} {
+				require.NoError(t, source.UpsertSession(t.Context(), Session{ID: id, Project: "sample", Machine: "local", Agent: "claude"}))
+			}
+			require.NoError(t, source.InsertMessages(t.Context(), []Message{{SessionID: "chat", Role: "assistant", Content: "Reply", SourceUUID: "one"}}))
+			if exported {
+				_, err := source.ExportConversationChanges(t.Context(), ConversationExportOptions{})
+				require.NoError(t, err)
+			}
+			require.NoError(t, source.DeleteSession(t.Context(), "chat"))
+			require.NoError(t, source.DeleteSession(t.Context(), "empty"))
+			destination := testDB(t)
+			require.NoError(t, destination.CopyArchiveIdentityFrom(source.Path()))
+			_, err := destination.CopyOrphanedDataFrom(source.Path())
+			require.NoError(t, err)
+			changes, err := destination.ExportConversationChanges(t.Context(), ConversationExportOptions{})
+			require.NoError(t, err)
+			deletedSessions := map[string]bool{}
+			deletedMessages := 0
+			for _, change := range changes.Changes {
+				assert.True(t, change.Deleted)
+				if change.Type == "session" {
+					deletedSessions[change.SessionID] = true
+				} else {
+					deletedMessages++
+				}
+			}
+			assert.Equal(t, map[string]bool{"chat": true, "empty": true}, deletedSessions)
+			expected := 0
+			if exported {
+				expected = 1
+			}
+			assert.Equal(t, expected, deletedMessages)
+		})
 	}
-	require.NoError(t, source.InsertMessages(t.Context(), []Message{{SessionID: "chat", Role: "assistant", Content: "Reply", SourceUUID: "one"}}))
-	require.NoError(t, source.DeleteSession(t.Context(), "chat"))
-	require.NoError(t, source.DeleteSession(t.Context(), "empty"))
-	destination := testDB(t)
-	_, err := destination.CopyOrphanedDataFrom(source.Path())
-	require.NoError(t, err)
-	changes, err := destination.ExportConversationChanges(t.Context(), ConversationExportOptions{})
-	require.NoError(t, err)
-	deletedSessions := map[string]bool{}
-	deletedMessages := 0
-	for _, change := range changes.Changes {
-		assert.True(t, change.Deleted)
-		if change.Type == "session" {
-			deletedSessions[change.SessionID] = true
-		} else {
-			deletedMessages++
-		}
-	}
-	assert.Equal(t, map[string]bool{"chat": true, "empty": true}, deletedSessions)
-	assert.Equal(t, 1, deletedMessages)
 }
 
 func TestConversationExportInitializesFromStoredArchive(t *testing.T) {
@@ -975,6 +1155,144 @@ func TestConversationExportInitializesFromStoredArchive(t *testing.T) {
 	}
 }
 
+func conversationProjectionState(t *testing.T, d *DB) (rows int, active bool) {
+	t.Helper()
+	require.NoError(t, d.Update(t.Context(), func(tx *sql.Tx) error {
+		if err := tx.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM conversation_messages`).Scan(&rows); err != nil {
+			return err
+		}
+		return tx.QueryRowContext(t.Context(), `SELECT EXISTS(SELECT 1 FROM archive_metadata WHERE key='conversation_export_initialized')`).Scan(&active)
+	}))
+	return rows, active
+}
+
+func TestConversationExportStaysColdUntilFirstExport(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	require.NoError(t, d.UpsertSession(ctx, Session{ID: "chat", Project: "sample", Machine: "local", Agent: "claude"}))
+	msgs := []Message{{SessionID: "chat", Ordinal: 0, Role: "user", Content: "Question", SourceUUID: "one"}}
+	require.NoError(t, d.InsertMessages(ctx, msgs))
+	msgs = append(msgs, Message{SessionID: "chat", Ordinal: 1, Role: "assistant", Content: "Reply", SourceUUID: "two"})
+	require.NoError(t, d.ReplaceSessionMessages(ctx, "chat", msgs))
+	require.NoError(t, d.SoftDeleteSession(ctx, "chat"))
+	_, err := d.RestoreSession(ctx, "chat")
+	require.NoError(t, err)
+	rows, active := conversationProjectionState(t, d)
+	assert.Zero(t, rows, "writes before the first export project nothing")
+	assert.False(t, active)
+
+	// A read-only handle cannot build the projection and says so.
+	reader, err := OpenReadOnly(ctx, d.Path())
+	require.NoError(t, err)
+	_, err = reader.ExportConversationChanges(ctx, ConversationExportOptions{})
+	require.ErrorIs(t, err, ErrConversationInitializationRequired)
+	require.NoError(t, reader.Close())
+
+	initial, err := d.ExportConversationChanges(ctx, ConversationExportOptions{})
+	require.NoError(t, err)
+	rows, active = conversationProjectionState(t, d)
+	assert.Equal(t, 2, rows)
+	assert.True(t, active)
+	// Session records stay transactional, so the restore is already published.
+	var messages []ConversationChange
+	for _, change := range initial.Changes {
+		if change.Type != "message" {
+			continue
+		}
+		messages = append(messages, change)
+		body, err := d.GetConversationMessage(ctx, ConversationMessageOptions{DatabaseID: initial.DatabaseID, SessionID: "chat", MessageID: change.MessageID, Revision: change.Revision})
+		require.NoError(t, err)
+		require.NotNil(t, body.Text)
+		assert.Equal(t, msgs[change.Ordinal].Content, *body.Text)
+	}
+	require.Len(t, messages, 2)
+
+	// Once active, writes publish through the projection as before.
+	msgs[1].Content = "Revised"
+	require.NoError(t, d.ReplaceSessionMessages(ctx, "chat", msgs))
+	delta, err := d.ExportConversationChanges(ctx, ConversationExportOptions{Checkpoint: initial.Checkpoint})
+	require.NoError(t, err)
+	require.Len(t, delta.Changes, 1)
+	assert.Equal(t, messages[1].MessageID, delta.Changes[0].MessageID)
+	assert.NotEqual(t, messages[1].Revision, delta.Changes[0].Revision)
+}
+
+func TestConversationExportActiveArchiveExportsWhileWriterClosed(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	require.NoError(t, d.UpsertSession(ctx, Session{ID: "chat", Project: "sample", Machine: "local", Agent: "claude"}))
+	require.NoError(t, d.InsertMessages(ctx, []Message{{SessionID: "chat", Role: "user", Content: "Question", SourceUUID: "one"}}))
+	initial, err := d.ExportConversationChanges(ctx, ConversationExportOptions{})
+	require.NoError(t, err)
+	// A rebuild closes the writer; reads of the active projection continue.
+	require.NoError(t, d.CloseWriter())
+	current, err := d.ExportConversationChanges(ctx, ConversationExportOptions{Checkpoint: initial.Checkpoint})
+	require.NoError(t, d.ReopenWriter())
+	require.NoError(t, err)
+	assert.Empty(t, current.Changes)
+}
+
+func TestConversationExportColdCopyKeepsSessionEvidence(t *testing.T) {
+	ctx := t.Context()
+	source := testDB(t)
+	source.SetArchiveContent(config.ArchiveContentUsage)
+	require.NoError(t, source.UpsertSession(ctx, Session{ID: "usage", Project: "sample", Machine: "local", Agent: "codex"}))
+	require.NoError(t, source.InsertMessages(ctx, []Message{{SessionID: "usage", Role: "assistant", Content: "Not retained"}}))
+	require.NoError(t, source.UpsertSession(ctx, Session{ID: "gone", Project: "sample", Machine: "local", Agent: "codex"}))
+	require.NoError(t, source.DeleteSession(ctx, "gone"))
+	destination := testDB(t)
+	require.NoError(t, destination.CopyArchiveIdentityFrom(source.Path()))
+	_, err := destination.CopyOrphanedDataFrom(source.Path())
+	require.NoError(t, err)
+	// Neither archive has projected messages, yet the first export of the
+	// rebuild carries the source's policy gap and hard deletion.
+	rows, active := conversationProjectionState(t, destination)
+	assert.Zero(t, rows)
+	assert.False(t, active)
+	copied, err := destination.ExportConversationChanges(ctx, ConversationExportOptions{})
+	require.NoError(t, err)
+	bySession := map[string]ConversationChange{}
+	for _, change := range copied.Changes {
+		if change.Type == "session" {
+			bySession[change.SessionID] = change
+		}
+	}
+	assert.Equal(t, "archive_content_excluded", bySession["usage"].Gap)
+	assert.True(t, bySession["gone"].Deleted)
+}
+
+func TestConversationExportCopyRejectsMismatchedState(t *testing.T) {
+	ctx := t.Context()
+	source := testDB(t)
+	require.NoError(t, source.UpsertSession(ctx, Session{ID: "orphan", Project: "sample", Machine: "local", Agent: "claude"}))
+	require.NoError(t, source.InsertMessages(ctx, []Message{{SessionID: "orphan", Role: "assistant", Content: "Reply", SourceUUID: "one"}}))
+	_, err := source.ExportConversationChanges(ctx, ConversationExportOptions{})
+	require.NoError(t, err)
+	// Without the source's identity the destination stays cold, and copying
+	// active rows into it would publish them without their stored messages.
+	destination := testDB(t)
+	_, err = destination.CopyOrphanedDataFrom(source.Path())
+	require.ErrorContains(t, err, "conversation export state differs")
+	session, err := destination.GetSession(ctx, "orphan")
+	require.NoError(t, err)
+	assert.Nil(t, session, "a rejected copy leaves the destination unchanged")
+}
+
+func TestConversationExportReopenKeepsColdArchiveCold(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	require.NoError(t, d.UpsertSession(ctx, Session{ID: "chat", Project: "sample", Machine: "local", Agent: "claude"}))
+	require.NoError(t, d.InsertMessages(ctx, []Message{{SessionID: "chat", Role: "user", Content: "Question", SourceUUID: "one"}}))
+	path := d.Path()
+	require.NoError(t, d.Close())
+	d, err := OpenIsolated(ctx, path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, d.Close()) })
+	rows, active := conversationProjectionState(t, d)
+	assert.Zero(t, rows, "opening an archive does not build the projection")
+	assert.False(t, active)
+}
+
 func TestConversationExportFailedWritePublishesNothing(t *testing.T) {
 	d := testDB(t)
 	before, err := d.ExportConversationChanges(t.Context(), ConversationExportOptions{})
@@ -997,7 +1315,9 @@ func TestConversationExportProjectSnapshotDuringTrash(t *testing.T) {
 	require.NoError(t, d.UpsertProjectIdentityObservationWithSnapshotProject(ctx, export.ProjectIdentityObservation{SessionID: "chat", Project: "remapped", Machine: "local"}, "remapped"))
 	initial, err := d.ExportConversationChanges(ctx, ConversationExportOptions{})
 	require.NoError(t, err)
-	require.Len(t, initial.Changes, 2)
+	// Project evidence recorded before the first export is part of that
+	// export's current state rather than a separate session change.
+	require.Len(t, initial.Changes, 1)
 	messageID := initial.Changes[0].MessageID
 	require.NoError(t, d.SoftDeleteSession(t.Context(), "chat"))
 	require.NoError(t, d.UpsertProjectIdentityObservationWithSnapshotProject(ctx, export.ProjectIdentityObservation{SessionID: "chat", Project: "backfilled", Machine: "local"}, "backfilled"))

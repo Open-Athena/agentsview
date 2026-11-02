@@ -17,6 +17,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/pathutil"
 )
 
 // osStat and osLstat are indirected through vars so tests can intercept
@@ -52,8 +53,8 @@ func statGitEntry(gitPath string) (os.FileInfo, error) {
 	return osStat(gitPath)
 }
 
-// allowProtectedPathProbes lets project extraction probe recorded working
-// directories inside macOS TCC-protected locations. It is package-level
+// allowProtectedPathProbes lets metadata discovery read recorded paths
+// inside macOS TCC-protected locations. It is package-level
 // because parsers extract project names deep inside per-format code with no
 // engine context to consult. The zero value refuses those probes, so a
 // process that never opts in cannot raise a consent prompt from parsing.
@@ -73,8 +74,8 @@ func filesystemProjectDiscoveryDisabled(ctx context.Context) bool {
 	return disabled
 }
 
-// SetAllowProtectedPathProbes sets whether project extraction may probe
-// macOS TCC-protected working directories for git roots. Wired from the
+// SetAllowProtectedPathProbes sets whether metadata discovery may read
+// macOS TCC-protected locations for Git roots and skill names. Wired from the
 // scan_protected_paths config option by the sync engine.
 func SetAllowProtectedPathProbes(allow bool) {
 	allowProtectedPathProbes.Store(allow)
@@ -85,7 +86,7 @@ func SetAllowProtectedPathProbes(allow bool) {
 // home layout.
 var (
 	probeGitRootForCwd = defaultProbeGitRootForCwd
-	probeGitfileTarget = defaultProbeGitfileTarget
+	probeGitfileTarget = defaultProbeMetadataPath
 )
 
 // classifyProbePath classifies cleaned for the local process: real GOOS,
@@ -133,12 +134,11 @@ func automountCwdProbeAllowed(cleaned string) bool {
 	return true
 }
 
-// defaultProbeGitfileTarget reports whether a path taken from gitfile
-// contents — a gitdir, a common directory, or the .git entry itself when it
-// is a symlink — may be read. Unlike the cwd guard, automount namespaces are
-// refused outright: targets never pass isForeignOSPath's resolved-autofs
-// probe, so reading one would wake automountd unvetted.
-func defaultProbeGitfileTarget(cleaned string) bool {
+// defaultProbeMetadataPath reports whether a recorded skill path or Git
+// metadata target may be read. Unlike the cwd guard, automount namespaces
+// are refused outright: these paths never pass isForeignOSPath's
+// resolved-autofs probe, so reading one would wake automountd unvetted.
+func defaultProbeMetadataPath(cleaned string) bool {
 	switch classifyProbePath(cleaned) {
 	case export.LocalPathProbeAutomountNamespace:
 		return false
@@ -509,11 +509,11 @@ func parseMountOutputForAutofs(data []byte) []string {
 			continue
 		}
 		rest := after
-		parenIdx := strings.LastIndex(rest, " (")
-		if parenIdx < 0 {
+		before, _, ok := strings.CutLast(rest, " (")
+		if !ok {
 			continue
 		}
-		mount := strings.TrimSpace(rest[:parenIdx])
+		mount := strings.TrimSpace(before)
 		mount = strings.TrimPrefix(mount, "/System/Volumes/Data")
 		if mount == "" || mount == "/" {
 			continue
@@ -838,14 +838,10 @@ func scanSiblingRepoCandidates(dir string) siblingScanResult {
 		if !gitFileTargetsProbeable(filepath.Join(dir, entry.Name()), gitPath) {
 			continue
 		}
-		gitDir := readGitDirFromFile(gitPath)
+		gitDir := pathutil.GitPointerPath(readGitDirFromFile(gitPath), filepath.Dir(gitPath), filepath.Join(dir, entry.Name()))
 		if gitDir == "" {
 			continue
 		}
-		if !filepath.IsAbs(gitDir) {
-			gitDir = filepath.Join(dir, entry.Name(), gitDir)
-		}
-		gitDir = filepath.Clean(gitDir)
 		if !strings.Contains(gitDir, worktreeMarker) {
 			continue
 		}
@@ -927,16 +923,11 @@ func deletedChildIsWorktree(
 }
 
 func repoRootFromGitFile(repoDir, gitFilePath string) string {
-	gitDir := readGitDirFromFile(gitFilePath)
+	gitDir := pathutil.GitPointerPath(readGitDirFromFile(gitFilePath), filepath.Dir(gitFilePath), repoDir)
 	if gitDir == "" {
 		return ""
 	}
-	if !filepath.IsAbs(gitDir) {
-		gitDir = filepath.Join(filepath.Dir(gitFilePath), gitDir)
-	}
-	gitDir = filepath.Clean(gitDir)
-
-	commonDir := readCommonDir(gitDir)
+	commonDir := readCommonDir(gitDir, repoDir)
 	if commonDir != "" {
 		if filepath.Base(commonDir) == ".git" {
 			return filepath.Dir(commonDir)
@@ -982,10 +973,10 @@ func gitFileTargetsProbeable(dir, gitPath string) bool {
 		// Nothing parseable means no target will be read from here.
 		return true
 	}
-	if !filepath.IsAbs(gitDir) {
-		gitDir = filepath.Join(dir, gitDir)
+	gitDir = pathutil.GitPointerPath(gitDir, filepath.Dir(gitPath), dir)
+	if gitDir == "" {
+		return false
 	}
-	gitDir = filepath.Clean(gitDir)
 	if !probeGitfileTarget(gitDir) {
 		return false
 	}
@@ -996,7 +987,7 @@ func gitFileTargetsProbeable(dir, gitPath string) bool {
 	if !probeGitfileTarget(filepath.Join(gitDir, "commondir")) {
 		return false
 	}
-	commonDir := readCommonDir(gitDir)
+	commonDir := readCommonDir(gitDir, dir)
 	if commonDir == "" {
 		// No commondir means a submodule-style gitdir: the gitdir is the
 		// effective common directory holding config and HEAD. Vet them
@@ -1027,7 +1018,7 @@ func readGitDirFromFile(path string) string {
 	return ""
 }
 
-func readCommonDir(gitDir string) string {
+func readCommonDir(gitDir, cwd string) string {
 	b, err := os.ReadFile(filepath.Join(gitDir, "commondir"))
 	if err != nil {
 		return ""
@@ -1036,10 +1027,7 @@ func readCommonDir(gitDir string) string {
 	if value == "" {
 		return ""
 	}
-	if filepath.IsAbs(value) {
-		return filepath.Clean(value)
-	}
-	return filepath.Clean(filepath.Join(gitDir, value))
+	return pathutil.GitPointerPath(value, gitDir, cwd)
 }
 
 func gitConfigCoreBare(gitDir string) bool {

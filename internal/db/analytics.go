@@ -48,9 +48,8 @@ func IsSupportedAnalyticsSignal(signal string) bool {
 	return ok
 }
 
-// inPlaceholders returns a "(?,?,...)" string and []any args for
-// a slice of string IDs.
-func inPlaceholders(ids []string) (string, []any) {
+// InPlaceholders binds string IDs with question-mark placeholders.
+func InPlaceholders(ids []string) (string, []any) {
 	ph := make([]string, len(ids))
 	args := make([]any, len(ids))
 	for i, id := range ids {
@@ -66,13 +65,11 @@ func queryChunked(
 	ids []string,
 	fn func(chunk []string) error,
 ) error {
-	return queryChunkedSize(ids, maxSQLVars, fn)
+	return QueryChunkedSize(ids, maxSQLVars, fn)
 }
 
-// queryChunkedSize is queryChunked with an explicit per-chunk size, for
-// queries that bind each ID more than once (and so need a smaller chunk to
-// keep the total bind count within SQLite's variable limit).
-func queryChunkedSize(
+// QueryChunkedSize executes ID batches in order, stopping on the first error.
+func QueryChunkedSize(
 	ids []string,
 	size int,
 	fn func(chunk []string) error,
@@ -88,10 +85,14 @@ func queryChunkedSize(
 
 // AnalyticsFilter is the shared filter for all analytics queries.
 type AnalyticsFilter struct {
-	From    string // ISO date YYYY-MM-DD, inclusive
-	To      string // ISO date YYYY-MM-DD, inclusive
-	Machine string // optional machine filter
-	Project string // optional project filter
+	ToolCategory   string
+	ToolName       string
+	ToolMetric     string
+	EvidenceOffset int
+	From           string // ISO date YYYY-MM-DD, inclusive
+	To             string // ISO date YYYY-MM-DD, inclusive
+	Machine        string // optional machine filter
+	Project        string // optional project filter
 	// GitBranch is a branchListSep-joined list of opaque (project, branch) tokens (EncodeBranchFilterToken).
 	GitBranch        string
 	Agent            string // optional agent filter
@@ -156,30 +157,18 @@ func RelationshipExclusionSQL(includeSubagents, includeForks bool, colPrefix str
 	}
 }
 
-// OneShotExclusionSQL wraps the one-shot exclusion predicate so it does
-// not drop subagent rows when subagents are being counted. Workflow
-// subagents are inherently one-shot (a single orchestrator prompt
-// yields one result) but represent real work, so the one-shot filter
-// would otherwise re-hide exactly the sessions IncludeSubagents is
-// meant to surface. Exported so the PostgreSQL and DuckDB builders
-// apply the same rule. base must be a self-contained boolean clause.
-func (f AnalyticsFilter) OneShotExclusionSQL(base string) string {
+func (f AnalyticsFilter) oneShotExclusionSQL(base, colPrefix string) string {
 	if f.IncludeSubagents {
-		return "(" + base + " OR relationship_type = 'subagent')"
+		return "(" + base + " OR " + colPrefix + "relationship_type = 'subagent')"
 	}
 	return base
 }
 
-// location loads the timezone or returns UTC on error.
+// location resolves the filter's timezone once per name, or returns UTC on
+// error. Row-level helpers such as ResolveSkillRowTime call it for every row,
+// and loading a location reads the zone database each time.
 func (f AnalyticsFilter) location() *time.Location {
-	if f.Timezone == "" {
-		return time.UTC
-	}
-	loc, err := time.LoadLocation(f.Timezone)
-	if err != nil {
-		return time.UTC
-	}
-	return loc
+	return LoadLocationOr(f.Timezone, time.UTC)
 }
 
 // utcRange returns UTC time bounds padded by ±14h to cover
@@ -295,7 +284,8 @@ func (f AnalyticsFilter) buildWhereWithoutDate() (string, []any) {
 	return f.buildWhereWithDate("", false, "sessions.id")
 }
 
-func csvFilterValues(raw string) []string {
+// CSVFilterValues splits a comma-separated filter and drops blank entries.
+func CSVFilterValues(raw string) []string {
 	values := strings.Split(raw, ",")
 	out := values[:0]
 	for _, value := range values {
@@ -307,24 +297,10 @@ func csvFilterValues(raw string) []string {
 	return out
 }
 
-func sqliteAnalyticsCSVPredicate(
-	col string,
-	raw string,
-) (string, []any) {
-	values := csvFilterValues(raw)
-	if len(values) == 0 {
-		return "", nil
-	}
-	if len(values) == 1 {
-		return col + " = ?", []any{values[0]}
-	}
-	placeholders := make([]string, len(values))
-	args := make([]any, 0, len(values))
-	for i, value := range values {
-		placeholders[i] = "?"
-		args = append(args, value)
-	}
-	return col + " IN (" + strings.Join(placeholders, ",") + ")", args
+func sqliteAnalyticsCSVPredicate(col, raw string) (string, []any) {
+	b := NewQueryBuilder(SQLiteQueryDialect(), 0)
+	pred := b.ValuesPredicate(col, CSVFilterValues(raw), true)
+	return pred, b.Args()
 }
 
 func (db *DB) getAnalyticsFilteredMessageCounts(
@@ -357,7 +333,7 @@ func (db *DB) getAnalyticsModelScopedMessages(
 	if scope == nil {
 		return map[string][]ScopedMessage{}, nil
 	}
-	return scope.MessagesBySession(), nil
+	return scope, nil
 }
 
 func (db *DB) getAnalyticsFilteredMessageStats(
@@ -375,163 +351,31 @@ func (db *DB) getAnalyticsFilteredMessageStats(
 	return scope.StatsBySession(), nil
 }
 
-func (f AnalyticsFilter) buildWhereWithDate(
-	dateCol string,
-	includeDate bool,
-	sessionIDExpr string,
-) (string, []any) {
+func (f AnalyticsFilter) buildWhereWithDate(dateCol string, includeDate bool, sessionIDExpr string) (string, []any) {
+	b := NewQueryBuilder(SQLiteQueryDialect(), 0)
+	var dates []string
+	if includeDate {
+		from, to := f.utcRange()
+		dates = append(dates, dateCol+" >= "+b.Add(from), dateCol+" <= "+b.Add(to))
+	}
 	if sessionIDExpr == "" {
 		sessionIDExpr = "sessions.id"
 	}
-	preds := []string{
-		"message_count > 0",
-		f.RelationshipExclusionSQL(),
-		"deleted_at IS NULL",
-	}
-	var args []any
-
-	if includeDate {
-		utcFrom, utcTo := f.utcRange()
-		preds = append(preds, dateCol+" >= ?")
-		args = append(args, utcFrom)
-		preds = append(preds, dateCol+" <= ?")
-		args = append(args, utcTo)
-	}
-
-	if f.Machine != "" {
-		machines := csvFilterValues(f.Machine)
-		if len(machines) == 1 {
-			preds = append(preds, "machine = ?")
-			args = append(args, machines[0])
-		} else if len(machines) > 1 {
-			placeholders := make(
-				[]string, len(machines),
-			)
-			for i, machine := range machines {
-				placeholders[i] = "?"
-				args = append(args, machine)
-			}
-			preds = append(preds,
-				"machine IN ("+
-					strings.Join(placeholders, ",")+
-					")",
-			)
-		}
-	}
-
-	if f.Project != "" {
-		preds = append(preds, "project = ?")
-		args = append(args, f.Project)
-	}
-
-	if f.GitBranch != "" {
-		var clause string
-		clause, args = BranchPairClauseArgs("project", "git_branch", f.GitBranch, args)
-		preds = append(preds, clause)
-	}
-
-	if f.Agent != "" {
-		agents := csvFilterValues(f.Agent)
-		if len(agents) == 1 {
-			preds = append(preds, "agent = ?")
-			args = append(args, agents[0])
-		} else if len(agents) > 1 {
-			placeholders := make(
-				[]string, len(agents),
-			)
-			for i, a := range agents {
-				placeholders[i] = "?"
-				args = append(args, a)
-			}
-			preds = append(preds,
-				"agent IN ("+
-					strings.Join(placeholders, ",")+
-					")",
-			)
-		}
-	}
-
-	if f.Model != "" {
-		models := csvFilterValues(f.Model)
-		if len(models) == 1 {
-			preds = append(preds,
-				"EXISTS (SELECT 1 FROM messages m WHERE "+
-					"m.session_id = "+sessionIDExpr+" AND "+
-					"m.model = ?)")
-			args = append(args, models[0])
-		} else if len(models) > 1 {
-			placeholders := make(
-				[]string, len(models),
-			)
-			for i, m := range models {
-				placeholders[i] = "?"
-				args = append(args, m)
-			}
-			preds = append(preds,
-				"EXISTS (SELECT 1 FROM messages m WHERE "+
-					"m.session_id = "+sessionIDExpr+" AND "+
-					"m.model IN ("+
-					strings.Join(placeholders, ",")+
-					"))")
-		}
-	}
-
-	if f.MinUserMessages > 0 {
-		preds = append(preds, "user_message_count >= ?")
-		args = append(args, f.MinUserMessages)
-	}
-	scope := normalizeAutomatedScope(f.AutomatedScope, f.ExcludeAutomated)
-	if f.ExcludeOneShot {
-		if scope != "human" {
-			preds = append(preds,
-				f.OneShotExclusionSQL(
-					"(user_message_count > 1 OR is_automated = 1)"))
-		} else {
-			preds = append(preds,
-				f.OneShotExclusionSQL("user_message_count > 1"))
-		}
-	}
-	if pred := automatedScopePredicate(scope, "is_automated"); pred != "" {
-		preds = append(preds, pred)
-	}
-	if f.ExcludeInteractive {
-		preds = append(preds, "is_automated = 1")
-	}
-
-	if f.ActiveSince != "" {
-		preds = append(preds,
-			"COALESCE(NULLIF(ended_at, ''), NULLIF(started_at, ''), created_at) >= ?")
-		args = append(args, f.ActiveSince)
-	}
-
-	if pred, pargs := buildTerminationPredSQLite(f.Termination); pred != "" {
-		preds = append(preds, pred)
-		args = append(args, pargs...)
-	}
-
-	return strings.Join(preds, " AND "), args
+	where := BuildAnalyticsWhere(f, b, "", sessionIDExpr, dates)
+	return where, b.Args()
 }
 
-func normalizeAutomatedScope(scope string, excludeAutomated bool) string {
-	switch strings.TrimSpace(scope) {
+// NormalizeAutomatedScope resolves the explicit scope and legacy exclusion flag.
+func NormalizeAutomatedScope(scope string, excludeAutomated bool) string {
+	scope = strings.TrimSpace(scope)
+	switch scope {
 	case "human", "all", "automated":
-		return strings.TrimSpace(scope)
+		return scope
 	}
 	if excludeAutomated {
 		return "human"
 	}
 	return "all"
-}
-
-func automatedScopePredicate(scope, col string) string {
-	switch scope {
-	case "human":
-		return col + " = 0"
-	case "automated":
-		return col + " = 1"
-	default:
-		return ""
-	}
 }
 
 func (db *DB) queryAnalyticsModels(
@@ -598,20 +442,12 @@ func (db *DB) getAnalyticsModelsForSessionIDs(
 	if len(sessionIDs) == 0 {
 		return []string{}, nil
 	}
-	seen := make(map[string]struct{}, len(sessionIDs))
-	unique := make([]string, 0, len(sessionIDs))
-	for _, sessionID := range sessionIDs {
-		if _, ok := seen[sessionID]; ok {
-			continue
-		}
-		seen[sessionID] = struct{}{}
-		unique = append(unique, sessionID)
-	}
+	unique := UniqueAnalyticsIDs(sessionIDs)
 
 	modelSet := make(map[string]struct{})
 	models := make([]string, 0)
 	if err := queryChunked(unique, func(chunk []string) error {
-		ph, args := inPlaceholders(chunk)
+		ph, args := InPlaceholders(chunk)
 		found, err := db.queryAnalyticsModels(ctx, `
 			SELECT DISTINCT model
 			FROM messages
@@ -646,17 +482,9 @@ func (db *DB) getAnalyticsModelsForSessionIDsFiltered(
 	if len(sessionIDs) == 0 {
 		return []string{}, nil
 	}
-	seen := make(map[string]struct{}, len(sessionIDs))
-	unique := make([]string, 0, len(sessionIDs))
-	for _, sessionID := range sessionIDs {
-		if _, ok := seen[sessionID]; ok {
-			continue
-		}
-		seen[sessionID] = struct{}{}
-		unique = append(unique, sessionID)
-	}
+	unique := UniqueAnalyticsIDs(sessionIDs)
 
-	filterModels := csvFilterValues(f.Model)
+	filterModels := CSVFilterValues(f.Model)
 	allowedModels := make(map[string]struct{}, len(filterModels))
 	for _, model := range filterModels {
 		allowedModels[model] = struct{}{}
@@ -665,7 +493,7 @@ func (db *DB) getAnalyticsModelsForSessionIDsFiltered(
 	modelSet := make(map[string]struct{})
 	models := make([]string, 0)
 	if err := queryChunked(unique, func(chunk []string) error {
-		ph, args := inPlaceholders(chunk)
+		ph, args := InPlaceholders(chunk)
 		rows, err := db.getReader().QueryContext(ctx, `
 			SELECT model, COALESCE(timestamp, '')
 			FROM messages
@@ -689,7 +517,7 @@ func (db *DB) getAnalyticsModelsForSessionIDsFiltered(
 				}
 			}
 			if f.HasTimeFilter() {
-				t, ok := localTime(ts, loc)
+				t, ok := LocalTime(ts, loc)
 				if !ok || !f.matchesTimeFilter(t) {
 					continue
 				}
@@ -897,7 +725,7 @@ func (db *DB) filteredSessionIDs(
 		if ids[sid] {
 			continue // already matched
 		}
-		t, ok := localTime(msgTS, loc)
+		t, ok := LocalTime(msgTS, loc)
 		if !ok {
 			continue
 		}
@@ -930,17 +758,15 @@ func (db *DB) filteredSessionIDsModel(
 		return nil, err
 	}
 	ids := make(map[string]bool)
-	if scope != nil {
-		for id := range scope.MessagesBySession() {
-			ids[id] = true
-		}
+	for id := range scope {
+		ids[id] = true
 	}
 	return ids, nil
 }
 
-// localTime parses a UTC timestamp string and converts it to the
+// LocalTime parses a UTC timestamp string and converts it to the
 // given location. Returns the local time and true on success.
-func localTime(
+func LocalTime(
 	ts string, loc *time.Location,
 ) (time.Time, bool) {
 	t, err := time.Parse(time.RFC3339Nano, ts)
@@ -953,10 +779,10 @@ func localTime(
 	return t.In(loc), true
 }
 
-// localDate converts a UTC timestamp string to a local date
+// LocalDate converts a UTC timestamp string to a local date
 // string (YYYY-MM-DD) in the given location.
-func localDate(ts string, loc *time.Location) string {
-	t, ok := localTime(ts, loc)
+func LocalDate(ts string, loc *time.Location) string {
+	t, ok := LocalTime(ts, loc)
 	if !ok {
 		if len(ts) >= 10 {
 			return ts[:10]
@@ -966,9 +792,9 @@ func localDate(ts string, loc *time.Location) string {
 	return t.Format("2006-01-02")
 }
 
-// percentileFloat returns the value at the given percentile
+// PercentileFloat returns the value at the given percentile
 // from a pre-sorted float64 slice.
-func percentileFloat(sorted []float64, pct float64) float64 {
+func PercentileFloat(sorted []float64, pct float64) float64 {
 	n := len(sorted)
 	if n == 0 {
 		return 0
@@ -980,10 +806,10 @@ func percentileFloat(sorted []float64, pct float64) float64 {
 	return sorted[idx]
 }
 
-// inDateRange checks if a local date falls within [from, to].
+// InDateRange checks if a local date falls within [from, to].
 // Empty bounds are treated as unbounded so callers can pass a
 // zero AnalyticsFilter to get every session.
-func inDateRange(date, from, to string) bool {
+func InDateRange(date, from, to string) bool {
 	if from != "" && date < from {
 		return false
 	}
@@ -993,10 +819,10 @@ func inDateRange(date, from, to string) bool {
 	return true
 }
 
-// medianInt returns the median of a sorted int slice of
+// MedianInt returns the median of a sorted int slice of
 // length n. For even n, returns the average of the two
 // middle elements.
-func medianInt(sorted []int, n int) int {
+func MedianInt(sorted []int, n int) int {
 	if n == 0 {
 		return 0
 	}
@@ -1035,6 +861,12 @@ type AnalyticsSummary struct {
 func (db *DB) GetAnalyticsSummary(
 	ctx context.Context, f AnalyticsFilter,
 ) (AnalyticsSummary, error) {
+	release, err := db.acquireBulkRead(ctx)
+	if err != nil {
+		return AnalyticsSummary{}, err
+	}
+	defer release()
+
 	// The summary is a token/session aggregate, so subagent sessions
 	// (including workflow subagents) are counted here.
 	f.IncludeSubagents = true
@@ -1118,7 +950,7 @@ func (db *DB) GetAnalyticsSummary(
 	}
 	if !rows.Next() {
 		rows.Close()
-		return s, nil
+		return s, rows.Err()
 	}
 	if err := rows.Scan(
 		&s.TotalSessions,
@@ -1241,8 +1073,8 @@ func (db *DB) getAnalyticsSummaryGo(
 			return AnalyticsSummary{},
 				fmt.Errorf("scanning summary row: %w", err)
 		}
-		date := localDate(ts, loc)
-		if !inDateRange(date, f.From, f.To) {
+		date := LocalDate(ts, loc)
+		if !InDateRange(date, f.From, f.To) {
 			continue
 		}
 		if timeIDs != nil && !timeIDs[id] {
@@ -1396,8 +1228,8 @@ type ActivityResponse struct {
 	Series      []ActivityEntry `json:"series"`
 }
 
-// bucketDate truncates a date to the start of its bucket.
-func bucketDate(date string, granularity string) string {
+// BucketDate truncates a date to the start of its bucket.
+func BucketDate(date string, granularity string) string {
 	t, err := time.Parse("2006-01-02", date)
 	if err != nil {
 		return date
@@ -1427,10 +1259,10 @@ func (db *DB) getModelScopedToolCallCounts(
 	if len(sessionIDs) == 0 || strings.TrimSpace(f.Model) == "" {
 		return counts, nil
 	}
-	flt := f.messageScopeFilter()
+	flt := f.MessageScopeFilter()
 	loc := f.location()
 	if err := queryChunked(sessionIDs, func(chunk []string) error {
-		ph, args := inPlaceholders(chunk)
+		ph, args := InPlaceholders(chunk)
 		rows, err := db.getReader().QueryContext(ctx, `
 			SELECT tc.session_id, m.model, COALESCE(m.timestamp, ''), COUNT(*)
 			FROM tool_calls tc
@@ -1454,7 +1286,7 @@ func (db *DB) getModelScopedToolCallCounts(
 			if _, ok := flt.Models[model]; !ok {
 				continue
 			}
-			parsed, has := localTime(ts, loc)
+			parsed, has := LocalTime(ts, loc)
 			if !flt.MatchesDayHour(parsed, has) {
 				continue
 			}
@@ -1504,8 +1336,8 @@ func (db *DB) getAnalyticsActivityFilteredByModelTime(
 			return ActivityResponse{},
 				fmt.Errorf("scanning analytics activity session: %w", err)
 		}
-		date := localDate(ts, loc)
-		if !inDateRange(date, f.From, f.To) {
+		date := LocalDate(ts, loc)
+		if !InDateRange(date, f.From, f.To) {
 			continue
 		}
 		if timeIDs != nil && !timeIDs[id] {
@@ -1534,7 +1366,7 @@ func (db *DB) getAnalyticsActivityFilteredByModelTime(
 
 	buckets := make(map[string]*ActivityEntry)
 	for _, session := range sessions {
-		bucket := bucketDate(session.date, granularity)
+		bucket := BucketDate(session.date, granularity)
 		entry := buckets[bucket]
 		if entry == nil {
 			entry = &ActivityEntry{
@@ -1572,6 +1404,12 @@ func (db *DB) GetAnalyticsActivity(
 	ctx context.Context, f AnalyticsFilter,
 	granularity string,
 ) (ActivityResponse, error) {
+	release, err := db.acquireBulkRead(ctx)
+	if err != nil {
+		return ActivityResponse{}, err
+	}
+	defer release()
+
 	if granularity == "" {
 		granularity = "day"
 	}
@@ -1631,14 +1469,14 @@ func (db *DB) GetAnalyticsActivity(
 				fmt.Errorf("scanning activity row: %w", err)
 		}
 
-		date := localDate(ts, loc)
-		if !inDateRange(date, f.From, f.To) {
+		date := LocalDate(ts, loc)
+		if !InDateRange(date, f.From, f.To) {
 			continue
 		}
 		if timeIDs != nil && !timeIDs[sid] {
 			continue
 		}
-		bucket := bucketDate(date, granularity)
+		bucket := BucketDate(date, granularity)
 
 		entry, ok := buckets[bucket]
 		if !ok {
@@ -1715,7 +1553,7 @@ func (db *DB) mergeActivityToolCalls(
 	buckets map[string]*ActivityEntry,
 	model string,
 ) error {
-	ph, args := inPlaceholders(chunk)
+	ph, args := InPlaceholders(chunk)
 	q := `SELECT tc.session_id, COUNT(*)
 		FROM tool_calls tc`
 	if model != "" {
@@ -1790,6 +1628,11 @@ func (db *DB) GetAnalyticsHeatmap(
 	if metric == "" {
 		metric = "messages"
 	}
+	release, err := db.acquireBulkRead(ctx)
+	if err != nil {
+		return HeatmapResponse{}, err
+	}
+	defer release()
 
 	loc := f.location()
 	dateCol := "COALESCE(NULLIF(started_at, ''), created_at)"
@@ -1839,8 +1682,8 @@ func (db *DB) GetAnalyticsHeatmap(
 			return HeatmapResponse{},
 				fmt.Errorf("scanning heatmap row: %w", err)
 		}
-		date := localDate(ts, loc)
-		if !inDateRange(date, f.From, f.To) {
+		date := LocalDate(ts, loc)
+		if !InDateRange(date, f.From, f.To) {
 			continue
 		}
 		if timeIDs != nil && !timeIDs[id] {
@@ -1884,7 +1727,6 @@ func (db *DB) GetAnalyticsHeatmap(
 		}
 	}
 
-	// Choose which map to use based on metric
 	source := dayCounts
 	switch metric {
 	case "sessions":
@@ -1892,43 +1734,31 @@ func (db *DB) GetAnalyticsHeatmap(
 	case "output_tokens":
 		source = dayOutputTokens
 	}
+	return BuildHeatmapResponse(f.From, f.To, metric, source), nil
+}
 
-	// For output_tokens, an empty source means no sessions
-	// reported token coverage. Return an empty heatmap so the
-	// UI can show "no data" instead of a misleading zero grid.
+// BuildHeatmapResponse builds one entry per day in [from, to], clamped to
+// MaxHeatmapDays, with quartile levels from the displayed days' values. An
+// output_tokens source with no days means no session reported token coverage,
+// so the response has no entries and the UI shows "no data".
+func BuildHeatmapResponse(
+	from, to, metric string, source map[string]int,
+) HeatmapResponse {
+	entriesFrom := clampFrom(from, to)
+	out := HeatmapResponse{Metric: metric, EntriesFrom: entriesFrom}
 	if metric == "output_tokens" && len(source) == 0 {
-		return HeatmapResponse{
-			Metric:      metric,
-			EntriesFrom: clampFrom(f.From, f.To),
-		}, nil
+		return out
 	}
-
-	// Determine effective date range (clamped to MaxHeatmapDays)
-	entriesFrom := clampFrom(f.From, f.To)
-
-	// Collect non-zero values from the displayed range only,
-	// so outliers outside the window don't skew intensity.
 	var values []int
-	for date, v := range source {
-		if v > 0 && date >= entriesFrom && date <= f.To {
-			values = append(values, v)
+	for date, value := range source {
+		if value > 0 && date >= entriesFrom && date <= to {
+			values = append(values, value)
 		}
 	}
 	sort.Ints(values)
-
-	levels := computeQuartileLevels(values)
-
-	// Build entries for each day in the clamped range
-	entries := buildDateEntries(
-		entriesFrom, f.To, source, levels,
-	)
-
-	return HeatmapResponse{
-		Metric:      metric,
-		Entries:     entries,
-		Levels:      levels,
-		EntriesFrom: entriesFrom,
-	}, nil
+	out.Levels = computeQuartileLevels(values)
+	out.Entries = buildDateEntries(entriesFrom, to, source, out.Levels)
+	return out
 }
 
 // computeQuartileLevels computes thresholds from sorted values.
@@ -2040,6 +1870,12 @@ type ProjectsAnalyticsResponse struct {
 func (db *DB) GetAnalyticsProjects(
 	ctx context.Context, f AnalyticsFilter,
 ) (ProjectsAnalyticsResponse, error) {
+	release, err := db.acquireBulkRead(ctx)
+	if err != nil {
+		return ProjectsAnalyticsResponse{}, err
+	}
+	defer release()
+
 	// Per-project session/token breakdown is an aggregate, so subagent
 	// sessions (including workflow subagents) are counted here.
 	f.IncludeSubagents = true
@@ -2099,8 +1935,8 @@ func (db *DB) GetAnalyticsProjects(
 			return ProjectsAnalyticsResponse{},
 				fmt.Errorf("scanning project row: %w", err)
 		}
-		date := localDate(ts, loc)
-		if !inDateRange(date, f.From, f.To) {
+		date := LocalDate(ts, loc)
+		if !InDateRange(date, f.From, f.To) {
 			continue
 		}
 		if timeIDs != nil && !timeIDs[id] {
@@ -2190,7 +2026,7 @@ func (db *DB) GetAnalyticsProjects(
 			FirstSession:   pd.first,
 			LastSession:    pd.last,
 			AvgMessages:    avg,
-			MedianMessages: medianInt(pd.counts, n),
+			MedianMessages: MedianInt(pd.counts, n),
 			Agents:         pd.agents,
 			DailyTrend:     trend,
 		})
@@ -2223,6 +2059,12 @@ type HourOfWeekResponse struct {
 func (db *DB) GetAnalyticsHourOfWeek(
 	ctx context.Context, f AnalyticsFilter,
 ) (HourOfWeekResponse, error) {
+	release, err := db.acquireBulkRead(ctx)
+	if err != nil {
+		return HourOfWeekResponse{}, err
+	}
+	defer release()
+
 	if strings.TrimSpace(f.Model) != "" {
 		return db.getAnalyticsHourOfWeekFilteredByModel(ctx, f)
 	}
@@ -2250,11 +2092,11 @@ func (db *DB) GetAnalyticsHourOfWeek(
 			return HourOfWeekResponse{},
 				fmt.Errorf("scanning hour-of-week row: %w", err)
 		}
-		sessDate := localDate(sessTS, loc)
-		if !inDateRange(sessDate, f.From, f.To) {
+		sessDate := LocalDate(sessTS, loc)
+		if !InDateRange(sessDate, f.From, f.To) {
 			continue
 		}
-		t, ok := localTime(msgTS, loc)
+		t, ok := LocalTime(msgTS, loc)
 		if !ok {
 			continue
 		}
@@ -2303,7 +2145,7 @@ func (db *DB) analyticsModelCandidateSessionIDs(
 		if err := rows.Scan(&id, &ts); err != nil {
 			return nil, fmt.Errorf("scanning model candidate session: %w", err)
 		}
-		if !inDateRange(localDate(ts, loc), f.From, f.To) {
+		if !InDateRange(LocalDate(ts, loc), f.From, f.To) {
 			continue
 		}
 		ids = append(ids, id)
@@ -2333,16 +2175,14 @@ func (db *DB) getAnalyticsHourOfWeekFilteredByModel(
 	}
 
 	var grid [7][24]int
-	if scope != nil {
-		for _, msgs := range scope.MessagesBySession() {
-			for _, m := range msgs {
-				if !m.HasLocalTime {
-					continue
-				}
-				// Go Sunday=0, convert to ISO Monday=0
-				dow := (int(m.LocalTime.Weekday()) + 6) % 7
-				grid[dow][m.LocalTime.Hour()]++
+	for _, msgs := range scope {
+		for _, m := range msgs {
+			if !m.HasLocalTime {
+				continue
 			}
+			// Go Sunday=0, convert to ISO Monday=0
+			dow := (int(m.LocalTime.Weekday()) + 6) % 7
+			grid[dow][m.LocalTime.Hour()]++
 		}
 	}
 
@@ -2382,8 +2222,8 @@ type SessionShapeResponse struct {
 	AutonomyDistribution []DistributionBucket `json:"autonomy_distribution"`
 }
 
-// lengthBucket returns the bucket label for a message count.
-func lengthBucket(mc int) string {
+// LengthBucket returns the bucket label for a message count.
+func LengthBucket(mc int) string {
 	switch {
 	case mc <= 5:
 		return "1-5"
@@ -2400,9 +2240,9 @@ func lengthBucket(mc int) string {
 	}
 }
 
-// durationBucket returns the bucket label for a duration in
+// DurationBucket returns the bucket label for a duration in
 // minutes.
-func durationBucket(mins float64) string {
+func DurationBucket(mins float64) string {
 	switch {
 	case mins < 5:
 		return "<5m"
@@ -2419,8 +2259,8 @@ func durationBucket(mins float64) string {
 	}
 }
 
-// autonomyBucket returns the bucket label for an autonomy ratio.
-func autonomyBucket(ratio float64) string {
+// AutonomyBucket returns the bucket label for an autonomy ratio.
+func AutonomyBucket(ratio float64) string {
 	switch {
 	case ratio < 0.5:
 		return "<0.5"
@@ -2477,11 +2317,32 @@ func mapToBuckets(
 	return buckets
 }
 
+// LengthDistributionBuckets orders message-count buckets for display.
+func LengthDistributionBuckets(counts map[string]int) []DistributionBucket {
+	return mapToBuckets(counts, lengthOrder)
+}
+
+// DurationDistributionBuckets orders duration buckets for display.
+func DurationDistributionBuckets(counts map[string]int) []DistributionBucket {
+	return mapToBuckets(counts, durationOrder)
+}
+
+// AutonomyDistributionBuckets orders autonomy-ratio buckets for display.
+func AutonomyDistributionBuckets(counts map[string]int) []DistributionBucket {
+	return mapToBuckets(counts, autonomyOrder)
+}
+
 // GetAnalyticsSessionShape returns distribution histograms for
 // session length, duration, and autonomy ratio.
 func (db *DB) GetAnalyticsSessionShape(
 	ctx context.Context, f AnalyticsFilter,
 ) (SessionShapeResponse, error) {
+	release, err := db.acquireBulkRead(ctx)
+	if err != nil {
+		return SessionShapeResponse{}, err
+	}
+	defer release()
+
 	loc := f.location()
 	modelFilter := strings.TrimSpace(f.Model) != ""
 	dateCol := "COALESCE(NULLIF(started_at, ''), created_at)"
@@ -2522,8 +2383,8 @@ func (db *DB) GetAnalyticsSessionShape(
 			return SessionShapeResponse{},
 				fmt.Errorf("scanning session shape row: %w", err)
 		}
-		date := localDate(ts, loc)
-		if !inDateRange(date, f.From, f.To) {
+		date := LocalDate(ts, loc)
+		if !InDateRange(date, f.From, f.To) {
 			continue
 		}
 		if timeIDs != nil && !timeIDs[id] {
@@ -2532,18 +2393,18 @@ func (db *DB) GetAnalyticsSessionShape(
 
 		totalCount++
 		if !modelFilter {
-			lengthCounts[lengthBucket(mc)]++
+			lengthCounts[LengthBucket(mc)]++
 		}
 		sessionIDs = append(sessionIDs, id)
 
 		if startedAt != nil && endedAt != nil &&
 			*startedAt != "" && *endedAt != "" {
-			tStart, okS := localTime(*startedAt, loc)
-			tEnd, okE := localTime(*endedAt, loc)
+			tStart, okS := LocalTime(*startedAt, loc)
+			tEnd, okE := LocalTime(*endedAt, loc)
 			if okS && okE {
 				mins := tEnd.Sub(tStart).Minutes()
 				if mins >= 0 {
-					durationCounts[durationBucket(mins)]++
+					durationCounts[DurationBucket(mins)]++
 				}
 			}
 		}
@@ -2569,11 +2430,11 @@ func (db *DB) GetAnalyticsSessionShape(
 			}
 			seen[sessionID] = struct{}{}
 			stat := stats[sessionID]
-			lengthCounts[lengthBucket(stat.Messages)]++
+			lengthCounts[LengthBucket(stat.Messages)]++
 			if stat.UserMessages > 0 {
 				ratio := float64(stat.ToolUseMessages) /
 					float64(stat.UserMessages)
-				autonomyCounts[autonomyBucket(ratio)]++
+				autonomyCounts[AutonomyBucket(ratio)]++
 			}
 		}
 	} else if len(sessionIDs) > 0 {
@@ -2590,9 +2451,9 @@ func (db *DB) GetAnalyticsSessionShape(
 
 	return SessionShapeResponse{
 		Count:                totalCount,
-		LengthDistribution:   mapToBuckets(lengthCounts, lengthOrder),
-		DurationDistribution: mapToBuckets(durationCounts, durationOrder),
-		AutonomyDistribution: mapToBuckets(autonomyCounts, autonomyOrder),
+		LengthDistribution:   LengthDistributionBuckets(lengthCounts),
+		DurationDistribution: DurationDistributionBuckets(durationCounts),
+		AutonomyDistribution: AutonomyDistributionBuckets(autonomyCounts),
 	}, nil
 }
 
@@ -2603,7 +2464,7 @@ func (db *DB) queryAutonomyChunk(
 	chunk []string,
 	counts map[string]int,
 ) error {
-	ph, args := inPlaceholders(chunk)
+	ph, args := InPlaceholders(chunk)
 	q := `SELECT session_id,
 		SUM(CASE WHEN role='user' AND is_system=0
 			AND COALESCE(source_subtype, '') <> 'tool_result'
@@ -2630,7 +2491,7 @@ func (db *DB) queryAutonomyChunk(
 		}
 		if userCount > 0 {
 			ratio := float64(toolCount) / float64(userCount)
-			counts[autonomyBucket(ratio)]++
+			counts[AutonomyBucket(ratio)]++
 		}
 	}
 	return rows.Err()
@@ -2655,11 +2516,16 @@ type ToolAgentBreakdown struct {
 
 // ToolUsageAnalysis holds ranked usage for one concrete tool name.
 type ToolUsageAnalysis struct {
-	ToolName     string  `json:"tool_name"`
-	Category     string  `json:"category"`
-	CallCount    int     `json:"call_count"`
-	SessionCount int     `json:"session_count"`
-	Pct          float64 `json:"pct"`
+	ToolEffectivenessCounts
+	MissingCalls int      `json:"missing_calls"`
+	EmptyRate    *float64 `json:"empty_rate"`
+	RepeatRate   *float64 `json:"repeat_rate"`
+	RecoveryRate *float64 `json:"recovery_rate"`
+	ToolName     string   `json:"tool_name"`
+	Category     string   `json:"category"`
+	CallCount    int      `json:"call_count"`
+	SessionCount int      `json:"session_count"`
+	Pct          float64  `json:"pct"`
 }
 
 // ToolTrendEntry holds tool call counts for one time bucket.
@@ -2680,6 +2546,11 @@ type ToolsAnalyticsResponse struct {
 // ToolAnalyticsRow is a backend-neutral intermediate row used to
 // aggregate concrete tool usage after native stores apply their filters.
 type ToolAnalyticsRow struct {
+	ToolEffectivenessCounts
+	Project string
+	// Ordinal is the first ordinal among the row's calls whose message still
+	// exists; nil when none do, so evidence never links to a missing message.
+	Ordinal   *int
 	SessionID string
 	ToolName  string
 	Category  string
@@ -2738,6 +2609,7 @@ type SkillAnalyticsRow struct {
 }
 
 type toolUsageAccumulator struct {
+	ToolEffectivenessCounts
 	toolName   string
 	category   string
 	callCount  int
@@ -2775,16 +2647,13 @@ func BuildToolsAnalytics(rows []ToolAnalyticsRow) ToolsAnalyticsResponse {
 		}
 		agentCats[row.Agent][row.Category] += row.Count
 
-		week := bucketDate(row.Date, "week")
+		week := BucketDate(row.Date, "week")
 		if trendBuckets[week] == nil {
 			trendBuckets[week] = make(map[string]int)
 		}
 		trendBuckets[week][row.Category] += row.Count
 
-		name := strings.TrimSpace(row.ToolName)
-		if name == "" {
-			name = "Unknown"
-		}
+		name := normalizeToolName(row.ToolName)
 		key := row.Category + "\x00" + name
 		acc := toolCounts[key]
 		if acc == nil {
@@ -2795,6 +2664,7 @@ func BuildToolsAnalytics(rows []ToolAnalyticsRow) ToolsAnalyticsResponse {
 			}
 			toolCounts[key] = acc
 		}
+		acc.Add(row.ToolEffectivenessCounts)
 		acc.callCount += row.Count
 		if row.SessionID != "" {
 			acc.sessionIDs[row.SessionID] = struct{}{}
@@ -2863,11 +2733,16 @@ func BuildToolsAnalytics(rows []ToolAnalyticsRow) ToolsAnalyticsResponse {
 			float64(acc.callCount)/float64(resp.TotalCalls)*1000,
 		) / 10
 		resp.ByTool = append(resp.ByTool, ToolUsageAnalysis{
-			ToolName:     acc.toolName,
-			Category:     acc.category,
-			CallCount:    acc.callCount,
-			SessionCount: len(acc.sessionIDs),
-			Pct:          pct,
+			ToolEffectivenessCounts: acc.ToolEffectivenessCounts,
+			MissingCalls:            acc.callCount - acc.AnalyzedCalls,
+			EmptyRate:               toolRate(acc.EmptyCalls, acc.KnownOutcomeCalls),
+			RepeatRate:              toolRate(acc.RepeatedCalls, acc.AnalyzedCalls),
+			RecoveryRate:            toolRate(acc.RecoveredSequences, acc.RecoveredSequences+acc.AbandonedSequences),
+			ToolName:                acc.toolName,
+			Category:                acc.category,
+			CallCount:               acc.callCount,
+			SessionCount:            len(acc.sessionIDs),
+			Pct:                     pct,
 		})
 	}
 	sort.Slice(resp.ByTool, func(i, j int) bool {
@@ -2912,8 +2787,8 @@ func timestampAfter(a, b string) bool {
 	if a == "" {
 		return false
 	}
-	ta, aok := localTime(a, time.UTC)
-	tb, bok := localTime(b, time.UTC)
+	ta, aok := LocalTime(a, time.UTC)
+	tb, bok := LocalTime(b, time.UTC)
 	if aok && bok {
 		return ta.After(tb)
 	}
@@ -2977,7 +2852,7 @@ func BuildSkillsAnalytics(
 			acc.lastUsedAt = row.LastUsedAt
 		}
 		if row.Date != "" {
-			date := bucketDate(row.Date, bucket)
+			date := BucketDate(row.Date, bucket)
 			if trendBuckets[date] == nil {
 				trendBuckets[date] = map[string]int{}
 			}
@@ -3073,10 +2948,10 @@ func analyticsToolsQuery(
 	query := `SELECT tc.session_id, tc.category,
 			TRIM(COALESCE(tc.tool_name, '')), COUNT(*)`
 	if includeMessageMeta {
-		query += `, MAX(COALESCE(m.timestamp, ''))`
+		query += `, MAX(COALESCE(m.timestamp, '')), MIN(m.ordinal)` + ToolEffectivenessSQL("tc", "s.quality_signal_version")
 	}
 	query += `
-		FROM tool_calls tc`
+		FROM tool_calls tc JOIN sessions s ON s.id = tc.session_id`
 	if includeMessageMeta {
 		query += `
 		LEFT JOIN messages m
@@ -3127,9 +3002,20 @@ func analyticsSkillsQuery(
 
 // GetAnalyticsTools returns tool usage analytics aggregated
 // from the tool_calls table.
-func (db *DB) GetAnalyticsTools(
+func (db *DB) GetAnalyticsTools(ctx context.Context, f AnalyticsFilter) (ToolsAnalyticsResponse, error) {
+	release, err := db.acquireBulkRead(ctx)
+	if err != nil {
+		return ToolsAnalyticsResponse{}, err
+	}
+	defer release()
+
+	rows, err := db.analyticsToolRows(ctx, f)
+	return BuildToolsAnalytics(rows), err
+}
+
+func (db *DB) analyticsToolRows(
 	ctx context.Context, f AnalyticsFilter,
-) (ToolsAnalyticsResponse, error) {
+) ([]ToolAnalyticsRow, error) {
 	dateCol := "COALESCE(NULLIF(started_at, ''), created_at)"
 	where, args := f.buildWhereWithoutDate()
 	if pred, windowArgs := f.toolSessionWindowSQL(dateCol, "sessions.id"); pred != "" {
@@ -3138,46 +3024,40 @@ func (db *DB) GetAnalyticsTools(
 	}
 
 	// Fetch filtered session IDs and their metadata.
-	sessQ := `SELECT id, ` + dateCol + `, agent
+	sessQ := `SELECT id, ` + dateCol + `, agent, project
 		FROM sessions WHERE ` + where
 
 	sessRows, err := db.getReader().QueryContext(ctx, sessQ, args...)
 	if err != nil {
-		return ToolsAnalyticsResponse{},
+		return nil,
 			fmt.Errorf("querying tool sessions: %w", err)
 	}
 	defer sessRows.Close()
 
 	type sessInfo struct {
-		ts    string
-		agent string
+		ts      string
+		agent   string
+		project string
 	}
 	sessionMap := make(map[string]sessInfo)
 	var sessionIDs []string
 
 	for sessRows.Next() {
-		var id, ts, agent string
-		if err := sessRows.Scan(&id, &ts, &agent); err != nil {
-			return ToolsAnalyticsResponse{},
+		var id, ts, agent, project string
+		if err := sessRows.Scan(&id, &ts, &agent, &project); err != nil {
+			return nil,
 				fmt.Errorf("scanning tool session: %w", err)
 		}
-		sessionMap[id] = sessInfo{ts: ts, agent: agent}
+		sessionMap[id] = sessInfo{ts: ts, agent: agent, project: project}
 		sessionIDs = append(sessionIDs, id)
 	}
 	if err := sessRows.Err(); err != nil {
-		return ToolsAnalyticsResponse{},
+		return nil,
 			fmt.Errorf("iterating tool sessions: %w", err)
 	}
 
-	resp := ToolsAnalyticsResponse{
-		ByCategory: []ToolCategoryCount{},
-		ByAgent:    []ToolAgentBreakdown{},
-		ByTool:     []ToolUsageAnalysis{},
-		Trend:      []ToolTrendEntry{},
-	}
-
 	if len(sessionIDs) == 0 {
-		return resp, nil
+		return nil, nil
 	}
 
 	// Query tool_calls for filtered sessions (chunked).
@@ -3185,11 +3065,17 @@ func (db *DB) GetAnalyticsTools(
 
 	err = queryChunked(sessionIDs,
 		func(chunk []string) error {
-			ph, chunkArgs := inPlaceholders(chunk)
+			ph, chunkArgs := InPlaceholders(chunk)
 			modelPred, modelArgs := sqliteAnalyticsCSVPredicate(
 				"m.model", f.Model,
 			)
 			chunkArgs = append(chunkArgs, modelArgs...)
+			for _, predicate := range ToolSelectionPredicates("tc", "s.quality_signal_version", f, func(value string) string { chunkArgs = append(chunkArgs, value); return "?" }) {
+				if modelPred != "" {
+					modelPred += " AND "
+				}
+				modelPred += predicate
+			}
 			from, to := f.messageWindowBoundsUTC()
 			windowPred, windowArgs := analyticsMessageWindowPred("m.timestamp", from, to)
 			chunkArgs = append(chunkArgs, windowArgs...)
@@ -3207,8 +3093,10 @@ func (db *DB) GetAnalyticsTools(
 			for rows.Next() {
 				var sid, cat, toolName, ts string
 				var count int
+				var ordinal *int
+				var facts ToolEffectivenessCounts
 				if err := rows.Scan(
-					&sid, &cat, &toolName, &count, &ts,
+					append([]any{&sid, &cat, &toolName, &count, &ts, &ordinal}, facts.ScanTargets()...)...,
 				); err != nil {
 					return fmt.Errorf(
 						"scanning tool_call: %w", err,
@@ -3225,6 +3113,7 @@ func (db *DB) GetAnalyticsTools(
 					continue
 				}
 				toolRows = append(toolRows, ToolAnalyticsRow{
+					ToolEffectivenessCounts: facts, Ordinal: ordinal, Project: info.project,
 					SessionID: sid,
 					Category:  cat,
 					ToolName:  toolName,
@@ -3236,14 +3125,14 @@ func (db *DB) GetAnalyticsTools(
 			return rows.Err()
 		})
 	if err != nil {
-		return ToolsAnalyticsResponse{}, err
+		return nil, err
 	}
 
 	if len(toolRows) == 0 {
-		return resp, nil
+		return nil, nil
 	}
 
-	return BuildToolsAnalytics(toolRows), nil
+	return toolRows, nil
 }
 
 // ResolveSkillRowTime resolves the timestamp for a single skill call and
@@ -3264,12 +3153,12 @@ func (f AnalyticsFilter) ResolveSkillRowTime(
 	if strings.TrimSpace(usedTS) == "" {
 		usedTS = sessionTS
 	}
-	date = localDate(usedTS, loc)
-	if !inDateRange(date, f.From, f.To) {
+	date = LocalDate(usedTS, loc)
+	if !InDateRange(date, f.From, f.To) {
 		return usedTS, date, false
 	}
 	if f.HasTimeFilter() {
-		t, ok := localTime(usedTS, loc)
+		t, ok := LocalTime(usedTS, loc)
 		if !ok || !f.matchesTimeFilter(t) {
 			return usedTS, date, false
 		}
@@ -3283,6 +3172,12 @@ func (f AnalyticsFilter) ResolveSkillRowTime(
 func (db *DB) GetAnalyticsSkills(
 	ctx context.Context, f AnalyticsFilter, granularity string,
 ) (SkillsAnalyticsResponse, error) {
+	release, err := db.acquireBulkRead(ctx)
+	if err != nil {
+		return SkillsAnalyticsResponse{}, err
+	}
+	defer release()
+
 	dateCol := "COALESCE(NULLIF(started_at, ''), created_at)"
 	where, args := f.buildWhereWithoutDate()
 	if pred, windowArgs := f.toolSessionWindowSQL(dateCol, "sessions.id"); pred != "" {
@@ -3334,7 +3229,7 @@ func (db *DB) GetAnalyticsSkills(
 	var skillRows []SkillAnalyticsRow
 	err = queryChunked(sessionIDs,
 		func(chunk []string) error {
-			ph, chunkArgs := inPlaceholders(chunk)
+			ph, chunkArgs := InPlaceholders(chunk)
 			modelPred, modelArgs := sqliteAnalyticsCSVPredicate(
 				"m.model", f.Model,
 			)
@@ -3393,27 +3288,18 @@ func (db *DB) GetAnalyticsSkills(
 
 // --- Velocity ---
 
-// velocityMsg holds per-message data needed for velocity
-// calculations.
-type velocityMsg struct {
-	role          string
-	ts            time.Time
-	valid         bool
-	contentLength int
-}
-
 // queryVelocityMsgs fetches messages for a chunk of session IDs
 // and appends them to sessionMsgs, keyed by session ID.
 func (db *DB) queryVelocityMsgs(
 	ctx context.Context,
 	chunk []string,
 	loc *time.Location,
-	sessionMsgs map[string][]velocityMsg,
+	sessionMsgs map[string][]TimingMessage,
 ) error {
-	ph, args := inPlaceholders(chunk)
+	ph, args := InPlaceholders(chunk)
 	// COALESCE the nullable timestamp column to '' so a NULL (only present
 	// on imported/migrated archives) does not fail rows.Scan with
-	// "converting NULL to string is unsupported". localTime treats "" as
+	// "converting NULL to string is unsupported". LocalTime treats "" as
 	// invalid, so the row is excluded from velocity stats rather than
 	// crashing the analytics endpoint. This matches the NULL-safe
 	// PostgreSQL and DuckDB velocity twins.
@@ -3443,11 +3329,11 @@ func (db *DB) queryVelocityMsgs(
 				"scanning velocity msg: %w", err,
 			)
 		}
-		t, ok := localTime(ts, loc)
+		t, ok := LocalTime(ts, loc)
 		sessionMsgs[sid] = append(sessionMsgs[sid],
-			velocityMsg{
-				role: role, ts: t, valid: ok,
-				contentLength: cl,
+			TimingMessage{
+				Role: role, Time: t, Valid: ok,
+				ContentLength: cl,
 			})
 	}
 	return rows.Err()
@@ -3457,8 +3343,8 @@ func (db *DB) getAnalyticsVelocityMessages(
 	ctx context.Context,
 	sessionIDs []string,
 	f AnalyticsFilter,
-) (map[string][]velocityMsg, error) {
-	sessionMsgs := make(map[string][]velocityMsg, len(sessionIDs))
+) (map[string][]TimingMessage, error) {
+	sessionMsgs := make(map[string][]TimingMessage, len(sessionIDs))
 	if len(sessionIDs) == 0 {
 		return sessionMsgs, nil
 	}
@@ -3478,15 +3364,7 @@ func (db *DB) getAnalyticsVelocityMessages(
 	if scope == nil {
 		return sessionMsgs, nil
 	}
-	for sessionID, rows := range scope.TimingBySession() {
-		for _, row := range rows {
-			sessionMsgs[sessionID] = append(sessionMsgs[sessionID], velocityMsg{
-				role: row.Role, ts: row.Time, valid: row.Valid,
-				contentLength: row.ContentLength,
-			})
-		}
-	}
-	return sessionMsgs, nil
+	return scope.TimingBySession(), nil
 }
 
 // Percentiles holds p50 and p90 values.
@@ -3518,9 +3396,9 @@ type VelocityResponse struct {
 	ByComplexity []VelocityBreakdown `json:"by_complexity"`
 }
 
-// complexityBucket returns the complexity label based on
+// ComplexityBucket returns the complexity label based on
 // message count.
-func complexityBucket(mc int) string {
+func ComplexityBucket(mc int) string {
 	switch {
 	case mc <= 15:
 		return "1-15"
@@ -3558,7 +3436,7 @@ func populateVelocityAccumulator(
 		return accum, nil
 	}
 
-	sessionMsgs := make(map[string][]velocityMsg)
+	sessionMsgs := make(map[string][]TimingMessage)
 	if err := queryChunked(sessionIDs,
 		func(chunk []string) error {
 			return db.queryVelocityMsgs(
@@ -3571,7 +3449,7 @@ func populateVelocityAccumulator(
 	toolCountMap := make(map[string]int)
 	err := queryChunked(sessionIDs,
 		func(chunk []string) error {
-			ph, chunkArgs := inPlaceholders(chunk)
+			ph, chunkArgs := InPlaceholders(chunk)
 			q := `SELECT session_id, COUNT(*)
 				FROM tool_calls
 				WHERE session_id IN ` + ph + `
@@ -3623,7 +3501,7 @@ func populateVelocityAccumulator(
 // itself bumps each accumulator's sessions counter.
 func processSessionVelocity(
 	accums []*velocityAccumulator,
-	msgs []velocityMsg,
+	msgs []TimingMessage,
 	toolCount int,
 ) {
 	const maxCycleSec = 1800.0
@@ -3639,11 +3517,11 @@ func processSessionVelocity(
 	for i := 1; i < len(msgs); i++ {
 		prev := msgs[i-1]
 		cur := msgs[i]
-		if !prev.valid || !cur.valid {
+		if !prev.Valid || !cur.Valid {
 			continue
 		}
-		if prev.role == "user" && cur.role == "assistant" {
-			delta := cur.ts.Sub(prev.ts).Seconds()
+		if prev.Role == "user" && cur.Role == "assistant" {
+			delta := cur.Time.Sub(prev.Time).Seconds()
 			if delta > 0 && delta <= maxCycleSec {
 				for _, a := range accums {
 					a.turnCycles = append(a.turnCycles, delta)
@@ -3654,10 +3532,10 @@ func processSessionVelocity(
 
 	// First response: first user → first assistant after it.
 	// Scan by ordinal (conversation order), not timestamp.
-	var firstUser, firstAsst *velocityMsg
+	var firstUser, firstAsst *TimingMessage
 	firstUserIdx := -1
 	for i := range msgs {
-		if msgs[i].role == "user" && msgs[i].valid {
+		if msgs[i].Role == "user" && msgs[i].Valid {
 			firstUser = &msgs[i]
 			firstUserIdx = i
 			break
@@ -3665,14 +3543,14 @@ func processSessionVelocity(
 	}
 	if firstUserIdx >= 0 {
 		for i := firstUserIdx + 1; i < len(msgs); i++ {
-			if msgs[i].role == "assistant" && msgs[i].valid {
+			if msgs[i].Role == "assistant" && msgs[i].Valid {
 				firstAsst = &msgs[i]
 				break
 			}
 		}
 	}
 	if firstUser != nil && firstAsst != nil {
-		delta := firstAsst.ts.Sub(firstUser.ts).Seconds()
+		delta := firstAsst.Time.Sub(firstUser.Time).Seconds()
 		// Clamp negative deltas to 0: ordinal order is
 		// authoritative, so a negative delta means clock skew,
 		// not a missing response.
@@ -3688,11 +3566,11 @@ func processSessionVelocity(
 	activeSec := 0.0
 	asstChars := 0
 	for i, m := range msgs {
-		if m.role == "assistant" {
-			asstChars += m.contentLength
+		if m.Role == "assistant" {
+			asstChars += m.ContentLength
 		}
-		if i > 0 && msgs[i-1].valid && m.valid {
-			gap := m.ts.Sub(msgs[i-1].ts).Seconds()
+		if i > 0 && msgs[i-1].Valid && m.Valid {
+			gap := m.Time.Sub(msgs[i-1].Time).Seconds()
 			if gap > 0 {
 				if gap > maxGapSec {
 					gap = maxGapSec
@@ -3743,15 +3621,15 @@ func (a *velocityAccumulator) computeOverview() VelocityOverview {
 	var v VelocityOverview
 	v.TurnCycleSec = Percentiles{
 		P50: math.Round(
-			percentileFloat(a.turnCycles, 0.5)*10) / 10,
+			PercentileFloat(a.turnCycles, 0.5)*10) / 10,
 		P90: math.Round(
-			percentileFloat(a.turnCycles, 0.9)*10) / 10,
+			PercentileFloat(a.turnCycles, 0.9)*10) / 10,
 	}
 	v.FirstResponseSec = Percentiles{
 		P50: math.Round(
-			percentileFloat(a.firstResponses, 0.5)*10) / 10,
+			PercentileFloat(a.firstResponses, 0.5)*10) / 10,
 		P90: math.Round(
-			percentileFloat(a.firstResponses, 0.9)*10) / 10,
+			PercentileFloat(a.firstResponses, 0.9)*10) / 10,
 	}
 	if a.activeMinutes > 0 {
 		v.MsgsPerActiveMin = math.Round(
@@ -3769,6 +3647,12 @@ func (a *velocityAccumulator) computeOverview() VelocityOverview {
 func (db *DB) GetAnalyticsVelocity(
 	ctx context.Context, f AnalyticsFilter,
 ) (VelocityResponse, error) {
+	release, err := db.acquireBulkRead(ctx)
+	if err != nil {
+		return VelocityResponse{}, err
+	}
+	defer release()
+
 	loc := f.location()
 	dateCol := "COALESCE(NULLIF(started_at, ''), created_at)"
 	where, args := f.buildWhere(dateCol)
@@ -3795,11 +3679,7 @@ func (db *DB) GetAnalyticsVelocity(
 	}
 	defer sessRows.Close()
 
-	type sessInfo struct {
-		agent string
-		mc    int
-	}
-	sessionMap := make(map[string]sessInfo)
+	sessionMap := make(map[string]VelocitySession)
 	var sessionIDs []string
 
 	for sessRows.Next() {
@@ -3811,14 +3691,14 @@ func (db *DB) GetAnalyticsVelocity(
 			return VelocityResponse{},
 				fmt.Errorf("scanning velocity session: %w", err)
 		}
-		date := localDate(ts, loc)
-		if !inDateRange(date, f.From, f.To) {
+		date := LocalDate(ts, loc)
+		if !InDateRange(date, f.From, f.To) {
 			continue
 		}
 		if timeIDs != nil && !timeIDs[id] {
 			continue
 		}
-		sessionMap[id] = sessInfo{agent: agent, mc: mc}
+		sessionMap[id] = VelocitySession{Agent: agent, MessageCount: mc}
 		sessionIDs = append(sessionIDs, id)
 	}
 	if err := sessRows.Err(); err != nil {
@@ -3841,7 +3721,7 @@ func (db *DB) GetAnalyticsVelocity(
 		}
 		for _, sid := range sessionIDs {
 			info := sessionMap[sid]
-			info.mc = stats[sid].Messages
+			info.MessageCount = stats[sid].Messages
 			sessionMap[sid] = info
 		}
 	}
@@ -3865,7 +3745,7 @@ func (db *DB) GetAnalyticsVelocity(
 		toolCountMap = make(map[string]int)
 		err = queryChunked(sessionIDs,
 			func(chunk []string) error {
-				ph, chunkArgs := inPlaceholders(chunk)
+				ph, chunkArgs := InPlaceholders(chunk)
 				q := `SELECT session_id, COUNT(*)
 					FROM tool_calls
 					WHERE session_id IN ` + ph + `
@@ -3898,6 +3778,17 @@ func (db *DB) GetAnalyticsVelocity(
 		}
 	}
 
+	return BuildVelocityResponse(sessionIDs, sessionMap, sessionMsgs, toolCountMap), nil
+}
+
+// VelocitySession supplies the metadata used for velocity breakdowns.
+type VelocitySession struct {
+	Agent        string
+	MessageCount int
+}
+
+// BuildVelocityResponse aggregates timing and tool counts by agent and complexity.
+func BuildVelocityResponse(sessionIDs []string, sessionMap map[string]VelocitySession, sessionMsgs map[string][]TimingMessage, toolCountMap map[string]int) VelocityResponse {
 	// Process per-session metrics
 	overall := &velocityAccumulator{}
 	byAgent := make(map[string]*velocityAccumulator)
@@ -3910,8 +3801,8 @@ func (db *DB) GetAnalyticsVelocity(
 			continue
 		}
 
-		agentKey := info.agent
-		compKey := complexityBucket(info.mc)
+		agentKey := info.Agent
+		compKey := ComplexityBucket(info.MessageCount)
 
 		if byAgent[agentKey] == nil {
 			byAgent[agentKey] = &velocityAccumulator{}
@@ -3978,7 +3869,7 @@ func (db *DB) GetAnalyticsVelocity(
 			})
 	}
 
-	return resp, nil
+	return resp
 }
 
 // --- Signals ---
@@ -4056,8 +3947,10 @@ type SignalCalibration struct {
 // SignalSessionsResponse returns concrete sessions that triggered
 // an aggregate signal, including the best available message excerpt.
 type SignalSessionsResponse struct {
-	Signal   string                 `json:"signal"`
-	Sessions []SignalSessionExample `json:"sessions"`
+	Total      *int                   `json:"total,omitempty"`
+	NextOffset *int                   `json:"next_offset,omitempty"`
+	Signal     string                 `json:"signal"`
+	Sessions   []SignalSessionExample `json:"sessions"`
 }
 
 type SignalSessionExample struct {
@@ -4065,7 +3958,7 @@ type SignalSessionExample struct {
 	Project        string  `json:"project"`
 	Agent          string  `json:"agent"`
 	Date           string  `json:"date"`
-	IsAutomated    bool    `json:"is_automated"`
+	IsAutomated    *bool   `json:"is_automated,omitempty"`
 	Outcome        string  `json:"outcome"`
 	HealthScore    *int    `json:"health_score"`
 	HealthGrade    *string `json:"health_grade"`
@@ -4073,9 +3966,9 @@ type SignalSessionExample struct {
 	ReasonCode     string  `json:"reason_code"`
 	Excerpt        string  `json:"excerpt"`
 	MessageOrdinal *int    `json:"message_ordinal,omitempty"`
-	FailureSignals int     `json:"failure_signals"`
-	Retries        int     `json:"retries"`
-	EditChurn      int     `json:"edit_churn"`
+	FailureSignals *int    `json:"failure_signals,omitempty"`
+	Retries        *int    `json:"retries,omitempty"`
+	EditChurn      *int    `json:"edit_churn,omitempty"`
 }
 
 type SignalMessage struct {
@@ -4163,6 +4056,12 @@ type SignalRow struct {
 func (db *DB) GetAnalyticsSignals(
 	ctx context.Context, f AnalyticsFilter,
 ) (SignalsAnalyticsResponse, error) {
+	release, err := db.acquireBulkRead(ctx)
+	if err != nil {
+		return SignalsAnalyticsResponse{}, err
+	}
+	defer release()
+
 	loc := f.location()
 	dateCol := "COALESCE(NULLIF(started_at, ''), created_at)"
 	where, args := f.buildWhere(dateCol)
@@ -4227,8 +4126,8 @@ func (db *DB) GetAnalyticsSignals(
 					"scanning signals row: %w", err,
 				)
 		}
-		r.Date = localDate(ts, loc)
-		if !inDateRange(r.Date, f.From, f.To) {
+		r.Date = LocalDate(ts, loc)
+		if !InDateRange(r.Date, f.From, f.To) {
 			continue
 		}
 		if timeIDs != nil && !timeIDs[r.ID] {
@@ -4259,8 +4158,22 @@ func (db *DB) GetAnalyticsSignalSessions(
 	signal string,
 	limit int,
 ) (SignalSessionsResponse, error) {
-	if !IsSupportedAnalyticsSignal(signal) {
+	if !IsToolMetric(signal) && !IsSupportedAnalyticsSignal(signal) {
 		return SignalSessionsResponse{}, ErrUnsupportedAnalyticsSignal
+	}
+	release, err := db.acquireBulkRead(ctx)
+	if err != nil {
+		return SignalSessionsResponse{}, err
+	}
+	defer release()
+
+	if IsToolMetric(signal) {
+		f.ToolMetric = signal
+		rows, err := db.analyticsToolRows(ctx, f)
+		if err != nil {
+			return SignalSessionsResponse{}, err
+		}
+		return BuildToolMetricEvidence(rows, signal, f.ToolName, f.EvidenceOffset, limit), nil
 	}
 	if limit <= 0 || limit > 20 {
 		limit = 10
@@ -4328,7 +4241,7 @@ func (db *DB) signalRows(
 		if err != nil {
 			return nil, err
 		}
-		if !inDateRange(r.Date, f.From, f.To) {
+		if !InDateRange(r.Date, f.From, f.To) {
 			continue
 		}
 		if timeIDs != nil && !timeIDs[r.ID] {
@@ -4358,7 +4271,7 @@ func (db *DB) populateFrustrationMarkers(
 		ids = append(ids, rows[i].ID)
 	}
 	return queryChunked(ids, func(chunk []string) error {
-		ph, args := inPlaceholders(chunk)
+		ph, args := InPlaceholders(chunk)
 		q := `SELECT session_id, ordinal, content, is_system
 			FROM messages
 			WHERE role = 'user' AND COALESCE(source_subtype, '') <> 'tool_result' AND session_id IN ` + ph
@@ -4420,7 +4333,7 @@ func scanSignalRow(rs rowScanner, loc *time.Location) (SignalRow, error) {
 			"scanning signal row: %w", err,
 		)
 	}
-	r.Date = localDate(ts, loc)
+	r.Date = LocalDate(ts, loc)
 	return r, nil
 }
 
@@ -4494,9 +4407,9 @@ func (db *DB) signalMessages(
 		}
 		return out, nil
 	}
-	filterModels := csvFilterValues(f.Model)
+	filterModels := CSVFilterValues(f.Model)
 	err := queryChunked(ids, func(chunk []string) error {
-		ph, args := inPlaceholders(chunk)
+		ph, args := InPlaceholders(chunk)
 		q := `SELECT session_id, ordinal, role, content,
 					COALESCE(timestamp, ''), is_system, has_tool_use, COALESCE(source_subtype, '')
 				FROM messages
@@ -4505,7 +4418,7 @@ func (db *DB) signalMessages(
 			q += ` AND model = ?`
 			args = append(args, filterModels[0])
 		} else if len(filterModels) > 1 {
-			modelPH, modelArgs := inPlaceholders(filterModels)
+			modelPH, modelArgs := InPlaceholders(filterModels)
 			q += ` AND model IN ` + modelPH
 			args = append(args, modelArgs...)
 		}
@@ -4556,7 +4469,7 @@ func BuildSignalExamples(
 			Project:        r.Project,
 			Agent:          r.Agent,
 			Date:           r.Date,
-			IsAutomated:    r.IsAutomated,
+			IsAutomated:    new(r.IsAutomated),
 			Outcome:        r.Outcome,
 			HealthScore:    r.HealthScore,
 			HealthGrade:    r.HealthGrade,
@@ -4564,9 +4477,9 @@ func BuildSignalExamples(
 			ReasonCode:     signalReason(signal),
 			Excerpt:        truncateExcerpt(excerpt, 180),
 			MessageOrdinal: ordinal,
-			FailureSignals: r.ToolFailureSignalCount,
-			Retries:        r.ToolRetryCount,
-			EditChurn:      r.EditChurnCount,
+			FailureSignals: new(r.ToolFailureSignalCount),
+			Retries:        new(r.ToolRetryCount),
+			EditChurn:      new(r.EditChurnCount),
 		})
 	}
 	return examples
@@ -5334,13 +5247,13 @@ func calibrateSignal(rows []SignalRow, signal string) SignalCalibration {
 		BaselineSessions: baseline.count,
 	}
 	if affected.count > 0 {
-		result.AffectedIncompleteRate = round1(
+		result.AffectedIncompleteRate = Round1(
 			float64(affected.incomplete) /
 				float64(affected.count) * 100,
 		)
 	}
 	if baseline.count > 0 {
-		result.BaselineIncompleteRate = round1(
+		result.BaselineIncompleteRate = Round1(
 			float64(baseline.incomplete) /
 				float64(baseline.count) * 100,
 		)
@@ -5348,14 +5261,14 @@ func calibrateSignal(rows []SignalRow, signal string) SignalCalibration {
 	if baseline.count > 0 &&
 		result.BaselineIncompleteRate > 0 &&
 		affected.count > 0 {
-		lift := round1(
+		lift := Round1(
 			result.AffectedIncompleteRate /
 				result.BaselineIncompleteRate,
 		)
 		result.IncompleteLift = &lift
 	}
 	if affected.scoreCount > 0 && baseline.scoreCount > 0 {
-		delta := round1(
+		delta := Round1(
 			float64(affected.scoreSum)/
 				float64(affected.scoreCount) -
 				float64(baseline.scoreSum)/
@@ -5429,7 +5342,8 @@ func isIncompleteOrLowQuality(r SignalRow) bool {
 	return *r.HealthGrade == "D" || *r.HealthGrade == "F"
 }
 
-func round1(v float64) float64 {
+// Round1 rounds v to one decimal place.
+func Round1(v float64) float64 {
 	return math.Round(v*10) / 10
 }
 
@@ -5507,6 +5421,12 @@ func (db *DB) GetAnalyticsTopSessions(
 	if metric == "" {
 		metric = "messages"
 	}
+	release, err := db.acquireBulkRead(ctx)
+	if err != nil {
+		return TopSessionsResponse{}, err
+	}
+	defer release()
+
 	if !f.canUseSQLiteTimeSQL() || strings.TrimSpace(f.Model) != "" {
 		return db.getAnalyticsTopSessionsGo(ctx, f, metric)
 	}
@@ -5659,8 +5579,8 @@ func (db *DB) getAnalyticsTopSessionsGo(
 			return TopSessionsResponse{},
 				fmt.Errorf("scanning top session: %w", err)
 		}
-		date := localDate(ts, loc)
-		if !inDateRange(date, f.From, f.To) {
+		date := LocalDate(ts, loc)
+		if !InDateRange(date, f.From, f.To) {
 			continue
 		}
 		if timeIDs != nil && !timeIDs[id] {
@@ -5668,8 +5588,8 @@ func (db *DB) getAnalyticsTopSessionsGo(
 		}
 		durMin := 0.0
 		if startedAt != nil && endedAt != nil {
-			tS, okS := localTime(*startedAt, loc)
-			tE, okE := localTime(*endedAt, loc)
+			tS, okS := LocalTime(*startedAt, loc)
+			tE, okE := LocalTime(*endedAt, loc)
 			if okS && okE {
 				durMin = math.Round(
 					tE.Sub(tS).Minutes()*10) / 10
@@ -5757,8 +5677,8 @@ func rankTopSessions(sessions []TopSession, needsGoSort bool) []TopSession {
 		})
 	}
 	for i := range sessions {
-		sessions[i].DurationMin = round1(sessions[i].DurationMin)
-		sessions[i].ActiveDurationMin = round1(sessions[i].ActiveDurationMin)
+		sessions[i].DurationMin = Round1(sessions[i].DurationMin)
+		sessions[i].ActiveDurationMin = Round1(sessions[i].ActiveDurationMin)
 	}
 	return sessions
 }

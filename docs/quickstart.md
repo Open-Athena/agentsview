@@ -3,6 +3,9 @@ title: Quick Start
 description: Get AgentsView running in under a minute
 ---
 
+CLI examples follow `main`. For older releases, use the legacy spellings in
+the [command migration](commands.md#command-migration).
+
 ## Install
 
 ### Desktop App
@@ -95,9 +98,9 @@ The installer detects your OS and architecture, downloads the latest release
 from GitHub Releases, verifies the SHA-256 checksum, and installs the binary.
 
 On macOS and Linux, it installs to `/usr/local/bin` when that directory is
-writable, or `~/.local/bin` otherwise. Follow the installer's `PATH` instructions
-and run `command -v agentsview` to check which binary your shell uses. When
-the standalone CLI and bundled CLI use different directories, put the
+writable, or `~/.local/bin` otherwise. Follow the installer's `PATH`
+instructions and run `command -v agentsview` to check which binary your shell
+uses. When the standalone CLI and bundled CLI use different directories, put the
 standalone install directory first in `PATH` to select it.
 
 !!! note
@@ -109,7 +112,7 @@ standalone install directory first in `PATH` to select it.
 
 ### Build from source
 
-Requires Go 1.27+ with CGO and Node.js 24.11+:
+Requires Go 1.27.3+ with CGO and Node.js 24.22.1+:
 
 ```bash
 git clone https://github.com/kenn-io/agentsview.git
@@ -163,8 +166,14 @@ docker run --rm -p 127.0.0.1:8080:8080 \
   ghcr.io/kenn-io/agentsview:latest
 ```
 
-The container's entrypoint runs `agentsview serve` by default. Set `PG_SERVE=1`
-to switch to `agentsview pg serve` instead — the same image powers both modes.
+The image runs `agentsview serve` by default. Set `AGENTSVIEW_MODE=pg-serve`, or
+pass `pg serve` as the command, to read PostgreSQL instead; the older
+`PG_SERVE=1` selector still works. The image listens on `0.0.0.0` inside the
+container and requires a bearer token. Flags you add, such as `--port 9000`,
+keep those defaults. The generated token is stored in `/data/config.toml`, or
+you can supply one with `AGENTSVIEW_AUTH_TOKEN_FILE`. See
+[container deployment](/docs/configuration/#container-deployment) for every
+variable.
 
 A containerized AgentsView only sees agent sessions from directories you
 explicitly bind-mount into the container. Mount each agent's session root
@@ -183,18 +192,23 @@ session roots read-only, and publishes the UI on `127.0.0.1:8080`:
 docker compose -f docker-compose.prod.yaml up -d
 ```
 
-The example publishes the UI on loopback only. To expose it beyond the host,
-also enable bearer-token [authentication](/docs/remote-access/#authentication) and
-publish the port intentionally.
+The example publishes the UI on loopback only. The image already requires
+bearer-token [authentication](/docs/remote-access/#authentication); publish the
+port beyond the host only intentionally.
 
 For a PostgreSQL-backed deployment, point the container at your shared database:
 
 ```bash
 docker run --rm -p 127.0.0.1:8080:8080 \
-  -e PG_SERVE=1 \
+  -e AGENTSVIEW_MODE=pg-serve \
   -e AGENTSVIEW_PG_URL='postgres://user:password@host:5432/agentsview?sslmode=require' \
   ghcr.io/kenn-io/agentsview:latest
 ```
+
+To ingest and publish sessions from the same container, enable the commented
+PostgreSQL and push-watch block in `docker-compose.prod.yaml` and set your
+database URL. That file mounts the session roots and `/data` and gives the
+container 40 seconds to finish its final push.
 
 ## Run
 
@@ -211,7 +225,8 @@ agentsview serve
 ```
 
 Bare `agentsview serve` runs in the foreground until you press `Ctrl+C`. If a
-compatible server is already running, it reports that server's URL and exits.
+compatible server is already running, it reports that server's URL and exits
+with an error (status 1).
 
 This will:
 
@@ -256,7 +271,7 @@ archive directly in read-only mode. Commands that need fresh data or need to
 write, including `sync`, `usage`, `token-use`, `pg push`, and `duckdb push`,
 auto-start the detached daemon when needed. The server remains running after
 these commands finish. For scripts or CI jobs that must leave no background
-server, stop the daemon first, then run `AGENTSVIEW_NO_DAEMON=1 agentsview sync`.
+server, stop the daemon first, then run `AGENTSVIEW_NO_DAEMON=1 agentsview source sync`.
 That setting disables auto-start; it does not stop a running daemon or bypass
 its archive lock.
 
@@ -307,6 +322,7 @@ export GPTME_DIR=~/custom/gptme/logs
 export GROK_DIR=~/custom/grok/sessions
 export HERMES_SESSIONS_DIR=~/custom/hermes
 export IFLOW_DIR=~/custom/iflow/projects
+export JUNIE_DIR=~/custom/junie/sessions
 export KILO_DIR=~/custom/kilo
 export KILO_LEGACY_DIR=~/custom/kilo-legacy
 export KIMI_DIR=~/custom/kimi/sessions
@@ -314,6 +330,7 @@ export KIMI_WORK_DIR=~/custom/kimi-work/sessions
 export KIRO_SESSIONS_DIR=~/custom/kiro
 export KIRO_IDE_DIR=~/custom/kiro-ide
 export MIMOCODE_DIR=~/custom/mimocode
+export MUSE_SESSIONS_DIR=~/custom/muse/sessions
 export VIBE_SESSIONS_DIR=~/custom/vibe/logs/session
 export OMP_DIR=~/custom/omp/sessions
 export OPENCLAW_DIR=~/custom/openclaw/agents

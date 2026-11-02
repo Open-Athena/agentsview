@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/service"
@@ -21,7 +22,7 @@ func (s *Server) registerMetadataRoutes() {
 	s.get(group, "/branches", "List branches", s.humaListBranches)
 	s.get(group, "/agents", "List agents", s.humaListAgents)
 	s.get(group, "/stats", "Get stats", s.humaGetStats)
-	s.get(group, "/session-stats", "Get session stats", s.humaGetSessionStats)
+	s.getLong(group, "/session-stats", "Get session stats", s.humaGetSessionStats)
 	s.get(group, "/version", "Get server version", s.humaGetVersion)
 	s.get(group, "/memory/status", "Get memory readiness", s.humaGetMemoryStatus)
 	s.get(group, "/update/check", "Check for updates", s.humaCheckUpdate)
@@ -29,6 +30,11 @@ func (s *Server) registerMetadataRoutes() {
 
 type statsInput struct {
 	BoolIncludeInput
+}
+
+type machinesInput struct {
+	BoolIncludeInput
+	Machine string `query:"machine" doc:"Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400."`
 }
 
 type sessionStatsInput struct {
@@ -48,9 +54,10 @@ type projectsResponse struct {
 }
 
 type machinesResponse struct {
-	Machines       []string          `json:"machines"`
-	MachineLabels  map[string]string `json:"machine_labels"`
-	MachineAliases map[string]string `json:"machine_aliases"`
+	Machines         []string          `json:"machines" doc:"Picker catalog filtered by visibility flags"`
+	ResolvedMachines []string          `json:"resolved_machines,omitempty" doc:"Canonical IDs for the machine selector, independent of catalog visibility"`
+	MachineLabels    map[string]string `json:"machine_labels"`
+	MachineAliases   map[string]string `json:"machine_aliases"`
 }
 
 func (s *Server) machineAliases(ctx context.Context) (map[string]string, error) {
@@ -134,12 +141,8 @@ func (s *Server) humaListProjects(
 
 func (s *Server) humaListMachines(
 	ctx context.Context,
-	in *statsInput,
+	in *machinesInput,
 ) (*jsonOutput[machinesResponse], error) {
-	machines, err := s.db.GetMachines(ctx, !in.IncludeOneShot, !in.IncludeAutomated)
-	if err != nil {
-		return nil, serverError(err)
-	}
 	labels, err := s.db.GetMachineLabels(ctx)
 	if err != nil {
 		return nil, serverError(err)
@@ -148,7 +151,19 @@ func (s *Server) humaListMachines(
 	if err != nil {
 		return nil, serverError(err)
 	}
-	return &jsonOutput[machinesResponse]{Body: machinesResponse{Machines: machines, MachineLabels: labels, MachineAliases: aliases}}, nil
+	machines, err := s.db.GetMachines(ctx, !in.IncludeOneShot, !in.IncludeAutomated)
+	if err != nil {
+		return nil, serverError(err)
+	}
+	var resolved []string
+	if strings.TrimSpace(in.Machine) != "" {
+		machine, err := db.ResolveMachineFilterWithMetadata(ctx, s.db, in.Machine, labels, aliases)
+		if err != nil {
+			return nil, serverError(err)
+		}
+		resolved = strings.Split(machine, ",")
+	}
+	return &jsonOutput[machinesResponse]{Body: machinesResponse{Machines: machines, ResolvedMachines: resolved, MachineLabels: labels, MachineAliases: aliases}}, nil
 }
 
 func (s *Server) humaListBranches(
@@ -174,11 +189,33 @@ func (s *Server) humaListAgents(
 }
 
 func (s *Server) humaGetVersion(
-	_ context.Context,
+	ctx context.Context,
 	_ *emptyInput,
 ) (*jsonOutput[VersionInfo], error) {
 	version := s.version
+	if database, ok := s.db.(*db.DB); ok {
+		var err error
+		version.ArchiveOnly, err = database.IsArchiveOnly(ctx)
+		if err != nil {
+			return nil, serverError(err)
+		}
+	}
 	version.InsightGenerationAvailable = supportsInsightGeneration(s.db)
+	_, version.SessionStatsAvailable = s.db.(*db.DB)
+	version.FrictionAvailable = s.frictionRunner != nil
+	_, version.FrictionReadable = s.db.(db.FrictionReader)
+	version.FrictionBuildAllowed = version.FrictionAvailable && s.frictionRunAllowed(ctx)
+	if restrictedIngress(ctx) {
+		// The restricted allowlist has no friction routes.
+		version.ReadOnly = true
+		version.InsightGenerationAvailable = false
+		version.SessionStatsAvailable = false
+		version.FrictionAvailable = false
+		version.FrictionReadable = false
+		version.FrictionBuildAllowed = false
+	} else {
+		version.KataAvailable = s.kataConn().LastReady()
+	}
 	return &jsonOutput[VersionInfo]{Body: version}, nil
 }
 

@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"time"
 
+	"github.com/cenkalti/backoff/v7"
 	"github.com/spf13/pflag"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
@@ -276,7 +277,19 @@ func workerWritePassLocked(
 		)
 	}
 
-	result, workerErr := launchSyncWorker(ctx, cfg, mode, onLine)
+	request := syncWorkerRequest{Mode: mode, LinksPending: engine.PendingSubagentLinksExclusive()}
+	result, workerErr := launchSyncWorker(ctx, cfg, request, onLine)
+	if result.Stats != nil {
+		if (mode == "sync" || mode == "audit") && result.LinkStateKnown {
+			engine.SetSubagentLinkRetryExclusive(result.Stats.LinksPending)
+		} else {
+			engine.RetainSubagentLinkRetryExclusive(result.Stats.LinksPending)
+		}
+	} else if !workerNeverRan(workerErr) {
+		// A started worker may commit before losing its terminal result.
+		// Keep one linking pass pending when its completion is unknown.
+		engine.RetainSubagentLinkRetryExclusive(true)
+	}
 
 	// Lock recovery must not die with the caller's context: foreground
 	// syncs pass the HTTP request context, and a client disconnect
@@ -321,22 +334,20 @@ func workerWritePassLocked(
 func restoreArchiveAccess(
 	ctx context.Context, what string, restore func() error,
 ) error {
-	backoff := reacquireBackoffInitial
-	for {
-		err := restore()
-		if err == nil {
-			return nil
-		}
-		log.Printf("%s failed; retrying in %s: %v", what, backoff, err)
-		timer := time.NewTimer(backoff)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return fmt.Errorf("%s: %w", what, ctx.Err())
-		case <-timer.C:
-		}
-		backoff = min(backoff*2, reacquireBackoffMax)
+	policy := backoff.NewExponentialBackOff()
+	policy.InitialInterval = reacquireBackoffInitial
+	policy.MaxInterval = reacquireBackoffMax
+	policy.Multiplier = 2
+	_, err := backoff.Retry(ctx, func() (struct{}, error) {
+		return struct{}{}, restore()
+	}, backoff.WithBackOff(policy), backoff.WithMaxTries(0), backoff.WithMaxElapsedTime(0),
+		backoff.WithNotify(func(err error, delay time.Duration) {
+			log.Printf("%s failed; retrying in %s: %v", what, delay, err)
+		}))
+	if err != nil {
+		return fmt.Errorf("%s: %w", what, ctx.Err())
 	}
+	return nil
 }
 
 // reacquireWriteOwnerLock retakes the write-owner lock after a worker pass,
@@ -348,27 +359,21 @@ func restoreArchiveAccess(
 func reacquireWriteOwnerLock(
 	ctx context.Context, lock *writeOwnerLock, mode string,
 ) error {
-	backoff := reacquireBackoffInitial
-	for {
-		if err := lock.Reacquire(); err == nil {
-			return nil
-		} else {
-			log.Printf(
-				"reacquire write lock after %s pass failed; retrying in %s: %v",
-				mode, backoff, err,
-			)
-		}
-		timer := time.NewTimer(backoff)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return fmt.Errorf(
-				"reacquire write lock after %s pass: %w", mode, ctx.Err(),
-			)
-		case <-timer.C:
-		}
-		backoff = min(backoff*2, reacquireBackoffMax)
+	policy := backoff.NewExponentialBackOff()
+	policy.InitialInterval = reacquireBackoffInitial
+	policy.MaxInterval = reacquireBackoffMax
+	policy.Multiplier = 2
+	_, err := backoff.Retry(ctx, func() (struct{}, error) {
+		return struct{}{}, lock.Reacquire()
+	}, backoff.WithBackOff(policy), backoff.WithMaxTries(0), backoff.WithMaxElapsedTime(0),
+		backoff.WithNotify(func(err error, delay time.Duration) {
+			log.Printf("reacquire write lock after %s pass failed; retrying in %s: %v",
+				mode, delay, err)
+		}))
+	if err != nil {
+		return fmt.Errorf("reacquire write lock after %s pass: %w", mode, ctx.Err())
 	}
+	return nil
 }
 
 // launchSyncWorkerProcess self-execs `sync-worker --mode=<mode>`, decodes the
@@ -379,9 +384,10 @@ func reacquireWriteOwnerLock(
 func launchSyncWorkerProcess(
 	ctx context.Context,
 	cfg config.Config,
-	mode string,
+	request syncWorkerRequest,
 	onLine func(workerLine),
 ) (workerResult, error) {
+	mode := request.Mode
 	exe, err := os.Executable()
 	if err != nil {
 		return workerResult{}, fmt.Errorf(
@@ -389,7 +395,7 @@ func launchSyncWorkerProcess(
 		)
 	}
 
-	cmd := exec.CommandContext(ctx, exe, syncWorkerChildArgs(os.Args[1:], mode)...)
+	cmd := exec.CommandContext(ctx, exe, syncWorkerChildArgs(os.Args[1:], request)...)
 	// Config forwarding mirrors startServeBackgroundProcess: the child inherits
 	// the parent environment (per-agent dir overrides, AGENTSVIEW_* vars), plus
 	// the worker marker and the resolved data dir. syncWorkerChildArgs forwards
@@ -454,11 +460,17 @@ func collectWorkerResult(
 // malformed line, or a result count other than one, is a protocol error.
 func readWorkerResult(
 	r io.Reader, onLine func(workerLine),
-) (workerResult, error) {
+) (result workerResult, err error) {
+	defer func() {
+		if err != nil {
+			// Partial counters can still report committed writes, but an invalid
+			// result must not acknowledge completion of the daemon's pending links.
+			result.LinkStateKnown = false
+		}
+	}()
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), workerLineMaxBytes)
 
-	var result workerResult
 	resultCount, malformed := 0, 0
 	for sc.Scan() {
 		raw := sc.Bytes()
@@ -501,8 +513,11 @@ func readWorkerResult(
 // --background child. Re-emitting the parsed flags (rather than copying raw
 // tokens) drops serve-only lifecycle flags the worker does not accept and
 // normalizes every value to an unambiguous --name=value form.
-func syncWorkerChildArgs(parentArgs []string, mode string) []string {
-	args := []string{"sync-worker", "--mode", mode}
+func syncWorkerChildArgs(parentArgs []string, request syncWorkerRequest) []string {
+	args := []string{"sync-worker", "--mode", request.Mode}
+	if request.LinksPending {
+		args = append(args, "--links-pending")
+	}
 	fs := pflag.NewFlagSet("sync-worker-forward", pflag.ContinueOnError)
 	fs.ParseErrorsAllowlist.UnknownFlags = true
 	config.RegisterServePFlags(fs)

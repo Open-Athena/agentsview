@@ -7,7 +7,7 @@ import { settings } from "../../stores/settings.svelte.js";
 import { yokedDates } from "../../stores/yokedDates.svelte.js";
 import { testMoney } from "../../test/money.js";
 import type { UsageSummaryResponse } from "../../api/generated/index";
-import source from "./UsagePage.svelte?raw";
+import { MetadataService, UsageService } from "../../api/generated/index";
 import UsagePage from "./UsagePage.svelte";
 
 async function flushEffects() {
@@ -97,6 +97,8 @@ function tenModelUsageSummary(): UsageSummaryResponse {
         machineBreakdowns: [],
       },
     ],
+    from: "2026-07-01",
+    to: "2026-07-01",
     modelTotals: models.map((model, index) => ({
       model,
       inputTokens: 10,
@@ -122,7 +124,12 @@ afterEach(() => {
   router.params = {};
   router.sessionId = null;
   window.history.replaceState(null, "", "/");
+  usage.backToProjects();
+  usage.selectedProjectKey = "";
+  usage.selectedModel = "";
+  usage.attributionSummary = null;
   usage.summary = null;
+  usage.referenceSummary = null;
   usage.topSessions = null;
   usage.errors.summary = null;
   usage.errors.topSessions = null;
@@ -146,6 +153,144 @@ afterEach(() => {
 });
 
 describe("UsagePage refresh behavior", () => {
+  it("loads usage once with the resolved machine from a label deep link", async () => {
+    const requests = vi
+      .spyOn(UsageService, "getApiV1UsageSummary")
+      .mockResolvedValue(usageSummaryWithUnsupported());
+    vi.spyOn(UsageService, "getApiV1UsageTopSessions").mockResolvedValue([]);
+    vi.spyOn(UsageService, "getApiV1UsageComparison").mockResolvedValue({
+      priorFrom: "2026-02-01",
+      priorTo: "2026-02-28",
+      priorTotalCost: testMoney(0),
+      deltaPct: 0,
+    });
+    vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+    const metadata =
+      Promise.withResolvers<Awaited<ReturnType<typeof MetadataService.getApiV1Machines>>>();
+    vi.spyOn(MetadataService, "getApiV1Machines").mockReturnValue(metadata.promise);
+    router.route = "usage";
+    router.params = { machine: "Workstation", from: "2026-03-01", to: "2026-03-31" };
+    const savedFilters = sessions.filters;
+    sessions.initFromParams(router.params);
+
+    try {
+      component = mount(UsagePage, { target: document.body });
+      await flushEffects();
+
+      metadata.resolve({
+        machines: ["id-a"],
+        resolved_machines: ["id-a"],
+        machine_labels: { "id-a": "Workstation" },
+        machine_aliases: {},
+      });
+      await sessions.loadMachines();
+      await flushEffects();
+      await vi.waitFor(() => expect(usage.isQuerying).toBe(false));
+
+      expect(requests.mock.calls.map(([params]) => params?.machine)).toEqual(["id-a"]);
+    } finally {
+      if (component) await unmount(component);
+      component = undefined;
+      usage.cancelInFlightReads();
+      sessions.filters = savedFilters;
+    }
+  });
+
+  it("keeps session-list label and pull request filters when the URL sets a shared filter", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    vi.spyOn(usage, "fetchAll").mockResolvedValue();
+    vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+    const saved = sessions.filters;
+    sessions.filters = { ...saved, labels: ["ticket=example"], pr: "acme/widgets" };
+    router.route = "usage";
+    router.params = { project: "proj-a" };
+    usage.summary = usageSummaryWithUnsupported();
+    try {
+      component = mount(UsagePage, { target: document.body });
+      await flushEffects();
+
+      expect(sessions.filters.project).toBe("proj-a");
+      expect(sessions.filters.labels).toEqual(["ticket=example"]);
+      expect(sessions.filters.pr).toBe("acme/widgets");
+    } finally {
+      sessions.filters = saved;
+    }
+  });
+
+  it("ignores a legacy model URL and shows all models", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    const summary = tenModelUsageSummary();
+    const requests = vi.spyOn(UsageService, "getApiV1UsageSummary").mockResolvedValue(summary);
+    vi.spyOn(UsageService, "getApiV1UsageTopSessions").mockResolvedValue([]);
+    vi.spyOn(UsageService, "getApiV1UsageComparison").mockResolvedValue({
+      priorFrom: "2026-06-01",
+      priorTo: "2026-06-30",
+      priorTotalCost: testMoney(0),
+      deltaPct: 0,
+    });
+    vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+    router.route = "usage";
+    router.params = { model: "model-alpha", exclude_agent: "hidden-agent" };
+    usage.toggles.attribution.groupBy = "model";
+    component = mount(UsagePage, { target: document.body });
+    await vi.waitFor(() => expect(requests).toHaveBeenCalled());
+    await flushEffects();
+    for (const [params] of requests.mock.calls) expect(params?.model).toBeUndefined();
+    expect(usage.selectedModel).toBe("");
+    expect(document.querySelector('button[aria-label="Model: All"]')).not.toBeNull();
+    usage.cancelInFlightReads();
+  });
+
+  it("keeps a saved variant's group available after re-including an empty period", async () => {
+    vi.spyOn(usage, "fetchAll").mockResolvedValue();
+    vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+    router.route = "usage";
+    router.params = { exclude_model: "claude-opus-4-20250514" };
+    usage.summary = {
+      ...usageSummaryWithUnsupported(),
+      model_aliases: { "claude-opus-4-20250514": "claude-4" },
+    };
+    component = mount(UsagePage, { target: document.body });
+    await flushEffects();
+    const trigger = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Model: 1 hidden"]',
+    );
+    expect(trigger).not.toBeNull();
+    trigger!.click();
+    await flushEffects();
+    const groupRow = () =>
+      [...document.querySelectorAll<HTMLButtonElement>(".kit-filter-dropdown__item")].find(
+        (row) =>
+          row.querySelector(".kit-filter-dropdown__label")?.textContent?.trim() === "claude-4",
+      );
+    expect(groupRow()).toBeDefined();
+    expect(document.querySelectorAll(".kit-filter-dropdown__item")).toHaveLength(1);
+    expect(groupRow()!.querySelector(".kit-filter-dropdown__check.on")).not.toBeNull();
+    expect(groupRow()!.getAttribute("title")).toBe("claude-opus-4-20250514");
+    [...document.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.trim() === "Select all")!
+      .click();
+    await flushEffects();
+    expect(usage.excludedModels).toBe("");
+    expect(groupRow()).toBeDefined();
+    expect(groupRow()!.querySelector(".kit-filter-dropdown__check.on")).not.toBeNull();
+    usage.cancelInFlightReads();
+  });
+
   it("restores hidden models from a shared URL", async () => {
     vi.spyOn(usage, "fetchAll").mockResolvedValue();
     vi.spyOn(sessions, "loadAgents").mockResolvedValue();
@@ -159,6 +304,26 @@ describe("UsagePage refresh behavior", () => {
     expect(usage.excludedModels).toBe("model-alpha");
     expect(router.params.exclude_model).toBe("model-alpha");
     expect(usage.hasActiveFilters).toBe(true);
+  });
+
+  it("refreshes once when Clear all clears shared filters, usage filters and the brush", async () => {
+    const fetchAll = vi.spyOn(usage, "fetchAll").mockResolvedValue();
+    vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+    router.route = "usage";
+    router.params = { exclude_model: "model-alpha", exclude_agent: "hidden-agent", machine: "box" };
+    usage.summary = usageSummaryWithUnsupported();
+
+    component = mount(UsagePage, { target: document.body });
+    await flushEffects();
+    usage.setTimeRange("2024-06-01", "2024-06-02");
+    fetchAll.mockClear();
+    document.querySelector<HTMLButtonElement>(".clear-all")!.click();
+    await flushEffects();
+
+    expect(usage.hasActiveFilters).toBe(false);
+    expect(usage.selectedTimeRange).toBeNull();
+    expect(fetchAll).toHaveBeenCalledTimes(1);
+    expect(fetchAll).toHaveBeenCalledWith({ preserveTimeRange: true });
   });
 
   it("uses stable project keys in the Project filter", async () => {
@@ -569,7 +734,7 @@ describe("UsagePage refresh behavior", () => {
     await flushEffects();
 
     const firstMark = () =>
-      document.querySelector<SVGElement>(".chart-svg .lc-bar, .chart-svg .lc-area-path");
+      document.querySelector<SVGElement>(".chart-svg .cost-seg, .chart-svg .lc-area-path");
     const firstDot = () => document.querySelector<HTMLElement>(".list-dot");
     expect(firstMark()?.getAttribute("fill")).toBe("var(--accent-blue)");
     expect(firstDot()?.style.background).toBe("var(--accent-blue)");
@@ -719,109 +884,160 @@ describe("UsagePage refresh behavior", () => {
     expect(document.body.textContent).toContain("Matching sessions do not expose token usage data");
     expect(document.body.textContent).not.toContain("Copilot sessions matched this range");
   });
+});
 
-  it("does not auto-refresh usage scans from SSE updates", () => {
-    expect(source).not.toContain("subscribeDebounced");
-    expect(source).not.toContain("REFRESH_MS");
-    // SSE only flags new data; the periodic refetch lives in RefreshControl.
-    expect(source).toContain("usage.markNewData");
-    expect(source).toContain("events.subscribe");
+describe("Usage attribution navigation", () => {
+  it("refreshes once after an agent click under a brush and project selection", async () => {
+    const refresh = vi.spyOn(usage, "fetchAll").mockResolvedValue();
+    vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    router.route = "usage";
+    router.params = {};
+    component = mount(UsagePage, { target: document.body });
+    await flushEffects();
+    usage.selectedTimeRange = { from: "2024-01-08", to: "2024-01-14" };
+    usage.selectedProjectKey = "pl1:sha256:alpha";
+    refresh.mockClear();
+    usage.toggleSelection("agent", "codex");
+    await flushEffects();
+    expect(refresh).toHaveBeenCalledExactlyOnceWith({ preserveTimeRange: true });
+    sessions.filters.agent = "";
+    usage.selectedTimeRange = null;
   });
 
-  it("delegates the refresh affordance and scheduler to RefreshControl", () => {
-    expect(source).toContain("<RefreshControl");
-    expect(source).toContain("usage.lastUpdatedAt");
-    expect(source).toContain("label={m.usage_refresh()}");
-    expect(source).toContain("title={m.shared_refresh()}");
-    // The scheduler, label tick, and icon now live in the shared component.
-    expect(source).not.toContain("REFRESH_LABEL_INTERVAL_MS");
-    expect(source).not.toContain("formatRefreshAge");
-    expect(source).not.toContain("RefreshCwIcon");
-    expect(source).not.toContain("setInterval");
+  it("keeps chart colors and the legend while clearing a model selection and after the clear refresh fails", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    const full = tenModelUsageSummary();
+    let clearFails = false;
+    vi.spyOn(UsageService, "getApiV1UsageSummary").mockImplementation(async (params) => {
+      if (clearFails && !params?.model) throw new Error("clear refresh failed");
+      const response = structuredClone(full);
+      if (params?.model) {
+        response.modelTotals = response.modelTotals.filter((entry) => entry.model === params.model);
+        for (const day of response.daily) {
+          day.modelBreakdowns = day.modelBreakdowns?.filter(
+            (entry) => entry.modelName === params.model,
+          );
+        }
+      }
+      return response;
+    });
+    vi.spyOn(UsageService, "getApiV1UsageTopSessions").mockResolvedValue([]);
+    vi.spyOn(UsageService, "getApiV1UsageComparison").mockResolvedValue({
+      priorFrom: "2026-06-01",
+      priorTo: "2026-06-30",
+      priorTotalCost: testMoney(0),
+      deltaPct: 0,
+    });
+    vi.spyOn(UsageService, "getApiV1UsagePairwiseComparison").mockRejectedValue(
+      new Error("pairwise not under test"),
+    );
+    vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+    router.route = "usage";
+    router.params = {};
+    usage.toggles.timeSeries.groupBy = "model";
+    usage.toggles.attribution.groupBy = "model";
+    usage.toggles.attribution.view = "list";
+    component = mount(UsagePage, { target: document.body });
+    await vi.waitFor(() => expect(usage.summary?.modelTotals).toHaveLength(10));
+    await vi.waitFor(() => expect(usage.isQuerying).toBe(false));
+    await flushEffects();
+    const colors = () => ({
+      legend: [...document.querySelectorAll<HTMLElement>(".legend-item")].map((item) => [
+        item.textContent?.trim(),
+        item.querySelector<HTMLElement>(".legend-dot")!.style.background,
+      ]),
+      rows: [...document.querySelectorAll<HTMLElement>(".list-row")].map((row) => [
+        row.querySelector(".list-label")!.textContent,
+        row.querySelector<HTMLElement>(".list-dot")!.style.background,
+      ]),
+    });
+    const initial = colors();
+    expect(initial.legend).toHaveLength(10);
+    expect(initial.rows).toHaveLength(10);
+
+    [...document.querySelectorAll<HTMLElement>(".list-row")]
+      .find((row) => row.querySelector(".list-label")!.textContent === "model-zulu")!
+      .dispatchEvent(new MouseEvent("click", { detail: 1, bubbles: true }));
+    await vi.waitFor(() => expect(usage.summary?.modelTotals).toHaveLength(1));
+    await vi.waitFor(() => expect(usage.isQuerying).toBe(false));
+    await flushEffects();
+    expect(colors()).toEqual(initial);
+
+    clearFails = true;
+    [...document.querySelectorAll<HTMLButtonElement>(".attribution-panel button")]
+      .find((button) => button.textContent?.trim() === "Clear selection")!
+      .click();
+    await flushEffects();
+    expect(usage.selectedModel).toBe("");
+    expect(colors()).toEqual(initial);
+    await vi.waitFor(() => expect(usage.errors.summary).toBe("clear refresh failed"));
+    await vi.waitFor(() => expect(usage.isQuerying).toBe(false));
+    await flushEffects();
+    expect(colors()).toEqual(initial);
+    usage.cancelInFlightReads();
   });
 
-  it("shows relative last-updated status without ambiguous badges", () => {
-    expect(source).not.toContain("formatUpdatedAt");
-    expect(source).not.toContain("usage.hasNewData");
-    expect(source).not.toContain("New data");
-    expect(source).not.toContain(".new-data");
-  });
-
-  it("treats termination as a usage URL session filter", () => {
-    expect(source).toContain('"termination",');
-    expect(source).toContain("filtersToParams(sessions.filters)");
-  });
-
-  it("keeps refresh progress out of content layout flow", () => {
-    const queryProgress = source.match(/\.query-progress\s*{[^}]+}/)?.[0] ?? "";
-
-    expect(queryProgress).toContain("position: absolute");
-    expect(queryProgress).toContain("left: 0;");
-    expect(queryProgress).toContain("right: 0;");
-    expect(queryProgress).not.toContain("position: sticky");
-    expect(queryProgress).not.toContain("margin:");
-  });
-
-  it("updates shared yoke state from usage range selections", () => {
-    expect(source).toContain("<RangePicker");
-    expect(source).toContain("function applyRange");
-    expect(source).toContain("updateYokeFromUsage");
-    expect(source).toContain("yokedDates.updateFromPanel");
-  });
-
-  it("seeds bare usage URLs from shared yoked dates", () => {
-    expect(source).toContain("const seed = yokedDates.seedForPanel()");
-    expect(source).toContain("applyUsagePanelDate(state)");
-    expect(source).toContain("usage.applyRollingWindow");
-    expect(source).toContain("usage.applyDateRange");
-  });
-
-  it("hydrates supported termination filters from usage URLs", () => {
-    const filterKeysIndex = source.indexOf("const SESSION_FILTER_KEYS");
-    const urlInitIndex = source.indexOf("let urlInitRan", filterKeysIndex);
-    const filterKeysBlock = source.slice(filterKeysIndex, urlInitIndex);
-
-    expect(filterKeysBlock).toContain('"termination"');
-  });
-
-  it("does not hydrate session-only date filters from usage URLs", () => {
-    const filterKeysIndex = source.indexOf("const SESSION_FILTER_KEYS");
-    const urlInitIndex = source.indexOf("let urlInitRan", filterKeysIndex);
-    const filterKeysBlock = source.slice(filterKeysIndex, urlInitIndex);
-
-    expect(filterKeysBlock).not.toContain('"date"');
-    expect(filterKeysBlock).not.toContain('"date_from"');
-    expect(filterKeysBlock).not.toContain('"date_to"');
-  });
-
-  it("sanitizes mixed usage URL session params before hydrating", () => {
-    const initStart = source.indexOf("if (hasSessionFilterKeys)");
-    const initEnd = source.indexOf("if (hasDateParam)", initStart);
-    const initBlock = source.slice(initStart, initEnd);
-
-    expect(source).toContain("function usageSupportedSessionParams");
-    expect(initBlock).toContain("parseFiltersFromParams(supportedSessionParams)");
-    expect(initBlock).toContain("sessions.initFromParams(supportedSessionParams)");
-    expect(initBlock).not.toContain("parseFiltersFromParams(params)");
-    expect(initBlock).not.toContain("sessions.initFromParams(params)");
-  });
-
-  it("mounts the pairwise comparison panel additively", () => {
-    expect(source).toContain("UsagePairwiseComparisonPanel");
-    expect(source).toContain("<UsagePairwiseComparisonPanel />");
-  });
-
-  it("keeps pairwise comparison below bounded secondary usage panels", () => {
-    const topSessionsIndex = source.indexOf("<TopSessionsTable />");
-    const cacheEfficiencyIndex = source.indexOf("<CacheEfficiencyPanel />");
-    const pairwiseIndex = source.indexOf("<UsagePairwiseComparisonPanel />");
-
-    expect(topSessionsIndex).toBeGreaterThan(-1);
-    expect(cacheEfficiencyIndex).toBeGreaterThan(-1);
-    expect(pairwiseIndex).toBeGreaterThan(cacheEfficiencyIndex);
-    expect(pairwiseIndex).toBeGreaterThan(topSessionsIndex);
-    expect(source).toContain('class="chart-panel bounded"');
-    expect(source).toContain("max-height:");
-    expect(source).toContain("overflow: auto;");
+  it.each(["button", "Escape"])("%s Back keeps the current dates and selection", async (action) => {
+    vi.spyOn(usage, "fetchAll").mockResolvedValue();
+    vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    window.history.replaceState(null, "", "/usage?from=2024-01-01&to=2024-01-31");
+    router.route = "usage";
+    router.params = { from: "2024-01-01", to: "2024-01-31" };
+    usage.summary = usageSummaryWithUnsupported();
+    component = mount(UsagePage, { target: document.body });
+    await flushEffects();
+    usage.toggleSelection("project", "pl1:sha256:alpha");
+    usage.setOpenProject("pl1:sha256:alpha");
+    await flushEffects();
+    usage.applyDateRange("2024-01-01", "2024-03-31");
+    usage.excludedModels = "model-hidden";
+    await flushEffects();
+    expect(window.location.search).toContain("to=2024-03-31");
+    if (action === "button") {
+      [...document.querySelectorAll<HTMLButtonElement>(".attribution-panel button")]
+        .find((button) => button.textContent?.trim() === "← All projects")!
+        .click();
+    } else {
+      const panel = document.querySelector<HTMLElement>(".attribution-panel")!;
+      panel.focus();
+      panel.dispatchEvent(
+        new KeyboardEvent("keydown", { key: action, bubbles: true, cancelable: true }),
+      );
+    }
+    await flushEffects();
+    expect(usage.zoomedProject).toBeNull();
+    expect(usage.isSelected("project", "pl1:sha256:alpha")).toBe(true);
+    expect(router.params).toEqual(
+      expect.objectContaining({
+        from: "2024-01-01",
+        to: "2024-03-31",
+        exclude_model: "model-hidden",
+      }),
+    );
+    expect(usage.to).toBe("2024-03-31");
+    expect(window.location.search).toContain("to=2024-03-31");
   });
 });

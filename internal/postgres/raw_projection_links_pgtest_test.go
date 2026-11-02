@@ -95,6 +95,14 @@ func TestHostedCrossSourceRelationshipScope(t *testing.T) {
 				assert.Nil(t, got.ParentSessionID)
 				assert.Empty(t, got.ParentSessionIDs)
 			}
+			h.SetCursorSecret([]byte("synthetic scoped sidebar cursor"))
+			roots := 2
+			if mode == "unique" || mode == "equal_cohort" {
+				roots = 1
+			} else if mode == "ambiguous" {
+				roots = 3
+			}
+			checkHostedSidebarPages(t, h, db.SessionFilter{}, roots, nil)
 		})
 	}
 }
@@ -322,7 +330,7 @@ func TestHostedCrossSourceTargetLifecycleAndReadRevision(t *testing.T) {
 		duration int64
 	}
 	reads := 0
-	result, err := hostedRead(t.Context(), h, func(_ hostedRevision) (snapshot, error) {
+	result, err := hostedRead(t.Context(), h, func(h *HostedStore, _ hostedRevision) (snapshot, error) {
 		reads++
 		physical, err := h.physical.GetSessionFull(t.Context(), ownerIdentity.SessionID)
 		if err != nil {
@@ -344,9 +352,46 @@ func TestHostedCrossSourceTargetLifecycleAndReadRevision(t *testing.T) {
 		return snapshot{physical, duration}, err
 	})
 	require.NoError(t, err)
-	assert.Equal(t, 2, reads)
-	assert.Equal(t, int64(13000), result.duration)
+	assert.Equal(t, 1, reads)
+	assert.Equal(t, int64(7000), result.duration)
 	require.NotNil(t, result.session.ParentSessionID)
 	assert.Equal(t, "codex:portable", *result.session.ParentSessionID)
 	check(true, 13)
+}
+
+// A hosted raw child links to its parent through raw_session_links, so the
+// PR filter must walk that relation to keep the parent's tree.
+func TestHostedSidebarPRFilterKeepsRawChildTree(t *testing.T) {
+	f := newProjectionFixture(t)
+	child, _ := f.acceptScoped(t, "device-a", "child", "", parser.AgentCodex, "root-a", "child.jsonl")
+	childOutcome := linkChildOutcome()
+	childOutcome.Outcome.Results[0].Result.Session.PRLinks = []parser.PRLink{{
+		URL: "https://github.com/acme/widgets/pull/42", Host: "github.com",
+		Repository: "acme/widgets", Number: 42,
+	}}
+	require.NoError(t, f.sink.Project(t.Context(), f.lease(t, child), child, childOutcome))
+	parent, _ := f.acceptScoped(t, "device-a", "parent", "", parser.AgentCodex, "root-a", "parent.jsonl")
+	p := projectionOutcome("parent")
+	call := &p.Outcome.Results[0].Result.Messages[1].ToolCalls[0]
+	call.SubagentSessionID = "codex:child"
+	call.ResultEvents = []parser.ParsedToolResultEvent{{ToolUseID: "call-1", SubagentSessionID: "codex:child", Source: "tool_result", Status: "completed", Content: "child complete"}}
+	p.Outcome.Results[0].Result.Messages[1].HasToolUse = true
+	require.NoError(t, f.sink.Project(t.Context(), f.lease(t, parent), parent, p))
+	h, err := newHostedAdapter(f.runtime, f.tenant)
+	require.NoError(t, err)
+
+	pr, err := db.ParsePRFilter("acme/widgets#42")
+	require.NoError(t, err)
+	for _, limit := range []int{0, 10} {
+		t.Run(fmt.Sprintf("limit %d", limit), func(t *testing.T) {
+			sidebar, err := h.GetSidebarSessionIndex(t.Context(), db.SessionFilter{PR: pr, Limit: limit})
+			require.NoError(t, err)
+			assert.Equal(t, 1, sidebar.Total)
+			ids := make([]string, 0, len(sidebar.Sessions))
+			for _, row := range sidebar.Sessions {
+				ids = append(ids, row.ID)
+			}
+			assert.Contains(t, ids, "codex:portable")
+		})
+	}
 }

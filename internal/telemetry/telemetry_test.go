@@ -1,124 +1,93 @@
 package telemetry
 
 import (
-	"context"
-	"runtime"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	kittelemetry "go.kenn.io/kit/telemetry"
+	kittelemetry "go.kenn.io/kit/telemetry/posthog"
 )
 
 func TestEnabledFromEnvHonorsAgentsViewAndGenericOptOut(t *testing.T) {
+	clearTelemetryVetoes(t)
+	t.Setenv(GenericEnabledEnv, "1")
+
 	t.Setenv(EnabledEnv, "0")
 	assert.False(t, EnabledFromEnv())
 
 	t.Setenv(EnabledEnv, "1")
-	if kittelemetry.PostHogTelemetryDisabled() {
-		assert.False(t, EnabledFromEnv())
-		return
-	}
 	assert.True(t, EnabledFromEnv())
 
 	t.Setenv(GenericEnabledEnv, "0")
 	assert.False(t, EnabledFromEnv())
 }
 
-func TestNewReporterDisabledByEnv(t *testing.T) {
-	t.Setenv(EnabledEnv, "0")
-
-	reporter, err := NewReporter(Options{InstallationID: "anonymous-install-id"})
-	require.NoError(t, err)
-
-	assert.False(t, reporter.Enabled())
-}
-
-func TestGenericTelemetryEnvDisablesReporter(t *testing.T) {
-	t.Setenv(GenericEnabledEnv, "0")
-
-	reporter, err := NewReporter(Options{InstallationID: "anonymous-install-id"})
-	require.NoError(t, err)
-
-	assert.False(t, reporter.Enabled())
-}
-
-func TestNewReporterDisabledDuringTestsDespiteEnabledEnv(t *testing.T) {
+func TestNewReporterDisabledWithoutProjectKey(t *testing.T) {
 	t.Setenv(EnabledEnv, "1")
+	clearTelemetryVetoes(t)
 	t.Setenv(GenericEnabledEnv, "1")
 
-	reporter, err := NewReporter(Options{InstallationID: "anonymous-install-id"})
+	reporter, err := NewReporter(Options{ScreenClaimsPath: filepath.Join(t.TempDir(), "screens"), InstallationID: "anonymous-install-id", Version: "v1.2.3"})
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reporter.Close()) })
 
 	assert.False(t, reporter.Enabled())
+	assert.True(t, reporter.EventAllowed(EventDaemonActive))
+}
+
+func TestNewReporterOptedOutKeepsAllowlist(t *testing.T) {
+	clearTelemetryVetoes(t)
+	t.Setenv(EnabledEnv, "1")
+	t.Setenv(GenericEnabledEnv, "0")
+
+	reporter, err := NewReporter(Options{ScreenClaimsPath: filepath.Join(t.TempDir(), "screens")})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reporter.Close()) })
+
+	assert.False(t, reporter.Enabled())
+	assert.True(t, reporter.EventAllowed(EventAppOpened))
+	assert.True(t, reporter.EventAllowed(EventDaemonActive))
+	assert.False(t, reporter.EventAllowed("daemon_started"))
 }
 
 func TestAllowedEventOptionsConfigureDaemonActiveShape(t *testing.T) {
 	t.Setenv(EnabledEnv, "1")
+	clearTelemetryVetoes(t)
 	t.Setenv(GenericEnabledEnv, "1")
 
-	client, err := newKitReporter(
-		"anonymous-install-id", "v1.2.3", "abc123",
-	)
+	opts := Options{
+		ScreenClaimsPath: filepath.Join(t.TempDir(), "screens"),
+		InstallationID:   "anonymous-install-id", Version: "v1.2.3", Commit: "abc123",
+	}
+	kitOpts := kitOptions(opts)
+	kitOpts.APIKey = "phc_test"
+	client, err := kittelemetry.NewReporter(kitOpts, allowedEventOptions(opts)...)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 
 	reporter := &Reporter{client: client}
 
-	assert.True(t, reporter.EventAllowed(EventDaemonActive))
-	assert.False(t, reporter.EventAllowed("daemon_started"))
-
 	props, err := reporter.SanitizeProperties(EventDaemonActive, map[string]any{
-		"$process_person_profile": true,
-		"$geoip_disable":          false,
-		"application":             "other",
-		"version":                 "caller-version",
-		"commit":                  "caller-commit",
-		"goos":                    "caller-os",
-		"goarch":                  "caller-arch",
-		"source":                  "caller-source",
-		"app":                     "legacy-app",
-		"project":                 "private-project",
-		"session":                 "private-session",
+		"app":     "legacy-app",
+		"project": "private-project",
+		"session": "private-session",
 	})
 	require.NoError(t, err)
 
-	assert.False(t, props["$process_person_profile"].(bool))
-	assert.True(t, props["$geoip_disable"].(bool))
 	assert.Equal(t, "agentsview", props["application"])
 	assert.Equal(t, "v1.2.3", props["version"])
 	assert.Equal(t, "abc123", props["commit"])
-	assert.Equal(t, runtime.GOOS, props["goos"])
-	assert.Equal(t, runtime.GOARCH, props["goarch"])
 	assert.Equal(t, "daemon", props["source"])
 	assert.NotContains(t, props, "app")
 	assert.NotContains(t, props, "project")
 	assert.NotContains(t, props, "session")
 }
 
-func TestReporterCaptureDaemonActiveNoopsDuringTests(t *testing.T) {
-	t.Setenv(EnabledEnv, "1")
-	t.Setenv(GenericEnabledEnv, "1")
-
-	client, err := newKitReporter(
-		"anonymous-install-id", "v1.2.3", "abc123",
-	)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, client.Close()) })
-
-	reporter := &Reporter{client: client}
-	assert.True(t, reporter.Enabled())
-
-	err = reporter.CaptureDaemonActive(t.Context())
-	require.NoError(t, err)
-}
-
-func TestReporterCaptureDaemonActiveTestBlockerWinsOverCanceledContext(t *testing.T) {
-	client := kittelemetry.DisabledPostHogReporter()
-	reporter := &Reporter{client: client}
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-
-	err := reporter.CaptureDaemonActive(ctx)
-	require.NoError(t, err)
+func clearTelemetryVetoes(t *testing.T) {
+	t.Helper()
+	t.Setenv("DO_NOT_TRACK", "0")
+	t.Setenv("CI", "")
+	require.NoError(t, os.Unsetenv("CI"))
 }

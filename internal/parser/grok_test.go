@@ -1200,6 +1200,8 @@ func TestGrokProviderPromptContextClassifiesNonInteractive(t *testing.T) {
 	require.Len(t, outcome.Results, 1)
 
 	assert.Equal(t, "non-interactive", outcome.Results[0].Result.Session.SessionKind)
+	assert.Equal(t, RelNone, outcome.Results[0].Result.Session.RelationshipType)
+	assert.Empty(t, outcome.Results[0].Result.Session.ParentSessionID)
 }
 
 func TestGrokProviderFingerprintTracksParsedFiles(t *testing.T) {
@@ -1341,23 +1343,4 @@ func TestGrokProviderArtifactBoundaries(t *testing.T) {
 	require.True(t, ok)
 	_, err = provider.Parse(t.Context(), ParseRequest{Source: source})
 	require.Error(t, err)
-}
-
-func TestGrokProviderRegistry(t *testing.T) {
-	def, ok := AgentByType(AgentGrok)
-	require.True(t, ok)
-	assert.Equal(t, "GROK_DIR", def.EnvVar)
-	assert.Equal(t, "grok_dirs", def.ConfigKey)
-	assert.Equal(t, "grok:", def.IDPrefix)
-	assert.Equal(t, []string{".grok/sessions"}, def.DefaultDirs)
-
-	factory, ok := ProviderFactoryByType(AgentGrok)
-	require.True(t, ok)
-	assert.Equal(t, AgentGrok, factory.Definition().Type)
-
-	mode, ok := ProviderMigrationModes()[AgentGrok]
-	require.True(t, ok)
-	assert.Equal(t, ProviderMigrationProviderAuthoritative, mode)
-	assert.Equal(t, CapabilitySupported,
-		factory.Capabilities().Content.AggregateUsageEvents)
 }

@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"go.kenn.io/kit/atomicfile"
 )
 
 // allowedImageExts is the set of passive image formats safe to serve inline.
@@ -79,19 +81,32 @@ func Put(assetsDir, mediaType string, body []byte) (ref string, created bool, er
 // isCompleteObject reports whether the content-addressed path already holds a
 // regular file with the expected size and SHA-256 digest.
 func isCompleteObject(destPath string, size int64, expectedHash string) bool {
-	info, err := os.Lstat(destPath)
-	if err != nil || !info.Mode().IsRegular() || info.Size() != size {
+	root, err := os.OpenRoot(filepath.Dir(destPath))
+	if err != nil {
+		return false
+	}
+	defer root.Close()
+	return IsCompleteObject(root, filepath.Base(destPath), size, expectedHash)
+}
+
+// IsCompleteObject verifies a passive image's file type, size and digest; a negative size skips the size check.
+func IsCompleteObject(root *os.Root, name string, size int64, expectedHash string) bool {
+	if !allowedImageExts[filepath.Ext(name)] || filepath.Base(name) != name {
+		return false
+	}
+	info, err := root.Lstat(name)
+	if err != nil || !info.Mode().IsRegular() || (size >= 0 && info.Size() != size) {
 		return false
 	}
 
-	f, err := os.Open(destPath)
+	f, err := root.Open(name)
 	if err != nil {
 		return false
 	}
 	h := sha256.New()
 	actualSize, copyErr := io.Copy(h, f)
 	closeErr := f.Close()
-	if copyErr != nil || closeErr != nil || actualSize != size {
+	if copyErr != nil || closeErr != nil || actualSize != info.Size() {
 		return false
 	}
 	return hex.EncodeToString(h.Sum(nil)) == expectedHash
@@ -127,7 +142,7 @@ func writeObject(assetsDir, destPath string, fill func(*os.File) error) error {
 	if err := os.Chmod(tmpPath, 0o644); err != nil {
 		return fmt.Errorf("setting asset mode: %w", err)
 	}
-	if err := os.Rename(tmpPath, destPath); err != nil {
+	if err := atomicfile.Replace(tmpPath, destPath); err != nil {
 		return fmt.Errorf("publishing asset: %w", err)
 	}
 	return nil

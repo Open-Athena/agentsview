@@ -3,6 +3,7 @@ package parser
 import (
 	"errors"
 	"fmt"
+	"image/color"
 	"os"
 	"path/filepath"
 	"strings"
@@ -119,6 +120,50 @@ func TestParseCodexSession_Basic(t *testing.T) {
 	assert.Equal(t, "/Users/alice/code/my-api", sess.Cwd)
 	assert.Len(t, msgs, 2)
 	assertSessionMeta(t, sess, "codex:abc-123", "my_api", AgentCodex)
+}
+
+func TestParseCodexSession_GitBranchFromSessionMeta(t *testing.T) {
+	content := `{"payload":{"cwd":"/Users/alice/code/my-api","git":{"branch":"feat/123-rate-limit","commit_hash":"1188b85c","repository_url":"git@github.com:alice/my-api.git"},"id":"abc-123","originator":"user"},"timestamp":"2024-01-01T10:00:00Z","type":"session_meta"}
+{"payload":{"content":[{"text":"Add rate limiting","type":"input_text"}],"role":"user"},"timestamp":"2024-01-01T10:00:01Z","type":"response_item"}
+`
+	sess, _ := runCodexParserTest(t, "test.jsonl", content, false)
+
+	require.NotNil(t, sess)
+	assert.Equal(t, "feat/123-rate-limit", sess.GitBranch)
+}
+
+func TestParseCodexSession_GitBranchFollowsLatestCwd(t *testing.T) {
+	content := `{"payload":{"cwd":"/Users/alice/code/my-api","git":{"branch":"feat/123-rate-limit"},"id":"abc-123","originator":"user"},"timestamp":"2024-01-01T10:00:00Z","type":"session_meta"}
+{"payload":{"content":[{"text":"Add rate limiting","type":"input_text"}],"role":"user"},"timestamp":"2024-01-01T10:00:01Z","type":"response_item"}
+{"payload":{"cwd":"/Users/alice/scratch","id":"abc-123","originator":"user"},"timestamp":"2024-01-01T11:00:00Z","type":"session_meta"}
+`
+	sess, _ := runCodexParserTest(t, "test.jsonl", content, false)
+
+	require.NotNil(t, sess)
+	assert.Equal(t, "/Users/alice/scratch", sess.Cwd)
+	assert.Empty(t, sess.GitBranch)
+}
+
+func TestParseCodexSession_RecordedRepository(t *testing.T) {
+	for _, tc := range []struct {
+		name, remote, nextMeta, want string
+	}{
+		{name: "https", remote: "https://example.com/team/api.git", want: "https://example.com/team/api.git"},
+		{name: "ssh", remote: "git@example.com:team/api.git", want: "example.com:team/api.git"},
+		{name: "credentials removed", remote: "https://user:secret@example.com/team/api.git?token=secret#fragment", want: "https://example.com/team/api.git"},
+		{name: "local remote", remote: "/work/other"},
+		{name: "later meta omits git", remote: "https://example.com/team/api.git", nextMeta: `{"type":"session_meta","payload":{"id":"recorded-repository","cwd":"/work/scratch"}}`, want: "https://example.com/team/api.git"},
+		{name: "later git omits url", remote: "https://example.com/team/api.git", nextMeta: `{"type":"session_meta","payload":{"id":"recorded-repository","cwd":"/work/scratch","git":{"branch":"main"}}}`},
+		{name: "later git replaces url", remote: "https://example.com/team/api.git", nextMeta: `{"type":"session_meta","payload":{"id":"recorded-repository","cwd":"/work/api","git":{"repository_url":"https://example.com/team/web.git"}}}`, want: "https://example.com/team/web.git"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			content := fmt.Sprintf(`{"type":"session_meta","payload":{"id":"recorded-repository","cwd":"/work/api","git":{"repository_url":%q}}}`+"\n", tc.remote) +
+				`{"type":"response_item","timestamp":"2026-10-08T12:00:01Z","payload":{"role":"user","content":[{"type":"input_text","text":"add rate limiting"}]}}` + "\n" + tc.nextMeta + "\n"
+			sess, _ := runCodexParserTest(t, "test.jsonl", content, false)
+			require.NotNil(t, sess)
+			assert.Equal(t, tc.want, sess.GitRemote)
+		})
+	}
 }
 
 func TestParseCodexSession_GuardianReviewIssue1644(t *testing.T) {
@@ -581,6 +626,8 @@ func TestParseCodexSession_ExecOriginator(t *testing.T) {
 		require.NotNil(t, sess)
 		assert.Equal(t, "codex:abc", sess.ID)
 		assert.Equal(t, SessionKindNonInteractive, sess.SessionKind)
+		assert.Equal(t, RelNone, sess.RelationshipType)
+		assert.Empty(t, sess.ParentSessionID)
 		assert.Len(t, msgs, 1)
 	})
 
@@ -589,6 +636,8 @@ func TestParseCodexSession_ExecOriginator(t *testing.T) {
 		require.NotNil(t, sess)
 		assert.Equal(t, "codex:abc", sess.ID)
 		assert.Equal(t, SessionKindNonInteractive, sess.SessionKind)
+		assert.Equal(t, RelNone, sess.RelationshipType)
+		assert.Empty(t, sess.ParentSessionID)
 		assert.Len(t, msgs, 1)
 	})
 
@@ -620,6 +669,33 @@ func TestParseCodexSession_RoborevThreadSource(t *testing.T) {
 	assert.Equal(t, RelNone, sess.RelationshipType)
 }
 
+func TestParseCodexSession_RoborevMetadataOrdering(t *testing.T) {
+	untagged := `{"type":"session_meta","payload":{"id":"abc","originator":"codex_exec"}}`
+	tagged := `{"type":"session_meta","payload":{"id":"abc","originator":"codex_exec","thread_source":"roborev"}}`
+	child := `{"type":"session_meta","payload":{"id":"abc","originator":"codex_exec","source":{"subagent":"task"},"parent_thread_id":"parent"}}`
+	taggedChild := `{"type":"session_meta","payload":{"id":"abc","originator":"codex_exec","source":{"subagent":"task"},"parent_thread_id":"parent","thread_source":"roborev"}}`
+	for _, tt := range []struct {
+		name   string
+		meta   []string
+		parent string
+		rel    RelationshipType
+	}{
+		{name: "later roborev tag", meta: []string{untagged, tagged}, rel: RelNone},
+		{name: "earlier roborev tag", meta: []string{tagged, untagged}, rel: RelNone},
+		{name: "roborev tag between exec metadata", meta: []string{untagged, tagged, untagged}, rel: RelNone},
+		{name: "Task child keeps relationship", meta: []string{child, taggedChild}, parent: "codex:parent", rel: RelSubagent},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			content := testjsonl.JoinJSONL(append(tt.meta, testjsonl.CodexMsgJSON("user", "Review this change", tsEarlyS1))...)
+			sess, _ := runCodexParserTest(t, "test.jsonl", content, false)
+			require.NotNil(t, sess)
+			assert.Equal(t, SessionKindRoborev, sess.SessionKind)
+			assert.Equal(t, tt.parent, sess.ParentSessionID)
+			assert.Equal(t, tt.rel, sess.RelationshipType)
+		})
+	}
+}
+
 func TestCodexBuilderCanUseLexicalProjectDiscovery(t *testing.T) {
 	root := t.TempDir()
 	repo := filepath.Join(root, "repository")
@@ -636,7 +712,7 @@ func TestCodexBuilderCanUseLexicalProjectDiscovery(t *testing.T) {
 
 	ctx := WithoutFilesystemProjectDiscovery(t.Context())
 	builder := newCodexSessionBuilder(
-		ctx, false, nil, NewCodexCollectingSink(0),
+		ctx, AgentCodex, false, nil, NewCodexCollectingSink(0),
 	)
 	builder.handleSessionMeta(gjson.Parse(`{"id":"abc","cwd":`+
 		fmt.Sprintf("%q", cwd)+`}`), time.Time{})
@@ -820,7 +896,7 @@ func TestParseCodexSession_FunctionCalls(t *testing.T) {
 		line := `{"timestamp":"2026-07-08T03:20:43.376Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_abc","output":"Exit code: 0\nWall time: 0 seconds\nOutput:\nSuccess."}}`
 
 		b := newCodexSessionBuilder(
-			t.Context(), false, nil, NewCodexCollectingSink(0),
+			t.Context(), AgentCodex, false, nil, NewCodexCollectingSink(0),
 		)
 		b.rememberToolCall("call_abc", "exec_command", &ParsedToolCallPosition{MessageOrdinal: 1, CallIndex: 0})
 		assert.False(t, b.codexIncrementalNeedsFullParse(line))
@@ -1661,6 +1737,72 @@ func TestParseCodexSession_TokenUsage(t *testing.T) {
 		assert.Equal(t, 10000, sess.PeakContextTokens)
 	})
 
+	t.Run("cache writes split from uncached input", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON("tu-cw-1", "/tmp", "user", tsEarly),
+			testjsonl.CodexTurnContextJSON("gpt-5.6-luna", tsEarlyS1),
+			testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+			testjsonl.CodexMsgJSON("assistant", "hi there", tsEarlyS5),
+			testjsonl.CodexTokenCountWithCacheWriteJSON(tsEarlyS5, 100000, 10000, 40000, 60000),
+		)
+		sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+		require.NotNil(t, sess)
+		require.Len(t, msgs, 2)
+
+		// Codex counts writes inside input_tokens: 100000 = 40000 read + 60000 written.
+		assert.Equal(t, `{"cache_creation_input_tokens":60000,"cache_read_input_tokens":40000,"input_tokens":0,"output_tokens":10000}`,
+			string(msgs[1].TokenUsage),
+		)
+		assert.Equal(t, 10000, msgs[1].OutputTokens)
+		assert.Equal(t, 100000, msgs[1].ContextTokens)
+		assert.True(t, msgs[1].HasContextTokens)
+		assert.Equal(t, 100000, sess.PeakContextTokens)
+	})
+
+	t.Run("zero cache write keeps base shape", func(t *testing.T) {
+		tokenCount := `{"type":"event_msg","timestamp":"` + tsEarlyS5 + `","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":21052,"cached_input_tokens":11520,"cache_write_input_tokens":0,"output_tokens":50,"reasoning_output_tokens":0,"total_tokens":21102}}}}`
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON("tu-cw-2", "/tmp", "user", tsEarly),
+			testjsonl.CodexTurnContextJSON("gpt-5.6-luna", tsEarlyS1),
+			testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+			testjsonl.CodexMsgJSON("assistant", "hi there", tsEarlyS5),
+			tokenCount,
+		)
+		_, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+		require.Len(t, msgs, 2)
+		assert.Equal(t, `{"cache_read_input_tokens":11520,"input_tokens":9532,"output_tokens":50}`,
+			string(msgs[1].TokenUsage),
+		)
+		assert.Equal(t, 21052, msgs[1].ContextTokens)
+		assert.Equal(t, 50, msgs[1].OutputTokens)
+	})
+
+	t.Run("cache write clamped to uncached input", func(t *testing.T) {
+		tests := []struct {
+			name       string
+			cacheWrite int
+			want       string
+		}{
+			{"write above uncached input", 90, `{"cache_creation_input_tokens":60,"cache_read_input_tokens":40,"input_tokens":0,"output_tokens":10}`},
+			{"negative write", -5, `{"cache_read_input_tokens":40,"input_tokens":60,"output_tokens":10}`},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				content := testjsonl.JoinJSONL(
+					testjsonl.CodexSessionMetaJSON("tu-cw-3", "/tmp", "user", tsEarly),
+					testjsonl.CodexTurnContextJSON("gpt-5.6-luna", tsEarlyS1),
+					testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+					testjsonl.CodexMsgJSON("assistant", "hi there", tsEarlyS5),
+					testjsonl.CodexTokenCountWithCacheWriteJSON(tsEarlyS5, 100, 10, 40, tt.cacheWrite),
+				)
+				_, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+				require.Len(t, msgs, 2)
+				assert.Equal(t, tt.want, string(msgs[1].TokenUsage))
+				assert.Equal(t, 100, msgs[1].ContextTokens)
+			})
+		}
+	})
+
 	t.Run("duplicate token_count events deduplicated", func(t *testing.T) {
 		content := testjsonl.JoinJSONL(
 			testjsonl.CodexSessionMetaJSON("tu-2", "/tmp", "user", tsEarly),
@@ -1883,6 +2025,59 @@ func TestParseCodexSession_ForkedSessionSkipsReplayedHistory(t *testing.T) {
 		require.Len(t, msgs, 2)
 		assert.Equal(t, 500, sess.TotalOutputTokens)
 	})
+}
+
+func TestParseCodexSessionForkLineage(t *testing.T) {
+	const (
+		parentID = "a1000000-0000-4000-8000-000000000001"
+		childID  = "a1000000-0000-4000-8000-000000000002"
+	)
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "rollout-2026-01-10T10-00-00-"+parentID+".jsonl"),
+		[]byte(testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON(parentID, "/tmp", "user", tsEarly),
+			testjsonl.CodexTurnContextWithIDJSON("gpt-5", "parent-turn", tsEarly),
+			testjsonl.CodexMsgJSON("user", "parent question", tsEarly),
+		)), 0o600,
+	))
+	forkMeta := testjsonl.CodexForkedSessionMetaJSON(childID, parentID, "/tmp", "user", tsEarly)
+	subagentFork := testjsonl.CodexSessionMetaWithFieldsJSON(childID, "/tmp", "user", tsEarly, map[string]any{
+		"forked_from_id": parentID,
+		"source": map[string]any{"subagent": map[string]any{
+			"thread_spawn": map[string]any{"parent_thread_id": "spawner"},
+		}},
+	})
+	tests := []struct {
+		name         string
+		meta         string
+		wantParent   string
+		wantRelation RelationshipType
+	}{
+		{"ordinary fork links its source thread", forkMeta, "codex:" + parentID, RelFork},
+		{"subagent parent wins over fork source", subagentFork, "codex:spawner", RelSubagent},
+		{"plain session has no parent", testjsonl.CodexSessionMetaJSON(childID, "/tmp", "user", tsEarly), "", RelNone},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(root, "rollout-2026-01-10T10-00-01-"+childID+".jsonl")
+			require.NoError(t, os.WriteFile(path, []byte(testjsonl.JoinJSONL(
+				tt.meta,
+				testjsonl.CodexTurnContextWithIDJSON("gpt-5", "child-turn", tsEarlyS1),
+				testjsonl.CodexMsgJSON("user", "child question", tsEarlyS1),
+				testjsonl.CodexMsgJSON("assistant", "child answer", tsEarlyS5),
+			)), 0o600))
+			sess, msgs, err := newCodexTestProvider(t, root).parseSession(path, "local", false)
+			require.NoError(t, err)
+			require.NotNil(t, sess)
+			assert.Equal(t, "codex:"+childID, sess.ID)
+			assert.Equal(t, tt.wantParent, sess.ParentSessionID)
+			assert.Equal(t, tt.wantRelation, sess.RelationshipType)
+			require.Len(t, msgs, 2)
+			assert.Equal(t, "child question", msgs[0].Content)
+			assert.Equal(t, "child answer", msgs[1].Content)
+		})
+	}
 }
 
 func TestParseCodexSessionWithCursorActiveForkGateNeverPersistsCheckpoint(
@@ -3716,7 +3911,7 @@ func TestSeedCodexIncrementalState_Model(t *testing.T) {
 func TestSeedCodexIncrementalStatePropagatesReaderError(t *testing.T) {
 	wantErr := errors.New("prefix read failed")
 
-	_, err := seedCodexIncrementalStateFromReader(t.Context(),
+	_, err := seedCodexIncrementalStateFromReader(t.Context(), AgentCodex,
 		iotest.ErrReader(wantErr),
 		nil,
 	)
@@ -3807,4 +4002,78 @@ func TestCodexDuplicateCallIDsAttachOutputsToLatestCall(t *testing.T) {
 	require.Len(t, msgs[2].ToolCalls[0].ResultEvents, 2)
 	assert.Equal(t, "first result", msgs[2].ToolCalls[0].ResultEvents[0].Content)
 	assert.Equal(t, "second result", msgs[2].ToolCalls[0].ResultEvents[1].Content)
+}
+
+func TestParseCodexSession_ArrayOutputKeepsRawJSON(t *testing.T) {
+	const output = `[{"type":"text","text":"Result"},{"type":"output_text","text":" text"}]`
+	content := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON("array-output", "/workspace/project", "codex-tui", tsEarly),
+		testjsonl.CodexMsgJSON("user", "Inspect", tsEarlyS1),
+		testjsonl.CodexFunctionCallWithCallIDJSON("shell", "call-array", `{}`, tsEarlyS5),
+		`{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-array","output":`+output+`}}`,
+	)
+	_, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+	require.Len(t, msgs, 2)
+	require.Len(t, msgs[1].ToolCalls, 1)
+	require.Len(t, msgs[1].ToolCalls[0].ResultEvents, 1)
+	assert.Equal(t, output, msgs[1].ToolCalls[0].ResultEvents[0].Content)
+}
+
+func TestCodexServiceTierMessages(t *testing.T) {
+	settings := func(provider, tier string) string {
+		return `{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model_provider_id":"` + provider + `","service_tier":"` + tier + `"}}}`
+	}
+	turn := func(id string) string {
+		return `{"type":"turn_context","payload":{"turn_id":"` + id + `","model":"gpt-6.1-sol"}}`
+	}
+	for _, tc := range []struct {
+		name  string
+		lines []string
+		want  []string
+	}{
+		{"tier changes", []string{
+			testjsonl.CodexSessionMetaJSON("tier-1", "/tmp", "user", tsEarly),
+			settings("openai", "priority"),
+			testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+			testjsonl.CodexMsgJSON("assistant", "answer", tsEarlyS5),
+			testjsonl.CodexFunctionCallJSON("shell", "run command", tsLate),
+			settings("openai", "ultrafast"),
+			testjsonl.CodexMsgJSON("assistant", "after tier change", tsLate),
+			settings("openai", "priority"),
+			testjsonl.CodexMsgJSON("assistant", "Fast again", tsLateS5),
+			settings("azure", "priority"),
+			testjsonl.CodexMsgJSON("assistant", "other provider", tsLateS5),
+			`{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model_provider_id":"openai"}}}`,
+			testjsonl.CodexMsgJSON("assistant", "missing tier", tsLateS5),
+		}, []string{"", "openai-priority", "openai-priority", "", "openai-priority", "", ""}},
+		{"fork replay", []string{
+			`{"type":"session_meta","payload":{"id":"child","forked_from_id":"parent","cwd":"/workspace"}}`,
+			testjsonl.CodexSessionMetaJSON("parent", "/workspace", "user", tsEarly),
+			turn("parent-turn"), settings("openai", "priority"), turn("child-turn"),
+			testjsonl.CodexMsgJSON("assistant", "child answer", tsEarlyS5),
+		}, []string{"openai-priority"}},
+		{"image generation", []string{
+			testjsonl.CodexSessionMetaJSON("image-tier", "/workspace", "user", tsEarly),
+			settings("openai", "priority"),
+			testjsonl.CodexImageGenerationCallJSON(
+				"call-image", "draw an image",
+				testjsonl.SolidPNGBase64(1, 1, color.RGBA{A: 255}), tsEarlyS5,
+			),
+		}, []string{"openai-priority"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newCodexSessionBuilder(t.Context(), AgentCodex, false, func(string) (map[string]struct{}, bool) {
+				return map[string]struct{}{"parent-turn": {}}, true
+			}, NewCodexCollectingSink(0))
+			for _, line := range tc.lines {
+				_, err := b.processLine(t.Context(), line)
+				require.NoError(t, err)
+			}
+			var got []string
+			for _, message := range b.sink.Messages() {
+				got = append(got, message.ProviderID)
+			}
+			assert.Equal(t, tc.want, got)
+		})
+	}
 }

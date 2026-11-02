@@ -136,6 +136,7 @@ func (e *Engine) ParseDiff(ctx context.Context, opts ParseDiffOptions) (*ParseDi
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	runCtx = parser.WithProjectRootMemo(runCtx)
+	runCtx = parser.WithCodexParentInventoryBatch(runCtx)
 	results := e.startWorkers(runCtx, files)
 	for i := range total {
 		var r syncJob
@@ -176,6 +177,14 @@ func (e *Engine) ParseDiff(ctx context.Context, opts ParseDiffOptions) (*ParseDi
 		if opts.Progress != nil {
 			opts.Progress(i+1, total)
 		}
+	}
+
+	changedParents, err := parser.ValidateCodexParentInventoryBatch(runCtx)
+	if err != nil {
+		return nil, fmt.Errorf("parse-diff: validate Codex parent inventory: %w", err)
+	}
+	if len(changedParents) > 0 {
+		return nil, fmt.Errorf("parse-diff: parent files changed for %d Codex forks; retry the comparison", len(changedParents))
 	}
 
 	// Presence sweep after all files: stored sessions under a
@@ -220,18 +229,18 @@ func (e *Engine) parseDiffProviderSources(
 	ctx context.Context,
 	agentType parser.AgentType,
 ) ([]parser.DiscoveredFile, error) {
-	factory, ok := e.providerFactories[agentType]
+	factory, ok := e.sources().providerFactories[agentType]
 	if !ok || factory == nil {
 		return nil, nil
 	}
-	roots := e.agentDirs[agentType]
+	roots := e.sources().agentDirs[agentType]
 	if len(roots) == 0 {
 		return nil, nil
 	}
 	provider := factory.NewProvider(parser.ProviderConfig{
 		Roots:          roots,
 		Machine:        e.machine,
-		SourceMachines: e.sourceMachines[agentType],
+		SourceMachines: e.sources().sourceMachines[agentType],
 		PathRewriter:   e.pathRewriter,
 	})
 	sources, err := provider.Discover(ctx)
@@ -293,7 +302,7 @@ func (e *Engine) parseDiffAgentDiscoverable(def parser.AgentDef) bool {
 	// rejects them.
 	switch e.providerMigrationModes[def.Type] {
 	case parser.ProviderMigrationProviderAuthoritative:
-		factory, ok := e.providerFactories[def.Type]
+		factory, ok := e.sources().providerFactories[def.Type]
 		return ok && factory != nil
 	default:
 		return false
@@ -432,6 +441,7 @@ func parseDiffSourceKey(agent parser.AgentType, path string) string {
 var perSessionDBVirtualSourceBases = []string{
 	"opencode.db", "kilo.db", "mimocode.db", "sessions.db",
 	parser.WarpDBFilename, parser.ForgeDBFilename, parser.PiebaldDBFilename,
+	"openclaw-agent.sqlite",
 }
 
 func isPerSessionDBVirtualSource(agent parser.AgentType, path string) bool {
@@ -443,6 +453,14 @@ func isPerSessionDBVirtualSource(agent parser.AgentType, path string) bool {
 		path, parser.WindsurfStateDBName,
 	); ok {
 		return agent == parser.AgentWindsurf
+	}
+	// Hermes and Augure Desktop share the "state.db#<sessionID>" virtual
+	// path, but that literal filename is not unique to them, so this case
+	// stays keyed to their agent types rather than joining the base list.
+	if _, _, ok := parser.ParseVirtualSourcePathForBase(
+		path, "state.db",
+	); ok {
+		return agent == parser.AgentHermes || agent == parser.AgentAugureDesktop
 	}
 	for _, base := range perSessionDBVirtualSourceBases {
 		if _, _, ok := parser.ParseVirtualSourcePathForBase(path, base); ok {

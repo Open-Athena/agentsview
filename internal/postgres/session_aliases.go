@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/parser"
 )
 
 func replacePGSessionAliases(
@@ -48,7 +49,26 @@ func pgSessionAliasIDs(sess db.Session) []string {
 
 func pgSessionTombstoneIDs(sess db.Session) []string {
 	ids := append([]string{sess.ID}, pgSessionAliasIDs(sess)...)
+	ids = append(ids, pgRetiredCodexRolloutIDs(sess)...)
 	return uniqueNonEmptyStrings(ids)
+}
+
+// pgRetiredCodexRolloutIDs returns the bare rollout id a canonical Codex page
+// held before data version 134. A permanent purge of that old row leaves only
+// its exclusion, so the canonical page must honor an exclusion recorded there.
+func pgRetiredCodexRolloutIDs(sess db.Session) []string {
+	switch sess.Agent {
+	case "codex", "traex", "augure-code":
+	default:
+		return nil
+	}
+	prefixEnd := strings.LastIndex(sess.ID, ":") + 1
+	key := sess.ID[prefixEnd:]
+	thread := parser.CodexThreadIDFromSessionKey(key)
+	if thread == key {
+		return nil
+	}
+	return []string{sess.ID[:prefixEnd] + key[len(thread)+1:]}
 }
 
 func pgVibeFallbackAliasID(id, agent, filePath string) string {
@@ -101,4 +121,24 @@ func uniqueNonEmptyStrings(values []string) []string {
 		out = append(out, value)
 	}
 	return out
+}
+
+// Record thread scope before exact aliases, so a later per-file tombstone
+// cannot narrow an existing permanent whole-thread exclusion.
+func insertPGTrashedSessionExclusions(ctx context.Context, tx *sql.Tx, ids, scopedIDs []string) error {
+	if len(scopedIDs) > 0 {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO excluded_sessions (id, include_codex_pages, owner_marker, machine, agent)
+			SELECT id, TRUE, owner_marker, machine, agent FROM sessions WHERE id = ANY($1)
+			ON CONFLICT (id) DO UPDATE SET
+				owner_marker = CASE WHEN excluded_sessions.include_codex_pages
+					THEN excluded_sessions.owner_marker ELSE EXCLUDED.owner_marker END,
+				machine = CASE WHEN excluded_sessions.include_codex_pages
+					THEN excluded_sessions.machine ELSE EXCLUDED.machine END,
+				agent = CASE WHEN excluded_sessions.include_codex_pages
+					THEN excluded_sessions.agent ELSE EXCLUDED.agent END,
+				include_codex_pages = TRUE`, scopedIDs); err != nil {
+			return fmt.Errorf("recording excluded Codex threads: %w", err)
+		}
+	}
+	return insertPGExcludedSessionIDs(ctx, tx, ids)
 }

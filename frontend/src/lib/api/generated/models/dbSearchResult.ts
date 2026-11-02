@@ -4,6 +4,7 @@
 
 export interface DbSearchResult {
   agent: string;
+  machine: string;
   name: string;
   ordinal: number;
   project: string;
@@ -11,5 +12,7 @@ export interface DbSearchResult {
   session_ended_at: string;
   session_id: string;
   snippet: string;
+  /** Contributing hosted device machine IDs; omitted for sessions without hosted provenance. */
+  source_machines?: string[];
   web_url?: string;
 }

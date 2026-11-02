@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,18 +26,19 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
-	duckdbsync "go.kenn.io/agentsview/internal/duckdb"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/remotesync"
 	"go.kenn.io/agentsview/internal/server"
 	"go.kenn.io/agentsview/internal/storage"
 	agentsync "go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/testjsonl"
+	"go.kenn.io/kit/stacktest"
 )
 
 type cursorSecretRecorder struct {
@@ -49,6 +51,8 @@ type usageCacheBackfillRecorder struct {
 	waited   chan struct{}
 	observer func()
 }
+
+func (recorder *usageCacheBackfillRecorder) SetUsageCacheNotificationWork(func() (func(), bool)) {}
 
 func (recorder *usageCacheBackfillRecorder) SetUsageCacheBackfillStarted(
 	observer func(),
@@ -115,6 +119,80 @@ func TestServeStartsUsageCacheBackfillWithoutIdleTracker(t *testing.T) {
 	close(recorder.release)
 }
 
+func TestUsageNotificationHoldsIdleWorkAfterSync(t *testing.T) {
+	path := filepath.Join(dbtest.MkdirTempWithCleanup(t), "archive.db")
+	database := dbtest.OpenTestDBAt(t, path)
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{ID: "session", Agent: "claude", Project: "project"}))
+	require.NoError(t, database.InsertMessages(t.Context(), []db.Message{{
+		SessionID: "session", Ordinal: 0, Role: "assistant", Model: "model-a",
+		Timestamp: "2026-08-10T09:00:00Z", TokenUsage: []byte(`{"input_tokens":10}`),
+		ClaudeMessageID: "message-a", ClaudeRequestID: "request-a",
+	}}))
+	idled := make(chan struct{})
+	shutdown := make(chan error, 1)
+	tracker := server.NewIdleTracker(20*time.Millisecond, func() { //nolint:kennlint // deadlinetest: absence check; the held cache write keeps notification work active beyond the idle deadline
+		close(idled)
+		shutdown <- database.Close()
+	})
+	finishSync, ok := tracker.BeginWork()
+	require.True(t, ok)
+	defer finishSync()
+	startDaemonUsageCacheBackfill(t.Context(), database, tracker)
+	require.NoError(t, database.WaitUsageCacheBackfill(t.Context()))
+	_, err := database.GetDailyUsage(t.Context(), db.UsageFilter{Timezone: "UTC"})
+	require.NoError(t, err)
+	paths, err := filepath.Glob(filepath.Join(filepath.Dir(path), "usage-cache-v*.db"))
+	require.NoError(t, err)
+	require.Len(t, paths, 1)
+	cache, err := sql.Open("sqlite3", paths[0])
+	require.NoError(t, err)
+	defer cache.Close()
+	conn, err := cache.Conn(t.Context())
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = conn.ExecContext(t.Context(), "BEGIN IMMEDIATE")
+	require.NoError(t, err)
+	defer func() { _, _ = conn.ExecContext(t.Context(), "ROLLBACK") }()
+	require.NoError(t, database.InsertMessages(t.Context(), []db.Message{{
+		SessionID: "session", Ordinal: 1, Role: "assistant", Model: "model-a",
+		Timestamp: "2026-08-10T10:00:00Z", TokenUsage: []byte(`{"input_tokens":7}`),
+		ClaudeMessageID: "message-b", ClaudeRequestID: "request-b",
+	}}))
+	go tracker.Run(t.Context())
+	idleFired := func() bool {
+		select {
+		case <-idled:
+			return true
+		default:
+			return false
+		}
+	}
+	assert.Never(t, idleFired, 50*time.Millisecond, time.Millisecond)
+	finishSync()
+	assert.Never(t, idleFired, 200*time.Millisecond, time.Millisecond, "idle shutdown cancelled the blocked notification rebuild")
+	_, err = conn.ExecContext(t.Context(), "ROLLBACK")
+	require.NoError(t, err)
+	select {
+	case <-idled:
+	case <-time.After(10 * time.Second):
+		require.FailNow(t, "notification work did not release its idle lease")
+	}
+	select {
+	case err := <-shutdown:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		require.FailNow(t, "idle shutdown did not finish")
+	}
+	reopened := dbtest.OpenTestDBAt(t, path)
+	var revisionBefore, revisionAfter int64
+	require.NoError(t, cache.QueryRowContext(t.Context(), "SELECT SUM(install_revision) FROM usage_rollup_installs").Scan(&revisionBefore))
+	daily, err := reopened.GetDailyUsage(t.Context(), db.UsageFilter{Timezone: "UTC"})
+	require.NoError(t, err)
+	assert.Equal(t, 17, daily.Totals.InputTokens)
+	require.NoError(t, cache.QueryRowContext(t.Context(), "SELECT SUM(install_revision) FROM usage_rollup_installs").Scan(&revisionAfter))
+	assert.Equal(t, revisionBefore, revisionAfter, "request rebuilt totals after idle work drained")
+}
+
 func (recorder *cursorSecretRecorder) SetCursorSecret(secret []byte) {
 	recorder.secret = append([]byte(nil), secret...)
 }
@@ -177,23 +255,40 @@ func TestServeCommandMountsWritableServerAtBasePath(t *testing.T) {
 }
 
 func TestServeSkipInitialSyncStillReparsesStaleArchive(t *testing.T) {
-	cfg := testConfigWithClaudeFixture(t)
-	cfg.Host = "127.0.0.1"
-	database, err := db.Open(t.Context(), cfg.DBPath)
-	require.NoError(t, err)
-	require.NoError(t, database.Close())
-	markArchiveStale(t, cfg.DBPath)
-	data, err := json.Marshal(cfg)
-	require.NoError(t, err)
-	out, err := runRuntimeWarningHelperProcess(t, "serve", "TestServeStaleArchiveHelperProcess",
-		[]string{
-			"AGENTSVIEW_STALE_SERVE_CONFIG=" + string(data),
-			"AGENTSVIEW_STALE_SERVE_SOURCES=" + cfg.AgentDirs[parser.AgentClaude][0],
-		}, "listening at")
-	require.NoError(t, err, string(out))
-	stale, err := db.ArchiveNeedsResync(t.Context(), cfg.DBPath)
-	require.NoError(t, err)
-	assert.False(t, stale, "a direct serve must complete required reparse before publishing readiness")
+	for _, kind := range []string{"data version", "archive only", "scoped pending", "schema repair"} {
+		t.Run(kind, func(t *testing.T) {
+			cfg := testConfigWithClaudeFixture(t)
+			cfg.Host = "127.0.0.1"
+			database, err := db.Open(t.Context(), cfg.DBPath)
+			require.NoError(t, err)
+			dbtest.SeedSessionWithMessages(t, database, "retained", "project", []db.Message{dbtest.UserMsg("retained", 0, "retained transcript")})
+			if kind == "archive only" {
+				require.NoError(t, database.EnableArchiveOnly(t.Context()))
+			}
+			require.NoError(t, database.Close())
+			if kind == "data version" || kind == "archive only" {
+				markArchiveStale(t, cfg.DBPath)
+			} else {
+				conn, err := sql.Open("sqlite3", cfg.DBPath)
+				require.NoError(t, err)
+				statement := "INSERT INTO stats(key, value) VALUES ('scoped_upgrade_pending', 1)"
+				if kind == "schema repair" {
+					statement = "ALTER TABLE tool_calls DROP COLUMN result_content_length"
+				}
+				_, err = conn.ExecContext(t.Context(), statement)
+				require.NoError(t, err)
+				require.NoError(t, conn.Close())
+			}
+			data, err := json.Marshal(cfg)
+			require.NoError(t, err)
+			out, err := runRuntimeWarningHelperProcess(t, "serve", "TestServeStaleArchiveHelperProcess", []string{
+				"AGENTSVIEW_STALE_SERVE_CONFIG=" + string(data),
+				"AGENTSVIEW_STALE_SERVE_SOURCES=" + cfg.AgentDirs[parser.AgentClaude][0],
+				"AGENTSVIEW_STALE_SERVE_KIND=" + kind,
+			}, "archive rebuild complete")
+			require.NoError(t, err, string(out))
+		})
+	}
 }
 
 func TestServeStaleArchiveHelperProcess(t *testing.T) {
@@ -201,23 +296,108 @@ func TestServeStaleArchiveHelperProcess(t *testing.T) {
 	if data == "" {
 		return
 	}
+	t.Setenv("PATH", "")
+	t.Setenv("GH_TOKEN", "")
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("GH_CONFIG_DIR", t.TempDir())
+	localTransport := http.DefaultTransport
+	withPricingCatalogTransport(t, pricingCatalogTransport{requests: make(chan *http.Request, 16)})
 	var cfg config.Config
 	require.NoError(t, json.Unmarshal([]byte(data), &cfg))
 	cfg.DBPath = filepath.Join(cfg.DataDir, "sessions.db")
-	cfg.AgentDirs = map[parser.AgentType][]string{
-		parser.AgentClaude: {os.Getenv("AGENTSVIEW_STALE_SERVE_SOURCES")},
+	cfg.AgentDirs = map[parser.AgentType][]string{parser.AgentClaude: {os.Getenv("AGENTSVIEW_STALE_SERVE_SOURCES")}}
+	kind := os.Getenv("AGENTSVIEW_STALE_SERVE_KIND")
+	release, launched, rebuilt := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	needsResync, _, err := db.ArchiveResyncState(t.Context(), cfg.DBPath)
+	require.NoError(t, err)
+	backgroundRebuild := kind == "data version" || kind == "archive only" || kind == "" && needsResync
+	if backgroundRebuild {
+		stubLaunchSyncWorker(t, func(ctx context.Context, cfg config.Config, request syncWorkerRequest, _ func(workerLine)) (workerResult, error) {
+			defer close(rebuilt)
+			require.Equal(t, "resync-build", request.Mode)
+			close(launched)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return workerResult{}, ctx.Err()
+			}
+			var output bytes.Buffer
+			err := runSyncWorkerContext(ctx, cfg, request, &output)
+			require.NoError(t, err, output.String())
+			result := decodeSingleResult(t, &output)
+			require.Equal(t, "ok", result.Status)
+			require.True(t, result.DiscoveryComplete)
+			return result, err
+		})
+	}
+	original := writeDaemonRuntimeWithAuthAndNoSync
+	writeDaemonRuntimeWithAuthAndNoSync = func(dataDir, host string, port int, version, browserURL string, readOnly, requireAuth, noSync bool, explicitPort *int, caddyPID ...int) (string, error) {
+		base := fmt.Sprintf("http://%s:%d", host, port)
+		client := &http.Client{Timeout: 10 * time.Second, Transport: localTransport}
+		if kind != "" {
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, base+"/api/v1/sessions/retained/messages", nil)
+			require.NoError(t, err)
+			resp, err := client.Do(req)
+			require.NoError(t, err)
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			require.Contains(t, string(body), "retained transcript")
+		}
+		if backgroundRebuild {
+			select {
+			case <-launched:
+			case <-time.After(10 * time.Second):
+				require.FailNow(t, "HTTP startup must hand off the rebuild before readiness")
+			}
+			select {
+			case <-rebuilt:
+				require.FailNow(t, "HTTP reads must arrive before the rebuild finishes")
+			default:
+			}
+			close(release)
+			<-rebuilt
+			require.Eventually(t, func() bool {
+				req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, base+"/api/v1/sync/status", nil)
+				require.NoError(t, err)
+				resp, err := client.Do(req)
+				if err != nil {
+					return false
+				}
+				defer resp.Body.Close()
+				var status struct {
+					Progress *agentsync.Progress `json:"progress"`
+				}
+				if json.UnmarshalRead(resp.Body, &status) != nil || status.Progress != nil {
+					return false
+				}
+				stale, _, err := db.ArchiveResyncState(t.Context(), cfg.DBPath)
+				return err == nil && !stale
+			}, 20*time.Second, 10*time.Millisecond, "replacement archive must be installed and fresh")
+		}
+		stale, _, err := db.ArchiveResyncState(t.Context(), cfg.DBPath)
+		require.NoError(t, err)
+		require.False(t, stale, "startup reconciliation must finish before readiness")
+		if kind == "data version" || kind == "scoped pending" || kind == "schema repair" {
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, base+"/api/v1/sessions/session0/messages", nil)
+			require.NoError(t, err)
+			resp, err := client.Do(req)
+			require.NoError(t, err)
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			require.Contains(t, string(body), "hello")
+		}
+		fmt.Println("archive rebuild complete")
+		return original(dataDir, host, port, version, browserURL, readOnly, requireAuth, noSync, explicitPort, caddyPID...)
 	}
 	runServe(t.Context(), cfg, serveOptions{SkipInitialSync: true}, 0)
 }
 
 func TestPGServeRuntimeRecordWriteFailureWarnsVisible(t *testing.T) {
 	out, err := runPGRuntimeWarningHelper(t)
-	require.NoError(t, err, string(out))
-	assert.Contains(t, string(out), "could not write daemon runtime record")
-}
-
-func TestDuckDBServeRuntimeRecordWriteFailureWarnsVisible(t *testing.T) {
-	out, err := runDuckDBRuntimeWarningHelper(t)
 	require.NoError(t, err, string(out))
 	assert.Contains(t, string(out), "could not write daemon runtime record")
 }
@@ -314,6 +494,7 @@ func runRuntimeWarningHelperProcess(
 		return stdoutOutput.Bytes(), nil
 	}
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		stacktest.Dump(t)
 		return combined, fmt.Errorf(
 			"%s helper deadline expired before stdout marker %q: %w\noutput:\n%s",
 			helperName, marker, ctx.Err(), combined,
@@ -397,36 +578,6 @@ func TestRunServeRuntimeWarningHelperProcess(t *testing.T) {
 	runServe(t.Context(), cfg, serveOptions{}, 0)
 }
 
-func runDuckDBRuntimeWarningHelper(t *testing.T) ([]byte, error) {
-	t.Helper()
-	dataDir := t.TempDir()
-	mirrorPath := filepath.Join(dataDir, "mirror.duckdb")
-	buildEmptyDuckDBMirrorFixture(t, mirrorPath)
-	return runRuntimeWarningHelperProcess(
-		t, "DuckDB", "TestRunDuckDBRuntimeWarningHelperProcess",
-		[]string{
-			"AGENTSVIEW_RUN_DUCKDB_RUNTIME_WARNING_HELPER=1",
-			"AGENTSVIEW_DATA_DIR=" + dataDir,
-			"AGENTSVIEW_DUCKDB_RUNTIME_WARNING_PATH=" + mirrorPath,
-		},
-		"could not write daemon runtime record",
-	)
-}
-
-// buildEmptyDuckDBMirrorFixture creates a schema-compatible, empty DuckDB
-// mirror file at path. 'duckdb serve' now probes instead of migrating (see
-// probeDuckDBMirrorForServe), so it fatally refuses to serve a missing or
-// bare file; tests that just need serve to reach its normal startup path
-// must seed a valid mirror first instead of relying on serve to create one.
-func buildEmptyDuckDBMirrorFixture(t *testing.T, path string) {
-	t.Helper()
-
-	conn, err := duckdbsync.Open(t.Context(), path)
-	require.NoError(t, err)
-	require.NoError(t, duckdbsync.EnsureSchema(t.Context(), conn))
-	require.NoError(t, conn.Close())
-}
-
 func runPGRuntimeWarningHelper(t *testing.T) ([]byte, error) {
 	t.Helper()
 	dataDir := t.TempDir()
@@ -460,7 +611,7 @@ func TestRunPGRuntimeWarningHelperProcess(t *testing.T) {
 		Port:    port,
 		DataDir: os.Getenv("AGENTSVIEW_DATA_DIR"),
 	}
-	prepareReplicaServe = func(storage.Replica, config.Config, string) (replicaServeStartup, error) {
+	prepareReplicaServe = func(storage.Replica, config.Config, string, *ReplicaPushConfig) (replicaServeStartup, error) {
 		return replicaServeStartup{
 			cfg: appCfg, ctx: ctx,
 			rtOpts: serveRuntimeOptions{
@@ -476,29 +627,7 @@ func TestRunPGRuntimeWarningHelperProcess(t *testing.T) {
 	// This is only an orphan guard if the parent dies; normal completion is
 	// driven by the parent observing the warning on stdout.
 	time.AfterFunc(2*time.Minute, func() { os.Exit(0) })
-	runReplicaServe(pgReplica{}, appCfg, "")
-}
-
-func TestRunDuckDBRuntimeWarningHelperProcess(t *testing.T) {
-	if os.Getenv("AGENTSVIEW_RUN_DUCKDB_RUNTIME_WARNING_HELPER") != "1" {
-		return
-	}
-	writeDaemonRuntimeWithAuth = func(
-		string, string, int, string, string, bool, bool, ...int,
-	) (string, error) {
-		return "", errors.New("forced runtime-record write failure")
-	}
-	// This is only an orphan guard if the parent dies; normal completion is
-	// driven by the parent observing the warning on stdout.
-	time.AfterFunc(2*time.Minute, func() { os.Exit(0) })
-	runDuckDBServe(config.Config{
-		Host:    "127.0.0.1",
-		Port:    0,
-		DataDir: os.Getenv("AGENTSVIEW_DATA_DIR"),
-		DuckDB: config.DuckDBConfig{
-			Path: os.Getenv("AGENTSVIEW_DUCKDB_RUNTIME_WARNING_PATH"),
-		},
-	}, "")
+	runReplicaServe(pgReplica{}, appCfg, "", nil)
 }
 
 func TestMustLoadConfig(t *testing.T) {
@@ -590,22 +719,98 @@ func TestPrepareServeRuntimeConfigPortZeroUsesAssignedPort(t *testing.T) {
 	assert.Equal(t, wantURL, rt.BrowserURL)
 }
 
-func TestSetupLogFile(t *testing.T) {
+func TestSetupLogFileRotatesOversizedLog(t *testing.T) {
 	dir := t.TempDir()
-	// Register after TempDir so LIFO cleanup closes the log file before
-	// TempDir removes the directory. On Windows, open files can't be deleted.
 	restoreTestLogOutput(t)
+	path := filepath.Join(dir, "debug.log")
+	writeTestFile(t, path, bytes.Repeat([]byte("x"), maxLogSize+1))
 
 	setupLogFile(dir)
 
-	// Log something and verify it reaches the file.
+	assert.FileExists(t, path+".1")
+}
+
+func TestSetupDebugLogWriterDefersRotation(t *testing.T) {
+	dir := t.TempDir()
+	restoreTestLogOutput(t)
+	path := filepath.Join(dir, "debug.log")
+	content := bytes.Repeat([]byte("x"), maxLogSize+1)
+	writeTestFile(t, path, content)
+
+	setupDebugLogWriter(dir)
+	log.Print("early startup message")
+
+	active, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.True(t, bytes.HasPrefix(active, content))
+	assert.Contains(t, string(active), "early startup message")
+	assert.NoFileExists(t, path+".1")
+}
+
+func TestSetupDebugLogWriterWritesWithoutLock(t *testing.T) {
+	dir := t.TempDir()
+	// Close the logger before TempDir cleanup on Windows.
+	restoreTestLogOutput(t)
+	path := filepath.Join(dir, "debug.log")
+	require.NoError(t, os.Mkdir(path+".rotate.lock", 0o700))
+
+	setupDebugLogWriter(dir)
 	log.Print("test-log-message")
 
-	logPath := filepath.Join(dir, "debug.log")
-	data, err := os.ReadFile(logPath)
-	require.NoError(t, err, "reading log file")
-	assert.Contains(t, string(data), "test-log-message",
-		"log file missing message")
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "test-log-message")
+}
+
+func TestSetupLogFileLiveWriterRotation(t *testing.T) {
+	dir := t.TempDir()
+	restoreTestLogOutput(t)
+	setupLogFile(dir)
+	path := filepath.Join(dir, "debug.log")
+	writeTestFile(t, path, bytes.Repeat([]byte("x\n"), maxLogSize/2+1))
+	ctx, cancel := context.WithCancel(t.Context())
+	first, done := make(chan struct{}), make(chan struct{})
+	var writeErr error
+	written := 0
+	go func() {
+		defer close(done)
+		for ctx.Err() == nil {
+			writeErr = log.Output(1, fmt.Sprintf("rotation-message-%05d", written))
+			if written == 0 {
+				close(first)
+			}
+			if writeErr != nil {
+				return
+			}
+			written++
+		}
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	<-first
+	require.Eventually(t, func() bool {
+		rotateLogFile(path, maxLogSize)
+		_, err := os.Stat(path + ".1")
+		return err == nil
+	}, 10*time.Second, 10*time.Millisecond)
+	cancel()
+	<-done
+	require.NoError(t, writeErr)
+	backup, err := os.ReadFile(path + ".1")
+	require.NoError(t, err)
+	active, err := os.ReadFile(path)
+	require.NoError(t, err)
+	counts := make(map[string]int)
+	for line := range strings.SplitSeq(string(backup)+string(active), "\n") {
+		if _, message, ok := strings.Cut(line, "rotation-message-"); ok {
+			counts[message]++
+		}
+	}
+	for i := range written {
+		require.Equal(t, 1, counts[fmt.Sprintf("%05d", i)], "message %d must survive exactly once", i)
+	}
 }
 
 func TestSetupLogFileOpenFailure(t *testing.T) {
@@ -621,6 +826,76 @@ func TestSetupLogFileOpenFailure(t *testing.T) {
 
 	assert.Contains(t, buf.String(), "cannot open log file",
 		"expected warning about log file")
+}
+
+func TestRotateLogFileTailAndMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.log")
+	writeTestFile(t, path, []byte("discarded prefix\nfirst retained line\nlast diagnostic\n"))
+	writeTestFile(t, path+".1", []byte("older log"))
+	require.NoError(t, os.Chmod(path, 0o640))
+	source, err := os.Stat(path)
+	require.NoError(t, err)
+
+	rotateLogFile(path, 36)
+
+	retained, err := os.ReadFile(path + ".1")
+	require.NoError(t, err)
+	assert.Equal(t, "first retained line\nlast diagnostic\n", string(retained))
+	backup, err := os.Stat(path + ".1")
+	require.NoError(t, err)
+	assert.Equal(t, source.Mode().Perm(), backup.Mode().Perm())
+	active, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Empty(t, active)
+}
+
+func TestRotateLogFileLeavesActiveLog(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		limit     int64
+		holdLock  bool
+		symlink   bool
+		backupDir bool
+	}{
+		{"held lock", 512, true, false, false},
+		{"at size limit", 1025, false, false, false},
+		{"symlink", 512, false, true, false},
+		{"backup failure", 512, false, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "test.log")
+			content := bytes.Repeat([]byte("line\n"), 205)
+			writeTestFile(t, path, content)
+			rotationPath := path
+			if tc.symlink {
+				rotationPath = filepath.Join(dir, "link.log")
+				requireSymlinkOrSkip(t, path, rotationPath)
+			}
+			if tc.holdLock {
+				writeTestFile(t, path+".1", []byte("older log"))
+				lock := flock.New(path + ".rotate.lock")
+				require.NoError(t, lock.RLock())
+				t.Cleanup(func() { require.NoError(t, lock.Close()) })
+			}
+			if tc.backupDir {
+				require.NoError(t, os.Mkdir(path+".1", 0o755))
+			}
+
+			rotateLogFile(rotationPath, tc.limit)
+
+			active, err := os.ReadFile(path)
+			require.NoError(t, err)
+			assert.Equal(t, content, active)
+			if tc.holdLock {
+				backup, err := os.ReadFile(path + ".1")
+				require.NoError(t, err)
+				assert.Equal(t, "older log", string(backup))
+			} else if !tc.backupDir {
+				assert.NoFileExists(t, rotationPath+".1")
+			}
+		})
+	}
 }
 
 func TestTruncateLogFile(t *testing.T) {
@@ -654,12 +929,6 @@ func TestTruncateLogFileUnderLimit(t *testing.T) {
 	assert.Equal(t, string(content), string(data), "content changed")
 }
 
-func TestTruncateLogFileMissing(t *testing.T) {
-	// Non-existent file: should not panic.
-	missing := filepath.Join(t.TempDir(), "missing", "log.txt")
-	truncateLogFile(missing, 1024)
-}
-
 func TestTruncateLogFileSymlink(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "real.log")
@@ -679,17 +948,19 @@ func TestTruncateLogFileSymlink(t *testing.T) {
 }
 
 func TestNewDaemonIdleTrackerUsesConfigTimeout(t *testing.T) {
-	t.Setenv(backgroundChildEnvVar, "1")
-	fired := make(chan struct{})
-	tracker := newDaemonIdleTracker(config.Config{DaemonIdleTimeout: 20 * time.Millisecond}, func() { close(fired) })
-	require.NotNil(t, tracker)
-	ctx := t.Context()
-	go tracker.Run(ctx)
-	select {
-	case <-fired:
-	case <-time.After(time.Second):
-		require.FailNow(t, "idle tracker did not fire")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		t.Setenv(backgroundChildEnvVar, "1")
+		fired := make(chan struct{})
+		tracker := newDaemonIdleTracker(config.Config{DaemonIdleTimeout: 20 * time.Millisecond}, func() { close(fired) })
+		require.NotNil(t, tracker)
+		ctx := t.Context()
+		go tracker.Run(ctx)
+		select {
+		case <-fired:
+		case <-time.After(time.Second):
+			require.FailNow(t, "idle tracker did not fire")
+		}
+	})
 }
 
 func TestNewDaemonIdleTrackerConfigZeroDisables(t *testing.T) {
@@ -910,7 +1181,7 @@ func TestRemoteHostSyncFuncSerializesWithEngineExclusiveLock(t *testing.T) {
 	select {
 	case <-exclusiveEntered:
 		assert.Fail(t, "exclusive operation overlapped scheduled remote sync")
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(50 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; the held remote sync keeps the exclusive operation out
 	}
 
 	close(releaseRemote)
@@ -969,15 +1240,15 @@ func TestRemoteHostSyncFuncAcquiresHTTPCleanupBeforeEngine(t *testing.T) {
 		},
 	)
 	require.Error(t, seedErr)
-	originalHTTP := runHTTPRemoteSync
+	originalHTTP := runRemoteHostSync
 	httpCalls := 0
-	runHTTPRemoteSync = func(
+	runRemoteHostSync = func(
 		context.Context, config.Config, *db.DB, config.RemoteHost, bool,
 	) (remotesync.SyncStats, error) {
 		httpCalls++
 		return remotesync.SyncStats{SessionsSynced: 1}, nil
 	}
-	t.Cleanup(func() { runHTTPRemoteSync = originalHTTP })
+	t.Cleanup(func() { runRemoteHostSync = originalHTTP })
 	database := dbtest.OpenTestDB(t)
 	syncFn := remoteHostSyncFunc(
 		t.Context(), config.Config{}, database, runner,
@@ -1035,7 +1306,7 @@ func TestRemoteHostSyncFuncDispatchesHTTPTransport(t *testing.T) {
 		Machine:   "local",
 	})
 	var called config.RemoteHost
-	restore := stubHTTPRemoteSyncForTest(t, func(
+	restore := stubRemoteHostSyncForTest(t, func(
 		_ context.Context,
 		rh config.RemoteHost,
 		full bool,
@@ -1116,50 +1387,52 @@ func TestRemoteHostSyncFuncForcesFullWhenDatabaseNeedsResync(t *testing.T) {
 }
 
 func TestStartRemoteHostSync_TracksRemoteWorkForIdleReaper(t *testing.T) {
-	idleFired := make(chan struct{})
-	idleTracker := server.NewIdleTracker(20*time.Millisecond, func() {
-		close(idleFired)
-	})
-	ctx := t.Context()
+	synctest.Test(t, func(t *testing.T) {
+		idleFired := make(chan struct{})
+		idleTracker := server.NewIdleTracker(20*time.Millisecond, func() {
+			close(idleFired)
+		})
+		ctx := t.Context()
 
-	syncEntered := make(chan struct{}, 1)
-	releaseSync := make(chan struct{})
-	syncFn := func() (int, error) {
-		select {
-		case syncEntered <- struct{}{}:
-		default:
+		syncEntered := make(chan struct{}, 1)
+		releaseSync := make(chan struct{})
+		syncFn := func() (int, error) {
+			select {
+			case syncEntered <- struct{}{}:
+			default:
+			}
+			<-releaseSync
+			return 1, nil
 		}
-		<-releaseSync
-		return 1, nil
-	}
 
-	done := make(chan struct{})
-	exited := make(chan struct{})
-	go func() {
-		runRemoteHostSyncLoop(ctx, "test-host", time.Millisecond, syncFn, nil, idleTracker, done)
-		close(exited)
-	}()
+		done := make(chan struct{})
+		exited := make(chan struct{})
+		go func() {
+			runRemoteHostSyncLoop(ctx, "test-host", time.Millisecond, syncFn, nil, idleTracker, done)
+			close(exited)
+		}()
 
-	select {
-	case <-syncEntered:
-	case <-time.After(time.Second):
-		require.FailNow(t, "remote sync did not enter")
-	}
-	go idleTracker.Run(ctx)
+		select {
+		case <-syncEntered:
+		case <-time.After(time.Second):
+			require.FailNow(t, "remote sync did not enter")
+		}
+		go idleTracker.Run(ctx)
 
-	select {
-	case <-idleFired:
-		require.FailNow(t, "idle tracker fired while remote sync was active")
-	case <-time.After(80 * time.Millisecond):
-	}
+		select {
+		case <-idleFired:
+			require.FailNow(t, "idle tracker fired while remote sync was active")
+		case <-time.After(80 * time.Millisecond):
+		}
 
-	close(releaseSync)
-	close(done)
-	select {
-	case <-exited:
-	case <-time.After(time.Second):
-		require.FailNow(t, "remote sync loop did not exit")
-	}
+		close(releaseSync)
+		close(done)
+		select {
+		case <-exited:
+		case <-time.After(time.Second):
+			require.FailNow(t, "remote sync loop did not exit")
+		}
+	})
 }
 
 func TestStartRemoteHostSync_ExitsOnContextCancel(t *testing.T) {
@@ -1264,7 +1537,7 @@ func TestStartRemoteHostSync_NoEmitOnZeroSynced(t *testing.T) {
 func TestStartRemoteHostSync_NoEmitOnError(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		em := &fakeEmitter{}
-		syncFn := func() (int, error) { return 0, errors.New("ssh failure") }
+		syncFn := func() (int, error) { return 0, errors.New("remote sync failure") }
 
 		done := make(chan struct{})
 		exited := make(chan struct{})
@@ -1347,6 +1620,29 @@ func TestCollectWatchRootsWatchesHermesProfilesContainerRecursively(t *testing.T
 	assert.True(t, roots[0].recursive)
 	assert.True(t, roots[0].exists)
 	assert.Equal(t, []watchScope{{agent: parser.AgentHermes, syncDir: profilesRoot}}, roots[0].scopes)
+}
+
+func TestCollectWatchRootsCarriesAntigravityBrainDepthLimit(t *testing.T) {
+	root := t.TempDir()
+	brain := filepath.Join(root, "brain")
+	require.NoError(t, os.MkdirAll(brain, 0o755))
+	cfg := config.Config{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentAntigravity: {root},
+		},
+	}
+
+	roots, _, _, _ := collectWatchRoots(cfg)
+
+	got, ok := findCollectedWatchRoot(roots, brain)
+	require.True(t, ok, "antigravity brain root not collected")
+	assert.True(t, got.recursive)
+	assert.Equal(t, 1, got.maxDepth)
+	assert.Equal(t, []string{"*/.system_generated/logs"}, got.extraDirectories)
+	registered := got.registeredRoot()
+	assert.True(t, registered.Recursive)
+	assert.Equal(t, 1, registered.MaxDepth)
+	assert.Equal(t, []string{"*/.system_generated/logs"}, registered.ExtraDirectories)
 }
 
 func TestCollectWatchRootsUsesCoworkProviderRecursiveRoot(t *testing.T) {
@@ -3693,7 +3989,7 @@ func TestOpenCodeSQLiteOnlyRootKeepsItsPollingFallback(t *testing.T) {
 	for _, obligation := range obligations {
 		local = append(local, syncObligationToPoller(obligation))
 	}
-	scopes := availableUnwatchedPollScopes(local)
+	scopes, _ := availableUnwatchedPollScopes(local)
 	assert.Equal(t, []string{root}, scopes[parser.AgentOpenCode],
 		"degraded coverage on a SQLite-only root must still reach polling")
 }
@@ -3724,7 +4020,7 @@ func TestOpenCodeAbsentRootPollsTheConfiguredDir(t *testing.T) {
 	for _, obligation := range obligations {
 		local = append(local, syncObligationToPoller(obligation))
 	}
-	scopes := availableUnwatchedPollScopes(local)
+	scopes, _ := availableUnwatchedPollScopes(local)
 	assert.Equal(t, []string{root}, scopes[parser.AgentOpenCode],
 		"the dir must become pollable as soon as it appears")
 }
@@ -3750,4 +4046,26 @@ func TestCollectWatchRootsWatchesAliasHomeIndexes(t *testing.T) {
 	aliasRoot, ok := findCollectedWatchRoot(roots, alias)
 	require.True(t, ok, "the alias home must be watched for session_index.jsonl")
 	assert.False(t, aliasRoot.recursive)
+}
+
+func TestNoSyncRebuildNotice(t *testing.T) {
+	for _, tc := range []struct {
+		name                           string
+		noSync, archiveOnly, needsSync bool
+		want                           bool
+	}{
+		{"no-sync with stale archive", true, false, true, true},
+		{"no-sync with current archive", true, false, false, false},
+		{"syncing daemon rebuilds at startup", false, false, true, false},
+		{"archive-only rebuilds at startup", true, true, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			notice := noSyncRebuildNotice(tc.noSync, tc.archiveOnly, tc.needsSync)
+			if tc.want {
+				assert.Contains(t, notice, "Click Sync")
+			} else {
+				assert.Empty(t, notice)
+			}
+		})
+	}
 }

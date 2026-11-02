@@ -20,7 +20,12 @@ import (
 // assignment state. v16 rebuilds after SQLite data version 111 rewrote
 // stored Devin source identities; pre-111 mirrors would otherwise keep
 // serving bare ids that deduplicate across sessions.
-const SchemaVersion = 16
+// v17 adds session groups to the rebuilt mirror. v18 adds per-call tool
+// observations for effectiveness rates. v19 adds session pull request links
+// and labels. v20 adds codex-cloud plan usage and capture coverage
+// (session_plan_usage).
+// v21 adds messages.dialogue_text.
+const SchemaVersion = 21
 
 const schemaVersionMetadataKey = "agentsview_schema_version"
 
@@ -170,6 +175,7 @@ var mirrorTables = []tableSpec{
 			git_branch TEXT NOT NULL DEFAULT '',
 			source_session_id TEXT NOT NULL DEFAULT '',
 			source_version TEXT NOT NULL DEFAULT '',
+			group_key TEXT NOT NULL DEFAULT '',
 			transcript_fidelity TEXT NOT NULL DEFAULT '',
 			parser_malformed_lines INTEGER NOT NULL DEFAULT 0,
 			is_truncated BOOLEAN NOT NULL DEFAULT FALSE,
@@ -179,6 +185,8 @@ var mirrorTables = []tableSpec{
 			termination_status TEXT,
 			secret_leak_count INTEGER NOT NULL DEFAULT 0,
 			secrets_rules_version TEXT NOT NULL DEFAULT '',
+			pr_links VARCHAR NOT NULL DEFAULT '',
+			labels VARCHAR[],
 			agentsview_push_fingerprint TEXT,
 			source_archive_id TEXT NOT NULL DEFAULT ''
 		)`,
@@ -242,6 +250,7 @@ var mirrorTables = []tableSpec{
 			{"git_branch", "git_branch TEXT NOT NULL DEFAULT ''"},
 			{"source_session_id", "source_session_id TEXT NOT NULL DEFAULT ''"},
 			{"source_version", "source_version TEXT NOT NULL DEFAULT ''"},
+			{"group_key", "group_key TEXT NOT NULL DEFAULT ''"},
 			{"transcript_fidelity", "transcript_fidelity TEXT NOT NULL DEFAULT ''"},
 			{"parser_malformed_lines", "parser_malformed_lines INTEGER NOT NULL DEFAULT 0"},
 			{"is_truncated", "is_truncated BOOLEAN NOT NULL DEFAULT FALSE"},
@@ -251,6 +260,8 @@ var mirrorTables = []tableSpec{
 			{"termination_status", "termination_status TEXT"},
 			{"secret_leak_count", "secret_leak_count INTEGER NOT NULL DEFAULT 0"},
 			{"secrets_rules_version", "secrets_rules_version TEXT NOT NULL DEFAULT ''"},
+			{"pr_links", "pr_links VARCHAR NOT NULL DEFAULT ''"},
+			{"labels", "labels VARCHAR[]"},
 			{"agentsview_push_fingerprint", "agentsview_push_fingerprint TEXT"},
 			{"source_archive_id", "source_archive_id TEXT NOT NULL DEFAULT ''"},
 		},
@@ -273,6 +284,7 @@ var mirrorTables = []tableSpec{
 			role TEXT NOT NULL,
 			content TEXT NOT NULL,
 			thinking_text TEXT NOT NULL DEFAULT '',
+			dialogue_text TEXT,
 			timestamp TIMESTAMP,
 			has_thinking BOOLEAN NOT NULL DEFAULT FALSE,
 			has_tool_use BOOLEAN NOT NULL DEFAULT FALSE,
@@ -304,6 +316,7 @@ var mirrorTables = []tableSpec{
 			{"role", "role TEXT NOT NULL DEFAULT ''"},
 			{"content", "content TEXT NOT NULL DEFAULT ''"},
 			{"thinking_text", "thinking_text TEXT NOT NULL DEFAULT ''"},
+			{"dialogue_text", "dialogue_text TEXT"},
 			{"timestamp", "timestamp TIMESTAMP"},
 			{"has_thinking", "has_thinking BOOLEAN NOT NULL DEFAULT FALSE"},
 			{"has_tool_use", "has_tool_use BOOLEAN NOT NULL DEFAULT FALSE"},
@@ -375,6 +388,51 @@ var mirrorTables = []tableSpec{
 			"CREATE INDEX IF NOT EXISTS idx_usage_events_session ON usage_events(session_id)",
 			"CREATE INDEX IF NOT EXISTS idx_usage_events_occurred ON usage_events(occurred_at)",
 			"CREATE INDEX IF NOT EXISTS idx_usage_events_dedup ON usage_events(session_id, source, dedup_key)",
+		},
+	},
+	{
+		// One row per session. Times and groups stay the archive's text so
+		// every backend returns the same values. No primary key: a push
+		// deletes and reinserts the row in one transaction.
+		name: "session_plan_usage",
+		create: `CREATE TABLE IF NOT EXISTS session_plan_usage (
+			session_id TEXT NOT NULL,
+			has_plan_usage BOOLEAN NOT NULL DEFAULT FALSE,
+			data_as_of TEXT,
+			data_status TEXT NOT NULL DEFAULT '',
+			usage_source TEXT NOT NULL DEFAULT '',
+			weekly_percent DOUBLE,
+			five_hour_percent DOUBLE,
+			credits TEXT,
+			groups_json TEXT NOT NULL DEFAULT '[]',
+			is_final BOOLEAN NOT NULL DEFAULT FALSE,
+			outcome_kind TEXT NOT NULL DEFAULT '',
+			outcome_at TEXT,
+			counted_under TEXT NOT NULL DEFAULT '',
+			has_coverage BOOLEAN NOT NULL DEFAULT FALSE,
+			last_capture_at TEXT,
+			uncaptured_turns INTEGER NOT NULL DEFAULT 0
+		)`,
+		columns: []columnSpec{
+			{"session_id", "session_id TEXT NOT NULL DEFAULT ''"},
+			{"has_plan_usage", "has_plan_usage BOOLEAN NOT NULL DEFAULT FALSE"},
+			{"data_as_of", "data_as_of TEXT"},
+			{"data_status", "data_status TEXT NOT NULL DEFAULT ''"},
+			{"usage_source", "usage_source TEXT NOT NULL DEFAULT ''"},
+			{"weekly_percent", "weekly_percent DOUBLE"},
+			{"five_hour_percent", "five_hour_percent DOUBLE"},
+			{"credits", "credits TEXT"},
+			{"groups_json", "groups_json TEXT NOT NULL DEFAULT '[]'"},
+			{"is_final", "is_final BOOLEAN NOT NULL DEFAULT FALSE"},
+			{"outcome_kind", "outcome_kind TEXT NOT NULL DEFAULT ''"},
+			{"outcome_at", "outcome_at TEXT"},
+			{"counted_under", "counted_under TEXT NOT NULL DEFAULT ''"},
+			{"has_coverage", "has_coverage BOOLEAN NOT NULL DEFAULT FALSE"},
+			{"last_capture_at", "last_capture_at TEXT"},
+			{"uncaptured_turns", "uncaptured_turns INTEGER NOT NULL DEFAULT 0"},
+		},
+		indexes: []string{
+			"CREATE INDEX IF NOT EXISTS idx_session_plan_usage_session ON session_plan_usage(session_id)",
 		},
 	},
 	{
@@ -611,6 +669,9 @@ var mirrorTables = []tableSpec{
 	{
 		name: "tool_calls",
 		create: `CREATE TABLE IF NOT EXISTS tool_calls (
+			observed_outcome TEXT,
+			observed_repeat TEXT,
+			sequence_ending TEXT,
 			id BIGINT,
 			message_id BIGINT,
 			session_id TEXT NOT NULL,
@@ -626,6 +687,10 @@ var mirrorTables = []tableSpec{
 			file_path TEXT
 		)`,
 		columns: []columnSpec{
+			{"observed_outcome", "observed_outcome TEXT"},
+			{"observed_repeat", "observed_repeat TEXT"},
+			{"sequence_ending", "sequence_ending TEXT"},
+
 			{"id", "id BIGINT"},
 			{"message_id", "message_id BIGINT"},
 			{"session_id", "session_id TEXT NOT NULL DEFAULT ''"},
@@ -768,7 +833,7 @@ var mirrorTables = []tableSpec{
 }
 
 // EnsureSchema creates the DuckDB mirror schema. It has no production
-// callers: Sync.Push always goes through ProbeMirror to pick rebuildMirror
+// callers: Sync.Push always goes through ProbeMirror to pick buildMirror
 // (create-only, via createSchema) or incrementalPush against an
 // already-valid mirror, and 'duckdb serve'/'duckdb quack serve' probe
 // instead of migrating (see ProbeMirror, WatchMirrorReplacement). It is
@@ -1035,7 +1100,7 @@ func checkSchemaShapeCompat(
 			)
 		}
 		return fmt.Errorf(
-			"duckdb schema incompatible; rebuild with 'agentsview duckdb push --full'; missing: %s",
+			"duckdb schema incompatible; rebuild with 'agentsview replica duckdb push --full'; missing: %s",
 			strings.Join(missing, ", "),
 		)
 	}
@@ -1072,7 +1137,7 @@ func checkSchemaShapeCompat(
 	if got != SchemaVersion {
 		return fmt.Errorf(
 			"mirror schema version %d does not match this build's %d; "+
-				"rebuild with 'agentsview duckdb push --full'",
+				"rebuild with 'agentsview replica duckdb push --full'",
 			got, SchemaVersion,
 		)
 	}

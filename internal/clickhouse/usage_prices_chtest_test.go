@@ -289,12 +289,70 @@ func modelCost(t *testing.T, result db.DailyUsageResult, model string) money.Mon
 func TestDailyUsagePersistedPricesMatchSQLite(t *testing.T) {
 	store, _, local := newUsagePriceStore(t)
 	assertDailyUsageParity(t, local, store)
+	for _, filter := range []db.UsageFilter{{}, {Model: " , "}, {ExcludeModel: " , "}, {Model: " , ", ExcludeModel: " , "}} {
+		filter.Agent, filter.Timezone = "copilot", "UTC"
+		daily, err := store.GetDailyUsage(t.Context(), filter)
+		require.NoError(t, err)
+		assert.Equal(t, money.MustParseDollars("0.5"), daily.Totals.TotalCost)
+		top, err := store.GetTopSessionsByCost(t.Context(), filter, 10)
+		require.NoError(t, err)
+		require.Len(t, top, 1)
+		assert.Equal(t, money.MustParseDollars("0.5"), top[0].Cost)
+	}
 
 	// Only the Copilot authoritative cost stays an explicit row; every other
 	// event arrives summed.
 	stats := dailyUsageGroupRowStats(t, store, db.UsageFilter{Timezone: "UTC"})
 	assert.Equal(t, 1, stats.explicit)
 	assert.Less(t, stats.rows, stats.events)
+}
+
+// TestDailyUsageCodexAutoReviewPricesAsLuna proves the ClickHouse CASE arm and
+// the persisted price records price codex-auto-review at Luna rates, matching
+// SQLite.
+func TestDailyUsageCodexAutoReviewPricesAsLuna(t *testing.T) {
+	local, target := seedUsagePriceFixture(t)
+	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
+		ModelPattern:     pricingpkg.GPT56LunaCanonical,
+		InputPerMTok:     money.MustParseDollars("0.2"),
+		OutputPerMTok:    money.MustParseDollars("1.2"),
+		CacheReadPerMTok: money.MustParseDollars("0.02"),
+	}}))
+	ts := "2026-01-12T05:00:00.000Z"
+	tokenUsage := `{"cache_read_input_tokens":900000,"input_tokens":100000,"output_tokens":10000}`
+	var writes []db.SessionBatchWrite
+	for _, fixture := range []struct{ id, model string }{
+		{"ch-price-auto-review", pricingpkg.CodexAutoReviewModelName},
+		{"ch-price-luna", pricingpkg.GPT56LunaCanonical},
+	} {
+		session := fixtureSession(fixture.id, "gamma", fixture.id, ts, 1)
+		session.Agent = "codex"
+		writes = append(writes, db.SessionBatchWrite{
+			Session:         session,
+			Messages:        []db.Message{usagePriceMessage(fixture.id, 0, ts, fixture.model, tokenUsage)},
+			DataVersion:     1,
+			ReplaceMessages: true,
+		})
+	}
+	_, err := local.WriteSessionBatchAtomic(t.Context(), writes)
+	require.NoError(t, err)
+
+	syncer := newTestSync(t, local, target, storage.PusherOptions{})
+	_, err = syncer.Push(t.Context(), false, nil)
+	require.NoError(t, err)
+	store, err := NewStore(t.Context(), target)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	assertDailyUsageParity(t, local, store)
+
+	filter := db.UsageFilter{Timezone: "UTC", Agent: "codex", Breakdowns: true}
+	got, err := store.GetDailyUsage(t.Context(), filter)
+	require.NoError(t, err)
+	review := modelCost(t, got, pricingpkg.CodexAutoReviewModelName)
+	assert.NotZero(t, review.Microdollars, "auto-review cost")
+	assert.Equal(t, modelCost(t, got, pricingpkg.GPT56LunaCanonical), review)
+	stats := dailyUsageGroupRowStats(t, store, db.UsageFilter{Timezone: "UTC", Agent: "codex"})
+	assert.Zero(t, stats.explicit)
 }
 
 func TestDailyUsagePersistedPricesKeepRequestRounding(t *testing.T) {
@@ -481,4 +539,40 @@ func TestPushPricesCursorUsageAddedLater(t *testing.T) {
 	assertDailyUsageParity(t, local, store)
 	stats := dailyUsageGroupRowStats(t, store, db.UsageFilter{Timezone: "UTC"})
 	assert.Equal(t, 1, stats.explicit)
+}
+
+// Serve installs custom rates after it opens the store. The background
+// work it starts afterwards must price with them, even when a session
+// pushed since the last refresh makes the first prepared state load the
+// pricing catalog.
+func TestServeStoreBackgroundPricesWithCustomRates(t *testing.T) {
+	ctx := t.Context()
+	store, syncer, local := newUsagePriceStore(t)
+	t.Setenv("CACHE_DIRECTORY", t.TempDir())
+	for _, stmt := range []string{"SYSTEM WAIT VIEW prepare_usage", "SYSTEM STOP VIEW prepare_usage"} {
+		_, err := store.DB().ExecContext(ctx, stmt)
+		require.NoError(t, err, stmt)
+	}
+	appendMessage(t, local, usagePriceRoundID, "one more turn", "2026-01-13T06:00:00.000Z")
+	_, err := syncer.Push(ctx, false, nil)
+	require.NoError(t, err)
+
+	opened, err := (Backend{}).OpenServeStore(ctx, storage.ReplicaTarget{
+		URL: syncer.target.URL, Schema: syncer.target.Database,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, opened.Close()) })
+	custom := map[string]config.CustomModelRate{
+		"round-test": {InputMicrodollarsPerMTok: 5_000_000},
+	}
+	opened.SetCustomPricing(custom)
+	serve, ok := opened.(*Store)
+	require.True(t, ok)
+	serve.StartBackground(ctx)
+	state, err := serve.preparedUsageState(ctx)
+	require.NoError(t, err)
+	require.NotEmpty(t, state.changed, "the startup state must price a delta")
+
+	local.SetCustomPricing(custom)
+	assertDailyUsageParity(t, local, serve)
 }

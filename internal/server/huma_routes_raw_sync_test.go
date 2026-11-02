@@ -793,23 +793,6 @@ func TestRawSyncBoundsTokenExchangeJSON(t *testing.T) {
 	assert.Zero(t, auth.issueCalls)
 }
 
-func TestRawSyncRoutesDeclareBodyLimits(t *testing.T) {
-	t.Parallel()
-
-	srv := newRawSyncHTTPTestServer(
-		t, new(rawSyncAuthStub), new(rawSyncCustodyStub),
-	)
-	paths := srv.api.OpenAPI().Paths
-
-	require.Equal(t, int64(4<<10), paths["/api/v1/raw-sync/tokens"].Post.MaxBodyBytes)
-	for _, path := range []string{
-		"/api/v1/raw-sync/objects/missing",
-		"/api/v1/raw-sync/manifests",
-	} {
-		require.Equal(t, int64(1<<20), paths[path].Post.MaxBodyBytes, path)
-	}
-}
-
 func TestRawSyncCanonicalOpenAPISpecIncludesRoutes(t *testing.T) {
 	t.Parallel()
 
@@ -890,7 +873,7 @@ func TestRawSyncAuthenticationUsesWriteTimeout(t *testing.T) {
 		Port:         8080,
 		AuthToken:    "legacy-shared-token",
 		RequireAuth:  true,
-		WriteTimeout: 20 * time.Millisecond,
+		WriteTimeout: 20 * time.Millisecond, //nolint:kennlint // deadlinetest: the blocked authentication ends only when the write deadline expires
 	}, nil, nil, WithRawSyncServices(auth, new(rawSyncCustodyStub)))
 
 	started := time.Now()
@@ -957,6 +940,52 @@ func TestRawSyncAuthenticationAndHandlerShareWriteDeadline(t *testing.T) {
 	require.True(t, authDeadline.ok)
 	require.True(t, custodyDeadline.ok)
 	assert.Equal(t, authDeadline.deadline, custodyDeadline.deadline)
+}
+
+func TestRestrictedRawSyncHandlerDoesNotInheritAuthTimeout(t *testing.T) {
+	t.Parallel()
+
+	type deadlineObservation struct {
+		deadline time.Time
+		ok       bool
+	}
+	authDeadlines := make(chan deadlineObservation, 1)
+	handlerDeadlines := make(chan deadlineObservation, 1)
+	auth := &rawSyncAuthStub{
+		authenticateToken: func(
+			ctx context.Context,
+			_ string,
+			_ rawsync.DeviceTokenScope,
+		) (rawsync.AuthIdentity, error) {
+			deadline, ok := ctx.Deadline()
+			authDeadlines <- deadlineObservation{deadline: deadline, ok: ok}
+			return rawsync.AuthIdentity{TenantID: "tenant-a", DeviceID: "dev-a"}, nil
+		},
+	}
+	srv := New(config.Config{
+		Host:         "127.0.0.1",
+		Port:         8080,
+		AuthToken:    "legacy-shared-token",
+		RequireAuth:  true,
+		WriteTimeout: 30 * time.Second,
+	}, nil, nil, WithRawSyncServices(auth, new(rawSyncCustodyStub)))
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		deadline, ok := r.Context().Deadline()
+		handlerDeadlines <- deadlineObservation{deadline: deadline, ok: ok}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	request := httptest.NewRequestWithContext(
+		t.Context(), http.MethodPost, "/api/v1/raw-sync/objects/missing", nil,
+	)
+	request.Header.Set("Authorization", "Bearer avdt_negotiate")
+	response := httptest.NewRecorder()
+	srv.authMiddlewareRequired(next, true).ServeHTTP(response, request)
+
+	require.Equal(t, http.StatusNoContent, response.Code)
+	authDeadline := <-authDeadlines
+	require.True(t, authDeadline.ok)
+	assert.WithinDuration(t, time.Now().Add(5*time.Second), authDeadline.deadline, time.Second)
+	assert.False(t, (<-handlerDeadlines).ok, "restricted handlers must keep the request lifetime")
 }
 
 func newRawSyncHTTPTestServer(

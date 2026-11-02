@@ -21,6 +21,7 @@ import (
 	"go.kenn.io/agentsview/internal/signals"
 	"go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/timeutil"
+	"golang.org/x/sync/errgroup"
 )
 
 // directBackend implements SessionService by wrapping a db.Store
@@ -35,6 +36,7 @@ import (
 // interface (GetSessionFilePath, Reader). Structural nil checks
 // on local+engine replace runtime type assertions.
 type directBackend struct {
+	modelGroups    ModelGroups
 	db             db.Store
 	local          *db.DB
 	engine         *sync.Engine
@@ -49,15 +51,31 @@ type directBackend struct {
 // engine is nil, Sync returns db.ErrReadOnly but reads still
 // work. Use NewReadOnlyBackend for stores that are not *db.DB
 // (e.g. a PostgreSQL reader).
-func NewDirectBackend(d *db.DB, engine *sync.Engine) SessionService {
-	return &directBackend{db: d, local: d, engine: engine, evidenceSource: newEvidenceSource()}
+func NewDirectBackend(d *db.DB, engine *sync.Engine, opts ...DirectBackendOption) SessionService {
+	b := &directBackend{db: d, local: d, engine: engine, evidenceSource: newEvidenceSource()}
+	for _, opt := range opts {
+		opt(b)
+	}
+	return b
 }
 
 // NewReadOnlyBackend returns a read-only SessionService over any
 // db.Store (e.g. a PostgreSQL reader used by `pg serve`). Sync
 // returns db.ErrReadOnly unconditionally.
-func NewReadOnlyBackend(d db.Store) SessionService {
-	return &directBackend{db: d, evidenceSource: newEvidenceSource()}
+func NewReadOnlyBackend(d db.Store, opts ...DirectBackendOption) SessionService {
+	b := &directBackend{db: d, evidenceSource: newEvidenceSource()}
+	for _, opt := range opts {
+		opt(b)
+	}
+	return b
+}
+
+// DirectBackendOption configures a direct or read-only backend.
+type DirectBackendOption func(*directBackend)
+
+// WithModelGroups configures model filters and optional display grouping.
+func WithModelGroups(groups ModelGroups) DirectBackendOption {
+	return func(b *directBackend) { b.modelGroups = groups }
 }
 
 // newEvidenceSource returns a random ID for this backend instance, so a
@@ -154,7 +172,14 @@ func (b *directBackend) Get(
 		return nil, err
 	}
 	hideStaleSecretCount(s, secrets.ActiveRulesVersions())
-	return buildSessionDetail(s), nil
+	detail := buildSessionDetail(s)
+	planUsage, err := b.db.GetSessionPlanUsage(ctx, s.ID)
+	if err != nil {
+		return nil, err
+	}
+	detail.PlanUsage = planUsage.PlanUsageView()
+	detail.CaptureCoverage = planUsage.CaptureCoverageView()
+	return detail, nil
 }
 
 func (b *directBackend) FindSessionIDsByPartial(
@@ -251,6 +276,14 @@ func (b *directBackend) List(
 			f.OrderBy, err, strings.Join(db.SortKeys(), ", "),
 		)
 	}
+	pr, err := db.ParsePRFilter(f.PR)
+	if err != nil {
+		return nil, fmt.Errorf("list: %w", err)
+	}
+	f.Labels, err = db.LabelFilterValues(f.Labels)
+	if err != nil {
+		return nil, fmt.Errorf("list: %w", err)
+	}
 	// Match the HTTP handler's clampLimit semantics: values over
 	// MaxSessionLimit clamp to the max, not reset to the default.
 	if f.Limit > db.MaxSessionLimit {
@@ -261,6 +294,7 @@ func (b *directBackend) List(
 	}
 
 	filter := listFilterToDB(f)
+	filter.PR = pr
 	page, err := b.db.ListSessions(ctx, filter)
 	if err != nil {
 		return nil, err
@@ -278,6 +312,7 @@ func (b *directBackend) List(
 // transports produce identical SessionFilter values.
 func listFilterToDB(f ListFilter) db.SessionFilter {
 	filter := db.SessionFilter{
+		IDs:                  f.IDs,
 		Project:              f.Project,
 		ExcludeProject:       f.ExcludeProject,
 		Machine:              f.Machine,
@@ -292,6 +327,8 @@ func listFilterToDB(f ListFilter) db.SessionFilter {
 		MaxMessages:          f.MaxMessages,
 		MinUserMessages:      f.MinUserMessages,
 		ExcludeOneShot:       !f.IncludeOneShot,
+		OneShotFilterSet:     f.OneShotFilterSet,
+		AutomatedFilterSet:   f.AutomatedFilterSet,
 		ExcludeAutomated:     !f.IncludeAutomated,
 		IncludeChildren:      f.IncludeChildren,
 		IncludeSource:        f.IncludeSource,
@@ -300,6 +337,7 @@ func listFilterToDB(f ListFilter) db.SessionFilter {
 		MinToolFailures:      f.MinToolFailures,
 		HasSecret:            f.HasSecret,
 		Starred:              f.Starred,
+		Labels:               f.Labels,
 		SecretsRulesVersions: secrets.ActiveRulesVersions(),
 	}
 	// Parse the public sort spec into the structured, per-key form. The spec is
@@ -515,6 +553,35 @@ func (b *directBackend) ToolCalls(
 	return &ToolCallList{ToolCalls: out, Count: len(out)}, nil
 }
 
+func (b *directBackend) ChildSessions(
+	ctx context.Context, id string,
+) ([]db.Session, error) {
+	children, err := b.db.GetChildSessions(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if children == nil {
+		children = []db.Session{}
+	}
+	return children, nil
+}
+
+func (b *directBackend) RecentEdits(
+	ctx context.Context, f RecentEditsFilter,
+) (*db.RecentEditsResult, error) {
+	res, err := b.db.RecentEdits(ctx, db.RecentEditsParams{
+		Project:         f.Project,
+		Search:          f.Search,
+		Limit:           f.Limit,
+		Offset:          f.Offset,
+		MaxEditsPerFile: recentEditsPerFile,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // Sync runs a one-off sync for the file path associated with the
 // given session (or an explicit path in SyncInput.Path) and
 // returns the resulting session detail. Returns db.ErrReadOnly
@@ -534,6 +601,15 @@ func (b *directBackend) Sync(
 	}
 	if in.Subagents && in.ID == "" {
 		return nil, errors.New("sync: subagents requires id")
+	}
+	if err := ValidateUsageRefresh(in); err != nil {
+		return nil, err
+	}
+	if in.UsageRefresh {
+		if err := b.engine.TrySyncSessionWithSubagentsContext(ctx, in.ID); err != nil {
+			return nil, err
+		}
+		return b.Get(ctx, in.ID)
 	}
 	if in.Subagents {
 		if err := b.engine.SyncSessionWithSubagentsContext(
@@ -567,7 +643,7 @@ func (b *directBackend) Sync(
 			}
 			return b.Get(ctx, in.ID)
 		}
-		if _, _, ok := parser.SplitWindsurfVirtualPath(storedPath); ok {
+		if _, _, ok := parser.SplitWindsurfVirtualPath(storedPath); ok || strings.HasPrefix(storedPath, "archive://") {
 			if err := b.engine.SyncSingleSessionContext(
 				ctx, in.ID,
 			); err != nil {
@@ -874,7 +950,7 @@ func (b *directBackend) UsageSummary(
 	if err != nil {
 		return nil, err
 	}
-	f, err := BuildUsageFilter(req)
+	f, err := BuildUsageFilter(req, b.modelGroups)
 	if err != nil {
 		return nil, err
 	}
@@ -882,9 +958,27 @@ func (b *directBackend) UsageSummary(
 	if err != nil {
 		return nil, err
 	}
-	summary, err := buildUsageSummary(f, result)
+	planFilter := f
+	if req.GroupModels {
+		planFilter.ModelAliases = b.modelGroups.Aliases()
+	}
+	planUsage, err := b.db.GetPlanUsageSessionCounts(ctx, planFilter)
 	if err != nil {
 		return nil, err
+	}
+	if req.GroupModels && b.modelGroups.Configured() {
+		if err := b.modelGroups.GroupDaily(result.Daily); err != nil {
+			return nil, err
+		}
+		result.SchemaVersion = 0
+		result.Pricing = nil
+	}
+	summary, err := buildUsageSummary(f, result, planUsage)
+	if err != nil {
+		return nil, err
+	}
+	if req.GroupModels {
+		summary.ModelAliases = b.modelGroups.Aliases()
 	}
 	if parser.AgentFilterLacksPerMessageTokenData(f.Agent) &&
 		db.NoTokenData(result.Totals) {
@@ -901,6 +995,14 @@ func (b *directBackend) UsageSummary(
 	return summary, nil
 }
 
+// SessionUsage reads one session's usage through LoadSessionUsage, the
+// path `session usage` uses for direct and PostgreSQL reads.
+func (b *directBackend) SessionUsage(
+	ctx context.Context, req SessionUsageRequest,
+) (*SessionUsageReport, error) {
+	return LoadSessionUsage(ctx, b.db, req)
+}
+
 func (b *directBackend) UsagePairwiseComparison(
 	ctx context.Context, req UsagePairwiseComparisonRequest,
 ) (*UsagePairwiseComparisonResponse, error) {
@@ -909,11 +1011,80 @@ func (b *directBackend) UsagePairwiseComparison(
 	if err != nil {
 		return nil, err
 	}
-	req, err = ResolveUsagePairwiseProjectKeys(ctx, b.db, req)
+	req.UsageRequest, err = ResolveUsageProjectKeys(ctx, b.db, req.UsageRequest)
 	if err != nil {
 		return nil, err
 	}
-	leftFilter, leftEmpty, rightFilter, rightEmpty, err := BuildUsagePairwiseFilters(req)
+	base, err := BuildUsageFilter(req.UsageRequest, b.modelGroups)
+	if err != nil {
+		return nil, err
+	}
+	useDefault := req.LeftDimension == "" && req.LeftValue == "" && req.RightDimension == "" && req.RightValue == ""
+	if req.FallbackToDefault && !useDefault {
+		if err := validatePairwiseDimension(req.LeftDimension, req.LeftValue, "left"); err != nil {
+			return nil, err
+		}
+		if err := validatePairwiseDimension(req.RightDimension, req.RightValue, "right"); err != nil {
+			return nil, err
+		}
+	}
+	if useDefault || req.FallbackToDefault {
+		left, right := req.LeftValue, req.RightValue
+		if req.LeftDimension == "model" {
+			left = b.modelGroups.Expand(left)
+		}
+		if req.RightDimension == "model" {
+			right = b.modelGroups.Expand(right)
+		}
+		rankingFilter := base
+		rankingFilter.Breakdowns = true
+		rankingFilter.SkipSessionCounts = true
+		rankingResult, err := b.db.GetDailyUsage(ctx, rankingFilter)
+		if err != nil {
+			return nil, err
+		}
+		rankingPlanUsage, err := b.db.GetPlanUsageSessionCounts(ctx, rankingFilter)
+		if err != nil {
+			return nil, err
+		}
+		summary, err := buildUsageSummary(rankingFilter, rankingResult, rankingPlanUsage)
+		if err != nil {
+			return nil, err
+		}
+		useDefault = useDefault || !usagePairwiseSideInRanking(summary, req.LeftDimension, left, b.modelGroups.Configured()) || !usagePairwiseSideInRanking(summary, req.RightDimension, right, b.modelGroups.Configured())
+		if useDefault {
+			if req.GroupModels && b.modelGroups.Configured() {
+				if err := b.modelGroups.GroupDaily(rankingResult.Daily); err != nil {
+					return nil, err
+				}
+				summary.ModelTotals, err = foldModelTotals(rankingResult.Daily, nil)
+				if err != nil {
+					return nil, err
+				}
+			}
+			req.LeftDimension, req.LeftValue, req.RightDimension, req.RightValue = defaultUsagePairwiseSelection(summary)
+		}
+		if req.LeftDimension == "" {
+			out, err := BuildUsagePairwiseComparisonResult(db.DailyUsageResult{}, db.DailyUsageResult{})
+			return &out, err
+		}
+	}
+	req.LeftProjectLabels, err = resolvePairwiseProjectLabels(ctx, b.db, req.LeftDimension, req.LeftValue)
+	if err != nil {
+		return nil, err
+	}
+	req.RightProjectLabels, err = resolvePairwiseProjectLabels(ctx, b.db, req.RightDimension, req.RightValue)
+	if err != nil {
+		return nil, err
+	}
+	query := req
+	if query.LeftDimension == "model" {
+		query.LeftValue = b.modelGroups.Expand(query.LeftValue)
+	}
+	if query.RightDimension == "model" {
+		query.RightValue = b.modelGroups.Expand(query.RightValue)
+	}
+	leftFilter, leftEmpty, rightFilter, rightEmpty, err := buildUsagePairwiseFilters(query, base)
 	if err != nil {
 		return nil, err
 	}
@@ -923,24 +1094,32 @@ func (b *directBackend) UsagePairwiseComparison(
 	rightFilter.SkipSessionCounts = false
 
 	var leftResult db.DailyUsageResult
-	if !leftEmpty {
-		leftResult, err = b.db.GetDailyUsage(ctx, leftFilter)
-		if err != nil {
-			return nil, err
-		}
-	}
 	var rightResult db.DailyUsageResult
+	group, groupCtx := errgroup.WithContext(ctx)
+	if !leftEmpty {
+		group.Go(func() error {
+			var readErr error
+			leftResult, readErr = b.db.GetDailyUsage(groupCtx, leftFilter)
+			return readErr
+		})
+	}
 	if !rightEmpty {
-		rightResult, err = b.db.GetDailyUsage(ctx, rightFilter)
-		if err != nil {
-			return nil, err
-		}
+		group.Go(func() error {
+			var readErr error
+			rightResult, readErr = b.db.GetDailyUsage(groupCtx, rightFilter)
+			return readErr
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return nil, err
 	}
 
 	out, err := BuildUsagePairwiseComparisonResult(leftResult, rightResult)
 	if err != nil {
 		return nil, err
 	}
+	out.Left.Dimension, out.Left.Value = req.LeftDimension, req.LeftValue
+	out.Right.Dimension, out.Right.Value = req.RightDimension, req.RightValue
 	return &out, nil
 }
 
@@ -958,6 +1137,14 @@ const maxContentSearchContext = 10
 func (b *directBackend) SearchContent(
 	ctx context.Context, req ContentSearchRequest,
 ) (*ContentSearchResult, error) {
+	var excludeActiveSince time.Time
+	if req.ExcludeActiveSince != "" {
+		var err error
+		excludeActiveSince, err = time.Parse(time.RFC3339, req.ExcludeActiveSince)
+		if err != nil || excludeActiveSince.IsZero() {
+			return nil, &db.SearchInputError{Msg: "search: invalid exclude_active_since: use RFC3339"}
+		}
+	}
 	if req.Mode == "fts" || req.Mode == "terms" {
 		for _, s := range req.Sources {
 			if s != "messages" {
@@ -986,27 +1173,28 @@ func (b *directBackend) SearchContent(
 		return nil, err
 	}
 	page, err := b.db.SearchContent(ctx, db.ContentSearchFilter{
-		Pattern:           req.Pattern,
-		Mode:              req.Mode,
-		Sources:           req.Sources,
-		ExcludeSystem:     req.ExcludeSystem,
-		Project:           req.Project,
-		ExcludeProject:    req.ExcludeProject,
-		Machine:           req.Machine,
-		GitBranch:         req.GitBranch,
-		SessionID:         req.SessionID,
-		GitBranchExact:    req.GitBranchExact,
-		Agent:             req.Agent,
-		Date:              req.Date,
-		DateFrom:          req.DateFrom,
-		DateTo:            req.DateTo,
-		Timezone:          req.Timezone,
-		ActiveSince:       req.ActiveSince,
-		IncludeChildren:   req.IncludeChildren,
-		IncludeAutomated:  req.IncludeAutomated,
-		IncludeOneShot:    req.IncludeOneShot,
-		ExcludeSessionIDs: req.ExcludeSessionIDs,
-		Scope:             req.Scope,
+		Pattern:            req.Pattern,
+		Mode:               req.Mode,
+		Sources:            req.Sources,
+		ExcludeSystem:      req.ExcludeSystem,
+		Project:            req.Project,
+		ExcludeProject:     req.ExcludeProject,
+		Machine:            req.Machine,
+		GitBranch:          req.GitBranch,
+		SessionID:          req.SessionID,
+		GitBranchExact:     req.GitBranchExact,
+		Agent:              req.Agent,
+		Date:               req.Date,
+		DateFrom:           req.DateFrom,
+		DateTo:             req.DateTo,
+		Timezone:           req.Timezone,
+		ActiveSince:        req.ActiveSince,
+		ExcludeActiveSince: excludeActiveSince,
+		IncludeChildren:    req.IncludeChildren,
+		IncludeAutomated:   req.IncludeAutomated,
+		IncludeOneShot:     req.IncludeOneShot,
+		ExcludeSessionIDs:  req.ExcludeSessionIDs,
+		Scope:              req.Scope,
 		// The store builds snippets from the full source field and redacts
 		// secrets (including ones straddling the snippet window) unless reveal
 		// is set. Redacting the pre-truncated snippet here would miss those.
@@ -1043,10 +1231,11 @@ func (b *directBackend) SearchContent(
 		}
 	}
 	return &ContentSearchResult{
-		Matches:       page.Matches,
-		NextCursor:    page.NextCursor,
-		RevisionBound: revisionBound,
-		Coverage:      coverage,
+		ActiveFilterApplied: !excludeActiveSince.IsZero(),
+		Matches:             page.Matches,
+		NextCursor:          page.NextCursor,
+		RevisionBound:       revisionBound,
+		Coverage:            coverage,
 	}, nil
 }
 
@@ -1342,19 +1531,39 @@ func (b *directBackend) Stats(
 	if err != nil {
 		return nil, err
 	}
-	stats.CodeAttribution = collectCodeAttribution(ctx, f, stats)
+	archiveOnly, err := b.local.IsArchiveOnly(ctx)
+	if err != nil {
+		return nil, err
+	}
+	stats.CodeAttribution = collectCodeAttribution(ctx, f, stats, archiveOnly)
 	return stats, nil
 }
 
 func collectCodeAttribution(ctx context.Context,
 	f StatsFilter,
 	stats *SessionStats,
+	archiveOnly bool,
 ) *db.CodeAttribution {
 	if stats == nil {
 		return nil
 	}
 	sources := []db.CodeAttributionSource{}
-	if source, ok := collectCursorAttribution(ctx, f, stats); ok {
+	if archiveOnly {
+		for _, outcome := range []struct {
+			provider  string
+			requested bool
+		}{
+			{"git", f.IncludeGitOutcomes}, {"github", f.IncludeGitHubOutcomes},
+		} {
+			if outcome.requested {
+				sources = append(sources, db.CodeAttributionSource{
+					Provider: outcome.provider, Scope: "machine_local", Status: "unavailable",
+					Warnings: []string{outcome.provider + " outcomes are unavailable in an archive-only database"},
+				})
+			}
+		}
+	}
+	if source, ok := collectCursorAttribution(ctx, f, stats, archiveOnly); ok {
 		sources = append(sources, source)
 	}
 	if len(sources) == 0 {
@@ -1375,8 +1584,13 @@ func collectCodeAttribution(ctx context.Context,
 func collectCursorAttribution(ctx context.Context,
 	f StatsFilter,
 	stats *SessionStats,
+	archiveOnly bool,
 ) (db.CodeAttributionSource, bool) {
-	switch cursorAttributionDecision(f) {
+	decision := cursorAttributionDecision(f)
+	if archiveOnly && decision != cursorAttributionSkip {
+		return cursorAttributionSource("unavailable", "Cursor attribution is unavailable in an archive-only database"), true
+	}
+	switch decision {
 	case cursorAttributionSkip:
 		return db.CodeAttributionSource{}, false
 	case cursorAttributionUnsupportedProjectFilter:

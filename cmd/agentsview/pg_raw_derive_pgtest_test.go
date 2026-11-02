@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
@@ -62,7 +63,7 @@ func TestHostedRuntimePreparationOffRetainsPublicReads(t *testing.T) {
 	cfg, _ := hostedRuntimeConfig(t)
 	// An occupied custody path makes any eager repository open fail decisively.
 	require.NoError(t, os.WriteFile(filepath.Join(cfg.DataDir, pgRawSyncDataDirectory), []byte("occupied"), 0600))
-	startup, err := prepareReplicaServeImpl(pgReplica{}, cfg, "")
+	startup, err := prepareReplicaServeImpl(pgReplica{}, cfg, "", nil)
 	require.NoError(t, err)
 	require.Nil(t, startup.startWorker)
 	startup.cleanup()
@@ -73,9 +74,57 @@ func TestHostedRuntimePreparationOffRetainsPublicReads(t *testing.T) {
 	_, ok := store.(*postgres.HostedStore)
 	require.True(t, ok)
 	cfg.PG.RawTenant = ""
-	_, err = prepareReplicaServeImpl(pgReplica{}, cfg, "")
+	_, err = prepareReplicaServeImpl(pgReplica{}, cfg, "", nil)
 	require.ErrorContains(t, err, "raw_tenant")
 }
+
+func TestHostedRuntimeHealthRequiresStatusToken(t *testing.T) {
+	cfg, admin := hostedRuntimeConfig(t)
+	authStore, err := postgres.NewTenantRawDeviceAuthStore(admin, cfg.PG.RawTenant)
+	require.NoError(t, err)
+	auth, err := rawsync.NewDeviceAuthService(authStore, time.Minute)
+	require.NoError(t, err)
+	device, err := auth.EnrollDevice(t.Context(), cfg.PG.RawTenant, "synthetic device")
+	require.NoError(t, err)
+	statusToken, err := auth.IssueToken(t.Context(), device.Identity.DeviceID, device.Credential, rawsync.ScopeStatus)
+	require.NoError(t, err)
+	uploadToken, err := auth.IssueToken(t.Context(), device.Identity.DeviceID, device.Credential, rawsync.ScopeUpload)
+	require.NoError(t, err)
+	startup, err := prepareReplicaServeImpl(pgReplica{}, cfg, "", nil)
+	require.NoError(t, err)
+	t.Cleanup(startup.cleanup)
+
+	for _, tc := range []struct {
+		name, token, query string
+		wantStatus         int
+	}{
+		{"status", statusToken.Token, "max_attempts=5&stale_after_seconds=3600", http.StatusOK},
+		{"upload", uploadToken.Token, "max_attempts=5&stale_after_seconds=3600", http.StatusUnauthorized},
+		{"viewer", cfg.AuthToken, "max_attempts=5&stale_after_seconds=3600", http.StatusUnauthorized},
+		{"anonymous", "", "max_attempts=5&stale_after_seconds=3600", http.StatusUnauthorized},
+		{"overflow attempts", statusToken.Token, "max_attempts=4294967297&stale_after_seconds=3600", http.StatusBadRequest},
+		{"zero attempts", statusToken.Token, "max_attempts=0&stale_after_seconds=3600", http.StatusBadRequest},
+		{"negative window", statusToken.Token, "max_attempts=5&stale_after_seconds=-1", http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := httptest.NewRequestWithContext(t.Context(), http.MethodGet,
+				"http://127.0.0.1/api/v1/raw-sync/health?"+tc.query, nil)
+			if tc.token != "" {
+				request.Header.Set("Authorization", "Bearer "+tc.token)
+			}
+			response := httptest.NewRecorder()
+			startup.srv.Handler().ServeHTTP(response, request)
+			require.Equal(t, tc.wantStatus, response.Code, response.Body.String())
+			if tc.wantStatus == http.StatusOK {
+				var report rawsync.JobHealthReport
+				require.NoError(t, json.Unmarshal(response.Body.Bytes(), &report))
+				assert.EqualValues(t, 5, report.MaxAttempts)
+				assert.EqualValues(t, 3600, report.StaleAfterSeconds)
+			}
+		})
+	}
+}
+
 func TestHostedRuntimePreparationSandboxAndIdle(t *testing.T) {
 	cfg, _ := hostedRuntimeConfig(t)
 	cfg.PG.RawDerivation = true
@@ -86,7 +135,7 @@ func TestHostedRuntimePreparationSandboxAndIdle(t *testing.T) {
 		t.Fatal("mandatory sandbox unavailable")
 	}
 	require.NoError(t, os.WriteFile(filepath.Join(cfg.DataDir, pgRawSyncDataDirectory), []byte("occupied"), 0600))
-	startup, err := prepareReplicaServeImpl(pgReplica{}, cfg, "")
+	startup, err := prepareReplicaServeImpl(pgReplica{}, cfg, "", nil)
 	if !supported {
 		require.ErrorIs(t, err, rawderive.ErrSandboxUnavailable)
 		return
@@ -114,7 +163,7 @@ func TestHostedRuntimeDerivesAcceptedSource(t *testing.T) {
 	cfg, _ := hostedRuntimeConfig(t)
 	cfg.PG.RawDerivation = true
 	cfg.PG.RawPollSeconds = 1
-	startup, err := prepareReplicaServeImpl(pgReplica{}, cfg, "")
+	startup, err := prepareReplicaServeImpl(pgReplica{}, cfg, "", nil)
 	require.NoError(t, err)
 	defer startup.cleanup()
 	database, err := postgres.OpenHosted(cfg.PG.URL, cfg.PG.Schema, cfg.PG.RawTenant, false)
@@ -197,7 +246,7 @@ func TestHostedRuntimeRejectsMissingPublicationPrivilegesBeforeReadiness(t *test
 	endpoint, err := url.Parse(cfg.PG.URL)
 	require.NoError(t, err)
 	role := endpoint.User.Username()
-	control, err := prepareReplicaServeImpl(pgReplica{}, cfg, "")
+	control, err := prepareReplicaServeImpl(pgReplica{}, cfg, "", nil)
 	require.NoError(t, err)
 	control.cleanup()
 	cfg.PG.RawDerivation = true
@@ -212,7 +261,7 @@ func TestHostedRuntimeRejectsMissingPublicationPrivilegesBeforeReadiness(t *test
 				_, err := admin.Exec(`GRANT ` + tc.privilege + ` ON ` + tc.kind + ` "` + tc.object + `" TO "` + role + `"`)
 				require.NoError(t, err)
 			}()
-			startup, err := prepareReplicaServeImpl(pgReplica{}, cfg, "")
+			startup, err := prepareReplicaServeImpl(pgReplica{}, cfg, "", nil)
 			if err == nil {
 				startup.cleanup()
 			}

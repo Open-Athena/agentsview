@@ -16,8 +16,6 @@ import (
 	"go.kenn.io/agentsview/internal/export"
 )
 
-const sessionExportCursorResetExitCode = 4
-
 type exportSessionsFormat string
 
 func (f *exportSessionsFormat) String() string { return string(*f) }
@@ -124,7 +122,7 @@ func newExportStatusCommand() *cobra.Command {
 		Args:         cobra.NoArgs,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			appCfg, err := config.LoadPFlags(cmd.Flags())
+			appCfg, err := config.LoadPFlagsFor(cmd.Flags(), config.ScopeLocal)
 			if err != nil {
 				return fmt.Errorf("loading config: %w", err)
 			}
@@ -203,7 +201,7 @@ func newExportSessionsCommand() *cobra.Command {
 	flags.StringVar(&cfg.ExcludeProject, "exclude-project", "",
 		"Exclude sessions from the given project")
 	flags.StringVar(&cfg.Machine, "machine", "",
-		"Filter by machine name")
+		machineFilterHelp)
 	flags.StringVar(&cfg.GitBranch, "git-branch", "",
 		"Filter by project/branch token")
 	flags.StringVar(&cfg.Agent, "agent", "",
@@ -262,7 +260,7 @@ func runExportSessions(cmd *cobra.Command, cfg exportSessionsConfig) error {
 			"--limit must be between 1 and %d", db.MaxSessionLimit)
 	}
 
-	appCfg, err := config.LoadPFlags(cmd.Flags())
+	appCfg, err := config.LoadPFlagsFor(cmd.Flags(), config.ScopeLocal)
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}

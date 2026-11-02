@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json/v2"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -18,10 +19,17 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// uuidRe matches a standard UUID (8-4-4-4-12 hex) at the end of a rollout filename stem.
+const codexUUIDPattern = `[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-` +
+	`[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`
+
+// uuidRe matches the session key that ends a rollout filename stem: the thread
+// UUID, or <thread>_<rollout> for a file Codex thread/revert wrote.
 var uuidRe = regexp.MustCompile(
-	`^rollout-.*-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-` +
-		`[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$`,
+	`^rollout-.*-(` + codexUUIDPattern + `(?:_` + codexUUIDPattern + `)?)$`,
+)
+
+var codexRevertPageKeyRe = regexp.MustCompile(
+	`^(` + codexUUIDPattern + `)_` + codexUUIDPattern + `$`,
 )
 
 const (
@@ -771,19 +779,44 @@ func claudeFindSourceFile(
 	return ""
 }
 
+// isCodexSessionFilename reports whether name is a Codex rollout, plain
+// (.jsonl) or compressed by Codex (.jsonl.zst); both forms name one session.
 func isCodexSessionFilename(name string) bool {
-	return strings.HasPrefix(name, "rollout-") &&
-		strings.HasSuffix(name, ".jsonl")
+	return strings.HasPrefix(name, "rollout-") && hasCodexRolloutSuffix(name)
 }
 
-// CodexSessionUUIDFromFilename extracts the canonical session UUID
-// from a Codex rollout filename. Returns "" when the filename does
-// not match Codex session naming.
+// CodexSessionUUIDFromFilename extracts the session key from a Codex
+// rollout filename: the thread UUID, or <thread>_<rollout> for a file
+// Codex thread/revert wrote. Returns "" when the filename does not
+// match Codex session naming.
 func CodexSessionUUIDFromFilename(name string) string {
 	if !isCodexSessionFilename(name) {
 		return ""
 	}
 	return extractUUIDFromRollout(name)
+}
+
+// CodexSessionUUIDFromPath is CodexSessionUUIDFromFilename for a stored session
+// path. A foreign raw-archive session stores "archive://<root>/<escaped key>",
+// so the file name sits inside the escaped last segment.
+func CodexSessionUUIDFromPath(path string) string {
+	if rest, ok := strings.CutPrefix(path, "archive://"); ok {
+		if _, after, found := strings.CutLast(rest, "/"); found {
+			if unescaped, err := url.PathUnescape(after); err == nil {
+				path = unescaped
+			}
+		}
+	}
+	return CodexSessionUUIDFromFilename(path[strings.LastIndexAny(path, `/\`)+1:])
+}
+
+// CodexThreadIDFromSessionKey returns the thread UUID of a revert page key
+// (<thread>_<rollout>) and returns any other key unchanged.
+func CodexThreadIDFromSessionKey(key string) string {
+	if m := codexRevertPageKeyRe.FindStringSubmatch(key); m != nil {
+		return m[1]
+	}
+	return key
 }
 
 // CodexLayout reports which on-disk layout a Codex session path uses.
@@ -809,7 +842,7 @@ func CodexSessionPathInfo(root, path string) (CodexLayout, string, bool) {
 	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+sep) {
 		return CodexLayoutUnknown, "", false
 	}
-	if !strings.HasSuffix(path, ".jsonl") {
+	if !hasCodexRolloutSuffix(path) {
 		return CodexLayoutUnknown, "", false
 	}
 	parts := strings.Split(rel, sep)
@@ -874,11 +907,12 @@ func walkCodexDayDirs(
 	}
 }
 
-// extractUUIDFromRollout extracts the UUID from a Codex filename
-// like rollout-{timestamp}-{uuid}.jsonl using regex matching on the
-// standard 8-4-4-4-12 hex format.
+// extractUUIDFromRollout extracts the session key from a Codex filename
+// like rollout-{timestamp}-{uuid}.jsonl or its compressed .jsonl.zst form:
+// the thread UUID, or {thread}_{rollout} for a file Codex thread/revert
+// wrote.
 func extractUUIDFromRollout(filename string) string {
-	stem := strings.TrimSuffix(filename, ".jsonl")
+	stem := codexRolloutStem(filename)
 	match := uuidRe.FindStringSubmatch(stem)
 	if len(match) < 2 {
 		return ""

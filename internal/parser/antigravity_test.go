@@ -19,6 +19,40 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestAntigravityCLIUserRequestContent(t *testing.T) {
+	tests := []struct {
+		name, content, want string
+		assistant           bool
+	}{
+		{name: "plain", content: "  Keep my spacing\n", want: "  Keep my spacing\n"},
+		{name: "missing closing tag", content: "<USER_REQUEST>unfinished", want: "<USER_REQUEST>unfinished"},
+		{name: "complete", content: "<USER_REQUEST>\nFirst line\nSecond line\n</USER_REQUEST><ADDITIONAL_METADATA>context</ADDITIONAL_METADATA>", want: "First line\nSecond line"},
+		{name: "request whitespace", content: "<USER_REQUEST>\n\n    code  \n\n</USER_REQUEST><ADDITIONAL_METADATA>context</ADDITIONAL_METADATA>", want: "\n    code  \n"},
+		{name: "bare literal wrapper", content: "<USER_REQUEST>Prompt</USER_REQUEST>", want: "<USER_REQUEST>Prompt</USER_REQUEST>"},
+		{name: "nested literal tags", content: "<USER_REQUEST>Explain <USER_REQUEST>hello</USER_REQUEST> tags.</USER_REQUEST><ADDITIONAL_METADATA>context</ADDITIONAL_METADATA>", want: "Explain <USER_REQUEST>hello</USER_REQUEST> tags."},
+		{name: "closing tag in metadata", content: "<USER_REQUEST>Prompt</USER_REQUEST><ADDITIONAL_METADATA>Describe </USER_REQUEST> here.</ADDITIONAL_METADATA>", want: "Prompt"},
+		{name: "CRLF and settings", content: " \r\n<USER_REQUEST>\r\nPrompt\r\n</USER_REQUEST>\r\n<ADDITIONAL_METADATA>context</ADDITIONAL_METADATA>\r\n<USER_SETTINGS_CHANGE>setting</USER_SETTINGS_CHANGE>\r\n", want: "Prompt"},
+		{name: "unknown tail", content: "<USER_REQUEST>Prompt</USER_REQUEST><OTHER>context</OTHER>", want: "<USER_REQUEST>Prompt</USER_REQUEST><OTHER>context</OTHER>"},
+		{name: "trailing prose", content: "<USER_REQUEST>Prompt</USER_REQUEST><ADDITIONAL_METADATA>context</ADDITIONAL_METADATA>prose", want: "<USER_REQUEST>Prompt</USER_REQUEST><ADDITIONAL_METADATA>context</ADDITIONAL_METADATA>prose"},
+		{name: "incomplete metadata", content: "<USER_REQUEST>Prompt</USER_REQUEST><ADDITIONAL_METADATA>context", want: "<USER_REQUEST>Prompt</USER_REQUEST><ADDITIONAL_METADATA>context"},
+		{name: "incomplete settings", content: "<USER_REQUEST>Prompt</USER_REQUEST><ADDITIONAL_METADATA>context</ADDITIONAL_METADATA><USER_SETTINGS_CHANGE>setting", want: "<USER_REQUEST>Prompt</USER_REQUEST><ADDITIONAL_METADATA>context</ADDITIONAL_METADATA><USER_SETTINGS_CHANGE>setting"},
+		{name: "empty request", content: "<USER_REQUEST> \n</USER_REQUEST><ADDITIONAL_METADATA>context</ADDITIONAL_METADATA>", want: "<USER_REQUEST> \n</USER_REQUEST><ADDITIONAL_METADATA>context</ADDITIONAL_METADATA>"},
+		{name: "mid-text literal tags", content: "Explain <USER_REQUEST>Prompt</USER_REQUEST> tags.", want: "Explain <USER_REQUEST>Prompt</USER_REQUEST> tags."},
+		{name: "assistant", content: "<USER_REQUEST>quoted prompt</USER_REQUEST><ADDITIONAL_METADATA>context</ADDITIONAL_METADATA>", want: "<USER_REQUEST>quoted prompt</USER_REQUEST><ADDITIONAL_METADATA>context</ADDITIONAL_METADATA>", assistant: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.assistant {
+				msg := ParsedMessage{Role: RoleAssistant, Content: tc.content}
+				normalizeAntigravityCLIUserMessage(&msg, nil)
+				assert.Equal(t, tc.want, msg.Content)
+				return
+			}
+			assert.Equal(t, tc.want, extractAntigravityCLIUserRequest(tc.content))
+		})
+	}
+}
+
 // newAntigravityTestProvider builds a concrete antigravityProvider for the given
 // roots so package tests can exercise the folded discovery, source-lookup, and
 // parse behavior directly through provider methods.
@@ -670,26 +704,58 @@ func createAntigravityOvershortPromptDB(t *testing.T, path string) {
 		0, 14, userPayload)
 }
 
-func TestAntigravityCLIDBFileInfoIncludesSQLiteSidecars(t *testing.T) {
+// TestAntigravityCLIDBFileInfoIncludesWALButNotSHM pins the SQLite
+// sidecar set: the -wal carries committed writes and counts, while the
+// -shm index is rewritten by readers (including the parse itself) and must
+// not move the effective size or mtime.
+func TestAntigravityCLIDBFileInfoIncludesWALButNotSHM(t *testing.T) {
 	root := t.TempDir()
 	id := "44444444-5555-6666-7777-888888888888"
 
 	mustMkdir(t, filepath.Join(root, "conversations"))
 	dbPath := filepath.Join(root, "conversations", id+".db")
 	mustWrite(t, dbPath, []byte("db"))
-	mustWrite(t, dbPath+"-wal", []byte("wal"))
+	mustWrite(t, dbPath+"-wal", []byte(walWithFramesFixture))
 	mustWrite(t, dbPath+"-shm", []byte("shm"))
 
 	early := time.Unix(1779000000, 0)
 	late := time.Unix(1779000300, 0)
+	latest := time.Unix(1779000600, 0)
 	require.NoError(t, os.Chtimes(dbPath, early, early))
 	require.NoError(t, os.Chtimes(dbPath+"-wal", late, late))
-	require.NoError(t, os.Chtimes(dbPath+"-shm", early, early))
+	require.NoError(t, os.Chtimes(dbPath+"-shm", latest, latest))
 
 	info, err := AntigravityCLIFileInfo(dbPath)
 	require.NoError(t, err)
-	assert.Equal(t, int64(len("dbwalshm")), info.Size())
+	assert.Equal(t, int64(len("db")+len(walWithFramesFixture)), info.Size())
 	assert.Equal(t, late.UnixNano(), info.ModTime().UnixNano())
+}
+
+// TestAntigravityCLIDBFileInfoIgnoresFramelessWAL pins that the empty WAL a
+// read connection leaves behind moves neither the effective size nor mtime.
+func TestAntigravityCLIDBFileInfoIgnoresFramelessWAL(t *testing.T) {
+	root := t.TempDir()
+	id := "55555555-6666-7777-8888-999999999999"
+	mustMkdir(t, filepath.Join(root, "conversations"))
+	dbPath := filepath.Join(root, "conversations", id+".db")
+	mustWrite(t, dbPath, []byte("db"))
+	early := time.Unix(1779000000, 0)
+	require.NoError(t, os.Chtimes(dbPath, early, early))
+	before, err := AntigravityCLIFileInfo(dbPath)
+	require.NoError(t, err)
+
+	mustWrite(t, dbPath+"-wal", make([]byte, 32))
+	late := time.Unix(1779000300, 0)
+	require.NoError(t, os.Chtimes(dbPath+"-wal", late, late))
+	after, err := AntigravityCLIFileInfo(dbPath)
+	require.NoError(t, err)
+	assert.Equal(t, before.Size(), after.Size())
+	assert.Equal(t, before.ModTime(), after.ModTime())
+	hashBefore, err := antigravityCompositeHash(dbPath)
+	require.NoError(t, err)
+	hashAfter, err := antigravityCompositeHash(dbPath, dbPath+"-wal")
+	require.NoError(t, err)
+	assert.Equal(t, hashBefore, hashAfter)
 }
 
 func TestAntigravityCLIFileInfoIncludesHistoryForLegacySync(t *testing.T) {
@@ -1145,18 +1211,6 @@ func TestMergeAntigravityDBHistoryMessagesIgnoresBlankHistoryRows(t *testing.T) 
 	assert.Equal(t, "history prompt", got[0].Content)
 	assert.Equal(t, len("history prompt"), got[0].ContentLength)
 	assert.Equal(t, ts, got[0].Timestamp)
-}
-
-// ---- crypto: key loading --------------------------------------
-
-func TestAntigravityKeyMissing(t *testing.T) {
-	// loadAntigravityKey memoizes via sync.Once, so we test the
-	// observable behavior via hasAntigravityKey on a process
-	// without the env var. Set+unset to be explicit.
-	t.Setenv("ANTIGRAVITY_KEY", "")
-	// Cannot reset sync.Once without restructuring the source.
-	// At minimum verify hasAntigravityKey doesn't panic.
-	_ = hasAntigravityKey()
 }
 
 // ---- crypto: cipher round-trips -------------------------------
@@ -2812,18 +2866,19 @@ func TestAntigravitySessionFileMetadataIncludesWAL(t *testing.T) {
 	require.NoError(t, err)
 
 	walPath := dbPath + "-wal"
-	mustWrite(t, walPath, []byte("wal bytes"))
+	mustWrite(t, walPath, []byte(walWithFramesFixture))
 	walTime := mainInfo.ModTime().Add(5 * time.Second)
 	require.NoError(t, os.Chtimes(walPath, walTime, walTime))
 
 	sess, _, _, err := parseAntigravityTestSession(t, dbPath, "p", "m")
 	require.NoError(t, err)
 
-	// The parse's own read-only open can create or touch -shm/-wal
-	// siblings, so the expected composite comes from post-parse disk
-	// state - the same state the next sync's skip check will stat.
+	// The parse's own read-only open can create or touch the -wal
+	// sibling, so the expected composite comes from post-parse disk
+	// state - the same state the next sync's skip check will stat. The
+	// -shm index is deliberately not part of the composite.
 	var wantSize int64
-	for _, p := range []string{dbPath, walPath, dbPath + "-shm"} {
+	for _, p := range []string{dbPath, walPath} {
 		fi, statErr := os.Stat(p)
 		if statErr != nil {
 			continue
@@ -2833,7 +2888,7 @@ func TestAntigravitySessionFileMetadataIncludesWAL(t *testing.T) {
 	require.Greater(t, wantSize, mainInfo.Size(),
 		"setup: WAL sidecar must contribute to the composite")
 	assert.Equal(t, wantSize, sess.File.Size,
-		"file size must include WAL/SHM sidecars")
+		"file size must include the WAL sidecar")
 	assert.Equal(t, walTime.UnixNano(), sess.File.Mtime,
 		"file mtime must reflect the newest sidecar")
 }

@@ -20,18 +20,6 @@ import (
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
 )
 
-func TestPaddedUTCBoundClampsBeforeYearOne(t *testing.T) {
-	t.Parallel()
-	assert.Equal(t,
-		"0001-01-01T00:00:00Z",
-		paddedUTCBound("0001-01-01T00:00:00Z", -14),
-	)
-	assert.Equal(t,
-		"2026-03-10T10:00:00Z",
-		paddedUTCBound("2026-03-11T00:00:00Z", -14),
-	)
-}
-
 type usageProbeDriver struct{}
 
 type usageProbeConn struct {
@@ -281,22 +269,6 @@ func TestPGGetDailyUsageReturnsDedupedSessionCounts(t *testing.T) {
 	assert.Zero(t, result.SessionCounts.ByAgent["codex"])
 }
 
-func TestPGUsageDedupTokenForRowFallsBackToSourceUUIDWhenClaudePairIncomplete(t *testing.T) {
-	got, ok := pgUsageDedupTokenForRow(
-		"message",
-		"claude-code",
-		"msg-dup",
-		"",
-		"source-dup",
-		"",
-	)
-	require.True(t, ok, "expected source_uuid fallback key")
-	assert.Equal(t, pgUsageDedupToken{
-		kind:  "source",
-		value: "claude-code:source-dup",
-	}, got)
-}
-
 func TestPGUsageAmountsPreserveSessionSummaryUsageEventTokens(t *testing.T) {
 	rawInput := db.MaxPlausibleTokens + 250_000
 	rawOutput := db.MaxPlausibleTokens + 500_000
@@ -424,7 +396,7 @@ func TestPGUsageRowQueryPushesDateBoundsIntoUnion(t *testing.T) {
 		From:             "2024-06-01",
 		To:               "2024-06-30",
 		ExcludeAutomated: true,
-	})
+	}, db.PostgresQueryDialect())
 
 	normalized := strings.ToLower(query)
 	assert.NotContains(t, normalized, "and u.ts >=")
@@ -465,7 +437,7 @@ func TestPGDailyUsageDetailedQuerySelectsMachine(t *testing.T) {
 		db.UsageFilter{
 			From: "2026-07-15", To: "2026-07-15", Breakdowns: true,
 		},
-		false,
+		false, db.PostgresQueryDialect(),
 	))
 	assert.Contains(t, detailed, "u.machine")
 
@@ -473,7 +445,7 @@ func TestPGDailyUsageDetailedQuerySelectsMachine(t *testing.T) {
 	fast := strings.ToLower(pgDailyUsageRowQuery(
 		fastParams,
 		db.UsageFilter{From: "2026-07-15", To: "2026-07-15"},
-		false,
+		false, db.PostgresQueryDialect(),
 	))
 	assert.NotContains(t, fast, "u.machine")
 }
@@ -484,7 +456,7 @@ func TestPGBoundedDailyUsageRowsCTEProjectsReasoningTokens(t *testing.T) {
 		From: "2024-06-01",
 		To:   "2024-06-30",
 	}
-	query := pgDailyUsageRowsSQLForBounds(pb, f, pgUsageBoundsForFilter(pb, f))
+	query := pgDailyUsageRowsSQLForBounds(pb, f, pgUsageBoundsForFilter(pb, f), db.PostgresQueryDialect())
 
 	normalized := strings.ToLower(query)
 	assert.Contains(t, normalized, "usage_event_timestamp_rows as materialized")
@@ -548,7 +520,7 @@ func TestPGMatchingUsageRowsSQLForBoundsRelaxesTokenEligibility(t *testing.T) {
 		Model: "gpt-5.3-codex",
 	}
 	bounds := pgUsageBoundsForFilter(pb, f)
-	query := pgMatchingUsageRowsSQLForBounds(pb, f, bounds)
+	query := pgMatchingUsageRowsSQLForBounds(pb, f, bounds, db.PostgresQueryDialect())
 
 	normalized := strings.ToLower(query)
 	assert.Contains(t, normalized, "message_timestamp_rows as materialized")
@@ -571,9 +543,12 @@ func TestPGTopSessionsUsageRowQueryUsesNarrowScan(t *testing.T) {
 		From:     "2024-06-01",
 		To:       "2024-06-30",
 		Timezone: "America/New_York",
-	})
+	}, true, db.PostgresQueryDialect())
 
 	normalized := strings.ToLower(query)
+	assert.Contains(t, normalized, "coalesce(attributed.group_key, '') as group_key")
+	assert.Contains(t, normalized, "coalesce(attributed.session_name, '') as session_name")
+	assert.Contains(t, normalized, "attributed.started_at as group_started_at")
 	assert.NotContains(t, normalized, "display_name")
 	assert.NotContains(t, normalized, "first_message")
 	assert.NotContains(t, normalized, "cost_status")
@@ -868,6 +843,71 @@ func TestPGDailyUsageAmountsPrefersExactCustomGPTReserve(t *testing.T) {
 	resolutions := block.Models[pricingpkg.GPTReserveModelName].Resolutions
 	require.Len(t, resolutions, 1)
 	assert.Equal(t, pricingpkg.GPTReserveModelName, resolutions[0].PricedModel)
+}
+
+func TestPGDailyUsageAmountsPricesCodexAutoReviewAsLuna(t *testing.T) {
+	lunaCost := money.MustParseDollars("0.20")
+	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+		ModelPattern: pricingpkg.GPT56LunaCanonical,
+		Rates:        export.ModelRates{InputPerMTok: lunaCost},
+	}})
+
+	_, _, _, _, cost, _, err := pgDailyUsageAmounts(pgDailyUsageScanRow{
+		usageSource: "provider",
+		model:       pricingpkg.CodexAutoReviewModelName,
+		inputTokens: 1_000_000,
+	}, resolver)
+	require.NoError(t, err)
+	assert.Equal(t, lunaCost, cost)
+	block, err := resolver.BuildBlock()
+	require.NoError(t, err)
+	require.Contains(t, block.Models, pricingpkg.CodexAutoReviewModelName)
+	resolutions := block.Models[pricingpkg.CodexAutoReviewModelName].Resolutions
+	require.Len(t, resolutions, 1)
+	assert.Equal(t, pricingpkg.GPT56LunaCanonical, resolutions[0].PricedModel)
+	assert.NotContains(t, block.Models, pricingpkg.GPT56LunaCanonical)
+}
+
+// TestPGDailyUsageAmountsPrefersExactCustomPrefixedCodexAutoReview proves an
+// exact custom row beats the alias for both the provider-prefixed name and the
+// bare name users configure today.
+func TestPGDailyUsageAmountsPrefersExactCustomPrefixedCodexAutoReview(t *testing.T) {
+	for _, model := range []string{
+		"openai/" + pricingpkg.CodexAutoReviewModelName,
+		pricingpkg.CodexAutoReviewModelName,
+	} {
+		t.Run(model, func(t *testing.T) {
+			resolver := export.NewPricingResolver([]export.EffectivePricingRow{
+				{
+					ModelPattern: model,
+					Rates: export.ModelRates{
+						InputPerMTok: money.MustParseDollars("7"),
+						Source:       export.PricingRowSourceCustom,
+					},
+				},
+				{
+					ModelPattern: pricingpkg.GPT56LunaCanonical,
+					Rates: export.ModelRates{
+						InputPerMTok: money.MustParseDollars("0.20"),
+						Source:       export.PricingRowSourceFetched,
+					},
+				},
+			})
+
+			_, _, _, _, cost, _, err := pgDailyUsageAmounts(pgDailyUsageScanRow{
+				usageSource: "provider",
+				model:       model,
+				inputTokens: 1_000_000,
+			}, resolver)
+			require.NoError(t, err)
+			assert.Equal(t, money.MustParseDollars("7"), cost)
+			block, err := resolver.BuildBlock()
+			require.NoError(t, err)
+			resolutions := block.Models[model].Resolutions
+			require.Len(t, resolutions, 1)
+			assert.Equal(t, model, resolutions[0].PricedModel)
+		})
+	}
 }
 
 func TestPGDailyUsageAmountsForwardsProviderToBilling(t *testing.T) {

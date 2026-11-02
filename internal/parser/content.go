@@ -13,22 +13,23 @@ import (
 // content can be a string or a JSON array of blocks.
 // Returns: flattened text (with inline [Thinking] markers for UI
 // compatibility), concatenated thinking-block text (no markers),
-// hasThinking, hasToolUse, tool calls, and tool results.
+// dialogue text, hasThinking, hasToolUse, tool calls, and tool results.
 // Thinking blocks are joined with "\n\n" to give an unambiguous
 // block boundary in the concatenated thinking text.
 func ExtractTextContent(
 	ctx context.Context, content gjson.Result,
-) (string, string, bool, bool, []ParsedToolCall, []ParsedToolResult) {
+) (string, string, string, bool, bool, []ParsedToolCall, []ParsedToolResult) {
 	if content.Type == gjson.String {
-		return content.Str, "", false, false, nil, nil
+		return content.Str, "", content.Str, false, false, nil, nil
 	}
 
 	if !content.IsArray() {
-		return "", "", false, false, nil, nil
+		return "", "", "", false, false, nil, nil
 	}
 
 	var (
 		parts         []string
+		dialogueParts []string
 		thinkingParts []string
 		toolCalls     []ParsedToolCall
 		toolResults   []ParsedToolResult
@@ -41,6 +42,7 @@ func ExtractTextContent(
 			text := block.Get("text").Str
 			if text != "" {
 				parts = append(parts, text)
+				dialogueParts = append(dialogueParts, text)
 			}
 		case "thinking":
 			thinking := block.Get("thinking").Str
@@ -72,7 +74,7 @@ func ExtractTextContent(
 	})
 
 	return strings.Join(parts, "\n"),
-		strings.Join(thinkingParts, "\n\n"),
+		strings.Join(thinkingParts, "\n\n"), strings.Join(dialogueParts, "\n"),
 		hasThinking, hasToolUse, toolCalls, toolResults
 }
 
@@ -118,10 +120,17 @@ func parseToolResult(block gjson.Result) (ParsedToolResult, bool) {
 		return ParsedToolResult{}, false
 	}
 	rc := block.Get("content")
+	status := ""
+	if block.Get("is_error").Type == gjson.True {
+		status = "errored"
+	}
 	return ParsedToolResult{
-		ToolUseID:     tuid,
-		ContentLength: toolResultContentLength(rc),
-		ContentRaw:    rc.Raw,
+		ToolUseID:                 tuid,
+		Source:                    "tool_result",
+		Status:                    status,
+		ContentLength:             toolResultContentLength(rc),
+		ContentRaw:                rc.Raw,
+		PersistedOutputUnresolved: block.Get(persistedOutputUnresolvedKey).Bool(),
 	}, true
 }
 
@@ -200,6 +209,10 @@ func formatToolUse(block gjson.Result) string {
 		}
 	}
 
+	return formatToolUseInput(name, input)
+}
+
+func formatToolUseInput(name string, input gjson.Result) string {
 	switch name {
 	case "AskUserQuestion":
 		return formatAskUserQuestion(name, input)
@@ -439,11 +452,14 @@ func orDefault(s, def string) string {
 // content for a tool call with the given name and raw input JSON, or "" when
 // the input is not an object.
 func ToolUseRendering(name, inputJSON string) string {
-	block, ok := toolUseBlock(name, inputJSON)
-	if !ok {
+	input := strings.TrimSpace(inputJSON)
+	if input == "" {
+		input = "{}"
+	}
+	if name == "" || !gjson.Valid(input) {
 		return ""
 	}
-	return formatToolUse(block)
+	return formatToolUseInput(name, gjson.Parse(input))
 }
 
 // RedactedToolUseRendering is ToolUseRendering with every argument except
@@ -452,17 +468,16 @@ func ToolUseRendering(name, inputJSON string) string {
 // it, so a transcript still shows which tool ran and on which file while
 // commands, patterns, prompts, and other arguments leave the archive.
 func RedactedToolUseRendering(name, inputJSON string) string {
-	block, ok := toolUseBlock(name, inputJSON)
-	if !ok {
+	input := strings.TrimSpace(inputJSON)
+	if input == "" {
+		input = "{}"
+	}
+	if name == "" || !gjson.Valid(input) {
 		return ""
 	}
-	reduced, ok := toolUseBlock(
-		name, reduceToolInputToPaths(block.Get("input").Raw),
-	)
-	if !ok {
-		return ""
-	}
-	return collapseEmptyRenderingDetail(formatToolUse(reduced))
+	return collapseEmptyRenderingDetail(formatToolUseInput(
+		name, gjson.Parse(reduceToolInputToPaths(input)),
+	))
 }
 
 func toolUseBlock(name, inputJSON string) (gjson.Result, bool) {
@@ -493,11 +508,26 @@ type ToolUseRenderingPair struct {
 }
 
 // ToolUseRenderingCandidates regenerates every rendering a parser could have
-// inlined for a call from its stored name and input. Copied rows carry no
-// record of which renderer produced their text, so callers try each pair.
+// inlined for a call from its stored name and input. An empty agent keeps
+// all candidates for copied rows whose renderer is unknown.
 func ToolUseRenderingCandidates(
-	category, name, inputJSON string,
+	agent AgentType, category, name, inputJSON string,
 ) []ToolUseRenderingPair {
+	// These archives identify their renderer. Rebuilding unrelated providers'
+	// renderings repeatedly parses and copies arguments that may be megabytes.
+	switch agent {
+	case AgentClaude, AgentOpenClaude, AgentCowork:
+		return []ToolUseRenderingPair{{
+			Full:     ToolUseRendering(name, inputJSON),
+			Redacted: RedactedToolUseRendering(name, inputJSON),
+		}}
+	case AgentCodex:
+		full := codexToolUseRendering(name, inputJSON)
+		return []ToolUseRenderingPair{{Full: full, Redacted: collapseToolHeader(full)}}
+	default:
+		// Keep the existing search for providers without a selected renderer.
+	}
+
 	candidates := []ToolUseRenderingPair{
 		{
 			Full:     ToolUseRendering(name, inputJSON),
@@ -557,7 +587,7 @@ func ToolUseRenderingCandidates(
 // rendering from any provider loses its arguments even when it cannot be
 // regenerated.
 func RedactToolUseRendering(full, category, name, inputJSON string) string {
-	for _, pair := range ToolUseRenderingCandidates(category, name, inputJSON) {
+	for _, pair := range ToolUseRenderingCandidates("", category, name, inputJSON) {
 		if pair.Full == full {
 			return pair.Redacted
 		}
@@ -626,9 +656,19 @@ func codexToolUseRendering(name, inputJSON string) string {
 func reduceToolInputToPaths(inputJSON string) string {
 	input := gjson.Parse(strings.TrimSpace(inputJSON))
 	kept := map[string]string{}
-	for _, key := range []string{"file_path", "path", "notebook_path", "dir_path"} {
-		if value := input.Get(key).Str; value != "" {
-			kept[key] = value
+	input.ForEach(func(key, value gjson.Result) bool {
+		switch key.Str {
+		case "file_path", "path", "notebook_path", "dir_path":
+			// Get used the first occurrence, including an empty value.
+			if _, seen := kept[key.Str]; !seen {
+				kept[key.Str] = value.Str
+			}
+		}
+		return true
+	})
+	for key, value := range kept {
+		if value == "" {
+			delete(kept, key)
 		}
 	}
 	reduced, err := json.Marshal(kept, json.Deterministic(true))

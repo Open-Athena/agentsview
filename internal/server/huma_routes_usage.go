@@ -50,7 +50,8 @@ type UsageFilterInput struct {
 	Timezone          string `query:"timezone" doc:"IANA timezone name"`
 	Agent             string `query:"agent" doc:"Filter by agent"`
 	Project           string `query:"project" doc:"Filter by project"`
-	Machine           string `query:"machine" doc:"Filter by machine"`
+	ProjectKey        string `query:"project_key" doc:"Filter by an opaque project key"`
+	Machine           string `query:"machine" doc:"Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400."`
 	GitBranch         string `query:"git_branch" doc:"Filter by git branch; opaque (project, branch) tokens from the /branches endpoint"`
 	ExcludeProject    string `query:"exclude_project" doc:"Exclude a project"`
 	ExcludeProjectKey string `query:"exclude_project_key" doc:"Exclude an opaque project key"`
@@ -67,10 +68,22 @@ type UsageFilterInput struct {
 	SessionCounts     bool   `query:"session_counts" default:"true" doc:"Include distinct session counts"`
 }
 
+type UsageSummaryInput struct {
+	GroupModels bool `query:"group_models" doc:"Group model aliases in report rows"`
+	UsageFilterInput
+}
+
+func usageSummaryRequestFromInput(in UsageSummaryInput) service.UsageRequest {
+	req := usageRequestFromInput(in.UsageFilterInput)
+	req.GroupModels = in.GroupModels
+	return req
+}
+
 type usageTopSessionsInput struct {
 	UsageFilterInput
 	Limit      int    `query:"limit" minimum:"0" maximum:"100" default:"20" doc:"Maximum number of sessions"`
 	Sort       string `query:"sort" enum:"cost,tokens" default:"cost" doc:"Rank sessions by cost or selected token types"`
+	GroupBy    string `query:"group_by" enum:"group" doc:"Merge sessions by project and group; a trailing row with no session or group ID sums rows past limit"`
 	TokenTypes string `query:"token_types" doc:"Comma-separated token counters for token ranking: input, cache_write, cache_read, output"`
 }
 
@@ -80,11 +93,12 @@ type usageComparisonInput struct {
 }
 
 type usagePairwiseComparisonInput struct {
-	UsageFilterInput
-	LeftDimension  string `query:"left_dimension" required:"true" doc:"Left-side comparison dimension"`
-	LeftValue      string `query:"left_value" required:"true" doc:"Left-side comparison value; opaque project key for the project dimension"`
-	RightDimension string `query:"right_dimension" required:"true" doc:"Right-side comparison dimension"`
-	RightValue     string `query:"right_value" required:"true" doc:"Right-side comparison value; opaque project key for the project dimension"`
+	UsageSummaryInput
+	LeftDimension     string `query:"left_dimension" doc:"Left-side comparison dimension; omit all four sides for the default pair"`
+	LeftValue         string `query:"left_value" doc:"Left-side comparison value; opaque project key for the project dimension"`
+	RightDimension    string `query:"right_dimension" doc:"Right-side comparison dimension"`
+	RightValue        string `query:"right_value" doc:"Right-side comparison value; opaque project key for the project dimension"`
+	FallbackToDefault bool   `query:"fallback_to_default" doc:"Use the default pair if either supplied side is absent from the scope's cost ranking"`
 }
 
 // usageRequestFromInput maps the HTTP query-param struct to the
@@ -96,6 +110,7 @@ func usageRequestFromInput(in UsageFilterInput) service.UsageRequest {
 		Timezone:          in.Timezone,
 		Agent:             in.Agent,
 		Project:           in.Project,
+		ProjectKey:        in.ProjectKey,
 		Machine:           in.Machine,
 		GitBranch:         in.GitBranch,
 		ExcludeProject:    in.ExcludeProject,
@@ -117,6 +132,9 @@ func usageRequestFromInput(in UsageFilterInput) service.UsageRequest {
 func usagePairwiseRequestFromInput(
 	in usagePairwiseComparisonInput,
 ) (service.UsagePairwiseComparisonRequest, error) {
+	if in.LeftDimension == "" && in.LeftValue == "" && in.RightDimension == "" && in.RightValue == "" {
+		return service.UsagePairwiseComparisonRequest{UsageRequest: usageSummaryRequestFromInput(in.UsageSummaryInput)}, nil
+	}
 	if in.LeftDimension == "" || in.LeftValue == "" {
 		return service.UsagePairwiseComparisonRequest{}, &service.UsageInputError{
 			Msg: "left side requires left_dimension and left_value",
@@ -128,11 +146,12 @@ func usagePairwiseRequestFromInput(
 		}
 	}
 	return service.UsagePairwiseComparisonRequest{
-		UsageRequest:   usageRequestFromInput(in.UsageFilterInput),
-		LeftDimension:  in.LeftDimension,
-		LeftValue:      in.LeftValue,
-		RightDimension: in.RightDimension,
-		RightValue:     in.RightValue,
+		UsageRequest:      usageSummaryRequestFromInput(in.UsageSummaryInput),
+		LeftDimension:     in.LeftDimension,
+		LeftValue:         in.LeftValue,
+		RightDimension:    in.RightDimension,
+		RightValue:        in.RightValue,
+		FallbackToDefault: in.FallbackToDefault,
 	}, nil
 }
 
@@ -144,15 +163,16 @@ func (s *Server) usageFilterFromInput(
 ) (db.UsageFilter, error) {
 	machine, err := db.ResolveMachineFilter(ctx, s.db, in.Machine)
 	if err != nil {
-		return db.UsageFilter{}, serverError(err)
+		return db.UsageFilter{}, usageSummaryAPIError(err)
 	}
 	in.Machine = machine
-	req, err := service.ResolveUsageProjectKeys(
-		ctx, s.db, usageRequestFromInput(in),
+	req := usageRequestFromInput(in)
+	req, err = service.ResolveUsageProjectKeys(
+		ctx, s.db, req,
 	)
 	if err == nil {
 		var f db.UsageFilter
-		f, err = service.BuildUsageFilter(req)
+		f, err = service.BuildUsageFilter(req, s.modelGroups)
 		if err == nil {
 			return f, nil
 		}
@@ -165,9 +185,9 @@ func (s *Server) usageFilterFromInput(
 
 func (s *Server) humaUsageSummary(
 	ctx context.Context,
-	in *UsageFilterInput,
+	in *UsageSummaryInput,
 ) (*jsonOutput[UsageSummaryResponse], error) {
-	res, err := s.sessions.UsageSummary(ctx, usageRequestFromInput(*in))
+	res, err := s.sessions.UsageSummary(ctx, usageSummaryRequestFromInput(*in))
 	if err != nil {
 		return nil, usageSummaryAPIError(err)
 	}
@@ -190,14 +210,23 @@ func usageSummaryAPIError(err error) error {
 }
 
 func (s *Server) humaUsageSummaryStream(
-	ctx context.Context, in *UsageFilterInput,
+	ctx context.Context, in *UsageSummaryInput,
 ) (*huma.StreamResponse, error) {
-	req := usageRequestFromInput(*in)
-	if _, err := service.BuildUsageFilter(req); err != nil {
-		if input, ok := errors.AsType[*service.UsageInputError](err); ok {
-			return nil, usageInputAPIError(input)
-		}
-		return nil, serverError(err)
+	// Resolve the machine and project keys before the stream starts so an
+	// unknown selector is a 400 like /usage/summary, not a 200 followed by an
+	// SSE error event. The resolved request has no keys left, so UsageSummary
+	// skips them.
+	req := usageSummaryRequestFromInput(*in)
+	machine, err := db.ResolveMachineFilter(ctx, s.db, req.Machine)
+	if err == nil {
+		req.Machine = machine
+		req, err = service.ResolveUsageProjectKeys(ctx, s.db, req)
+	}
+	if err == nil {
+		_, err = service.BuildUsageFilter(req, s.modelGroups)
+	}
+	if err != nil {
+		return nil, usageSummaryAPIError(err)
 	}
 	return &huma.StreamResponse{Body: func(hctx huma.Context) {
 		stream, ok := newHumaSSEStream(hctx)
@@ -338,6 +367,7 @@ func (s *Server) humaUsageTopSessions(
 	if err != nil {
 		return nil, err
 	}
+	f.TopSessionsByGroup = in.GroupBy == "group"
 	f.Breakdowns = false
 	switch strings.ToLower(strings.TrimSpace(in.Sort)) {
 	case "", db.TopSessionsSortCost:

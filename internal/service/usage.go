@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -28,10 +29,12 @@ type UsageRequest struct {
 	Machine           string `json:"machine,omitempty"`
 	GitBranch         string `json:"git_branch,omitempty"`
 	ExcludeProject    string `json:"exclude_project,omitempty"`
+	ProjectKey        string `json:"project_key,omitempty"`
 	ExcludeProjectKey string `json:"exclude_project_key,omitempty"`
 	ExcludeAgent      string `json:"exclude_agent,omitempty"`
 	ExcludeModel      string `json:"exclude_model,omitempty"`
 	Model             string `json:"model,omitempty"`
+	GroupModels       bool   `json:"group_models,omitempty"`
 	MinUserMessages   int    `json:"min_user_messages,omitempty"`
 	ActiveSince       string `json:"active_since,omitempty"`
 	Termination       string `json:"termination,omitempty"`
@@ -57,23 +60,54 @@ type UsageRequest struct {
 func ResolveUsageProjectKeys(
 	ctx context.Context, store db.Store, req UsageRequest,
 ) (UsageRequest, error) {
-	if req.ExcludeProjectKey == "" {
+	if req.ExcludeProjectKey == "" && req.ProjectKey == "" {
 		return req, nil
 	}
-	resolved, err := resolveUsageProjectKeyLabels(
-		ctx, store, req.ExcludeProjectKey,
-	)
+	byKey, err := usageProjectKeyCatalog(ctx, store)
 	if err != nil {
 		return UsageRequest{}, err
 	}
-	req.ExcludeProjectLabels = append(req.ExcludeProjectLabels, resolved...)
-	req.ExcludeProjectKey = ""
+	if req.ProjectKey != "" {
+		resolved, err := usageProjectKeyLabels(byKey, req.ProjectKey)
+		if err != nil {
+			return UsageRequest{}, err
+		}
+		if len(resolved) == 0 {
+			return UsageRequest{}, &UsageInputError{Code: UsageErrorCodeUnknownProjectKey, Msg: "unknown project key"}
+		}
+		labels, ok := intersectValues(append(splitCSVTokens(req.Project), req.ProjectLabels...), resolved)
+		if ok {
+			req.ProjectLabels = labels
+		} else {
+			// Equal include and exclude lists intentionally match nothing.
+			req.ProjectLabels = resolved
+			req.ExcludeProjectLabels = append(req.ExcludeProjectLabels, resolved...)
+		}
+		req.Project = ""
+		req.ProjectKey = ""
+	}
+	if req.ExcludeProjectKey != "" {
+		resolved, err := usageProjectKeyLabels(byKey, req.ExcludeProjectKey)
+		if err != nil {
+			return UsageRequest{}, err
+		}
+		req.ExcludeProjectLabels = append(req.ExcludeProjectLabels, resolved...)
+		req.ExcludeProjectKey = ""
+	}
 	return req, nil
 }
 
 func resolveUsageProjectKeyLabels(
 	ctx context.Context, store db.Store, keys string,
 ) ([]string, error) {
+	byKey, err := usageProjectKeyCatalog(ctx, store)
+	if err != nil {
+		return nil, err
+	}
+	return usageProjectKeyLabels(byKey, keys)
+}
+
+func usageProjectKeyCatalog(ctx context.Context, store db.Store) (map[string]string, error) {
 	labels, err := store.GetActiveProjectLabels(ctx)
 	if err != nil {
 		return nil, err
@@ -88,6 +122,10 @@ func resolveUsageProjectKeyLabels(
 			byKey[entry.ProjectKey] = label
 		}
 	}
+	return byKey, nil
+}
+
+func usageProjectKeyLabels(byKey map[string]string, keys string) ([]string, error) {
 	resolved := make([]string, 0)
 	for _, key := range splitCSVTokens(keys) {
 		label, ok := byKey[key]
@@ -100,29 +138,6 @@ func resolveUsageProjectKeyLabels(
 		resolved = append(resolved, label)
 	}
 	return resolved, nil
-}
-
-func ResolveUsagePairwiseProjectKeys(
-	ctx context.Context, store db.Store, req UsagePairwiseComparisonRequest,
-) (UsagePairwiseComparisonRequest, error) {
-	resolvedBase, err := ResolveUsageProjectKeys(ctx, store, req.UsageRequest)
-	if err != nil {
-		return UsagePairwiseComparisonRequest{}, err
-	}
-	req.UsageRequest = resolvedBase
-	req.LeftProjectLabels, err = resolvePairwiseProjectLabels(
-		ctx, store, req.LeftDimension, req.LeftValue,
-	)
-	if err != nil {
-		return UsagePairwiseComparisonRequest{}, err
-	}
-	req.RightProjectLabels, err = resolvePairwiseProjectLabels(
-		ctx, store, req.RightDimension, req.RightValue,
-	)
-	if err != nil {
-		return UsagePairwiseComparisonRequest{}, err
-	}
-	return req, nil
 }
 
 func resolvePairwiseProjectLabels(
@@ -152,7 +167,7 @@ func (e *UsageInputError) Error() string { return e.Msg }
 // comparison/top-sessions handlers. Date defaulting matches the
 // server's analytics range (last 30 days through today, UTC) unless
 // NoDefaultRange is set.
-func BuildUsageFilter(req UsageRequest) (db.UsageFilter, error) {
+func BuildUsageFilter(req UsageRequest, groups ModelGroups) (db.UsageFilter, error) {
 	tz := req.Timezone
 	if tz == "" {
 		tz = "UTC"
@@ -201,8 +216,8 @@ func BuildUsageFilter(req UsageRequest) (db.UsageFilter, error) {
 			req.ExcludeProject, req.ExcludeProjectLabels,
 		),
 		ExcludeAgent:      req.ExcludeAgent,
-		ExcludeModel:      req.ExcludeModel,
-		Model:             req.Model,
+		ExcludeModel:      groups.Expand(req.ExcludeModel),
+		Model:             groups.Expand(req.Model),
 		Timezone:          tz,
 		MinUserMessages:   req.MinUserMessages,
 		ExcludeOneShot:    !req.IncludeOneShot,
@@ -252,6 +267,9 @@ type ProjectTotal struct {
 }
 
 // ModelTotal holds range-wide token and cost totals per model.
+// PlanOnlySessions counts the model's sessions billed as plan usage, which
+// the token and cost figures leave out; a model used only in such sessions
+// has a row with zero tokens and cost and a nonzero PlanOnlySessions.
 type ModelTotal struct {
 	Model               string      `json:"model"`
 	InputTokens         int         `json:"inputTokens"`
@@ -259,6 +277,7 @@ type ModelTotal struct {
 	CacheCreationTokens int         `json:"cacheCreationTokens"`
 	CacheReadTokens     int         `json:"cacheReadTokens"`
 	Cost                money.Money `json:"cost"`
+	PlanOnlySessions    int         `json:"planOnlySessions,omitempty"`
 }
 
 // AgentTotal holds range-wide token and cost totals per agent.
@@ -321,11 +340,20 @@ type UsageSummaryResult struct {
 	SessionCounts    db.UsageSessionCounts             `json:"sessionCounts"`
 	CacheStats       CacheStats                        `json:"cacheStats"`
 	UnsupportedUsage *UnsupportedUsage                 `json:"unsupportedUsage,omitempty"`
+	ModelAliases     map[string]string                 `json:"model_aliases,omitempty"`
+	// PlanOnlySessions counts matching sessions billed as plan usage, which
+	// the token and cost figures leave out.
+	PlanOnlySessions int `json:"planOnlySessions,omitempty"`
+	// PartlyCapturedSessions counts matching sessions whose token counts
+	// miss turns live capture did not see.
+	PartlyCapturedSessions int `json:"partlyCapturedSessions,omitempty"`
 }
 
 // UsagePairwiseComparisonSide holds aggregate and derived
 // metrics for one side of a pairwise comparison.
 type UsagePairwiseComparisonSide struct {
+	Dimension           string       `json:"dimension,omitempty"`
+	Value               string       `json:"value,omitempty"`
 	TotalCost           money.Money  `json:"totalCost"`
 	InputTokens         int          `json:"inputTokens"`
 	OutputTokens        int          `json:"outputTokens"`
@@ -372,40 +400,87 @@ type UsagePairwiseComparisonResponse struct {
 // extra include filter per side.
 type UsagePairwiseComparisonRequest struct {
 	UsageRequest
-	LeftDimension  string `json:"left_dimension,omitempty"`
-	LeftValue      string `json:"left_value,omitempty"`
-	RightDimension string `json:"right_dimension,omitempty"`
-	RightValue     string `json:"right_value,omitempty"`
+	LeftDimension     string `json:"left_dimension,omitempty"`
+	LeftValue         string `json:"left_value,omitempty"`
+	RightDimension    string `json:"right_dimension,omitempty"`
+	RightValue        string `json:"right_value,omitempty"`
+	FallbackToDefault bool   `json:"fallback_to_default,omitempty"`
 	// Project label slices are populated only after resolving opaque keys and
 	// preserve exact labels that cannot round-trip through CSV strings.
 	LeftProjectLabels  []string `json:"-"`
 	RightProjectLabels []string `json:"-"`
 }
 
-// buildUsageSummary assembles a UsageSummaryResult from a daily-usage
-// query result over the [from, to] range.
+func usagePairwiseSideInRanking(summary *UsageSummaryResult, dimension, value string, expandModels bool) bool {
+	switch dimension {
+	case "model":
+		values := []string{value}
+		if expandModels {
+			values = splitCSVTokens(value)
+		}
+		return slices.ContainsFunc(summary.ModelTotals, func(total ModelTotal) bool { return slices.Contains(values, total.Model) })
+	case "project":
+		return slices.ContainsFunc(summary.ProjectTotals, func(total ProjectTotal) bool { return total.ProjectKey == value })
+	}
+	return false
+}
+
+func defaultUsagePairwiseSelection(summary *UsageSummaryResult) (leftDimension, leftValue, rightDimension, rightValue string) {
+	var models, projects []string
+	for _, total := range summary.ModelTotals {
+		// A model with only plan usage has no token data to compare, so the
+		// default pair skips it. Picking it explicitly still works.
+		planOnly := total.PlanOnlySessions > 0 && total.Cost.Microdollars == 0 &&
+			total.InputTokens+total.OutputTokens+total.CacheCreationTokens+total.CacheReadTokens == 0
+		if total.Model != "" && !planOnly {
+			models = append(models, total.Model)
+		}
+	}
+	for _, total := range summary.ProjectTotals {
+		if total.ProjectKey != "" {
+			projects = append(projects, total.ProjectKey)
+		}
+	}
+	switch {
+	case len(models) >= 2:
+		return "model", models[0], "model", models[1]
+	case len(projects) >= 2:
+		return "project", projects[0], "project", projects[1]
+	case len(models) > 0 && len(projects) > 0:
+		return "model", models[0], "project", projects[0]
+	default:
+		return "", "", "", ""
+	}
+}
+
 // BuildUsageSummaryResult assembles a usage summary from a filter and a daily
 // usage result. Exported for the snapshot exporter, which builds the summary
-// outside the SessionService backends.
+// outside the SessionService backends and has no plan-usage counts.
 func BuildUsageSummaryResult(
 	f db.UsageFilter, result db.DailyUsageResult,
 ) (*UsageSummaryResult, error) {
-	return buildUsageSummary(f, result)
+	return buildUsageSummary(f, result, db.PlanUsageSessionCounts{})
 }
+
+// buildUsageSummary assembles a UsageSummaryResult from a daily-usage
+// query result over the [from, to] range.
 
 func buildUsageSummary(
 	f db.UsageFilter, result db.DailyUsageResult,
+	planUsage db.PlanUsageSessionCounts,
 ) (*UsageSummaryResult, error) {
 	out := &UsageSummaryResult{
-		SchemaVersion: result.SchemaVersion,
-		Pricing:       result.Pricing,
-		Projects:      result.Projects,
-		From:          f.From,
-		To:            f.To,
-		Totals:        result.Totals,
-		Daily:         result.Daily,
-		SessionCounts: result.SessionCounts,
-		CacheStats:    computeCacheStats(result.Totals),
+		PlanOnlySessions:       planUsage.PlanOnly,
+		PartlyCapturedSessions: planUsage.PartlyCaptured,
+		SchemaVersion:          result.SchemaVersion,
+		Pricing:                result.Pricing,
+		Projects:               result.Projects,
+		From:                   f.From,
+		To:                     f.To,
+		Totals:                 result.Totals,
+		Daily:                  result.Daily,
+		SessionCounts:          result.SessionCounts,
+		CacheStats:             computeCacheStats(result.Totals),
 	}
 	if f.Breakdowns {
 		var err error
@@ -413,7 +488,7 @@ func buildUsageSummary(
 		if err != nil {
 			return nil, err
 		}
-		out.ModelTotals, err = foldModelTotals(result.Daily)
+		out.ModelTotals, err = foldModelTotals(result.Daily, planUsage.PlanOnlyByModel)
 		if err != nil {
 			return nil, err
 		}
@@ -471,9 +546,15 @@ func foldProjectTotals(daily []db.DailyUsageEntry) ([]ProjectTotal, error) {
 }
 
 // foldModelTotals sums daily model breakdowns into range-wide totals
-// sorted by cost descending.
-func foldModelTotals(daily []db.DailyUsageEntry) ([]ModelTotal, error) {
+// sorted by cost descending, and marks each model's plan-only sessions,
+// adding a row for a model used only in them.
+func foldModelTotals(
+	daily []db.DailyUsageEntry, planOnlyByModel map[string]int,
+) ([]ModelTotal, error) {
 	m := make(map[string]*ModelTotal)
+	for model, sessions := range planOnlyByModel {
+		m[model] = &ModelTotal{Model: model, PlanOnlySessions: sessions}
+	}
 	for _, d := range daily {
 		for _, mb := range d.ModelBreakdowns {
 			mt, ok := m[mb.ModelName]
@@ -586,20 +667,9 @@ func BuildUsagePairwiseComparisonResult(
 	}, nil
 }
 
-func BuildUsagePairwiseFilters(
-	req UsagePairwiseComparisonRequest,
-) (
-	db.UsageFilter,
-	bool,
-	db.UsageFilter,
-	bool,
-	error,
-) {
-	base, err := BuildUsageFilter(req.UsageRequest)
-	if err != nil {
-		return db.UsageFilter{}, false, db.UsageFilter{}, false, err
-	}
-
+func buildUsagePairwiseFilters(
+	req UsagePairwiseComparisonRequest, base db.UsageFilter,
+) (db.UsageFilter, bool, db.UsageFilter, bool, error) {
 	left, err := applyPairwiseDimension(
 		base,
 		req.LeftDimension,
@@ -678,38 +748,41 @@ type pairwiseFilterResult struct {
 	empty  bool
 }
 
+func validatePairwiseDimension(dimension, value, label string) error {
+	if value == "" {
+		return &UsageInputError{Msg: label + "_value is required"}
+	}
+	switch dimension {
+	case "model", "project":
+		return nil
+	case "":
+		return &UsageInputError{Msg: label + "_dimension is required"}
+	default:
+		return &UsageInputError{Msg: label + "_dimension must be model or project"}
+	}
+}
+
 func applyPairwiseDimension(
 	base db.UsageFilter, dimension, value string, projectLabels []string,
 	label string,
 ) (pairwiseFilterResult, error) {
-	filter := base
-	if value == "" {
-		return pairwiseFilterResult{},
-			&UsageInputError{Msg: label + "_value is required"}
+	if err := validatePairwiseDimension(dimension, value, label); err != nil {
+		return pairwiseFilterResult{}, err
 	}
+	filter := base
 	var ok bool
-	switch dimension {
-	case "model":
+	if dimension == "model" {
 		filter.Model, ok = intersectCSV(filter.Model, value)
 		return pairwiseFilterResult{filter: filter, empty: !ok}, nil
-	case "project":
-		if projectLabels == nil {
-			projectLabels = splitCSVTokens(value)
-		}
-		filter.ProjectLabels, ok = intersectValues(
-			filter.ProjectFilterLabels(), projectLabels,
-		)
-		filter.Project = joinCSVTokens(filter.ProjectLabels)
-		return pairwiseFilterResult{filter: filter, empty: !ok}, nil
-	case "":
-		return pairwiseFilterResult{},
-			&UsageInputError{Msg: label + "_dimension is required"}
-	default:
-		return pairwiseFilterResult{},
-			&UsageInputError{
-				Msg: label + "_dimension must be model or project",
-			}
 	}
+	if projectLabels == nil {
+		projectLabels = splitCSVTokens(value)
+	}
+	filter.ProjectLabels, ok = intersectValues(
+		filter.ProjectFilterLabels(), projectLabels,
+	)
+	filter.Project = joinCSVTokens(filter.ProjectLabels)
+	return pairwiseFilterResult{filter: filter, empty: !ok}, nil
 }
 
 func safePerTurnDenominator(count int) bool {

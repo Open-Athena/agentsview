@@ -5,6 +5,19 @@ import type { GetApiV1AnalyticsSignalSessionsAutomatedScope } from "./getApiV1An
 
 export type GetApiV1AnalyticsSignalSessionsParams = {
   /**
+   * Tool category for a tool rate
+   */
+  tool_category?: string;
+  /**
+   * Tool name for a tool rate
+   */
+  tool_name?: string;
+  /**
+   * Session evidence offset for a tool rate
+   * @minimum 0
+   */
+  offset?: number;
+  /**
    * Range start date
    */
   from?: string;
@@ -17,7 +30,7 @@ export type GetApiV1AnalyticsSignalSessionsParams = {
    */
   timezone?: string;
   /**
-   * Filter by machine
+   * Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400.
    */
   machine?: string;
   /**

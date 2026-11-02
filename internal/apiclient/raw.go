@@ -5,11 +5,16 @@ import (
 	"net/http"
 
 	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
+	"go.kenn.io/agentsview/internal/requestsign"
 )
 
 // RawRequest invokes one generated operation without consuming its response.
 // The caller owns status handling, read limits, decoding, and closing Body.
 func RawRequest(baseURL string, httpClient *http.Client, operation func(*Client) error, editors ...runtime.RequestEditorFn) (*http.Response, error) {
+	httpClient, err := requestsign.ClientFromEnvironment(baseURL, httpClient)
+	if err != nil {
+		return nil, err
+	}
 	options := make([]runtime.APIClientOption, 0, len(editors))
 	for _, editor := range editors {
 		options = append(options, runtime.WithRequestEditorFn(editor))
@@ -39,6 +44,7 @@ func (t *rawTransport) ExecuteRequest(ctx context.Context, req *http.Request, _ 
 	if err != nil {
 		return nil, err
 	}
+	ObserveArchiveFreshness(ctx, response)
 	t.response = response
 	return &runtime.Response{StatusCode: response.StatusCode, Headers: response.Header, Raw: response}, nil
 }

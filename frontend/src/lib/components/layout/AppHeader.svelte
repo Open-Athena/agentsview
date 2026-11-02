@@ -47,8 +47,10 @@
     getMarkdownExportUrl,
   } from "../../api/client.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
+  import { reportTelemetry } from "../../utils/telemetry.js";
   import ProjectTypeahead from "./ProjectTypeahead.svelte";
   import ImportModal from "../import/ImportModal.svelte";
+  import { claudeAISync } from "../../stores/claudeAISync.svelte.js";
 
   const isMac = navigator.platform.toUpperCase().includes("MAC");
   const modKey = isMac ? "⌘" : "Ctrl";
@@ -91,26 +93,30 @@
     "recall",
     "pinned",
     "quality",
+    "friction",
     "trash",
     "recent-edits",
     "data",
   ] as const;
+
+  const frictionNavVisible = $derived(sync.serverVersion?.friction_readable === true);
 
   // Published snapshots expose only the read-only browsing tabs; the
   // curation/management routes are hidden.
   const SNAPSHOT_TABS = new Set(["sessions", "usage", "activity"]);
   const tabs: TopBarTab[] = $derived(
     [
-      { id: "sessions", label: m.nav_sessions() },
-      { id: "usage", label: m.nav_usage() },
-      { id: "activity", label: m.nav_activity() },
-      { id: "trends", label: m.nav_trends() },
-      { id: "recall", label: m.nav_recall() },
-      { id: "pinned", label: m.nav_pinned() },
-      { id: "quality", label: m.nav_quality() },
-      { id: "trash", label: m.nav_trash() },
-      { id: "recent-edits", label: m.nav_recent_edits() },
-      { id: "data", label: m.nav_data() },
+    { id: "sessions", label: m.nav_sessions() },
+    { id: "usage", label: m.nav_usage() },
+    { id: "activity", label: m.nav_activity() },
+    { id: "trends", label: m.nav_trends() },
+    { id: "recall", label: m.nav_recall() },
+    { id: "pinned", label: m.nav_pinned() },
+    { id: "quality", label: m.nav_quality() },
+    ...(frictionNavVisible ? [{ id: "friction", label: m.nav_friction() }] : []),
+    { id: "trash", label: m.nav_trash() },
+    { id: "recent-edits", label: m.nav_recent_edits() },
+    { id: "data", label: m.nav_data() },
     ].filter((t) => !SNAPSHOT || SNAPSHOT_TABS.has(t.id)),
   );
 
@@ -156,6 +162,7 @@
     ).toString();
     const ok = await copyToClipboard(url);
     if (!ok) return;
+    reportTelemetry("export_run", { format: "markdown_link" });
     copiedMarkdownLink = true;
     clearTimeout(copiedMarkdownLinkTimer);
     copiedMarkdownLinkTimer = setTimeout(() => {
@@ -649,6 +656,7 @@
       </div>
     {/if}
 
+    {#if !sync.archiveOnly}
     <button
       class="header-btn sync-btn"
       class:syncing={sync.syncing}
@@ -664,19 +672,28 @@
       {/if}
       <span class="sync-label" class:collapsed={navCollapsed}>{sync.readOnly ? m.header_actions_refresh() : m.header_actions_sync()}</span>
     </button>
+    {/if}
 
     <button
       class="import-btn"
       onclick={() => {
-        if (!sync.readOnly) showImportModal = true;
+        if (!sync.readOnly && !sync.archiveOnly) showImportModal = true;
       }}
-      disabled={sync.readOnly}
-      title={sync.readOnly
+      disabled={sync.readOnly || sync.archiveOnly}
+      title={sync.archiveOnly
+        ? m.header_actions_import_archive_only()
+        : sync.readOnly
         ? m.header_actions_import_unavailable()
+        : claudeAISync.running
+        ? m.header_actions_import_claude_syncing()
         : m.header_actions_import_conversations()}
-      aria-label={m.header_actions_import_conversations()}
+      aria-label={claudeAISync.running ? m.header_actions_import_claude_syncing() : m.header_actions_import_conversations()}
     >
-      <DownloadIcon size="12" strokeWidth="2" aria-hidden="true" />
+      {#if claudeAISync.running}
+        <span class="sync-spinner" aria-hidden="true"><Spinner size={12} /></span>
+      {:else}
+        <DownloadIcon size="12" strokeWidth="2" aria-hidden="true" />
+      {/if}
       <span class="import-label" class:collapsed={navCollapsed}>{m.header_actions_import()}</span>
     </button>
 

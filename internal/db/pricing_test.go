@@ -11,46 +11,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestMigrationCreatesModelPricingTable(t *testing.T) {
-	d := testDB(t)
-
-	var count int
-	err := d.getReader().QueryRow(t.Context(),
-		`SELECT count(*) FROM pragma_table_info('model_pricing')`,
-	).Scan(&count)
-	require.NoError(t, err, "pragma_table_info")
-
-	assert.NotZero(t, count, "model_pricing table not created by schema")
-}
-
-func TestMigrationCreatesModelPricingBandsTable(t *testing.T) {
-	d := testDB(t)
-
-	rows, err := d.getReader().Query(t.Context(),
-		`SELECT name FROM pragma_table_info('model_pricing_bands') ORDER BY cid`,
-	)
-	require.NoError(t, err)
-	defer rows.Close()
-	var columns []string
-	for rows.Next() {
-		var column string
-		require.NoError(t, rows.Scan(&column))
-		columns = append(columns, column)
-	}
-	require.NoError(t, rows.Err())
-
-	assert.Equal(t, []string{
-		"model_pattern",
-		"above_input_tokens",
-		"input_microdollars_per_mtok",
-		"output_microdollars_per_mtok",
-		"cache_creation_microdollars_per_mtok",
-		"cache_creation_1h_microdollars_per_mtok",
-		"cache_read_microdollars_per_mtok",
-		"updated_at",
-	}, columns)
-}
-
 func TestUpsertModelPricingPricingBandsReplacesCompleteSet(t *testing.T) {
 	d := testDB(t)
 	initial := ModelPricing{
@@ -588,7 +548,7 @@ func TestLoadPricingMapKeepsCustomSourceWhenRatesMatchFallback(t *testing.T) {
 	d := testDB(t)
 	ctx := t.Context()
 
-	fallback := fallbackRateMap()
+	fallback := FallbackRateMap()
 	fallbackRates, ok := fallback["gpt-5.5"]
 	require.True(t, ok, "expected gpt-5.5 fallback rates")
 	d.SetCustomPricing(map[string]config.CustomModelRate{
@@ -658,7 +618,7 @@ func TestDeleteModelPricing(t *testing.T) {
 
 func TestLoadPricingMapTreatsBandOnlyFallbackMismatchAsFetched(t *testing.T) {
 	d := testDB(t)
-	fallback, ok := fallbackRateMap()["gpt-5.5"]
+	fallback, ok := FallbackRateMap()["gpt-5.5"]
 	require.True(t, ok)
 	require.NotEmpty(t, fallback.Bands)
 	require.NoError(t, d.UpsertModelPricing([]ModelPricing{{

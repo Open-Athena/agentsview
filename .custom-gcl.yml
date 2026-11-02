@@ -1,8 +1,8 @@
-version: v2.13.1
+version: v2.14.0
 plugins:
   - module: "go.uber.org/nilaway"
     import: "go.uber.org/nilaway/cmd/gclplugin"
     version: "v0.0.0-20260808063849-8649a03c818a"
   - module: "go.kenn.io/kit"
     import: "go.kenn.io/kit/lint/gclplugin"
-    version: "v0.25.1-0.20260918202731-04a175847323"
+    version: "v0.47.2"

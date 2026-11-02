@@ -96,14 +96,15 @@ func TestClassifyProviderChangedPathSchedulesStoredSourceHintsByCapability(t *te
 				StoredSourceHints:   tc.caps,
 			}}
 			factory := hintRecordingFactory{agent: "hint-agent", caps: caps, seen: &seen}
-			engine := &Engine{
+			engine := withTestSources(&Engine{
 				db: database, machine: "local",
-				agentDirs:         map[parser.AgentType][]string{"hint-agent": {root}},
-				providerFactories: map[parser.AgentType]parser.ProviderFactory{"hint-agent": factory},
 				providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
 					"hint-agent": parser.ProviderMigrationProviderAuthoritative,
 				},
-			}
+			}, &engineSources{
+				agentDirs:         map[parser.AgentType][]string{"hint-agent": {root}},
+				providerFactories: map[parser.AgentType]parser.ProviderFactory{"hint-agent": factory},
+			})
 
 			files := requireClassifyProviderChangedPath(t, engine, changedPath)
 
@@ -134,14 +135,15 @@ func TestClassifyStoredHintProviderChangedPathAllocationsStayBoundedByContainer(
 				Project: "archive", Machine: "local", FilePath: strPtr(hint),
 			}))
 		}
-		engine := &Engine{
+		engine := withTestSources(&Engine{
 			db: database, machine: "local",
-			agentDirs:         map[parser.AgentType][]string{parser.AgentWindsurf: {root}},
-			providerFactories: providerFactoryMap(parser.ProviderFactories()),
 			providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
 				parser.AgentWindsurf: parser.ProviderMigrationProviderAuthoritative,
 			},
-		}
+		}, &engineSources{
+			agentDirs:         map[parser.AgentType][]string{parser.AgentWindsurf: {root}},
+			providerFactories: providerFactoryMap(parser.ProviderFactories()),
+		})
 		warm := requireClassifyProviderChangedPath(t, engine, path)
 		require.Len(t, warm, 1)
 		assert.Equal(t, path+"#live", warm[0].Path)
@@ -163,6 +165,13 @@ func TestClassifyStoredHintProviderChangedPathAllocationsStayBoundedByContainer(
 	largeAllocs := measure(t, 2000)
 	assert.LessOrEqual(t, largeAllocs, smallAllocs*2,
 		"unrelated stored containers must not scale changed-path allocations")
+}
+
+// writeWALWithFrames leaves a WAL sibling past the 32-byte header, as an open
+// writer would; a frame-less WAL event never routes to its container.
+func writeWALWithFrames(t *testing.T, dbPath string) {
+	t.Helper()
+	require.NoError(t, os.WriteFile(dbPath+"-wal", make([]byte, 4096), 0o644))
 }
 
 func TestClassifyProviderChangedPathPreservesHintDependentTombstones(t *testing.T) {
@@ -202,6 +211,7 @@ func TestClassifyProviderChangedPathPreservesHintDependentTombstones(t *testing.
 					folder_paths TEXT, folder_paths_order TEXT, created_at TEXT)`)
 				require.NoError(t, err)
 				require.NoError(t, store.Close())
+				writeWALWithFrames(t, path)
 				return root, path + "-wal", parser.ZedSQLiteVirtualPath(path, "deleted")
 			},
 		},
@@ -248,6 +258,7 @@ func TestClassifyProviderChangedPathPreservesHintDependentTombstones(t *testing.
 				_, err = store.ExecContext(t.Context(), `DELETE FROM conversations_v2 WHERE conversation_id = 'deleted'`)
 				require.NoError(t, err)
 				require.NoError(t, store.Close())
+				writeWALWithFrames(t, path)
 				return root, path + "-wal", parser.KiroSQLiteVirtualPath(path, "deleted")
 			},
 		},
@@ -292,14 +303,15 @@ func TestClassifyProviderChangedPathPreservesHintDependentTombstones(t *testing.
 				ID: string(tc.agent) + ":deleted", Agent: string(tc.agent),
 				Project: "fixture", Machine: "local", FilePath: strPtr(deletedPath),
 			}))
-			engine := &Engine{
+			engine := withTestSources(&Engine{
 				db: database, machine: "local", skipCache: make(map[string]int64),
-				agentDirs:         map[parser.AgentType][]string{tc.agent: {root}},
-				providerFactories: providerFactoryMap(parser.ProviderFactories()),
 				providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
 					tc.agent: parser.ProviderMigrationProviderAuthoritative,
 				},
-			}
+			}, &engineSources{
+				agentDirs:         map[parser.AgentType][]string{tc.agent: {root}},
+				providerFactories: providerFactoryMap(parser.ProviderFactories()),
+			})
 
 			files := requireClassifyProviderChangedPath(t, engine, changedPath)
 			var tombstone parser.DiscoveredFile

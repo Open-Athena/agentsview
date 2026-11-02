@@ -26,14 +26,16 @@ type hybridFakeSearcher struct {
 	units []db.UnitRef
 }
 
-func (f *hybridFakeSearcher) SemanticSearch(
-	_ context.Context, _ string, limit int,
-) ([]db.VectorHit, error) {
-	hits := f.hits
-	if limit > 0 && limit < len(hits) {
-		hits = hits[:limit]
-	}
-	return hits, nil
+func (f *hybridFakeSearcher) PrepareSemanticSearch(
+	context.Context, string,
+) (db.VectorSearchPage, int, error) {
+	return func(_ context.Context, limit int) ([]db.VectorHit, bool, error) {
+		hits := f.hits
+		if limit > 0 && limit < len(hits) {
+			hits = hits[:limit]
+		}
+		return hits, len(f.hits) < limit, nil
+	}, 0, nil
 }
 
 func (f *hybridFakeSearcher) ResolveMessageUnits(
@@ -305,4 +307,40 @@ func hybridSessionIDs(page db.ContentSearchPage) []string {
 		out[i] = m.SessionID
 	}
 	return out
+}
+
+func TestPGHybridSnippetUsesDialogue(t *testing.T) {
+	for _, leg := range []string{"keyword", "fused", "vector"} {
+		t.Run(leg, func(t *testing.T) {
+			f := &hybridFakeSearcher{}
+			if leg != "keyword" {
+				f.hits = []db.VectorHit{{SessionID: "dialogue", Ordinal: 0, OrdinalStart: 0, OrdinalEnd: 0, Snippet: "answerneedle", Score: 0.9}}
+			}
+			store := wireHybrid(t, f)
+			insertCSSession(t, store, "dialogue", "proj", "claude", hybridStart, hybridEnd)
+			const rendered = "[Thinking] reasonneedle [/Thinking] answerneedle [Bash] $ commandneedle"
+			insertCSUnitMessage(t, store, "dialogue", 0, "assistant", rendered, false, false)
+			_, err := store.DB().ExecContext(t.Context(), `UPDATE messages SET dialogue_text='answerneedle' WHERE session_id='dialogue'`)
+			require.NoError(t, err)
+			pattern := "answerneedle"
+			if leg == "vector" {
+				pattern = "reasonneedle"
+			}
+			page, err := store.SearchContent(t.Context(), db.ContentSearchFilter{Pattern: pattern, Mode: "hybrid", Limit: 50})
+			require.NoError(t, err)
+			require.Len(t, page.Matches, 1)
+			if leg == "vector" {
+				assert.Equal(t, rendered, page.Matches[0].Snippet)
+			} else {
+				assert.Equal(t, "answerneedle", page.Matches[0].Snippet)
+			}
+			if leg == "keyword" {
+				for _, hidden := range []string{"reasonneedle", "commandneedle"} {
+					page, err := store.SearchContent(t.Context(), db.ContentSearchFilter{Pattern: hidden, Mode: "hybrid"})
+					require.NoError(t, err)
+					assert.Empty(t, page.Matches)
+				}
+			}
+		})
+	}
 }

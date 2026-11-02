@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -45,7 +46,7 @@ func newSessionGetCommand() *cobra.Command {
 				return err
 			}
 			if detail == nil {
-				return fmt.Errorf("session %s not found", args[0])
+				return &cliDiagnosticError{err: fmt.Errorf("session %s not found", args[0]), kind: "not_found", hint: sessionLookupHint}
 			}
 			if outputFormat(cmd) == "json" {
 				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), detail)
@@ -63,8 +64,9 @@ func newSessionGetCommand() *cobra.Command {
 		"machine", "local",
 		"Filter bare Codebuff/Freebuff timestamp resolution to a single "+
 			"machine identity. Use 'local' (default) to match this "+
-			"archive's own sessions, a machine name to match by exact "+
-			"sessions.machine value, or '*' to accept any. Does not "+
+			"archive's own sessions, an exact ID or alias, a unique whole "+
+			"display name, or '*' to accept any. "+
+			"Unknown or ambiguous values return an error. Does not "+
 			"affect canonical IDs or agents other than Codebuff/Freebuff.",
 	)
 	return cmd
@@ -294,7 +296,7 @@ func resolveBareCodebuffID(
 // codebuffMachineMatches reports whether a row's machine column
 // passes the user's --machine filter. "" or "local" defers to
 // localMachine (cfg.InstallationID); "*" matches anything; any
-// other non-empty value is matched exactly. This keeps the resolver
+// other non-empty value is a comma-separated ID list. This keeps the resolver
 // decoupled from cobra while still honouring the rule that
 // unspecified / "local" mean "this archive's own sessions".
 func codebuffMachineMatches(
@@ -306,7 +308,7 @@ func codebuffMachineMatches(
 	case "", "local":
 		return rowMachine == localMachine
 	default:
-		return rowMachine == filter
+		return slices.Contains(strings.Split(filter, ","), rowMachine)
 	}
 }
 
@@ -447,6 +449,23 @@ func printSessionDetailHuman(w io.Writer, s *service.SessionDetail) error {
 	fmt.Fprintf(w, "%s %s\n", label("Project"), sanitizeTerminal(s.Project))
 	fmt.Fprintf(w, "%s %s\n", label("Agent"), sanitizeTerminal(s.Agent))
 	fmt.Fprintf(w, "%s %s\n", label("Machine"), sanitizeTerminal(s.Machine))
+	if s.ParentSessionID != nil && *s.ParentSessionID != "" {
+		fmt.Fprintf(w, "%s %s (%s)\n", label("Parent"),
+			sanitizeTerminal(*s.ParentSessionID),
+			sanitizeTerminal(orEmDash(s.RelationshipType)))
+	}
+	if len(s.Labels) > 0 {
+		fmt.Fprintf(w, "%s %s\n", label("Labels"),
+			sanitizeTerminal(strings.Join(s.Labels, ", ")))
+	}
+	for i, pr := range s.PRLinks {
+		name := strings.Repeat(" ", 14)
+		if i == 0 {
+			name = label("Pull Requests")
+		}
+		fmt.Fprintf(w, "%s %s#%d %s\n", name,
+			sanitizeTerminal(pr.Repository), pr.Number, sanitizeTerminal(pr.URL))
+	}
 	fmt.Fprintf(w, "%s %s\n",
 		label("Started At"), sanitizeTerminal(derefStringOrDash(s.StartedAt)))
 	fmt.Fprintf(w, "%s %s\n",

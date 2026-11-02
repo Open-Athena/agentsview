@@ -86,7 +86,7 @@
   });
 
   $effect(() => {
-    displayedActive;
+    void displayedActive;
     const scroller = pageElement?.querySelector<HTMLElement>(
       ".kit-settings__scroll",
     );
@@ -228,6 +228,7 @@
         {/each}
       {/snippet}
       {#snippet footer()}
+        {#if !sync.archiveOnly}
         <Button
           onclick={() => {
             if (!sync.readOnly) ui.activeModal = "resync";
@@ -244,6 +245,7 @@
             ? m.settings_resync_unavailable_hint()
             : m.settings_resync_hint()}
         </span>
+        {/if}
       {/snippet}
     </SettingsLayout>
   {/if}
@@ -280,6 +282,12 @@
 
   .settings-panel[hidden] {
     display: none;
+  }
+
+  /* Reserve the scrollbar's width up front so the centered panel does not
+     shift when switching to a panel tall enough to scroll. */
+  .settings-page :global(.kit-settings__scroll) {
+    scrollbar-gutter: stable;
   }
 
   .settings-page.settings-no-results :global(.kit-settings__nav),

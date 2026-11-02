@@ -20,14 +20,34 @@ Read this file before adding or changing tests.
 - Test helpers must use testify for their own assertions.
 - Use the existing `testDB(t)` helper for database tests.
 - Use `t.TempDir()` for temporary directories.
+- Never locate files from a path returned by `runtime.Caller` or a stack trace;
+  builds use `-trimpath`, so those paths are module-relative. Tests run from
+  their package directory, so use paths relative to it, such as `testdata/...`
+  or `filepath.Join("..", "..", "docs")`.
+- A package whose tests load IANA timezone names, such as `America/New_York`,
+  keeps a `tzdata_test.go` that imports `time/tzdata`. Trimmed test binaries
+  cannot read the zone database in `GOROOT`, and Windows has no system copy.
 
 ### Timing budgets
 
-Run `go run ./scripts/check-timing-budgets .` or `make check-timing-budgets` to check test source. Both lint targets and the pre-commit hook enforce this check. It rejects literal budgets below one second, including zero and negative durations, in package-qualified `Eventually` and `Never` calls from testify's `assert` and `require` packages. It resolves ordinary import aliases and checks the third argument. Exactly one second and longer budgets are accepted; polling intervals stay outside the rule.
+The kit `deadlinetest` analyzer, run by `kennlint` in `make lint` and
+`make lint-ci`, rejects sub-second constant budgets in tests outside a
+`testing/synctest` bubble, such as `context.WithTimeout`, `time.After`, timers,
+and testify `Eventually`. It also checks configuration fields, same-module
+helper arguments, and standalone `time.Now().Add` deadlines. Wait on a real
+event, run the test under `synctest.Test`, or use a long hang guard on a
+`select` that already waits for the event. Mutex acquisition does not durably
+block in a synctest bubble.
 
-Literal expressions can use numbers, arithmetic, standard `time` units, and `time.Duration` conversions. Expressions containing application identifiers, including named constants, stay outside the rule. Formatted variants, `EventuallyWithT`, assertion-object methods, dot-import calls, and sleeps also stay outside this initial check. The checker reads `_test.go` files regardless of build tags or platform suffixes, excluding descendant `vendor`, `node_modules`, `testdata`, dot-prefixed, and underscore-prefixed directories.
+Mark a site `//nolint:kennlint // deadlinetest: <reason>` only when the asserted
+result is the deadline or cancellation expiring, or when a `select` on a timer
+shows that an event does not happen. The reason names which case applies and
+what holds the wait.
 
-The finite `allowedBudgets` inventory in `scripts/check-timing-budgets/main.go` preserves the retained integration-test scope through explicit file, enclosing function, assertion, duration, and occurrence limits. Watcher allowances include fake-backend fixtures retained by the earlier conversions. Mutex acquisition does not durably block in a synctest bubble. Justify each allowance addition with a concrete reason and review it. Deleted waits may disappear; remove obsolete records during reviewed cleanup. Replacing a call within the same allowed identity and duration retains its allowance.
+The check sees only the `fts5` test files each lint run compiles: Linux and
+Windows in full, and on macOS only the packages the macOS job lints. Tests
+behind `pgtest`, `chtest`, `duckdbtest`, or `s3test` go unchecked. It skips
+short positive `Never` windows, which cannot fail.
 
 ## Frontend and End-to-End Tests
 

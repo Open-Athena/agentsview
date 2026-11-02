@@ -34,6 +34,14 @@ empty. `HasFTS()` is true (ILIKE). `HasSemantic()` is true once
 `clickhouse serve` finds a pushed embedding generation matching the local
 `[vector.embeddings]` fingerprint (see the vector decision below).
 
+Content search matches dialogue in `messages` and reasoning in `thinking` for
+substring and regex modes. Hybrid keyword hits use dialogue for matching and
+snippets; vector-only hits use rendered messages. A per-archive dialogue marker
+forces a full push after upgrading. That push re-sends every session in the
+configured mirror scope, including sessions without dialogue. Session
+fingerprints include nullable dialogue values so later dialogue-only changes
+trigger another write. The marker is set after a clean full push.
+
 ## Boundaries
 
 - SQLite is never deleted, dropped, truncated, or recreated for a ClickHouse
@@ -72,13 +80,22 @@ matches what the experimental `vector_similarity` index accelerates, which would
 need per-dimension tables and a raised `max_limit_for_vector_search_queries` if
 scale ever demands it.
 
+The vector phase writes changed sessions in batches of up to 500 sessions or
+about 32 MiB of document text and embeddings, whichever fills first. Each batch
+inserts its documents and chunks, deletes its sessions' older chunks and
+documents, then inserts their `vector_push_state` rows, all under one version.
+The statement count grows with the number of batches, not sessions. A crash
+before the state rows land leaves every session in the batch stale, so the next
+push repeats them.
+
 **Tables are `ReplacingMergeTree(push_version)`.** `push_version` is the push
 start time in Unix nanoseconds. Same-key rows from a retry collapse on merge and
 on read. Timestamps are `DateTime64(6, 'UTC')`. `sessions.last_message_at` is
 computed at push time so date filters do not need a correlated `MAX`.
 
 **Push order is the consistency mechanism.** ClickHouse has no multi-statement
-transactions. Per batch of changed sessions, with `v` this push's version:
+transactions. Per batch of changed sessions (100 by default, set by the target's
+`push_batch_size`), with `v` this push's version:
 
 1. Insert dependent rows (messages, tool calls, result events, usage, findings,
    pins).
@@ -91,6 +108,30 @@ transactions. Per batch of changed sessions, with `v` this push's version:
 A crash before step 3 leaves the fingerprint stale, so the next push re-selects
 the session. A crash between 1 and 2 leaves extra old rows that step 2 removes
 on retry.
+
+**Full pushes resume.** A full push writes a run record under
+`agentsview_full_push_run:<archive>` in `sync_metadata` before its first batch
+and clears it with the cursor. The record holds the run's starting push version,
+the archive database ID, the scope, and the schema and data versions. A later
+push that finds the record with matching values resumes the run. It treats a
+session as done when this archive's mirror session row has the local fingerprint
+and a push version at or after the run's. The vector phase skips a session whose
+`vector_push_state` row has a matching hash and a version at or after the run's.
+Any mismatch starts a new full push, and so does `--full`. A run that ends with
+session errors stays recorded with an `errored` flag. A matching record resumes
+only if another trigger already forces a full push, and the push clears it
+otherwise. A record from a different push scope, archive, or format keeps the
+next push full, and the run that replaces it is marked `must_finish`. The push
+never clears a `must_finish` run until it ends without errors: a filtered run
+deletes mirror sessions outside its scope, and only a full push writes back
+sessions older than the stored cursor. A resumed run checks vectors for every
+session even when the caller scopes vectors to changed sessions, because the
+earlier process may have stopped before its vector phase. A resumed run skips
+the whole-mirror usage repricing that the run's first process already did.
+Pushes send sessions newest activity first (`ended_at`, then `started_at`, then
+`created_at`). A Codex revert page goes right after its thread's session, which
+mirrors read to decide whether the page is trashed. PostgreSQL pushes and DuckDB
+rebuilds use the same order.
 
 **Shared filter builder, ClickHouse dialect.** Existing SQLite, PostgreSQL, and
 DuckDB SQL stay byte-identical. ClickHouse uses `UNION ALL` in recursive CTEs,
@@ -206,15 +247,172 @@ capable push completes it.
 whether the mirror changed. That source probe used to scan `sessions`,
 `messages`, `usage_events`, both pricing tables, and `sync_metadata` for their
 counts and maxima on every request. The store now hashes the active
-`system.parts` rows of those six tables, which is metadata and reads no data,
-and reuses the last probe result while the hash is unchanged. A merge changes
-the parts without changing the data, so the hash is never the report token: on a
-hash miss the store recomputes the original probe and caches it under the new
-hash, and only a real data change moves the token or resets pagination. The
-mutex protects only the cached pair, never a query, and an error is not cached.
-This is whole-mirror invalidation; any insert, delete, or merge on one of those
-tables triggers one full probe. Reading `system.parts` needs its own grant,
-described in [ClickHouse sync](../clickhouse-sync.md#3-serve-the-dashboard).
+`system.parts` rows of those six tables, plus `usage_session_snapshots` and
+`prepared_usage`, which is metadata and reads no data, and reuses the last probe
+result while the hash is unchanged. A merge changes the parts without changing
+the data, so the hash is never the report token: on a hash miss the store
+recomputes the original probe and caches it under the new hash, and only a real
+data change moves the token or resets pagination. The mutex protects only the
+cached pair, never a query, and an error is not cached. This is whole-mirror
+invalidation; any insert, delete, or merge on one of those tables triggers one
+full probe. Reading `system.parts` needs its own grant, described in
+[ClickHouse sync](../clickhouse-sync.md#3-serve-the-dashboard).
+
+## Prepared usage
+
+Usage, analytics, and Activity reports read date-ordered usage rows. Computing
+those rows from `messages` and `usage_events` on every request dominated report
+time on small hosts, so the mirror prepares them ahead of time.
+
+**Complete snapshots.** Each push reads a session and its usage from the archive
+in one transaction and writes them to `usage_session_snapshots` as one versioned
+snapshot. A retry of a failed batch reuses the payload it already loaded, so one
+push version never mixes two archive states.
+
+**Refreshed table.** The refreshable materialized view `prepare_usage` turns the
+snapshots into `prepared_usage` every 15 minutes, and every push starts a
+refresh. Rows are sorted by their stored UTC time, so a day read touches only
+that day's granules. Each row stores its price model, price key, and a copy of
+its price record, stamped with the pricing digest it was priced under. The table
+comment names the query that built it; a table built by another query is dropped
+and rebuilt on the next schema step, and a rebuild that stopped halfway finishes
+on the next start. The schema step adds a missing projection only with the
+refresh stopped, and always starts it again.
+
+**Refresh without a table exchange.** Every refresh of the view ends with
+`EXCHANGE TABLES`, which ClickHouse runs as a `renameat2` call with the
+`RENAME_EXCHANGE` flag on the database's metadata files and has no fallback for.
+Filesystems without that flag, such as NFS, fail every refresh with
+`UNSUPPORTED_METHOD`, and the table is never filled. The schema step therefore
+exchanges two empty scratch tables in the mirror database. When that fails, it
+does not create the view, drops one an earlier version created, and creates the
+first rebuild lock if none exists. Probe tables that a killed push left behind
+are dropped once they are an hour old.
+
+A failed probe logs an `UNSUPPORTED_METHOD` error on the server, and a push
+watch runs the schema step before every push. The answer depends on the
+filesystem under the server's metadata directory, which changes only across a
+restart. The schema step therefore records the answer, the server's
+`serverUUID()`, and the server time of the probe under
+`agentsview_table_exchange_probe` in `sync_metadata`. It probes again when the
+server started after that time, or when the record names another server. The
+start comes from `now() - uptime()`, which counts whole seconds, so a probe up
+to a second before the computed start still counts. `RESTORE` runs on a live
+server and can copy in another server's record that is newer than this server's
+start; the server check catches that case. The probe tables a killed push left
+behind are dropped at every schema step, because a stored answer skips the probe
+until the next restart.
+
+The lock table is what tells pushes to rebuild. A push without the view rebuilds
+only while a lock exists and the newest one is not retired. A database that can
+swap tables has no lock. A push there that finds the view missing, as while a
+schema step recreates it, never rebuilds.
+
+Each push in rebuild mode rebuilds the table itself before it returns. It runs
+the view's query into a new `prepared_usage_build_<n>` table and moves that
+table's parts into `prepared_usage` with `REPLACE PARTITION`, which replaces all
+the parts at once. Readers see the previous rows or the new ones, never a mix,
+and read them as they read rows the view prepared. A push skips its rebuild when
+the stored stamp equals the current one, both before and after it takes the
+lock. After publishing, the holder rebuilds once more if the snapshots changed
+meanwhile. If they changed again, it logs that and leaves the rest to the next
+push. Without the view, nothing refreshes on a schedule, and a failed rebuild
+waits for the next push. Because `prepared_usage` is then not a refreshable
+view's target, native backups include its rows without
+`backup_data_from_refreshable_materialized_view_targets`.
+
+Rebuilds take turns, as the view's refreshes do. A read checks freshness and
+fetches rows in separate queries, so an older build must never replace a newer
+one between them. The lock is a numbered `prepared_usage_rebuild_lock_<n>`
+table. A push takes the lock by creating the table with the next number, which
+only one push can do. The push drops the older lock tables; the newest stays
+after release, so one lock table persists and numbers never repeat. A push that
+finds the lock held skips its rebuild, and reads prepare the changed sessions
+themselves meanwhile.
+
+A lock's comment holds its state as JSON, which ClickHouse changes atomically.
+`status` is `held`, `released`, or `retired`. A held lock also carries
+`renewed_at`, the ClickHouse server's Unix time when its holder last renewed it.
+A comment that is not valid JSON or has another status fails every read of the
+newest lock. Each push logs the error and skips its rebuild, and the schema step
+fails. The error names the lock and ends with the statement that repairs it.
+
+A lock can outlive its holder:
+
+- The holder renews the lock's timestamp every ten minutes. A lock not renewed
+  for an hour belongs to a stopped push, and the next push takes the next
+  number.
+- A push that paused between reading the locks and creating its own can create a
+  number a newer push already retired. Right after creating its lock, a push
+  checks for a higher number and gives its own up if one exists.
+- The build table carries the lock's number, and only a lock holder creates one.
+  A new holder drops every build table with a lower number. A publish still
+  reading one finishes before the drop returns, and a later one fails without
+  its table, so older rows never land after newer ones. A push also checks for
+  a newer lock before publishing and discards its build if one exists.
+- A push drops its own build table when it finishes, so a leftover exists only
+  between a killed push and the next rebuild.
+- When a later schema step finds that the database can swap tables, as when the
+  data directory moved off NFS, it first creates one more lock number with
+  status `retired` and drops the older locks and every build table. A rebuild
+  that already took a lock finds the newer lock and discards its build;
+  dropping its build table waits for a publish already running and fails a
+  later one. A push that tries to take the lock afterwards finds it retired
+  and skips. Only then does the schema step create the view. Because a push
+  rebuilds only while a lock exists, a database with no lock has no rebuild to
+  fence.
+- If the schema step stops after retiring the lock but before creating the view,
+  a push finds the newest lock retired and no view. The push first checks that
+  the database can still swap tables. If it can, the push retires again,
+  creates the view, and starts its refresh. If it cannot, the push releases
+  the retired lock and rebuilds.
+- Retirement can pause after reading the locks while pushes take newer numbers,
+  so it checks for a higher number right after creating its retired lock, as a
+  push does after taking a lock. If one exists, it retires again above it.
+- If the database later loses the ability to swap tables, the schema step marks
+  the retired lock released and then drops the view. From then on, each push
+  rebuilds. A schema step that also replaces `prepared_usage` drops the view
+  before it releases the lock. A push in that gap finds the newest lock
+  retired and no view, and its swap check sends it to rebuild instead of
+  creating the view.
+
+**Currency is proven per read.** A read uses prepared rows only when every
+session has a current snapshot. Sessions pushed since the last refresh form a
+delta: their rows are prepared and priced in Go once per snapshot, sent to the
+read as an external table, and replace that session's stored rows. A refresh
+empties the delta. Before the first refresh, or while a session lacks a current
+snapshot, reads use raw rows. When the stored price copies no longer match the
+price records, for example after the records were cleared, reads keep the
+prepared rows and price them through the per-request join.
+
+## Kept reads
+
+Serve keeps the results of recent reads in memory so a repeat request between
+pushes reads no rows from ClickHouse; it still runs the small metadata queries
+that check whether its inputs changed. Each kept read has one slot per selection
+(filter, range, and similar inputs), and its key names the rows it read: the
+prepared usage stamp and the parts of the small tables it joins, the candidate
+sessions and their push versions, or the parts of the tables it scanned. A push
+that changes those replaces the slot; a push that does not leaves it in place.
+Usage reads filtered by `active`, `stale`, or `unclean` termination compare
+session times with the current time, so their rows are never kept. Kept reads
+include usage rows, analytics session listings, Activity pairing inputs per
+session version, candidate listings, project label maps, and the whole report of
+an ended range.
+
+Nothing rebuilds kept reads in the background. The first request after a push
+that changes a read's rows pays for that read.
+
+**Reports on disk.** When a client opens an ended day, its report is written to
+the report cache described in
+[ClickHouse sync](../clickhouse-sync.md#agentsview-clickhouse-serve), one file
+per selection and one directory per mirror. Nothing prepares days ahead of time,
+so a day no one opens costs no disk. A file names the binary that wrote it and
+the report's key, so a new build or a change to that day's rows rebuilds it.
+Every open, whether served from memory or from the file, refreshes the file's
+modification time. At startup and about once a day serve removes reports no one
+has opened for 30 days, and temporary files that interrupted writes left more
+than an hour ago; there is no other size or count limit.
 
 ## Tradeoffs
 
@@ -232,5 +430,8 @@ hides the stale ones from readers.
 
 Unit tests cover dialect rendering, config, TLS checks, and fingerprints.
 Integration tests use the `chtest` tag against
-`clickhouse/clickhouse-server:26.8` or `TEST_CLICKHOUSE_URL`.
-`make test-clickhouse` is the suite. Do not point it at a live mirror.
+`clickhouse/clickhouse-server:26.8` or `TEST_CLICKHOUSE_URL`. Tests of the
+refresh without a table exchange start a second server under a seccomp profile
+that fails every `renameat2` call with a flag, as NFS does, or use
+`TEST_CLICKHOUSE_NO_EXCHANGE_URL`. `make test-clickhouse` is the suite. Do not
+point it at a live mirror.

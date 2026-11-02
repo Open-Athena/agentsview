@@ -1,20 +1,34 @@
 <script lang="ts">
+  import { errorTelemetry } from "../../utils/error-telemetry.js";
   import {
     usage,
     type GroupBy,
     type AttributionView,
   } from "../../stores/usage.svelte.js";
+  import { tick } from "svelte";
+  import { Button } from "@kenn-io/kit-ui";
+  import { seriesSwatchBackground, type SeriesStyle } from "@kenn-io/kit-ui/utils/palette";
+  import { shortenId } from "../../utils/shortId.js";
   import Treemap from "./Treemap.svelte";
+  import { TREEMAP_LABEL_SCALES, type TreemapLabelScale } from "./treemapLabelSize.js";
   import { m } from "../../i18n/index.js";
   import { formatMoney, moneyFromMicrodollars } from "../../money.js";
   import { formatTokenCount } from "../../utils/format.js";
   import { sumSelectedTokens } from "../../stores/usageTokenTypes.js";
+  import type { DbTopSessionEntry } from "../../api/generated/index.js";
 
   interface Props {
-    colorMap: ReadonlyMap<string, string>;
+    styleMap: ReadonlyMap<string, SeriesStyle>;
   }
 
-  let { colorMap }: Props = $props();
+  let { styleMap }: Props = $props();
+
+  const MUTED_STYLE: SeriesStyle = {
+    color: "var(--text-muted)",
+    fill: "solid",
+    dash: "solid",
+    marker: "circle",
+  };
 
   function fmtPct(v: number, total: number): string {
     if (total <= 0) return "";
@@ -22,29 +36,91 @@
   }
 
   const groupBy = $derived(usage.toggles.attribution.groupBy);
+  const hasSelection = $derived(usage.hasSelection(groupBy));
   const view = $derived(usage.toggles.attribution.view);
+  const labelScale = $derived(usage.toggles.attribution.labelScale);
   const isTokenMode = $derived(usage.mode === "token");
 
   interface Row {
     id: string;
     label: string;
     value: number;
-    color: string;
+    style: SeriesStyle;
+    swatch: string;
     pct: number;
+    // Billed only as plan usage: no tokens or cost to show.
+    planOnly: boolean;
+  }
+
+  let panel: HTMLElement;
+
+  const zoomedProject = $derived(usage.zoomedProject);
+
+  function zoomRowId(row: { groupKey?: string; machine?: string; sessionId: string }): string {
+    return row.groupKey ? `group:${JSON.stringify([row.groupKey, row.machine ?? ""])}` : row.sessionId ? `session:${row.sessionId}` : "remainder";
+  }
+
+  function zoomRowText(row: DbTopSessionEntry, rows: DbTopSessionEntry[]): { label: string; title: string } {
+    const name = (item: DbTopSessionEntry) => item.groupKey ? item.groupLabel || item.groupKey : item.sessionId ? item.displayName : m.shared_other();
+    const key = (item: DbTopSessionEntry) => item.groupKey || item.sessionId;
+    // Cron keys are "<job ID>:<home hash>"; job IDs never contain a colon.
+    const job = (item: DbTopSessionEntry) => item.groupKey ? item.groupKey.split(":")[0]! : item.sessionId;
+    const home = (item: DbTopSessionEntry) => item.groupKey ? item.groupKey.slice(job(item).length + 1) : "";
+    const peers = rows.filter((other) => name(other) === name(row));
+    const jobs = peers.map(job);
+    const homes = peers.filter((other) => job(other) === job(row)).map(home);
+    const machines = peers.filter((other) => key(other) === key(row)).map((other) => other.machine ?? "");
+    const label = [name(row)];
+    if (jobs.some((other) => other !== job(row))) label.push(shortenId(job(row), jobs));
+    if (new Set(homes).size > 1) label.push(shortenId(home(row), homes));
+    if (machines.length > 1) label.push(shortenId(row.machine ?? "", machines));
+    return {
+      label: label.filter(Boolean).join(" · "),
+      title: [name(row), job(row) === name(row) ? "" : job(row), row.machine].filter(Boolean).join(" · "),
+    };
+  }
+
+  function handleBackKey(event: KeyboardEvent) {
+    const target = event.target as HTMLElement;
+    if (!zoomedProject || !panel.contains(document.activeElement) || target.closest("input, textarea, select, [contenteditable]")) return;
+    if (event.key === "Escape" || event.key === "Backspace") {
+      event.preventDefault();
+      void closeProject();
+    }
+  }
+
+  // Leaving zoom unmounts the Back button, so hand focus to the project that was open.
+  async function closeProject() {
+    const key = zoomedProject?.key;
+    usage.setOpenProject(null);
+    await tick();
+    const row = [...panel.querySelectorAll<HTMLElement>("[data-row-id]")].find((el) => el.dataset.rowId === key);
+    (row ?? panel).focus();
   }
 
   const rowItems = $derived.by(() => {
-    const s = usage.summary;
-    if (!s) return [];
+    const s = usage.attributionSummary ?? usage.summary;
+    if (!s && !zoomedProject) return [];
 
     let items: Array<{
       id: string;
       label: string;
       value: number;
+      planOnly?: boolean;
     }> = [];
 
-    if (groupBy === "project") {
-      items = s.projectTotals.map((p) => ({
+    if (zoomedProject && groupBy === "project") {
+      const zoomRows = usage.zoomRows ?? [];
+      items = zoomRows.map((row) => {
+        const id = zoomRowId(row);
+        return {
+          id,
+          label: zoomRowText(row, zoomRows).label,
+          value: isTokenMode ? sumSelectedTokens(row, usage.selectedTokenTypes) : row.cost.microdollars,
+        };
+      });
+    } else if (groupBy === "project") {
+      items = s!.projectTotals.map((p) => ({
         id: p.project_key,
         label: p.project,
         value: isTokenMode
@@ -52,15 +128,22 @@
           : p.cost.microdollars,
       }));
     } else if (groupBy === "model") {
-      items = s.modelTotals.map((m) => ({
+      items = s!.modelTotals.map((m) => ({
         id: m.model,
         label: m.model,
         value: isTokenMode
           ? sumSelectedTokens(m, usage.selectedTokenTypes)
           : m.cost.microdollars,
+        // In cost mode a tokenless row with a reported cost keeps its cost:
+        // another agent can report only a dollar total under the same model
+        // name. Token mode has no tokens to show for that row either way.
+        planOnly:
+          (m.planOnlySessions ?? 0) > 0 &&
+          m.inputTokens + m.outputTokens + m.cacheCreationTokens + m.cacheReadTokens === 0 &&
+          (isTokenMode || m.cost.microdollars === 0),
       }));
     } else {
-      items = s.agentTotals.map((a) => ({
+      items = s!.agentTotals.map((a) => ({
         id: a.agent,
         label: a.agent,
         value: isTokenMode
@@ -73,6 +156,11 @@
     return items;
   });
 
+  function styleFields(style: SeriesStyle | undefined): Pick<Row, "style" | "swatch"> {
+    const resolved = style ?? MUTED_STYLE;
+    return { style: resolved, swatch: seriesSwatchBackground(resolved) };
+  }
+
   const rows = $derived.by((): Row[] => {
     const items = rowItems;
     const total = items.reduce((sum, item) => sum + item.value, 0);
@@ -83,8 +171,11 @@
       id: d.id,
       label: d.label,
       value: d.value,
-      color: colorMap.get(d.id) ?? "var(--text-muted)",
+      ...styleFields(
+        zoomedProject ? styleMap.get(zoomedProject.key) : styleMap.get(d.id),
+      ),
       pct: total > 0 ? d.value / total : 0,
+      planOnly: d.planOnly ?? false,
     }));
   });
 
@@ -93,20 +184,45 @@
       id: r.id,
       label: r.label,
       value: r.value,
-      color: r.color,
+      style: r.style,
+      title: rowTitle(r.id, r.label),
+      selected: usage.isSelected(groupBy, r.id),
+      dimmed: !zoomedProject && hasSelection && !usage.isSelected(groupBy, r.id),
       meta: fmtPct(r.value, rows.reduce(
         (sum, item) => sum + item.value, 0,
       )),
     })),
   );
 
+  function rowTitle(id: string, label: string): string {
+    if (zoomedProject) {
+      const row = usage.zoomRows?.find((row) => zoomRowId(row) === id);
+      return row ? zoomRowText(row, usage.zoomRows!).title : label;
+    }
+    return groupBy === "project" ? m.usage_click_project({ label }) : m.usage_click_to_focus({ label });
+  }
+
   function handleSelect(id: string) {
-    if (groupBy === "project") {
-      usage.toggleProjectKey(id, { preserveTimeRange: true });
-    } else if (groupBy === "agent") {
-      usage.toggleAgent(id, { preserveTimeRange: true });
-    } else {
-      usage.hideModel(id, { preserveTimeRange: true });
+    usage.toggleSelection(groupBy, id);
+  }
+
+  function handleOpen(id: string) {
+    if (groupBy !== "project") return;
+    const project = rows.find((row) => row.id === id);
+    if (!project) return;
+    usage.setOpenProject(project.id);
+    panel.focus();
+  }
+
+  function handleClick(event: MouseEvent, id: string) {
+    // A second click opens a project instead of toggling it back.
+    if (event.detail < 2 || groupBy !== "project") handleSelect(id);
+  }
+
+  function handleKey(event: KeyboardEvent, id: string) {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      handleSelect(id);
     }
   }
 
@@ -117,16 +233,37 @@
   function handleViewChange(v: AttributionView) {
     usage.setAttributionView(v);
   }
+
+  const labelScaleNames: Record<TreemapLabelScale, () => string> = {
+    linear: m.usage_label_scale_linear,
+    sqrt: m.usage_label_scale_sqrt,
+    log: m.usage_label_scale_log,
+  };
 </script>
 
-<div class="attribution-panel">
+<svelte:window onkeydown={handleBackKey} />
+
+<section class="attribution-panel" aria-label={isTokenMode ? m.usage_tokens_attribution_title() : m.usage_cost_attribution_title()} tabindex="-1" bind:this={panel}>
   <div class="panel-header">
-    <h3 class="chart-title">
-      {isTokenMode
-        ? m.usage_tokens_attribution_title()
-        : m.usage_cost_attribution_title()}
-    </h3>
+    {#if zoomedProject}
+      <Button surface="soft" label={`← ${m.usage_all_projects()}`} onclick={closeProject} />
+      <h3 class="chart-title">{zoomedProject.label}</h3>
+    {:else}
+      <h3 class="chart-title">
+        {isTokenMode
+          ? m.usage_tokens_attribution_title()
+          : m.usage_cost_attribution_title()}
+      </h3>
+    {/if}
     <div class="toggles">
+      <div class="selection-actions" class:inactive={!hasSelection}>
+        <Button size="sm" surface="soft" label={m.usage_clear_selection()} onclick={() => usage.clearSelection(groupBy)} />
+        {#if groupBy === "project"}
+          <span class:inactive={!usage.selectedProjectKey || !!zoomedProject || !rows.some((row) => row.id === usage.selectedProjectKey)}>
+            <Button size="sm" surface="soft" label={m.usage_open_project()} title={usage.focusLabel} onclick={() => handleOpen(usage.selectedProjectKey)} />
+          </span>
+        {/if}
+      </div>
       <div class="segment-toggle">
         <button
           class="toggle-btn"
@@ -166,42 +303,71 @@
           {m.usage_attribution_list()}
         </button>
       </div>
+      {#if view === "treemap"}
+        <div class="segment-toggle" role="group" aria-label={m.usage_label_scale_title()} title={m.usage_label_scale_title()}>
+          {#each TREEMAP_LABEL_SCALES as scale (scale)}
+            <button
+              class="toggle-btn"
+              class:active={labelScale === scale}
+              aria-pressed={labelScale === scale}
+              onclick={() => usage.setAttributionLabelScale(scale)}
+            >
+              {labelScaleNames[scale]()}
+            </button>
+          {/each}
+        </div>
+      {/if}
     </div>
   </div>
-
-  {#if rows.length === 0}
+  {#if zoomedProject && usage.errors.zoom}
+    <div class="empty" {@attach errorTelemetry("analytics")}>{usage.errors.zoom}</div>
+  {:else if zoomedProject && usage.loading.zoom && usage.zoomRows === null}
+    <div class="empty">{m.usage_loading()}</div>
+  {:else if rows.length === 0}
     <div class="empty">{m.shared_no_data_for_period()}</div>
   {:else}
-    <div class="hint">{m.usage_click_to_hide_hint()}</div>
+    {#if !zoomedProject}<div class="hint">{groupBy === "project" ? m.usage_click_project_hint() : m.usage_click_to_focus_hint()}</div>{/if}
     {#if view === "treemap"}
       <div class="treemap-layout">
         <div class="treemap-main">
           <Treemap
             items={treemapItems}
             height={260}
-            onSelect={handleSelect}
+            onSelect={zoomedProject ? undefined : handleSelect}
+            onOpen={!zoomedProject && groupBy === "project" ? handleOpen : undefined}
             formatValue={isTokenMode ? formatTokenCount : undefined}
+            {labelScale}
           />
         </div>
         <div class="side-rail">
           {#each rows as row, i (row.id)}
-            <!-- svelte-ignore a11y_click_events_have_key_events -->
-            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <!-- svelte-ignore a11y_no_noninteractive_tabindex (Only selectable rows receive a button role and tab stop.) -->
             <div
               class="rail-row"
-              title={m.usage_click_to_hide({ label: row.label })}
-              onclick={() => handleSelect(row.id)}
+              data-row-id={row.id}
+              class:selected={usage.isSelected(groupBy, row.id)}
+              class:dimmed={!zoomedProject && hasSelection && !usage.isSelected(groupBy, row.id)}
+              role={zoomedProject ? undefined : "button"}
+              tabindex={zoomedProject ? undefined : 0}
+              aria-pressed={zoomedProject ? undefined : usage.isSelected(groupBy, row.id)}
+              title={rowTitle(row.id, row.label)}
+              onclick={zoomedProject ? undefined : (event) => handleClick(event, row.id)}
+              ondblclick={!zoomedProject && groupBy === "project" ? () => handleOpen(row.id) : undefined}
+              onkeydown={zoomedProject ? undefined : (event) => handleKey(event, row.id)}
             >
               <span class="rail-rank">{i + 1}</span>
               <span
                 class="rail-dot"
-                style="background: {row.color}"
+                class:patterned={row.style.fill !== "solid"}
+                style="background: {row.swatch}"
               ></span>
               <span class="rail-label">{row.label}</span>
               <span class="rail-cost">
-                {isTokenMode
-                  ? formatTokenCount(row.value)
-                  : formatMoney(moneyFromMicrodollars(row.value))}
+                {row.planOnly
+                  ? m.plan_usage_title()
+                  : isTokenMode
+                    ? formatTokenCount(row.value)
+                    : formatMoney(moneyFromMicrodollars(row.value))}
               </span>
             </div>
           {/each}
@@ -210,42 +376,52 @@
     {:else}
       <div class="list-view">
         {#each rows as row, i (row.id)}
-          <!-- svelte-ignore a11y_click_events_have_key_events -->
-          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <!-- svelte-ignore a11y_no_noninteractive_tabindex (Only selectable rows receive a button role and tab stop.) -->
           <div
             class="list-row"
-            title={m.usage_click_to_hide({ label: row.label })}
-            onclick={() => handleSelect(row.id)}
+            data-row-id={row.id}
+            class:selected={usage.isSelected(groupBy, row.id)}
+            class:dimmed={!zoomedProject && hasSelection && !usage.isSelected(groupBy, row.id)}
+            role={zoomedProject ? undefined : "button"}
+            tabindex={zoomedProject ? undefined : 0}
+            aria-pressed={zoomedProject ? undefined : usage.isSelected(groupBy, row.id)}
+            title={rowTitle(row.id, row.label)}
+            onclick={zoomedProject ? undefined : (event) => handleClick(event, row.id)}
+            ondblclick={!zoomedProject && groupBy === "project" ? () => handleOpen(row.id) : undefined}
+            onkeydown={zoomedProject ? undefined : (event) => handleKey(event, row.id)}
           >
             <span class="list-rank">{i + 1}</span>
             <span
               class="list-dot"
-              style="background: {row.color}"
+              class:patterned={row.style.fill !== "solid"}
+              style="background: {row.swatch}"
             ></span>
             <div class="list-info">
               <span class="list-label">{row.label}</span>
               <div class="list-bar-track">
                 <div
                   class="list-bar-fill"
-                  style="width: {Math.max(row.pct * 100, 1)}%;
-                         background: {row.color};"
+                  style="width: {row.planOnly ? 0 : Math.max(row.pct * 100, 1)}%;
+                         background: {row.swatch};"
                 ></div>
               </div>
             </div>
             <span class="list-pct">
-              {(row.pct * 100).toFixed(1)}%
+              {row.planOnly ? "" : `${(row.pct * 100).toFixed(1)}%`}
             </span>
             <span class="list-cost">
-              {isTokenMode
-                ? formatTokenCount(row.value)
-                : formatMoney(moneyFromMicrodollars(row.value))}
+              {row.planOnly
+                ? m.plan_usage_title()
+                : isTokenMode
+                  ? formatTokenCount(row.value)
+                  : formatMoney(moneyFromMicrodollars(row.value))}
             </span>
           </div>
         {/each}
       </div>
     {/if}
   {/if}
-</div>
+</section>
 
 <style>
   .attribution-panel {
@@ -258,11 +434,13 @@
     align-items: center;
     justify-content: space-between;
     margin-bottom: 12px;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
+    min-height: 32px;
     gap: 8px;
   }
 
   .chart-title {
+    min-width: 0;
     font-size: 12px;
     font-weight: 600;
     color: var(--text-primary);
@@ -270,7 +448,19 @@
 
   .toggles {
     display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
     gap: 8px;
+  }
+
+  .selection-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .inactive {
+    visibility: hidden;
   }
 
   .segment-toggle {
@@ -327,12 +517,27 @@
     gap: 6px;
     padding: 3px 4px;
     border-radius: var(--radius-sm);
-    cursor: pointer;
     transition: background 0.1s;
   }
 
-  .rail-row:hover {
+  .rail-row[role="button"]:hover {
     background: var(--bg-surface-hover);
+  }
+
+  .rail-row, .list-row {
+    touch-action: manipulation;
+  }
+
+  .dimmed {
+    opacity: 0.35;
+  }
+
+  .rail-row.selected, .list-row.selected {
+    background: var(--bg-surface-hover);
+  }
+
+  .rail-row[role="button"], .list-row[role="button"] {
+    cursor: pointer;
   }
 
   .rail-rank {
@@ -349,6 +554,23 @@
     height: 6px;
     border-radius: 50%;
     flex-shrink: 0;
+  }
+
+  /* Patterned swatches need room to show at least one full pattern tile.
+     Negative margins keep their footprint at the plain dot's width, so
+     labels stay aligned. */
+  .rail-dot.patterned {
+    width: 10px;
+    height: 10px;
+    margin-inline: -2px;
+    border-radius: 2px;
+  }
+
+  .list-dot.patterned {
+    width: 12px;
+    height: 12px;
+    margin-inline: -2px;
+    border-radius: 2px;
   }
 
   .rail-label {
@@ -380,11 +602,10 @@
     gap: 8px;
     padding: 4px 6px;
     border-radius: var(--radius-sm);
-    cursor: pointer;
     transition: background 0.1s;
   }
 
-  .list-row:hover {
+  .list-row[role="button"]:hover {
     background: var(--bg-surface-hover);
   }
 
@@ -463,6 +684,8 @@
     font-size: 10px;
     color: var(--text-muted);
     margin-bottom: 6px;
+    line-height: 14px;
+    height: 14px;
     font-style: italic;
   }
 

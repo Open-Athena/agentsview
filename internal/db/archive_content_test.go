@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -11,31 +12,61 @@ import (
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/friction"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
 func TestOpenUsageOnlyPreservesStoredAutomationClassification(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "sessions.db")
-	database, err := OpenWithArchiveContent(t.Context(), path, config.ArchiveContentUsage)
-	require.NoError(t, err)
+	for name, reopen := range map[string]func(context.Context, string, config.ArchiveContent) (*DB, error){
+		"maintained": OpenWithArchiveContent,
+		"isolated":   OpenIsolatedWithArchiveContent,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "sessions.db")
+			database, err := OpenWithArchiveContent(t.Context(), path, config.ArchiveContentUsage)
+			require.NoError(t, err)
 
-	prompt := "You are a code reviewer. Review the code changes shown below."
-	startedAt := "2026-08-31T10:00:00Z"
-	require.NoError(t, database.UpsertSession(t.Context(), Session{
-		ID: "automated", Project: "project", Agent: "claude", Machine: "local",
-		FirstMessage: &prompt, StartedAt: &startedAt, UserMessageCount: 1,
-	}))
-	require.NoError(t, database.Close())
+			prompt := "You are a code reviewer. Review the code changes shown below."
+			startedAt := "2026-08-31T10:00:00Z"
+			require.NoError(t, database.UpsertSession(t.Context(), Session{
+				ID: "automated", Project: "project", Agent: "claude", Machine: "local",
+				FirstMessage: &prompt, StartedAt: &startedAt, UserMessageCount: 1,
+			}))
+			require.NoError(t, database.Close())
 
-	reopened, err := OpenWithArchiveContent(t.Context(), path, config.ArchiveContentUsage)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
-	stored, err := reopened.GetSessionFull(t.Context(), "automated")
-	require.NoError(t, err)
-	require.NotNil(t, stored)
-	assert.True(t, stored.IsAutomated,
-		"startup migrations cannot reclassify discarded transcript text")
-	assert.Nil(t, stored.FirstMessage)
+			reopened, err := reopen(t.Context(), path, config.ArchiveContentUsage)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+			stored, err := reopened.GetSessionFull(t.Context(), "automated")
+			require.NoError(t, err)
+			require.NotNil(t, stored)
+			assert.True(t, stored.IsAutomated,
+				"startup migrations cannot reclassify discarded transcript text")
+			assert.Nil(t, stored.FirstMessage)
+		})
+	}
+}
+
+func TestUsageOnlyAuditPreservesLegacyHeadlessAutomation(t *testing.T) {
+	for _, hash := range []string{"old-classifier", ClassifierHash()} {
+		t.Run(hash, func(t *testing.T) {
+			database := testDB(t)
+			database.SetArchiveContent(config.ArchiveContentUsage)
+			_, err := database.getWriter().Exec(t.Context(), `INSERT INTO sessions (id, machine, project, agent, session_kind, user_message_count, is_automated) VALUES
+				('codex-headless', 'local', 'project', 'codex', 'headless', 2, 1),
+				('codex-interactive', 'local', 'project', 'codex', '', 2, 0)`)
+			require.NoError(t, err)
+			_, err = database.getWriter().Exec(t.Context(), `UPDATE stats SET value = ? WHERE key = ?`, hash, ClassifierHashKey)
+			require.NoError(t, err)
+			require.NoError(t, database.backfillIsAutomatedLocked(t.Context(), database.getWriter()))
+			for id, want := range map[string]bool{"codex-headless": true, "codex-interactive": false} {
+				stored, err := database.GetSessionFull(t.Context(), id)
+				require.NoError(t, err)
+				require.NotNil(t, stored)
+				assert.Equal(t, want, stored.IsAutomated, id)
+			}
+		})
+	}
 }
 
 func TestUsageOnlyUpsertsPreserveAutomationWithoutPreview(t *testing.T) {
@@ -95,13 +126,14 @@ func TestUsageOnlyStoragePolicyOwnsDirectAndBatchWrites(t *testing.T) {
 	database.SetArchiveContent(config.ArchiveContentUsage)
 	require.Equal(t, config.ArchiveContentUsage, database.ArchiveContent())
 
-	privateTitle := "private conversation title"
+	privateTitle := "private conversation title · Aug 31 10:00"
 	privatePrompt := "You are a code reviewer. Review the code changes shown below."
 	startedAt := "2026-08-31T10:00:00Z"
 	session := Session{
 		ID: "direct", Project: "project", Agent: "claude", Machine: "local",
 		FirstMessage: &privatePrompt, DisplayName: &privateTitle,
 		SessionName: &privateTitle, PreserveSessionName: true,
+		GroupKey:     "job-a",
 		StartedAt:    &startedAt,
 		MessageCount: 4, UserMessageCount: 1,
 		SecretLeakCount: 2, SecretsRulesVersion: "private-rules",
@@ -135,7 +167,7 @@ func TestUsageOnlyStoragePolicyOwnsDirectAndBatchWrites(t *testing.T) {
 	))
 
 	assertUsageOnlyStoredSession(t, database, session.ID, []int{2, 3})
-	replacementTitle := "title added after the initial import"
+	replacementTitle := "title added after the initial import · Aug 31 10:00"
 	require.NoError(t, database.RefreshSessionName(t.Context(), session.ID, &replacementTitle))
 	require.NoError(t, database.RenameSession(t.Context(), session.ID, &replacementTitle))
 	stored, err := database.GetSessionFull(t.Context(), session.ID)
@@ -236,7 +268,8 @@ func TestUsageOnlyStoragePreservesContentFreeIncrementalSubagentEdge(
 			SubagentLinks: []ToolCallSubagentLink{{
 				ToolUseID: "tool-use-1", SubagentSessionID: "child",
 				ResultContent: "private subagent result", ResultContentLen: 23,
-				HasResult: true,
+				ResultEvents: []ToolResultEvent{{Content: "private subagent result", ContentLength: 23, Status: "errored"}},
+				HasResult:    true,
 			}},
 		},
 	)
@@ -460,7 +493,8 @@ func TestTranscriptsArchiveContentKeepsTextAndDropsToolPayloads(t *testing.T) {
 			SubagentLinks: []ToolCallSubagentLink{{
 				ToolUseID: "tool-use-2", SubagentSessionID: "child",
 				ResultContent: "subagent result", ResultContentLen: 15,
-				HasResult: true,
+				ResultEvents: []ToolResultEvent{{Content: "subagent result", ContentLength: 15, Status: "errored"}},
+				HasResult:    true,
 			}},
 		},
 	)
@@ -475,6 +509,77 @@ func TestTranscriptsArchiveContentKeepsTextAndDropsToolPayloads(t *testing.T) {
 	assert.Empty(t, link.InputJSON)
 	assert.Empty(t, link.ResultContent)
 	assert.Equal(t, 15, link.ResultContentLength)
+	require.Len(t, link.ResultEvents, 1)
+	assert.Empty(t, link.ResultEvents[0].Content)
+	assert.Equal(t, 15, link.ResultEvents[0].ContentLength)
+	assert.Equal(t, "errored", link.ResultEvents[0].Status)
+}
+
+func TestTranscriptArchiveRedactsQuotedToolRenderingFromDialogue(t *testing.T) {
+	for _, path := range []string{"write", "orphaned", "trashed"} {
+		for _, tc := range []struct{ name, content string }{
+			{"both-fields", "Kept prose.\n[Bash]\n$ cat archiveargumentsecret"},
+			{"dialogue-only", "Kept prose.\n[Bash]"},
+		} {
+			t.Run(path+"/"+tc.name, func(t *testing.T) {
+				source := testDB(t)
+				if path == "write" {
+					source.SetArchiveContent(config.ArchiveContentTranscripts)
+				}
+				require.NoError(t, source.UpsertSession(t.Context(), Session{
+					ID: "quoted-tool", Project: "project", Agent: "claude", Machine: "local",
+					MessageCount: 1,
+				}))
+				dialogue := "Kept prose.\n[Bash]\n$ cat archiveargumentsecret"
+				require.NoError(t, source.InsertMessages(t.Context(), []Message{{
+					SessionID: "quoted-tool", Role: "assistant", HasToolUse: true,
+					Content: tc.content, DialogueText: &dialogue,
+					ToolCalls: []ToolCall{{
+						ToolName: "Bash", Category: "Bash", ToolUseID: "quoted-call",
+						InputJSON: `{"command":"cat archiveargumentsecret"}`, Rendering: "[Bash]\n$ cat archiveargumentsecret",
+					}},
+				}}))
+				destination := source
+				if path != "write" {
+					destination = testDB(t)
+					destination.SetArchiveContent(config.ArchiveContentTranscripts)
+					copyData := func(sourcePath string) ([]string, error) {
+						return destination.CopyOrphanedDataFromExcluding(sourcePath, nil)
+					}
+					if path == "trashed" {
+						require.NoError(t, source.SoftDeleteSession(t.Context(), "quoted-tool"))
+						copyData = destination.CopyTrashedDataFrom
+					}
+					copied, err := copyData(source.Path())
+					require.NoError(t, err)
+					require.Equal(t, []string{"quoted-tool"}, copied)
+					if path == "trashed" {
+						_, err = destination.RestoreSession(t.Context(), "quoted-tool")
+						require.NoError(t, err)
+					}
+				}
+				messages, err := destination.GetAllMessages(t.Context(), "quoted-tool")
+				require.NoError(t, err)
+				require.Len(t, messages, 1)
+				assert.Equal(t, "Kept prose.\n[Bash]", messages[0].Content)
+				require.NotNil(t, messages[0].DialogueText)
+				assert.Equal(t, "Kept prose.\n[Bash]", *messages[0].DialogueText)
+				for _, mode := range []string{"substring", "fts"} {
+					filter := ContentSearchFilter{
+						Pattern: "archiveargumentsecret", Mode: mode, Sources: []string{"messages"},
+						SessionID: "quoted-tool", IncludeOneShot: true, IncludeAutomated: true, IncludeChildren: true,
+					}
+					page, err := destination.SearchContent(t.Context(), filter)
+					require.NoError(t, err)
+					assert.Empty(t, page.Matches, mode)
+					filter.Pattern = "prose"
+					page, err = destination.SearchContent(t.Context(), filter)
+					require.NoError(t, err)
+					assert.Len(t, page.Matches, 1, mode)
+				}
+			})
+		}
+	}
 }
 
 func TestTranscriptArchiveRedactsOverlappingToolRenderings(t *testing.T) {
@@ -829,6 +934,10 @@ func TestCopyOrphanedDataProjectsArchiveContent(t *testing.T) {
 			[]SecretFinding{{SessionID: "archived", RuleName: "aws-access-key"}},
 			1, "rules-v1",
 		))
+		frictionRows := frictionFixture("archived")
+		require.NoError(t, source.replaceSessionFriction(t.Context(), "archived",
+			frictionRows, friction.RulesVersion,
+			FrictionHash(frictionRows, friction.RulesVersion)))
 		archivedRows, err := source.GetAllMessages(t.Context(), "archived")
 		require.NoError(t, err)
 		pinNote := "quoted the secret here"
@@ -866,6 +975,11 @@ func TestCopyOrphanedDataProjectsArchiveContent(t *testing.T) {
 		)
 		require.NoError(t, err)
 		assert.Empty(t, findings)
+		frictionRows, err := destination.SessionFrictionFindings(t.Context(), "archived")
+		require.NoError(t, err)
+		assert.Empty(t, frictionRows, "findings from dropped tool payloads are cleared")
+		assert.Empty(t, stored.FrictionRulesVersion,
+			"the projected transcript must be recomputed")
 
 		messages, err := destination.GetAllMessages(t.Context(), "archived")
 		require.NoError(t, err)
@@ -937,6 +1051,12 @@ func TestCopyOrphanedDataProjectsArchiveContent(t *testing.T) {
 		)
 		require.NoError(t, err)
 		assert.Empty(t, findings)
+		frictionRows, err := destination.SessionFrictionFindings(t.Context(), "archived")
+		require.NoError(t, err)
+		assert.Empty(t, frictionRows)
+		assert.Zero(t, stored.FrictionCount)
+		assert.Equal(t, friction.RulesVersion, stored.FrictionRulesVersion)
+		assert.Equal(t, FrictionHash(nil, friction.RulesVersion), stored.FrictionHash)
 
 		messages, err := destination.GetAllMessages(t.Context(), "archived")
 		require.NoError(t, err)
@@ -1048,13 +1168,13 @@ func TestUsageArchiveClearsTextLeftByAnEarlierPolicy(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sessions.db")
 	full := testDBAtPath(t, path, "full")
-	title := "private title"
+	title := "private title · Aug 31 10:00"
 	prompt := "private prompt"
 	startedAt := "2026-08-31T10:00:00Z"
 	seed := func(id string) {
 		require.NoError(t, full.UpsertSession(t.Context(), Session{
 			ID: id, Project: "project", Agent: "claude", Machine: "local",
-			FirstMessage: &prompt, DisplayName: &title, SessionName: &title,
+			FirstMessage: &prompt, DisplayName: &title, SessionName: &title, GroupKey: id,
 			StartedAt: &startedAt, MessageCount: 1,
 		}))
 		require.NoError(t, full.InsertMessages(t.Context(), []Message{{
@@ -1073,6 +1193,8 @@ func TestUsageArchiveClearsTextLeftByAnEarlierPolicy(t *testing.T) {
 		require.NoError(t, err)
 		note := "quoted secret"
 		_, err = full.PinMessage(t.Context(), id, rows[0].ID, &note)
+		require.NoError(t, err)
+		_, err = full.getWriter().Exec(t.Context(), `INSERT INTO usage_events(session_id, source, model, input_tokens, output_tokens, occurred_at) VALUES (?, 'session', 'model-a', 10, 2, ?)`, id, startedAt)
 		require.NoError(t, err)
 	}
 	seed("upsert")
@@ -1100,7 +1222,7 @@ func TestUsageArchiveClearsTextLeftByAnEarlierPolicy(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, database.Close()) })
 
 	require.NoError(t, database.UpsertSession(t.Context(), Session{
-		ID: "upsert", Project: "project", Agent: "claude", Machine: "local",
+		ID: "upsert", GroupKey: "upsert", Project: "project", Agent: "claude", Machine: "local",
 		StartedAt: &startedAt, MessageCount: 1,
 	}))
 	require.NoError(t, database.ReplaceSessionMessages(t.Context(), "replace", []Message{{
@@ -1120,9 +1242,10 @@ func TestUsageArchiveClearsTextLeftByAnEarlierPolicy(t *testing.T) {
 	))
 	_, err = database.WriteSessionBatch([]SessionBatchWrite{{
 		Session: Session{
-			ID: "batch", Project: "project", Agent: "claude", Machine: "local",
+			ID: "batch", GroupKey: "batch", Project: "project", Agent: "claude", Machine: "local",
 			StartedAt: &startedAt, MessageCount: 1,
 		},
+		UsageEvents: []UsageEvent{{SessionID: "batch", Source: "session", Model: "model-a", InputTokens: 10, OutputTokens: 2, OccurredAt: startedAt}},
 		Messages: []Message{{
 			SessionID: "batch", Ordinal: 0, Role: "assistant", Model: "model-a",
 			Content: "reply",
@@ -1132,7 +1255,7 @@ func TestUsageArchiveClearsTextLeftByAnEarlierPolicy(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, database.UpsertSessionWithProjectIdentity(t.Context(),
 		Session{
-			ID: "identity", Project: "project", Agent: "claude",
+			ID: "identity", GroupKey: "identity", Project: "project", Agent: "claude",
 			Machine: "local", StartedAt: &startedAt, MessageCount: 1,
 		},
 		export.ProjectIdentityObservation{
@@ -1157,6 +1280,7 @@ func TestUsageArchiveClearsTextLeftByAnEarlierPolicy(t *testing.T) {
 		assert.Empty(t, findings, "the write settles findings the row carried: %s", id)
 	}
 
+	assertUsageOnlyGroup(t, database, "project", "upsert", "replace", "incremental", "metadata-update", "batch", "identity", "rename", "display-rename")
 	for _, id := range []string{
 		"upsert", "replace", "incremental", "metadata-update", "batch", "identity", "rename", "display-rename",
 	} {
@@ -1187,14 +1311,14 @@ func TestUsageOnlyTitleChangesRollBackWhenCleanupFails(t *testing.T) {
 	for _, name := range []string{"refresh", "rename"} {
 		t.Run(name, func(t *testing.T) {
 			database := testDB(t)
-			title, prompt, note := "provider title", "original prompt", "pinned note"
+			title, prompt, note := "provider title · Aug 31 10:00", "original prompt", "pinned note"
 			require.NoError(t, database.UpsertSession(t.Context(), Session{
 				ID: "title-update", Project: "project", Agent: "claude", Machine: "local",
-				SessionName: &title, FirstMessage: &prompt,
+				SessionName: &title, FirstMessage: &prompt, GroupKey: "job-a", StartedAt: new("2026-08-31T10:00:00Z"),
 			}))
 			require.NoError(t, database.RenameSession(t.Context(), "title-update", &title))
 			require.NoError(t, database.InsertMessages(t.Context(), []Message{{
-				SessionID: "title-update", Ordinal: 0, Role: "assistant", Content: "reply",
+				SessionID: "title-update", Ordinal: 0, Role: "assistant", Content: "reply", Model: "model-a", TokenUsage: []byte(`{"input_tokens":10,"output_tokens":2}`),
 			}}))
 			messages, err := database.GetAllMessages(t.Context(), "title-update")
 			require.NoError(t, err)
@@ -1233,6 +1357,7 @@ func TestUsageOnlyTitleChangesRollBackWhenCleanupFails(t *testing.T) {
 			assert.Nil(t, after.FirstMessage)
 			assert.Nil(t, after.DisplayName)
 			assert.Nil(t, after.SessionName)
+			assertUsageOnlyGroup(t, database, "project", "job-a")
 			pins, err = database.ListPinnedMessages(t.Context(), "title-update", "")
 			require.NoError(t, err)
 			require.Len(t, pins, 1)
@@ -1333,5 +1458,21 @@ func TestArchiveProjectionOfLateToolResults(t *testing.T) {
 				assert.Equal(t, "tool output", call.ResultEvents[0].Content)
 			}
 		})
+	}
+}
+
+func assertUsageOnlyGroup(t *testing.T, database *DB, project string, keys ...string) {
+	t.Helper()
+	rows, err := database.GetTopSessionsByCost(t.Context(), UsageFilter{ProjectLabels: []string{project}, TopSessionsByGroup: true}, 100)
+	require.NoError(t, err)
+	require.Len(t, rows, len(keys))
+	byKey := make(map[string]TopSessionEntry, len(rows))
+	for _, row := range rows {
+		byKey[row.GroupKey] = row
+	}
+	for _, key := range keys {
+		require.Contains(t, byKey, key)
+		assert.Empty(t, byKey[key].GroupLabel)
+		assert.Equal(t, key, byKey[key].DisplayName)
 	}
 }

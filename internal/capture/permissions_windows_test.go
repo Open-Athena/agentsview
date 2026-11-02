@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,7 +38,8 @@ func TestCreateStateRejectsReplaceableParentDACL(t *testing.T) {
 		windowsPermissionManifest(t, "windows-unsafe-parent"),
 	)
 
-	require.ErrorContains(t, err, "permits replacement")
+	require.ErrorContains(t, err, "validating capture parent safety")
+	assert.ErrorContains(t, err, "permits replacement")
 }
 
 func TestOpenStateRejectsParentDACLMadeReplaceable(t *testing.T) {
@@ -51,79 +53,83 @@ func TestOpenStateRejectsParentDACLMadeReplaceable(t *testing.T) {
 
 	_, err = openState(dir)
 
-	require.ErrorContains(t, err, "permits replacement")
+	require.ErrorContains(t, err, "validating capture parent safety")
+	assert.ErrorContains(t, err, "permits replacement")
 }
 
-func TestWindowsParentSecurityRejectsUntrustedOwner(t *testing.T) {
+func TestWindowsParentSecurity(t *testing.T) {
 	allowed, err := captureDirectorySIDs()
 	require.NoError(t, err)
-	descriptor, err := windows.SecurityDescriptorFromString(
-		"O:WDD:P(A;;GA;;;" + allowed[0].String() + ")",
-	)
-	require.NoError(t, err)
-
-	err = verifyWindowsParentSecurity(descriptor, allowed)
-
-	require.ErrorContains(t, err, "untrusted owner")
-}
-
-func TestWindowsParentSecurityAllowsTrustedInstallerOwner(t *testing.T) {
-	allowed, err := captureDirectorySIDs()
-	require.NoError(t, err)
-	descriptor, err := windows.SecurityDescriptorFromString(
-		"O:" + trustedInstallerSIDString + "D:P(A;;GA;;;" + allowed[0].String() + ")",
-	)
-	require.NoError(t, err)
-
-	err = verifyWindowsParentSecurity(descriptor, allowed)
-
-	require.NoError(t, err)
-}
-
-func TestWindowsParentSecurityAllowsInheritOnlyWrites(t *testing.T) {
-	allowed, err := captureDirectorySIDs()
-	require.NoError(t, err)
-	descriptor, err := windows.SecurityDescriptorFromString(
-		"O:" + allowed[0].String() + "D:P" +
-			"(A;;GA;;;" + allowed[0].String() + ")" +
-			"(A;CIIO;GW;;;WD)",
-	)
-	require.NoError(t, err)
-
-	err = verifyWindowsParentSecurity(descriptor, allowed)
-
-	require.NoError(t, err)
-}
-
-func TestWindowsCaptureDirectoryAllowsSplitTrustedEntries(t *testing.T) {
-	allowed, err := captureDirectorySIDs()
-	require.NoError(t, err)
-	sddl := "D:P"
-	for _, sid := range allowed {
-		sddl += "(A;OICI;GA;;;" + sid.String() + ")"
+	for _, tc := range []struct {
+		name    string
+		sddl    string
+		wantErr string
+	}{
+		{
+			name:    "rejects untrusted owner",
+			sddl:    "O:WDD:P(A;;GA;;;" + allowed[0].String() + ")",
+			wantErr: "untrusted owner",
+		},
+		{
+			name: "allows TrustedInstaller owner",
+			sddl: "O:" + trustedInstallerSIDString + "D:P(A;;GA;;;" + allowed[0].String() + ")",
+		},
+		{
+			name: "allows inherit-only full access",
+			sddl: "O:" + allowed[0].String() + "D:P(A;;GA;;;" + allowed[0].String() + ")(A;CIIO;GA;;;WD)",
+		},
+		{
+			name:    "rejects replacement by another principal",
+			sddl:    "O:" + allowed[0].String() + "D:P(A;;GA;;;WD)",
+			wantErr: "permits replacement",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			descriptor, err := windows.SecurityDescriptorFromString(tc.sddl)
+			require.NoError(t, err)
+			err = verifyWindowsParentSecurity(descriptor, allowed)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
 	}
-	sddl += "(A;CI;GA;;;" + allowed[0].String() + ")"
-	descriptor, err := windows.SecurityDescriptorFromString(sddl)
-	require.NoError(t, err)
-
-	err = verifyCaptureDirectorySecurity(descriptor, allowed)
-
-	require.NoError(t, err)
 }
 
-func TestWindowsCaptureDirectoryAllowsMappedFullAccess(t *testing.T) {
+func TestWindowsCaptureDirectorySecurity(t *testing.T) {
 	allowed, err := captureDirectorySIDs()
 	require.NoError(t, err)
-	sddl := "D:P"
-	for _, sid := range allowed {
-		sddl += "(A;OICI;FA;;;" + sid.String() + ")"
+	for _, tc := range []struct {
+		name    string
+		sddl    string
+		wantErr string
+	}{
+		{
+			name: "allows split trusted entries",
+			sddl: allowedSDDL("D:P", "A;OICI;GA", allowed) + "(A;CI;GA;;;" + allowed[0].String() + ")",
+		},
+		{
+			name: "allows mapped full access",
+			sddl: allowedSDDL("D:P", "A;OICI;FA", allowed),
+		},
+		{
+			name:    "requires inheritable trusted access",
+			sddl:    allowedSDDL("D:P", "A;;GA", allowed),
+			wantErr: "omits inheritable full access",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			descriptor, err := windows.SecurityDescriptorFromString(tc.sddl)
+			require.NoError(t, err)
+			err = verifyCaptureDirectorySecurity(descriptor, allowed)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
 	}
-	descriptor, err := windows.SecurityDescriptorFromString(sddl)
-	require.NoError(t, err)
-
-	err = verifyCaptureDirectorySecurity(descriptor, allowed)
-
-	require.NoError(t, err)
 }
 
 func TestClaudeProviderRootCreatedWithProtectedInheritableDACL(t *testing.T) {
@@ -149,32 +155,7 @@ func TestClaudeProviderRootAllowsExistingSafeUnprotectedDACL(t *testing.T) {
 	providerRoot := t.TempDir()
 	allowed, err := captureDirectorySIDs()
 	require.NoError(t, err)
-	var pinner runtime.Pinner
-	defer pinner.Unpin()
-	entries := make([]windows.EXPLICIT_ACCESS, 0, len(allowed))
-	for _, sid := range allowed {
-		pinner.Pin(sid)
-		entries = append(entries, windows.EXPLICIT_ACCESS{
-			AccessPermissions: windows.GENERIC_ALL,
-			AccessMode:        windows.SET_ACCESS,
-			Inheritance:       windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-			Trustee: windows.TRUSTEE{
-				TrusteeForm:  windows.TRUSTEE_IS_SID,
-				TrusteeValue: windows.TrusteeValueFromSID(sid),
-			},
-		})
-	}
-	dacl, err := windows.ACLFromEntries(entries, nil)
-	require.NoError(t, err)
-	require.NoError(t, windows.SetNamedSecurityInfo(
-		providerRoot,
-		windows.SE_FILE_OBJECT,
-		windows.DACL_SECURITY_INFORMATION|windows.UNPROTECTED_DACL_SECURITY_INFORMATION,
-		nil,
-		nil,
-		dacl,
-		nil,
-	))
+	require.NoError(t, setCaptureDACL(providerRoot, allowed))
 
 	_, err = prepareClaudeReservationDirectory(providerRoot)
 
@@ -188,34 +169,35 @@ func TestClaudeProviderRootAllowsExistingSafeUnprotectedDACL(t *testing.T) {
 		"existing provider ACLs must be validated without being rewritten")
 }
 
-func TestWindowsCaptureDirectoryRequiresInheritableTrustedAccess(t *testing.T) {
+func TestWindowsClaudeProviderRootSecurity(t *testing.T) {
 	allowed, err := captureDirectorySIDs()
 	require.NoError(t, err)
-	sddl := "D:P"
-	for _, sid := range allowed {
-		sddl += "(A;;GA;;;" + sid.String() + ")"
+	for _, tc := range []struct {
+		name    string
+		sddl    string
+		wantErr string
+	}{
+		{
+			name: "allows inherited trusted access",
+			sddl: allowedSDDL("D:AI", "A;OICIID;GA", allowed),
+		},
+		{
+			name:    "rejects sensitive access by another principal",
+			sddl:    "D:P(A;;GA;;;WD)",
+			wantErr: "grants sensitive access",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			descriptor, err := windows.SecurityDescriptorFromString(tc.sddl)
+			require.NoError(t, err)
+			err = verifyClaudeProviderRootSecurity(descriptor, allowed)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
 	}
-	descriptor, err := windows.SecurityDescriptorFromString(sddl)
-	require.NoError(t, err)
-
-	err = verifyCaptureDirectorySecurity(descriptor, allowed)
-
-	require.ErrorContains(t, err, "omits inheritable full access")
-}
-
-func TestWindowsClaudeProviderRootAllowsInheritedTrustedAccess(t *testing.T) {
-	allowed, err := captureDirectorySIDs()
-	require.NoError(t, err)
-	sddl := "D:AI"
-	for _, sid := range allowed {
-		sddl += "(A;OICIID;GA;;;" + sid.String() + ")"
-	}
-	descriptor, err := windows.SecurityDescriptorFromString(sddl)
-	require.NoError(t, err)
-
-	err = verifyClaudeProviderRootSecurity(descriptor, allowed)
-
-	require.NoError(t, err)
 }
 
 func windowsPermissionManifest(t *testing.T, occurrence string) manifest {
@@ -233,25 +215,33 @@ func windowsPermissionManifest(t *testing.T, occurrence string) manifest {
 }
 
 func setPermissiveCaptureDACL(path string) error {
-	if err := os.MkdirAll(path, 0o700); err != nil {
-		return err
-	}
 	world, err := windows.CreateWellKnownSid(windows.WinWorldSid)
 	if err != nil {
 		return err
 	}
+	return setCaptureDACL(path, []*windows.SID{world})
+}
+
+func setCaptureDACL(path string, sids []*windows.SID) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
 	var pinner runtime.Pinner
 	defer pinner.Unpin()
-	pinner.Pin(world)
-	dacl, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{{
-		AccessPermissions: windows.GENERIC_ALL,
-		AccessMode:        windows.SET_ACCESS,
-		Inheritance:       windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-		Trustee: windows.TRUSTEE{
-			TrusteeForm:  windows.TRUSTEE_IS_SID,
-			TrusteeValue: windows.TrusteeValueFromSID(world),
-		},
-	}}, nil)
+	entries := make([]windows.EXPLICIT_ACCESS, 0, len(sids))
+	for _, sid := range sids {
+		pinner.Pin(sid)
+		entries = append(entries, windows.EXPLICIT_ACCESS{
+			AccessPermissions: windows.GENERIC_ALL,
+			AccessMode:        windows.SET_ACCESS,
+			Inheritance:       windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+			Trustee: windows.TRUSTEE{
+				TrusteeForm:  windows.TRUSTEE_IS_SID,
+				TrusteeValue: windows.TrusteeValueFromSID(sid),
+			},
+		})
+	}
+	dacl, err := windows.ACLFromEntries(entries, nil)
 	if err != nil {
 		return err
 	}
@@ -281,4 +271,14 @@ func assertProtectedCaptureDACL(t *testing.T, path string) {
 	allowed, err := captureDirectorySIDs()
 	require.NoError(t, err)
 	require.NoError(t, verifyCaptureDirectoryDACL(path, allowed))
+}
+
+// allowedSDDL builds a DACL string that grants ace to every allowed SID.
+func allowedSDDL(header, ace string, allowed []*windows.SID) string {
+	var sddl strings.Builder
+	sddl.WriteString(header)
+	for _, sid := range allowed {
+		sddl.WriteString("(" + ace + ";;;" + sid.String() + ")")
+	}
+	return sddl.String()
 }

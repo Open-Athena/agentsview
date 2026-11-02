@@ -8,6 +8,8 @@ import "@kenn-io/kit-ui/mermaid.css";
 import "./app.css";
 import { initI18n } from "./lib/i18n/index.js";
 import { installPerfFetchInstrumentation } from "./lib/stores/perf.svelte.js";
+// Applies saved message colors before the first render.
+import "./lib/stores/messageColors.svelte.js";
 
 // Resolve a snapshot view's ?t= grant token before any component (and its
 // data fetches) mounts, so the very first requests carry the token.

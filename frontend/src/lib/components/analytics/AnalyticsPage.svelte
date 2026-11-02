@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { modelPickerItems } from "../../utils/model-groups.js";
   import { Card } from "@kenn-io/kit-ui";
   import { onMount, onDestroy, untrack } from "svelte";
   import RangePicker from "../shared/RangePicker.svelte";
@@ -14,6 +15,7 @@
   import HourOfWeekHeatmap from "./HourOfWeekHeatmap.svelte";
   import SessionShape from "./SessionShape.svelte";
   import VelocityMetrics from "./VelocityMetrics.svelte";
+  import OutcomeTotals from "./OutcomeTotals.svelte";
   import ToolUsage from "./ToolUsage.svelte";
   import TopSkills from "./TopSkills.svelte";
   import SkillTrend from "./SkillTrend.svelte";
@@ -28,6 +30,8 @@
     analytics,
     ANALYTICS_DEFAULT_WINDOW_DAYS,
   } from "../../stores/analytics.svelte.js";
+  import { outcomeTotals } from "../../stores/outcomeTotals.svelte.js";
+  import { settings } from "../../stores/settings.svelte.js";
   import { analyticsPageDates } from "../../stores/analyticsPageDates.js";
   import {
     sessions,
@@ -46,7 +50,7 @@
     sessionParamsToPanelDate,
     type PanelDateState,
   } from "../../stores/yokedDates.svelte.js";
-  import { rollingRange } from "../../utils/dates.js";
+  import { parseLocalDate, rollingRange } from "../../utils/dates.js";
   import { exportAnalyticsCSV } from "../../utils/csv-export.js";
   import RefreshControl from "../shared/RefreshControl.svelte";
   import { m } from "../../i18n/index.js";
@@ -242,16 +246,23 @@
     });
   }
 
-  function refreshAnalytics(): Promise<void> {
+  async function refreshAnalytics(): Promise<void> {
     cancelInitialLoad();
     const refresh = analytics.fetchAll();
-    if (router.isRootPath || suppressSessionDateRefresh) return refresh;
-    const state = currentAnalyticsPanelDate();
-    if (state && !analyticsDateYokeIsClear()) {
-      yokedDates.updateFromPanel(state);
-      writeSessionDateParams(state);
+    // A pull-request lookup can take minutes, so refresh keeps its totals;
+    // changing the window or filters reloads them through the outcome effect.
+    const outcomes = outcomeWindow && !outcomeFiltersUnsupported &&
+      (!outcomeTotals.includePullRequests || outcomeTotals.pullRequestLookupFailed)
+      ? outcomeTotals.load(outcomeWindow)
+      : undefined;
+    if (!router.isRootPath && !suppressSessionDateRefresh) {
+      const state = currentAnalyticsPanelDate();
+      if (state && !analyticsDateYokeIsClear()) {
+        yokedDates.updateFromPanel(state);
+        writeSessionDateParams(state);
+      }
     }
-    return refresh;
+    await Promise.all([refresh, outcomes]);
   }
 
   function handleActivityRangeSelect(from: string, to: string) {
@@ -292,14 +303,12 @@
   });
 
   $effect(() => {
-    const selected = analytics.model
-      .split(",")
-      .filter((model) => model.length > 0);
+    const selected = analytics.model.split(",").filter(Boolean);
     untrack(() => mergeIntoKnownModels(selected));
   });
 
   const modelItems = $derived(
-    knownModels.map((name) => ({ name })),
+    modelPickerItems(knownModels, analytics.model, analytics.modelAliases),
   );
   function handleExportCSV() {
     exportAnalyticsCSV({
@@ -322,7 +331,7 @@
   const INITIAL_LOAD_CEILING_MS = 2000;
   let initialLoadTimer: ReturnType<typeof setTimeout> | undefined;
   // Child mount effects run before the page's first-load effect.
-  let initialLoadDeferred = $state(sessions.loading);
+  let initialLoadDeferred = $state(sessions.loading || sessions.machineFilterPending);
 
   function cancelInitialLoad() {
     clearTimeout(initialLoadTimer);
@@ -348,8 +357,47 @@
 
   analytics.setFetchStartHandler(cancelInitialLoad);
 
+  // The outcome totals are read on their own, not through analytics.fetchAll,
+  // because the GitHub half of the aggregation shells out once per repository
+  // and must never be pulled into the page's normal refresh.
+  const outcomeFiltersUnsupported = $derived(Boolean(
+    analytics.machine || analytics.model || analytics.termination ||
+    analytics.minUserMessages > 0 || analytics.recentlyActive ||
+    analytics.selectedDow !== null || analytics.selectedHour !== null,
+  ));
+
+  const outcomeWindow = $derived.by(() => {
+    if (sync.serverVersion?.session_stats_available !== true) return null;
+    const from = analytics.selectedDate ?? analytics.selectedActivityRange?.from ?? analytics.from;
+    const to = analytics.selectedDate ?? analytics.selectedActivityRange?.to ?? analytics.to;
+    const start = parseLocalDate(from);
+    const end = parseLocalDate(to);
+    if (!start || !end) return null;
+    // Dashboard dates include the last day; stats bounds exclude the end.
+    // Advance by a local calendar day so DST changes keep midnight aligned.
+    end.setDate(end.getDate() + 1);
+    return {
+      since: start.toISOString(),
+      until: end.toISOString(),
+      timezone: analytics.timezone,
+      agent: analytics.agent || undefined,
+      includeProject: analytics.project ? [analytics.project] : undefined,
+      includeOneShot: analytics.includeOneShot,
+      includeAutomated: analytics.includeAutomated,
+    };
+  });
+
   $effect(() => {
-    if (initialLoadDeferred && !sessions.loading) {
+    const window = outcomeWindow;
+    const unsupported = outcomeFiltersUnsupported;
+    untrack(() => {
+      if (!window || unsupported) outcomeTotals.reset();
+      else void outcomeTotals.load(window);
+    });
+  });
+
+  $effect(() => {
+    if (initialLoadDeferred && !sessions.loading && !sessions.machineFilterPending) {
       untrack(() => {
         clearTimeout(initialLoadTimer);
         initialLoadTimer = setTimeout(releaseInitialLoad, 0);
@@ -370,6 +418,7 @@
   // the sidebar filters change. Uses untrack on analytics state
   // so that local drill-downs don't re-trigger.
   $effect(() => {
+    if (sessions.machineFilterPending) return;
     const headerProject = sessions.filters.project;
     const headerMachine = sessions.filters.machine;
     const headerAgent = sessions.filters.agent;
@@ -456,6 +505,7 @@
   });
 
   $effect(() => {
+    if (sessions.machineFilterPending) return;
     const route = router.route;
     const params = router.params;
     const earliestSession = sync.stats?.earliest_session ?? undefined;
@@ -579,6 +629,7 @@
     cancelInitialLoad();
     analytics.setFetchStartHandler(undefined);
     analytics.cancelInFlightReads();
+    outcomeTotals.reset();
     const state = currentAnalyticsPanelDate();
     if (state) {
       analyticsPageDates.retain(
@@ -602,6 +653,7 @@
         <SessionFilterControl
           showDisplay={false}
           showStarred={false}
+          showLabelFilters={false}
           align="left"
         />
       </div>
@@ -624,8 +676,9 @@
     />
     <FilterDropdown
       label={m.analytics_model()}
+      selectedLabel={analytics.model !== analytics.displayedModels ? analytics.model : ""}
       items={modelItems}
-      excludedCsv={analytics.model}
+      excludedCsv={analytics.displayedModels}
       mode="include"
       onToggle={(name) => analytics.toggleModel(name)}
       onSelectAll={() => analytics.clearModel()}
@@ -683,7 +736,7 @@
         <SessionShape />
       </Card>
 
-      <Card level="default" padding="none" class="chart-panel">
+      <Card level="default" padding="none" class="chart-panel wide">
         <ToolUsage />
       </Card>
 
@@ -701,6 +754,21 @@
 
       <Card level="default" padding="none" class="chart-panel wide">
         <AgentComparison />
+      </Card>
+
+      <Card level="default" padding="none" class="chart-panel wide">
+        <OutcomeTotals
+          stats={outcomeTotals.stats}
+          loading={outcomeTotals.loading}
+          unavailable={outcomeFiltersUnsupported}
+          backendAvailable={sync.serverVersion?.session_stats_available}
+          githubConfigured={settings.githubConfigured}
+          error={outcomeTotals.error}
+          includePullRequests={outcomeTotals.includePullRequests}
+          onIncludePullRequests={() => {
+            if (outcomeWindow) void outcomeTotals.loadWithPullRequests(outcomeWindow);
+          }}
+        />
       </Card>
     </div>
 
@@ -752,6 +820,9 @@
   .analytics-content {
     flex: 1;
     overflow-y: auto;
+    /* Reserve the scrollbar's width up front so right-aligned controls do not
+       shift when loaded results first make a tall pane scroll. */
+    scrollbar-gutter: stable;
     padding: 16px;
     display: flex;
     flex-direction: column;

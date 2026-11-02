@@ -11,7 +11,7 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
   import { messages as messagesStore } from "../../stores/messages.svelte.js";
   import { sessionTiming } from "../../stores/sessionTiming.svelte.js";
   import { liveTick } from "../../stores/liveTick.svelte.js";
-  import { isRemoteConnection } from "../../api/runtime.js";
+  import { generatedErrorMessage, isRemoteConnection } from "../../api/runtime.js";
   import { SessionsService, type ResumeRequest, type ResumeResponse } from "../../api/generated/index";
   import ThinkingBlock from "./ThinkingBlock.svelte";
   import ToolBlock from "./ToolBlock.svelte";
@@ -113,11 +113,13 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
   }
 
   let showText = $derived(ui.isBlockVisible(isUser ? "user" : "assistant"));
-  let accentColor = $derived(isUser ? "var(--accent-blue)" : "var(--accent-purple)");
-  let accentForeground = $derived(isUser ? "var(--accent-blue-foreground)" : "var(--accent-purple-foreground)");
+  let accentColor = $derived(isUser ? "var(--role-user-accent)" : "var(--role-assistant-accent)");
+  let accentForeground = $derived(isUser ? "var(--role-user-accent-foreground)" : "var(--role-assistant-accent-foreground)");
+  let roleInk = $derived(isUser ? "var(--role-user-ink)" : "var(--role-assistant-ink)");
   let roleBg = $derived(isUser ? "var(--user-bg)" : "var(--assistant-bg)");
   let pinned = $derived(pins.isPinned(message.id));
   let pinFeedback = $state("");
+  let pinFailed = $state(false);
   let forkFeedback = $state("");
   let turnByMessage = $derived.by(() => {
     const map = new Map<number, TurnTiming>();
@@ -174,13 +176,19 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
     }
   }
   async function handleTogglePin() {
+    clearTimeout(pinTimer);
+    pinFeedback = "";
+    pinFailed = false;
     const wasPinned = pinned;
     try {
-      await pins.togglePin(message.session_id, message.id, message.ordinal);
+      if (!await pins.togglePin(message.session_id, message.id, message.ordinal)) return;
       clearTimeout(pinTimer);
       pinFeedback = wasPinned ? m.message_content_unpinned() : m.message_content_pinned();
       pinTimer = setTimeout(() => { pinFeedback = ""; }, 1500);
-    } catch { /* Preserve the existing non-blocking pin interaction. */ }
+    } catch (error) {
+      pinFailed = true;
+      pinFeedback = generatedErrorMessage(error);
+    }
   }
   let canForkFromMessage = $derived(allowMutations && owningSession?.agent === "claude" &&
     !(owningSession?.id ?? "").includes("~") && !(sync.readOnly && isRemoteConnection()));
@@ -215,7 +223,7 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
 <div class="message" class:is-user={isUser} class:compact style:border-left-color={accentColor} style:background={roleBg}>
   <div class="message-header">
     <span class="role-icon" style:background={accentColor} style:color={accentForeground}>{roleIcon}</span>
-    <span class="role-label" style:color={accentColor}>{roleLabel}</span>
+    <span class="role-label" style:color={roleInk}>{roleLabel}</span>
     <CopyButton revealOnHover {copied} ariaLabel={m.message_content_copy_message()}
       copiedAriaLabel={m.message_content_copied_message()} title={m.message_content_copy_message()}
       copiedTitle={m.message_content_copied()} onclick={handleCopy} />
@@ -231,7 +239,7 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
         <CirclePlayIcon size="14" strokeWidth="1.8" aria-hidden="true" />
       </button>
     {/if}
-    {#if pinFeedback}<span class="pin-feedback">{pinFeedback}</span>{/if}
+    {#if pinFeedback}<span class="pin-feedback" role={pinFailed ? "alert" : undefined}>{pinFeedback}</span>{/if}
     {#if forkFeedback}<span class="fork-feedback">{forkFeedback}</span>{/if}
     <div class="header-meta">
       {#if tokenSummary}<span class="message-tokens">{tokenSummary}</span>{/if}
@@ -330,7 +338,11 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
 </div>
 
 <style>
-  .message { border-left: 4px solid; padding: 14px 20px; border-radius: 0 var(--radius-md) var(--radius-md) 0; }
+  .message {
+    border-left: var(--role-assistant-bar-width) var(--role-assistant-bar-style);
+    padding: 14px 20px; border-radius: 0 var(--radius-md) var(--radius-md) 0;
+  }
+  .message.is-user { border-left: var(--role-user-bar-width) var(--role-user-bar-style); }
   .message-header { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
   .role-icon {
     width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center;
@@ -365,6 +377,7 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
   .pin-btn.pinned { color: var(--accent-blue); }
   .pin-btn:active { transform: var(--press-transform); }
   .pin-feedback, .fork-feedback { font-size: 11px; color: var(--text-muted); animation: fade-in-out 1.5s ease-in-out; }
+  .pin-feedback[role="alert"] { animation: none; }
   @keyframes fade-in-out { 0% { opacity: 0; } 15% { opacity: 1; } 75% { opacity: 1; } 100% { opacity: 0; } }
   .text-content { font-size: 14px; line-height: 1.7; color: var(--text-primary); word-wrap: break-word; }
   .code-fence-block {
@@ -394,7 +407,10 @@ import type { DbMessage as Message } from "../../api/generated/index.js";
     font-family: var(--font-mono); font-size: 0.85em; background: var(--bg-inset);
     border: 1px solid var(--border-muted); border-radius: 4px; padding: 0.15em 0.4em;
   }
-  .markdown :global(pre:not(.unknown-xml-block)) { background: var(--code-bg); color: var(--code-text); border-radius: var(--radius-md); padding: 12px 16px; overflow-x: auto; margin: 0.5em 0; }
+  .markdown :global(pre:not(.unknown-xml-block)) {
+    background: var(--code-bg); color: var(--code-text); border-radius: var(--radius-md); padding: 12px 16px; overflow-x: auto; margin: 0.5em 0;
+    border: var(--role-code-frame-width) var(--role-code-frame-style) var(--role-code-accent);
+  }
   .markdown :global(pre code) { background: none; border: none; padding: 0; font-size: 13px; color: inherit; }
   .markdown :global(blockquote) { border-left: 3px solid var(--border-default); margin: 0.5em 0; padding: 0.3em 1em; color: var(--text-secondary); }
   .markdown :global(ul), .markdown :global(ol) { padding-left: 1.6em; margin: 0.5em 0; }

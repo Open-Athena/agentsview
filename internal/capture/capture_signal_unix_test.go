@@ -17,6 +17,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kit/stacktest"
 )
 
 func TestInterruptedChildStillSealsRecoverableUsage(t *testing.T) {
@@ -148,7 +149,7 @@ func TestRepeatedWrapperSignalEscalatesIgnoredChild(t *testing.T) {
 	select {
 	case early := <-done:
 		require.FailNowf(t, "test failed", "signal-ignoring child exited before escalation: %+v", early)
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(50 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; the signal-ignoring child must outlive the first SIGTERM
 	}
 	require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGTERM))
 
@@ -188,6 +189,8 @@ func TestForwardSignalsDeliversSignalBufferedBeforeChildAvailable(t *testing.T) 
 func waitForCaptureSignalMarker(t *testing.T, marker string) int {
 	t.Helper()
 	deadline := time.After(20 * time.Second)
+	poll := time.NewTicker(10 * time.Millisecond)
+	defer poll.Stop()
 	for {
 		if data, err := os.ReadFile(marker); err == nil {
 			group, parseErr := strconv.Atoi(string(data))
@@ -197,8 +200,9 @@ func waitForCaptureSignalMarker(t *testing.T, marker string) int {
 		}
 		select {
 		case <-deadline:
+			stacktest.Dump(t)
 			require.FailNow(t, "child did not write signal marker")
-		case <-time.After(10 * time.Millisecond):
+		case <-poll.C:
 		}
 	}
 }

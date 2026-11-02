@@ -19,6 +19,12 @@ filter:
       - get-api-v1-sessions
       - get-api-v1-sessions-id-messages
       - get-api-v1-sessions-id-tool-calls
+      - get-api-v1-sessions-id-tool-sequences
+      - get-api-v1-sessions-id-children
+      - get-api-v1-recent-edits
+      - get-api-v1-analytics-tools
+      - get-api-v1-analytics-signals
+      - get-api-v1-analytics-signal-sessions
       - post-api-v1-sessions-sync
       - get-api-v1-sessions-id-watch
       - get-api-v1-session-stats
@@ -31,9 +37,12 @@ filter:
       - post-api-v1-recall-query
       - post-api-v1-recall-import
       - get-api-v1-secrets
+      - get-api-v1-kata-status
       - post-api-v1-secrets-scan
       - get-api-v1-projects
       - get-api-v1-sessions-id-usage
+      - patch-api-v1-sessions-id-labels
+      - put-api-v1-sessions-id-parent
       - post-api-v1-data-compact
       - post-api-v1-embeddings-build
       - get-api-v1-embeddings-status
@@ -44,6 +53,8 @@ filter:
       - get-api-v1-activity-report-report-id-sessions
       - get-api-v1-usage-summary-stream
       - post-api-v1-sync
+      - get-api-v1-sync-status
+      - post-api-v1-import-claude-ai-sync
       - post-api-v1-resync
       - post-api-v1-sync-remotes
       - post-api-v1-push-pg
@@ -53,12 +64,20 @@ filter:
       - post-api-v1-remote-sync-archive
       - get-api-v1-remote-sync-targets
       - post-api-v1-artifacts-exchange
+      - post-api-v1-export-conversations-initialize
       - post-api-v1-raw-sync-tokens
       - get-api-v1-raw-sync-status
+      - get-api-v1-codex-cloud-status
       - post-api-v1-raw-sync-objects-missing
       - post-api-v1-raw-sync-uploads
       - head-api-v1-raw-sync-uploads-upload-id
       - patch-api-v1-raw-sync-uploads-upload-id
+      - get-api-v1-friction-digests
+      - get-api-v1-friction-digests-date
+      - get-api-v1-friction-digests-date-md
+      - get-api-v1-friction-findings
+      - get-api-v1-friction-patterns
+      - post-api-v1-friction-run
       - post-api-v1-raw-sync-manifests
 overlay:
   sources:

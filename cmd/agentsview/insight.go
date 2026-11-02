@@ -16,8 +16,10 @@ import (
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+	"go.kenn.io/agentsview/internal/apiclient"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/requestsign"
 )
 
 type insightListResponse struct {
@@ -194,13 +196,13 @@ func newInsightGenerateCommand() *cobra.Command {
 	flags := cmd.Flags()
 	flags.StringVar(
 		&req.Type, "type", "daily_activity",
-		"Insight type: daily_activity or agent_analysis",
+		"Insight type: daily_activity, agent_analysis, or tool_effectiveness (requires --session-id)",
 	)
 	flags.StringVar(&req.DateFrom, "date-from", "", "Start date (YYYY-MM-DD)")
 	flags.StringVar(&req.DateTo, "date-to", "", "End date (YYYY-MM-DD)")
 	flags.StringVar(&req.Project, "project", "", "Project to include")
 	flags.StringVar(&req.Prompt, "prompt", "", "Optional focus prompt")
-	flags.StringVar(&req.SessionID, "session-id", "", "Session ID for agent analysis")
+	flags.StringVar(&req.SessionID, "session-id", "", "Session ID for agent_analysis or tool_effectiveness")
 	flags.StringVar(&req.Agent, "agent", "", "Agent used by the server")
 	flags.StringVar(
 		&req.AutomatedScope, "automated-scope", "",
@@ -229,7 +231,7 @@ func resolveInsightTransport(
 		}, token, nil
 	}
 
-	cfg, err := config.LoadPFlags(cmd.Flags())
+	cfg, err := config.LoadPFlagsFor(cmd.Flags(), config.ScopeLocal)
 	if err != nil {
 		return transport{}, "", fmt.Errorf("loading config: %w", err)
 	}
@@ -278,7 +280,12 @@ func doInsightRequest(
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	resp, err := (&http.Client{Timeout: 0}).Do(req)
+	client, err := requestsign.ClientFromEnvironment(baseURL, &http.Client{Timeout: 0})
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	apiclient.ObserveArchiveFreshness(ctx, resp)
 	if err != nil {
 		return nil, err
 	}

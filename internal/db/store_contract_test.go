@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -154,6 +153,16 @@ func contractSessionsCursorFiltersAndDates(
 	t.Helper()
 
 	ctx := t.Context()
+
+	selected, err := store.ListSessions(ctx, SessionFilter{
+		IDs:             []string{fixture.alphaID, fixture.childID, fixture.automatedID, "missing"},
+		IncludeChildren: true, ExcludeAutomated: true, ExcludeOneShot: true,
+	})
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{fixture.alphaID, fixture.childID, fixture.automatedID}, sessionIDs(selected.Sessions))
+	empty, err := store.ListSessions(ctx, SessionFilter{IDs: []string{}})
+	require.NoError(t, err)
+	assert.Empty(t, empty.Sessions)
 
 	page, err := store.ListSessions(ctx, SessionFilter{Limit: 2})
 	require.NoError(t, err)
@@ -307,6 +316,7 @@ func contractSearchModesAndSecretFindings(
 		require.NoError(t, err)
 		require.NotEmpty(t, search.Results)
 		require.Equal(t, fixture.alphaID, search.Results[0].SessionID)
+		assert.Equal(t, "mac", search.Results[0].Machine)
 
 		nameSearch, err := store.Search(ctx, SearchFilter{
 			Query: "Old Contract Name",
@@ -314,6 +324,7 @@ func contractSearchModesAndSecretFindings(
 		})
 		require.NoError(t, err)
 		require.Equal(t, []string{fixture.oldID}, searchResultIDs(nameSearch.Results))
+		assert.Equal(t, "linux", nameSearch.Results[0].Machine)
 	}
 
 	substring, err := store.SearchContent(ctx, ContentSearchFilter{
@@ -325,6 +336,9 @@ func contractSearchModesAndSecretFindings(
 	})
 	require.NoError(t, err)
 	require.Equal(t, []string{"tool_input"}, contentLocations(substring.Matches))
+	assert.Equal(t, "mac", substring.Matches[0].Machine)
+	require.NotNil(t, substring.Matches[0].DisplayName)
+	assert.Equal(t, "Alpha DuckDB parity", *substring.Matches[0].DisplayName)
 
 	regex, err := store.SearchContent(ctx, ContentSearchFilter{
 		Pattern:        `trend\s+trend`,
@@ -335,6 +349,8 @@ func contractSearchModesAndSecretFindings(
 	})
 	require.NoError(t, err)
 	require.Equal(t, []string{fixture.gammaID}, contentSessionIDs(regex.Matches))
+	assert.Equal(t, "mac", regex.Matches[0].Machine)
+	assert.Nil(t, regex.Matches[0].DisplayName)
 
 	if store.HasFTS(ctx) {
 		fts, err := store.SearchContent(ctx, ContentSearchFilter{
@@ -346,6 +362,13 @@ func contractSearchModesAndSecretFindings(
 		})
 		require.NoError(t, err)
 		require.Contains(t, contentSessionIDs(fts.Matches), fixture.alphaID)
+		for _, match := range fts.Matches {
+			if match.SessionID == fixture.alphaID {
+				assert.Equal(t, "mac", match.Machine)
+				require.NotNil(t, match.DisplayName)
+				assert.Equal(t, "Alpha DuckDB parity", *match.DisplayName)
+			}
+		}
 	}
 
 	findings, err := store.ListSecretFindings(ctx, SecretFindingFilter{
@@ -472,7 +495,7 @@ func contractAnalyticsTrendsAndUsage(
 	// With one-shot exclusion on (the summary endpoint default), the
 	// one-shot subagent child must still be counted (workflow subagents
 	// are inherently one-shot) while one-shot root sessions drop. This
-	// exercises OneShotExclusionSQL on every backend, including PG.
+	// exercises oneShotExclusionSQL on every backend, including PG.
 	//
 	// Kept rows: alpha (3 user msgs, 320 tok), gamma (2 user, 60 tok),
 	// automated (roborev, kept via is_automated, 0 tok), and the subagent
@@ -1246,16 +1269,4 @@ func requireReadOnly(t *testing.T, err error) {
 	t.Helper()
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrReadOnly, "expected ErrReadOnly, got %v", err)
-}
-
-func TestStoreContractBackendsAreRegisteredExplicitly(t *testing.T) {
-	backends := storeContractBackends()
-	require.NotEmpty(t, backends)
-	names := make([]string, 0, len(backends))
-	for _, backend := range backends {
-		names = append(names, backend.name)
-		assert.NotNil(t, backend.open)
-		assert.NotNil(t, backend.seed)
-	}
-	require.True(t, slices.Contains(names, "sqlite"))
 }

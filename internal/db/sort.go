@@ -364,8 +364,7 @@ func intValue(get func(*Session) int) func(*Session, SessionFilter) (string, boo
 }
 
 func recentExpr(b *QueryBuilder, _ SessionFilter) string {
-	return "COALESCE(" + b.dialect.timestampExpr("ended_at") + ", " +
-		b.dialect.timestampExpr("started_at") + ", created_at)"
+	return b.activityExpr("")
 }
 
 func startedExpr(b *QueryBuilder, _ SessionFilter) string {
@@ -484,4 +483,29 @@ func SortKeys() []string {
 		keys[i] = s.key
 	}
 	return keys
+}
+
+// NormalizeSessionLimit applies the session list's default and upper bound.
+func NormalizeSessionLimit(limit int) int {
+	if limit <= 0 || limit > MaxSessionLimit {
+		return DefaultSessionLimit
+	}
+	return limit
+}
+
+// BuildSessionPage trims the extra row and encodes the next page's cursor.
+func BuildSessionPage(
+	sessions []Session,
+	total int,
+	f SessionFilter,
+	rs []ResolvedSort,
+	encode func(SessionCursor) string,
+) SessionPage {
+	page := SessionPage{Sessions: sessions, Total: total}
+	if len(sessions) > f.Limit {
+		page.Sessions = sessions[:f.Limit]
+		last := &page.Sessions[f.Limit-1]
+		page.NextCursor = encode(NextSessionCursor(last, rs, total, f))
+	}
+	return page
 }

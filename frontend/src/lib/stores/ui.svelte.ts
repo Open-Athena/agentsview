@@ -33,7 +33,46 @@ type ModalType =
   | "resync"
   | "update"
   | "confirmDelete"
+  | "toolImage"
   | null;
+
+/** A tool call a jump expects at its target message; a rewrite can renumber messages, so the jump checks it. */
+export interface ScrollCall {
+  /** The call's position in its message; undefined when the jump targets the message itself. */
+  index?: number;
+  toolUseId: string;
+  /** Without a tool ID, the transcript revision the link was made from, since position alone can't tell calls apart. */
+  revision?: string;
+  /** The call's tool name and input fingerprint, since some agents derive tool IDs from the call's position. */
+  fingerprint?: string;
+}
+
+/** URL parameters that carry a ScrollCall in a message link. */
+export function scrollCallParams(call: ScrollCall): Record<string, string> {
+  const params: Record<string, string> = {};
+  if (call.index !== undefined) params["call"] = String(call.index);
+  if (call.toolUseId) params["tool_use_id"] = call.toolUseId;
+  else if (call.revision) params["rev"] = call.revision;
+  if (call.index !== undefined && call.fingerprint) params["fp"] = call.fingerprint;
+  return params;
+}
+
+/** Read a ScrollCall back from message-link parameters; undefined when the link names no call or revision. */
+export function parseScrollCall(
+  index?: string,
+  toolUseId?: string,
+  revision?: string,
+  fingerprint?: string,
+): ScrollCall | undefined {
+  const position = index !== undefined && /^\d+$/.test(index) ? Number(index) : undefined;
+  if (position === undefined) return revision ? { toolUseId: "", revision } : undefined;
+  let call: ScrollCall;
+  if (toolUseId) call = { index: position, toolUseId };
+  else if (revision) call = { index: position, toolUseId: "", revision };
+  else call = { index: position, toolUseId: "" };
+  if (fingerprint) call.fingerprint = fingerprint;
+  return call;
+}
 
 /** Block types that can be toggled visible/hidden. */
 export type BlockType = "user" | "assistant" | "thinking" | "tool" | "code" | "system";
@@ -268,6 +307,8 @@ class UIStore {
   selectedOrdinal: number | null = $state(null);
   pendingScrollOrdinal: number | null = $state(null);
   pendingScrollSession: string | null = $state(null);
+  /** The tool call a pending jump expects at its message; null when any message at the ordinal will do. */
+  pendingScrollCall: ScrollCall | null = $state(null);
 
   private localZoomLevel = readStoredZoom();
   zoomLevel: ZoomLevel = $state(this.localZoomLevel ?? ZOOM_DEFAULT);
@@ -544,13 +585,15 @@ class UIStore {
     this.selectedOrdinal = null;
     this.pendingScrollOrdinal = null;
     this.pendingScrollSession = null;
+    this.pendingScrollCall = null;
   }
 
-  scrollToOrdinal(ordinal: number, sessionId?: string) {
+  scrollToOrdinal(ordinal: number, sessionId?: string, call?: ScrollCall) {
     this.followLatest = false;
     this.selectedOrdinal = ordinal;
     this.pendingScrollOrdinal = ordinal;
     this.pendingScrollSession = sessionId ?? null;
+    this.pendingScrollCall = call ?? null;
   }
 
   setFollowLatest(enabled: boolean) {
@@ -560,6 +603,7 @@ class UIStore {
       this.selectedOrdinal = null;
       this.pendingScrollOrdinal = null;
       this.pendingScrollSession = null;
+      this.pendingScrollCall = null;
     }
   }
 

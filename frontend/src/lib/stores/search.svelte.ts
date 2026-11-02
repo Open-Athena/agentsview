@@ -3,6 +3,7 @@ import { SearchService } from "../api/generated/index.js";
 import { ApiError, isAbortError } from "../api/runtime.js";
 import type { DbSearchResult as SearchResult } from "../api/generated/index.js";
 import { resolveRange, type RangeSelection } from "../components/shared/rangeSelection.js";
+import { reportErrorShown, reportTelemetry } from "../utils/telemetry.js";
 
 export type SearchMode = "fulltext" | "semantic" | "hybrid";
 export type SearchSort = "relevance" | "recency";
@@ -133,6 +134,10 @@ export class SearchStore {
   results: PaletteSearchResult[] = $state([]);
   isSearching: boolean = $state(false);
   error: SearchFailure | null = $state(null);
+  // Telemetry counts per palette open: search_run once per mode, and search_empty
+  // once when the open ends on an accepted empty result. endSession() closes it.
+  private reportedModes = new Set<SearchMode>();
+  private endedEmpty = false;
 
   private storage: SearchModeStorage | null;
   private abortController: AbortController | null = null;
@@ -221,7 +226,15 @@ export class SearchStore {
     this.sort = "relevance";
   }
 
+  /** Ends a palette open. Call it before clear(), which discards the outcome. */
+  endSession() {
+    if (this.endedEmpty) reportTelemetry("search_empty");
+    this.endedEmpty = false;
+    this.reportedModes.clear();
+  }
+
   private cancelInFlight() {
+    this.endedEmpty = false;
     this.requestVersion += 1;
     this.abortController?.abort();
     this.abortController = null;
@@ -236,6 +249,10 @@ export class SearchStore {
     this.isSearching = true;
     this.error = null;
     const mode = this.mode;
+    if (!this.reportedModes.has(mode)) {
+      this.reportedModes.add(mode);
+      reportTelemetry("search_run", { query_type: mode === "fulltext" ? "text" : mode });
+    }
     // All time must omit both bounds, rather than use the picker's fallback
     // start date when the earliest archived session is unknown.
     const range =
@@ -278,6 +295,7 @@ export class SearchStore {
 
       if (requestVersion !== this.requestVersion || signal.aborted) return;
       this.results = results;
+      this.endedEmpty = results.length === 0;
       this.error = null;
     } catch (error: unknown) {
       if (requestVersion !== this.requestVersion || signal.aborted || isAbortError(error)) {
@@ -286,6 +304,7 @@ export class SearchStore {
       this.results = [];
       const detail = errorDetail(error);
       this.error = { detail, kind: failureKind(mode, error, detail) };
+      reportErrorShown("search");
     } finally {
       if (requestVersion === this.requestVersion && !signal.aborted) {
         this.isSearching = false;

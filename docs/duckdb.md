@@ -18,20 +18,30 @@ up a PostgreSQL server.
     core extension. Expect rough edges, and treat the Quack remote
     path as suitable for trusted networks only.
 
+Content search matches dialogue for `--in messages` and reasoning for
+`--in thinking` in substring and regex modes. Substring and regex searches
+include reasoning by default; pass `--in messages` to skip it. A regex without a
+literal prefix loads every in-scope body from the selected sources into memory
+before matching and pagination.
+
+A mirror written before dialogue storage (schema version 20 or older) rejects
+reads with a schema compatibility error naming `messages.dialogue_text`. Run
+`agentsview replica duckdb push` to rebuild it before serving it with a newer binary.
+
 ## Quick Start
 
 ```bash
 # Mirror local SQLite into ~/.agentsview/sessions.duckdb
-agentsview duckdb push
+agentsview replica duckdb push
 
 # Check mirror state
-agentsview duckdb status
+agentsview replica duckdb status
 
 # Serve the read-only web UI from the mirror
-agentsview duckdb serve
+agentsview replica duckdb serve
 
 # Keep the mirror current in the foreground
-agentsview duckdb push --watch
+agentsview replica duckdb push --watch
 ```
 
 `duckdb push` accepts the same project-filter and foreground watcher flags as
@@ -55,7 +65,7 @@ watcher cleanly.
 pushes to a remote Quack endpoint. If `[duckdb].url` or
 `AGENTSVIEW_DUCKDB_URL` is configured, push fails immediately with an error
 telling you to unset it for pushes and expose the mirror remotely with
-`agentsview duckdb quack serve` instead. `url` is read-side only, configuring
+`agentsview replica duckdb quack serve` instead. `url` is read-side only, configuring
 `duckdb status` and `duckdb serve`; `token` and `allow_insecure` also
 configure `duckdb quack serve`.
 
@@ -79,14 +89,14 @@ web UI on one machine from a mirror that lives on another:
 
 ```bash
 # Machine A: expose the local mirror over loopback Quack
-agentsview duckdb quack serve \
+agentsview replica duckdb quack serve \
   --bind quack:127.0.0.1:9494 \
   --token "$AGENTSVIEW_DUCKDB_TOKEN"
 
 # Machine B (or another terminal): serve the UI from that endpoint
 AGENTSVIEW_DUCKDB_URL='quack:127.0.0.1:9494' \
 AGENTSVIEW_DUCKDB_TOKEN="$AGENTSVIEW_DUCKDB_TOKEN" \
-agentsview duckdb serve
+agentsview replica duckdb serve
 ```
 
 The client `url` uses the native `quack:HOST:PORT` form. The Quack extension
@@ -185,12 +195,12 @@ Environment variables override the config file:
   rather than the FTS5 index that local SQLite serving uses, so content search
   is slower on large archives.
 - **No Windows ARM64 support** — the upstream `duckdb-go-bindings` ship no
-  prebuilt DuckDB library for `windows/arm64`, so `agentsview duckdb`
+  prebuilt DuckDB library for `windows/arm64`, so `agentsview replica duckdb`
   subcommands report a clear error on that platform. Everything SQLite-backed
   works normally. On all other platforms the DuckDB driver is linked into the
   standard binary (which grows it considerably — this is expected).
 - **The mirror is a disposable derived artifact** — `duckdb push` rebuilds it
-  from scratch (temp file, atomic swap) when the file is missing or damaged,
+  from scratch (rebuild file, atomic swap) when the file is missing or damaged,
   `--full` is passed, the mirror's schema version does not match the running
   binary, the local SQLite data version has changed (for example after a
   resync), the mirror was built from a different SQLite archive than the one
@@ -198,6 +208,26 @@ Environment variables override the config file:
   applies a bounded incremental update that replaces only changed sessions,
   applies recorded deletions, and removes previously mirrored sessions whose
   project has since moved out of the configured scope.
+- **An interrupted rebuild resumes** — a rebuild writes the new mirror to
+  `<mirror-name>.rebuild` in the work directory, newest sessions first, and
+  swaps it in only when it is complete. If the process stops partway, the
+  next push continues that file instead of starting over, even when the
+  existing mirror would accept an incremental push, and reports
+  `resuming an unfinished rebuild`. Sessions the stopped rebuild already
+  wrote are kept unless they changed or were deleted since. The push
+  discards the file and starts over when `--full` is passed or when the
+  local archive, the project scope, the machine name, or the mirror format
+  changed since the rebuild began. When `--full` discards an unfinished
+  rebuild, the push mode line says `discarded an unfinished rebuild`. A
+  rebuild that ended with session errors resumes only while the mirror still
+  needs a rebuild. A manual push also resumes it when other processes have the
+  mirror open and the push has to fall back to a rebuild. The reported reason
+  then names those processes. Otherwise the push deletes the rebuild file after
+  the incremental update runs.
+- **One rebuild at a time** — a push holds a lock beside the rebuild file
+  from the moment it reads the file until the swap. While another push holds
+  it, a watch-mode push waits for a later cycle and a manual push fails. A
+  push also fails while another process has the rebuild file open.
 - **The first push after a resync is always a full rebuild** — the mirror
   records the `database_id` of the SQLite archive generation it was built
   from, and a resync builds a fresh archive with a new `database_id`. A push
@@ -215,7 +245,7 @@ Environment variables override the config file:
   from the mirror by the next incremental push, including when it was
   hard-deleted locally after the move.
 - **Generated artifacts live in a per-mirror work directory** — push and
-  serve keep everything they generate (rebuild temp files, the hardlink
+  serve keep everything they generate (the rebuild file, the hardlink
   aliases serve uses to reopen a replaced mirror) in a private directory
   next to the mirror named `<mirror-path>.agentsview-work`. Stale-artifact
   cleanup only ever deletes inside that directory, so your own files next
@@ -240,7 +270,7 @@ Environment variables override the config file:
   therefore always inspect a served mirror; only DuckDB's exclusive WRITE
   lock conflicts. While serve processes hold the file, an incremental
   push cannot acquire write access: an explicit `duckdb push` falls back
-  to a full rebuild (temp file plus atomic rename, which never opens the
+  to a full rebuild (rebuild file plus atomic rename, which never opens the
   destination for writing), while the automatic pushes of `duckdb push
   --watch` defer instead (logging the deferral) so a long-running serve
   does not turn every changed batch into a full-archive rebuild. A
@@ -254,7 +284,10 @@ Environment variables override the config file:
   development builds are inert and can be deleted. On POSIX platforms,
   where rename is atomic even against an open destination handle, a
   running serve process picks up a rebuilt file automatically (see the
-  reopen behavior above) without needing a restart. On Windows, the serve
-  process's open handle on the destination file can block the rename
-  outright; `duckdb push` retries briefly and then fails with an error
-  asking you to stop the serving process and re-run the push.
+  reopen behavior above) without needing a restart. On Windows the rename
+  uses POSIX semantics, which DuckDB's file handles allow, so a push also
+  replaces a mirror that serve has open, and `duckdb serve` picks it up
+  the same way. A program that holds the mirror open without allowing
+  deletion can still block the rename there; `duckdb push` retries
+  briefly and then fails with an error asking you to close that program
+  and re-run the push.

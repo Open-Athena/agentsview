@@ -15,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/friction"
 	"go.kenn.io/agentsview/internal/ingest"
 	"go.kenn.io/agentsview/internal/postgres"
 	"go.kenn.io/agentsview/internal/rawderive"
@@ -22,7 +23,11 @@ import (
 	"go.kenn.io/agentsview/internal/server"
 )
 
-func rawProcessingVersion() string { return fmt.Sprintf("parser-data-%d", db.CurrentDataVersion()) }
+// Friction rules are part of the version so a rules change reaches existing
+// hosted sessions through the same reparse rollout as a parser change.
+func rawProcessingVersion() string {
+	return fmt.Sprintf("parser-data-%d+%s", db.CurrentDataVersion(), friction.RulesVersion)
+}
 
 // pgRawRuntime owns one bounded sequential worker/maintenance loop. Stop joins
 // all materialization/parser work before custody and database owners may close.
@@ -185,7 +190,7 @@ func prepareHostedPGServe(app config.Config, pg config.PGConfig, basePath string
 		return fail(err)
 	}
 	closeUploads = closeUploadStore
-	opts := []server.Option{server.WithVersion(server.VersionInfo{Version: version, Commit: commit, BuildDate: buildDate, ReadOnly: true, InsightGenerationAvailable: store.InsightGenerationAvailable()}), server.WithDataDir(app.DataDir), server.WithBaseContext(ctx), server.WithRawSyncServices(auth, custody), server.WithRawSyncStatus(metadata), server.WithRawSyncTenant(pg.RawTenant), uploadOption}
+	opts := []server.Option{server.WithVersion(server.VersionInfo{Version: version, Commit: commit, BuildDate: buildDate, ReadOnly: true, InsightGenerationAvailable: store.InsightGenerationAvailable()}), server.WithDataDir(app.DataDir), server.WithBaseContext(ctx), server.WithRawSyncServices(auth, custody), server.WithRawSyncStatus(metadata), server.WithRawSyncJobHealth(metadata), server.WithRawSyncTenant(pg.RawTenant), uploadOption, pgKataConn(app)}
 	if basePath != "" {
 		opts = append(opts, server.WithBasePath(basePath))
 	}
@@ -198,7 +203,7 @@ func prepareHostedPGServe(app config.Config, pg config.PGConfig, basePath string
 
 func newPGHostedProvisionCommand() *cobra.Command {
 	return &cobra.Command{Use: "hosted-provision [target]", Short: "Explicitly provision one hosted tenant schema using the configured owner connection", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		cfg, err := config.LoadMinimal()
+		cfg, err := config.LoadMinimalFor(config.ScopePG)
 		if err != nil {
 			return err
 		}
@@ -230,11 +235,12 @@ func newPGHostedProvisionCommand() *cobra.Command {
 func newPGRawReparseCommand() *cobra.Command {
 	var runID string
 	var batch int
-	cmd := &cobra.Command{Use: "raw-reparse [target]", Short: "Schedule one bounded, resumable batch of current raw heads for this parser version", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		if runID == "" {
-			return errors.New("raw-reparse requires --run-id for its durable checkpoint")
+	var repair bool
+	cmd := &cobra.Command{Use: "raw-reparse [target]", Short: "Schedule current raw heads or repair failed jobs in one bounded batch for this parser version", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		if !repair && strings.TrimSpace(runID) == "" {
+			return errors.New("raw-reparse requires --run-id")
 		}
-		cfg, err := config.LoadMinimal()
+		cfg, err := config.LoadMinimalFor(config.ScopePG)
 		if err != nil {
 			return err
 		}
@@ -246,7 +252,7 @@ func newPGRawReparseCommand() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		if err = pg.ValidateRawDerivation(cfg.RequireAuth); err != nil {
+		if err = cfg.ValidatePGRawDerivation(pg); err != nil {
 			return err
 		}
 		if pg.RawTenant == "" {
@@ -261,6 +267,18 @@ func newPGRawReparseCommand() *cobra.Command {
 		if err != nil {
 			return err
 		}
+		if repair {
+			count, err := sink.RepairFailedJobs(cmd.Context(), rawProcessingVersion(), batch)
+			if err != nil {
+				return err
+			}
+			jobs := "jobs"
+			if count == 1 {
+				jobs = "job"
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Rescheduled %d failed %s\n", count, jobs)
+			return nil
+		}
 		result, err := sink.ScheduleCurrentHeads(cmd.Context(), runID, rawProcessingVersion(), batch)
 		if err != nil {
 			return err
@@ -269,7 +287,10 @@ func newPGRawReparseCommand() *cobra.Command {
 		return nil
 	}}
 	cmd.Flags().StringVar(&runID, "run-id", "", "Durable rollout checkpoint ID; reuse to resume")
-	cmd.Flags().IntVar(&batch, "batch-size", 64, "Maximum current heads in this invocation (1-256)")
+	cmd.Flags().IntVar(&batch, "batch-size", 64, "Maximum current heads to schedule or failed jobs to repair in this invocation (1-256)")
+	cmd.Flags().BoolVar(&repair, "repair", false, "Reschedule failed jobs for this parser version")
+	cmd.MarkFlagsMutuallyExclusive("repair", "run-id")
+	cmd.MarkFlagsOneRequired("repair", "run-id")
 	return cmd
 }
 

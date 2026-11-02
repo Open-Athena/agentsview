@@ -990,6 +990,7 @@ func parseWindsurfSessionContext(
 		virtualPath,
 		project,
 		machine,
+		AgentWindsurf,
 	)
 	if err != nil {
 		return nil, nil, err
@@ -1326,6 +1327,7 @@ func windsurfProviderCapabilities() Capabilities {
 		},
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
+			SessionName:          CapabilitySupported,
 			ToolCalls:            CapabilitySupported,
 			ToolResults:          CapabilitySupported,
 			Thinking:             CapabilitySupported,

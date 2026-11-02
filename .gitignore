@@ -29,6 +29,9 @@ coverage.out
 # Air (live-reload dev server)
 /tmp/
 
+# Frontend scratch directory
+frontend/tmp/
+
 # OS files
 .DS_Store
 Thumbs.db
@@ -63,9 +66,6 @@ docs/.vercel/
 docs/.env*.local
 .vercel
 .env*.local
-
-# SSH test key (extracted from Docker container)
-testdata/ssh/test_key
 
 # Local data
 /data/

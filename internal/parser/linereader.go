@@ -44,12 +44,14 @@ func (cr *countingReader) Read(p []byte) (int, error) {
 // grows on demand up to maxLen. After iteration, call Err() to
 // check for I/O errors (as opposed to normal EOF).
 type lineReader struct {
-	r         *bufio.Reader
-	cr        *countingReader
-	maxLen    int
-	buf       []byte
-	err       error
-	bytesRead int64 // total bytes consumed (from countingReader)
+	r                *bufio.Reader
+	cr               *countingReader
+	maxLen           int
+	buf              []byte
+	err              error
+	bytesRead        int64 // total bytes consumed (from countingReader)
+	terminated       bool  // the returned line ended with a newline
+	skippedOversized bool  // callers requiring complete input must reject skipped records
 }
 
 const maxPooledLineBufferSize = 256 << 10
@@ -80,6 +82,8 @@ func newLineReaderContext(
 	lr.buf = lr.buf[:0]
 	lr.err = nil
 	lr.bytesRead = 0
+	lr.terminated = false
+	lr.skippedOversized = false
 	return lr
 }
 
@@ -98,6 +102,8 @@ func releaseLineReader(lr *lineReader) {
 	lr.maxLen = 0
 	lr.err = nil
 	lr.bytesRead = 0
+	lr.terminated = false
+	lr.skippedOversized = false
 	lineReaderPool.Put(lr)
 }
 
@@ -149,6 +155,8 @@ func (lr *lineReader) updateBytesRead() {
 }
 
 func (lr *lineReader) readLineBytes() ([]byte, error) {
+	start := lr.bytesRead
+	lr.terminated = false
 	lr.buf = lr.buf[:0]
 	oversized := false
 
@@ -175,7 +183,9 @@ func (lr *lineReader) readLineBytes() ([]byte, error) {
 		// a second initialScanBufSize scratch buffer for every file.
 		if len(lr.buf) == 0 && !isPrefix {
 			lr.updateBytesRead()
+			lr.terminated = lr.bytesRead-start > int64(len(chunk))
 			if len(chunk) > lr.maxLen {
+				lr.skippedOversized = true
 				return nil, nil
 			}
 			return chunk, nil
@@ -184,6 +194,7 @@ func (lr *lineReader) readLineBytes() ([]byte, error) {
 		lr.buf = append(lr.buf, chunk...)
 
 		if len(lr.buf) > lr.maxLen {
+			lr.skippedOversized = true
 			oversized = true
 			lr.buf = lr.buf[:0]
 			if !isPrefix {
@@ -199,6 +210,7 @@ func (lr *lineReader) readLineBytes() ([]byte, error) {
 		}
 	}
 
+	lr.terminated = lr.bytesRead-start > int64(len(lr.buf))
 	return lr.buf, nil
 }
 

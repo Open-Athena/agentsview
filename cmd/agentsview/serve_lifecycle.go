@@ -4,15 +4,19 @@ package main
 
 import (
 	"context"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"go.kenn.io/agentsview/internal/apiclient"
+	"go.kenn.io/agentsview/internal/codexcloud"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/kit/daemon"
 )
@@ -157,6 +161,11 @@ func runServeStatus(cfg config.Config) {
 			for _, line := range serveStatusLines(rt) {
 				fmt.Println(line)
 			}
+			for _, line := range codexCloudStatusLines(
+				context.Background(), urlFromDaemonRuntime(rt), cfg.AuthToken,
+			) {
+				fmt.Println(line)
+			}
 			return
 		}
 	}
@@ -194,6 +203,62 @@ func runServeStatus(cfg config.Config) {
 		return
 	}
 	fmt.Println("No agentsview server is running.")
+}
+
+// codexCloudStatusTimeout bounds the codex-cloud status request.
+const codexCloudStatusTimeout = 5 * time.Second
+
+// codexCloudStatusLines reads the daemon's codex-cloud status rows. An
+// older daemon has no such route and adds no lines. A failure gets a plain
+// sentence; the request's own error is noise next to the daemon lines.
+func codexCloudStatusLines(ctx context.Context, baseURL, authToken string) []string {
+	unavailable := func(reason string) []string {
+		return []string{"  codex-cloud status unavailable: " + reason}
+	}
+	api, err := apiclient.NewHTTPClient(baseURL, authToken, &http.Client{Timeout: codexCloudStatusTimeout})
+	if err != nil {
+		return unavailable(fmt.Sprintf("the server address %s could not be used.", baseURL))
+	}
+	resp, err := api.GetAPIV1CodexCloudStatusWithResponse(ctx)
+	if resp == nil {
+		if netErr, ok := errors.AsType[net.Error](err); ok && netErr.Timeout() {
+			return unavailable(fmt.Sprintf("the server did not answer within %d seconds. It may be busy; "+
+				"run `agentsview serve status` again in a moment.", int(codexCloudStatusTimeout.Seconds())))
+		}
+		return unavailable("the server could not be reached. It may have just stopped; " +
+			"run `agentsview serve status` again to check.")
+	}
+	if resp.HTTPResponse != nil {
+		defer resp.HTTPResponse.Body.Close()
+	}
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotFound:
+		return nil
+	case http.StatusUnauthorized:
+		if authToken == "" {
+			return unavailable("the server needs an auth token, and this command has none. " +
+				"Set auth_token in config.toml, or AGENTSVIEW_AUTH_TOKEN, to the server's token.")
+		}
+		return unavailable("the server did not accept this command's auth token. " +
+			"Check that auth_token in config.toml, or AGENTSVIEW_AUTH_TOKEN, matches the server's.")
+	default:
+		return unavailable(fmt.Sprintf("the server answered with HTTP status %d. The AgentsView log, "+
+			"debug.log in its data directory, may say why.", resp.StatusCode))
+	}
+	var rows []codexcloud.HomeStatus
+	if err := json.Unmarshal(resp.Body, &rows); err != nil {
+		return unavailable("the server's reply could not be read. " +
+			"The server may run a different AgentsView version than this command; " +
+			"after an upgrade, restart the server so both match.")
+	}
+	var lines []string
+	for _, row := range rows {
+		for _, line := range codexcloud.StatusLines(row) {
+			lines = append(lines, "  "+line)
+		}
+	}
+	return lines
 }
 
 // serveStatusLines renders the human-readable status of a discovered daemon.
@@ -273,10 +338,8 @@ func serveIncompatibleDaemonStatusLines(
 
 // runServeStop terminates every agentsview server owning this data dir whose
 // identity it can confirm. A record is signalled only once its PID is confirmed
-// to be the recorded daemon -- either it answers the ping probe, or its process
-// start time predates the record (proving the PID was not reused by an
-// unrelated process). This keeps a hung-but-alive daemon stoppable while never
-// signalling a stale record whose PID belongs to something else.
+// to identify the recorded daemon in the caller's PID namespace. A matching
+// process identity also keeps a hung-but-alive daemon stoppable.
 func runServeStop(cfg config.Config) {
 	records, _ := localWritableDaemonRecordsWithFallback(
 		cfg.DataDir, cfg.AuthToken,
@@ -389,14 +452,10 @@ func stopWritableDaemonsForUpdate(ctx context.Context,
 }
 
 // stopTargetConfirmed reports whether rec's live PID is safe to signal as the
-// recorded agentsview daemon. It accepts the target when the daemon answers the
-// ping probe, or, for a daemon that is alive but no longer answering, when the
-// process create time exactly matches the one recorded at startup. Either check
-// rules out a PID that an unrelated process reused after the record was
-// written.
-func stopTargetConfirmed(rec daemon.RuntimeRecord, authToken string) bool {
-	return daemonRecordPingConfirmed(rec, authToken) ||
-		processIdentityConfirmed(rec)
+// recorded agentsview daemon. A ping identifies the HTTP endpoint, but its PID
+// may identify a different process in the caller's PID namespace.
+func stopTargetConfirmed(rec daemon.RuntimeRecord, _ string) bool {
+	return processIdentityConfirmed(rec)
 }
 
 // daemonRecordPingConfirmed reports whether rec's PID answers the kit ping
@@ -423,18 +482,16 @@ func probeDaemonRecord(
 }
 
 // processIdentityConfirmed reports whether the process now holding rec.PID is
-// the same one that wrote the record, by matching the OS create time persisted
-// at startup against the live process's current create time.
+// the same one that wrote the record. Kit's v2 identity takes precedence when
+// present; older records use the persisted create time.
 func processIdentityConfirmed(rec daemon.RuntimeRecord) bool {
-	return processCreateTimeMatches(rec.PID, rec.Metadata[runtimeCreateTime])
+	return runtimeRecordIdentityState(rec) == processCreateTimeMatch
 }
 
 // processCreateTimeMatches reports whether pid's current OS create time equals
-// recordedMillis. The match is exact: the create time is fixed for a given
-// process, so a PID reused by a different process yields a different value and
-// is rejected -- there is no slack window an impostor could fall into. An empty
-// or unparseable recordedMillis (legacy, or unreadable at write time) returns
-// false.
+// recordedMillis. This is the compatibility check for startup snapshots,
+// managed children, and records without a Kit v2 identity. The match is exact.
+// An empty or unparseable recordedMillis returns false.
 func processCreateTimeMatches(pid int, recordedMillis string) bool {
 	return processCreateTimeStateForPID(
 		pid, recordedMillis,
@@ -512,22 +569,29 @@ func caddyStopRecord(pid int, createTime string) daemon.RuntimeRecord {
 	}
 }
 
-// stopDaemonProcess signals the daemon to shut down, waits up to grace for it
-// to exit, then escalates to a forced kill. Before escalating it re-checks that
-// the live PID is still the recorded daemon, so a PID reused during the grace
-// wait is never killed. It cleans up the runtime record if the process leaves
-// one behind.
+// stopDaemonProcess confirms the local process identity before each signal,
+// asks the daemon to shut down, then escalates to a forced kill after grace.
+// It cleans up the runtime record if the process leaves one behind.
 func stopDaemonProcess(rec daemon.RuntimeRecord, grace time.Duration) error {
 	return stopDaemonProcessWithIdentity(
-		rec, grace, processCreateTimeStateForPID,
+		rec, grace, runtimeRecordIdentityState,
 	)
 }
 
 func stopDaemonProcessWithIdentity(
 	rec daemon.RuntimeRecord,
 	grace time.Duration,
-	identityStateForPID func(int, string) processCreateTimeState,
+	identityStateForRecord func(daemon.RuntimeRecord) processCreateTimeState,
 ) error {
+	switch identityStateForRecord(rec) {
+	case processCreateTimeMismatch:
+		removeRuntimeRecordFile(rec)
+		return nil
+	case processCreateTimeMatch:
+		// Only a matching local process identity authorizes the first signal.
+	default:
+		return processIdentityUnconfirmedError(rec, "before graceful shutdown")
+	}
 	proc, err := os.FindProcess(rec.PID)
 	if err != nil {
 		return fmt.Errorf("finding process: %w", err)
@@ -539,9 +603,7 @@ func stopDaemonProcessWithIdentity(
 		removeRuntimeRecordFile(rec)
 		return nil
 	}
-	identityState := identityStateForPID(
-		rec.PID, rec.Metadata[runtimeCreateTime],
-	)
+	identityState := identityStateForRecord(rec)
 	switch identityState {
 	case processCreateTimeMismatch:
 		// The PID is alive but its identity no longer matches the record: the
@@ -564,9 +626,7 @@ func stopDaemonProcessWithIdentity(
 		removeRuntimeRecordFile(rec)
 		return nil
 	}
-	identityState = identityStateForPID(
-		rec.PID, rec.Metadata[runtimeCreateTime],
-	)
+	identityState = identityStateForRecord(rec)
 	switch identityState {
 	case processCreateTimeMismatch:
 		// The daemon exited after SIGKILL and the PID was reused. The record

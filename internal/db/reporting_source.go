@@ -18,6 +18,8 @@ type reportingSourceLoadStats struct {
 }
 
 type reportingExportSource struct {
+	localMachineID      string
+	machineAliases      map[string]string
 	activitySessions    []reportingSourceSession
 	activityEvents      []activity.ActivityEvent
 	usageSessions       []activity.SessionMeta
@@ -40,6 +42,9 @@ type reportingSourceSession struct {
 }
 
 type reportingDaySource struct {
+	localMachineID   string
+	machineAliases   map[string]string
+	archiveID        string
 	activitySessions []activity.SessionMeta
 	activityIDs      []string
 	activityEvents   []activity.ActivityEvent
@@ -109,8 +114,8 @@ func (db *DB) loadReportingExportSource(
 		return source, err
 	}
 
-	lowerBound := paddedUTCBound(start.UTC().Format(time.RFC3339), -14)
-	upperBound := paddedUTCBound(end.UTC().Format(time.RFC3339), 14)
+	lowerBound := PaddedUTCBound(start.UTC().Format(time.RFC3339), -14)
+	upperBound := PaddedUTCBound(end.UTC().Format(time.RFC3339), 14)
 	usageSessions, usageIDs, err := db.reportingUsageSessionsFrom(
 		ctx, tx, lowerBound, upperBound,
 	)
@@ -158,7 +163,7 @@ func (db *DB) loadReportingExportSource(
 	}
 
 	allSessions := mergeReportingSessions(sessions, usageSessions)
-	labels := activityReportProjectLabels(allSessions)
+	labels := activity.ProjectLabels(allSessions)
 	observations := []export.ProjectIdentityObservation{}
 	archiveScope := export.IdentityScope{}
 	if len(labels) > 0 || schemaVersion == export.ReportingJointSchemaVersion {
@@ -233,8 +238,8 @@ func (src reportingExportSource) forDate(
 		}
 	}
 
-	lowerBound := paddedUTCBound(date.Format(time.RFC3339), -14)
-	upperBound := paddedUTCBound(end.Format(time.RFC3339), 14)
+	lowerBound := PaddedUTCBound(date.Format(time.RFC3339), -14)
+	upperBound := PaddedUTCBound(end.Format(time.RFC3339), 14)
 	usageCandidates := make([]activityReportUsageCandidate, 0, len(src.usageCandidates))
 	usageIDs := make(map[string]struct{}, len(src.usageCandidates))
 	for _, candidate := range src.usageCandidates {
@@ -260,7 +265,7 @@ func (src reportingExportSource) forDate(
 	}
 
 	allSessions := mergeReportingSessions(selectedSessions, usageSessions)
-	labels := activityReportProjectLabels(allSessions)
+	labels := activity.ProjectLabels(allSessions)
 	labelSet := make(map[string]struct{}, len(labels))
 	for _, label := range labels {
 		labelSet[label] = struct{}{}
@@ -287,6 +292,9 @@ func (src reportingExportSource) forDate(
 		}
 	}
 	return reportingDaySource{
+		localMachineID:   src.localMachineID,
+		machineAliases:   src.machineAliases,
+		archiveID:        src.archiveScope.ArchiveID,
 		activitySessions: selectedSessions,
 		activityIDs:      activityIDs,
 		activityEvents:   activityEvents,
@@ -328,7 +336,7 @@ func reportingCreatedAtFrom(
 	rawValues := make(map[string]string, len(ids))
 	parsedValues := make(map[string]time.Time, len(ids))
 	if err := queryChunked(ids, func(chunk []string) error {
-		placeholders, args := inPlaceholders(chunk)
+		placeholders, args := InPlaceholders(chunk)
 		rows, err := q.QueryContext(
 			ctx,
 			`SELECT id, created_at FROM sessions WHERE id IN `+placeholders,
@@ -366,7 +374,7 @@ func reportingTerminalTimestampsFrom(
 ) (map[string]string, error) {
 	out := make(map[string]string, len(ids))
 	err := queryChunked(ids, func(chunk []string) error {
-		placeholders, args := inPlaceholders(chunk)
+		placeholders, args := InPlaceholders(chunk)
 		args = append(args, lowerBound)
 		rows, err := q.QueryContext(ctx, `
 			SELECT session_id, MAX(timestamp)

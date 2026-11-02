@@ -24,6 +24,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/kit/daemon"
+	"go.kenn.io/kit/embedclient"
+	"go.kenn.io/kit/embedconfig"
 	kitvec "go.kenn.io/kit/vector"
 	"go.kenn.io/kit/vector/sqlitevec"
 
@@ -245,7 +247,7 @@ func TestNewVectorEncoderWiresOllamaCPUFallback(t *testing.T) {
 				OllamaCPUFallback: true,
 			},
 		},
-	}, "local", "", false)
+	}, "local", embedconfig.RoleDocument, false)
 	require.NoError(t, err)
 
 	out, err := enc(t.Context(), []string{"alpha"})
@@ -557,7 +559,9 @@ func TestImportedOnlyRecallEmbeddingsBuildAndVectorQueryEndToEnd(t *testing.T) {
 // TestRoleAwarePrefixesReachBuildAndSearch exercises the user-visible role
 // split through a real direct build, vectors.db, and SQLite semantic search.
 // The embeddings server observes document-prefixed build inputs and a
-// query-prefixed search input, with the shared suffix applied last.
+// query-prefixed search input, with the shared suffix applied last. Changing
+// any part of the input recipe makes search refuse the old generation
+// without sending the query to the endpoint.
 func TestRoleAwarePrefixesReachBuildAndSearch(t *testing.T) {
 	dataDir := t.TempDir()
 	seedEmbeddableArchive(t, dataDir)
@@ -601,16 +605,22 @@ func TestRoleAwarePrefixesReachBuildAndSearch(t *testing.T) {
 	require.NotNil(t, closeVector)
 	t.Cleanup(func() { require.NoError(t, closeVector()) })
 
-	result, err := database.SearchContent(t.Context(), db.ContentSearchFilter{
+	filter := db.ContentSearchFilter{
 		Pattern:        "find greeting",
 		Mode:           "semantic",
 		Limit:          5,
 		IncludeOneShot: true,
-	})
+	}
+	result, err := database.SearchContent(t.Context(), filter)
 	require.NoError(t, err)
 	require.NotEmpty(t, result.Matches,
 		"semantic search should return the indexed session")
 
+	capturedCount := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(captured)
+	}
 	mu.Lock()
 	got := append([]string(nil), captured...)
 	mu.Unlock()
@@ -618,6 +628,31 @@ func TestRoleAwarePrefixesReachBuildAndSearch(t *testing.T) {
 	assert.Contains(t, got, "document: hello there<eos>")
 	assert.Contains(t, got, "document: hi back\n\nand a follow-up thought<eos>")
 	assert.Contains(t, got, "query: find greeting<eos>")
+
+	for _, change := range []struct {
+		name  string
+		apply func(*config.VectorEmbeddingsConfig)
+	}{
+		{"query prefix", func(c *config.VectorEmbeddingsConfig) { c.QueryPrefix = "q: " }},
+		{"document prefix", func(c *config.VectorEmbeddingsConfig) { c.DocumentPrefix = "d: " }},
+		{"suffix", func(c *config.VectorEmbeddingsConfig) { c.InputSuffix = "" }},
+		{"requested dimensions", func(c *config.VectorEmbeddingsConfig) { c.RequestDimensions = true }},
+	} {
+		t.Run("stale "+change.name, func(t *testing.T) {
+			changed := cfg
+			change.apply(&changed.Vector.Embeddings)
+			closeChanged := installDirectVectorSearcher(changed, database)
+			require.NotNil(t, closeChanged)
+			t.Cleanup(func() { require.NoError(t, closeChanged()) })
+			before := capturedCount()
+
+			result, err := database.SearchContent(t.Context(), filter)
+			require.ErrorIs(t, err, db.ErrSemanticUnavailable)
+			assert.Empty(t, result.Matches)
+			assert.Equal(t, before, capturedCount(),
+				"a stale generation must be refused before the query is encoded")
+		})
+	}
 }
 
 func TestRunDirectBuildPrintsFailedAttemptResult(t *testing.T) {
@@ -643,10 +678,7 @@ func TestRunDirectBuildPrintsFailedAttemptResult(t *testing.T) {
 	require.NoError(t, raw.Close())
 
 	failingEncoder := func(context.Context, []string) ([][]float32, error) {
-		return nil, &vector.HTTPStatusError{
-			Status: http.StatusBadRequest,
-			Body:   "input exceeds token limit",
-		}
+		return nil, &embedclient.APIError{StatusCode: http.StatusBadRequest, Reason: embedclient.ReasonInputTooLong}
 	}
 	m := vector.NewManager(ix, src, vector.EncoderSet{
 		Default: "default",

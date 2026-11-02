@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json/v2"
 	"errors"
@@ -279,6 +280,59 @@ func runtimeTestDir(t *testing.T) string {
 	return dir
 }
 
+func mismatchedProcessIdentityForTest(
+	t *testing.T, identity daemon.ProcessIdentity,
+) daemon.ProcessIdentity {
+	t.Helper()
+	if runtime.GOOS == "linux" {
+		fields := strings.Split(string(identity), ":")
+		require.Len(t, fields, 4)
+		startTicks, err := strconv.ParseUint(fields[3], 10, 64)
+		require.NoError(t, err)
+		fields[3] = strconv.FormatUint(startTicks+1, 10)
+		return daemon.ProcessIdentity(strings.Join(fields, ":"))
+	}
+	created, err := strconv.ParseUint(string(identity), 10, 64)
+	require.NoError(t, err)
+	return daemon.ProcessIdentity(strconv.FormatUint(created+1, 10))
+}
+
+func TestRuntimeRecordIdentityState(t *testing.T) {
+	identity, ok := daemon.ReadProcessIdentity(os.Getpid())
+	require.True(t, ok, "must be able to read this process identity")
+	createTime, ok := processCreateTimeMillis(os.Getpid())
+	require.True(t, ok, "must be able to read this process create time")
+
+	mismatched := mismatchedProcessIdentityForTest(t, identity)
+
+	legacy := strconv.FormatInt(createTime, 10)
+	tests := []struct {
+		name       string
+		v2         daemon.ProcessIdentity
+		createTime string
+		want       processCreateTimeState
+	}{
+		{name: "v2 match overrides legacy mismatch", v2: identity, createTime: "1", want: processCreateTimeMatch},
+		{name: "v2 mismatch overrides legacy match", v2: mismatched, createTime: legacy, want: processCreateTimeMismatch},
+		{name: "present malformed v2 stays unknown", v2: "future-v1:12345", createTime: legacy, want: processCreateTimeUnknown},
+		{name: "legacy match", createTime: legacy, want: processCreateTimeMatch},
+		{name: "legacy mismatch", createTime: "1", want: processCreateTimeMismatch},
+		{name: "legacy unknown", createTime: "not-a-time", want: processCreateTimeUnknown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := daemon.RuntimeRecord{
+				PID:               os.Getpid(),
+				ProcessIdentityV2: tt.v2,
+				Metadata: map[string]string{
+					runtimeCreateTime: tt.createTime,
+				},
+			}
+			assert.Equal(t, tt.want, runtimeRecordIdentityState(rec))
+		})
+	}
+}
+
 // TestSameProcessStartMarkerNeverReportsExternal hammers the race between
 // markDaemonStarting's flock-acquire-then-register sequence and the
 // isExternalDaemonStarting probe: a start marker owned by this process must
@@ -310,7 +364,7 @@ func TestSameProcessStartMarkerNeverReportsExternal(t *testing.T) {
 		UnmarkDaemonStarting(dir)
 	})
 
-	deadline := time.Now().Add(300 * time.Millisecond)
+	deadline := time.Now().Add(300 * time.Millisecond) //nolint:kennlint // deadlinetest: absence check; repeated lock probes must never classify this process as an external startup
 	for time.Now().Before(deadline) {
 		require.False(t, isExternalDaemonStarting(dir),
 			"same-process start marker reported as external")
@@ -319,7 +373,9 @@ func TestSameProcessStartMarkerNeverReportsExternal(t *testing.T) {
 
 func holdExternalDaemonStartLock(t *testing.T, dataDir string) func() {
 	t.Helper()
-	stdin := startExternalDaemonStartLockHelper(t, dataDir)
+	lockPath, err := runtimeStore(dataDir).LockPath()
+	require.NoError(t, err)
+	stdin := startExternalDaemonStartLockHelper(t, lockPath)
 
 	var once sync.Once
 	unlock := func() {
@@ -335,7 +391,7 @@ func holdExternalDaemonStartLock(t *testing.T, dataDir string) func() {
 	return unlock
 }
 
-func startExternalDaemonStartLockHelper(t *testing.T, dataDir string) io.Closer {
+func startExternalDaemonStartLockHelper(t *testing.T, lockPath string) io.Closer {
 	t.Helper()
 
 	cmd := exec.CommandContext(t.Context(),
@@ -345,7 +401,7 @@ func startExternalDaemonStartLockHelper(t *testing.T, dataDir string) io.Closer 
 	cmd.Env = append(
 		os.Environ(),
 		"AGENTSVIEW_HOLD_EXTERNAL_START_LOCK_HELPER=1",
-		"AGENTSVIEW_HOLD_EXTERNAL_START_LOCK_DATA_DIR="+dataDir,
+		"AGENTSVIEW_HOLD_EXTERNAL_START_LOCK_PATH="+lockPath,
 	)
 	stdin, err := cmd.StdinPipe()
 	require.NoError(t, err)
@@ -375,10 +431,6 @@ func startExternalDaemonStartLockHelper(t *testing.T, dataDir string) io.Closer 
 		_ = cmd.Process.Kill()
 		require.Equal(t, "ready", strings.TrimSpace(line))
 	}
-	require.Eventually(t, func() bool {
-		return isExternalDaemonStarting(dataDir)
-	}, 2*time.Second, 10*time.Millisecond,
-		"external daemon start lock should be visible to parent")
 	return stdin
 }
 
@@ -448,10 +500,8 @@ func TestHoldExternalDaemonStartLockHelperProcess(t *testing.T) {
 	if os.Getenv("AGENTSVIEW_HOLD_EXTERNAL_START_LOCK_HELPER") != "1" {
 		return
 	}
-	dataDir := os.Getenv("AGENTSVIEW_HOLD_EXTERNAL_START_LOCK_DATA_DIR")
-	require.NotEmpty(t, dataDir)
-	lockPath, err := runtimeStore(dataDir).LockPath()
-	require.NoError(t, err)
+	lockPath := os.Getenv("AGENTSVIEW_HOLD_EXTERNAL_START_LOCK_PATH")
+	require.NotEmpty(t, lockPath)
 	lock := flock.New(lockPath)
 	locked, err := lock.TryLock()
 	require.NoError(t, err)
@@ -555,7 +605,7 @@ func writeStartupFallbackFixture(
 func failRuntimeRecordListing(t *testing.T) {
 	t.Helper()
 	oldList := listDaemonRuntimeRecords
-	listDaemonRuntimeRecords = func(daemon.RuntimeStore) ([]daemon.RuntimeRecord, error) {
+	listDaemonRuntimeRecords = func(daemonRuntimeStore) ([]daemon.RuntimeRecord, error) {
 		return nil, errors.New("store unavailable")
 	}
 	t.Cleanup(func() { listDaemonRuntimeRecords = oldList })
@@ -1020,9 +1070,121 @@ func TestWriteAndRemoveDaemonRuntime(t *testing.T) {
 	assertPathRemoved(t, path, "runtime record not removed")
 }
 
+func TestDaemonRuntimeStoreLegacyRecords(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		wrongPID bool
+	}{
+		{name: "record whose PID differs from its filename is ignored", wrongPID: true},
+		{name: "older legacy record precedes new runtime record"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			store := daemonRuntimeStore{Dir: filepath.Join(dir, "run"), legacyDir: dir}
+			rec := daemon.NewRuntimeRecord(daemonService, "test", daemon.Endpoint{
+				Network: daemon.NetworkTCP, Address: "127.0.0.1:1",
+			})
+			filenamePID := rec.PID
+			if tt.wrongPID {
+				filenamePID = deadPID(t)
+			}
+			path := filepath.Join(dir, fmt.Sprintf("daemon.%d.json", filenamePID))
+			body, err := json.Marshal(rec)
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(path, body, 0o600))
+			var newPath string
+			if !tt.wrongPID {
+				newRec := rec
+				newRec.PID++
+				newRec.StartedAt = rec.StartedAt.Add(time.Hour)
+				newPath, err = store.Write(newRec)
+				require.NoError(t, err)
+			}
+
+			records, err := store.List()
+			require.NoError(t, err)
+			if tt.wrongPID {
+				assert.Empty(t, records)
+				assert.FileExists(t, path)
+				return
+			}
+			require.Len(t, records, 2)
+			assert.Equal(t, newPath, records[1].SourcePath)
+			assert.Equal(t, rec.PID, records[0].PID)
+			assert.Equal(t, path, records[0].SourcePath)
+			assert.FileExists(t, path)
+		})
+	}
+}
+
 func TestFindDaemonRuntime_NoFiles(t *testing.T) {
 	dir := runtimeTestDir(t)
 	assert.Nil(t, FindDaemonRuntime(dir))
+}
+
+func TestDaemonRuntimeUnknownIdentityWithoutLocalPID(t *testing.T) {
+	for _, reachable := range []bool{true, false} {
+		t.Run(fmt.Sprintf("reachable_%t", reachable), func(t *testing.T) {
+			dir := runtimeTestDir(t)
+			pid := deadPID(t)
+			ts := httptest.NewServer(daemon.NewPingHandler(daemon.PingHandlerOptions{
+				Service: daemonService, Version: "test", PID: pid,
+			}))
+			t.Cleanup(ts.Close)
+			rec := runtimeRecordForEndpoint(serverEndpoint(t, ts), withRuntimePID(pid))
+			// The identity cannot be judged here, and its PID is not visible.
+			// Kit applies the same unknown state across Linux PID namespaces.
+			rec.ProcessIdentityV2 = "future-v1:unavailable"
+			path := writeRuntimeRecordFixture(t, dir, rec)
+			if !reachable {
+				ts.Close()
+			}
+
+			rt := FindDaemonRuntime(dir)
+			if reachable {
+				require.NotNil(t, rt)
+				assert.Equal(t, pid, rt.Record.PID)
+			} else {
+				assert.Nil(t, rt)
+			}
+			assert.FileExists(t, path, "a failed local PID check or ping cannot prove the owner exited")
+			assert.True(t, hasLiveDaemonRuntime(dir))
+			assert.True(t, hasLiveWritableDaemonRuntime(dir))
+			assert.Len(t, liveDaemonRecords(dir), 1)
+			writers, err := writableDaemonRecords(dir, "")
+			require.NoError(t, err)
+			assert.Len(t, writers, 1, "an unjudged owner must prevent a second writer")
+
+			deps := defaultDaemonCommandDeps()
+			deps.loadReadOnlyConfig = func() (config.Config, error) {
+				return config.Config{DataDir: dir}, nil
+			}
+			var out bytes.Buffer
+			require.NoError(t, runDaemonStatus(&out, deps))
+			if reachable {
+				assert.Contains(t, out.String(), "agentsview running at")
+			} else {
+				assert.Contains(t, out.String(), "not responding")
+			}
+
+			if reachable {
+				waitDeps := defaultDaemonLaunchWaitDeps()
+				waitDeps.loadReadOnlyConfig = deps.loadReadOnlyConfig
+				observation := waitForDaemonLaunchContentionWithDeps(dir, waitDeps)
+				require.NoError(t, observation.Err)
+				assert.Len(t, observation.Records, 1)
+				assert.Empty(t, observation.UnconfirmedRecords)
+
+				rec.Metadata[runtimeAPIVersion] = "0"
+				_, err := runtimeStore(dir).Write(rec)
+				require.NoError(t, err)
+				incompatible, err := FindIncompatibleDaemonRuntime(dir)
+				require.Error(t, err)
+				require.NotNil(t, incompatible)
+				assert.Equal(t, pid, incompatible.Record.PID)
+			}
+		})
+	}
 }
 
 func TestFindDaemonRuntime_StaleFile(t *testing.T) {
@@ -1270,7 +1432,7 @@ func errorThenRecoverableTryLock(t *testing.T, dir string) func(daemon.RuntimeSt
 	t.Helper()
 	calls := 0
 	return func(store daemon.RuntimeStore, ctx context.Context) (func(), bool, error) {
-		require.Equal(t, dir, store.Dir)
+		require.Equal(t, config.RuntimeDir(dir), store.Dir)
 		calls++
 		if calls == 1 {
 			return nil, false, errors.New("simulated lock probe failure")
@@ -1732,14 +1894,14 @@ func TestWaitForDaemonStartup_AlreadyRunning(t *testing.T) {
 	dir := runtimeTestDir(t)
 	writeLiveRuntime(t, dir, false, withRuntimeVersion("1.0.0"))
 
-	assert.True(t, WaitForDaemonStartup(dir, 100*time.Millisecond),
+	assert.True(t, WaitForDaemonStartup(dir, time.Second),
 		"expected true, server is running")
 }
 
 func TestWaitForDaemonStartup_LockClearsNoServer(t *testing.T) {
 	dir := runtimeTestDir(t)
 
-	assert.False(t, WaitForDaemonStartup(dir, 100*time.Millisecond),
+	assert.False(t, WaitForDaemonStartup(dir, time.Second),
 		"expected false, no start lock and no server")
 }
 

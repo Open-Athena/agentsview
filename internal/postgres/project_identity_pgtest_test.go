@@ -11,6 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -226,48 +229,6 @@ func TestSyncProjectIdentityObservationsBatchMatchesSequential(t *testing.T) {
 	assert.Equal(t, batched, readIdentityRows(t, ctx, pg))
 }
 
-func TestPGProjectIdentityAggregatesSourceArchives(t *testing.T) {
-	pgURL := testPGURL(t)
-	const schema = "agentsview_project_identity_selector_test"
-	pg, err := Open(pgURL, schema, true)
-	require.NoError(t, err)
-	defer pg.Close()
-	ctx := context.Background()
-	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
-	require.NoError(t, err)
-	require.NoError(t, EnsureSchema(ctx, pg, schema))
-
-	for i, archiveID := range []string{"archive-a", "archive-b"} {
-		_, err = pg.ExecContext(ctx, `
-			INSERT INTO source_archives (source_archive_id, source_archive_salt)
-			VALUES ($1, $2)`, archiveID, archiveID+"-salt")
-		require.NoError(t, err)
-		_, err = pg.ExecContext(ctx, `
-			INSERT INTO source_project_identity_observations (
-				source_archive_id, source_archive_salt, project, machine,
-				root_path, git_remote, observed_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			archiveID, archiveID+"-salt", "app", "host", "/repo/app",
-			[]string{
-				"https://github.com/acme/app-a.git",
-				"https://github.com/acme/app-b.git",
-			}[i],
-			time.Date(2026, 7, 10, 12, i, 0, 0, time.UTC),
-		)
-		require.NoError(t, err)
-	}
-
-	store := &Store{pg: pg}
-	projects, err := store.BuildProjectIdentityMap(ctx, []string{"app", "missing"})
-	require.NoError(t, err)
-	assert.Equal(t, export.ProjectResolutionAmbiguous, projects["app"].Resolution)
-	assert.Nil(t, projects["app"].Identity)
-	assert.NotEmpty(t, projects["app"].ProjectKey)
-	assert.NotEmpty(t, projects["missing"].ProjectKey)
-	assert.Contains(t, export.ProjectMapForWire(projects), projects["app"].ProjectKey)
-	assert.Contains(t, export.ProjectMapForWire(projects), projects["missing"].ProjectKey)
-}
-
 func TestPGListProjectIdentityObservationsChunksLargeLabelLists(t *testing.T) {
 	pgURL := testPGURL(t)
 	const schema = "agentsview_project_identity_chunk_test"
@@ -325,37 +286,6 @@ func TestPGListProjectIdentityObservationsChunksLargeLabelLists(t *testing.T) {
 		"chunked label lookup must match the unfiltered scan, order included")
 }
 
-func TestPGProjectIdentityLegacySessionsUseDistinctFallbackKeys(t *testing.T) {
-	pgURL := testPGURL(t)
-	const schema = "agentsview_project_identity_legacy_scope_test"
-	pg, err := Open(pgURL, schema, true)
-	require.NoError(t, err)
-	defer pg.Close()
-	ctx := context.Background()
-	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
-	require.NoError(t, err)
-	require.NoError(t, EnsureSchema(ctx, pg, schema))
-	_, err = pg.ExecContext(ctx, `
-		INSERT INTO sessions (id, project, machine, agent)
-		VALUES
-			('legacy-alpha', 'alpha', 'host', 'codex'),
-			('legacy-beta', 'beta', 'host', 'codex')`)
-	require.NoError(t, err)
-
-	store := &Store{pg: pg}
-	first, err := store.BuildProjectIdentityMap(ctx, []string{"alpha", "beta"})
-	require.NoError(t, err)
-	second, err := store.BuildProjectIdentityMap(ctx, []string{"alpha", "beta"})
-	require.NoError(t, err)
-
-	assert.NotEmpty(t, first["alpha"].ProjectKey)
-	assert.NotEmpty(t, first["beta"].ProjectKey)
-	assert.NotEqual(t, first["alpha"].ProjectKey, first["beta"].ProjectKey)
-	assert.Equal(t, first["alpha"].ProjectKey, second["alpha"].ProjectKey)
-	assert.Equal(t, first["beta"].ProjectKey, second["beta"].ProjectKey)
-	assert.Len(t, export.ProjectMapForWire(first), 2)
-}
-
 func TestPGSourceArchiveScopeRejectsSaltMismatch(t *testing.T) {
 	pgURL := testPGURL(t)
 	const schema = "agentsview_project_identity_salt_mismatch_test"
@@ -371,4 +301,37 @@ func TestPGSourceArchiveScopeRejectsSaltMismatch(t *testing.T) {
 		ctx, pg, "archive-a", "salt-a"))
 	err = upsertSourceArchiveScope(ctx, pg, "archive-a", "salt-b")
 	require.ErrorContains(t, err, "archive salt mismatch")
+}
+
+func TestPGUsageGroups(t *testing.T) {
+	const schema = "agentsview_usage_groups_test"
+	pg, err := Open(testPGURL(t), schema, true)
+	require.NoError(t, err)
+	defer pg.Close()
+	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+	require.NoError(t, err)
+	require.NoError(t, EnsureSchema(t.Context(), pg, schema))
+	dbtest.SeedUsageGroups(t, pg)
+	dbtest.AssertUsageGroups(t, &Store{pg: pg})
+	_, err = pg.Exec(`UPDATE sessions SET display_name = 'Individual run' WHERE id = 'group-other'`)
+	require.NoError(t, err)
+	store := &Store{pg: pg}
+	for _, grouped := range []bool{false, true} {
+		rows, err := store.GetTopSessionsByCost(t.Context(), db.UsageFilter{TopSessionsByGroup: grouped}, 100)
+		require.NoError(t, err)
+		byID := make(map[string]db.TopSessionEntry)
+		byGroup := make(map[string]db.TopSessionEntry)
+		for _, row := range rows {
+			byID[row.SessionID] = row
+			if row.Project == "hermes-cron" {
+				byGroup[row.GroupKey] = row
+			}
+		}
+		assert.Equal(t, "Individual run", byID["group-other"].DisplayName)
+		assert.Equal(t, "2026-10-08T12:00:00Z", byID["group-other"].StartedAt)
+		if grouped {
+			assert.Equal(t, "Research digest", byGroup["job-a"].DisplayName)
+			assert.Equal(t, "2026-10-08T12:00:00Z", byGroup["job-a"].StartedAt)
+		}
+	}
 }

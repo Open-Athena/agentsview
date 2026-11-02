@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+
+	"go.kenn.io/agentsview/internal/parser"
 )
 
 func safeRemotePathArchiveName(remotePath string) (string, error) {
@@ -235,8 +237,7 @@ func resolveSymlinksBestEffort(p string) string {
 
 // PathWithinForbiddenRoots reports whether path is a forbidden root or lies
 // beneath one. sep is the path separator of the caller's domain: '/' for
-// remote POSIX paths (see internal/ssh, which builds paths for the resolve
-// script and tar filter), or filepath.Separator for local OS paths. Roots
+// POSIX paths or filepath.Separator for local OS paths. Roots
 // and path are normalized (dot segments resolved, redundant separators
 // collapsed) before comparison, and matching requires a full path-component
 // boundary so sibling names such as .forbidden-provider-backup do not get
@@ -297,17 +298,35 @@ func cleanPathWithSeparator(p string, sep byte) string {
 	return strings.ReplaceAll(cleaned, "/", sepStr)
 }
 
+// splitHermesMemberPath reuses parser.ParseVirtualSourcePath for the "#"
+// member-suffix split, but still finds the physical path's basename itself
+// (LastIndexAny on both separators) rather than through filepath.Base:
+// a remote path can use the other OS's separator convention regardless of
+// the separator this process's filepath package expects.
+func splitHermesMemberPath(source string) (physical, suffix string) {
+	physical, sourceID, ok := parser.ParseVirtualSourcePath(source)
+	if !ok {
+		return source, ""
+	}
+	base := physical[strings.LastIndexAny(physical, `/\`)+1:]
+	if base != "state.db" {
+		return source, ""
+	}
+	return physical, "#" + sourceID
+}
+
 func tempPathToRemotePath(
 	tempPath string,
 	remoteDirs []string,
 	tempDirs []string,
 ) (string, bool) {
+	tempPath, suffix := splitHermesMemberPath(tempPath)
 	for i, tempDir := range tempDirs {
 		rel, ok := localPathRel(tempDir, tempPath)
 		if !ok {
 			continue
 		}
-		return joinRemoteRelative(remoteDirs[i], rel), true
+		return joinRemoteRelative(remoteDirs[i], rel) + suffix, true
 	}
 	return "", false
 }

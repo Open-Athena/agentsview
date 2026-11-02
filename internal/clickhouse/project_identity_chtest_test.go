@@ -4,12 +4,14 @@ package clickhouse
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/export"
 )
 
@@ -31,7 +33,6 @@ func TestProjectInventoryRulesAndCandidates(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, fixtureMachine, rules.Machine)
 	assert.Empty(t, rules.Rules, "no worktree mapping rules seeded")
-	assert.Contains(t, rules.Machines, fixtureMachine)
 
 	projects, err := store.BuildProjectIdentityMap(ctx, []string{"alpha"})
 	require.NoError(t, err)
@@ -46,4 +47,39 @@ func TestProjectInventoryRulesAndCandidates(t *testing.T) {
 	assert.Equal(t, "unavailable", candidates[0].EvidenceKind, "no cwd or identity evidence seeded")
 	assert.False(t, candidates[0].Available)
 	assert.Equal(t, 2, candidates[0].ContributingSessions, "alpha root plus subagent child")
+}
+
+// The project map depends on the set of labels, so callers that list the
+// same labels in another order share one kept map.
+func TestProjectIdentityMapKeptPerLabelSet(t *testing.T) {
+	store, _, _ := newPushedStore(t)
+	ctx := t.Context()
+	first, err := store.BuildProjectIdentityMap(ctx, []string{"alpha", "beta"})
+	require.NoError(t, err)
+	second, err := store.BuildProjectIdentityMap(ctx, []string{"beta", "alpha", "beta"})
+	require.NoError(t, err)
+	require.Equal(t, first, second)
+	require.Len(t, store.projectIdentityMaps.order, 1)
+}
+
+func TestCHUsageGroups(t *testing.T) {
+	store, syncer, local := newPushedStore(t)
+	conn, err := sql.Open("sqlite3", local.Path())
+	require.NoError(t, err)
+	defer conn.Close()
+	dbtest.SeedUsageGroups(t, conn)
+	_, err = syncer.Push(t.Context(), false, nil)
+	require.NoError(t, err)
+	dbtest.AssertUsageGroups(t, store)
+}
+
+func TestProjectRuleMachinesSortCombinedUnion(t *testing.T) {
+	store, _, _ := newPushedStore(t)
+	for _, machine := range []string{"z-machine", "a-machine", "m-machine"} {
+		_, err := store.conn.ExecContext(t.Context(), `INSERT INTO source_worktree_project_mappings (source_archive_id, machine, path_prefix, layout, project, original_project, enabled, updated_at, push_version) VALUES ('archive-order', ?, '/repo', 'explicit', 'alpha', '', true, '', 1)`, machine)
+		require.NoError(t, err)
+	}
+	rules, err := store.ListProjectRules(t.Context(), "")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a-machine", "m-machine", "test-machine", "z-machine"}, rules.Machines)
 }

@@ -30,9 +30,13 @@ type PreparedSession struct {
 	Session     db.Session
 	Messages    []db.Message
 	UsageEvents []db.UsageEvent
-	Signals     db.SessionSignalUpdate
-	Findings    []db.SecretFinding
-	Validation  db.ValidationStats
+	// PlanUsage is the session's plan usage and live-capture coverage
+	// row; nil when the parser reported neither.
+	PlanUsage  *db.SessionPlanUsage
+	Signals    db.SessionSignalUpdate
+	Findings   []db.SecretFinding
+	Friction   db.SessionFrictionUpdate
+	Validation db.ValidationStats
 }
 
 // PrepareCandidate converts and pairs parser output before caller-owned
@@ -47,9 +51,7 @@ func PrepareCandidate(
 	if err != nil {
 		return Candidate{}, err
 	}
-	if options.ToolResultImages == config.ToolResultImagesDrop && !options.ArchiveContent.OmitsToolContent() {
-		messages, _ = db.ProjectToolResultImagesWithoutWriting(messages, options.ToolResultImages, "")
-	}
+	messages = dropToolResultImagesIfPolicy(messages, options)
 	session, err := ConvertSessionContext(ctx, parsed.Session, parsed.Messages)
 	if err != nil {
 		return Candidate{}, err
@@ -65,7 +67,8 @@ func PrepareCandidate(
 }
 
 // Finalize applies post-reconciliation validation, aggregate repair, storage
-// projection, usage conversion, and content-derived state.
+// projection, usage conversion, signals, and secret findings. Friction is
+// computed separately after the caller assigns the final session identity.
 func Finalize(
 	ctx context.Context, candidate Candidate, options ContentOptions,
 ) (PreparedSession, error) {
@@ -149,6 +152,7 @@ func finalize(
 		return PreparedSession{}, err
 	}
 	validation = addValidationStats(validation, usageValidation)
+	session.RelationshipType = db.SessionRelationship(session)
 	session, messages = db.ProjectSessionForStoragePolicy(
 		session, messages, options.ArchiveContent,
 	)
@@ -156,9 +160,16 @@ func finalize(
 	var findings []db.SecretFinding
 	if derive {
 		signalUpdate, findings = ComputeSignalsAndSecrets(session, messages)
+		if options.ArchiveContent.OmitsToolContent() {
+			signalUpdate.ToolObservations = []db.ToolObservation{}
+		}
 	}
 	return PreparedSession{
 		Session: session, Messages: messages, UsageEvents: usageEvents,
+		PlanUsage: ConvertPlanUsage(
+			candidate.Parsed.Session.PlanUsage,
+			candidate.Parsed.Session.CaptureCoverage,
+		),
 		Signals: signalUpdate, Findings: findings, Validation: validation,
 	}, ctx.Err()
 }
@@ -184,7 +195,7 @@ func ApplySessionMessageDerivedFieldsContext(
 		session.UserMessageCount = user
 	}
 	session.IsAutomated = db.IsAutomatedSessionMetadata(
-		session.Agent, session.SessionKind,
+		session.SessionKind,
 	) || db.IsAutomatedTranscript(
 		session.UserMessageCount, messages, session.FirstMessage,
 	)
@@ -256,6 +267,25 @@ func UsageEventTokenTotalsContext(
 		rolled = append(rolled, event)
 	}
 	return parser.UsageEventTokenAggregateContext(ctx, rolled)
+}
+
+// dropToolResultImagesIfPolicy strips inline tool-result images when the
+// live policy drops them and the archive content mode doesn't already omit
+// tool content outright. Any caller that can hand the live parse or an
+// archived transcript back to a reader under ToolResultImagesDrop must call
+// this after that content lands in messages, since merging or restoring
+// prior content can reintroduce images the live policy no longer keeps.
+func dropToolResultImagesIfPolicy(
+	messages []db.Message, options ContentOptions,
+) []db.Message {
+	if options.ToolResultImages != config.ToolResultImagesDrop ||
+		options.ArchiveContent.OmitsToolContent() {
+		return messages
+	}
+	projected, _ := db.ProjectToolResultImagesWithoutWriting(
+		messages, options.ToolResultImages, "",
+	)
+	return projected
 }
 
 func addValidationStats(a, b db.ValidationStats) db.ValidationStats {

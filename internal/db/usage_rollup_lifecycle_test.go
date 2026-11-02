@@ -17,7 +17,6 @@ import (
 
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/money"
-	pricingpkg "go.kenn.io/agentsview/internal/pricing"
 )
 
 func TestUsageTimezoneIdentityUsesNamedZone(t *testing.T) {
@@ -134,6 +133,158 @@ func TestUsageTimezoneIdentitySurvivesLocalInitialization(t *testing.T) {
 	assert.Equal(t, before, after)
 }
 
+// setUsageLocalLocation pins the resolved local zone and clears identities
+// cached under the previous resolution.
+func setUsageLocalLocation(t *testing.T, location *time.Location) {
+	t.Helper()
+	previous := usageLocalLocation
+	usageLocalLocation = func() *time.Location { return location }
+	usageTimezoneIdentityCache.Clear()
+	t.Cleanup(func() {
+		usageLocalLocation = previous
+		usageTimezoneIdentityCache.Clear()
+	})
+}
+
+func TestUsageLocalRequestsShareNamedZoneIdentity(t *testing.T) {
+	newYork, err := time.LoadLocation("America/New_York")
+	require.NoError(t, err)
+	setUsageLocalLocation(t, newYork)
+	want := usageTimezoneIdentityFor(newYork, nil)
+	require.Equal(t, "America/New_York", want.Name)
+
+	for _, filter := range []UsageFilter{
+		{}, {Timezone: "Local"}, {Timezone: "America/New_York"},
+	} {
+		got := usageTimezoneIdentityFor(filter.Location(), nil)
+		assert.Equal(t, want.Key, got.Key, "timezone %q", filter.Timezone)
+	}
+	assert.Equal(t, "UTC", usageTimezoneIdentityFor(
+		UsageFilter{Timezone: "UTC"}.Location(), nil).Name)
+}
+
+func TestUsageCacheBackfillPrunesStaleLocalTimezones(t *testing.T) {
+	newYork, err := time.LoadLocation("America/New_York")
+	require.NoError(t, err)
+	anonymous := time.FixedZone("Local", -5*60*60)
+	tests := []struct {
+		name      string
+		local     *time.Location
+		wantKept  []string
+		wantGone  []string
+		wantZones []string
+	}{
+		{
+			name:      "resolved local zone prunes unnamed sets",
+			local:     newYork,
+			wantKept:  []string{"named"},
+			wantGone:  []string{"local-old", "local-current"},
+			wantZones: []string{"America/New_York"},
+		},
+		{
+			name:      "unresolved local zone keeps its own set",
+			local:     anonymous,
+			wantKept:  []string{"named", "local-current"},
+			wantGone:  []string{"local-old"},
+			wantZones: []string{"Local", "America/New_York"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			usageTimezoneIdentityCache.Clear()
+			t.Cleanup(usageTimezoneIdentityCache.Clear)
+			database := testDB(t)
+			seedUsageSnapshotSession(t, database, "session", "project-a",
+				"2026-08-10T09:00:00Z", 0, 10, "model-a")
+			snapshot, fills, cache := prepareUsageRollupTest(t, database)
+			// The real install path seeds each set, so the fixture tracks the schema.
+			install := func(location *time.Location) string {
+				zoned := snapshot
+				zoned.location = location
+				_, _, err := cache.rollup.Ensure(t.Context(), zoned, fills,
+					export.NewPricingResolver(zoned.PricingRows))
+				require.NoError(t, err)
+				return usageTimezoneIdentityFor(location, nil).Key
+			}
+			named := install(newYork)
+			current := install(anonymous)
+			require.Equal(t, "local:", current[:len("local:")])
+			_, err := cache.db.ExecContext(t.Context(), `UPDATE usage_rollup_timezones
+				SET timezone_key = 'local:old' WHERE timezone_key = ?`, current)
+			require.NoError(t, err)
+			install(anonymous)
+			keys := map[string]string{
+				"named": named, "local-current": current, "local-old": "local:old",
+			}
+			require.Equal(t, 3, usageCacheCount(t, cache, "usage_rollup_installs"))
+			require.Equal(t, 3, usageCacheCount(t, cache, "usage_rollup_days"))
+
+			snapshot.location = tt.local
+			require.NoError(t, database.runUsageCacheBackfillPass(t.Context(), time.Now(), snapshot))
+			locations, err := usageBackfillLocations(t.Context(), cache, tt.local)
+			require.NoError(t, err)
+
+			names := make([]string, 0, len(locations))
+			for _, location := range locations {
+				names = append(names, location.String())
+			}
+			assert.Equal(t, tt.wantZones, names)
+			installsFor := func(key string) int {
+				var count int
+				require.NoError(t, cache.db.QueryRowContext(t.Context(), `SELECT COUNT(*)
+					FROM usage_rollup_installs i JOIN usage_rollup_timezones tz
+					  ON tz.id = i.timezone_id
+					WHERE tz.timezone_key = ?`, key).Scan(&count))
+				return count
+			}
+			for _, label := range tt.wantKept {
+				assert.Equal(t, 1, installsFor(keys[label]), label)
+			}
+			for _, label := range tt.wantGone {
+				assert.Zero(t, installsFor(keys[label]), label)
+			}
+			kept := len(tt.wantKept)
+			assert.Equal(t, kept, usageCacheCount(t, cache, "usage_rollup_timezones"))
+			assert.Equal(t, kept, usageCacheCount(t, cache, "usage_rollup_installs"),
+				"pruned timezones must cascade to their installs")
+			assert.Equal(t, kept, usageCacheCount(t, cache, "usage_rollup_days"),
+				"pruned timezones must cascade to their days")
+		})
+	}
+}
+
+func TestUsageRollupCompletionWaitsForCallRemoval(t *testing.T) {
+	database := testDB(t)
+	seedUsageSnapshotSession(t, database, "session", "project-a",
+		"2026-08-10T09:00:00Z", 0, 10, "model-a")
+	snapshot, fills, cache := prepareUsageRollupTest(t, database)
+	started := make(chan struct{})
+	cache.rollup.observer.beforeEnsure = func() {
+		cache.rollup.mu.Lock()
+		close(started)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := cache.rollup.Ensure(t.Context(), snapshot, fills,
+			export.NewPricingResolver(snapshot.PricingRows))
+		done <- err
+	}()
+	<-started
+	func() {
+		defer cache.rollup.mu.Unlock()
+		// Hold call removal until the worker has finished writing the rollup.
+		require.Eventually(t, func() bool {
+			return usageCacheCount(t, cache, "usage_rollup_installs") == 1
+		}, 5*time.Second, time.Millisecond)
+		select {
+		case <-done:
+			require.FailNow(t, "a completed request must be removed before its caller can request another rollup")
+		case <-time.After(100 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; the held rollup mutex keeps call removal and completion waiting
+		}
+	}()
+	require.NoError(t, <-done)
+}
+
 func TestUsageRollupCallKeyIncludesCursorHighWater(t *testing.T) {
 	snapshot := usageQuerySnapshot{CursorHighWater: 1, location: time.UTC}
 	first := usageRollupCallKey(snapshot, nil, "pricing")
@@ -222,21 +373,6 @@ func TestUsagePricingHashTracksPricingSemantics(t *testing.T) {
 			assert.NotEqual(t, original, got)
 		})
 	}
-}
-
-func TestUsagePricingIdentityIncludesPolicyAndCatalog(t *testing.T) {
-	rows := []export.EffectivePricingRow{{
-		ModelPattern: "policy-model",
-		Rates:        export.ModelRates{InputPerMTok: money.MustParseDollars("1")},
-	}}
-	original, err := usagePricingIdentity(rows)
-	require.NoError(t, err)
-	assert.Contains(t, original, pricingpkg.BillingPolicyVersion())
-	changed := cloneEffectivePricingRowsForTest(rows)
-	changed[0].Rates.InputPerMTok.Microdollars++
-	next, err := usagePricingIdentity(changed)
-	require.NoError(t, err)
-	assert.NotEqual(t, original, next)
 }
 
 func TestUsageQuerySnapshotPinsPricingRows(t *testing.T) {
@@ -392,39 +528,67 @@ func TestUsageRollupStartedAtChangeInvalidatesInstalledRows(t *testing.T) {
 func TestUsageRollupPricingChangeInvalidatesInstalledRows(t *testing.T) {
 	database := testDB(t)
 	started := "2026-08-10T08:00:00Z"
-	insertSession(t, database, "rollup-price", "project-a", func(session *Session) {
-		session.StartedAt = &started
-	})
-	require.NoError(t, database.InsertMessages(t.Context(), []Message{{
-		SessionID: "rollup-price", Ordinal: 0, Role: "assistant",
-		Timestamp: "2026-08-10T09:00:00Z", Model: "priced-model",
-		TokenUsage: json.RawMessage(`{"input_tokens":1000000}`),
-	}}))
-	require.NoError(t, database.UpsertModelPricing([]ModelPricing{{
-		ModelPattern: "priced-model",
-		InputPerMTok: money.Money{Microdollars: 1_000_000},
-	}}))
+	for _, item := range []struct{ id, model string }{
+		{"session-a", "model-a"}, {"session-b", "model-b"},
+	} {
+		insertSession(t, database, item.id, "project-a", func(session *Session) {
+			session.StartedAt = &started
+		})
+		require.NoError(t, database.InsertMessages(t.Context(), []Message{{
+			SessionID: item.id, Ordinal: 0, Role: "assistant",
+			Timestamp: "2026-08-10T09:00:00Z", Model: item.model,
+			TokenUsage: json.RawMessage(`{"input_tokens":1000000}`),
+		}}))
+	}
+	setPrice := func(pattern string, microdollars int64) {
+		require.NoError(t, database.UpsertModelPricing([]ModelPricing{{
+			ModelPattern: pattern,
+			InputPerMTok: money.Money{Microdollars: microdollars},
+		}}))
+	}
+	setPrice("model-a", 1_000_000)
+	setPrice("model-b", 2_000_000)
+	setPrice("unused-model", 5_000_000)
+	ensure := func() (map[string]usageRollupInstall, usageRollupMetrics) {
+		snapshot, fills, cache := prepareUsageRollupTest(t, database)
+		installs, metrics, err := cache.rollup.Ensure(t.Context(), snapshot, fills,
+			export.NewPricingResolver(snapshot.PricingRows))
+		require.NoError(t, err)
+		return installs, metrics
+	}
+	first, _ := ensure()
 
-	firstSnapshot, firstFills, cache := prepareUsageRollupTest(t, database)
-	first, _, err := cache.rollup.Ensure(t.Context(), firstSnapshot, firstFills,
-		export.NewPricingResolver(firstSnapshot.PricingRows))
+	// A refresh that re-stamps used rows and reprices unused ones changes
+	// no session's cost.
+	setPrice("unused-model", 9_000_000)
+	_, err := database.getWriter().ExecContext(t.Context(), `UPDATE model_pricing
+		SET updated_at = '2030-01-01T00:00:00.000Z'`)
 	require.NoError(t, err)
-	require.NoError(t, database.UpsertModelPricing([]ModelPricing{{
-		ModelPattern: "priced-model",
-		InputPerMTok: money.Money{Microdollars: 2_000_000},
-	}}))
-	secondSnapshot, secondFills, _ := prepareUsageRollupTest(t, database)
-	second, _, err := cache.rollup.Ensure(t.Context(), secondSnapshot, secondFills,
-		export.NewPricingResolver(secondSnapshot.PricingRows))
-	require.NoError(t, err)
-	assert.Greater(t, second["rollup-price"].InstallRevision,
-		first["rollup-price"].InstallRevision)
+	unchanged, metrics := ensure()
+	assert.Equal(t, first["session-a"].InstallRevision, unchanged["session-a"].InstallRevision)
+	assert.Equal(t, first["session-b"].InstallRevision, unchanged["session-b"].InstallRevision)
+	assert.Zero(t, metrics.DailyRows)
 
-	daily, err := database.GetDailyUsage(t.Context(), UsageFilter{
+	setPrice("model-a", 3_000_000)
+	repriced, metrics := ensure()
+	assert.Greater(t, repriced["session-a"].InstallRevision,
+		unchanged["session-a"].InstallRevision)
+	assert.Equal(t, unchanged["session-b"].InstallRevision,
+		repriced["session-b"].InstallRevision,
+		"a session that never used the changed row keeps its rollup")
+	assert.Equal(t, int64(1), metrics.DailyRows)
+
+	sessions, err := database.GetTopSessionsByCost(t.Context(), UsageFilter{
 		From: "2026-08-10", To: "2026-08-10", Timezone: "UTC",
-	})
+	}, 10)
 	require.NoError(t, err)
-	assert.Equal(t, int64(2_000_000), daily.Totals.TotalCost.Microdollars)
+	costs := make(map[string]int64)
+	for _, session := range sessions {
+		costs[session.SessionID] = session.Cost.Microdollars
+	}
+	assert.Equal(t, map[string]int64{
+		"session-a": 3_000_000, "session-b": 2_000_000,
+	}, costs)
 }
 
 func TestUsageRollupConnectedSnapshotChangeRebuildsOnlyChangedSession(t *testing.T) {
@@ -639,13 +803,11 @@ func TestUsageRollupInstallReadScopesToSnapshotBatch(t *testing.T) {
 	conn, err := cache.db.Conn(t.Context())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, conn.Close()) })
-	pricingHash, err := usagePricingIdentity(batch.PricingRows)
-	require.NoError(t, err)
-
 	installs, stale, err := readUsageRollupInstalls(
 		t.Context(), conn,
 		usageTimezoneIdentityFor(batch.location, batch.Intervals),
-		batch, fills, pricingHash)
+		batch, fills, newUsagePricingIdentities(
+			export.NewPricingResolver(batch.PricingRows)))
 	require.NoError(t, err)
 	assert.Empty(t, stale, "the batch was installed by the preceding Ensure")
 	assert.Contains(t, installs, batch.Sessions[0].ID)

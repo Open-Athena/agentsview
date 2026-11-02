@@ -393,6 +393,7 @@ func (s *Store) Search(
 				m.session_id,
 				s.project,
 				s.agent,
+ s.machine,
 				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
 				COALESCE(s.ended_at, s.started_at) AS session_ended_at,
 				m.ordinal,
@@ -423,6 +424,7 @@ func (s *Store) Search(
 				s.id AS session_id,
 				s.project,
 				s.agent,
+ s.machine,
 				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
 				COALESCE(s.ended_at, s.started_at) AS session_ended_at,
 				-1 AS ordinal,
@@ -450,7 +452,7 @@ func (s *Store) Search(
 		-- rank is a constant 1.0 because PostgreSQL ILIKE has no
 	-- relevance scoring engine (unlike SQLite FTS5). Ordering
 	-- uses match_pos and session_ended_at instead.
-	SELECT session_id, project, agent, name,
+	SELECT session_id, project, agent, machine, name,
 			session_ended_at, ordinal,
 			snippet, 1.0 AS rank, match_pos
 		FROM (
@@ -481,7 +483,7 @@ func (s *Store) Search(
 		var endedAt *time.Time
 		var matchPos int
 		if err := rows.Scan(
-			&r.SessionID, &r.Project, &r.Agent, &r.Name,
+			&r.SessionID, &r.Project, &r.Agent, &r.Machine, &r.Name,
 			&endedAt, &r.Ordinal,
 			&r.Snippet, &r.Rank, &matchPos,
 		); err != nil {
@@ -572,7 +574,7 @@ func (s *Store) attachToolCallsBatch(
 			COALESCE(result_content, ''),
 			COALESCE(subagent_session_id, ''),
 			COALESCE(file_path, ''),
-			COALESCE(call_index, 0)
+			COALESCE(call_index, 0), observed_outcome, observed_repeat, sequence_ending
 		FROM tool_calls
 		WHERE session_id = $1
 			AND message_ordinal IN (%s)
@@ -596,7 +598,7 @@ func (s *Store) attachToolCallsBatch(
 			&tc.ToolUseID, &tc.InputJSON, &tc.SkillName,
 			&tc.ResultContentLength, &tc.ResultContent,
 			&tc.SubagentSessionID,
-			&tc.FilePath, &tc.CallIndex,
+			&tc.FilePath, &tc.CallIndex, &tc.ObservedOutcome, &tc.ObservedRepeat, &tc.SequenceEnding,
 		); err != nil {
 			return fmt.Errorf(
 				"scanning tool_call: %w", err,

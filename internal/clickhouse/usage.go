@@ -1,13 +1,19 @@
 package clickhouse
 
 import (
+	"cmp"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"go.kenn.io/agentsview/internal/config"
@@ -15,62 +21,40 @@ import (
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/money"
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
+	"go.kenn.io/agentsview/internal/readbase"
+
+	chdriver "github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/ClickHouse/clickhouse-go/v2/ext"
 )
 
-const (
-	chActiveWindow = 10 * time.Minute
-	chStaleWindow  = 60 * time.Minute
-	chTimestampSQL = "parseDateTime64BestEffort(?, 6, 'UTC')"
-)
-
-type chRates struct {
-	input           money.Money
-	output          money.Money
-	cacheCreation   money.Money
-	cacheCreation1h money.Money
-	cacheRead       money.Money
-	updatedAt       *time.Time
-	source          export.PricingRowSource
-	bands           []export.PricingBand
-}
+const chTimestampSQL = "parseDateTime64BestEffort(?, 6, 'UTC')"
 
 // chLoadPricing reads the mirrored model catalog and layers the reader's
 // custom rates on top. Push passes no custom rates.
 func chLoadPricing(
 	ctx context.Context, conn *sql.DB,
 	customPricing map[string]config.CustomModelRate,
-) (map[string]chRates, error) {
+) (map[string]export.ModelRates, error) {
 	rows, err := readModelPricing(ctx, conn)
 	if err != nil {
 		return nil, err
 	}
-	out := map[string]chRates{}
+	out := map[string]export.ModelRates{}
 	count := 0
 	for _, p := range rows {
 		if strings.HasPrefix(p.ModelPattern, "_") {
 			continue
 		}
-		rates := chRates{
-			input:           p.InputPerMTok,
-			output:          p.OutputPerMTok,
-			cacheCreation:   p.CacheCreationPerMTok,
-			cacheCreation1h: p.CacheCreation1hPerMTok,
-			cacheRead:       p.CacheReadPerMTok,
-			bands:           chExportPricingBands(p.Bands),
-		}
-		if parsed, err := time.Parse(time.RFC3339Nano, p.UpdatedAt); err == nil {
-			t := parsed.UTC()
-			rates.updatedAt = &t
-		}
+		rates := db.ModelPricingRates(p)
 		out[p.ModelPattern] = rates
 		count++
 	}
 	if count == 0 {
-		out = chFallbackPricingMap()
+		out = db.FallbackPricingMap()
 	} else {
-		fallback := chFallbackPricingMap()
+		fallback := db.FallbackPricingMap()
 		for model, rates := range out {
-			rates.source = chPricingSource(model, rates, fallback)
+			rates.Source = db.ModelPricingSource(model, rates, fallback)
 			out[model] = rates
 		}
 	}
@@ -78,176 +62,34 @@ func chLoadPricing(
 	return out, nil
 }
 
-func chApplyCustomPricing(out map[string]chRates, customPricing map[string]config.CustomModelRate) {
+func chApplyCustomPricing(out map[string]export.ModelRates, customPricing map[string]config.CustomModelRate) {
 	for model, custom := range customPricing {
-		rates := chRates{
-			input:  money.Money{Microdollars: custom.InputMicrodollarsPerMTok},
-			output: money.Money{Microdollars: custom.OutputMicrodollarsPerMTok},
-			cacheCreation: money.Money{
+		rates := export.ModelRates{
+			InputPerMTok:  money.Money{Microdollars: custom.InputMicrodollarsPerMTok},
+			OutputPerMTok: money.Money{Microdollars: custom.OutputMicrodollarsPerMTok},
+			CacheWritePerMTok: money.Money{
 				Microdollars: custom.CacheCreationMicrodollarsPerMTok,
 			},
-			cacheCreation1h: money.Money{
+			CacheWrite1hPerMTok: money.Money{
 				Microdollars: custom.CacheCreation1hMicrodollarsPerMTok,
 			},
-			cacheRead: money.Money{
+			CacheReadPerMTok: money.Money{
 				Microdollars: custom.CacheReadMicrodollarsPerMTok,
 			},
 		}
-		rates.source = chCustomPricingSource()
+		rates.Source = export.PricingRowSourceCustom
 		out[model] = rates
 	}
-}
-
-// chLoadPricingRows returns the effective pricing rows plus the raw GenAI
-// document they were built from; document is nil when the mirror has none.
-func chLoadPricingRows(
-	ctx context.Context, conn *sql.DB,
-	customPricing map[string]config.CustomModelRate,
-) ([]export.EffectivePricingRow, *db.GenAIPricingDocument, error) {
-	pricing, err := chLoadPricing(ctx, conn, customPricing)
-	if err != nil {
-		return nil, nil, err
-	}
-	document, err := loadGenAIPricing(ctx, conn)
-	if err != nil {
-		return nil, nil, err
-	}
-	genAI, err := genAIEffectivePricingRow(document)
-	if err != nil {
-		return nil, nil, err
-	}
-	return append(chPricingRows(pricing), genAI), document, nil
 }
 
 func (s *Store) loadPricingResolver(
 	ctx context.Context,
 ) (*export.PricingResolver, error) {
-	rows, _, err := chLoadPricingRows(ctx, s.conn, s.customPricing)
+	snapshot, err := s.pricingSnapshot(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return export.NewPricingResolver(rows), nil
-}
-
-func chCustomPricingSource() export.PricingRowSource {
-	return export.PricingRowSourceCustom
-}
-
-func chFallbackPricingMap() map[string]chRates {
-	prices := pricingpkg.FallbackPricing()
-	out := make(map[string]chRates, len(prices))
-	for _, p := range prices {
-		if strings.HasPrefix(p.ModelPattern, "_") {
-			continue
-		}
-		out[p.ModelPattern] = chRates{
-			input:           p.InputPerMTok,
-			output:          p.OutputPerMTok,
-			cacheCreation:   p.CacheCreationPerMTok,
-			cacheCreation1h: p.CacheCreation1hPerMTok,
-			cacheRead:       p.CacheReadPerMTok,
-			source:          export.PricingRowSourceEmbedded,
-			bands:           chCatalogPricingBands(p.Bands),
-		}
-	}
-	return out
-}
-
-func chPricingSource(
-	model string, rates chRates, fallback map[string]chRates,
-) export.PricingRowSource {
-	if f, ok := fallback[model]; ok &&
-		f.input == rates.input &&
-		f.output == rates.output &&
-		f.cacheCreation == rates.cacheCreation &&
-		f.cacheCreation1h == rates.cacheCreation1h &&
-		f.cacheRead == rates.cacheRead &&
-		chPricingBandsEqual(f.bands, rates.bands) {
-		return export.PricingRowSourceEmbedded
-	}
-	return export.PricingRowSourceFetched
-}
-
-func chCatalogPricingBands(
-	bands []pricingpkg.PricingBand,
-) []export.PricingBand {
-	out := make([]export.PricingBand, len(bands))
-	for i, band := range bands {
-		out[i] = export.PricingBand{
-			AboveInputTokens:    band.AboveInputTokens,
-			InputPerMTok:        band.InputPerMTok,
-			OutputPerMTok:       band.OutputPerMTok,
-			CacheWritePerMTok:   band.CacheCreationPerMTok,
-			CacheWrite1hPerMTok: band.CacheCreation1hPerMTok,
-			CacheReadPerMTok:    band.CacheReadPerMTok,
-		}
-	}
-	return out
-}
-
-func chExportPricingBands(bands []db.PricingBand) []export.PricingBand {
-	out := make([]export.PricingBand, 0, len(bands))
-	for _, band := range bands {
-		var parsedUpdatedAt *time.Time
-		if parsed, err := time.Parse(time.RFC3339Nano, band.UpdatedAt); err == nil {
-			t := parsed.UTC()
-			parsedUpdatedAt = &t
-		}
-		out = append(out, export.PricingBand{
-			AboveInputTokens:    band.AboveInputTokens,
-			InputPerMTok:        band.InputPerMTok,
-			OutputPerMTok:       band.OutputPerMTok,
-			CacheWritePerMTok:   band.CacheCreationPerMTok,
-			CacheWrite1hPerMTok: band.CacheCreation1hPerMTok,
-			CacheReadPerMTok:    band.CacheReadPerMTok,
-			UpdatedAt:           parsedUpdatedAt,
-		})
-	}
-	return out
-}
-
-func chPricingBandsEqual(a, b []export.PricingBand) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i].AboveInputTokens != b[i].AboveInputTokens ||
-			a[i].InputPerMTok != b[i].InputPerMTok ||
-			a[i].OutputPerMTok != b[i].OutputPerMTok ||
-			a[i].CacheWritePerMTok != b[i].CacheWritePerMTok ||
-			a[i].CacheWrite1hPerMTok != b[i].CacheWrite1hPerMTok ||
-			a[i].CacheReadPerMTok != b[i].CacheReadPerMTok {
-			return false
-		}
-	}
-	return true
-}
-
-func chPricingRows(
-	in map[string]chRates,
-) []export.EffectivePricingRow {
-	out := make([]export.EffectivePricingRow, 0, len(in))
-	fallback := chFallbackPricingMap()
-	for pattern, rates := range in {
-		source := rates.source
-		if source == "" {
-			source = chPricingSource(pattern, rates, fallback)
-		}
-		out = append(out, export.EffectivePricingRow{
-			ModelPattern: pattern,
-			Rates: export.ModelRates{
-				InputPerMTok:        rates.input,
-				OutputPerMTok:       rates.output,
-				CacheWritePerMTok:   rates.cacheCreation,
-				CacheWrite1hPerMTok: rates.cacheCreation1h,
-				CacheReadPerMTok:    rates.cacheRead,
-				UpdatedAt:           rates.updatedAt,
-				Source:              source,
-				Bands:               append([]export.PricingBand(nil), rates.bands...),
-			},
-		})
-	}
-	return out
+	return export.NewPricingResolverWithDigest(snapshot.rows, snapshot.digest), nil
 }
 
 type chUsageBounds struct {
@@ -255,23 +97,9 @@ type chUsageBounds struct {
 	to   string
 }
 
-func chUsagePaddedUTCBound(ts string, hours int) string {
-	t, err := time.Parse(time.RFC3339, ts)
-	if err != nil {
-		return ts
-	}
-	return t.Add(time.Duration(hours) * time.Hour).Format(time.RFC3339)
-}
-
 func chUsageBoundsForFilter(f db.UsageFilter) chUsageBounds {
-	var b chUsageBounds
-	if f.From != "" {
-		b.from = chUsagePaddedUTCBound(f.From+"T00:00:00Z", -14)
-	}
-	if f.To != "" {
-		b.to = chUsagePaddedUTCBound(f.To+"T23:59:59Z", 14)
-	}
-	return b
+	from, to := readbase.PaddedDateBounds(f.From, f.To)
+	return chUsageBounds{from: from, to: to}
 }
 
 func appendChUsageColumnBounds(
@@ -288,182 +116,34 @@ func appendChUsageColumnBounds(
 	return where, args
 }
 
-func appendChUsageCSVFilter(
-	where string, args []any, col, csv string, include bool,
-) (string, []any) {
-	if csv == "" {
-		return where, args
-	}
-	parts := strings.Split(csv, ",")
-	vals := make([]string, 0, len(parts))
-	for _, value := range parts {
-		trimmed := strings.TrimSpace(value)
-		if trimmed != "" {
-			vals = append(vals, trimmed)
-		}
-	}
-	return appendChUsageValuesFilter(where, args, col, vals, include)
-}
-
-func appendChUsageValuesFilter(
-	where string, args []any, col string, vals []string, include bool,
-) (string, []any) {
-	if len(vals) == 0 {
-		return where, args
-	}
-	op := "IN"
-	if !include {
-		op = "NOT IN"
-	}
-	if len(vals) == 1 {
-		if include {
-			where += "\n\t\t\tAND " + col + " = ?"
-		} else {
-			where += "\n\t\t\tAND " + col + " != ?"
-		}
-		args = append(args, vals[0])
-		return where, args
-	}
-	ph := make([]string, len(vals))
-	for i, value := range vals {
-		ph[i] = "?"
-		args = append(args, value)
-	}
-	where += "\n\t\t\tAND " + col + " " + op +
-		" (" + strings.Join(ph, ",") + ")"
-	return where, args
-}
-
 func appendChUsageSourceFilterClauses(
 	where string, args []any, modelCol string, f db.UsageFilter,
 ) (string, []any) {
-	where, args = appendChUsageCSVFilter(where, args, modelCol, f.Model, true)
-	return appendChUsageCSVFilter(where, args, modelCol, f.ExcludeModel, false)
-}
-
-func chNormalizeAutomatedScope(
-	scope string,
-	excludeAutomated bool,
-) string {
-	switch strings.TrimSpace(scope) {
-	case "human", "all", "automated":
-		return strings.TrimSpace(scope)
-	}
-	if excludeAutomated {
-		return "human"
-	}
-	return "all"
-}
-
-func chAutomatedScopePredicate(scope, col string) string {
-	switch scope {
-	case "human":
-		return col + " = false"
-	case "automated":
-		return col + " = true"
-	default:
-		return ""
-	}
+	b := db.NewQueryBuilder(db.ClickHouseQueryDialect(), 0)
+	preds := db.BuildUsageSourceFilter(f, b, modelCol)
+	where = db.AppendUsagePredicates(where, preds, "\t\t\t")
+	return where, append(args, b.Args()...)
 }
 
 func appendChUsageSessionFilterClauses(
 	where string, args []any, f db.UsageFilter, sessionID string,
 ) (string, []any) {
-	where, args = appendChUsageCSVFilter(where, args, "s.agent", f.Agent, true)
-	where, args = appendChUsageValuesFilter(
-		where, args, "s.project", f.ProjectFilterLabels(), true,
-	)
-	where, args = appendChUsageCSVFilter(where, args, "s.machine", f.Machine, true)
-	if f.GitBranch != "" {
-		var clause string
-		clause, args = db.BranchPairClauseArgs("s.project", "s.git_branch", f.GitBranch, args)
-		where += "\n\t\t\tAND " + clause
-	}
-	where, args = appendChUsageValuesFilter(
-		where, args, "s.project", f.ExcludedProjectFilterLabels(), false,
-	)
-	where, args = appendChUsageCSVFilter(where, args, "s.agent", f.ExcludeAgent, false)
-	if sessionID != "" {
-		where += "\n\t\t\tAND s.id = ?"
-		args = append(args, sessionID)
-	}
-	if f.MinUserMessages > 0 {
-		where += "\n\t\t\tAND s.user_message_count >= ?"
-		args = append(args, f.MinUserMessages)
-	}
-	scope := chNormalizeAutomatedScope(
-		f.AutomatedScope, f.ExcludeAutomated)
-	if f.ExcludeOneShot {
-		if scope == "human" {
-			where += "\n\t\t\tAND s.user_message_count > 1"
-		} else {
-			where += "\n\t\t\tAND (s.user_message_count > 1 OR COALESCE(s.is_automated, false) = true)"
-		}
-	}
-	if pred := chAutomatedScopePredicate(
-		scope, "COALESCE(s.is_automated, false)"); pred != "" {
-		where += "\n\t\t\tAND " + pred
-	}
-	if f.ActiveSince != "" {
-		where += "\n\t\t\tAND COALESCE(s.ended_at, s.started_at, s.created_at) >= " + chTimestampSQL
-		args = append(args, f.ActiveSince)
-	}
-	if pred, predArgs := chUsageTerminationPred(f.Termination); pred != "" {
-		where += "\n\t\t\tAND " + pred
-		args = append(args, predArgs...)
-	}
-	return where, args
+	b := db.NewQueryBuilder(db.ClickHouseQueryDialect(), 0)
+	preds := db.BuildUsageSessionFilter(f, b, sessionID)
+	where = db.AppendUsagePredicates(where, preds, "\t\t\t")
+	return where, append(args, b.Args()...)
 }
 
-func chUsageTerminationPred(status string) (string, []any) {
-	return chTerminationPred(
-		status,
-		"COALESCE(s.ended_at, s.started_at, s.created_at)",
-		"s.termination_status",
-	)
-}
-
-func chTerminationPred(
-	status string,
-	activityExpr string,
-	statusExpr string,
-) (string, []any) {
-	if status == "" || status == "all" {
-		return "", nil
-	}
-	now := time.Now().UTC()
-	activeCutoff := now.Add(-chActiveWindow)
-	staleCutoff := now.Add(-chStaleWindow)
-	flagged := statusExpr + " IN ('tool_call_pending', 'truncated')"
-	var parts []string
-	var args []any
+// chTerminationUsesTime reports whether a termination filter compares
+// session times with the current time.
+func chTerminationUsesTime(status string) bool {
 	for part := range strings.SplitSeq(status, ",") {
 		switch strings.TrimSpace(part) {
-		case "active":
-			parts = append(parts, activityExpr+" > "+chTimestampSQL)
-			args = append(args, activeCutoff.Format(time.RFC3339))
-		case "stale":
-			parts = append(parts, "("+flagged+
-				" AND "+activityExpr+" > "+chTimestampSQL+
-				" AND "+activityExpr+" <= "+chTimestampSQL+")")
-			args = append(args,
-				staleCutoff.Format(time.RFC3339),
-				activeCutoff.Format(time.RFC3339),
-			)
-		case "unclean":
-			parts = append(parts, "("+flagged+
-				" AND "+activityExpr+" <= "+chTimestampSQL+")")
-			args = append(args, staleCutoff.Format(time.RFC3339))
-		case "clean":
-			parts = append(parts, statusExpr+" = 'clean'")
-		case "awaiting_user":
-			parts = append(parts, statusExpr+" = 'awaiting_user'")
+		case "active", "stale", "unclean":
+			return true
 		}
 	}
-	if len(parts) == 0 {
-		return "", nil
-	}
-	return "(" + strings.Join(parts, " OR ") + ")", args
+	return false
 }
 
 const chDailyCursorUsageRowsSQLTemplate = `
@@ -485,6 +165,7 @@ SELECT
 	cu.cache_write_tokens AS cache_create,
 	cu.cache_read_tokens AS cache_read,
 	toInt64(0) AS reasoning_tokens,
+	toInt64(0) AS cache_create_1h, toInt64(0) AS web_search_requests,
 	CAST(cu.charged_microdollars AS Nullable(Int64)) AS cost_microdollars,
 	'cursor-reported' AS cost_source,
 	'' AS project,
@@ -493,6 +174,7 @@ SELECT
 	toInt64(0) AS user_message_count,
 	cu.is_headless AS is_automated,
 	'' AS display_name,
+	'' AS group_key, '' AS session_name,
 	CAST(NULL AS Nullable(DateTime64(6, 'UTC'))) AS started_at,
 	cu.occurred_at AS activity_at
 FROM cursor_usage_events cu
@@ -528,6 +210,13 @@ func chUsageSourceWheres(
 		messageWhere, messageArgs, f, sessionID)
 	messageWhere, messageArgs = appendChUsageColumnBounds(
 		messageWhere, "COALESCE(m.timestamp, s.started_at)", b, messageArgs)
+	if b.from != "" || b.to != "" {
+		// Filter timestamped rows before joining sessions; missing timestamps
+		// still use the session start and the original bounds above.
+		timestampWhere, timestampArgs := appendChUsageColumnBounds("1", "m.timestamp", b, nil)
+		messageWhere += "\n\t\t\tAND (m.timestamp IS NULL OR (" + timestampWhere + "))"
+		messageArgs = append(messageArgs, timestampArgs...)
+	}
 
 	eventWhere := chUsageEventEligibility
 	var eventArgs []any
@@ -567,10 +256,13 @@ func chUsageRawSQLFromWheres(
 				toInt64(0) AS input_tokens, toInt64(0) AS output_tokens,
 				toInt64(0) AS cache_create, toInt64(0) AS cache_read,
 				JSONExtractInt(m.token_usage, 'reasoning_tokens') AS reasoning_tokens,
+				JSONExtractInt(m.token_usage, 'cache_creation', 'ephemeral_1h_input_tokens') AS cache_create_1h,
+				JSONExtractInt(m.token_usage, 'server_tool_use', 'web_search_requests') AS web_search_requests,
 				CAST(NULL AS Nullable(Int64)) AS cost_microdollars, '' AS cost_source,
 			s.project AS project, s.agent AS agent, s.machine AS machine,
 			s.user_message_count AS user_message_count, s.is_automated AS is_automated,
 			ifNull(COALESCE(s.display_name, s.session_name, s.first_message, s.project, s.id), '') AS display_name,
+			s.group_key AS group_key, ifNull(s.session_name, '') AS session_name,
 			s.started_at AS started_at,
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS activity_at
 		FROM messages m
@@ -591,11 +283,13 @@ func chUsageRawSQLFromWheres(
 				ue.cache_creation_input_tokens AS cache_create,
 				ue.cache_read_input_tokens AS cache_read,
 				ue.reasoning_tokens AS reasoning_tokens,
+				toInt64(0) AS cache_create_1h, toInt64(0) AS web_search_requests,
 				ue.cost_microdollars AS cost_microdollars,
 				ue.cost_source AS cost_source,
 			s.project AS project, s.agent AS agent, s.machine AS machine,
 			s.user_message_count AS user_message_count, s.is_automated AS is_automated,
 			ifNull(COALESCE(s.display_name, s.session_name, s.first_message, s.project, s.id), '') AS display_name,
+			s.group_key AS group_key, ifNull(s.session_name, '') AS session_name,
 			s.started_at AS started_at,
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS activity_at
 		FROM usage_events ue
@@ -631,40 +325,30 @@ func chMatchingUsageRawSQL(f db.UsageFilter) (string, []any) {
 	return query, args
 }
 
-func chCursorUsageRowsSQLForBounds(
+// chCursorUsageRowsWhere is the predicate selecting the cursor usage rows a
+// filter reads; ok is false when the filter excludes cursor rows entirely.
+func chCursorUsageRowsWhere(
 	f db.UsageFilter, b chUsageBounds,
 ) (string, []any, bool) {
 	hasTermFilter := f.Termination != "" && f.Termination != "all"
 	if len(f.ProjectFilterLabels()) > 0 ||
 		len(f.ExcludedProjectFilterLabels()) > 0 ||
-		f.Machine != "" || f.GitBranch != "" || f.MinUserMessages > 0 ||
+		len(db.CSVFilterValues(f.Machine)) > 0 || f.GitBranch != "" || f.MinUserMessages > 0 ||
 		f.ExcludeOneShot || hasTermFilter ||
 		f.ActiveSince != "" {
 		return "", nil, false
 	}
-	if f.Agent != "" {
-		vals := strings.Split(f.Agent, ",")
-		for i := range vals {
-			vals[i] = strings.TrimSpace(vals[i])
-		}
-		if !slices.Contains(vals, "cursor") {
-			return "", nil, false
-		}
+	if vals := db.CSVFilterValues(f.Agent); len(vals) > 0 && !slices.Contains(vals, "cursor") {
+		return "", nil, false
 	}
-	if f.ExcludeAgent != "" {
-		vals := strings.Split(f.ExcludeAgent, ",")
-		for i := range vals {
-			vals[i] = strings.TrimSpace(vals[i])
-		}
-		if slices.Contains(vals, "cursor") {
-			return "", nil, false
-		}
+	if vals := db.CSVFilterValues(f.ExcludeAgent); slices.Contains(vals, "cursor") {
+		return "", nil, false
 	}
 
 	where := "cu.model != ''"
 	var args []any
-	scope := chNormalizeAutomatedScope(f.AutomatedScope, f.ExcludeAutomated)
-	if pred := chAutomatedScopePredicate(scope, "cu.is_headless"); pred != "" {
+	scope := db.NormalizeAutomatedScope(f.AutomatedScope, f.ExcludeAutomated)
+	if pred := db.ClickHouseQueryDialect().AutomatedScopePredicate(scope, "cu.is_headless"); pred != "" {
 		where += "\n\tAND " + pred
 	}
 	where, args = appendChUsageSourceFilterClauses(
@@ -673,7 +357,34 @@ func chCursorUsageRowsSQLForBounds(
 	where, args = appendChUsageColumnBounds(
 		where, "cu.occurred_at", b, args,
 	)
+	return where, args, true
+}
+
+func chCursorUsageRowsSQLForBounds(
+	f db.UsageFilter, b chUsageBounds,
+) (string, []any, bool) {
+	where, args, ok := chCursorUsageRowsWhere(f, b)
+	if !ok {
+		return "", nil, false
+	}
 	return fmt.Sprintf(chDailyCursorUsageRowsSQLTemplate, where), args, true
+}
+
+// cursorUsageRowsInBounds reports whether a daily read under f selects any
+// cursor usage rows. The rows join the usage union from their own small
+// table, and the union roughly doubles what ClickHouse must analyze for the
+// read, so a read without them leaves the union out.
+func (s *Store) cursorUsageRowsInBounds(ctx context.Context, f db.UsageFilter) (bool, error) {
+	where, args, ok := chCursorUsageRowsWhere(f, chUsageBoundsForFilter(f))
+	if !ok {
+		return false, nil
+	}
+	var present uint8
+	err := s.queryRowContext(ctx, "SELECT count() > 0 FROM cursor_usage_events cu WHERE "+where, args...).Scan(&present)
+	if err != nil {
+		return false, fmt.Errorf("checking clickhouse cursor usage rows: %w", err)
+	}
+	return present != 0, nil
 }
 
 func chDailyUsageRawSQL(f db.UsageFilter) (string, []any) {
@@ -707,6 +418,219 @@ func chUsageLocalDateSQL(f db.UsageFilter) (string, any) {
 	}
 	_, offset := ref.In(time.Local).Zone() //nolint:forbidigo // Usage reports group UTC timestamps into local calendar dates when no timezone is selected.
 	return "if(ts IS NULL, '', formatDateTime(ts + toIntervalSecond(?), '%Y-%m-%d', 'UTC'))", offset
+}
+
+// chPreparedUsageRawSQL renders usage_raw from prepared_usage instead of
+// messages and usage_events. Prepared rows already hold the normalized
+// counters, so they take the place of the token JSON and the raw counters;
+// the normalization step is idempotent on them. Session columns still come
+// from the live sessions row, exactly as the raw form joins them.
+func chPreparedUsageRawSQL(state preparedUsageState, f db.UsageFilter, sessionID string) (string, []any) {
+	// Model and session filters apply after Claude snapshot attribution
+	// (usage_snapshot_filtered), exactly as the raw source does: a filtered
+	// session's facts may belong to another session in the same request.
+	inputFilter := chUsageSnapshotInputFilter(f)
+	bounds := chUsageBoundsForFilter(inputFilter)
+	rangeWhere, rangeArgs := appendChUsageColumnBounds("1", "ts", bounds, nil)
+	rangeWhere, rangeArgs = appendChUsageColumnBounds(rangeWhere, chPreparedUsageKeyColumn, bounds, rangeArgs)
+	sourceSQL, args := chPreparedUsageSourceSQL(state, rangeWhere, rangeArgs)
+	where := "s.deleted_at IS NULL"
+	where, args = appendChUsageSessionFilterClauses(where, args, inputFilter, sessionID)
+	return `
+		SELECT p.session_id AS session_id, p.message_ordinal AS message_ordinal,
+			p.source AS source, p.ts AS ts, p.pricing_ts AS pricing_ts,
+			p.model AS model, p.provider_id AS provider_id, '' AS token_json,
+			p.claude_message_id AS claude_message_id,
+			p.claude_request_id AS claude_request_id,
+			p.source_uuid AS source_uuid,
+			p.usage_dedup_key AS usage_dedup_key,
+			p.input_tokens_norm AS input_tokens, p.output_tokens_norm AS output_tokens,
+			p.cache_create_norm AS cache_create, p.cache_read_norm AS cache_read,
+			p.reasoning_tokens_norm AS reasoning_tokens,
+			p.cache_create_1h_norm AS cache_create_1h,
+			p.web_search_requests_norm AS web_search_requests,
+			p.cost_microdollars AS cost_microdollars, p.cost_source AS cost_source,
+			s.project AS project, s.agent AS agent, s.machine AS machine,
+			s.user_message_count AS user_message_count, s.is_automated AS is_automated,
+			ifNull(COALESCE(s.display_name, s.session_name, s.first_message, s.project, s.id), '') AS display_name,
+			s.group_key AS group_key, ifNull(s.session_name, '') AS session_name,
+			s.started_at AS started_at,
+			COALESCE(s.ended_at, s.started_at, s.created_at) AS activity_at,
+			p.price_model AS stored_price_model, p.price_key AS stored_price_key,
+			` + chUsageStoredPriceSelect() + `
+		FROM (` + sourceSQL + `) p
+		JOIN sessions s ON s.id = p.session_id
+		WHERE ` + where, args
+}
+
+// chPreparedUsageSourceSQL renders the prepared rows a read may use under
+// where, which names prepared columns without a prefix: the stored rows of
+// every session whose snapshot is the one they were derived from, and rows
+// prepared now for the sessions pushed since the refresh. The two sets are
+// disjoint, so their union is what a refresh would store for the current
+// snapshots. The session lists travel as external tables; see
+// withUsageDeltaTables.
+func chPreparedUsageSourceSQL(state preparedUsageState, where string, whereArgs []any) (string, []any) {
+	query := "SELECT " + chPreparedUsageRowColumns + " FROM prepared_usage WHERE " + where
+	args := slices.Clone(whereArgs)
+	if len(state.replaced()) > 0 {
+		query += " AND session_id NOT IN (SELECT id FROM usage_replaced_sessions)"
+	}
+	if len(state.changed) > 0 {
+		query += "\n\t\tUNION ALL\n\t\tSELECT " + chPreparedUsageRowColumns + " FROM usage_delta_rows WHERE " + where
+		args = append(args, whereArgs...)
+	}
+	if len(state.raw) > 0 {
+		query += "\n\t\tUNION ALL\n\t\tSELECT " + chPreparedUsageRowColumns + " FROM (" + chRawHostUsageRowsSQL() + ") WHERE " + where
+		args = append(args, state.pricingDigest)
+		args = append(args, whereArgs...)
+	}
+	return query, args
+}
+
+// usageSessionListTable is an external table of session ids under name.
+func usageSessionListTable(name string, ids []string) (*ext.Table, error) {
+	table, err := ext.NewTable(name, ext.Column("id", "String"))
+	if err != nil {
+		return nil, fmt.Errorf("creating %s table: %w", name, err)
+	}
+	for _, id := range ids {
+		if err := table.Append(id); err != nil {
+			return nil, fmt.Errorf("adding %s session: %w", name, err)
+		}
+	}
+	return table, nil
+}
+
+// chExternalColumn declares an external table column of a type named as a
+// string. The column type's Go type is inferred from ext.Column, so this
+// package does not import the driver's column package, which the compile
+// graph fixed before patching does not provide.
+func chExternalColumn[T ~string](declare func(string, T) func(*ext.Table) error, name, typ string) func(*ext.Table) error {
+	return declare(name, T(typ))
+}
+
+// withUsageDeltaTables attaches the replaced session list, the raw hosts'
+// session list, and the prepared delta rows a prepared read's SQL names,
+// when the state has them, to the context the read runs under.
+func withUsageDeltaTables(ctx context.Context, state preparedUsageState) (context.Context, error) {
+	if !state.ready {
+		return ctx, nil
+	}
+	var tables []*ext.Table
+	if replaced := state.replaced(); len(replaced) > 0 {
+		table, err := usageSessionListTable("usage_replaced_sessions", replaced)
+		if err != nil {
+			return nil, err
+		}
+		tables = append(tables, table)
+	}
+	if len(state.raw) > 0 {
+		table, err := usageSessionListTable("usage_raw_host_sessions", state.raw)
+		if err != nil {
+			return nil, err
+		}
+		tables = append(tables, table)
+	}
+	if len(state.changed) > 0 {
+		columns := make([]func(*ext.Table) error, 0, len(chPreparedUsageDeltaColumns))
+		for _, c := range chPreparedUsageDeltaColumns {
+			columns = append(columns, chExternalColumn(ext.Column, c.name, c.typ))
+		}
+		table, err := ext.NewTable("usage_delta_rows", columns...)
+		if err != nil {
+			return nil, fmt.Errorf("creating usage_delta_rows table: %w", err)
+		}
+		for _, row := range state.deltaRows {
+			if err := table.Append(row...); err != nil {
+				return nil, fmt.Errorf("adding usage_delta_rows row: %w", err)
+			}
+		}
+		tables = append(tables, table)
+	}
+	if len(tables) == 0 {
+		return ctx, nil
+	}
+	return chdriver.Context(ctx, chdriver.WithExternalTable(tables...)), nil
+}
+
+// chUsageStoredPriceSelect selects the stored price columns of the joined
+// price rows p.
+func chUsageStoredPriceSelect() string {
+	columns := make([]string, 0, len(chUsageStoredPriceColumns))
+	for _, column := range chUsageStoredPriceColumns {
+		columns = append(columns, "p."+column.stored+" AS "+column.stored)
+	}
+	return strings.Join(columns, ", ")
+}
+
+// chUsageStoredPriceZeroSelect gives rows from another table the stored
+// price columns' shape; their values are ignored in favor of the join.
+func chUsageStoredPriceZeroSelect() string {
+	columns := make([]string, 0, len(chUsageStoredPriceColumns)+2)
+	columns = append(columns, "'' AS stored_price_model", "'' AS stored_price_key")
+	for _, column := range chUsageStoredPriceColumns {
+		columns = append(columns, column.zero+" AS "+column.stored)
+	}
+	return strings.Join(columns, ", ")
+}
+
+// chUsageSource is a usage CTE and how its rows were sourced.
+type chUsageSource struct {
+	cte  string
+	args []any
+	// storedPricesDigest is the pricing digest whose records the rows carry
+	// in their stored price columns; empty for raw rows.
+	storedPricesDigest string
+	// cursorRows reports whether the CTE unions cursor usage rows, which
+	// carry no stored price record.
+	cursorRows bool
+}
+
+// chPreparedUsageCTE is chUsageCTE over prepared usage rows.
+func chPreparedUsageCTE(state preparedUsageState, f db.UsageFilter, sessionID string) (string, []any) {
+	rawSQL, args := chPreparedUsageRawSQL(state, f, sessionID)
+	return chUsageCTEFromRawSource(f, rawSQL, args, true, chPreparedUsageNormSource())
+}
+
+// chPreparedDailyUsageCTE is chDailyUsageCTE over prepared usage rows.
+func chPreparedDailyUsageCTE(state preparedUsageState, f db.UsageFilter, includeCursor bool) (string, []any, bool) {
+	sessionRowsSQL, sessionArgs := chPreparedUsageRawSQL(state, f, "")
+	cursorRowsSQL, cursorArgs, ok := chCursorUsageRowsSQLForBounds(f, chUsageBoundsForFilter(f))
+	ok = ok && includeCursor
+	if ok {
+		sessionRowsSQL += "\n\t\tUNION ALL\n\t\tSELECT c.*, " + chUsageStoredPriceZeroSelect() +
+			"\n\t\tFROM (" + cursorRowsSQL + ") c"
+		sessionArgs = append(sessionArgs, cursorArgs...)
+	}
+	cte, args := chUsageCTEFromRawSource(f, sessionRowsSQL, sessionArgs, true, chPreparedUsageNormSource())
+	return cte, args, ok
+}
+
+// usageCTEFor selects the prepared form once every archive has published
+// complete snapshots and the refresh has run; until then reads use the raw
+// messages and usage events. A single-session read stays raw: prepared
+// usage is ordered by time, not session, and one session is cheap by key.
+func usageCTEFor(state preparedUsageState, f db.UsageFilter, sessionID string) chUsageSource {
+	if sessionID == "" && state.ready {
+		cte, args := chPreparedUsageCTE(state, f, "")
+		return chUsageSource{cte: cte, args: args, storedPricesDigest: state.pricingDigest}
+	}
+	cte, args := chUsageCTE(f, sessionID)
+	return chUsageSource{cte: cte, args: args}
+}
+
+func (s *Store) dailyUsageCTE(ctx context.Context, state preparedUsageState, f db.UsageFilter) (chUsageSource, error) {
+	if state.ready {
+		includeCursor, err := s.cursorUsageRowsInBounds(ctx, f)
+		if err != nil {
+			return chUsageSource{}, err
+		}
+		cte, args, cursorRows := chPreparedDailyUsageCTE(state, f, includeCursor)
+		return chUsageSource{cte: cte, args: args, storedPricesDigest: state.pricingDigest, cursorRows: cursorRows}, nil
+	}
+	cte, args := chDailyUsageCTE(f)
+	return chUsageSource{cte: cte, args: args}, nil
 }
 
 func chUsageCTE(f db.UsageFilter, sessionID string) (string, []any) {
@@ -770,12 +694,68 @@ func chClampedJSONInt(jsonExpr string, keys ...string) string {
 	)
 }
 
+// chUsageNormSource holds the per-row expressions usage_normalized computes
+// for message rows, and the columns survivors must carry past attribution.
+// Raw rows carry the message's token JSON; prepared rows already carry the
+// normalized counters.
+type chUsageNormSource struct {
+	input, output, cacheCreate, cacheCreate1h, cacheRead, reasoning, web string
+	priceModel, priceKey                                                 string
+	passthrough                                                          []string
+}
+
+func chUsageRawNormSource() chUsageNormSource {
+	return chUsageNormSource{
+		input:         chClampedJSONInt("token_json", "input_tokens"),
+		output:        chClampedJSONInt("token_json", "output_tokens"),
+		cacheCreate:   chClampedJSONInt("token_json", "cache_creation_input_tokens"),
+		cacheCreate1h: chClampedJSONInt("token_json", "cache_creation", "ephemeral_1h_input_tokens"),
+		cacheRead:     chClampedJSONInt("token_json", "cache_read_input_tokens"),
+		reasoning:     chClampedJSONInt("token_json", "reasoning_tokens"),
+		web:           "greatest(JSONExtractInt(token_json, 'server_tool_use', 'web_search_requests'), toInt64(0))",
+		priceModel:    chPriceModelCaseSQL(),
+		priceKey:      chUsagePriceKeySQL,
+	}
+}
+
+// chPreparedUsageNormSource reads the counters chPreparedUsageRawSQL exposes
+// under the raw column names; they are already normalized.
+// Prepared rows also carry their price model, price key, and price record;
+// cursor rows, which join the union from their own table, still compute
+// the first two here and are priced by the per-request join.
+func chPreparedUsageNormSource() chUsageNormSource {
+	passthrough := make([]string, 0, len(chUsageStoredPriceColumns))
+	for _, column := range chUsageStoredPriceColumns {
+		passthrough = append(passthrough, column.stored)
+	}
+	return chUsageNormSource{
+		input: "input_tokens", output: "output_tokens",
+		cacheCreate: "cache_create", cacheCreate1h: "cache_create_1h",
+		cacheRead: "cache_read", reasoning: "reasoning_tokens",
+		web:         "web_search_requests",
+		priceModel:  "if(source = 'cursor', " + chPriceModelCaseSQL() + ", stored_price_model)",
+		priceKey:    "if(source = 'cursor', " + chUsagePriceKeySQL + ", stored_price_key)",
+		passthrough: passthrough,
+	}
+}
+
 func chUsageCTEFromRaw(
 	f db.UsageFilter, rawSQL string, args []any,
 	preferCompleteClaudeSnapshots bool,
 ) (string, []any) {
+	return chUsageCTEFromRawSource(f, rawSQL, args, preferCompleteClaudeSnapshots, chUsageRawNormSource())
+}
+
+func chUsageCTEFromRawSource(
+	f db.UsageFilter, rawSQL string, args []any,
+	preferCompleteClaudeSnapshots bool, norms chUsageNormSource,
+) (string, []any) {
 	localDateSQL, localDateArg := chUsageLocalDateSQL(f)
-	priceModelSQL := chPriceModelCaseSQL()
+	priceModelSQL := norms.priceModel
+	var passthrough strings.Builder
+	for _, column := range norms.passthrough {
+		passthrough.WriteString("\n\t\t\t\tranked." + column + ",")
+	}
 	datePred := "1"
 	var dateArgs []any
 	if f.From != "" {
@@ -787,7 +767,7 @@ func chUsageCTEFromRaw(
 		dateArgs = append(dateArgs, f.To)
 	}
 	snapshotCTE := ""
-	rankedSource := "usage_windowed"
+	rankedSource := "usage_normalized"
 	var snapshotFilterArgs []any
 	if preferCompleteClaudeSnapshots {
 		snapshotFilter := "1"
@@ -833,7 +813,7 @@ func chUsageCTEFromRaw(
 						)
 					ELSE web_search_requests_norm
 				END AS snapshot_web_search_requests
-			FROM usage_windowed
+			FROM usage_normalized
 		),
 		usage_snapshot_survivors AS (
 			SELECT
@@ -866,7 +846,7 @@ func chUsageCTEFromRaw(
 				ranked.dedup_group,
 				ranked.local_date,
 				ranked.price_model,
-				ranked.price_key,
+				ranked.price_key,` + passthrough.String() + `
 				ranked.snapshot_deduplicated_output_tokens,
 				if(attributed.id = '', ranked.project, attributed.project) AS project,
 				if(attributed.id = '', ranked.agent, attributed.agent) AS agent,
@@ -877,6 +857,8 @@ func chUsageCTEFromRaw(
 					attributed.display_name, attributed.session_name,
 					attributed.first_message, attributed.project, attributed.id
 				), '')) AS display_name,
+				if(attributed.id = '', ranked.group_key, attributed.group_key) AS group_key,
+				if(attributed.id = '', ranked.session_name, ifNull(attributed.session_name, '')) AS session_name,
 				if(attributed.id = '', ranked.started_at, attributed.started_at) AS started_at,
 				if(attributed.id = '', ranked.activity_at, COALESCE(
 					attributed.ended_at, attributed.started_at,
@@ -918,9 +900,7 @@ func chUsageCTEFromRaw(
 				if(source = 'message', %[13]s,
 					if(source = 'session', greatest(reasoning_tokens, toInt64(0)),
 						least(greatest(reasoning_tokens, toInt64(0)), toInt64(%[4]d)))) AS reasoning_tokens_norm,
-				if(source = 'message',
-					greatest(JSONExtractInt(token_json, 'server_tool_use', 'web_search_requests'), toInt64(0)),
-					toInt64(0)) AS web_search_requests_norm,
+				if(source = 'message', %[15]s, toInt64(0)) AS web_search_requests_norm,
 				if(claude_message_id != '' AND claude_request_id != '',
 					concat('claude:', claude_message_id, ':', claude_request_id),
 					if(source = 'message' AND agent != '' AND source_uuid != '',
@@ -937,13 +917,9 @@ func chUsageCTEFromRaw(
 				%[5]s AS price_model,
 				%[14]s AS price_key
 			FROM usage_raw
-		),
-		usage_windowed AS (
-			SELECT *
-			FROM usage_normalized
 			WHERE %[3]s
 		)%[6]s,
-		usage_ranked AS (
+		usage_localized AS (
 			SELECT *,
 				row_number() OVER (
 					PARTITION BY dedup_group
@@ -951,20 +927,12 @@ func chUsageCTEFromRaw(
 						COALESCE(message_ordinal, -1) ASC
 				) AS dedup_rank
 			FROM %[7]s
-		),
-		usage_localized AS (
-			SELECT *
-			FROM usage_ranked
-			WHERE dedup_rank = 1
+			QUALIFY dedup_rank = 1
 		)`, rawSQL, localDateSQL, datePred, maxTok,
 		priceModelSQL, snapshotCTE, rankedSource,
-		chClampedJSONInt("token_json", "input_tokens"),
-		chClampedJSONInt("token_json", "output_tokens"),
-		chClampedJSONInt("token_json", "cache_creation_input_tokens"),
-		chClampedJSONInt("token_json", "cache_creation", "ephemeral_1h_input_tokens"),
-		chClampedJSONInt("token_json", "cache_read_input_tokens"),
-		chClampedJSONInt("token_json", "reasoning_tokens"),
-		chUsagePriceKeySQL,
+		norms.input, norms.output, norms.cacheCreate, norms.cacheCreate1h,
+		norms.cacheRead, norms.reasoning,
+		norms.priceKey, norms.web,
 	)
 	args = append(args, localDateArg)
 	args = append(args, dateArgs...)
@@ -1012,6 +980,7 @@ type chUsageAggregateRow struct {
 	authoritativeCost     int64
 	authoritativeCostRows int
 	snapshotDedupOutput   int
+	groupKey, sessionName string
 }
 
 type chSessionUsageRow struct {
@@ -1034,7 +1003,7 @@ type chSessionUsageRow struct {
 }
 
 func chUsageLookupModel(model, ts string) string {
-	timestamp, _ := parseAnalyticsTime(ts)
+	timestamp, _ := readbase.ParseAnalyticsTime(ts)
 	if canonical := pricingpkg.CanonicalModelForDate(model, timestamp); canonical != "" {
 		return canonical
 	}
@@ -1042,7 +1011,7 @@ func chUsageLookupModel(model, ts string) string {
 }
 
 func chUsagePricingTimestamp(ts string) time.Time {
-	timestamp, _ := parseAnalyticsTime(ts)
+	timestamp, _ := readbase.ParseAnalyticsTime(ts)
 	return timestamp
 }
 
@@ -1106,7 +1075,7 @@ func chUsageAggregateResolvedCost(
 		pricing.RecordResolvedReported(reportedModel, pricedModel, lookup)
 	}
 	if hasComputedUsage {
-		chRecordComputedUsagePricing(
+		db.RecordComputedUsagePricing(
 			pricing, reportedModel, pricedModel, lookup, requestScoped,
 			billableInput, billableCacheCr, billableCacheRd,
 		)
@@ -1163,22 +1132,6 @@ func chUsageAggregateResolvedCost(
 		priced = true
 	}
 	return cost, savings, priced, true, nil
-}
-
-func chRecordComputedUsagePricing(
-	pricing *export.PricingResolver,
-	reportedModel, pricedModel string,
-	lookup export.PricingLookup,
-	requestScoped bool,
-	inputTokens, cacheWriteTokens, cacheReadTokens int,
-) {
-	if requestScoped {
-		pricing.RecordResolvedComputedRequest(
-			reportedModel, pricedModel, lookup,
-			inputTokens, cacheWriteTokens, cacheReadTokens)
-		return
-	}
-	pricing.RecordResolvedComputedAggregate(reportedModel, pricedModel, lookup)
 }
 
 func chSessionUsageRowCost(
@@ -1299,6 +1252,45 @@ type chDailyUsageGroupRow struct {
 	overflow   bool
 }
 
+// chUsagePricedCTE attaches each row's price record under pricingDigest.
+// Rows prepared under that digest already carry their record; only cursor
+// rows, if any, still join the records, restricted to their own keys.
+// Other rows join every record for the digest.
+func chUsagePricedCTE(source chUsageSource, pricingDigest string) (string, []any) {
+	columns := make([]string, 0, len(chUsageStoredPriceColumns))
+	stored := source.storedPricesDigest != "" && source.storedPricesDigest == pricingDigest
+	for _, column := range chUsageStoredPriceColumns {
+		switch {
+		case stored && source.cursorRows:
+			columns = append(columns, "if(u.source = 'cursor', p."+column.joined+", u."+column.stored+") AS "+column.joined)
+		case stored:
+			columns = append(columns, "u."+column.stored+" AS "+column.joined)
+		default:
+			columns = append(columns, "p."+column.joined+" AS "+column.joined)
+		}
+	}
+	query := `,
+		usage_priced AS (
+			SELECT u.*,` + chUsageBillableSelect + `,
+				` + strings.Join(columns, ",\n\t\t\t\t") + `
+			FROM usage_localized u`
+	if stored && !source.cursorRows {
+		return query + `
+		)`, nil
+	}
+	query += `
+			LEFT JOIN (
+				` + chUsagePriceRowsSQL() + `
+				WHERE pricing_digest = ?`
+	if stored {
+		query += `
+					AND price_key IN (SELECT price_key FROM usage_normalized WHERE source = 'cursor')`
+	}
+	return query + `
+			) p ON p.p_price_key = u.price_key
+		)`, []any{pricingDigest}
+}
+
 func (s *Store) forEachDailyUsageGroupRow(
 	ctx context.Context,
 	f db.UsageFilter,
@@ -1306,7 +1298,29 @@ func (s *Store) forEachDailyUsageGroupRow(
 	customModels [][2]string,
 	visit func(chDailyUsageGroupRow) error,
 ) error {
-	cte, args := chDailyUsageCTE(f)
+	// The state and the key come from the caller's parts snapshot, taken
+	// before any read the rows depend on.
+	state, err := s.preparedUsageState(ctx)
+	if err != nil {
+		return err
+	}
+	memoSlot, memoVersion, err := s.usageRowMemoKey(ctx, state, "daily", f, "", pricingDigest, customModels)
+	if err != nil {
+		return err
+	}
+	if rows, ok := s.dailyUsageRows.get(memoSlot, memoVersion); ok {
+		for _, r := range rows {
+			if err := visit(r); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	source, err := s.dailyUsageCTE(ctx, state, f)
+	if err != nil {
+		return err
+	}
+	cte, args := source.cte, source.args
 	machineSelect := "''"
 	if f.Breakdowns {
 		machineSelect = "machine"
@@ -1321,31 +1335,8 @@ func (s *Store) forEachDailyUsageGroupRow(
 		}
 		customPred = "(model, price_model) IN (" + strings.Join(tuples, ", ") + ")"
 	}
-	query := cte + `,
-		usage_priced AS (
-			SELECT u.*,` + chUsageBillableSelect + `,
-				p.p_priced AS p_priced,
-				p.p_token_cost AS p_token_cost,
-				p.p_savings AS p_savings,
-				p.p_billed_context_id AS p_billed_context_id,
-				p.p_unbilled_context_id AS p_unbilled_context_id,
-				p.p_request_scoped AS p_request_scoped,
-				p.p_band AS p_band,
-				p.p_price_error AS p_price_error
-			FROM usage_localized u
-			LEFT JOIN (
-				SELECT price_key AS p_price_key, priced AS p_priced,
-					token_cost_microdollars AS p_token_cost,
-					cache_savings_microdollars AS p_savings,
-					billed_context_id AS p_billed_context_id,
-					unbilled_context_id AS p_unbilled_context_id,
-					request_scoped AS p_request_scoped,
-					band_above_input_tokens AS p_band,
-					price_error AS p_price_error
-				FROM usage_event_prices
-				WHERE pricing_digest = ?
-			) p ON p.p_price_key = u.price_key
-		),
+	pricedSQL, pricedArgs := chUsagePricedCTE(source, pricingDigest)
+	query := cte + pricedSQL + `,
 		usage_classified AS (
 			SELECT *,
 				` + machineSelect + ` AS group_machine,
@@ -1393,13 +1384,18 @@ func (s *Store) forEachDailyUsageGroupRow(
 		ORDER BY session_id ASC, local_date ASC, project ASC, agent ASC, group_machine ASC,
 			model ASC, row_price_model ASC, row_ts ASC, COALESCE(row_message_ordinal, -1) ASC,
 			row_source ASC, row_usage_dedup_key ASC`
-	args = append(args, pricingDigest)
+	args = append(args, pricedArgs...)
 	args = append(args, customArgs...)
-	rows, err := s.queryContext(ctx, query, args...)
+	readCtx, err := withUsageDeltaTables(ctx, state)
+	if err != nil {
+		return err
+	}
+	rows, err := s.queryContext(readCtx, query, args...)
 	if err != nil {
 		return fmt.Errorf("querying clickhouse daily usage aggregates: %w", err)
 	}
 	defer rows.Close()
+	var memo []chDailyUsageGroupRow
 	for rows.Next() {
 		var r chDailyUsageGroupRow
 		var explicitKey string
@@ -1425,6 +1421,7 @@ func (s *Store) forEachDailyUsageGroupRow(
 		r.explicit = explicitKey != ""
 		r.ts = formatDBTime(ts)
 		r.pricingTS = formatDBTime(pricingTS)
+		memo = append(memo, r)
 		if err := visit(r); err != nil {
 			return err
 		}
@@ -1432,6 +1429,7 @@ func (s *Store) forEachDailyUsageGroupRow(
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterating clickhouse daily usage aggregates: %w", err)
 	}
+	s.dailyUsageRows.put(memoSlot, memoVersion, memo)
 	return nil
 }
 
@@ -1507,12 +1505,18 @@ var errUsagePriceContextChanged = errors.New("usage price context changed during
 func (s *Store) GetDailyUsage(
 	ctx context.Context, f db.UsageFilter,
 ) (db.DailyUsageResult, error) {
-	catalog, err := chLoadPricingCatalog(ctx, s.conn, s.customPricing)
+	// One parts snapshot names the prepared state and the kept read alike,
+	// so a push that lands during the read makes the next request miss.
+	ctx, err := s.withPartsSnapshot(ctx)
+	if err != nil {
+		return db.DailyUsageResult{}, err
+	}
+	snapshot, err := s.pricingSnapshot(ctx)
 	if err != nil {
 		return db.DailyUsageResult{}, err
 	}
 	for attempt := 1; ; attempt++ {
-		result, err := s.dailyUsageForCatalog(ctx, f, catalog)
+		result, err := s.dailyUsageForCatalog(ctx, f, snapshot)
 		if !errors.Is(err, errUsagePriceContextChanged) || attempt == chDailyUsageLoadAttempts {
 			return result, err
 		}
@@ -1522,9 +1526,10 @@ func (s *Store) GetDailyUsage(
 // Each attempt owns its accumulator and resolver. If a push adds a context
 // during the query, retry with fresh contexts instead of retaining raw rows.
 func (s *Store) dailyUsageForCatalog(
-	ctx context.Context, f db.UsageFilter, catalog chPricingCatalog,
+	ctx context.Context, f db.UsageFilter, snapshot *pricingSnapshot,
 ) (db.DailyUsageResult, error) {
-	rateResolver := export.NewPricingResolver(catalog.rows)
+	catalog := snapshot.catalog
+	rateResolver := export.NewPricingResolverWithDigest(catalog.rows, snapshot.catalogDigest)
 	priceContexts, err := loadUsagePriceContexts(ctx, s.conn, catalog.digest)
 	if err != nil {
 		return db.DailyUsageResult{}, err
@@ -1547,7 +1552,7 @@ func (s *Store) dailyUsageForCatalog(
 		authoritative *money.Money
 	}
 	sessionCosts := map[string]sessionCost{}
-	useAuthoritativeCost := f.Model == "" && f.ExcludeModel == ""
+	useAuthoritativeCost := !f.HasModelFilter()
 	projectLabels := map[string]bool{}
 	var seenSessions map[string]db.UsageSessionInfo
 	if !f.SkipSessionCounts {
@@ -1725,7 +1730,7 @@ func (s *Store) dailyUsageForCatalog(
 	}
 
 	var result db.DailyUsageResult
-	for _, date := range sortedKeys(days) {
+	for _, date := range db.SortedKeys(days) {
 		day := days[date]
 		if day == nil {
 			continue
@@ -1819,7 +1824,7 @@ func (s *Store) dailyUsageForCatalog(
 			"building pricing block: %w", err)
 	}
 	result.Pricing = &pricingBlock
-	projects, err := s.BuildProjectIdentityMap(ctx, sortedKeys(projectLabels))
+	projects, err := s.BuildProjectIdentityMap(ctx, db.SortedKeys(projectLabels))
 	if err != nil {
 		if !errors.Is(err, errNotImplemented) {
 			return db.DailyUsageResult{}, err
@@ -1873,10 +1878,37 @@ func (s *Store) forEachSessionUsageAggregateRow(
 	sessionID string,
 	visit func(chUsageAggregateRow) error,
 ) error {
-	cte, args := chUsageCTE(f, sessionID)
+	// One session's usage is read raw; only a read across sessions uses
+	// prepared rows and the delta of the sessions pushed since the refresh.
+	var state preparedUsageState
+	if sessionID == "" {
+		var err error
+		if state, err = s.preparedUsageState(ctx); err != nil {
+			return err
+		}
+	}
+	// Only one session's rows are kept. Callers across every session keep
+	// their own totals instead of the rows, so their read takes no slot.
+	var memoSlot, memoVersion string
+	if sessionID != "" {
+		var err error
+		if memoSlot, memoVersion, err = s.usageRowMemoKey(ctx, state, "session", f, sessionID, "", nil); err != nil {
+			return err
+		}
+	}
+	if rows, ok := s.sessionAggregateRows.get(memoSlot, memoVersion); ok {
+		for _, r := range rows {
+			if err := visit(r); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	source := usageCTEFor(state, f, sessionID)
+	cte, args := source.cte, source.args
 	query := cte + `
 		SELECT session_id, project, agent, model, provider_id, price_model, source, message_ordinal, ts,
-			pricing_ts, display_name, started_at,
+			pricing_ts, display_name, started_at, group_key, session_name, machine,
 			input_tokens_norm AS input_tokens,
 			output_tokens_norm AS output_tokens,
 			snapshot_deduplicated_output_tokens,
@@ -1886,18 +1918,23 @@ func (s *Store) forEachSessionUsageAggregateRow(
 		FROM usage_localized
 		ORDER BY session_id ASC, model ASC, price_model ASC, ts ASC,
 			COALESCE(message_ordinal, -1) ASC, source ASC, usage_dedup_key ASC`
-	rows, err := s.queryContext(ctx, query, args...)
+	readCtx, err := withUsageDeltaTables(ctx, state)
+	if err != nil {
+		return err
+	}
+	rows, err := s.queryContext(readCtx, query, args...)
 	if err != nil {
 		return fmt.Errorf("querying clickhouse session usage aggregates: %w", err)
 	}
 	defer rows.Close()
+	var memo []chUsageAggregateRow
 	for rows.Next() {
 		var r chUsageAggregateRow
 		var ts, pricingTS, startedAt any
 		if err := rows.Scan(
 			&r.sessionID, &r.project, &r.agent, &r.model, &r.providerID,
 			&r.priceModel, &r.source, &r.messageOrdinal, &ts, &pricingTS,
-			&r.displayName, &startedAt,
+			&r.displayName, &startedAt, &r.groupKey, &r.sessionName, &r.machine,
 			&r.inputTok, &r.outputTok, &r.snapshotDedupOutput,
 			&r.cacheCr, &r.cacheCr1h, &r.cacheRd,
 			&r.billableInput, &r.billableOutput, &r.billableReason,
@@ -1911,6 +1948,9 @@ func (s *Store) forEachSessionUsageAggregateRow(
 		r.ts = formatDBTime(ts)
 		r.pricingTS = formatDBTime(pricingTS)
 		r.startedAt = formatDBTime(startedAt)
+		if memoSlot != "" {
+			memo = append(memo, r)
+		}
 		if err := visit(r); err != nil {
 			return err
 		}
@@ -1918,6 +1958,7 @@ func (s *Store) forEachSessionUsageAggregateRow(
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterating clickhouse session usage aggregates: %w", err)
 	}
+	s.sessionAggregateRows.put(memoSlot, memoVersion, memo)
 	return nil
 }
 
@@ -1985,10 +2026,35 @@ func (s *Store) sessionUsageRows(
 func (s *Store) GetTopSessionsByCost(
 	ctx context.Context, f db.UsageFilter, limit int,
 ) ([]db.TopSessionEntry, error) {
-	rateResolver, err := s.loadPricingResolver(ctx)
+	// One parts snapshot names the prepared state and the kept read alike,
+	// so a push that lands during the read makes the next request miss.
+	ctx, err := s.withPartsSnapshot(ctx)
 	if err != nil {
 		return nil, err
 	}
+	state, err := s.preparedUsageState(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pricing, err := s.pricingSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Keep one total per session rather than every usage row: the totals
+	// are all a later read needs, and they are a small fraction of the rows.
+	memoSlot, memoVersion, err := s.usageRowMemoKey(ctx, state, "top", f, "", pricing.digest, nil)
+	if err != nil {
+		return nil, err
+	}
+	if kept, ok := s.topSessionTotals.get(memoSlot, memoVersion); ok {
+		if f.TopSessionsByGroup {
+			return db.GroupTopSessions(kept, limit, f.TopSessionsSort, f.TopSessionsTokenTypes)
+		}
+		return db.SortAndLimitTopSessions(
+			slices.Clone(kept), limit, f.TopSessionsSort, f.TopSessionsTokenTypes,
+		), nil
+	}
+	rateResolver := export.NewPricingResolverWithDigest(pricing.rows, pricing.digest)
 	type acc struct {
 		row               db.TopSessionEntry
 		tokens            int
@@ -2003,6 +2069,7 @@ func (s *Store) GetTopSessionsByCost(
 				a = &acc{row: db.TopSessionEntry{
 					SessionID: r.sessionID, DisplayName: r.displayName,
 					Agent: r.agent, Project: r.project, StartedAt: r.startedAt,
+					GroupKey: r.groupKey, SessionName: r.sessionName, Machine: r.machine,
 				}}
 				bySession[r.sessionID] = a
 			}
@@ -2029,7 +2096,7 @@ func (s *Store) GetTopSessionsByCost(
 			if priceErr != nil {
 				return fmt.Errorf("summing clickhouse top-session cost: %w", priceErr)
 			}
-			if f.Model == "" && f.ExcludeModel == "" && r.authoritativeCostRows > 0 {
+			if !f.HasModelFilter() && r.authoritativeCostRows > 0 {
 				v := money.Money{Microdollars: r.authoritativeCost}
 				a.authoritativeCost = &v
 			}
@@ -2048,40 +2115,304 @@ func (s *Store) GetTopSessionsByCost(
 		}
 		out = append(out, a.row)
 	}
+	s.topSessionTotals.put(memoSlot, memoVersion, out)
+	if f.TopSessionsByGroup {
+		return db.GroupTopSessions(out, limit, f.TopSessionsSort, f.TopSessionsTokenTypes)
+	}
 	return db.SortAndLimitTopSessions(
-		out, limit, f.TopSessionsSort, f.TopSessionsTokenTypes,
+		slices.Clone(out), limit, f.TopSessionsSort, f.TopSessionsTokenTypes,
 	), nil
 }
 
 func (s *Store) GetUsageSessionCounts(
 	ctx context.Context, f db.UsageFilter,
 ) (db.UsageSessionCounts, error) {
-	cte, args := chUsageCTE(f, "")
-	rows, err := s.queryContext(ctx, cte+`
-		SELECT DISTINCT session_id, project, agent
-		FROM usage_localized
-		WHERE session_id != ''
-		ORDER BY session_id`, args...)
+	// One parts snapshot names the prepared state and the kept read alike,
+	// so a push that lands during the read makes the next request miss.
+	ctx, err := s.withPartsSnapshot(ctx)
 	if err != nil {
-		return db.UsageSessionCounts{}, fmt.Errorf(
-			"querying clickhouse usage session counts: %w", err)
+		return db.UsageSessionCounts{}, err
 	}
-	defer rows.Close()
-	seen := map[string]db.UsageSessionInfo{}
-	for rows.Next() {
-		var sessionID string
-		var info db.UsageSessionInfo
-		if err := rows.Scan(&sessionID, &info.Project, &info.Agent); err != nil {
-			return db.UsageSessionCounts{}, fmt.Errorf(
-				"scanning clickhouse usage session count: %w", err)
+	state, err := s.preparedUsageState(ctx)
+	if err != nil {
+		return db.UsageSessionCounts{}, err
+	}
+	memoSlot, memoVersion, err := s.usageRowMemoKey(ctx, state, "counts", f, "", "", nil)
+	if err != nil {
+		return db.UsageSessionCounts{}, err
+	}
+	counted, ok := s.usageSessionRows.get(memoSlot, memoVersion)
+	if !ok {
+		source := usageCTEFor(state, f, "")
+		readCtx, err := withUsageDeltaTables(ctx, state)
+		if err != nil {
+			return db.UsageSessionCounts{}, err
 		}
-		seen[sessionID] = info
+		rows, err := s.queryContext(readCtx, source.cte+`
+			SELECT DISTINCT session_id, project, agent
+			FROM usage_localized
+			WHERE session_id != ''
+			ORDER BY session_id`, source.args...)
+		if err != nil {
+			return db.UsageSessionCounts{}, fmt.Errorf(
+				"querying clickhouse usage session counts: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var r chUsageSessionRow
+			if err := rows.Scan(&r.sessionID, &r.project, &r.agent); err != nil {
+				return db.UsageSessionCounts{}, fmt.Errorf(
+					"scanning clickhouse usage session count: %w", err)
+			}
+			counted = append(counted, r)
+		}
+		if err := rows.Err(); err != nil {
+			return db.UsageSessionCounts{}, fmt.Errorf(
+				"iterating clickhouse usage session counts: %w", err)
+		}
+		s.usageSessionRows.put(memoSlot, memoVersion, counted)
 	}
-	if err := rows.Err(); err != nil {
-		return db.UsageSessionCounts{}, fmt.Errorf(
-			"iterating clickhouse usage session counts: %w", err)
+	seen := make(map[string]db.UsageSessionInfo, len(counted))
+	for _, r := range counted {
+		seen[r.sessionID] = db.UsageSessionInfo{Project: r.project, Agent: r.agent}
 	}
 	return db.NewUsageSessionCounts(seen), nil
+}
+
+type chUsageSessionRow struct {
+	sessionID, project, agent string
+}
+
+// usageRowMemoKey names a usage read's memo slot by the read's own
+// parameters and its version by everything its rows depend on (see
+// usageReadFingerprint). A single session's usage is read from the raw
+// rows even when prepared rows are ready (see usageCTEFor), so its version
+// names the parts of every table: a push that fails after writing the raw
+// rows and before the snapshot changes no table a prepared read joins.
+func (s *Store) usageRowMemoKey(
+	ctx context.Context, state preparedUsageState, kind string, f db.UsageFilter,
+	sessionID, pricingDigest string, customModels [][2]string,
+) (slot, version string, err error) {
+	if sessionID != "" {
+		version, err = s.partsFingerprint(ctx)
+	} else {
+		version, err = s.usageReadFingerprint(ctx, state)
+	}
+	if err != nil {
+		return "", "", err
+	}
+	slot, err = usageRowMemoKeyFor(kind, f, sessionID, pricingDigest, customModels)
+	return slot, version, err
+}
+
+// chUsageReadTables are the tables a prepared usage read touches besides
+// prepared_usage itself, whose rows the state's stamp identifies.
+var chUsageReadTables = []string{
+	"sessions", "usage_session_snapshots", "cursor_usage_events", "usage_event_prices",
+	"usage_price_contexts", "model_pricing", "model_pricing_bands", "genai_pricing", "sync_metadata",
+}
+
+// chRawHostUsageTables are the tables a prepared read also reads while some
+// host is read raw; see preparedUsageState.raw.
+var chRawHostUsageTables = []string{"usage_messages", "usage_events"}
+
+// usageReadFingerprint identifies what a usage read depends on. A prepared
+// read depends on the prepared rows, named by the state's stamp, and on the
+// active parts of the tables it joins or prices from; the large message and
+// event tables, whose background merges rename parts long after a push, are
+// not among them. A raw read depends on the parts of every table.
+func (s *Store) usageReadFingerprint(ctx context.Context, state preparedUsageState) (string, error) {
+	if !state.ready {
+		return s.partsFingerprint(ctx)
+	}
+	tables := chUsageReadTables
+	if len(state.raw) > 0 {
+		// The raw hosts' rows come from the message and event tables.
+		tables = slices.Concat(tables, chRawHostUsageTables)
+	}
+	fingerprint, err := s.tablePartsFingerprint(ctx, tables)
+	if err != nil {
+		return "", err
+	}
+	return fingerprint + "|" + state.stamp, nil
+}
+
+// usageRowMemoKeyFor renders the key. The filter is JSON and the custom
+// models are Go syntax, so every field and string boundary is preserved.
+// A filter that compares session times with the current time selects
+// other sessions as time passes, with no write to name the change, so its
+// key is empty and its rows are not kept.
+func usageRowMemoKeyFor(
+	kind string, f db.UsageFilter, sessionID, pricingDigest string,
+	customModels [][2]string,
+) (string, error) {
+	if chTerminationUsesTime(f.Termination) {
+		return "", nil
+	}
+	filter, err := json.Marshal(f)
+	if err != nil {
+		return "", fmt.Errorf("encoding usage filter for memo: %w", err)
+	}
+	return fmt.Sprintf("%s|%s|%s|%s|%#v", kind, filter, sessionID, pricingDigest, customModels), nil
+}
+
+// partsFingerprint identifies the active parts of every table in the
+// mirror. Two reads under the same fingerprint see the same rows.
+func (s *Store) partsFingerprint(ctx context.Context) (string, error) {
+	return s.tablePartsFingerprint(ctx, nil)
+}
+
+// tablePartsFingerprint identifies the active parts of the named tables,
+// or of every table when none are named. Within a request that took a
+// parts snapshot, every fingerprint comes from that one snapshot.
+func (s *Store) tablePartsFingerprint(ctx context.Context, tables []string) (string, error) {
+	snapshot, ok := ctx.Value(partsSnapshotKey{}).(partsSnapshot)
+	if !ok {
+		var err error
+		if snapshot, err = s.readPartsSnapshot(ctx); err != nil {
+			return "", err
+		}
+	}
+	if len(tables) == 0 {
+		tables = slices.Collect(maps.Keys(snapshot))
+	}
+	tables = slices.Sorted(slices.Values(tables))
+	sum := sha256.New()
+	for _, table := range slices.Compact(tables) {
+		fmt.Fprintf(sum, "%s\x00%s\x00", table, snapshot[table])
+	}
+	return hex.EncodeToString(sum.Sum(nil)), nil
+}
+
+// partsSnapshot maps each table to a digest of its active parts.
+type partsSnapshot map[string]string
+
+type partsSnapshotKey struct{}
+
+// readPartsSnapshot reads the active parts of every table in one query.
+func (s *Store) readPartsSnapshot(ctx context.Context) (partsSnapshot, error) {
+	rows, err := s.queryContext(ctx, `SELECT table,
+		hex(SHA256(toString(arraySort(groupArray((name, hash_of_all_files))))))
+		FROM system.parts WHERE database = currentDatabase() AND active GROUP BY table`)
+	if err != nil {
+		return nil, fmt.Errorf("reading clickhouse parts: %w", err)
+	}
+	defer rows.Close()
+	snapshot := partsSnapshot{}
+	for rows.Next() {
+		var table, digest string
+		if err := rows.Scan(&table, &digest); err != nil {
+			return nil, fmt.Errorf("scanning clickhouse parts: %w", err)
+		}
+		snapshot[table] = digest
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating clickhouse parts: %w", err)
+	}
+	return snapshot, nil
+}
+
+// withPartsSnapshot makes the fingerprints of the reads under the returned
+// context come from one snapshot of the parts, taken before any of them.
+func (s *Store) withPartsSnapshot(ctx context.Context) (context.Context, error) {
+	snapshot, err := s.readPartsSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return context.WithValue(ctx, partsSnapshotKey{}, snapshot), nil
+}
+
+// usageRowMemo keeps the rows of recent usage reads. A slot names the read
+// and holds only the rows of its latest version, which names the parts the
+// rows were read from. A push replaces a slot's rows instead of adding a
+// second copy beside them, and a stale version is never returned. The
+// empty slot keeps nothing. The oldest written slots go first when the
+// memo is over its slot or byte limit.
+type usageRowMemo[T any] struct {
+	mu      sync.Mutex
+	entries map[string]usageRowMemoEntry[T]
+	order   []string
+	// limit caps the slots; zero means usageRowMemoLimit.
+	limit int
+	// size estimates a row's bytes. With it, maxBytes caps the bytes kept,
+	// zero meaning usageRowMemoBytes, and rows over that cap are not kept.
+	// Without it only the slots are capped.
+	size     func(T) int64
+	maxBytes int64
+	bytes    int64
+}
+
+type usageRowMemoEntry[T any] struct {
+	version string
+	rows    []T
+	bytes   int64
+}
+
+const (
+	usageRowMemoLimit = 64
+	usageRowMemoBytes = 64 << 20
+)
+
+func (m *usageRowMemo[T]) get(slot, version string) ([]T, bool) {
+	if slot == "" {
+		return nil, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, ok := m.entries[slot]
+	if !ok || entry.version != version {
+		return nil, false
+	}
+	return entry.rows, true
+}
+
+func (m *usageRowMemo[T]) put(slot, version string, rows []T) {
+	if slot == "" {
+		return
+	}
+	var size int64
+	if m.size != nil {
+		for _, row := range rows {
+			size += m.size(row)
+		}
+	}
+	maxBytes := cmp.Or(m.maxBytes, usageRowMemoBytes)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.removeLocked(slot)
+	if m.size != nil && size > maxBytes {
+		return
+	}
+	if m.entries == nil {
+		m.entries = map[string]usageRowMemoEntry[T]{}
+	}
+	m.entries[slot] = usageRowMemoEntry[T]{version: version, rows: rows, bytes: size}
+	m.order = append(m.order, slot)
+	m.bytes += size
+	for len(m.order) > cmp.Or(m.limit, usageRowMemoLimit) || m.bytes > maxBytes {
+		m.removeLocked(m.order[0])
+	}
+}
+
+// deleteSlots removes the slots drop reports.
+func (m *usageRowMemo[T]) deleteSlots(drop func(slot string) bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, slot := range slices.Clone(m.order) {
+		if drop(slot) {
+			m.removeLocked(slot)
+		}
+	}
+}
+
+func (m *usageRowMemo[T]) removeLocked(slot string) {
+	entry, ok := m.entries[slot]
+	if !ok {
+		return
+	}
+	delete(m.entries, slot)
+	m.order = slices.DeleteFunc(m.order, func(s string) bool { return s == slot })
+	m.bytes -= entry.bytes
 }
 
 func appendChUsageMatchingActivityClauses(
@@ -2148,7 +2479,7 @@ func (s *Store) GetUsageMatchingSessionCount(
 		if err := rows.Scan(&id, &ts); err != nil {
 			return 0, fmt.Errorf("scanning matching usage session: %w", err)
 		}
-		date := analyticsLocalDate(formatDBTime(ts), f.Timezone)
+		date := readbase.AnalyticsLocalDate(formatDBTime(ts), f.Timezone)
 		if date == "" {
 			continue
 		}
@@ -2164,6 +2495,29 @@ func (s *Store) GetUsageMatchingSessionCount(
 		return 0, fmt.Errorf("iterating matching usage sessions: %w", err)
 	}
 	return len(seen), nil
+}
+
+// GetSessionPlanUsage returns one session's plan usage row, or nil when
+// the session has none.
+func (s *Store) GetSessionPlanUsage(
+	ctx context.Context, sessionID string,
+) (*db.SessionPlanUsage, error) {
+	rows, err := s.conn.QueryContext(ctx,
+		`SELECT `+db.SessionPlanUsageColumns+` FROM session_plan_usage WHERE session_id = ?`,
+		sessionID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("querying clickhouse plan usage for %s: %w", sessionID, err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, rows.Err()
+	}
+	p, err := db.ScanSessionPlanUsage(rows.Scan)
+	if err != nil {
+		return nil, fmt.Errorf("scanning clickhouse plan usage for %s: %w", sessionID, err)
+	}
+	return p, rows.Err()
 }
 
 func (s *Store) GetSessionUsage(
@@ -2272,8 +2626,8 @@ func (s *Store) GetSessionUsage(
 		TotalOutputTokens: max(sess.TotalOutputTokens-deduplicatedOutputTokens, 0),
 		PeakContextTokens: sess.PeakContextTokens,
 		HasTokenData:      sess.HasTotalOutputTokens || sess.HasPeakContextTokens,
-		Models:            sortedKeys(models),
-		UnpricedModels:    sortedKeys(unpriced),
+		Models:            db.SortedKeys(models),
+		UnpricedModels:    db.SortedKeys(unpriced),
 		BreakdownCount:    breakdownCount,
 		Breakdown:         breakdown,
 	}
@@ -2290,5 +2644,8 @@ func (s *Store) GetSessionUsage(
 		out.AICredits = db.AICreditsFromCost(sess.Agent, out.Cost)
 	}
 	out.CostUSD = db.CostUSDFromCost(out.HasCost, out.Cost)
+	if out.PlanUsage, err = s.GetSessionPlanUsage(ctx, sess.ID); err != nil {
+		return nil, err
+	}
 	return out, nil
 }

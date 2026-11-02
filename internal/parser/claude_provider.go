@@ -4,9 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"syscall"
 )
 
 var (
@@ -54,6 +58,50 @@ func (p *claudeProvider) Discover(ctx context.Context) ([]SourceRef, error) {
 
 func (p *claudeProvider) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
 	return p.sources.DiscoverEach(ctx, yield)
+}
+
+func (p *claudeProvider) DiscoverScopesEach(ctx context.Context, scopes []ReconciliationScope, yield func(SourceRef) error) error {
+	paths := make(map[string][]string)
+	for _, scope := range scopes {
+		for _, root := range scope.TraversalRoots {
+			for _, proof := range scope.PhysicalProofScopes {
+				paths[root] = append(paths[root], filepath.Clean(proof.Path))
+			}
+		}
+	}
+	var incomplete error
+	emit := func(source SourceRef) error {
+		if err := yield(source); err != nil {
+			return discoveryYieldError{cause: err}
+		}
+		return nil
+	}
+	for _, root := range slices.Sorted(maps.Keys(paths)) {
+		slices.Sort(paths[root])
+		var covered []string
+		for _, path := range paths[root] {
+			if slices.ContainsFunc(covered, func(parent string) bool {
+				return reconciliationScopeWithinOrSame(path, parent)
+			}) {
+				continue
+			}
+			covered = append(covered, path)
+			var err error
+			if reconciliationScopeSamePath(cleanReconciliationScopeRoot(root), cleanReconciliationScopeRoot(path)) {
+				err = p.sources.discoverEachRoot(ctx, root, emit)
+			} else {
+				err = p.sources.streamLocalSubtree(ctx, root, path, true, yield)
+			}
+			if cause, ok := discoveryYieldCause(err); ok {
+				return cause
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			incomplete = errors.Join(incomplete, err)
+		}
+	}
+	return incomplete
 }
 
 func (p *claudeProvider) DiscoverRawCaptureSourcesEach(
@@ -208,6 +256,29 @@ func (p *claudeProvider) ComputeMultiFileStatHash(chatPath string) uint64 {
 	return fileStatTupleDigest(0xC1, chatPath)
 }
 
+func (p *claudeProvider) ParseSourceSize(ctx context.Context, source SourceRef) (int64, error) {
+	path, ok := p.sources.pathFromSource(source)
+	if !ok {
+		return 0, errors.New("claude source path unavailable")
+	}
+	paths, err := claudeSubagentSiblingTranscripts(path)
+	if err != nil {
+		return 0, err
+	}
+	var size int64
+	for _, input := range append(paths, path) {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		info, err := os.Stat(input)
+		if err != nil {
+			return 0, err
+		}
+		size += info.Size()
+	}
+	return size, nil
+}
+
 func (p *claudeProvider) Parse(
 	ctx context.Context,
 	req ParseRequest,
@@ -249,9 +320,23 @@ func (p *claudeProvider) Parse(
 			results[i].Session.File.Hash = req.Fingerprint.Hash
 		}
 	}
+	// A sub-agent that ran again under a second parent session wrote a second
+	// transcript with the same name. Both are the same sub-agent session, so the
+	// later entries are appended here rather than colliding with the first
+	// file's session row and replacing it.
+	results, joined, err := p.joinClaudeSubagentContinuations(
+		ctx, path, project, machine, opts, results,
+	)
+	if err != nil {
+		return ParseOutcome{}, err
+	}
 	InferRelationshipTypes(results)
 	out := make([]ParseResultOutcome, 0, len(results))
 	for _, result := range results {
+		if _, _, subagent := claudeSubagentTranscriptRel(result.Session.File.Path); subagent &&
+			result.Session.ClaudeSubagentSources == nil {
+			result.Session.ClaudeSubagentSources = []string{result.Session.File.Path}
+		}
 		out = append(out, ParseResultOutcome{
 			Result:      result,
 			DataVersion: DataVersionCurrent,
@@ -261,6 +346,7 @@ func (p *claudeProvider) Parse(
 		Results:            out,
 		ExcludedSessionIDs: excludedIDs,
 		ResultSetComplete:  true,
+		ForceReplace:       joined,
 	}, nil
 }
 
@@ -312,6 +398,20 @@ func (p *claudeProvider) ParseIncremental(
 	if req.Fingerprint.Size == req.Offset {
 		return IncrementalOutcome{}, IncrementalNoNewData, nil
 	}
+	siblings, err := claudeSubagentSiblingTranscripts(path)
+	if err != nil {
+		return IncrementalOutcome{}, IncrementalNeedsFullParse, err
+	}
+	if len(siblings) > 0 {
+		// This sub-agent session's messages end in a companion transcript under
+		// another parent, so an offset into this file is not the end of the
+		// session: appending its tail would interleave with entries that already
+		// carry later ordinals. The session rebuilds authoritatively. The check
+		// sits after the no-new-data arm so an unchanged transcript never pays
+		// for the companion lookup.
+		return IncrementalOutcome{ForceReplace: true},
+			IncrementalNeedsFullParse, nil
+	}
 	newMsgs, links, endedAt, consumed, err := claudeParseSessionFrom(
 		path,
 		req.Offset,
@@ -326,6 +426,7 @@ func (p *claudeProvider) ParseIncremental(
 			storedLinearParse:         req.StoredClaudeLinearParse,
 			storedTailClaudeMessageID: req.StoredLastClaudeMessageID,
 			storedSessionName:         req.StoredSessionName,
+			storedPRLinks:             req.StoredPRLinks,
 		},
 	)
 	if err != nil {
@@ -350,6 +451,9 @@ func (p *claudeProvider) ParseIncremental(
 			}, IncrementalApplied, nil
 		}
 		return IncrementalOutcome{}, IncrementalNoNewData, nil
+	}
+	if req.StoredUserMessageCount == 0 && req.StoredSessionKind == "" && req.StoredEntrypoint == "sdk-cli" && slices.ContainsFunc(newMsgs, isRealClaudeUserMessage) {
+		return IncrementalOutcome{ForceReplace: true}, IncrementalNeedsFullParse, nil
 	}
 	totalOut, peakCtx, hasTotalOut, hasPeakCtx := claudeProviderTokenTotals(newMsgs)
 	return IncrementalOutcome{
@@ -517,18 +621,7 @@ func (s claudeSourceSet) streamLocalRoot(
 			return nil
 		}
 		projectRoot := filepath.Join(root, project.Name())
-		err := streamDirectoryTreeRecursive(ctx, projectRoot, func(
-			path string, entry os.DirEntry,
-		) error {
-			if !strings.HasSuffix(entry.Name(), ".jsonl") {
-				return nil
-			}
-			source, ok := s.sourceRef(root, path)
-			if !ok {
-				return nil
-			}
-			return yield(source)
-		})
+		err := s.streamLocalSubtree(ctx, root, projectRoot, false, yield)
 		if err == nil {
 			return nil
 		}
@@ -545,6 +638,40 @@ func (s claudeSourceSet) streamLocalRoot(
 		return cause
 	}
 	return errors.Join(incomplete, err)
+}
+
+func (s claudeSourceSet) streamLocalSubtree(ctx context.Context, root, path string, allowMissing bool, yield func(SourceRef) error) error {
+	info, err := os.Stat(path)
+	if allowMissing && errors.Is(err, syscall.ENOTDIR) {
+		return nil
+	}
+	if allowMissing && errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+	}
+	if err != nil {
+		return incompleteDiscoveryError(s.spec.agent, "resolve "+s.spec.dirLabel+" "+path, err)
+	}
+	emit := func(path string, entry os.DirEntry) error {
+		if !strings.HasSuffix(entry.Name(), ".jsonl") {
+			return nil
+		}
+		if source, ok := s.sourceRef(root, path); ok {
+			return yield(source)
+		}
+		return nil
+	}
+	if !info.IsDir() {
+		if !allowMissing {
+			return incompleteDiscoveryError(s.spec.agent, "resolve "+s.spec.dirLabel+" "+path, syscall.ENOTDIR)
+		}
+		if err := emit(path, fs.FileInfoToDirEntry(info)); err != nil {
+			return discoveryYieldError{cause: err}
+		}
+		return nil
+	}
+	return streamDirectoryTreeRecursive(ctx, path, emit)
 }
 
 // discoveredSourceRef builds the SourceRef for one enumerated session file.

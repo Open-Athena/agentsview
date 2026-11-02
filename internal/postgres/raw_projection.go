@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 
+	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/ingest"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/rawderive"
@@ -45,8 +46,8 @@ func (s *RawProjectionStore) Project(ctx context.Context, lease rawderive.JobLea
 	if parsed.Tombstone != (m.Manifest.Kind == rawsync.ManifestTombstone) {
 		return errors.New("raw projection tombstone mismatch")
 	}
-	if parsed.Tombstone && len(parsed.Outcome.Results) > 0 {
-		return errors.New("tombstone cannot publish members")
+	if o := parsed.Outcome; parsed.Tombstone && (len(o.Results) > 0 || len(o.ExcludedSessionIDs) > 0 || len(o.SourceErrors) > 0 || o.ResultSetComplete || o.ForceReplace) {
+		return errors.New("tombstone cannot carry a parse outcome")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -174,13 +175,38 @@ func (s *RawProjectionStore) Project(ctx context.Context, lease rawderive.JobLea
 		if err != nil {
 			return err
 		}
+		var codexCloud *ingest.CodexCloudPrior
+		if exists && c.Session.Agent == string(parser.AgentCodexCloud) {
+			codexCloud = &ingest.CodexCloudPrior{
+				Session: old.Session, UsageEvents: old.UsageEvents, PlanUsage: old.PlanUsage,
+				Current: previous.Version == lease.ProcessingVersion,
+			}
+			if ingest.CodexCloudKeepReason(len(c.Messages), *codexCloud) != "" {
+				decision.Action = ingest.HistoryPreserve
+				decision.PriorContributed = true
+			}
+		}
 		var prepared ingest.PreparedSession
 		if decision.Action == ingest.HistoryPreserve {
 			prepared = old
+			if s.options.Content.ArchiveContent.OmitsToolContent() {
+				prepared.Signals.ToolObservations = []db.ToolObservation{}
+			} else if prepared.Signals.ToolObservations == nil {
+				prepared.Signals.ToolObservations = ingest.ComputeToolObservations(prepared.Session, ingest.ExtractToolCallRows(prepared.Messages))
+			}
 		} else {
 			prepared, err = ingest.Finalize(ctx, decision.Candidate, s.options.Content)
 			if err != nil {
 				return err
+			}
+			if codexCloud != nil && ingest.CarryCodexCloudUsage(&prepared, *codexCloud) {
+				decision.PriorContributed = true
+				// Finalize derived the signals before the carry put back the
+				// saved peak context, which the context signals read.
+				prepared.Signals, prepared.Findings = ingest.ComputeSignalsAndSecrets(prepared.Session, prepared.Messages)
+				if s.options.Content.ArchiveContent.OmitsToolContent() {
+					prepared.Signals.ToolObservations = []db.ToolObservation{}
+				}
 			}
 		}
 		prepared.Signals = ingest.RefreshSignalRecencyAt(prepared.Session, prepared.Messages, prepared.Signals, s.options.Now())
@@ -198,6 +224,11 @@ func (s *RawProjectionStore) Project(ctx context.Context, lease rawderive.JobLea
 		if err != nil {
 			return err
 		}
+		dialogueChanged, err := syncRawDialogue(ctx, tx, sessionID, prepared.Messages)
+		if err != nil {
+			return err
+		}
+		derivedChanged = derivedChanged || dialogueChanged
 		visibleChange, err := publishRawRecency(ctx, tx, sessionID, prepared.Signals)
 		if err != nil {
 			return err
@@ -243,7 +274,9 @@ func (s *RawProjectionStore) Project(ctx context.Context, lease rawderive.JobLea
 		changed = changed || !exists || !previous.Active || previous.CapturedSession != sessionID
 	}
 	// A complete archive snapshot can omit sessions that must remain retained.
-	replaceMembership := complete && (parsed.Tombstone || parsed.Outcome.ForceReplace)
+	// A tombstone reports that the source left its device, not that the user
+	// or the provider removed its sessions, so it withdraws no membership.
+	replaceMembership := complete && parsed.Outcome.ForceReplace
 	for _, b := range prior {
 		_, present := candidates[b.Group]
 		excluded := slices.Contains(parsed.Outcome.ExcludedSessionIDs, b.Member)
@@ -255,18 +288,30 @@ func (s *RawProjectionStore) Project(ctx context.Context, lease rawderive.JobLea
 			changed = true
 		}
 	}
-	if changed || derivedChanged {
-		var revision int64
-		err = tx.QueryRowContext(ctx, `INSERT INTO raw_corpus_state(singleton,corpus_revision,identity_revision) VALUES(1,1,CASE WHEN $1 THEN 1 ELSE 0 END) ON CONFLICT(singleton) DO UPDATE SET corpus_revision=raw_corpus_state.corpus_revision+1,identity_revision=raw_corpus_state.identity_revision+EXCLUDED.identity_revision RETURNING corpus_revision`, changed).Scan(&revision)
-		if err != nil {
-			return err
+	staleFrictionGroups := make(map[string]bool)
+	for _, group := range ordered {
+		stale, staleErr := rawGroupHasStaleFriction(ctx, tx, group)
+		if staleErr != nil {
+			return staleErr
 		}
-		if changed {
-			for _, group := range ordered {
-				if err = s.materializeGroup(ctx, tx, group, revision); err != nil {
-					return err
-				}
+		if stale {
+			staleFrictionGroups[group] = true
+		}
+	}
+	// Materialization is serialized per group by the group locks taken above.
+	// The corpus row is shared with manifest acceptance and every other
+	// projection, so it is locked only after every row write.
+	var embeddings []rawEmbeddingChange
+	if changed || len(staleFrictionGroups) > 0 {
+		for _, group := range ordered {
+			if !changed && !staleFrictionGroups[group] {
+				continue
 			}
+			changes, err := s.materializeGroup(ctx, tx, group)
+			if err != nil {
+				return err
+			}
+			embeddings = append(embeddings, changes...)
 		}
 	}
 	_, err = tx.ExecContext(ctx, rawSourceProofDeleteSQL, source)
@@ -278,10 +323,21 @@ func (s *RawProjectionStore) Project(ctx context.Context, lease rawderive.JobLea
 		return err
 	}
 
-	_, err = tx.ExecContext(ctx, `UPDATE raw_source_projections SET last_attempt_manifest_id=$2,successful_manifest_id=CASE WHEN $5 THEN $2 ELSE successful_manifest_id END,membership_complete=$3,diagnostics=$4 WHERE source_id=$1`, source, m.ManifestID, complete, fmt.Sprintf("results=%d errors=%d complete=%t", len(parsed.Outcome.Results), len(parsed.Outcome.SourceErrors), complete), complete || len(candidates) > 0)
+	diagnostics := fmt.Sprintf("results=%d errors=%d complete=%t", len(parsed.Outcome.Results), len(parsed.Outcome.SourceErrors), complete)
+	if parsed.Tombstone {
+		diagnostics = "tombstone"
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE raw_source_projections SET last_attempt_manifest_id=$2,successful_manifest_id=CASE WHEN $5 THEN $2 ELSE successful_manifest_id END,membership_complete=$3,diagnostics=$4 WHERE source_id=$1`, source, m.ManifestID, complete, diagnostics, complete || len(candidates) > 0)
 	if err != nil {
 		return err
 	}
+	if changed || derivedChanged || len(staleFrictionGroups) > 0 {
+		if err = publishRawRevision(ctx, tx, changed, embeddings); err != nil {
+			return err
+		}
+	}
+	// The job row is already locked, so completing it cannot wait. Checking the
+	// lease after the corpus row wait keeps an expired lease from committing.
 	outcome, err := completeProjectionJob(ctx, tx, lease, complete, s.options.RetryPolicy)
 	if err != nil {
 		return err
@@ -312,6 +368,26 @@ func loadRawPayload(ctx context.Context, tx *sql.Tx, id string) (ingest.Prepared
 			return p, err
 		}
 		state.apply(&p.Signals)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT ordinal, dialogue_text FROM raw_message_dialogue WHERE session_id=$1`, id)
+	if err != nil {
+		return p, err
+	}
+	defer rows.Close()
+	dialogue := make(map[int]*string)
+	for rows.Next() {
+		var ordinal int
+		var text string
+		if err := rows.Scan(&ordinal, &text); err != nil {
+			return p, err
+		}
+		dialogue[ordinal] = &text
+	}
+	if err := rows.Err(); err != nil {
+		return p, err
+	}
+	for i := range p.Messages {
+		p.Messages[i].DialogueText = dialogue[p.Messages[i].Ordinal]
 	}
 	return p, nil
 }

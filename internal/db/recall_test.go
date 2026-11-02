@@ -17,11 +17,12 @@ import (
 )
 
 type fakeRecallVectorSearcher struct {
-	hits     []RecallVectorHit
-	query    string
-	limit    int
-	onSearch func()
-	database *DB
+	hits       []RecallVectorHit
+	query      string
+	limit      int
+	onSearch   func()
+	onValidate func()
+	database   *DB
 }
 
 type boundedRecallVectorSearcher struct {
@@ -86,6 +87,9 @@ func (f *fakeRecallVectorSearcher) SearchRecall(
 func (f *fakeRecallVectorSearcher) ValidateRecallSnapshot(
 	ctx context.Context, snapshot RecallVectorSnapshot,
 ) error {
+	if f.onValidate != nil {
+		f.onValidate()
+	}
 	if f.database == nil {
 		return nil
 	}
@@ -120,19 +124,6 @@ func TestClampRecallVectorCandidates(t *testing.T) {
 				clampRecallVectorCandidates(tt.k, tt.ceiling))
 		})
 	}
-}
-
-func TestRecallEntriesSchemaIndexesSourceEpisode(t *testing.T) {
-	d := testDB(t)
-
-	var count int
-	err := d.getReader().QueryRow(t.Context(),
-		`SELECT count(*) FROM sqlite_master
-		 WHERE type='index' AND name='idx_recall_entries_source_episode'`,
-	).Scan(&count)
-
-	require.NoError(t, err, "query recall source episode index")
-	assert.Equal(t, 1, count)
 }
 
 func TestInsertRecallEntryDefaultsReviewStateToUnreviewedAuto(t *testing.T) {
@@ -1846,6 +1837,70 @@ func TestQueryRecallEntriesVectorRejectsCorpusMutationAfterSearch(t *testing.T) 
 	})
 
 	assert.ErrorIs(t, err, ErrSemanticUnavailable)
+}
+
+func TestQueryRecallEntriesHybridSeesEntriesChangedBetweenRankings(t *testing.T) {
+	newEntry := func(id string) RecallEntry {
+		return RecallEntry{
+			ID: id, Type: "fact", Scope: "project", Status: "accepted",
+			Title: "Database pool", Body: "Reuse idle connections.",
+			SourceSessionID: "s1",
+		}
+	}
+	exec := func(stmt string) func(*testing.T, *DB) {
+		return func(t *testing.T, d *DB) {
+			t.Helper()
+			_, err := d.getWriter().ExecContext(t.Context(), stmt)
+			require.NoError(t, err)
+		}
+	}
+	for _, tt := range []struct {
+		name   string
+		change func(*testing.T, *DB)
+		want   []string
+	}{
+		{
+			name:   "rejected after the vector ranking reads it",
+			change: exec("UPDATE recall_entries SET status = 'rejected' WHERE id = 'hidden'"),
+			want:   []string{"kept"},
+		},
+		{
+			name: "added after the vector ranking reads it",
+			change: func(t *testing.T, d *DB) {
+				t.Helper()
+				_, err := d.InsertRecallEntry(t.Context(), newEntry("added"))
+				require.NoError(t, err)
+			},
+			want: []string{"added", "hidden", "kept"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDB(t)
+			insertSession(t, d, "s1", "agentsview")
+			for _, id := range []string{"kept", "hidden"} {
+				_, err := d.InsertRecallEntry(t.Context(), newEntry(id))
+				require.NoError(t, err)
+			}
+			// No database: validation accepts the write, as a lag-tolerant index does.
+			d.SetRecallVectorSearcher(&fakeRecallVectorSearcher{
+				hits: []RecallVectorHit{
+					{EntryID: "hidden", Score: 0.9}, {EntryID: "kept", Score: 0.8},
+				},
+				onValidate: func() { tt.change(t, d) },
+			})
+
+			page, err := d.QueryRecallEntries(t.Context(), RecallQuery{
+				Text: "database pool", Mode: RecallQueryModeHybrid, Limit: 5,
+			})
+
+			require.NoError(t, err)
+			ids := make([]string, 0, len(page.RecallEntries))
+			for _, result := range page.RecallEntries {
+				ids = append(ids, result.ID)
+			}
+			assert.ElementsMatch(t, tt.want, ids)
+		})
+	}
 }
 
 func TestQueryRecallEntriesVectorExpandsPastFilteredCandidates(t *testing.T) {

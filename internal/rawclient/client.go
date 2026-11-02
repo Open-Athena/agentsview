@@ -17,6 +17,7 @@ import (
 	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
 	"go.kenn.io/agentsview/internal/apiclient"
 	"go.kenn.io/agentsview/internal/rawsync"
+	"go.kenn.io/agentsview/internal/requestsign"
 )
 
 // Error codes produced by the raw-sync HTTP surface.
@@ -122,6 +123,16 @@ type Client struct {
 // each do request with scoped avdt_ bearer tokens, exchanged on demand for
 // the device credential. A zero TokenMargin falls back to defaultTokenMargin.
 func NewClient(cfg Config) (*Client, error) {
+	return newClient(cfg, tokenScopes)
+}
+
+// NewStatusClient validates configuration and returns a Client that requests
+// only the hosted status scope.
+func NewStatusClient(cfg Config) (*Client, error) {
+	return newClient(cfg, statusTokenScopes)
+}
+
+func newClient(cfg Config, scopes []string) (*Client, error) {
 	base, err := url.Parse(strings.TrimRight(cfg.BaseURL, "/"))
 	if err != nil || base.Scheme == "" || base.Host == "" {
 		return nil, fmt.Errorf("rawclient: invalid base URL %q", cfg.BaseURL)
@@ -142,6 +153,10 @@ func NewClient(cfg Config) (*Client, error) {
 		enforced.CheckRedirect = refuseRedirects
 		httpClient = &enforced
 	}
+	httpClient, err = requestsign.ClientFromEnvironment(cfg.BaseURL, httpClient)
+	if err != nil {
+		return nil, err
+	}
 	chunkBytes := cfg.ChunkBytes
 	if chunkBytes <= 0 {
 		chunkBytes = defaultChunkBytes
@@ -158,7 +173,9 @@ func NewClient(cfg Config) (*Client, error) {
 	if margin <= 0 {
 		margin = defaultTokenMargin
 	}
-	client.tokens = newTokenProvider(client, cfg.DeviceID, cfg.Credential, margin)
+	client.tokens = newTokenProvider(
+		client, cfg.DeviceID, cfg.Credential, margin, scopes,
+	)
 	return client, nil
 }
 

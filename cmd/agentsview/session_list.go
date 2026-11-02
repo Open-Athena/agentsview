@@ -23,6 +23,8 @@ type sessionListDocument struct {
 	MachineLabels service.MachineLabelCatalog `json:"machine_labels"`
 }
 
+const machineFilterHelp = "Exact machine IDs or aliases (comma-separated), or one unique whole display name. IDs and aliases take precedence over matching names; unknown or ambiguous values return an error"
+
 func newSessionListCommand() *cobra.Command {
 	var (
 		project, excludeProject, machine, agent string
@@ -36,6 +38,8 @@ func newSessionListCommand() *cobra.Command {
 		outcome, healthGrade                    string
 		minToolFailures                         int
 		hasSecret                               bool
+		labels                                  []string
+		pr                                      string
 		cursor                                  string
 		limit                                   int
 		sort                                    string
@@ -54,33 +58,31 @@ func newSessionListCommand() *cobra.Command {
 			}
 			activeSince = resolvedActiveSince
 
-			svc, cleanup, err := resolveService(cmd)
-			if err != nil {
-				return err
-			}
-			defer cleanup()
-
 			f := service.ListFilter{
-				Project:          project,
-				ExcludeProject:   excludeProject,
-				Machine:          machine,
-				Agent:            agent,
-				Date:             date,
-				DateFrom:         dateFrom,
-				DateTo:           dateTo,
-				ActiveSince:      activeSince,
-				MinMessages:      minMessages,
-				MaxMessages:      maxMessages,
-				MinUserMessages:  minUserMessages,
-				IncludeOneShot:   includeOneShot,
-				IncludeAutomated: includeAutomated,
-				IncludeChildren:  includeChildren,
-				IncludeSource:    includeSource,
-				Outcome:          outcome,
-				HealthGrade:      healthGrade,
-				HasSecret:        hasSecret,
-				Cursor:           cursor,
-				Limit:            limit,
+				Project:            project,
+				ExcludeProject:     excludeProject,
+				Machine:            machine,
+				Agent:              agent,
+				Date:               date,
+				DateFrom:           dateFrom,
+				DateTo:             dateTo,
+				ActiveSince:        activeSince,
+				MinMessages:        minMessages,
+				MaxMessages:        maxMessages,
+				MinUserMessages:    minUserMessages,
+				IncludeOneShot:     includeOneShot,
+				OneShotFilterSet:   cmd.Flags().Changed("include-one-shot"),
+				AutomatedFilterSet: cmd.Flags().Changed("include-automated"),
+				IncludeAutomated:   includeAutomated,
+				IncludeChildren:    includeChildren,
+				IncludeSource:      includeSource,
+				Outcome:            outcome,
+				HealthGrade:        healthGrade,
+				HasSecret:          hasSecret,
+				Labels:             labels,
+				PR:                 pr,
+				Cursor:             cursor,
+				Limit:              limit,
 			}
 			if cmd.Flags().Changed("min-tool-failures") {
 				f.MinToolFailures = &minToolFailures
@@ -104,7 +106,7 @@ func newSessionListCommand() *cobra.Command {
 			// captures the ordering.
 			keys, err := db.ParseSortSpec(sort)
 			if err != nil {
-				return fmt.Errorf("invalid sort %q: %w", sort, err)
+				return cliValidationError(fmt.Errorf("invalid sort %q: %w", sort, err), "choose --sort keys listed by `agentsview session list --help` (each accepts :asc or :desc)")
 			}
 			// An empty spec means the implicit default; materialize it so
 			// --reverse has a term to flip instead of silently no-opping.
@@ -120,6 +122,12 @@ func newSessionListCommand() *cobra.Command {
 				}
 			}
 			f.OrderBy = db.FormatSortSpec(keys)
+
+			svc, cleanup, err := resolveService(cmd)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
 
 			list, err := svc.List(cmd.Context(), f)
 			if err != nil {
@@ -164,7 +172,7 @@ func newSessionListCommand() *cobra.Command {
 	flags.StringVar(&excludeProject, "exclude-project", "",
 		"Exclude sessions from the given project")
 	flags.StringVar(&machine, "machine", "",
-		"Filter by machine name")
+		machineFilterHelp)
 	flags.StringVar(&agent, "agent", "",
 		"Filter by agent (claude, codex, cursor, ...)")
 	flags.StringVar(&date, "date", "",
@@ -199,6 +207,10 @@ func newSessionListCommand() *cobra.Command {
 		"Minimum tool-failure signal count (0 is a valid filter)")
 	flags.BoolVar(&hasSecret, "has-secret", false,
 		"Only sessions with detected secret leaks")
+	flags.StringArrayVar(&labels, "label", nil,
+		"Only sessions carrying this exact label (repeat to require several)")
+	flags.StringVar(&pr, "pr", "",
+		"Only sessions linked to a pull request: owner/repo, owner/repo#123, or github.com::owner/repo#123")
 	flags.StringVar(&cursor, "cursor", "",
 		"Pagination cursor from a previous response")
 	flags.IntVar(&limit, "limit", 0,

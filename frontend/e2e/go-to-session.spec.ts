@@ -9,9 +9,7 @@ type RenderLintModule = {
 
 const require = createRequire(import.meta.url);
 const renderLintPath = process.env.PR_RENDER_LINT_PATH;
-const renderLint = renderLintPath
-  ? (require(renderLintPath) as RenderLintModule)
-  : undefined;
+const renderLint = renderLintPath ? (require(renderLintPath) as RenderLintModule) : undefined;
 const renderProofDir = process.env.PR_RENDER_PROOF_DIR;
 const renderArtifactDir = process.env.PR_RENDER_ARTIFACT_DIR;
 
@@ -67,6 +65,25 @@ function message(id: string, content: string) {
 }
 
 test.describe("go to session", () => {
+  test.afterEach(async ({ page }) => {
+    await page.unrouteAll({ behavior: "wait" });
+  });
+
+  test("opens a bare UUID link at its canonical session URL", async ({ page }) => {
+    await page.route("**/api/v1/session-ids/resolve**", (route) =>
+      route.fulfill({ json: { ids: [TARGET_ID] } }),
+    );
+    await page.route(`**/api/v1/sessions/${encodeURIComponent(TARGET_ID)}`, (route) =>
+      route.fulfill({ json: session(TARGET_ID, "Bare UUID target") }),
+    );
+    await page.route(`**/api/v1/sessions/${encodeURIComponent(TARGET_ID)}/messages**`, (route) =>
+      route.fulfill({ json: { messages: [message(TARGET_ID, "Bare UUID content")], count: 1 } }),
+    );
+    await page.goto(`/sessions/${TARGET_UUID}`);
+    await expect(page).toHaveURL(TARGET_PATH);
+    await expect(page.getByText("Bare UUID content", { exact: true })).toBeVisible();
+  });
+
   test("opens by shortcut, resolves an off-list UUID, and preserves session state", async ({
     page,
   }, testInfo) => {
@@ -151,7 +168,9 @@ test.describe("go to session", () => {
       });
     });
 
-    const modifier = await page.evaluate(() => (/Mac/.test(navigator.platform) ? "Meta" : "Control"));
+    const modifier = await page.evaluate(() =>
+      /Mac/.test(navigator.platform) ? "Meta" : "Control",
+    );
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.keyboard.press(`${modifier}+g`);
     const dialog = page.getByRole("dialog", { name: "Go to session" });
@@ -168,6 +187,7 @@ test.describe("go to session", () => {
     await input.press("Enter");
     await expect(page.getByRole("alert")).toHaveText("No session matches that ID or UUID.");
     await expect(page).toHaveURL(/\/usage\?desktop=1$/);
+    expect(await page.evaluate(() => window.history.length)).toBe(initialHistoryLength);
 
     for (const width of [1280, 768, 400]) {
       await page.setViewportSize({ width, height: 900 });
@@ -181,8 +201,7 @@ test.describe("go to session", () => {
       expect(field!.x + field!.width).toBeLessThanOrEqual(width + 1);
       await page.screenshot({ path: testInfo.outputPath(`go-to-session-error-${width}.png`) });
       if (renderLint) {
-        const lint = await page.evaluate((snippet) => (0, eval)(snippet),
-          renderLint.renderLintSnippet(".kit-modal-panel"));
+        const lint = await page.evaluate(renderLint.renderLintSnippet(".kit-modal-panel"));
         console.log(`render-lint width=${width}px violations=${JSON.stringify(lint)}`);
         if (renderProofDir) {
           mkdirSync(renderProofDir, { recursive: true });
@@ -198,17 +217,16 @@ test.describe("go to session", () => {
         await page.screenshot({
           path: join(
             renderArtifactDir,
-            width === 1280
-              ? "agentsview-1768-2-after.png"
-              : `agentsview-1768-2-${width}.png`,
+            width === 1280 ? "agentsview-1768-2-after.png" : `agentsview-1768-2-${width}.png`,
           ),
         });
       }
     }
 
     const observed = await page.evaluate(
-      () => (window as Window & { __goToSessionShortcutObserved?: boolean[] })
-        .__goToSessionShortcutObserved,
+      () =>
+        (window as Window & { __goToSessionShortcutObserved?: boolean[] })
+          .__goToSessionShortcutObserved,
     );
     expect(observed?.[0]).toBe(true);
     await input.press("Escape");
@@ -220,13 +238,17 @@ test.describe("go to session", () => {
     await input.fill(TARGET_UUID);
     await input.press("Enter");
 
-    await expect(page).toHaveURL(new RegExp(`${TARGET_PATH.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\?desktop=1$`));
+    await expect(page).toHaveURL(
+      new RegExp(`${TARGET_PATH.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\?desktop=1$`),
+    );
     await expect(page.getByText("Off-list hydrated content hydrated")).toBeVisible();
     expect(await page.evaluate(() => window.history.length)).toBe(beforeTarget + 1);
     expect(await page.evaluate(() => window.location.search)).toBe("?desktop=1");
     expect(await page.evaluate(() => window.location.pathname)).toBe(TARGET_PATH);
     expect(listResponses.length).toBeGreaterThan(0);
-    expect(listResponses.every(({ ids }) => ids.every((id) => !id.includes(TARGET_UUID)))).toBe(true);
+    expect(listResponses.every(({ ids }) => ids.every((id) => !id.includes(TARGET_UUID)))).toBe(
+      true,
+    );
 
     await page.keyboard.press(`${modifier}+f`);
     const findInput = page.locator(".kit-find-bar__input");
@@ -248,7 +270,9 @@ test.describe("go to session", () => {
     await input.fill(OPAQUE_ID);
     await input.press("Enter");
 
-    await expect(page).toHaveURL(new RegExp(`${OPAQUE_PATH.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\?desktop=1$`));
+    await expect(page).toHaveURL(
+      new RegExp(`${OPAQUE_PATH.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\?desktop=1$`),
+    );
     await expect(page.getByText("Opaque session ID content")).toBeVisible();
 
     await page.keyboard.press(`${modifier}+g`);
@@ -256,7 +280,9 @@ test.describe("go to session", () => {
     await input.fill(MISSING_UUID);
     await input.press("Enter");
 
-    await expect(page).toHaveURL(new RegExp(`${MISSING_PATH.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\?desktop=1$`));
+    await expect(page).toHaveURL(
+      new RegExp(`${MISSING_PATH.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\?desktop=1$`),
+    );
     await expect(page.getByText("Session not found")).toBeVisible();
     await expect(page.getByText("Off-list hydrated content hydrated")).toHaveCount(0);
   });

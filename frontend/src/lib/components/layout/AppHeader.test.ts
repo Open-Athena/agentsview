@@ -5,11 +5,16 @@ const mocks = vi.hoisted(() => ({
   downloadExport: vi.fn().mockResolvedValue(undefined),
   getMarkdownExportUrl: vi.fn().mockReturnValue("/api/v1/sessions/sess-123/md"),
   copyToClipboard: vi.fn().mockResolvedValue(true),
+  reportTelemetry: vi.fn(),
+  syncClaudeAI: vi.fn(),
 }));
+
+vi.mock("../../utils/telemetry.js", () => ({ reportTelemetry: mocks.reportTelemetry }));
 
 vi.mock("../../api/client.js", () => ({
   downloadExport: mocks.downloadExport,
   getMarkdownExportUrl: mocks.getMarkdownExportUrl,
+  syncClaudeAI: mocks.syncClaudeAI,
 }));
 
 vi.mock("../../utils/clipboard.js", () => ({
@@ -21,6 +26,7 @@ import { sync } from "../../stores/sync.svelte.js";
 import { settings } from "../../stores/settings.svelte.js";
 import { ui } from "../../stores/ui.svelte.js";
 import { router } from "../../stores/router.svelte.js";
+import { claudeAISync } from "../../stores/claudeAISync.svelte.js";
 import { setLocale } from "../../i18n/index.js";
 import type { Session } from "../../api/types.js";
 
@@ -91,6 +97,51 @@ describe("AppHeader export actions", () => {
     settings.error = null;
   });
 
+  it.each([
+    { archive_only: false, read_only: false, importDisabled: false, syncLabel: "Sync sessions" },
+    { archive_only: false, read_only: true, importDisabled: true, syncLabel: "Refresh data" },
+    { archive_only: true, read_only: false, importDisabled: true, syncLabel: null },
+  ])(
+    "offers the available actions for archive_only=$archive_only read_only=$read_only",
+    async ({ archive_only, read_only, importDisabled, syncLabel }) => {
+      sync.serverVersion = { archive_only, read_only } as NonNullable<typeof sync.serverVersion>;
+      component = mount(AppHeader, { target: document.body });
+      await tick();
+
+      const importButton = document.querySelector<HTMLButtonElement>(".import-btn")!;
+      expect(importButton.disabled).toBe(importDisabled);
+      if (archive_only) expect(importButton.title).toBe("Import unavailable in archive-only mode");
+      else if (read_only) expect(importButton.title).toBe("Import unavailable in read-only mode");
+      const syncButton = document.querySelector<HTMLButtonElement>(".sync-btn");
+      if (syncLabel) expect(syncButton?.getAttribute("aria-label")).toBe(syncLabel);
+      else expect(syncButton).toBeNull();
+      expect(
+        document.querySelector<HTMLButtonElement>('button[aria-label="Export session"]')?.disabled,
+      ).toBe(false);
+      importButton.click();
+      await tick();
+      expect(document.querySelector('[role="dialog"]') !== null).toBe(!importDisabled);
+    },
+  );
+
+  it("marks the Import button while Claude.ai Sync runs with the dialog closed", async () => {
+    mocks.syncClaudeAI.mockReturnValue(new Promise(() => {}));
+    component = mount(AppHeader, { target: document.body });
+    await tick();
+    const importButton = document.querySelector<HTMLButtonElement>(".import-btn")!;
+    expect(importButton.getAttribute("aria-label")).toBe("Import conversations");
+    void claudeAISync.start(undefined, () => {});
+    await tick();
+    expect(importButton.getAttribute("aria-label")).toBe(
+      "Claude.ai Sync is running. Open Import to see progress or stop it.",
+    );
+    expect(importButton.querySelector(".sync-spinner")).not.toBeNull();
+    claudeAISync.stop();
+    await tick();
+    expect(importButton.getAttribute("aria-label")).toBe("Import conversations");
+    expect(importButton.querySelector(".sync-spinner")).toBeNull();
+  });
+
   it("copies markdown export link from export menu", async () => {
     component = mount(AppHeader, { target: document.body });
     await tick();
@@ -114,6 +165,9 @@ describe("AppHeader export actions", () => {
     expect(mocks.getMarkdownExportUrl).toHaveBeenCalledWith("sess-123");
     expect(mocks.copyToClipboard).toHaveBeenCalledWith(
       "http://localhost:3000/api/v1/sessions/sess-123/md",
+    );
+    await vi.waitFor(() =>
+      expect(mocks.reportTelemetry).toHaveBeenCalledWith("export_run", { format: "markdown_link" }),
     );
   });
 
@@ -230,6 +284,20 @@ describe("AppHeader export actions", () => {
   });
 
   it("renders every route as a primary-nav tab", async () => {
+    sync.serverVersion = {
+      api_version: 1,
+      data_version: 1,
+      insight_generation_available: false,
+      friction_available: true,
+      friction_build_allowed: true,
+      friction_readable: true,
+      session_stats_available: false,
+      kata_available: false,
+      version: "dev",
+      commit: "unknown",
+      build_date: "",
+      read_only: false,
+    };
     component = mount(AppHeader, { target: document.body });
     await tick();
 
@@ -248,6 +316,7 @@ describe("AppHeader export actions", () => {
       "Recall",
       "Pinned",
       "Quality",
+      "Friction Log",
       "Trash",
       "Recent Edits",
       "Data",
@@ -255,6 +324,52 @@ describe("AppHeader export actions", () => {
       expect(labels).toContain(expected);
     }
     expect(labels).not.toContain("Token Usage");
+  });
+
+  it("shows the Friction Log tab on a server that reads digests but cannot build them", async () => {
+    sync.serverVersion = {
+      api_version: 1,
+      data_version: 1,
+      insight_generation_available: false,
+      friction_available: false,
+      friction_build_allowed: false,
+      friction_readable: true,
+      session_stats_available: false,
+      version: "dev",
+      commit: "unknown",
+      build_date: "",
+      read_only: true,
+    } as never;
+    component = mount(AppHeader, { target: document.body });
+    await tick();
+    const labels = Array.from(
+      document.querySelectorAll<HTMLElement>(".kit-top-bar__probe .kit-top-bar__tab"),
+    ).map((b) => b.textContent?.trim());
+    expect(labels).toContain("Friction Log");
+  });
+
+  it("hides the Friction Log tab when the server does not store digests", async () => {
+    sync.serverVersion = {
+      api_version: 1,
+      data_version: 1,
+      insight_generation_available: false,
+      friction_available: false,
+      friction_build_allowed: false,
+      session_stats_available: false,
+      kata_available: false,
+      version: "dev",
+      commit: "unknown",
+      build_date: "",
+      read_only: true,
+    };
+    component = mount(AppHeader, { target: document.body });
+    await tick();
+
+    const labels = Array.from(
+      document.querySelectorAll<HTMLElement>(".kit-top-bar__probe .kit-top-bar__tab"),
+    ).map((b) => b.textContent?.trim());
+    expect(labels).toContain("Quality");
+    expect(labels).not.toContain("Friction Log");
   });
 
   it("distinguishes global sync from page refresh controls", async () => {
@@ -274,7 +389,11 @@ describe("AppHeader export actions", () => {
     sync.serverVersion = {
       api_version: 1,
       data_version: 1,
+      session_stats_available: false,
+      friction_available: false,
+      friction_build_allowed: false,
       insight_generation_available: false,
+      kata_available: false,
       version: "dev",
       commit: "unknown",
       build_date: "",
@@ -298,7 +417,11 @@ describe("AppHeader export actions", () => {
     sync.serverVersion = {
       api_version: 1,
       data_version: 1,
+      session_stats_available: false,
+      friction_available: false,
+      friction_build_allowed: false,
       insight_generation_available: false,
+      kata_available: false,
       version: "dev",
       commit: "unknown",
       build_date: "",

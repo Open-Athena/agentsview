@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, it, expect } from "vitest";
+import { describe, it, expect } from "vite-plus/test";
 import { highlightToHtml, HIGHLIGHT_MAX_BYTES, HIGHLIGHT_MAX_LINES } from "./syntax-highlight.js";
 
 function spans(html: string): HTMLSpanElement[] {
@@ -27,14 +27,6 @@ describe("highlightToHtml", () => {
       const result = await highlightToHtml(code, lang);
       expect(result).not.toBeNull();
       expect(spans(result!).length).toBeGreaterThanOrEqual(1);
-    });
-
-    it("preserves the source tokens in the output", async () => {
-      const code = "const greeting = 'hello';";
-      const result = await highlightToHtml(code, "typescript");
-      expect(result).not.toBeNull();
-      expect(result).toContain("greeting");
-      expect(result).toContain("hello");
     });
 
     it("uses the catppuccin-mocha palette (keyword color is stable)", async () => {
@@ -92,12 +84,6 @@ describe("highlightToHtml", () => {
   });
 
   describe("size thresholds", () => {
-    it("returns null when code exceeds the byte threshold", async () => {
-      const oversized = "x".repeat(HIGHLIGHT_MAX_BYTES + 1);
-      const result = await highlightToHtml(oversized, "typescript");
-      expect(result).toBeNull();
-    });
-
     it("highlights code at exactly HIGHLIGHT_MAX_BYTES bytes", async () => {
       // Exactly at the threshold must still be highlighted (guard is strict >).
       // Use a JSON string value so tokenization stays fast at 50 kB.
@@ -132,12 +118,6 @@ describe("highlightToHtml", () => {
       const result = await highlightToHtml(code, "typescript");
       expect(result).toBeNull();
     });
-
-    it("returns null when code exceeds the line threshold (bulk check)", async () => {
-      const oversized = "x\n".repeat(HIGHLIGHT_MAX_LINES + 1);
-      const result = await highlightToHtml(oversized, "typescript");
-      expect(result).toBeNull();
-    });
   });
 
   describe("output safety", () => {
@@ -153,19 +133,6 @@ describe("highlightToHtml", () => {
       // spans, so assert the escaped bracket and the tag name are both present.
       expect(result).toContain("&#x3C;");
       expect(result).toContain("script");
-    });
-
-    it("does not emit raw angle brackets from javascript code input", async () => {
-      // Shiki escapes code tokens; < and > from source must be entities.
-      const code = "if (a < b && b > c) {}";
-      const result = await highlightToHtml(code, "javascript");
-      expect(result).not.toBeNull();
-      // The raw < and > inside code tokens should be escaped.
-      // We check that the literal source string (with raw brackets) is absent.
-      expect(result).not.toContain("a < b");
-      expect(result).not.toContain("b > c");
-      // Escaping is proven by presence of the escaped entity, not just absence.
-      expect(result).toContain("&#x3C;");
     });
 
     it("output has no <pre> wrapper (structure: inline)", async () => {

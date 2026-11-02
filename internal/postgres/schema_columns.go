@@ -3,6 +3,10 @@ package postgres
 // schemaColumnMigrations is shared by legacy setup and atomic hosted provisioning.
 func schemaColumnMigrations() []columnMigration {
 	return []columnMigration{
+		{"tool_calls", "observed_outcome", `observed_outcome TEXT`, "adding tool_calls.observed_outcome"},
+		{"tool_calls", "observed_repeat", `observed_repeat TEXT`, "adding tool_calls.observed_repeat"},
+		{"tool_calls", "sequence_ending", `sequence_ending TEXT`, "adding tool_calls.sequence_ending"},
+
 		{"sessions", "provenance_kind", `provenance_kind TEXT NOT NULL DEFAULT 'legacy'`, "adding sessions.provenance_kind"},
 		{"sessions", "raw_group_id", `raw_group_id TEXT NOT NULL DEFAULT ''`, "adding sessions.raw_group_id"},
 		{"sessions", "raw_content_revision", `raw_content_revision TEXT NOT NULL DEFAULT ''`, "adding sessions.raw_content_revision"},
@@ -302,6 +306,11 @@ func schemaColumnMigrations() []columnMigration {
 			"adding sessions.source_version",
 		},
 		{
+			"sessions", "group_key",
+			`group_key TEXT NOT NULL DEFAULT ''`,
+			"adding sessions.group_key",
+		},
+		{
 			"sessions", "transcript_fidelity",
 			`transcript_fidelity TEXT NOT NULL DEFAULT ''`,
 			"adding sessions.transcript_fidelity",
@@ -357,6 +366,11 @@ func schemaColumnMigrations() []columnMigration {
 			"adding messages.thinking_text",
 		},
 		{
+			"messages", "dialogue_text",
+			`dialogue_text TEXT`,
+			"adding messages.dialogue_text",
+		},
+		{
 			"sessions", "termination_status",
 			`termination_status TEXT`,
 			"adding sessions.termination_status",
@@ -370,6 +384,21 @@ func schemaColumnMigrations() []columnMigration {
 			"sessions", "secrets_rules_version",
 			`secrets_rules_version TEXT NOT NULL DEFAULT ''`,
 			"adding sessions.secrets_rules_version",
+		},
+		{
+			"sessions", "friction_count",
+			`friction_count INTEGER NOT NULL DEFAULT 0`,
+			"adding sessions.friction_count",
+		},
+		{
+			"sessions", "friction_rules_version",
+			`friction_rules_version TEXT NOT NULL DEFAULT ''`,
+			"adding sessions.friction_rules_version",
+		},
+		{
+			"sessions", "friction_hash",
+			`friction_hash TEXT NOT NULL DEFAULT ''`,
+			"adding sessions.friction_hash",
 		},
 		{
 			"sessions", "session_name",
@@ -445,6 +474,22 @@ func schemaColumnMigrations() []columnMigration {
 			"sessions", "file_path",
 			`file_path TEXT`,
 			"adding sessions.file_path",
+		},
+		{"sessions", "trash_includes_codex_pages", `trash_includes_codex_pages BOOLEAN NOT NULL DEFAULT FALSE`, "adding sessions.trash_includes_codex_pages"},
+		{"sessions", "source_trash_includes_codex_pages", `source_trash_includes_codex_pages BOOLEAN NOT NULL DEFAULT FALSE`, "adding sessions.source_trash_includes_codex_pages"},
+		{"excluded_sessions", "include_codex_pages", `include_codex_pages BOOLEAN NOT NULL DEFAULT FALSE`, "adding excluded_sessions.include_codex_pages"},
+		{"excluded_sessions", "owner_marker", `owner_marker TEXT`, "adding excluded_sessions.owner_marker"},
+		{"excluded_sessions", "machine", `machine TEXT`, "adding excluded_sessions.machine"},
+		{"excluded_sessions", "agent", `agent TEXT`, "adding excluded_sessions.agent"},
+		{
+			"sessions", "pr_links",
+			`pr_links TEXT NOT NULL DEFAULT ''`,
+			"adding sessions.pr_links",
+		},
+		{
+			"sessions", "labels",
+			`labels TEXT[] NOT NULL DEFAULT '{}'`,
+			"adding sessions.labels",
 		},
 	}
 }

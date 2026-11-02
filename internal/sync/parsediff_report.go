@@ -132,11 +132,13 @@ const (
 	FieldSessionKind          = "session_kind"
 	FieldCwd                  = "cwd"
 	FieldGitBranch            = "git_branch"
+	FieldPRLinks              = "pr_links"
 	FieldParentSessionID      = "parent_session_id"
 	FieldRelationshipType     = "relationship_type"
 	FieldSourceSessionID      = "source_session_id"
 	FieldSourceVersion        = "source_version"
 	FieldTranscriptFidelity   = "transcript_fidelity"
+	FieldGroupKey             = "group_key"
 	FieldParserMalformedLines = "parser_malformed_lines"
 	FieldIsTruncated          = "is_truncated"
 	// FieldPresence is the synthetic diff attached when a stored,

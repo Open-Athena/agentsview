@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -8,19 +9,34 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"go.kenn.io/agentsview/internal/apiclient"
 )
 
 func executeCLIWithLegacyFlagCompat(args []string, stdout, stderr io.Writer) error {
 	cmd := newRootCommand()
 	cmd.SetOut(stdout)
 	cmd.SetErr(stderr)
+	cmd.InitDefaultHelpCmd()
+	cmd.InitDefaultCompletionCmd()
+	installCLIDiagnostics(cmd)
 
 	normalized, rewrites := normalizeLegacyLongFlags(args, collectLongFlags(cmd))
 	if len(rewrites) > 0 {
 		fmt.Fprint(stderr, legacyLongFlagWarning(rewrites))
 	}
+	normalized, err := deploymentArgs(normalized)
+	if err != nil {
+		return contextualizeCLIError(cmd, err, false)
+	}
 	cmd.SetArgs(normalized)
-	return cmd.Execute()
+	ctx, _ := apiclient.TrackArchiveFreshness(context.Background(), func() {
+		fmt.Fprintln(stderr, apiclient.ArchiveStaleWarning)
+	})
+	executed, err := cmd.ExecuteContextC(ctx)
+	if executed == nil {
+		executed = cmd
+	}
+	return contextualizeCLIError(executed, err, requestedErrorJSON(executed, normalized))
 }
 
 func collectLongFlags(root *cobra.Command) map[string]struct{} {

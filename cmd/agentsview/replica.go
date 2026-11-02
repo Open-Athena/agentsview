@@ -29,9 +29,20 @@ type ReplicaPushConfig struct {
 	ExcludeProjects string
 	AllProjects     bool
 	Watch           bool
+	NoStartDaemon   bool
 	Debounce        time.Duration
 	Interval        time.Duration
 	NoVectors       bool
+	// Embed builds pending embeddings in this process before each push
+	// (pg push --embed). It requires the local archive writer.
+	Embed bool
+	// Health records each watch push's outcome for `<backend> status
+	// --max-stale`. It is set internally for the watcher holding the watch
+	// lock; it has no CLI flag.
+	Health *replicaWatchHealth
+	// OnPushSuccess refreshes serve-side capabilities after a watch push. It
+	// is set only by the combined PG serve/watch owner.
+	OnPushSuccess func(context.Context)
 	// ScopeVectorsToChangedSessions is set internally by the watch
 	// loop for change-triggered pushes; it has no CLI flag.
 	ScopeVectorsToChangedSessions bool
@@ -53,6 +64,9 @@ type ReplicaStatusConfig struct {
 	ProjectsFlag    string
 	ExcludeProjects string
 	AllProjects     bool
+	// MaxStale fails the status when the push watcher has stalled for
+	// longer than this. Zero disables the check.
+	MaxStale time.Duration
 }
 
 // replicaServeExtras is implemented by a replica registered in
@@ -83,7 +97,7 @@ func replicaVectorPushSource(
 func runReplicaPush(
 	backend storage.Replica, cfg ReplicaPushConfig, targetName string,
 ) error {
-	appCfg, err := config.LoadMinimal()
+	appCfg, err := config.LoadMinimalFor(replicaConfigScope(backend, &cfg))
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
@@ -98,6 +112,17 @@ func runReplicaPush(
 	if err != nil {
 		return err
 	}
+	for _, ref := range targets {
+		target, err := backend.ResolveTarget(appCfg, ref)
+		if err != nil {
+			// The per-target push loop reports these errors so --all can
+			// attempt the remaining targets and aggregate their failures.
+			continue
+		}
+		if err := validateReplicaPushVectors(appCfg, cfg, target.Target.PushVectors); err != nil {
+			return err
+		}
+	}
 
 	applyClassifierConfig(appCfg)
 	ctx, stop := signal.NotifyContext(
@@ -105,7 +130,10 @@ func runReplicaPush(
 	)
 	defer stop()
 
-	writer, cleanup, err := resolveArchiveWriteBackend(ctx, appCfg)
+	// --embed builds in this process, so it never auto-starts a daemon; a
+	// live daemon still wins the writer and rejects the request.
+	appCfg.NoDaemonAutostart = cfg.Embed
+	writer, cleanup, err := resolveArchiveWriteBackend(ctx, appCfg, transportIntentArchiveWrite)
 	if err != nil {
 		return fmt.Errorf("opening writer: %w", err)
 	}
@@ -146,6 +174,26 @@ func runReplicaPush(
 	return nil
 }
 
+func replicaConfigScope(backend storage.Replica, push *ReplicaPushConfig) config.ValidationScope {
+	scope := config.ScopeLocal
+	if backend.Name() == "pg" {
+		scope |= config.ScopePG
+		if push != nil {
+			scope |= config.ScopeDeployment
+		}
+	} else if backend.Name() == "clickhouse" {
+		scope |= config.ScopeClickHouse
+	}
+	return scope
+}
+
+func validateReplicaPushVectors(appCfg config.Config, cfg ReplicaPushConfig, pushVectors bool) error {
+	if cfg.Embed || (pushVectors && !cfg.NoVectors) {
+		return appCfg.Vector.Validate()
+	}
+	return nil
+}
+
 func runReplicaPushTarget(
 	ctx context.Context,
 	backend storage.Replica,
@@ -182,10 +230,12 @@ func runReplicaPushTarget(
 	result, err := writer.ReplicaPush(
 		ctx, backend, target, cfg, projects, excludeProjects,
 	)
+	if err == nil || result.SessionsPushed > 0 || result.MessagesPushed > 0 {
+		writeReplicaPushSummary(os.Stdout, backend.DisplayName(), result)
+	}
 	if err != nil {
 		return err
 	}
-	writeReplicaPushSummary(os.Stdout, backend.DisplayName(), result)
 	if result.Errors > 0 {
 		return fmt.Errorf("%d session(s) failed", result.Errors)
 	}
@@ -287,19 +337,24 @@ func writeReplicaPushSummary(
 			"Warning: skipped %d session(s) owned by another %s push marker\n",
 			result.SkippedConflicts, displayName,
 		)
-		writeReplicaVectorPushSummary(w, displayName, result.Vectors)
-		return
+	} else {
+		fmt.Fprintf(
+			w,
+			"Pushed %d sessions, %d messages%s in %s\n",
+			result.SessionsPushed,
+			result.MessagesPushed,
+			errSuffix,
+			dur,
+		)
 	}
-	fmt.Fprintf(
-		w,
-		"Pushed %d sessions, %d messages%s in %s\n",
-		result.SessionsPushed,
-		result.MessagesPushed,
-		errSuffix,
-		dur,
-	)
+	if result.FullReason != "" {
+		fmt.Fprintf(w, "%s push mode: full (%s)\n", displayName, result.FullReason)
+	}
 	if result.SkippedUnchanged > 0 {
 		fmt.Fprintf(w, "Skipped %d unchanged session(s)\n", result.SkippedUnchanged)
+	}
+	if result.SkippedResumed > 0 {
+		fmt.Fprintf(w, "Skipped %d session(s) already pushed by the unfinished full push\n", result.SkippedResumed)
 	}
 	if result.DeletedStale > 0 {
 		fmt.Fprintf(w, "Removed %d stale session(s)\n", result.DeletedStale)
@@ -346,7 +401,7 @@ func runReplicaStatus(
 	ctx context.Context, backend storage.Replica, targetName string,
 	cfg ReplicaStatusConfig,
 ) error {
-	appCfg, err := config.LoadMinimal()
+	appCfg, err := config.LoadMinimalFor(replicaConfigScope(backend, nil))
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
@@ -410,6 +465,10 @@ func runReplicaStatus(
 	return nil
 }
 
+// replicaStatusQueryTimeout bounds the replica's status query under
+// --max-stale, so a monitor gets a failure instead of a hung check.
+var replicaStatusQueryTimeout = time.Minute
+
 func runReplicaStatusTarget(
 	backend storage.Replica,
 	database *db.DB,
@@ -436,18 +495,58 @@ func runReplicaStatusTarget(
 		return err
 	}
 
+	now := time.Now()
+	path := replicaWatchHealthPath(appCfg.DataDir, backend.Name())
+	rec, recErr := loadReplicaWatchRecord(path)
+	if recErr == nil && !rec.matches(target) {
+		recErr = fmt.Errorf("%s was written for another target or destination", path)
+	}
+	var watchRows []storage.StatusRow
+	if recErr == nil {
+		watchRows = replicaWatchRows(rec, now)
+	}
+	// A stuck push can hold locks that block the replica's status query, so
+	// a stall the record already shows is reported without querying.
+	if cfg.MaxStale > 0 && recErr == nil {
+		if stall := replicaWatchStall(rec, now, cfg.MaxStale); stall != "" {
+			writeReplicaStatus(os.Stdout, storage.ReplicaStatus{Rows: watchRows})
+			return fmt.Errorf(
+				"push watcher stalled for more than --max-stale %s: %s; run `agentsview replica %s service logs` for details",
+				cfg.MaxStale, stall, backend.Name(),
+			)
+		}
+	}
+
 	ctx, stop := signal.NotifyContext(
 		context.Background(), os.Interrupt,
 	)
 	defer stop()
+	if cfg.MaxStale > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, replicaStatusQueryTimeout)
+		defer cancel()
+	}
 
 	status, err := backend.Status(
 		ctx, database, target, projects, excludeProjects,
 	)
 	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf(
+				"%s did not answer the status query within %s: %w",
+				backend.DisplayName(), replicaStatusQueryTimeout, err,
+			)
+		}
 		return err
 	}
+	status.Rows = append(status.Rows, watchRows...)
 	writeReplicaStatus(os.Stdout, status)
+	if cfg.MaxStale > 0 && recErr != nil {
+		return fmt.Errorf(
+			"--max-stale needs a record from `agentsview replica %s push --watch` for this target: %w",
+			backend.Name(), recErr,
+		)
+	}
 	return nil
 }
 
@@ -485,12 +584,14 @@ type replicaServeStartup struct {
 	srv         *server.Server
 	cleanup     func()
 	startWorker func()
+	joinWorker  func() error
 }
 
 var prepareReplicaServe = prepareReplicaServeImpl
 
 func prepareReplicaServeImpl(
 	backend storage.Replica, appCfg config.Config, basePath string,
+	watch *ReplicaPushConfig,
 ) (replicaServeStartup, error) {
 	name := backend.Name()
 	if err := validateServeConfig(appCfg); err != nil {
@@ -535,6 +636,11 @@ func prepareReplicaServeImpl(
 	}
 	if len(appCfg.CustomModelPricing) > 0 {
 		store.SetCustomPricing(appCfg.CustomModelPricing)
+	}
+	// A store that prepares reads in the background starts only now, so
+	// that work uses every serve-time setting installed above.
+	if starter, ok := store.(interface{ StartBackground(context.Context) }); ok {
+		starter.StartBackground(ctx)
 	}
 
 	var closeExtras func() error
@@ -586,10 +692,17 @@ func prepareReplicaServeImpl(
 	if basePath != "" {
 		opts = append(opts, server.WithBasePath(rtOpts.BasePath))
 	}
-	return replicaServeStartup{
+	startup := replicaServeStartup{
 		cfg: appCfg, ctx: ctx, rtOpts: rtOpts,
 		srv: server.New(appCfg, store, nil, opts...), cleanup: cleanup,
-	}, nil
+	}
+	if watch != nil {
+		if err := attachReplicaServeWatch(&startup, stop, backend, store, watch); err != nil {
+			cleanup()
+			return replicaServeStartup{}, err
+		}
+	}
+	return startup, nil
 }
 
 // supportsInsightGeneration reports whether a replica store proved at startup
@@ -599,7 +712,7 @@ func supportsInsightGeneration(store storage.ReplicaStore) bool {
 	return ok && capable.InsightGenerationAvailable()
 }
 
-func runReplicaServe(backend storage.Replica, appCfg config.Config, basePath string) {
+func runReplicaServe(backend storage.Replica, appCfg config.Config, basePath string, watch *ReplicaPushConfig) {
 	name := backend.Name()
 	setupLogFile(appCfg.DataDir)
 	if appCfg.RequireAuth {
@@ -608,7 +721,7 @@ func runReplicaServe(backend storage.Replica, appCfg config.Config, basePath str
 		}
 	}
 
-	startup, err := prepareReplicaServe(backend, appCfg, basePath)
+	startup, err := prepareReplicaServe(backend, appCfg, basePath, watch)
 	if err != nil {
 		fatal("%v", err)
 	}
@@ -652,16 +765,20 @@ func runPreparedReplicaServe(name string, startup replicaServeStartup) error {
 	if rt.Cfg.RequireAuth && rt.Cfg.AuthToken != "" {
 		fmt.Println("Auth enabled. Token is configured.")
 	}
+	mode := name + " read-only"
+	if startup.joinWorker != nil {
+		mode = name + " read-only API, push-watch on"
+	}
 	if rt.PublicURL == rt.LocalURL {
 		fmt.Printf(
-			"agentsview %s (%s read-only) at %s\n",
-			version, name,
+			"agentsview %s (%s) at %s\n",
+			version, mode,
 			rt.LocalURL,
 		)
 	} else {
 		fmt.Printf(
-			"agentsview %s (%s read-only) listening at %s, browser URL: %s\n",
-			version, name,
+			"agentsview %s (%s) listening at %s, browser URL: %s\n",
+			version, mode,
 			rt.LocalURL,
 			rt.PublicURL,
 		)
@@ -669,6 +786,9 @@ func runPreparedReplicaServe(name string, startup replicaServeStartup) error {
 
 	if err := waitForServerRuntime(ctx, srv, rt); err != nil {
 		return fmt.Errorf("%s serve: %w", name, err)
+	}
+	if startup.joinWorker != nil {
+		return startup.joinWorker()
 	}
 	return nil
 }

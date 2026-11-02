@@ -24,7 +24,11 @@ export type GetApiV1UsageComparisonParams = {
    */
   project?: string;
   /**
-   * Filter by machine
+   * Filter by an opaque project key
+   */
+  project_key?: string;
+  /**
+   * Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400.
    */
   machine?: string;
   /**

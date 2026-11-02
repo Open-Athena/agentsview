@@ -18,9 +18,8 @@ const (
 	rawSyncUploadStartMaxBytes  = 4 << 10
 	// Upload PATCH authentication runs before this route-specific extension.
 	rawSyncUploadReadTimeout = 15 * time.Minute
-	// Huma treats a body exactly equal to MaxBodyBytes as oversized, so the
-	// transport read ceiling is one byte above the service's accepted chunk.
-	rawSyncUploadReadMaxBytes = rawsync.DefaultUploadChunkBytes + 1
+	// Huma accepts a body of exactly MaxBodyBytes and rejects anything larger.
+	rawSyncUploadReadMaxBytes = rawsync.DefaultUploadChunkBytes
 )
 
 func (s *Server) registerRawUploadRoutes(group *huma.Group) {
@@ -77,7 +76,11 @@ func (s *Server) humaRawSyncUploadStart(
 	}
 	location := ""
 	if session.ID != "" {
-		location = s.basePath + "/api/v1/raw-sync/uploads/" + session.ID
+		prefix := s.basePath
+		if restrictedIngress(ctx) {
+			prefix = restrictedIngressPrefix(ctx)
+		}
+		location = prefix + "/api/v1/raw-sync/uploads/" + session.ID
 	}
 	return &rawSyncUploadStartOutput{
 		Location: location,

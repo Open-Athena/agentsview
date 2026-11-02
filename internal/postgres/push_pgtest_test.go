@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/storage"
+	"go.kenn.io/agentsview/internal/testutil"
 )
 
 func TestPushPreservesLegacyOffsetTimestamps(t *testing.T) {
@@ -133,7 +135,7 @@ func TestPGUsageEventFingerprintsPreserveExactMicrodollars(t *testing.T) {
 		CostStatus: "priced", CostSource: "provider",
 		OccurredAt: "2026-07-22T12:00:00Z", DedupKey: "exact-cost",
 	}}))
-	want, err := local.UsageEventFingerprint("exact-money")
+	want, err := localUsageEventPGFingerprint(ctx, local, "exact-money")
 	require.NoError(t, err)
 
 	_, err = pg.ExecContext(ctx, `
@@ -152,15 +154,9 @@ func TestPGUsageEventFingerprintsPreserveExactMicrodollars(t *testing.T) {
 	tx, err := pg.BeginTx(ctx, nil)
 	require.NoError(t, err)
 	defer tx.Rollback()
-	got, err := pgUsageEventFingerprint(ctx, tx, "exact-money")
-	require.NoError(t, err)
-	assert.Equal(t, want, got)
-
-	batched := map[string]string{}
-	require.NoError(t, loadPushUsageEventFingerprints(
-		ctx, tx, []string{"exact-money"}, batched,
-	))
-	assert.Equal(t, want, batched["exact-money"])
+	fingerprints := make(map[string]string, 1)
+	require.NoError(t, loadPushUsageEventFingerprints(ctx, tx, []string{"exact-money"}, fingerprints))
+	assert.Equal(t, want, fingerprints["exact-money"])
 }
 
 func TestPushMirrorsSessionProjectIdentitySnapshotsByArchiveGeneration(
@@ -827,18 +823,10 @@ func TestIdentityPublicationUpdatesOnlyChangedRowsAndAppliesTombstones(
 	assert.Zero(t, snapshotCount)
 }
 
-// TestPushSystemFingerprintCollisionRegression verifies that the fast-path
-// in pushMessages correctly detects a change when the is_system flags are
-// reclassified between two ordinal sets that previously collided under the
-// two-component (SUM, SUM-of-squares) fingerprint: {0,4,5} and {1,2,6}
-// both produce sum=9, sumSq=41.
-//
-// Steps:
-//  1. Push a session with 7 messages where ordinals {0,4,5} are system.
-//  2. Without changing content lengths, reclassify to {1,2,6} as system.
-//  3. Push again with full=false.
-//  4. Confirm PG now reflects the updated is_system values.
-func TestPushSystemFingerprintCollisionRegression(t *testing.T) {
+// TestPushSystemReclassificationRepublishes verifies that an is_system
+// reclassification at unchanged content length reaches the flags stream
+// and republishes the updated message flags.
+func TestPushSystemReclassificationRepublishes(t *testing.T) {
 	pgURL := testPGURL(t)
 
 	const schema = "agentsview_push_sysfingerprint_test"
@@ -867,7 +855,7 @@ func TestPushSystemFingerprintCollisionRegression(t *testing.T) {
 		schemaDone: true,
 	}
 
-	const sessID = "fp-collision-001"
+	const sessID = "system-reclassification-001"
 	sess := db.Session{
 		ID:           sessID,
 		Project:      "test-proj",
@@ -900,9 +888,7 @@ func TestPushSystemFingerprintCollisionRegression(t *testing.T) {
 	// Verify PG reflects system ordinals {0,4,5}.
 	checkIsSystem(t, pg, sessID, firstSet, 7)
 
-	// Switch to {1,2,6} — same sum(ordinal)=9, same sum(ordinal²)=41,
-	// but the string fingerprint differs ("0,4,5" vs "1,2,6").
-	// Replace local messages with updated is_system flags.
+	// Reclassify system messages without changing content or its length.
 	secondSet := map[int]bool{1: true, 2: true, 6: true}
 	for i := range 7 {
 		msgs[i].IsSystem = secondSet[i]
@@ -910,169 +896,15 @@ func TestPushSystemFingerprintCollisionRegression(t *testing.T) {
 	require.NoError(t, localDB.ReplaceSessionMessages(t.Context(), sessID, msgs),
 		"ReplaceSessionMessages (second set)")
 
-	// Force re-evaluation by clearing both the watermark and the cached
-	// session-level boundary fingerprints. The session-level fingerprint
-	// does not include is_system flags (only metadata like MessageCount),
-	// so the boundary cache must be cleared for the incremental push to
-	// reach pushMessages and compare the message-level string fingerprint.
-	require.NoError(t, localDB.SetSyncState(t.Context(), "last_push_at", ""),
-		"clearing last_push_at")
-	require.NoError(t, localDB.SetSyncState(t.Context(), lastPushBoundaryStateKey, ""),
-		"clearing boundary state")
+	// Clear push history so the incremental push compares the flags stream.
+	forgetPushHistory(t, localDB)
 
-	// Second push — must NOT skip due to fingerprint match.
+	// The changed flags stream must trigger republication.
 	_, err = sync.Push(ctx, false, nil)
 	require.NoError(t, err, "Push (second)")
 
 	// Verify PG now reflects updated system ordinals {1,2,6}.
 	checkIsSystem(t, pg, sessID, secondSet, 7)
-}
-
-func TestPushMessageContentHashRewriteRegression(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_push_contenthash_test"
-	pg, err := Open(pgURL, schema, true)
-	require.NoError(t, err, "Open")
-	defer pg.Close()
-
-	ctx := context.Background()
-	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
-	require.NoError(t, err, "drop schema")
-	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
-
-	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
-	require.NoError(t, err, "db.Open")
-	defer localDB.Close()
-
-	sync := &Sync{
-		pg:         pg,
-		local:      localDB,
-		machine:    "test-machine",
-		schema:     schema,
-		schemaDone: true,
-	}
-
-	const sessID = "content-hash-rewrite-001"
-	sess := db.Session{
-		ID:               sessID,
-		Project:          "test-proj",
-		Machine:          "test-machine",
-		Agent:            "shelley",
-		MessageCount:     2,
-		UserMessageCount: 1,
-		CreatedAt:        "2026-01-01T00:00:00Z",
-	}
-	require.NoError(t, localDB.UpsertSession(t.Context(), sess), "UpsertSession")
-	msgs := []db.Message{
-		{
-			SessionID:     sessID,
-			Ordinal:       1,
-			Role:          "user",
-			Content:       "question",
-			ContentLength: len("question"),
-		},
-		{
-			SessionID:     sessID,
-			Ordinal:       2,
-			Role:          "assistant",
-			Content:       "answer aaaa",
-			ContentLength: len("answer aaaa"),
-		},
-	}
-	require.NoError(t, localDB.InsertMessages(t.Context(), msgs),
-		"InsertMessages first content")
-
-	_, err = sync.Push(ctx, false, nil)
-	require.NoError(t, err, "Push first content")
-	assertPGMessageContent(t, pg, sessID, 2, "answer aaaa")
-
-	msgs[1].Content = "answer bbbb"
-	msgs[1].ContentLength = len("answer bbbb")
-	require.NoError(t, localDB.ReplaceSessionMessages(t.Context(), sessID, msgs),
-		"ReplaceSessionMessages rewritten content")
-	require.NoError(t, localDB.SetSyncState(t.Context(), "last_push_at", ""),
-		"clearing last_push_at")
-	require.NoError(t, localDB.SetSyncState(t.Context(), lastPushBoundaryStateKey, ""),
-		"clearing boundary state")
-
-	_, err = sync.Push(ctx, false, nil)
-	require.NoError(t, err, "Push rewritten content")
-	assertPGMessageContent(t, pg, sessID, 2, "answer bbbb")
-}
-
-func TestPushMessageFlagsRewriteRegression(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_push_msgflags_test"
-	pg, err := Open(pgURL, schema, true)
-	require.NoError(t, err, "Open")
-	defer pg.Close()
-
-	ctx := context.Background()
-	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
-	require.NoError(t, err, "drop schema")
-	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
-
-	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
-	require.NoError(t, err, "db.Open")
-	defer localDB.Close()
-
-	sync := &Sync{
-		pg:         pg,
-		local:      localDB,
-		machine:    "test-machine",
-		schema:     schema,
-		schemaDone: true,
-	}
-
-	const sessID = "message-flags-rewrite-001"
-	sess := db.Session{
-		ID:               sessID,
-		Project:          "test-proj",
-		Machine:          "test-machine",
-		Agent:            "shelley",
-		MessageCount:     2,
-		UserMessageCount: 1,
-		CreatedAt:        "2026-01-01T00:00:00Z",
-	}
-	require.NoError(t, localDB.UpsertSession(t.Context(), sess), "UpsertSession")
-	msgs := []db.Message{
-		{
-			SessionID:     sessID,
-			Ordinal:       1,
-			Role:          "user",
-			Content:       "question",
-			ContentLength: len("question"),
-		},
-		{
-			SessionID:     sessID,
-			Ordinal:       2,
-			Role:          "assistant",
-			Content:       "answer",
-			ContentLength: len("answer"),
-		},
-	}
-	require.NoError(t, localDB.InsertMessages(t.Context(), msgs),
-		"InsertMessages first metadata")
-
-	_, err = sync.Push(ctx, false, nil)
-	require.NoError(t, err, "Push first metadata")
-	assertPGMessageThinking(t, pg, sessID, 2, false, "")
-
-	msgs[1].ThinkingText = "private chain of thought"
-	msgs[1].HasThinking = true
-	require.NoError(t, localDB.ReplaceSessionMessages(t.Context(), sessID, msgs),
-		"ReplaceSessionMessages rewritten metadata")
-	require.NoError(t, localDB.SetSyncState(t.Context(), "last_push_at", ""),
-		"clearing last_push_at")
-	require.NoError(t, localDB.SetSyncState(t.Context(), lastPushBoundaryStateKey, ""),
-		"clearing boundary state")
-
-	_, err = sync.Push(ctx, false, nil)
-	require.NoError(t, err, "Push rewritten metadata")
-	assertPGMessageThinking(t, pg, sessID, 2, true,
-		"private chain of thought")
 }
 
 func TestPushMessageNanosecondTimestampNoRewriteRegression(t *testing.T) {
@@ -1126,10 +958,7 @@ func TestPushMessageNanosecondTimestampNoRewriteRegression(t *testing.T) {
 		"2026-01-01T00:00:00.123456Z")
 
 	ctidBefore := pgMessageCTID(t, pg, sessID, 1)
-	require.NoError(t, localDB.SetSyncState(t.Context(), "last_push_at", ""),
-		"clearing last_push_at")
-	require.NoError(t, localDB.SetSyncState(t.Context(), lastPushBoundaryStateKey, ""),
-		"clearing boundary state")
+	forgetPushHistory(t, localDB)
 
 	_, err = sync.Push(ctx, false, nil)
 	require.NoError(t, err, "Push same timestamp")
@@ -2009,7 +1838,7 @@ func TestPushSyncsUsageEventsForZeroMessageSession(t *testing.T) {
 	require.NoError(t, localDB.UpsertSession(t.Context(), sess), "UpsertSession")
 
 	// gpt-5.5 usage event with NULL cost so it is priced from the catalog.
-	require.NoError(t, localDB.ReplaceSessionUsageEvents(t.Context(), sessID, []db.UsageEvent{{
+	usage := db.UsageEvent{
 		SessionID:    sessID,
 		Source:       "session",
 		Model:        "gpt-5.5",
@@ -2018,7 +1847,8 @@ func TestPushSyncsUsageEventsForZeroMessageSession(t *testing.T) {
 		Cost:         nil,
 		OccurredAt:   started,
 		DedupKey:     "session:" + sessID,
-	}}), "ReplaceSessionUsageEvents")
+	}
+	require.NoError(t, localDB.ReplaceSessionUsageEvents(t.Context(), sessID, []db.UsageEvent{usage}), "ReplaceSessionUsageEvents")
 
 	_, err = sync.Push(ctx, false, nil)
 	require.NoError(t, err, "Push")
@@ -2046,6 +1876,26 @@ func TestPushSyncsUsageEventsForZeroMessageSession(t *testing.T) {
 	require.NoError(t, err, "GetDailyUsage")
 	assert.Equal(t, money.MustParseDollars("20"), result.Totals.TotalCost,
 		"gpt-5.5 usage should be priced from the catalog")
+
+	_, err = pg.ExecContext(ctx, `UPDATE sessions SET updated_at='2000-01-01T00:00:00Z' WHERE id=$1`, sessID)
+	require.NoError(t, err)
+	var before time.Time
+	require.NoError(t, pg.QueryRowContext(ctx, "SELECT updated_at FROM sessions WHERE id=$1", sessID).Scan(&before))
+
+	// Change only accounting, leaving the zero-message session's metadata intact.
+	usage.OutputTokens = 600000
+	require.NoError(t, localDB.ReplaceSessionUsageEvents(t.Context(), sessID, []db.UsageEvent{usage}))
+	pushed, err := sync.Push(ctx, true, nil)
+	require.NoError(t, err)
+	require.Zero(t, pushed.Errors)
+	var outputTokens int
+	require.NoError(t, pg.QueryRowContext(ctx,
+		"SELECT output_tokens FROM usage_events WHERE session_id=$1", sessID,
+	).Scan(&outputTokens))
+	assert.Equal(t, 600000, outputTokens, "full push must replace changed usage without messages")
+	var after time.Time
+	require.NoError(t, pg.QueryRowContext(ctx, "SELECT updated_at FROM sessions WHERE id=$1", sessID).Scan(&after))
+	assert.True(t, after.After(before), "full push of changed usage must advance updated_at and wake remote session viewers")
 }
 
 func TestPushSyncsCursorUsageEventsIntoPGDailyUsage(t *testing.T) {
@@ -2304,43 +2154,6 @@ func checkIsSystem(
 	}
 }
 
-func assertPGMessageContent(
-	t *testing.T,
-	pg *sql.DB,
-	sessionID string,
-	ordinal int,
-	want string,
-) {
-	t.Helper()
-	var got string
-	require.NoError(t, pg.QueryRow(
-		`SELECT content FROM messages
-		  WHERE session_id = $1 AND ordinal = $2`,
-		sessionID, ordinal,
-	).Scan(&got), "read pg message content")
-	assert.Equal(t, want, got)
-}
-
-func assertPGMessageThinking(
-	t *testing.T,
-	pg *sql.DB,
-	sessionID string,
-	ordinal int,
-	wantHasThinking bool,
-	wantThinkingText string,
-) {
-	t.Helper()
-	var gotHasThinking bool
-	var gotThinkingText string
-	require.NoError(t, pg.QueryRow(
-		`SELECT has_thinking, thinking_text FROM messages
-		  WHERE session_id = $1 AND ordinal = $2`,
-		sessionID, ordinal,
-	).Scan(&gotHasThinking, &gotThinkingText), "read pg message thinking")
-	assert.Equal(t, wantHasThinking, gotHasThinking)
-	assert.Equal(t, wantThinkingText, gotThinkingText)
-}
-
 func assertPGMessageTimestamp(
 	t *testing.T,
 	pg *sql.DB,
@@ -2357,6 +2170,20 @@ func assertPGMessageTimestamp(
 	).Scan(&gotTime), "read pg message timestamp")
 	require.True(t, gotTime.Valid, "timestamp should be non-NULL")
 	assert.Equal(t, want, FormatISO8601(gotTime.Time))
+}
+
+// forgetPushHistory makes the next push look like this archive's first push to
+// a database that already holds its sessions, so that push compares
+// fingerprints. Clearing only the watermark would force a full push, because
+// the saved-state mark shows this archive pushed before.
+func forgetPushHistory(t *testing.T, localDB *db.DB) {
+	t.Helper()
+	require.NoError(t, localDB.SetSyncState(t.Context(), "last_push_at", ""),
+		"clearing last_push_at")
+	require.NoError(t, localDB.SetSyncState(t.Context(), lastPushBoundaryStateKey, ""),
+		"clearing boundary state")
+	require.NoError(t, localDB.SetSyncState(t.Context(), pushStateSavedKey, ""),
+		"clearing the saved-state mark")
 }
 
 func pgMessageCTID(
@@ -2465,11 +2292,7 @@ func TestPushMessagesSanitizesNULBytes(t *testing.T) {
 		 WHERE session_id = $1 AND ordinal = 0`, sessID,
 	).Scan(&ctidBefore), "reading ctid before second push")
 
-	require.NoError(t, localDB.SetSyncState(t.Context(), "last_push_at", ""),
-		"clearing last_push_at")
-	require.NoError(t,
-		localDB.SetSyncState(t.Context(), lastPushBoundaryStateKey, ""),
-		"clearing boundary state")
+	forgetPushHistory(t, localDB)
 
 	res, err = sync.Push(ctx, false, nil)
 	require.NoError(t, err, "Push (second)")
@@ -2570,7 +2393,7 @@ func TestPushIncrementalWithOnlyForeignMachineSessions(t *testing.T) {
 // TestPushDetectsResetWhenCompetingMachineRowsExist verifies that a PG reset is
 // detected even when another pusher has repopulated rows under a machine value
 // this host also writes. The local session carries Machine "remote-host" (as a
-// remote host's sessions synced in over SSH would); after the first push the PG
+// remote host's sessions synced from a remote would); after the first push the PG
 // rows and this host's push marker are removed and a competing "remote-host"
 // row is inserted, simulating the remote host re-pushing first after a shared
 // PG reset. A machine-count check would see the competing row and skip the full
@@ -3241,9 +3064,12 @@ func TestArchiveIdentityChangeRepublishesUnchangedSessions(t *testing.T) {
 	)
 	require.NoError(t, err)
 
+	// The failed push committed sess-1 under the repaired archive before
+	// metadata publication failed, so the retry resumes that run.
 	second, err := syncer.Push(ctx, false, nil)
 	require.NoError(t, err)
-	assert.Equal(t, 1, second.SessionsPushed)
+	assert.Zero(t, second.SessionsPushed)
+	assert.Equal(t, 1, second.SkippedResumed)
 	var gotArchiveID string
 	require.NoError(t, pg.QueryRowContext(ctx, `
 		SELECT source_archive_id FROM sessions WHERE id = 'sess-1'`,
@@ -3550,4 +3376,251 @@ func TestSessionProvenanceBackfillCompletesPerFilterScope(t *testing.T) {
 	require.NoError(t, err, "GetSyncState after unfiltered push")
 	assert.Equal(t, "1", marker,
 		"unfiltered push must complete the provenance marker")
+}
+
+type usagePushFixture struct {
+	local   *db.DB
+	pusher  *Sync
+	session db.Session
+}
+
+// newUsagePushFixture stores one session with a single message and the given
+// usage events, then completes an initial push.
+func newUsagePushFixture(
+	t *testing.T, schema string, events []db.UsageEvent,
+) usagePushFixture {
+	t.Helper()
+	ctx := t.Context()
+	pgURL := testPGURL(t)
+	cleanNamedPGSchema(t, pgURL, schema)
+	t.Cleanup(func() { cleanNamedPGSchema(t, pgURL, schema) })
+
+	local := testDB(t)
+	session := db.Session{
+		ID: "hermes:usage", Project: "project", Machine: "machine",
+		Agent: "hermes", MessageCount: 1,
+		FileMtime: new(time.Now().Add(time.Hour).UnixNano()),
+		FileHash:  new("first-source"),
+	}
+	require.NoError(t, local.UpsertSession(ctx, session))
+	require.NoError(t, local.InsertMessages(ctx, []db.Message{{
+		SessionID: session.ID, Ordinal: 0, Role: "user",
+		Content: "unchanged message", ContentLength: 17,
+	}}))
+	for i := range events {
+		events[i].SessionID = session.ID
+	}
+	require.NoError(t, local.ReplaceSessionUsageEvents(ctx, session.ID, events))
+
+	pusher, err := New(pgURL, schema, local, "machine", true, storage.PusherOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pusher.Close() })
+	_, err = pusher.Push(ctx, false, nil)
+	require.NoError(t, err)
+	return usagePushFixture{local: local, pusher: pusher, session: session}
+}
+
+// pushMetadataChange renames the session and changes its source hash without
+// touching messages or usage, then pushes.
+func (f *usagePushFixture) pushMetadataChange(
+	t *testing.T, name, fileHash string,
+) storage.PushResult {
+	t.Helper()
+	f.session.SessionName = new(name)
+	f.session.FileHash = new(fileHash)
+	require.NoError(t, f.local.UpsertSession(t.Context(), f.session))
+	result, err := f.pusher.Push(t.Context(), false, nil)
+	require.NoError(t, err)
+	return result
+}
+
+func TestPGPushMetadataChangesPreserveUnchangedUsage(t *testing.T) {
+	type mirroredMessage struct {
+		Version     string
+		SessionName string
+	}
+	readMessage := func(t *testing.T, f usagePushFixture) mirroredMessage {
+		t.Helper()
+		var got mirroredMessage
+		require.NoError(t, f.pusher.DB().QueryRowContext(t.Context(), `
+			SELECT m.xmin::text, COALESCE(s.session_name, '')
+			FROM messages m JOIN sessions s ON s.id = m.session_id
+			WHERE m.session_id = $1 AND m.ordinal = 0`, f.session.ID,
+		).Scan(&got.Version, &got.SessionName))
+		return got
+	}
+	for _, test := range []struct {
+		name       string
+		timestamps []string
+	}{
+		{name: "nanoseconds", timestamps: []string{"2026-07-01T12:00:00.123456789Z"}},
+		{name: "trailing zeroes", timestamps: []string{"2026-07-01T12:00:00.000Z"}},
+		{name: "offset", timestamps: []string{"2026-07-01T13:00:00.123456789+01:00"}},
+		{name: "empty", timestamps: []string{""}},
+		{name: "whole and fractional seconds", timestamps: []string{
+			"2026-07-01T12:00:00Z", "2026-07-01T12:00:00.5Z",
+		}},
+		{name: "different offsets", timestamps: []string{
+			"2026-07-01T13:00:00+01:00", "2026-07-01T12:30:00Z",
+		}},
+		{name: "same microsecond", timestamps: []string{
+			"2026-07-01T12:00:00.123456900Z", "2026-07-01T12:00:00.123456100Z",
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			events := make([]db.UsageEvent, len(test.timestamps))
+			for i, timestamp := range test.timestamps {
+				events[i] = db.UsageEvent{
+					Source: "session", Model: "model", InputTokens: i + 1,
+					OccurredAt: timestamp, DedupKey: fmt.Sprintf("event-%d", i),
+				}
+			}
+			f := newUsagePushFixture(t, "agentsview_usage_timestamp_test", events)
+			archived, err := f.local.UsageEventFingerprints([]string{f.session.ID})
+			require.NoError(t, err)
+			before := readMessage(t, f)
+
+			result := f.pushMetadataChange(t, "Renamed session", "second-source")
+
+			assert.Zero(t, result.MessagesPushed)
+			assert.Equal(t, mirroredMessage{
+				Version: before.Version, SessionName: "Renamed session",
+			}, readMessage(t, f), "metadata changes must not replace messages")
+			after, err := f.local.UsageEventFingerprints([]string{f.session.ID})
+			require.NoError(t, err)
+			assert.Equal(t, archived, after,
+				"pushing must keep the archive's timestamp text")
+		})
+	}
+}
+
+func TestPGPushReplacesChangedUsage(t *testing.T) {
+	type mirroredUsage struct {
+		OutputTokens int
+		OccurredAt   sql.NullTime
+	}
+	usage := db.UsageEvent{
+		Source: "session", Model: "model", InputTokens: 10, OutputTokens: 2,
+		DedupKey: "session:usage",
+	}
+	f := newUsagePushFixture(t, "agentsview_usage_change_test", []db.UsageEvent{usage})
+	usage.SessionID = f.session.ID
+
+	_, err := f.pusher.DB().ExecContext(t.Context(), `UPDATE sessions SET updated_at='2000-01-01T00:00:00Z' WHERE id=$1`, f.session.ID)
+	require.NoError(t, err)
+	var before time.Time
+	require.NoError(t, f.pusher.DB().QueryRowContext(t.Context(), "SELECT updated_at FROM sessions WHERE id=$1", f.session.ID).Scan(&before))
+
+	usage.OutputTokens = 3
+	require.NoError(t, f.local.ReplaceSessionUsageEvents(
+		t.Context(), f.session.ID, []db.UsageEvent{usage},
+	))
+	_, err = f.pusher.Push(t.Context(), false, nil)
+	require.NoError(t, err)
+	var after time.Time
+	require.NoError(t, f.pusher.DB().QueryRowContext(t.Context(), "SELECT updated_at FROM sessions WHERE id=$1", f.session.ID).Scan(&after))
+	assert.True(t, after.After(before), "changed usage must advance updated_at and wake remote session viewers")
+
+	var got mirroredUsage
+	require.NoError(t, f.pusher.DB().QueryRowContext(t.Context(),
+		"SELECT output_tokens, occurred_at FROM usage_events WHERE session_id = $1",
+		f.session.ID,
+	).Scan(&got.OutputTokens, &got.OccurredAt))
+	assert.Equal(t, mirroredUsage{OutputTokens: 3}, got,
+		"accounting changes must replace mirrored usage")
+
+	// PostgreSQL holds a NULL timestamp for this event, so a malformed local
+	// timestamp must not compare equal to it after normalization.
+	usage.OccurredAt = "invalid"
+	require.NoError(t, f.local.ReplaceSessionUsageEvents(
+		t.Context(), f.session.ID, []db.UsageEvent{usage},
+	))
+	result := f.pushMetadataChange(t, "Renamed session", "second-source")
+	assert.Equal(t, 1, result.Errors,
+		"a malformed usage timestamp must fail the push and remain retryable")
+}
+
+// A filtered push that starts while a local sync is moving a session out of
+// scope must reconcile the move. The push lists move candidates and takes its
+// cutoff; if it listed before the move committed and took the cutoff after,
+// the session would stay remote under its old project with the watermark
+// already past the move.
+func TestFilteredPushReconcilesProjectMoveCommittedDuringPush(t *testing.T) {
+	const (
+		sessionID     = "pg-concurrent-move"
+		sourceProject = "source_project"
+		targetProject = "target_project"
+		schema        = "agentsview_concurrent_move"
+	)
+	pgURL := testPGURL(t)
+	cleanNamedPGSchema(t, pgURL, schema)
+	t.Cleanup(func() { cleanNamedPGSchema(t, pgURL, schema) })
+	ctx := t.Context()
+	local, err := db.Open(ctx, filepath.Join(t.TempDir(), "local.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, local.Close()) })
+	startedAt := "2026-07-16T12:00:00.000Z"
+	require.NoError(t, local.UpsertSession(ctx, db.Session{
+		ID: sessionID, Project: sourceProject, Machine: "local",
+		Agent: "claude", StartedAt: &startedAt, LocalModifiedAt: &startedAt,
+		MessageCount: 1, UserMessageCount: 1,
+	}))
+	syncer, err := New(pgURL, schema, local, "test-machine", true, storage.PusherOptions{
+		Projects: []string{sourceProject},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, syncer.Close()) })
+	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, err)
+
+	// A local sync moves the session to an excluded project and holds its
+	// transaction open. Its stamp is after the first push's cutoff.
+	stamp := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
+	moved := make(chan struct{})
+	release := make(chan struct{})
+	committed := make(chan error, 1)
+	go func() {
+		committed <- local.Update(ctx, func(tx *sql.Tx) error {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE sessions SET project = ?, local_modified_at = ?
+				WHERE id = ?`, targetProject, stamp, sessionID,
+			); err != nil {
+				return err
+			}
+			close(moved)
+			<-release
+			return nil
+		})
+	}()
+	<-moved
+
+	pushed := make(chan error, 1)
+	go func() {
+		_, err := syncer.Push(ctx, false, nil)
+		pushed <- err
+	}()
+	// Commit the move once the push waits for its cutoff, or once it has
+	// finished without waiting.
+	var pushErr error
+	finished := false
+	for !finished && !testutil.GoroutineBlockedOnMutexIn("lockctx.Lock") {
+		select {
+		case pushErr = <-pushed:
+			finished = true
+		default:
+			runtime.Gosched()
+		}
+	}
+	close(release)
+	require.NoError(t, <-committed)
+	if !finished {
+		pushErr = <-pushed
+	}
+	require.NoError(t, pushErr)
+
+	var count int
+	require.NoError(t, syncer.pg.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sessions WHERE id = $1`, sessionID,
+	).Scan(&count))
+	assert.Zero(t, count, "a session moved out of scope during the push must leave the remote")
 }

@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dlclark/regexp2/v2"
@@ -36,6 +38,18 @@ type GenAIPrices struct {
 	providers []genAIProvider
 	raw       []byte
 	version   string
+	// resolved memoizes provider and model matching per (provider, model)
+	// identifier. Matching runs pattern lists that include regular
+	// expressions, and a usage report resolves the same few models for
+	// every row; only the price version depends on the timestamp.
+	resolved sync.Map
+	// fingerprints memoizes ModelFingerprint per (provider, model) lookup.
+	fingerprints sync.Map
+}
+
+type genAIResolvedModel struct {
+	provider *genAIProvider
+	model    *genAIModel
 }
 
 type genAIProvider struct {
@@ -579,29 +593,81 @@ func (p *GenAIPrices) Resolve(
 	if p == nil || modelID == "" {
 		return ModelPricing{}, false
 	}
-	lowerModelID := strings.ToLower(modelID)
-	provider := p.findProvider(providerID, modelID, lowerModelID)
-	if provider == nil {
+	resolved := p.resolveModel(providerID, modelID)
+	if resolved.model == nil {
 		return ModelPricing{}, false
 	}
-	model := provider.findModel(modelID, lowerModelID)
-	if model == nil {
-		for _, fallbackID := range provider.fallbackModelProviders {
-			fallback := p.providerByID(fallbackID)
-			if fallback != nil {
-				model = fallback.findModel(modelID, lowerModelID)
-			}
-			if model != nil {
-				break
+	selected := resolved.model.activePrices(timestamp)
+	rates, ok := genAIModelPricing(resolved.provider.id+"/"+resolved.model.id, selected)
+	return rates, ok
+}
+
+// ModelFingerprint hashes the matched model and every conditional price Resolve can select.
+func (p *GenAIPrices) ModelFingerprint(providerID, modelID string) string {
+	if p == nil || modelID == "" {
+		return "none"
+	}
+	key := providerID + "\x00" + modelID
+	if cached, ok := p.fingerprints.Load(key); ok {
+		return cached.(string)
+	}
+	fingerprint := "none"
+	if resolved := p.resolveModel(providerID, modelID); resolved.model != nil {
+		digest := sha256.New()
+		writeField := func(value string) {
+			_, _ = fmt.Fprintf(digest, "%d:%s", len(value), value)
+		}
+		writeField(resolved.provider.id)
+		writeField(resolved.model.id)
+		for _, conditional := range resolved.model.prices {
+			constraint := conditional.constraint
+			_, _ = fmt.Fprintf(digest, "|%d,%d.%d,%d,%d",
+				constraint.kind, constraint.startDate.Unix(), constraint.startDate.Nanosecond(),
+				constraint.startTime, constraint.endTime)
+			units := slices.Sorted(maps.Keys(conditional.prices))
+			_, _ = fmt.Fprintf(digest, "|%d", len(units))
+			for _, unit := range units {
+				rate := conditional.prices[unit]
+				writeField(unit)
+				_, _ = fmt.Fprintf(digest, "%d,%d", rate.base.Microdollars, len(rate.tiers))
+				for _, tier := range rate.tiers {
+					_, _ = fmt.Fprintf(digest, ",%d:%d", tier.start, tier.price.Microdollars)
+				}
 			}
 		}
+		fingerprint = hex.EncodeToString(digest.Sum(nil))
 	}
-	if model == nil {
-		return ModelPricing{}, false
+	actual, _ := p.fingerprints.LoadOrStore(key, fingerprint)
+	return actual.(string)
+}
+
+func (p *GenAIPrices) resolveModel(providerID, modelID string) genAIResolvedModel {
+	key := providerID + "\x00" + modelID
+	if cached, ok := p.resolved.Load(key); ok {
+		return cached.(genAIResolvedModel)
 	}
-	selected := model.activePrices(timestamp)
-	rates, ok := genAIModelPricing(provider.id+"/"+model.id, selected)
-	return rates, ok
+	var resolved genAIResolvedModel
+	lowerModelID := strings.ToLower(modelID)
+	provider := p.findProvider(providerID, modelID, lowerModelID)
+	if provider != nil {
+		model := provider.findModel(modelID, lowerModelID)
+		if model == nil {
+			for _, fallbackID := range provider.fallbackModelProviders {
+				fallback := p.providerByID(fallbackID)
+				if fallback != nil {
+					model = fallback.findModel(modelID, lowerModelID)
+				}
+				if model != nil {
+					break
+				}
+			}
+		}
+		if model != nil {
+			resolved = genAIResolvedModel{provider: provider, model: model}
+		}
+	}
+	p.resolved.Store(key, resolved)
+	return resolved
 }
 
 func (p *GenAIPrices) findProvider(

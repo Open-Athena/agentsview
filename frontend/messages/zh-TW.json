@@ -93,12 +93,18 @@
   "header_actions_refresh": "重新整理",
   "header_actions_sync": "同步",
   "header_actions_import_unavailable": "唯讀模式下無法匯入",
+  "header_actions_import_archive_only": "僅封存模式下無法匯入",
   "header_actions_import_conversations": "匯入對話",
   "header_actions_import": "匯入",
+  "header_actions_import_claude_syncing": "Claude.ai 同步正在執行。開啟匯入可查看進度或停止同步。",
   "header_actions_toggle_theme": "切換主題",
   "header_actions_settings": "設定",
   "header_actions_keyboard_shortcuts": "鍵盤快捷鍵",
   "header_actions_keyboard_shortcuts_shortcut": "鍵盤快捷鍵 (?)",
+  "status_bar_archive_stale": "封存資料結果可能已過時。",
+  "status_bar_archive_rebuilding": "封存資料結果可能已過時。重建完成前，變更操作已暫停。",
+  "status_bar_archive_stale_rebuild": "封存資料結果可能已過時。按一下以重建。",
+  "status_bar_sync_failed": "同步失敗",
   "status_bar_sessions": [
     {
       "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
@@ -151,8 +157,10 @@
   "command_palette_search_error": "搜尋無法使用",
   "command_palette_search_failed": "搜尋失敗。請再試一次。",
   "command_palette_semantic_setup_title": "語意搜尋尚未設定",
-  "command_palette_semantic_setup_config_step": "1. 在 config.toml 中新增 [vector] 區段，並依你的嵌入伺服器調整模型與端點（任何相容 OpenAI 的端點皆可，例如 Ollama）：",
-  "command_palette_semantic_setup_build_step": "2. 重新啟動常駐程式，然後建置索引：",
+  "command_palette_semantic_setup_config_step": "1. 將以下內容加入 config.toml：",
+  "command_palette_semantic_setup_local": "已在 Ollama 中使用 Nomic？切換至共用本機伺服器時，請使用完整設定範例以保留索引。",
+  "command_palette_semantic_setup_local_link": "伺服器設定",
+  "command_palette_semantic_setup_build_step": "2. 重新啟動守護程序，然後建立索引。CLI 會在首次下載前徵求許可：",
   "command_palette_semantic_copy_config": "複製設定片段",
   "command_palette_semantic_copy_command": "複製指令",
   "command_palette_semantic_copied": "已複製！",
@@ -175,7 +183,6 @@
   "command_palette_recent_sessions": "最近對話",
   "session_breadcrumb_back_to_sessions": "返回對話列表",
   "session_breadcrumb_sessions": "對話",
-  "session_breadcrumb_session_health": "對話健康度",
   "session_breadcrumb_resume_session_in_terminal": "在終端繼續對話",
   "session_breadcrumb_session_actions": "對話操作",
   "session_breadcrumb_resume_session": "繼續對話",
@@ -371,9 +378,22 @@
       }
     }
   ],
+  "tool_block_image_alt": "工具輸出中的圖片",
+  "tool_block_image_open": "檢視原尺寸圖片",
+  "tool_block_image_close": "關閉原尺寸圖片",
   "thinking_block_label": "思考",
   "compact_boundary_title": "上下文窗口在此處被壓縮",
   "compact_boundary_label": "上下文已壓縮",
+  "transcript_empty_messages": [
+    {
+      "declarations": ["input count", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{count} 則空訊息"
+      }
+    }
+  ],
+  "transcript_empty_messages_title": "這些訊息沒有文字、思考內容或工具呼叫",
   "compact_boundary_show_full_summary": "顯示完整摘要",
   "sidebar_session_count": [
     {
@@ -427,10 +447,18 @@
   "sidebar_filters_no_match": "無匹配",
   "sidebar_filters_no_agents": "無 agents",
   "sidebar_filters_machine": "Machine",
+  "sidebar_filters_machine_loading": "正在載入機器...",
+  "sidebar_filters_machine_update_failed": "無法更新機器篩選條件。請重試。",
   "sidebar_filters_search_machines": "搜尋 machines...",
   "sidebar_filters_no_machines": "無 machines",
   "sidebar_filters_min_prompts": "最少提示數",
   "sidebar_filters_clear_filters": "清除篩選器",
+  "sidebar_filters_labels": "標籤",
+  "sidebar_filters_label_input": "依標籤篩選",
+  "sidebar_filters_label_placeholder": "新增標籤，例如 ticket=example",
+  "sidebar_filters_pull_request": "拉取請求",
+  "sidebar_filters_pull_request_input": "依拉取請求篩選",
+  "sidebar_filters_pull_request_placeholder": "owner/repo#123",
   "sidebar_row_expand": "展開",
   "sidebar_row_collapse": "摺疊",
   "sidebar_row_select_session": "選擇對話",
@@ -461,6 +489,8 @@
   "shared_active_filters_clear_automated": "清除自動對話篩選器",
   "shared_active_filters_automated_included": "已包含自動對話",
   "shared_active_filters_remove_model": "移除 {model} model 篩選器",
+  "shared_active_filters_remove_label": "移除標籤 {label} 篩選器",
+  "shared_active_filters_clear_pull_request": "清除拉取請求篩選器",
   "shared_active_filters_clear_all": "清除所有篩選器",
   "shared_active_filters_clear_all_label": "全部清除",
   "shared_range_select_date_range": "選擇日期範圍",
@@ -517,6 +547,9 @@
   "shared_refresh_step_skills": "技能",
   "shared_refresh_step_top_sessions": "熱門會話",
   "shared_refresh_step_context_summary": "時間視窗概覽",
+  "shared_refresh_step_attribution_summary": "成本歸因",
+  "shared_refresh_step_reference_summary": "時間視窗成本歸因",
+  "shared_refresh_step_zoom": "專案分組",
   "shared_refresh_step_signals": "信號",
   "shared_refresh_step_comparison": "對比",
   "shared_refresh_step_pairwise": "成對對比",
@@ -634,7 +667,9 @@
   "analytics_total_count": "共 {countLabel} 個",
   "analytics_projects_empty": "無專案資料",
   "analytics_activity_timeline_tooltip_value": "{label}：{value} {metric}",
-  "analytics_activity_timeline_tooltip_messages": "使用者：{user} / assistant：{assistant}",
+  "analytics_activity_timeline_tooltip_messages": "使用者：{user} / 助手：{assistant} / 其他：{other}",
+  "analytics_activity_timeline_mode_absolute": "絕對值",
+  "analytics_activity_timeline_mode_percent": "百分比",
   "analytics_metric_messages": "訊息",
   "analytics_metric_sessions": "對話",
   "analytics_metric_output_tokens": "輸出 token",
@@ -761,7 +796,7 @@
   "usage_summary_total_cost": "總成本",
   "usage_summary_total_tokens": "總 Token",
   "usage_summary_copilot_ai_credits": "Copilot AI Credits",
-  "usage_summary_input_tokens": "輸入 token",
+  "usage_summary_total_input": "總輸入",
   "usage_summary_daily_burn": "每日消耗",
   "usage_summary_daily_burn_tokens": "每日消耗",
   "usage_summary_peak_day": "尖峰日期",
@@ -792,9 +827,15 @@
   "usage_tokens_attribution_title": "Token 歸因",
   "usage_attribution_treemap": "矩形樹圖",
   "usage_attribution_list": "列表",
-  "usage_click_to_hide_hint": "點擊可從圖表隱藏",
-  "usage_click_to_hide": "點擊隱藏 {label}",
-  "usage_hide_from_chart": "從圖表隱藏 {label}",
+  "usage_label_scale_title": "標籤大小比例",
+  "usage_label_scale_linear": "線性",
+  "usage_label_scale_sqrt": "平方根",
+  "usage_label_scale_log": "對數",
+  "usage_chart_style": "圖表樣式",
+  "usage_chart_style_smooth": "平滑",
+  "usage_chart_style_lines": "折線",
+  "usage_chart_style_bars": "長條",
+  "usage_chart_day_label": "{date}：{value}",
   "usage_cache_efficiency_title": "快取效率",
   "usage_cache_reads": "快取讀取",
   "usage_cache_writes": "快取寫入",
@@ -816,7 +857,7 @@
   "settings_search_empty": "沒有相符的設定",
   "settings_search_clear": "清除搜尋",
   "settings_search_result": "顯示：{category}",
-  "settings_search_keywords_appearance": "主題 對比度 版面配置 文字 字體 區塊 theme contrast layout text font blocks 縮放 zoom",
+  "settings_search_keywords_appearance": "主題 對比度 版面配置 文字 字體 區塊 theme contrast layout text font blocks 縮放 zoom 顏色 色盲 color",
   "settings_search_keywords_language": "語言 地區設定 翻譯 language locale translation",
   "settings_search_keywords_date_ranges": "日期 範圍 關聯 頁面 date range linked pages",
   "settings_search_keywords_terminal": "終端機 繼續 啟動 執行檔 參數 剪貼簿 terminal resume launch binary arguments clipboard",
@@ -1204,6 +1245,13 @@
   "activity_peak_at": "{time} 達到尖峰 {count}",
   "activity_all_sessions_overlay": "所有工作階段疊加",
   "activity_class_split": "交互 {int} / 子代理 {sub} / 自動 {auto}",
+  "activity_message_bucket_label": "{range}，{metric}：{count}。篩選此時段的對話。",
+  "activity_timeline_metric": "時間軸指標",
+  "activity_user_messages": "使用者訊息",
+  "activity_assistant_messages": "助手訊息",
+  "activity_messages_per_interval": "每 {interval} 的訊息數",
+  "activity_user_messages_help": "互動式對話中的提示詞。不含自動執行、子代理、系統項目及工具結果。",
+  "activity_assistant_messages_help": "所選對話中的助手訊息。不含系統項目及工具結果。",
   "activity_concurrency": "並發",
   "activity_overlay": "疊加",
   "activity_overlay_metric": "並發疊加指標",
@@ -1507,6 +1555,10 @@
   "session_vitals_repository_copied": "已複製儲存庫",
   "session_vitals_copy_worktree": "複製工作樹",
   "session_vitals_worktree_copied": "已複製工作樹",
+  "session_vitals_pull_requests": "拉取請求",
+  "session_vitals_open_pull_request": "在新分頁中開啟 {pr}",
+  "session_vitals_labels": "標籤",
+  "session_vitals_filter_by_label": "顯示帶有標籤 {label} 的對話",
   "session_vitals_running": "執行中",
   "session_vitals_running_duration": "執行中 {duration}+",
   "session_vitals_tool_calls": "工具使用",
@@ -1613,6 +1665,14 @@
   "insights_page_template_tool_reliability": "工具可靠度",
   "insights_page_template_model_cost": "模型與成本",
   "insights_page_template_instruction_opportunities": "指令最佳化機會",
+  "insights_page_template_friction_review": "摩擦檢討",
+  "friction_review_summary_title": "模型撰寫的摘要",
+  "friction_review_summary_notice": "由模型根據此日報的摘要與模式標題撰寫。不會修改發現項目、日報或議題。",
+  "friction_review_summary_empty": "此日報尚無摘要。",
+  "friction_review_summary_generate": "產生摘要",
+  "friction_review_summary_regenerate": "重新產生",
+  "friction_review_summary_generating": "正在產生：{phase}",
+  "friction_review_summary_unavailable": "此封存無法產生摘要。",
   "insights_page_scope_no_automated": "排除自動化",
   "insights_page_scope_both": "全部",
   "insights_page_scope_only_automated": "僅自動化",
@@ -1911,7 +1971,7 @@
   "settings_session_providers_enable_aria": "啟用 {provider} 工作階段同步",
   "settings_session_providers_enabled": "已啟用",
   "settings_session_providers_disabled": "已停用",
-  "settings_session_providers_restart_notice": "請重新啟動 AgentsView 常駐程式及任何獨立的推送監看程序，以套用這些變更。",
+  "settings_session_providers_applied_notice": "AgentsView 已套用這些變更。請重新啟動任何獨立的推送監看程序，以便在其中也套用這些變更。",
   "settings_session_providers_save_failed": "無法更新工作階段提供者。先前的選擇仍然有效。",
   "settings_session_providers_homes_title": "備用主目錄",
   "settings_session_providers_homes_hint": "新增代理主目錄，例如自訂的 {envVar}。AgentsView 會自動推導其工作階段目錄。",
@@ -1936,6 +1996,7 @@
   "appearance_chart_palette": "圖表配色",
   "appearance_chart_palette_agentsview": "Agentsview",
   "appearance_chart_palette_matplotlib": "Matplotlib",
+  "appearance_chart_palette_colorblind": "色盲友善",
   "appearance_message_layout": "訊息佈局",
   "appearance_block_visibility": "區塊可見性",
   "settings_github_token_saved": "GitHub token 已儲存。",
@@ -2084,6 +2145,7 @@
   "system_boundary_interrupted": "請求中斷",
   "system_boundary_task_notification": "任務通知",
   "system_boundary_stop_hook": "停止 Hook 回饋",
+  "system_boundary_peer_message": "來自其他工作階段的訊息",
   "system_boundary_title": "系統邊界：{subtype}",
   "system_boundary_show_content": "顯示內容",
   "trash_loading": "正在載入垃圾桶...",
@@ -2131,7 +2193,6 @@
   "usage_treemap": "樹狀圖",
   "usage_list": "列表",
   "usage_no_data_period": "此時段無資料",
-  "usage_click_to_hide_item": "點擊隱藏 {label}",
   "usage_cache_efficiency": "快取效率",
   "usage_cost_over_time": "成本隨時間變化",
   "filter_dropdown_all": "全部",
@@ -2173,7 +2234,6 @@
   "usage_pairwise_tokens_per_session": "每對話 token",
   "usage_summary_unsupported_generic": "符合條件的對話階段並未提供 token 使用量。",
   "usage_copilot_credits": "Copilot AI 點數",
-  "usage_input_tokens": "輸入 token",
   "usage_cached_suffix": "+{tokens} 已快取",
   "usage_output_tokens": "輸出 token",
   "usage_daily_burn": "每日消耗",
@@ -2203,7 +2263,6 @@
   "activity_loading_sessions": "正在載入工作階段…",
   "activity_loading_usage": "正在載入用量…",
   "activity_finalizing_report": "正在完成報告…",
-  "activity_next_sessions_page": "下一頁工作階段",
   "activity_sessions_load_failed": "無法載入活動工作階段",
   "activity_report_load_failed": "無法載入活動報告",
   "session_activity_load_failed": "無法載入活動",
@@ -2295,5 +2354,696 @@
   "go_to_session_ambiguous": "有多個對話符合此 ID 或 UUID。請透過現有連結開啟目標對話。",
   "go_to_session_capped": "符合此 ID 或 UUID 的對話太多。請透過現有連結開啟目標對話。",
   "go_to_session_failed": "無法查詢此對話。請再試一次。",
-  "shortcuts_go_to_session": "關閉查找後跳轉至對話"
+  "shortcuts_go_to_session": "關閉查找後跳轉至對話",
+  "analytics_outcome_title": "產出",
+  "analytics_outcome_repositories": "儲存庫",
+  "analytics_outcome_commits": "提交",
+  "analytics_outcome_loc_added": "新增行數",
+  "analytics_outcome_loc_removed": "刪除行數",
+  "analytics_outcome_files_changed": "變更檔案",
+  "analytics_outcome_prs_opened": "已開啟的拉取請求",
+  "analytics_outcome_prs_merged": "已合併的拉取請求",
+  "analytics_outcome_include_prs": "包含拉取請求",
+  "analytics_outcome_include_prs_hint": "會逐一向 GitHub 查詢每個儲存庫，可能需要數分鐘。",
+  "analytics_outcome_backend_unavailable": "此後端不支援成果總計。",
+  "analytics_outcome_configure_github": "請在設定中設定 GitHub，以載入提取請求總數。",
+  "analytics_outcome_loading": "正在讀取 git 歷史...",
+  "analytics_outcome_empty": "此時間範圍內沒有 git 活動。",
+  "analytics_outcome_filters_unsupported": "清除機器、模型、終止狀態、最少訊息數、近期活動和時段篩選條件，以查看成果總計。",
+  "analytics_outcome_partial": "未計入：",
+  "analytics_outcome_partial_entry": "{repo}（{op}）：{reason}",
+  "session_breadcrumb_session_health_and_tool_sequences": "工作階段健康與工具序列",
+  "tool_sequences_title": "觀察到的工具序列",
+  "tool_sequences_loading": "正在載入工具序列…",
+  "tool_sequences_error": "無法載入工具序列。",
+  "tool_sequences_unavailable": "此封存不記錄對話紀錄的版本，因此無法顯示工具序列。",
+  "tool_sequences_none_recorded": "此工作階段未記錄工具呼叫。",
+  "tool_sequences_no_sequences": "沒有工具呼叫傳回錯誤或空結果。",
+  "tool_sequences_sequence_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} 個序列",
+        "countPlural=other": "{countLabel} 個序列"
+      }
+    }
+  ],
+  "tool_sequences_ending_recovered": "已恢復",
+  "tool_sequences_ending_abandoned": "已結束",
+  "tool_sequences_ending_open": "未結束",
+  "tool_sequences_ending_unknown": "未知",
+  "tool_sequences_recovered_explanation": "後續呼叫傳回了內容。",
+  "tool_sequences_abandoned_explanation": "工作階段在錯誤或空結果後結束。",
+  "tool_sequences_open_explanation": "追蹤記錄在序列完成前結束。",
+  "tool_sequences_unknown_explanation": "軌跡未顯示此序列如何結束。",
+  "tool_sequences_outcome_errored": "錯誤",
+  "tool_sequences_outcome_empty": "空",
+  "tool_sequences_outcome_content": "有內容",
+  "tool_sequences_outcome_unknown": "未知",
+  "tool_sequences_repeat_identical": "相同輸入",
+  "tool_sequences_repeat_near_identical": "相同輸入，格式不同",
+  "tool_sequences_tool_changed": "切換了工具",
+  "tool_sequences_missing_identity": "沒有工具呼叫 ID",
+  "tool_sequences_input": "輸入",
+  "tool_sequences_no_input": "未記錄輸入。",
+  "tool_sequences_byte_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} 位元組",
+        "countPlural=other": "{countLabel} 位元組"
+      }
+    }
+  ],
+  "tool_sequences_result": "結果",
+  "tool_sequences_result_unknown": "此結果不是文字，因此結果未知。",
+  "tool_sequences_result_unavailable": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "此處無法顯示保留的 {countLabel} 位元組結果文字。",
+        "countPlural=other": "此處無法顯示保留的 {countLabel} 位元組結果文字。"
+      }
+    }
+  ],
+  "tool_sequences_result_empty": "工具未傳回任何內容。",
+  "tool_sequences_result_size_unknown": "結果大小未知。",
+  "tool_sequences_not_measured": "未測量",
+  "tool_sequences_duration": "耗時",
+  "tool_sequences_repeat_near_identical_title": "輸入相同，但 JSON 格式不同",
+  "tool_sequences_flag_identical": "重複相同輸入",
+  "tool_sequences_flag_near_identical": "格式不同的重複",
+  "tool_sequences_flag_tool_switch": "切換了工具",
+  "tool_sequences_sequence_calls": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "序列中 {countLabel} 次呼叫",
+        "countPlural=other": "序列中 {countLabel} 次呼叫"
+      }
+    }
+  ],
+  "tool_sequences_session_calls": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "工作階段中 {countLabel} 次工具呼叫",
+        "countPlural=other": "工作階段中 {countLabel} 次工具呼叫"
+      }
+    }
+  ],
+  "tool_sequences_legend": "結果顏色",
+  "tool_sequences_message": "訊息 {ordinal}",
+  "tool_sequences_messages_range": "訊息 {first}–{last}",
+  "tool_sequences_jump_label": "訊息 {ordinal}：在對話中開啟 {tool} 呼叫",
+  "tool_sequences_more_calls": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=one": "+{countLabel} 次", "countPlural=other": "+{countLabel} 次" }
+    }
+  ],
+  "tool_sequences_calls_hidden_between": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input from",
+        "input to",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "訊息 {from} 與訊息 {to} 之間還有 {countLabel} 次呼叫未顯示。",
+        "countPlural=other": "訊息 {from} 與訊息 {to} 之間還有 {countLabel} 次呼叫未顯示。"
+      }
+    }
+  ],
+  "tool_sequences_calls_in_row": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "連續 {countLabel} 次呼叫。",
+        "countPlural=other": "連續 {countLabel} 次呼叫。"
+      }
+    }
+  ],
+  "tool_sequences_showing_sequences": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input shownLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "顯示 {countLabel} 個序列中的 {shownLabel} 個。其餘序列在工作階段後面。",
+        "countPlural=other": "顯示 {countLabel} 個序列中的 {shownLabel} 個。其餘序列在工作階段後面。"
+      }
+    }
+  ],
+  "tool_sequences_calls_not_shown": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "此檢視未顯示序列中的 {countLabel} 次呼叫。",
+        "countPlural=other": "此檢視未顯示序列中的 {countLabel} 次呼叫。"
+      }
+    }
+  ],
+  "tool_sequences_preview_shows": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input shownLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "預覽顯示 {countLabel} 位元組中的 {shownLabel} 位元組。",
+        "countPlural=other": "預覽顯示 {countLabel} 位元組中的 {shownLabel} 位元組。"
+      }
+    }
+  ],
+  "tool_sequences_full_input_in_message": "完整輸入在訊息 {ordinal} 中。",
+  "tool_sequences_full_result_in_message": "完整結果在訊息 {ordinal} 中。",
+  "tool_sequences_retry": "重試",
+  "import_claude_connect": "登入",
+  "import_claude_sync_running": "Chrome 同步已在進行中。",
+  "import_claude_sync": "同步",
+  "import_claude_chrome_title": "Chrome",
+  "import_claude_desktop_title": "帳戶",
+  "import_claude_status_disconnected": "未連線",
+  "import_claude_status_connected": "已連線",
+  "import_claude_status_signed_out": "未登入",
+  "import_claude_status_update": "需要更新",
+  "import_claude_stop": "停止",
+  "import_claude_terminal": "終端機",
+  "import_claude_copy_command": "複製指令",
+  "import_claude_setup_load": "接著重新啟動 AgentsView，開啟 {url}，啟用開發人員模式，選擇載入未封裝項目，再選取指令顯示的資料夾。",
+  "import_claude_open_chrome": "開啟 Chrome 並啟用 AgentsView 擴充功能。如果你在啟動 AgentsView 之後執行了設定，請重新啟動 AgentsView。",
+  "import_claude_tab_note": "如果沒有開啟 claude.ai 分頁，同步會在背景開啟一個。同步後，該分頁會保持開啟。",
+  "import_claude_signed_out": "請在安裝了 AgentsView 擴充功能的 Chrome 設定檔中登入 claude.ai。請僅在一個 Chrome 設定檔中啟用擴充功能。同步會使用最先連線的設定檔。",
+  "import_claude_reload_extension": "接著在 {url} 中重新載入擴充功能。",
+  "import_claude_update_app": "如果你升級了 AgentsView，請重新啟動它。",
+  "import_claude_syncing": "同步中...",
+  "import_claude_sync_background": "關閉此對話框後，同步仍會繼續。",
+  "import_claude_sync_failed": "同步失敗",
+  "import_claude_sign_in_failed": "登入失敗",
+  "import_claude_desktop_note": "登入使用電子郵件驗證碼。Google 帳戶請在 Chrome 中透過網頁介面同步。",
+  "usage_click_project": "點擊聚焦 {label}，雙擊開啟其群組和工作階段",
+  "usage_click_project_hint": "選取專案以篩選頁面，開啟專案可查看其分組與會話。",
+  "usage_click_to_focus": "點擊聚焦 {label}",
+  "usage_click_to_focus_hint": "點擊聚焦，再次點擊清除",
+  "session_breadcrumb_tool_effectiveness": "分析工具成效",
+  "insights_page_tool_effectiveness": "工具成效",
+  "tool_effectiveness_model_assessment": "模型評估",
+  "tool_effectiveness_no_omissions": "模型輸入沒有省略任何內容。",
+  "tool_effectiveness_assessment_helped": "有幫助",
+  "tool_effectiveness_assessment_did_not_help": "沒有幫助",
+  "tool_effectiveness_assessment_unknown": "不明確",
+  "tool_effectiveness_omission_budget_input": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input keptLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} 個呼叫輸入截斷為最多 {keptLabel} 位元組",
+        "countPlural=other": "{countLabel} 個呼叫輸入截斷為最多 {keptLabel} 位元組"
+      }
+    }
+  ],
+  "tool_effectiveness_omission_budget_result": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input keptLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} 個呼叫結果截斷為最多 {keptLabel} 位元組",
+        "countPlural=other": "{countLabel} 個呼叫結果截斷為最多 {keptLabel} 位元組"
+      }
+    }
+  ],
+  "tool_effectiveness_omission_unretained": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} 個呼叫結果未保留",
+        "countPlural=other": "{countLabel} 個呼叫結果未保留"
+      }
+    }
+  ],
+  "tool_effectiveness_omission_no_result": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} 個呼叫沒有記錄到結果",
+        "countPlural=other": "{countLabel} 個呼叫沒有記錄到結果"
+      }
+    }
+  ],
+  "tool_effectiveness_omission_previews": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input charsLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} 則訊息以 {charsLabel} 字元預覽顯示",
+        "countPlural=other": "{countLabel} 則訊息以 {charsLabel} 字元預覽顯示"
+      }
+    }
+  ],
+  "tool_effectiveness_details_unavailable": "報告詳細資料無法使用，因此顯示已儲存的文字。",
+  "tool_effectiveness_session_changed": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input currentLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "此報告產生後工作階段已變更：模型評估了 {countLabel} 次呼叫，工作階段現在有 {currentLabel} 次。",
+        "countPlural=other": "此報告產生後工作階段已變更：模型評估了 {countLabel} 次呼叫，工作階段現在有 {currentLabel} 次。"
+      }
+    }
+  ],
+  "tool_effectiveness_session_revised": "此報告產生後工作階段已變更，因此下方事實可能與模型評估的內容不同。",
+  "tool_sequences_message_call": "訊息 {ordinal}，呼叫 {callNumber}",
+  "tool_sequences_jump_call_label": "訊息 {ordinal}，呼叫 {callNumber}：在對話中開啟 {tool} 呼叫",
+  "tool_effectiveness_calls_judged": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "已評估 {countLabel} 次呼叫",
+        "countPlural=other": "已評估 {countLabel} 次呼叫"
+      }
+    }
+  ],
+  "tool_effectiveness_conclusion_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} 條結論",
+        "countPlural=other": "{countLabel} 條結論"
+      }
+    }
+  ],
+  "tool_effectiveness_count_helped": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "有幫助 {countLabel}",
+        "countPlural=other": "有幫助 {countLabel}"
+      }
+    }
+  ],
+  "tool_effectiveness_count_did_not_help": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "無幫助 {countLabel}",
+        "countPlural=other": "無幫助 {countLabel}"
+      }
+    }
+  ],
+  "tool_effectiveness_count_unknown": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "不明確 {countLabel}",
+        "countPlural=other": "不明確 {countLabel}"
+      }
+    }
+  ],
+  "tool_effectiveness_calls_cited": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input citedLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "引用了 {countLabel} 次呼叫中的 {citedLabel} 次",
+        "countPlural=other": "引用了 {countLabel} 次呼叫中的 {citedLabel} 次"
+      }
+    }
+  ],
+  "tool_effectiveness_select_citation": "選擇引用以檢視呼叫",
+  "tool_effectiveness_citation_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} 條引用",
+        "countPlural=other": "{countLabel} 條引用"
+      }
+    }
+  ],
+  "tool_effectiveness_message_label": "訊息",
+  "tool_effectiveness_message_no_call": "訊息文字，無工具呼叫",
+  "tool_effectiveness_left_out": "未包含在模型輸入中",
+  "tool_effectiveness_model_saw": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "模型看到 {countLabel} 位元組",
+        "countPlural=other": "模型看到 {countLabel} 位元組"
+      }
+    }
+  ],
+  "tool_effectiveness_open_session": "開啟工作階段",
+  "tool_effectiveness_message_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} 則訊息",
+        "countPlural=other": "{countLabel} 則訊息"
+      }
+    }
+  ],
+  "analytics_tool_empty_rate": "空結果率",
+  "analytics_tool_repeat_rate": "重複率",
+  "analytics_tool_recovery_rate": "恢復率",
+  "analytics_tool_name": "工具",
+  "analytics_tool_coverage": "已分析",
+  "analytics_tool_sessions": "工作階段",
+  "analytics_tool_share": "占比",
+  "analytics_tool_unavailable": "無法使用",
+  "analytics_tool_show_all": "顯示所有工具",
+  "analytics_tool_show_less": "收起工具",
+  "analytics_tool_more_sessions": "更多工作階段",
+  "analytics_tool_empty_explanation": "已知結果中空結果為 {count}/{total}。",
+  "analytics_tool_repeat_explanation": "已分析呼叫中相同或近似的後續呼叫為 {count}/{total}。",
+  "analytics_tool_recovery_explanation": "已恢復序列為 {count}/{total}。未結束：{open}。未知：{unknown}。",
+  "analytics_tool_coverage_explanation": "已分析呼叫 / 所有呼叫。等待重新計算及尚未計算的舊工作階段缺少涵蓋。",
+  "analytics_tool_recovery_note": "恢復表示後續呼叫傳回了內容。恢復率歸屬於開始該序列的工具。",
+  "analytics_tool_evidence_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countLabel} 個對話"
+      }
+    }
+  ],
+  "analytics_tool_history_note": "比率不包含仍在重新計算或未儲存工具結果的工作階段中的呼叫。",
+  "analytics_tool_rate_button_label": "{tool} {rate}：{value}",
+  "analytics_tool_latest_matching_call": "最近符合的呼叫：{date}",
+  "analytics_tool_matching_calls": "符合的呼叫：{count}",
+  "usage_all_projects": "所有專案",
+  "usage_clear_selection": "清除選擇",
+  "usage_open_project": "開啟",
+  "usage_loading": "正在載入...",
+  "plan_usage_title": "方案用量",
+  "plan_usage_trigger_weekly": "方案用量：每週 {percent}%",
+  "plan_usage_as_of": "方案用量（截至 {time}）",
+  "plan_usage_not_checked": "方案用量：尚未檢查",
+  "plan_usage_still_updating": "方案用量：仍在更新（截至 {time}）",
+  "plan_usage_not_reported_yet": "方案用量：尚未回報（截至 {time}）",
+  "plan_usage_partial": "部分方案用量（截至 {time}）",
+  "plan_usage_not_reported": "OpenAI 未回報",
+  "plan_usage_too_many_subagents": "子代理聊天過多，OpenAI 用量報告無法納入",
+  "plan_usage_could_not_check": "AgentsView 無法檢查方案用量",
+  "plan_usage_account_unavailable": "此帳戶無法取得用量",
+  "plan_usage_counted_under": "計入聊天 {title}",
+  "plan_usage_stale": "此後：{reason}（{time}）。這些數字可能已過時。",
+  "plan_usage_left_out_later": "OpenAI 用量報告未納入此聊天",
+  "plan_usage_weekly_share": "Codex 每週上限的 {percent}%",
+  "plan_usage_five_hour_share": "Codex 五小時上限的 {percent}%",
+  "plan_usage_credits": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countLabel} 點數"
+      }
+    }
+  ],
+  "plan_usage_credits_note": "點數依 OpenAI 用量報告提供的數值顯示。",
+  "plan_usage_col_split": "模型、推理強度、速度",
+  "plan_usage_col_weekly": "每週",
+  "plan_usage_col_five_hour": "5 小時",
+  "plan_usage_col_credits": "點數",
+  "capture_tokens_live": "即時擷取 token（截至 {time}）",
+  "capture_turns_not_captured": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countLabel} 輪未擷取"
+      }
+    }
+  ],
+  "capture_turns_not_captured_covered": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input time",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countLabel} 輪未擷取；{time} 之前的輪次已計入方案用量"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_waiting": "Codex Cloud：等待首次同步",
+  "status_bar_codex_cloud_importing_found": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "Codex Cloud：匯入中，目前已找到 {countLabel} 個聊天"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_importing_progress": "Codex Cloud：正在匯入 {imported}/{total} 個聊天",
+  "status_bar_codex_cloud_up_to_date": "Codex Cloud：截至 {time} 已是最新",
+  "status_bar_codex_cloud_retrying": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "Codex Cloud：{countLabel} 個聊天無法匯入"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_error": "Codex Cloud：錯誤",
+  "status_bar_codex_cloud_off": "Codex Cloud：已關閉",
+  "status_bar_codex_cloud_config_error": "Codex Cloud：設定錯誤",
+  "status_bar_codex_cloud_live_attention": "Codex Cloud：即時權杖需要處理",
+  "status_bar_codex_cloud_oldest_failure": "最早的失敗：{time}",
+  "status_bar_codex_cloud_last_success": "上次成功同步：{time}",
+  "status_bar_codex_cloud_homes": "Codex 主目錄：{homes}",
+  "appearance_message_colors": "訊息顏色",
+  "appearance_message_colors_description": "為每種訊息類型設定獨立的顏色。色盲友善預設使用在常見色覺缺陷下仍可區分的色調，並加入線條樣式，讓類型在形狀與顏色上都有區別。",
+  "appearance_message_colors_preset": "訊息顏色預設",
+  "appearance_message_colors_preset_default": "主題預設",
+  "appearance_message_colors_preset_colorblind": "色盲友善",
+  "appearance_message_colors_preset_custom": "自訂",
+  "appearance_message_colors_patterns": "除了顏色，也用線條樣式標示訊息類型",
+  "appearance_message_colors_reset_all": "恢復預設",
+  "appearance_message_colors_reset_role": "重設",
+  "appearance_message_colors_reset_role_label": "重設{role}的顏色",
+  "appearance_message_colors_role_label": "{role}的顏色",
+  "appearance_message_colors_picker": "開啟取色器",
+  "appearance_message_colors_hex": "十六進位顏色",
+  "appearance_message_colors_warning_text": "在{modes}下文字可能難以閱讀（{ratio}:1，需要 {required}:1）。",
+  "appearance_message_colors_warning_marker": "在{modes}下顏色標記可能難以看清（{ratio}:1，需要 {required}:1）。",
+  "appearance_message_colors_mode_light": "淺色模式",
+  "appearance_message_colors_mode_dark": "深色模式",
+  "appearance_message_colors_mode_high_contrast_light": "高對比淺色模式",
+  "appearance_message_colors_mode_high_contrast_dark": "高對比深色模式",
+  "appearance_message_colors_swatch_blue": "藍色",
+  "appearance_message_colors_swatch_vermillion": "朱紅色",
+  "appearance_message_colors_swatch_bluish_green": "藍綠色",
+  "appearance_message_colors_swatch_reddish_purple": "紫紅色",
+  "appearance_message_colors_swatch_dark_yellow": "暗黃色",
+  "appearance_message_colors_swatch_gray": "灰色",
+  "appearance_message_colors_preview": "預覽",
+  "appearance_message_colors_preview_user": "日期測試為什麼會失敗？",
+  "appearance_message_colors_preview_assistant": "測試夾具要求 UTC，我已更新。",
+  "nav_friction": "摩擦日誌",
+  "friction_page_help_docs": "摩擦日誌的運作方式",
+  "friction_page_refresh": "重新整理摩擦日誌",
+  "friction_date_label": "摘要日期",
+  "friction_date_previous": "上一份摘要",
+  "friction_date_next": "下一份摘要",
+  "friction_date_no_match": "沒有相符的日期",
+  "friction_build_now": "立即產生",
+  "friction_build_title": "為每個尚無摘要的完整日期產生摘要",
+  "friction_build_done": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "已產生 {countNumber} 份摘要" }
+    }
+  ],
+  "friction_build_nothing": "每個完整日期都已有摘要。",
+  "friction_build_failed": "產生失敗：{error}",
+  "friction_empty_title": "尚無摩擦摘要",
+  "friction_empty_hint": "每個本地日期結束後會自動產生摘要，每小時執行的工作會補上遺漏的日期。使用「立即產生」可馬上產生缺少的日期。",
+  "friction_empty_hint_remote": "每個本地日期結束後會自動產生摘要，每小時執行的工作會補上遺漏的日期。若要馬上產生缺少的日期，請在執行 AgentsView 的電腦上開啟此頁面，或在伺服器上啟用 require_auth。",
+  "friction_load_error": "無法載入摩擦日誌",
+  "friction_retry": "重試",
+  "friction_digest_heading": "摩擦日誌 — {date}",
+  "friction_digest_built": "產生於 {when}（{timezone}）",
+  "friction_p0_failed": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "在 {countNumber} 個工作階段中失敗"
+      }
+    }
+  ],
+  "friction_clean_title": "未發現摩擦",
+  "friction_clean_hint": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "掃描的 {countNumber} 個工作階段中沒有標記任何問題。"
+      }
+    }
+  ],
+  "friction_clean_no_sessions": "這一天沒有活躍的工作階段。",
+  "friction_deferral_said": "推遲了工作：「{phrase}」",
+  "friction_pattern_retry_loop": "重試迴圈",
+  "friction_pattern_runaway_loop": "失控的工具迴圈",
+  "friction_pattern_edit_churn": "反覆編輯",
+  "friction_pattern_mid_task_compaction": "任務中途壓縮上下文",
+  "friction_pattern_context_pressure": "上下文壓力",
+  "friction_pattern_iteration_runaway": "長時間執行且無使用者輸入",
+  "friction_digest_missing": "{date} 沒有摘要。",
+  "friction_scanned": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "已掃描 {countNumber} 個對話" }
+    }
+  ],
+  "friction_headline_title": "需要關注",
+  "friction_p0_title": "在多個工作階段中失敗的工具",
+  "friction_patterns_new": "新模式",
+  "friction_patterns_recurring": "反覆出現的模式",
+  "friction_pattern_occurrences": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "出現 {countNumber} 次" }
+    }
+  ],
+  "friction_pattern_sessions": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "{countNumber} 個對話" }
+    }
+  ],
+  "friction_pattern_first_seen": "首次出現於 {date}",
+  "friction_section_corrections": "糾正",
+  "friction_section_errors": "錯誤",
+  "friction_section_workarounds": "暫時解法",
+  "friction_section_deferrals": "延後事項",
+  "friction_section_patterns": "模式",
+  "friction_section_frustration": "挫折",
+  "friction_section_interruptions": "中斷",
+  "friction_interruption_count": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "中斷 {countNumber} 次" }
+    }
+  ],
+  "friction_kind_correction": "糾正",
+  "friction_kind_error": "錯誤",
+  "friction_kind_workaround": "暫時解法",
+  "friction_kind_deferral": "延後事項",
+  "friction_kind_pattern": "模式",
+  "friction_kind_frustration": "挫折",
+  "friction_kind_interruption": "中斷",
+  "friction_disabled_title": "此伺服器已關閉摩擦日誌",
+  "friction_disabled_hint": "此伺服器不產生摘要。請在 config.toml 中設定 [friction] enabled = true 並重新啟動常駐程式。唯讀封存無法產生摘要。",
+  "friction_markdown_title": "Markdown",
+  "friction_markdown_show": "顯示 Markdown",
+  "friction_markdown_copy": "複製 Markdown",
+  "friction_markdown_copied": "已複製 Markdown",
+  "friction_markdown_download": "下載 Markdown",
+  "friction_markdown_loading": "正在載入 Markdown…",
+  "friction_markdown_error": "無法載入 Markdown 摘要。",
+  "friction_open_session": "在第 {ordinal} 則訊息開啟 {session}",
+  "friction_open_session_start": "開啟 {session}",
+  "friction_quality_card_title": "摩擦日誌",
+  "friction_quality_card_body": "在你的對話中發現的糾正、工具錯誤、暫時解法、延後事項和反覆出現模式的每日摘要。",
+  "friction_quality_card_open": "開啟摩擦日誌",
+  "friction_session_title": "摩擦發現",
+  "friction_session_loading": "正在載入摩擦發現…",
+  "friction_session_error": "摩擦發現無法使用。",
+  "friction_session_empty": "此對話中沒有摩擦發現。",
+  "friction_session_jump": "訊息 {ordinal}",
+  "friction_session_jump_title": "跳至訊息 {ordinal}"
 }

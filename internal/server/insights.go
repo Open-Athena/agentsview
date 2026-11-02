@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -16,12 +17,6 @@ import (
 	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/timeutil"
 )
-
-var validInsightTypes = map[string]bool{
-	"daily_activity":   true,
-	"agent_analysis":   true,
-	insight.CannedType: true,
-}
 
 type generateInsightRequest struct {
 	Type           string                     `json:"type"`
@@ -44,7 +39,7 @@ type generateInsightRequest struct {
 
 type cannedSessionFiltersInput struct {
 	Timezone        string `json:"timezone,omitempty"`
-	Machine         string `json:"machine,omitempty"`
+	Machine         string `json:"machine,omitempty" doc:"Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Unknown or ambiguous values return HTTP 400 before streaming."`
 	Agent           string `json:"agent,omitempty"`
 	Termination     string `json:"termination,omitempty"`
 	MinUserMessages int    `json:"min_user_messages,omitempty"`
@@ -178,8 +173,13 @@ func (s *Server) humaGenerateCannedInsight(
 		return nil, apiError(http.StatusBadRequest,
 			"date_to must be >= date_from")
 	}
+	if kind == insight.CannedFrictionReview {
+		if err := s.validateFrictionReviewRequest(ctx, req); err != nil {
+			return nil, err
+		}
+	}
 	if req.Agent == "" {
-		req.Agent = "claude"
+		req.Agent = s.insightDefaultAgent()
 	}
 	if !insight.ValidAgents[req.Agent] {
 		return nil, apiError(http.StatusBadRequest,
@@ -226,14 +226,20 @@ func (s *Server) generateCannedInsight(
 		return
 	}
 	generationOptions := s.currentInsightGenerateOptions(ctx)
-	payload, aggregateHash, cacheKey, err := s.buildCannedPayload(
+	build := s.buildCannedPayload
+	if kind == insight.CannedFrictionReview {
+		build = s.buildFrictionReviewPayload
+	}
+	payload, aggregateHash, cacheKey, err := build(
 		ctx, kind, req, filters, generationOptions,
 	)
 	if err != nil {
 		log.Printf("canned insight payload error: %v", err)
-		sendJSON("error", map[string]string{
-			"message": "failed to build canned insight payload",
-		})
+		message := "failed to build canned insight payload"
+		if errors.Is(err, errFrictionDigestNotFound) {
+			message = errFrictionDigestNotFound.Error()
+		}
+		sendJSON("error", map[string]string{"message": message})
 		return
 	}
 
@@ -355,7 +361,7 @@ func (s *Server) generateCannedInsight(
 	}
 
 	var id int64
-	err = s.serializeArchiveWrite(ctx, func() error {
+	err = s.SerializeArchiveWrite(ctx, func() error {
 		var insertErr error
 		id, insertErr = s.db.InsertInsight(ctx, db.Insight{
 			Type:            insight.CannedType,
@@ -381,7 +387,7 @@ func (s *Server) generateCannedInsight(
 	if err != nil {
 		log.Printf("canned insight insert error: %v", err)
 		sendJSON("error", map[string]string{
-			"message": insightSaveErrorMessage(err),
+			"message": s.insightSaveErrorMessage(err),
 		})
 		return
 	}

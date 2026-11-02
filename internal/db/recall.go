@@ -236,6 +236,11 @@ func (db *DB) CopyRecallEntriesFrom(sourcePath string) error {
 		_, _ = conn.ExecContext(ctx, "DETACH DATABASE old_db")
 	}()
 
+	if _, err := prepareCodexSessionIDMap(ctx, conn, false); err != nil {
+		return err
+	}
+	defer func() { _, _ = conn.ExecContext(ctx, dropCodexSessionIDMapSQL) }()
+
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin recall copy: %w", err)
@@ -273,12 +278,13 @@ func (db *DB) CopyRecallEntriesFrom(sourcePath string) error {
 		SELECT
 			id, type, scope, status, review_state, title, body, trigger,
 			confidence, uncertainty, project, cwd, git_branch, agent,
-			source_session_id, source_episode_id, source_run_id,
+			COALESCE(mapped.target_id, source_session_id), source_episode_id, source_run_id,
 			extractor_method, model, transferable, provenance_ok,
 			supersedes_entry_id, superseded_by_entry_id,
 			created_at, updated_at
 		FROM old_db.recall_entries
-		WHERE source_session_id IN (SELECT id FROM main.sessions)`)
+		LEFT JOIN _codex_page_metadata mapped ON mapped.source_id = source_session_id
+		WHERE COALESCE(mapped.target_id, source_session_id) IN (SELECT id FROM main.sessions)`)
 	if err != nil {
 		return fmt.Errorf("copying entries: %w", err)
 	}
@@ -301,12 +307,13 @@ func (db *DB) CopyRecallEntriesFrom(sourcePath string) error {
 			message_end_source_uuid, content_digest, tool_use_id, snippet
 		)
 		SELECT
-			entry_id, session_id, message_start_ordinal,
+			entry_id, COALESCE(mapped.target_id, session_id), message_start_ordinal,
 			message_end_ordinal, message_start_source_uuid,
 			message_end_source_uuid, content_digest, tool_use_id, snippet
 		FROM old_db.recall_evidence
+		LEFT JOIN _codex_page_metadata mapped ON mapped.source_id = session_id
 		WHERE entry_id IN (SELECT id FROM main.recall_entries)
-		  AND session_id IN (SELECT id FROM main.sessions)`); err != nil {
+		  AND COALESCE(mapped.target_id, session_id) IN (SELECT id FROM main.sessions)`); err != nil {
 		return fmt.Errorf("copying recall evidence: %w", err)
 	}
 	if err := revokeRecallEntriesWithDroppedEvidenceTx(
@@ -1097,7 +1104,7 @@ func (db *DB) queryRecallEntriesVector(
 	searcher := db.getRecallVectorSearcher()
 	if searcher == nil {
 		return RecallPage{}, NewSemanticUnavailableError(
-			"recall index is not available; run 'agentsview embeddings build --store recall'",
+			"recall index is not available; run 'agentsview index embeddings build --store recall'",
 		)
 	}
 	limit := recallLimit(q.Limit)
@@ -1191,14 +1198,16 @@ func (db *DB) queryRecallEntriesHybrid(
 ) (RecallPage, error) {
 	limit := recallLimit(q.Limit)
 	candidateQuery := q
-	candidateQuery.Mode = RecallQueryModeLexical
 	candidateQuery.Limit = MaxRecallEntryLimit
-	lexical, err := db.queryRecallEntriesLexical(ctx, candidateQuery)
+	// The vector leg waits on query encoding, so the lexical leg reads after
+	// it and sees entries written meanwhile.
+	candidateQuery.Mode = RecallQueryModeVector
+	vector, err := db.queryRecallEntriesVector(ctx, candidateQuery)
 	if err != nil {
 		return RecallPage{}, err
 	}
-	candidateQuery.Mode = RecallQueryModeVector
-	vector, err := db.queryRecallEntriesVector(ctx, candidateQuery)
+	candidateQuery.Mode = RecallQueryModeLexical
+	lexical, err := db.queryRecallEntriesLexical(ctx, candidateQuery)
 	if err != nil {
 		return RecallPage{}, err
 	}
@@ -1206,7 +1215,7 @@ func (db *DB) queryRecallEntriesHybrid(
 		recallResultRankedUnits(lexical.RecallEntries),
 		recallResultRankedUnits(vector.RecallEntries),
 	}
-	merged := RRFMerge(legs, limit)
+	merged := RRFMerge(legs, 0)
 	byID := make(map[string]RecallResult,
 		len(lexical.RecallEntries)+len(vector.RecallEntries))
 	for _, result := range lexical.RecallEntries {
@@ -1222,11 +1231,34 @@ func (db *DB) queryRecallEntriesHybrid(
 		}
 		byID[result.ID] = result
 	}
-	page := RecallPage{RecallEntries: make([]RecallResult, 0, len(merged))}
-	for _, fused := range merged {
-		result := byID[fused.Unit.Key]
-		result.Score = fused.Score
-		page.RecallEntries = append(page.RecallEntries, result)
+	// The two legs read entries at different moments. Only this reread drops
+	// an entry that left the query's filters in between; the leg order can't.
+	page := RecallPage{RecallEntries: make([]RecallResult, 0, min(limit, len(merged)))}
+	for len(merged) > 0 && len(page.RecallEntries) < limit {
+		batch := merged[:min(limit-len(page.RecallEntries), len(merged))]
+		merged = merged[len(batch):]
+		ids := make([]string, 0, len(batch))
+		for _, fused := range batch {
+			ids = append(ids, fused.Unit.Key)
+		}
+		current, err := db.listRecallEntriesByIDs(ctx, candidateQuery, ids)
+		if err != nil {
+			return RecallPage{}, err
+		}
+		visible := make(map[string]RecallEntry, len(current))
+		for _, entry := range current {
+			visible[entry.ID] = entry
+		}
+		for _, fused := range batch {
+			entry, ok := visible[fused.Unit.Key]
+			if !ok {
+				continue
+			}
+			result := byID[fused.Unit.Key]
+			result.RecallEntry = entry
+			result.Score = fused.Score
+			page.RecallEntries = append(page.RecallEntries, result)
+		}
 	}
 	return page, nil
 }
@@ -1248,7 +1280,7 @@ func (db *DB) listRecallEntriesByIDs(
 	var entries []RecallEntry
 	err := queryChunked(ids, func(chunk []string) error {
 		where, filterArgs := buildRecallEntryWhere(q, false)
-		placeholders, idArgs := inPlaceholders(chunk)
+		placeholders, idArgs := InPlaceholders(chunk)
 		args := slices.Concat(idArgs, filterArgs)
 		rows, err := db.getReader().QueryContext(ctx,
 			"SELECT "+recallBaseCols+" FROM recall_entries WHERE id IN "+

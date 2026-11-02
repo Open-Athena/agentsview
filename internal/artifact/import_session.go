@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/ingest"
 )
 
 type importClosureOutcome uint8
@@ -329,11 +330,14 @@ func rewriteManifestForImport(
 			}
 		}
 	}
+	signals := signalsFromImportedSession(session)
+	signals.ToolObservations = ingest.ComputeToolObservations(session, ingest.ExtractToolCallRows(messages))
 	return db.SessionBatchWrite{
 		Session:         session,
 		Messages:        messages,
 		UsageEvents:     importedUsageEvents(m.UsageEvents, importedID),
-		Signals:         signalsFromImportedSession(session),
+		PlanUsage:       importedPlanUsage(m),
+		Signals:         signals,
 		DataVersion:     m.DataVersion,
 		ReplaceMessages: true,
 	}

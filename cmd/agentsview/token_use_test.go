@@ -129,6 +129,34 @@ func TestResolveSessionID_NotInDB_FoundOnDisk(t *testing.T) {
 	assert.True(t, known, "disk probe found match")
 }
 
+func TestResolveSessionID_ArchiveOnlyUsesDatabase(t *testing.T) {
+	d := newTestDB(t)
+	root := t.TempDir()
+	const bare = "33333333-3333-3333-3333-333333333333"
+	chats := filepath.Join(root, "tmp", "project", "chats")
+	require.NoError(t, os.MkdirAll(chats, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(chats, "session-33333333.json"),
+		[]byte(`{"sessionId":"`+bare+`"}`), 0o600))
+	dirs := map[parser.AgentType][]string{parser.AgentGemini: {root}}
+
+	// The real provider can locate the receiving host's source before the
+	// archive-only boundary applies, including its in-file session ID check.
+	got, known := resolveRawSessionID(t.Context(), d, dirs, bare)
+	require.True(t, known)
+	require.Equal(t, "gemini:"+bare, got)
+	require.NoError(t, d.EnableArchiveOnly(t.Context()))
+	for _, input := range []string{bare, "gemini:" + bare} {
+		got, known = resolveRawSessionID(t.Context(), d, dirs, input)
+		assert.Equal(t, input, got)
+		assert.False(t, known, "local files must not resolve %s", input)
+	}
+
+	upsertSession(t, d, "gemini:"+bare, "gemini", "2026-04-17T10:00:00Z")
+	got, known = resolveRawSessionID(t.Context(), d, dirs, bare)
+	assert.Equal(t, "gemini:"+bare, got)
+	assert.True(t, known, "stored sessions still resolve")
+}
+
 func TestResolveSessionID_NotFoundAnywhere_PassThrough(t *testing.T) {
 	d := newTestDB(t)
 	ctx := t.Context()
@@ -439,22 +467,24 @@ func TestAgentHasDiskSourceLookupIncludesProviderAuthoritativeAgents(t *testing.
 	}
 }
 
-func TestUsageExitCode_TokenData(t *testing.T) {
-	u := &db.SessionUsage{HasTokenData: true}
-	assert.Equal(t, tokenUseExitOK, usageExitCode(u))
-}
-
-func TestUsageExitCode_CostOnly(t *testing.T) {
-	u := &db.SessionUsage{HasTokenData: false, HasCost: true}
-	assert.Equal(t, tokenUseExitOK, usageExitCode(u),
-		"cost-only must not be exit 3")
-}
-
-func TestUsageExitCode_NoData(t *testing.T) {
-	u := &db.SessionUsage{}
-	assert.Equal(t, tokenUseExitNoTokenData, usageExitCode(u))
-}
-
-func TestUsageExitCode_NotFound(t *testing.T) {
-	assert.Equal(t, tokenUseExitNotFound, usageExitCode(nil))
+func TestUsageExitCode(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		out  *sessionUsageOutput
+		want int
+	}{
+		{"token data", &sessionUsageOutput{HasTokenData: true}, tokenUseExitOK},
+		{"cost only", &sessionUsageOutput{HasCost: true}, tokenUseExitOK},
+		{"nothing", &sessionUsageOutput{}, tokenUseExitNoTokenData},
+		{
+			"plan usage without figures",
+			&sessionUsageOutput{Plan: &db.PlanUsageView{OutcomeKind: "left_out"}},
+			tokenUseExitNoTokenData,
+		},
+		{"not found", nil, tokenUseExitNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, usageExitCode(tc.out))
+		})
+	}
 }

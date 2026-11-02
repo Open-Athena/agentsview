@@ -65,7 +65,7 @@ func (db *DB) assembleDailyUsageFacts(
 	accum := make(map[usageCostAllocationKey]*usageDailyFactsBucket)
 	sessionCosts := make(map[string]usageDailyFactsSessionCost)
 	projectLabels := make(map[string]struct{})
-	useAuthoritative := filter.Model == "" && filter.ExcludeModel == ""
+	useAuthoritative := !filter.HasModelFilter()
 	var totalSavings money.Money
 
 	for _, group := range facts.Groups {
@@ -154,7 +154,7 @@ func (db *DB) assembleDailyUsageFacts(
 	if !filter.SkipSessionCounts {
 		sessionCounts = NewUsageSessionCounts(facts.MatchingSessions)
 	}
-	projects, err := db.BuildProjectIdentityMap(ctx, sortedSetKeys(projectLabels))
+	projects, err := db.BuildProjectIdentityMap(ctx, SortedKeys(projectLabels))
 	if err != nil {
 		return DailyUsageResult{}, err
 	}

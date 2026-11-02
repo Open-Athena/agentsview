@@ -1,4 +1,6 @@
-const SERVER_URL_KEY = "agentsview-server-url";
+export const SERVER_URL_KEY = "agentsview-server-url";
+/** Dispatched on window when this tab changes the selected server. */
+export const SERVER_URL_CHANGE_EVENT = "agentsview:server-url-change";
 const AUTH_TOKEN_KEY = "agentsview-auth-token";
 
 export function getGeneratedBase(): string {
@@ -16,20 +18,23 @@ export function getServerUrl(): string {
 }
 
 export function setServerUrl(url: string): void {
+  const previous = getServerUrl();
   if (url) {
     localStorage.setItem(SERVER_URL_KEY, url);
   } else {
     localStorage.removeItem(SERVER_URL_KEY);
   }
+  if (url !== previous) {
+    window.dispatchEvent(new Event(SERVER_URL_CHANGE_EVENT));
+  }
 }
 
-function authTokenKey(): string {
-  const server = getServerUrl();
+function authTokenKey(server = getServerUrl()): string {
   return server ? `${AUTH_TOKEN_KEY}::${server}` : AUTH_TOKEN_KEY;
 }
 
-export function getAuthToken(): string {
-  return localStorage.getItem(authTokenKey()) ?? "";
+export function getAuthToken(server = getServerUrl()): string {
+  return localStorage.getItem(authTokenKey(server)) ?? "";
 }
 
 export function setAuthToken(token: string): void {

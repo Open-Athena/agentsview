@@ -19,6 +19,7 @@ import (
 // ReportingExportOptions selects one UTC calendar date and fixes the current
 // time used to decide which hours have closed.
 type ReportingExportOptions struct {
+	ByMachine     bool
 	Date          time.Time
 	Now           time.Time
 	SchemaVersion int
@@ -34,6 +35,7 @@ type ReportingExportOptions struct {
 // ReportingDigestExportOptions selects an inclusive UTC date range and fixes
 // the current time used to decide which hours have closed.
 type ReportingDigestExportOptions struct {
+	ByMachine     bool
 	From          time.Time
 	To            time.Time
 	Now           time.Time
@@ -104,6 +106,11 @@ func (db *DB) ExportReportingDay(
 	}
 	if opts.afterSourceLoad != nil {
 		opts.afterSourceLoad(source.observerStats())
+	}
+	if opts.ByMachine {
+		if err := loadReportingMachineIdentity(ctx, tx, schemaVersion, &source); err != nil {
+			return export.ReportingDay{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return export.ReportingDay{}, fmt.Errorf("commit reporting snapshot: %w", err)
@@ -216,6 +223,11 @@ func (db *DB) ExportReportingDigest(
 	if opts.afterSourceLoad != nil {
 		opts.afterSourceLoad(source.observerStats())
 	}
+	if opts.ByMachine {
+		if err := loadReportingMachineIdentity(ctx, tx, schemaVersion, &source); err != nil {
+			return nil, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit reporting snapshot: %w", err)
 	}
@@ -286,6 +298,47 @@ func reportingHoursFromSource(
 	projectKeys []string,
 	bucket time.Duration,
 ) ([]export.ReportingHour, error) {
+	hours, err := reportingHoursFromMachineSource(ctx, source, date, hourCount, schemaVersion, projectKeys, bucket, "")
+	if err != nil || source.localMachineID == "" {
+		return hours, err
+	}
+	machines := map[string]bool{source.localMachineID: true}
+	for _, session := range mergeReportingSessions(source.activitySessions, source.usageSessions) {
+		machines[source.machineID(session.Machine)] = true
+	}
+	if len(source.standaloneUsage) > 0 {
+		machines[source.machineID("")] = true
+	}
+	for i := range hours {
+		hours[i].LocalMachineID = source.localMachineID
+		hours[i].Machines = make(map[string]export.ReportingHour, len(machines))
+	}
+	for machine := range machines {
+		parts, err := reportingHoursFromMachineSource(ctx, source, date, hourCount, schemaVersion, projectKeys, bucket, machine)
+		if err != nil {
+			return nil, err
+		}
+		for i, part := range parts {
+			part, _, err = export.FinalizeReportingHour(part)
+			if err != nil {
+				return nil, err
+			}
+			hours[i].Machines[machine] = part
+		}
+	}
+	for i := range hours {
+		hours[i], _, err = export.FinalizeReportingHour(hours[i])
+		if err != nil {
+			return nil, err
+		}
+	}
+	return hours, nil
+}
+
+func reportingHoursFromMachineSource(
+	ctx context.Context, source reportingDaySource, date time.Time,
+	hourCount, schemaVersion int, projectKeys []string, bucket time.Duration, machine string,
+) ([]export.ReportingHour, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -335,9 +388,25 @@ func reportingHoursFromSource(
 		return nil, err
 	}
 	projects := source.projects
+	if machine != "" {
+		sessions = slices.DeleteFunc(slices.Clone(sessions), func(s activity.SessionMeta) bool { return source.machineID(s.Machine) != machine })
+		ids = make([]string, 0, len(sessions))
+		for _, session := range sessions {
+			ids = append(ids, session.SessionID)
+		}
+		events = slices.DeleteFunc(slices.Clone(events), func(e activity.ActivityEvent) bool {
+			return source.machineID(sessionByID[e.SessionID].Machine) != machine
+		})
+		usage = slices.DeleteFunc(slices.Clone(usage), func(u activity.UsageRow) bool { return source.machineID(sessionByID[u.SessionID].Machine) != machine })
+	}
 	var references map[string]export.ProjectReference
+	var groupLabels map[string]string
 	if schemaVersion == export.ReportingJointSchemaVersion {
-		references = source.references
+		projects, references, groupLabels = partitionReportingProjects(sessionByID, projects, source.references)
+		sessions = slices.Clone(sessions)
+		for i := range sessions {
+			sessions[i] = sessionByID[sessions[i].SessionID]
+		}
 		sessions, ids, events, usage = scopeJointReporting(sessions, events, usage, sessionByID, projects, projectKeys)
 		for i := range sessions {
 			sessions[i].ProjectKey = export.ProjectKeyForEntry(projects[sessions[i].Project])
@@ -355,6 +424,7 @@ func reportingHoursFromSource(
 		createdAt,
 		events,
 		activityUsage,
+		groupLabels,
 	)
 	// Pair once for the whole range. Prior-model inheritance does not depend on
 	// the pruning window, and each hour's window [hourStart-gapCap, hourEnd)
@@ -427,6 +497,7 @@ func reportingHoursFromSource(
 			if err != nil {
 				return nil, err
 			}
+			restoreReportingProjectLabels(&hour, projects, groupLabels)
 		}
 		hours[i] = hour
 	}
@@ -528,10 +599,10 @@ func (db *DB) reportingStandaloneUsageCandidatesFrom(
 		)
 	}
 
-	lowerBound := paddedUTCBound(
+	lowerBound := PaddedUTCBound(
 		query.RangeStart.UTC().Format(time.RFC3339), -14,
 	)
-	upperBound := paddedUTCBound(
+	upperBound := PaddedUTCBound(
 		query.RangeEnd.UTC().Format(time.RFC3339), 14,
 	)
 	rows, err := tx.QueryContext(ctx, `
@@ -572,7 +643,7 @@ func (db *DB) reportingStandaloneUsageCandidatesFrom(
 		row.InputTokens,
 			row.OutputTokens,
 			row.CacheCreationTokens,
-			row.CacheReadTokens = usageEventRowTokens(
+			row.CacheReadTokens = UsageEventRowTokens(
 			"cursor",
 			inputTokens,
 			outputTokens,
@@ -773,7 +844,7 @@ func allocateReportingUsageCosts(
 			continue
 		}
 		key := usageCostAllocationKey{
-			date:       localDate(row.Timestamp, time.UTC),
+			date:       LocalDate(row.Timestamp, time.UTC),
 			project:    row.Project,
 			agent:      row.Agent,
 			machine:    row.Machine,
@@ -848,6 +919,7 @@ func buildReportingFirstSeen(
 	createdAt map[string]time.Time,
 	events []activity.ActivityEvent,
 	usage []activity.UsageRow,
+	groupLabels map[string]string,
 ) map[int]reportingFirstSeenCounts {
 	sessionFirst := make(map[string]time.Time, len(sessions))
 	timed := make(map[string]bool, len(sessions))
@@ -923,8 +995,13 @@ func buildReportingFirstSeen(
 	sessionByID := make(map[string]activity.SessionMeta, len(sessions))
 	for _, session := range sessions {
 		sessionByID[session.SessionID] = session
-		if at, ok := sessionFirst[session.SessionID]; ok && session.Project != "" {
-			setEarlierReportingTime(projectFirst, session.Project, at)
+		// Identity groups split a project; count the project, not each group.
+		project := session.Project
+		if label, grouped := groupLabels[project]; grouped {
+			project = label
+		}
+		if at, ok := sessionFirst[session.SessionID]; ok && project != "" {
+			setEarlierReportingTime(projectFirst, project, at)
 		}
 	}
 	for _, event := range events {
@@ -1275,7 +1352,7 @@ func addReportingUsageBreakdown(
 func reportingUsageBreakdowns(
 	values map[string]*reportingUsageAccum,
 ) []export.ReportingUsageBreakdown {
-	keys := reportingSortedKeys(values)
+	keys := SortedKeys(values)
 	out := make([]export.ReportingUsageBreakdown, 0, len(keys))
 	for _, key := range keys {
 		value := values[key]
@@ -1298,7 +1375,7 @@ func reportingUsageProjectBreakdowns(
 	values map[string]*reportingUsageAccum,
 	projects map[string]export.ProjectMapEntry,
 ) []export.ReportingUsageProjectBreakdown {
-	keys := reportingSortedKeys(values)
+	keys := SortedKeys(values)
 	out := make([]export.ReportingUsageProjectBreakdown, 0, len(keys))
 	for _, project := range keys {
 		value := values[project]
@@ -1324,7 +1401,9 @@ func reportingUsageProjectBreakdowns(
 	return out
 }
 
-func reportingSortedKeys[T any](values map[string]T) []string {
+// SortedKeys returns the map keys sorted; never nil so JSON renders "[]"
+// rather than "null".
+func SortedKeys[T any](values map[string]T) []string {
 	keys := make([]string, 0, len(values))
 	for key := range values {
 		keys = append(keys, key)

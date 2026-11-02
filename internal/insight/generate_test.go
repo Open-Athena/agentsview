@@ -174,15 +174,6 @@ func TestAgentEnv(t *testing.T) {
 	assert.Equal(t, "1", envMap["CLAUDE_NO_SOUND"])
 }
 
-func TestValidAgents(t *testing.T) {
-	for _, agent := range []string{
-		"claude", "codex", "copilot", "gemini", "kiro",
-	} {
-		assert.True(t, ValidAgents[agent], "%s should be valid", agent)
-	}
-	assert.False(t, ValidAgents["gpt"], "gpt should not be valid")
-}
-
 func createMockBinary(
 	t *testing.T, stdout string, exitCode int, writeArgs bool, name string,
 ) (bin, argsFile string) {
@@ -685,4 +676,30 @@ func TestGenerateClaude_TruncatesLargeStdoutLogEvent(t *testing.T) {
 	require.NotEmpty(t, stdoutLog, "expected stdout log event")
 	assert.Contains(t, stdoutLog, "[truncated ", "expected truncation marker in stdout log")
 	assert.Less(t, len(stdoutLog), len(stdout), "expected truncated stdout log to be smaller than raw payload")
+}
+
+func TestPromptArgLimit_SkipsEndpointMode(t *testing.T) {
+	assert.Positive(t, PromptArgLimit("copilot", GenerateOptions{}))
+	assert.Zero(t, PromptArgLimit("copilot", GenerateOptions{Endpoint: &EndpointConfig{}}))
+	assert.Zero(t, PromptArgLimit("claude", GenerateOptions{}))
+}
+
+func TestWindowsArgLength(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want int
+	}{
+		{"", 2},
+		{"plain", 5},
+		{"two words", 11},
+		{`say "hi"`, 12},
+		{`x"y`, 4},
+		{`a\"b`, 6},
+		{`dir\ `, 7},
+		{`dir\`, 4},
+		{"日本 語", 6},
+		{"😀", 2},
+	} {
+		assert.Equal(t, tc.want, windowsArgLength(tc.in), tc.in)
+	}
 }

@@ -13,6 +13,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/artifact"
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/friction"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/rawderive"
 	"go.kenn.io/agentsview/internal/rawsync"
@@ -77,6 +79,19 @@ func (f projectionFixture) acceptScoped(t *testing.T, device, capture, parent st
 	return canonical, result
 }
 
+// tombstone accepts and projects the manifest a device sends once a source it
+// previously captured is no longer present there.
+func (f projectionFixture) tombstone(t *testing.T, previous rawsync.CanonicalManifest, capture, parent string) (rawsync.CanonicalManifest, rawsync.CommitResult) {
+	t.Helper()
+	manifest := rawsync.Manifest{SchemaVersion: rawsync.ManifestSchemaVersion, Provider: previous.Manifest.Provider, ConfiguredRootID: previous.Manifest.ConfiguredRootID, SourceKey: previous.Manifest.SourceKey, ExpectedParentReceipt: parent, CaptureID: capture, CapturedAt: rawIngestCapturedAt(), Kind: rawsync.ManifestTombstone}
+	canonical, err := rawsync.ValidateAndCanonicalize(previous.Identity, manifest, rawsync.DefaultManifestLimits())
+	require.NoError(t, err)
+	result, err := f.custody.CommitManifest(t.Context(), previous.Identity, manifest)
+	require.NoError(t, err)
+	require.NoError(t, f.sink.Project(t.Context(), f.lease(t, canonical), canonical, rawderive.ParsedManifest{Tombstone: true}))
+	return canonical, result
+}
+
 // projectionOutcome models a complete, authoritative source snapshot.
 func projectionOutcome(content string) rawderive.ParsedManifest {
 	return rawderive.ParsedManifest{Outcome: parser.ParseOutcome{ResultSetComplete: true, ForceReplace: true, Results: []parser.ParseResultOutcome{{Result: parser.ParseResult{
@@ -85,6 +100,13 @@ func projectionOutcome(content string) rawderive.ParsedManifest {
 		UsageEvents: []parser.ParsedUsageEvent{{Source: "turn", Model: "synthetic-model", InputTokens: 11, OutputTokens: 7}},
 	}}}}}
 }
+
+// Codex keeps prose and tool calls in separate messages, so the deferral
+// is its own assistant reply.
+func deferralReply() parser.ParsedMessage {
+	return parser.ParsedMessage{Ordinal: 2, Role: parser.RoleAssistant, Content: "Continue next session."}
+}
+
 func (f projectionFixture) lease(t *testing.T, m rawsync.CanonicalManifest) rawderive.JobLease {
 	t.Helper()
 	_, err := f.sink.SelectSourceGeneration(t.Context(), m, "parser-1")
@@ -122,6 +144,128 @@ func TestRawProjectionPublishesNormalizedGraph(t *testing.T) {
 	require.NoError(t, f.runtime.QueryRowContext(t.Context(), `SELECT state FROM raw_ingest_jobs WHERE id=$1`, lease.ID).Scan(&state))
 	assert.Equal(t, "complete", state)
 	assert.ErrorIs(t, f.sink.Project(t.Context(), lease, m, projectionOutcome("must not replace")), rawderive.ErrLeaseLost)
+}
+
+func TestRawProjectionFrictionUsesFinalSessionIdentity(t *testing.T) {
+	f := newProjectionFixture(t)
+	var firstID, firstFingerprint string
+	for _, tc := range []struct {
+		device, id, sourceID string
+	}{
+		{"device-a", "codex:portable", "portable"},
+		{"device-b", "codex:transport-alias", "portable"},
+		{"device-c", "codex:unrelated", "unrelated"},
+	} {
+		outcome := projectionOutcome("finish the task")
+		parsed := &outcome.Outcome.Results[0].Result
+		parsed.Session.ID, parsed.Session.SourceSessionID = tc.id, tc.sourceID
+		parsed.Messages = append(parsed.Messages, deferralReply())
+		m, _ := f.accept(t, tc.device, "capture-"+tc.device, "")
+		require.NoError(t, f.sink.Project(t.Context(), f.lease(t, m), m, outcome))
+		resolved, err := f.sink.Resolve(t.Context(), tc.id)
+		require.NoError(t, err)
+		require.Equal(t, RawIdentityUnique, resolved.State)
+		findings := pgFrictionFindings(t, &Sync{pg: f.runtime}, resolved.SessionID)
+		require.Len(t, findings, 1)
+		assert.Equal(t, "deferral", findings[0].Kind)
+		assert.Equal(t, "[friction/deferral] "+resolved.SessionID+": next session", findings[0].Title)
+		switch tc.device {
+		case "device-a":
+			firstID, firstFingerprint = resolved.SessionID, findings[0].Fingerprint
+		case "device-b":
+			assert.Equal(t, firstID, resolved.SessionID, "capture IDs do not split identical session content")
+			assert.Equal(t, firstFingerprint, findings[0].Fingerprint)
+		case "device-c":
+			assert.NotEqual(t, firstID, resolved.SessionID)
+			assert.NotEqual(t, firstFingerprint, findings[0].Fingerprint, "unrelated sessions have distinct deferral identities")
+		}
+	}
+}
+
+func TestRawProjectionRefreshesFrictionForExistingPhysicalSession(t *testing.T) {
+	f := newProjectionFixture(t)
+	for _, table := range []string{"friction_findings"} {
+		_, err := f.admin.Exec(`REVOKE ALL PRIVILEGES ON "` + table + `" FROM "` + f.role + `"`)
+		require.NoError(t, err)
+		_, err = f.admin.Exec(`GRANT SELECT,INSERT,DELETE ON "` + table + `" TO "` + f.role + `"`)
+		require.NoError(t, err)
+	}
+	require.NoError(t, CheckHostedRuntimeWritable(
+		t.Context(), f.runtime, f.schema, config.ArchiveContentFull,
+	))
+	outcome := projectionOutcome("finish the task")
+	result := &outcome.Outcome.Results[0].Result
+	result.Messages = append(result.Messages, deferralReply())
+	m1, accepted := f.accept(t, "device-a", "capture-a", "")
+	require.NoError(t, f.sink.Project(
+		t.Context(), f.lease(t, m1), m1, outcome,
+	))
+	resolved, err := f.sink.Resolve(t.Context(), "codex:portable")
+	require.NoError(t, err)
+	findings := pgFrictionFindings(t, &Sync{pg: f.runtime}, resolved.SessionID)
+	require.Len(t, findings, 1)
+	var originalRevision string
+	require.NoError(t, f.runtime.QueryRowContext(
+		t.Context(), `SELECT raw_content_revision FROM sessions WHERE id=$1`,
+		resolved.SessionID,
+	).Scan(&originalRevision))
+
+	_, err = f.runtime.ExecContext(t.Context(), `
+		UPDATE sessions SET friction_count=0, friction_rules_version='friction-v0',
+			friction_hash='stale' WHERE id=$1`, resolved.SessionID)
+	require.NoError(t, err)
+
+	// Reproject the same source content under a new manifest. Content identity
+	// stays fixed, so only a separate friction-version fence can refresh the
+	// already materialized physical session.
+	m2, _ := f.accept(t, "device-a", "capture-b", accepted.Receipt)
+	require.Equal(t, m1.Manifest.SourceKey, m2.Manifest.SourceKey)
+	require.NoError(t, f.sink.Project(
+		t.Context(), f.lease(t, m2), m2, outcome,
+	))
+
+	var version, hash, revision string
+	var count int
+	require.NoError(t, f.runtime.QueryRowContext(
+		t.Context(), `SELECT friction_rules_version,friction_count,friction_hash,
+			raw_content_revision FROM sessions WHERE id=$1`, resolved.SessionID,
+	).Scan(&version, &count, &hash, &revision))
+	assert.Equal(t, friction.RulesVersion, version)
+	assert.Equal(t, 1, count)
+	assert.NotEmpty(t, hash)
+	assert.NotEqual(t, "stale", hash)
+	assert.Equal(t, originalRevision, revision,
+		"friction refresh must not change raw content identity")
+	findings = pgFrictionFindings(t, &Sync{pg: f.runtime}, resolved.SessionID)
+	require.Len(t, findings, 1)
+	assert.Equal(t, "deferral", findings[0].Kind)
+	assert.Equal(t, "[friction/deferral] "+resolved.SessionID+": next session", findings[0].Title)
+}
+
+func TestRawProjectionQueueFencesReselectedGeneration(t *testing.T) {
+	f := newProjectionFixture(t)
+	m, _ := f.accept(t, "device-a", "capture-a", "")
+	old := f.lease(t, m)
+	_, err := f.sink.SelectSourceGeneration(t.Context(), m, "parser-2")
+	require.NoError(t, err)
+	_, err = f.sink.SelectSourceGeneration(t.Context(), m, "parser-1")
+	require.NoError(t, err)
+	leases, err := f.jobs.ClaimRawParseJobs(t.Context(), old.Owner, 1, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, leases, 1)
+	current := leases[0]
+	require.Equal(t, old.ID, current.ID)
+	require.Equal(t, old.Attempt, current.Attempt)
+	require.Greater(t, current.ProjectionGeneration, old.ProjectionGeneration)
+
+	assert.ErrorIs(t, f.jobs.FailRawParseJob(t.Context(), old, "parse", "parse:internal"), rawderive.ErrLeaseLost)
+	assert.ErrorIs(t, f.jobs.RetryRawParseJob(t.Context(), old, time.Now().Add(time.Minute), "parse", "parse:internal"), rawderive.ErrLeaseLost)
+	assert.ErrorIs(t, f.jobs.HeartbeatRawParseJob(t.Context(), old, time.Minute), rawderive.ErrLeaseLost)
+	assert.ErrorIs(t, f.jobs.CompleteRawParseJob(t.Context(), old), rawderive.ErrLeaseLost)
+	var state string
+	require.NoError(t, f.runtime.QueryRowContext(t.Context(), `SELECT state FROM raw_ingest_jobs WHERE id=$1`, current.ID).Scan(&state))
+	assert.Equal(t, "leased", state)
+	require.NoError(t, f.jobs.HeartbeatRawParseJob(t.Context(), current, time.Minute))
 }
 
 func TestRawProjectionGenerationAndLeaseFences(t *testing.T) {

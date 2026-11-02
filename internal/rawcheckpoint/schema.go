@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-const schemaVersion = 8
+const schemaVersion = 10
 
 func (s *Store) init(ctx context.Context) error {
 	var version int
@@ -86,6 +86,20 @@ func (s *Store) init(ctx context.Context) error {
 			}
 		}
 	}
+	if version < 9 {
+		for _, statement := range versionNineMigrationStatements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("rawcheckpoint: migrate schema to version 9: %w", err)
+			}
+		}
+	}
+	if version < 10 {
+		for _, statement := range versionTenMigrationStatements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("rawcheckpoint: migrate schema to version 10: %w", err)
+			}
+		}
+	}
 	if _, err := tx.ExecContext(ctx,
 		fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
 		return fmt.Errorf("rawcheckpoint: set schema version: %w", err)
@@ -96,7 +110,7 @@ func (s *Store) init(ctx context.Context) error {
 	return nil
 }
 
-//nolint:kennlint // Shipped migration constraints must remain unchanged for historical upgrades.
+//nolint:kennlint // sqlcheck: Shipped migration constraints must remain unchanged for historical upgrades.
 var versionOneSchemaStatements = []string{
 	`CREATE TABLE IF NOT EXISTS device_config (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -115,7 +129,7 @@ var versionOneSchemaStatements = []string{
 	)`,
 }
 
-//nolint:kennlint // Shipped migration constraints must remain unchanged for historical upgrades.
+//nolint:kennlint // sqlcheck: Shipped migration constraints must remain unchanged for historical upgrades.
 var versionTwoMigrationStatements = []string{
 	`ALTER TABLE raw_sources ADD COLUMN latest_capture_id TEXT NOT NULL DEFAULT ''`,
 	`CREATE TABLE outbox_config (
@@ -242,7 +256,7 @@ var versionTwoMigrationStatements = []string{
 	`CREATE INDEX outbox_objects_state_idx ON outbox_objects(state)`,
 }
 
-//nolint:kennlint // Shipped migration constraints must remain unchanged for historical upgrades.
+//nolint:kennlint // sqlcheck: Shipped migration constraints must remain unchanged for historical upgrades.
 var versionThreeMigrationStatements = []string{
 	`ALTER TABLE outbox_generations
 		ADD COLUMN retry_at TEXT NOT NULL DEFAULT ''`,
@@ -322,21 +336,21 @@ var versionFiveMigrationStatements = []string{
 		FROM raw_coverage WHERE state = 'degraded'`,
 }
 
-//nolint:kennlint // Shipped migration constraints must remain unchanged for historical upgrades.
+//nolint:kennlint // sqlcheck: Shipped migration constraints must remain unchanged for historical upgrades.
 var versionSixMigrationStatements = []string{
 	`ALTER TABLE outbox_config
 		ADD COLUMN max_outbox_bytes INTEGER NOT NULL DEFAULT 1073741824
 		CHECK (max_outbox_bytes > 0)`,
 }
 
-//nolint:kennlint // Shipped migration constraints must remain unchanged for historical upgrades.
+//nolint:kennlint // sqlcheck: Shipped migration constraints must remain unchanged for historical upgrades.
 var versionSevenMigrationStatements = []string{
 	`ALTER TABLE outbox_generations
 		ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0
 		CHECK (attempt_count >= 0)`,
 }
 
-//nolint:kennlint // Shipped migration constraints must remain unchanged for historical upgrades.
+//nolint:kennlint // sqlcheck: Shipped migration constraints must remain unchanged for historical upgrades.
 var versionEightMigrationStatements = []string{
 	`ALTER TABLE raw_sources
 		ADD COLUMN observation_revision INTEGER NOT NULL DEFAULT 0
@@ -344,4 +358,12 @@ var versionEightMigrationStatements = []string{
 	`UPDATE outbox_generations SET manifest_id = ''
 		WHERE state = 'finalized' AND manifest_id != ''
 			AND ack_receipt = '' AND ack_generation = 0`,
+}
+
+// Acknowledgement and garbage collection ask whether any acknowledged base
+// still references an object. Without this index each lookup reads the whole
+// base, which grows with every source the device has ever uploaded.
+var versionTenMigrationStatements = []string{
+	`CREATE INDEX raw_source_base_objects_object_idx
+		ON raw_source_base_objects(sha256, length)`,
 }

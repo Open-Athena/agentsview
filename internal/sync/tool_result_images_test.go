@@ -245,15 +245,16 @@ func TestEngineImagePolicyDeduplicatesHistoricalRawLinkedResult(t *testing.T) {
 		ID: "historical-link", Agent: string(parser.AgentClaude), Project: "project",
 		Machine: "local", MessageCount: 1,
 	}))
+	event := db.ToolResultEvent{
+		ToolUseID: "link-call", Source: "tool", Status: "completed", Content: raw,
+	}
+	db.PrepareToolResultEvent(&event)
 	require.NoError(t, database.InsertMessages(t.Context(), []db.Message{{
 		SessionID: "historical-link", Ordinal: 0, Role: "assistant",
 		ToolCalls: []db.ToolCall{{
 			ToolUseID: "link-call", ToolName: "Task", Category: "Task",
 			ResultContent: raw,
-			ResultEvents: []db.ToolResultEvent{{
-				ToolUseID: "link-call", Source: "tool", Status: "completed",
-				Content: raw,
-			}},
+			ResultEvents:  []db.ToolResultEvent{event},
 		}},
 	}}))
 
@@ -738,4 +739,20 @@ func TestToolResultImagesStagedRoute(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestToolResultImagesOffloadFrictionUsesStoredContent(t *testing.T) {
+	database := dbtest.OpenTestDB(t)
+	engine := NewEngine(t.Context(), database, EngineConfig{Machine: "local", ToolResultImages: config.ToolResultImages("offload"), AssetsDir: t.TempDir(), FrictionEnabled: true})
+	t.Cleanup(engine.Close)
+	engine.writeBatchBulkWithOutcome([]pendingWrite{{
+		sess: parser.ParsedSession{ID: "offload-friction", Project: "project", Machine: "local", Agent: parser.AgentCodex, StartedAt: time.Unix(1, 0)},
+		msgs: []parser.ParsedMessage{{Ordinal: 0, Role: parser.RoleAssistant, Content: "answer", ToolCalls: []parser.ParsedToolCall{{ToolUseID: "image", ToolName: "Bash", Category: "Bash", ResultEvents: []parser.ParsedToolResultEvent{{ToolUseID: "image", Source: "tool", Status: "errored", Content: `[{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="},{"type":"text","text":"render failed"}]`}}}}}},
+	}}, false)
+	_, err := engine.BackfillFriction(t.Context())
+	require.NoError(t, err)
+	stored, err := database.SessionFrictionFindings(t.Context(), "offload-friction")
+	require.NoError(t, err)
+	require.Len(t, stored, 1)
+	assert.NotContains(t, stored[0].Text, "data:image", "findings come from the offloaded rows the archive stores")
 }

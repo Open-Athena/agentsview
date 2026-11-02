@@ -283,6 +283,22 @@ ladder:
 There is no "retry with a compact prompt" path: a capped response silently loses
 entries, so truncation always splits or fails.
 
+Each action window computes its stored tool evidence independently. A message
+with no visible text but a tool flag marks the assistant block before it and the
+block after it, so a packing boundary cannot leave either side of one call
+without evidence. A window without evidence omits `procedure` from its allowed
+entry types and receives a preamble on its action prompt saying nothing ran.
+
+A returned type that is valid but outside the window's narrowed enum fails only
+that session, behind the normal failure backoff, and the pass continues. A
+server that ignores the enum still answers unrestricted windows correctly, so
+this is not an endpoint failure. A type outside every enum still aborts the pass
+as a protocol violation. `recall extract doctor` probes only the unrestricted
+intent request.
+
+A stored call flag proves invocation, not success: a denied or failed call still
+counts as evidence. Wording in other entry types depends on the model.
+
 ## Scheduling
 
 The daemon scheduler mirrors the embedding scheduler's shape:
@@ -348,8 +364,17 @@ The daemon scheduler mirrors the embedding scheduler's shape:
 - passes drop instead of queueing when one is already running, and a dropped
   backstop carries into the next debounced pass.
 
-Concurrency is one pass at a time, one session at a time, one unit per model
-call. Each response is bounded locally as well as by the transport size cap: the
+Concurrency is one pass at a time and one unit per model call. Within a pass,
+up to the server's `concurrency` sessions (default 1) distill in parallel, each
+owned by a single worker for the whole pass: its units still distill and commit
+in cursor order, so the progress row's optimistic guards never see two writers
+from one pass. Model calls run outside any transaction and each unit commit
+still goes through the archive's single writer, so parallel sessions add no
+write-lock hold time. An error that would abort a sequential pass (an
+endpoint-scoped rejection, an exhausted retry ladder, a storage error) stops
+handing out sessions and cancels the ones still in flight; cancellation leaves
+their rows resumable exactly as daemon shutdown does, so an outage cannot burn
+every in-flight session's retry ladder or failure backoff. Each response is bounded locally as well as by the transport size cap: the
 client refuses responses exceeding fixed limits on entries per call and on
 title, body, and entity lengths. The requested JSON schema declares the entry,
 title, entity-count, and entity-length bounds. The 5000-character body bound is

@@ -1,15 +1,16 @@
 ---
 title: Stats
-description: Experimental workspace analytics via agentsview stats
+description: Experimental workspace analytics via agentsview report stats
 ---
 
-`agentsview stats` is a top-level CLI command added in 0.23.0 for window-scoped
-reporting over your local session archive. It emits a human-readable summary by
-default and can also emit JSON for scripts and downstream tooling.
+`agentsview report stats` reports over a selected window of your local session
+archive. It emits a human-readable summary by default and can also emit JSON for
+scripts and downstream tooling. The reporting feature originally shipped as
+`agentsview stats` in 0.23.0.
 
 !!! warning "Experimental"
 
-    `agentsview stats` is experimental. The human-readable output is not stable, and
+    `agentsview report stats` is experimental. The human-readable output is not stable, and
     the exact JSON output may change in future releases. Treat it as a moving
     surface and parse it defensively.
 
@@ -18,33 +19,33 @@ default and can also emit JSON for scripts and downstream tooling.
 The command pulls together several categories of information:
 
 - **Session totals** — total sessions, human versus automation sessions, total
-  messages, total user messages
+    messages, total user messages
 - **Session archetypes** — automation, quick, standard, deep, and marathon
-  buckets
+    buckets
 - **Session shape** — mean duration, user-message counts, peak context, and
-  tools-per-turn
+    tools-per-turn
 - **Velocity** — turn-cycle timing, first-response timing, and messages per
-  active hour
+    active hour
 - **Tool, model, and agent mix** — top tool categories plus token and session
-  mix by model and agent
+    mix by model and agent
 - **Claude-only optional sections** — cache economics, plan-mode adoption,
-  subagent activity, and skill counts when the window has compatible data
+    subagent activity, and skill counts when the window has compatible data
 - **Temporal activity** — active UTC-hour buckets plus the reporter timezone
 - **Git outcomes** — commit, LOC, file-change, and optional PR totals for repos
-  enclosing session working directories
+    enclosing session working directories
 - **Session outcomes** — aggregate counts, grade distribution, retry rate,
-  compactions per session, and edit churn. The raw
-  [four outcomes](/docs/session-intelligence/#outcome-classification)
-  (`completed`, `abandoned`, `errored`, `unknown`) are rolled up here into
-  three buckets: `success` (= `completed`), `failure` (= `abandoned` or
-  `errored`), and `unknown` (= `unknown` plus any unrecognized value). The
-  rollup applies to both the human summary and the JSON `outcomes` block.
+    compactions per session, and edit churn. The raw
+    [four outcomes](/docs/session-intelligence/#outcome-classification)
+    (`completed`, `abandoned`, `errored`, `unknown`) are rolled up here into
+    three buckets: `success` (= `completed`), `failure` (= `abandoned` or
+    `errored`), and `unknown` (= `unknown` plus any unrecognized value). The
+    rollup applies to both the human summary and the JSON `outcomes` block.
 - **Code attribution** — optional AI-authored code attribution from host-local
-  attribution sources such as Cursor.
+    attribution sources such as Cursor.
 
 ## Automation Scope
 
-As of 0.25.0, `agentsview stats` uses each session's stored `is_automated` value
+Since 0.25.0, stats reporting uses each session's stored `is_automated` value
 as the authority for human versus automation scope. That classification drives
 session totals, archetypes, the `scope_human` distributions, and the
 human-scoped `agent_portfolio` fields (`by_sessions_human`, `by_messages_human`,
@@ -60,13 +61,13 @@ the human bucket set starts at two user messages. They still contribute to
 
 ```bash
 # Human-readable summary for the last 28 days
-agentsview stats
+agentsview report stats
 
 # Fixed date range as JSON
-agentsview stats --format json --since 2026-04-01 --until 2026-04-15
+agentsview report stats --format json --since 2026-04-01 --until 2026-04-15
 
 # Narrow to one agent and one project
-agentsview stats --agent claude --include-project my-app
+agentsview report stats --agent claude --include-project my-app
 ```
 
 ## Flags
@@ -126,6 +127,11 @@ when AgentsView cannot derive any repos from the sessions in the selected
 window, and Claude-only sections are omitted when the window has no compatible
 data.
 
+When a repository lookup fails, the outcome section lists its path, operation,
+and reason under `Incomplete:`. Multiline reasons keep their continuation lines
+indented. A `pr` entry means only that repository's pull-request counts are
+missing; its commit, line, file, and active-repository counts still contribute.
+
 ## JSON Output
 
 JSON output currently carries `schema_version: 1` and is divided into top-level
@@ -151,6 +157,25 @@ Optional blocks may also appear:
 - `outcomes`
 - `code_attribution`
 
+`outcome_stats.skipped` lists repository operations that could not contribute to
+the totals. It is omitted when no lookups were skipped. Each entry contains:
+
+- `repo`: the local repository's root path
+- `op`: the operation that could not contribute, as listed below
+- `reason`: the full diagnostic text, which may contain multiple lines
+
+| `op`     | Meaning                           | Counts missing for this repository          |
+| -------- | --------------------------------- | ------------------------------------------- |
+| `author` | No author email could be resolved | All git and PR counts                       |
+| `log`    | The commit lookup failed          | All git and PR counts                       |
+| `pr`     | The pull-request lookup failed    | Only PR counts; git counts still contribute |
+
+Other repositories still contribute their available counts. If none can
+contribute, `outcome_stats` remains present with zero git counters and the
+`skipped` entries explaining them. Check `skipped` before interpreting zeros as
+no activity: the presence of the block alone does not mean data was available.
+The block is omitted when no repositories can be discovered.
+
 `code_attribution.sources` lists attribution sources that contributed to the
 selected stats request. Each source carries `provider`, `scope`, `status`,
 optional `warnings`, and provider-specific `metrics`. The Cursor source
@@ -168,7 +193,7 @@ formatting changes over time.
 
 ## Git And PR Aggregation
 
-`agentsview stats` uses session working directories to discover git repositories
+`agentsview report stats` uses session working directories to discover git repositories
 and then aggregates git activity for the configured author in each repo.
 
 That includes:
@@ -182,15 +207,19 @@ Pull-request counts are optional and use CLI-oriented GitHub token sources:
 - If `AGENTSVIEW_GITHUB_TOKEN` is set, AgentsView uses it.
 - Otherwise it tries `gh auth token`.
 - If neither source yields a token, PR counts are omitted instead of being
-  reported as zero.
+    reported as zero.
 
-This distinction matters in JSON output: a missing PR field means "GitHub lookup
-not configured", not "configured and zero PRs found".
+This distinction matters in JSON output: a missing PR field means no repository
+returned PR counts, either because the lookup was not configured or because
+repositories could not contribute. Check `outcome_stats.skipped` for failures. A
+present PR field containing zero means the successful lookups found no matching
+PRs; check `skipped` to see whether any repositories are missing from that
+total.
 
 ## Relationship To Session Intelligence
 
 [`Session Intelligence`](/docs/session-intelligence/) is the per-session surface
 for health scores, outcomes, and signal inspection.
 
-`agentsview stats` is the aggregate surface: it summarizes the whole archive
+`agentsview report stats` is the aggregate surface: it summarizes the whole archive
 over a window rather than explaining one session at a time.

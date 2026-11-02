@@ -7,8 +7,12 @@ export interface DbContentMatch {
   agent: string;
   context_after?: DbMessage[];
   context_before?: DbMessage[];
+  /** @nullable */
+  display_name: string | null;
   is_sidechain?: boolean;
+  /** Where the match occurred: message, thinking, tool_input, or tool_result. */
   location: string;
+  machine: string;
   ordinal: number;
   /**
    * @minItems 2
@@ -22,6 +26,8 @@ export interface DbContentMatch {
   score?: number;
   session_id: string;
   snippet: string;
+  /** Contributing hosted device machine IDs; omitted for sessions without hosted provenance. */
+  source_machines?: string[];
   subordinate?: boolean;
   timestamp: string;
   tool_name?: string;

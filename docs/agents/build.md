@@ -3,37 +3,54 @@
 Read this file before changing build commands, toolchain setup, CI build tags,
 or frontend dependencies. Use the `Makefile` as the command reference.
 
-## Namespace runner policy
+## CI path filters
 
-The repository's Namespace runner profiles use **Restricted** Access Level, as
-confirmed by the maintainer. This setting is managed in the Namespace profile
-editor under **Advanced Settings**, outside the workflow YAML. Namespace
-documents Restricted mode for untrusted third-party code: it disables the runner
-workload's access to Namespace APIs. See
-[Namespace access levels](https://namespace.so/docs/solutions/github-actions/runner-controls/access-levels).
+Update the CI path filters when adding a reader of files in another lane.
 
-Running fork pull requests on these profiles is intentional. Do not infer
-unrestricted infrastructure or credential access from a Namespace runner label
-or GitHub's self-hosted classification alone. A security finding must identify
-the resource an untrusted job can reach, the boundary it crosses, and evidence
-that the configured restrictions allow that access. If runtime enforcement
-cannot be checked, state that limitation instead of claiming an exposure or
-guaranteeing isolation.
+## CI runner policy
 
-Restricted API access and cache persistence are separate controls. Evaluate
-cache findings against the actual profile and cache-volume settings, including
-which branches may persist updates. See
-[Namespace cache protection](https://namespace.so/docs/solutions/github-actions/caching#protect-caches-from-updates).
-Do not treat Restricted mode as proof of cache protection. Revisit this policy
-when the runner configuration changes.
+All CI jobs use standard GitHub-hosted runners, including fork pull requests,
+scheduled checks, and desktop builds. Select labels from
+[GitHub's supported runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+Keep the explicit architecture labels for Linux ARM64 and macOS desktop builds.
+
+Use the local `go-cache-restore` and `go-cache-save` actions for Go caches and
+disable the built-in cache in `actions/setup-go`. Use npm caching in
+`actions/setup-node`. Set `cache-dependency-path` to the lockfiles for the
+packages the job installs. Desktop jobs cache Rust dependencies through
+`Swatinem/rust-cache` with the GitHub cache backend. Pull-request workflow
+callers set `cache-mode: read` so jobs can restore caches without saving copies.
+Playwright jobs run browsers in Microsoft's public MCR image through a remote
+server.
+
+`desktop-artifacts.yml` builds the frontend once on Linux and packages those
+assets in its Windows, Linux, and Linux ARM64 desktop builds.
+
+Go builds and tests use `-trimpath` everywhere: the `Makefile` exports it in
+`GOFLAGS`, the Go workflows set `GOFLAGS: -trimpath`, and desktop sidecar builds
+pass it unless `AGENTSVIEW_SIDECAR_TRIMPATH=false`. Matching flags let desktop
+builds reuse compile results from test jobs and let local worktrees share one
+build cache. See the [README](../../README.md#shared-go-build-cache) for opting
+out and debugging.
+
+Windows Go test and lint jobs in `ci.yml` put caches and temp files under
+`RUNNER_TEMP`. Capture tests use a private system-drive temporary directory so
+ancestor permissions satisfy their checks.
 
 ## Go and SQLite
 
 - Build with `CGO_ENABLED=1`; the SQLite driver requires CGO.
 - Use the `fts5` build tag for full-text search.
-- Do not add the `kit_posthog_disabled` tag to `go test`. The telemetry reporter
-  disables itself under `testing.Testing()`. E2E binaries run as real
-  processes, so their build keeps the tag.
+- The Makefile's `LDFLAGS` set the PostHog project key with
+  `-X go.kenn.io/kit/telemetry/posthog.projectKey`. Builds without it send no
+  telemetry, so keep it out of test and e2e builds.
+- `DISTRIBUTION` sets `main.distribution` and
+  `go.kenn.io/kit/telemetry/posthog.distribution` to who ships the binary.
+  Official direct downloads use `kenn` and keep self-updating, like builds
+  with no value. Any other value names a package manager: those builds refuse
+  `agentsview update` installs and point users at the package manager.
+  `make homebrew` is the release build with `DISTRIBUTION=homebrew`, written
+  to `$(BINDIR)/agentsview`.
 
 ## Frontend
 

@@ -19,6 +19,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/rawcapture"
 	"go.kenn.io/agentsview/internal/rawcheckpoint"
@@ -65,8 +66,10 @@ func newRawSyncCommand() *cobra.Command {
 		},
 	}
 	cmd.AddCommand(newRawSyncWatchCommand())
+	cmd.AddCommand(newRawSyncBackfillCommand())
 	cmd.AddCommand(newRawSyncStatusCommand())
 	cmd.AddCommand(newRawSyncCleanUploadsCommand())
+	cmd.AddCommand(newRawSyncServerStatusCommand())
 	return cmd
 }
 
@@ -124,9 +127,16 @@ func runRawSyncWatch(ctx context.Context, watchCfg rawSyncWatchConfig) error {
 	if err := validateRawSyncWatchConfig(watchCfg, credential); err != nil {
 		return err
 	}
-	appCfg, err := config.LoadReadOnly()
+	appCfg, err := config.LoadReadOnlyFor(config.ScopeLocal)
 	if err != nil {
 		return err
+	}
+	archiveOnly, err := archiveModeAfterRecovery(ctx, appCfg)
+	if err != nil {
+		return err
+	}
+	if archiveOnly {
+		return db.ErrArchiveOnly
 	}
 	providers, roots, err := rawSyncProvidersAndRoots(ctx, appCfg)
 	if err != nil {
@@ -142,6 +152,9 @@ func runRawSyncWatch(ctx context.Context, watchCfg rawSyncWatchConfig) error {
 	}
 	defer store.Close()
 	if err := store.EnsureDevice(ctx, watchCfg.DeviceID); err != nil {
+		return err
+	}
+	if err := store.EnsureDestination(ctx, watchCfg.Server); err != nil {
 		return err
 	}
 	client, err := rawclient.NewClient(rawclient.Config{
@@ -273,10 +286,25 @@ func refreshRawSyncRoots(
 }
 
 func validateRawSyncWatchConfig(cfg rawSyncWatchConfig, credential string) error {
-	if strings.TrimSpace(cfg.Server) == "" {
+	if err := validateRawSyncConnection(
+		cfg.Server, cfg.DeviceID, credential, cfg.AllowInsecureHTTP,
+	); err != nil {
+		return err
+	}
+	if cfg.Debounce <= 0 || cfg.Interval <= 0 || cfg.AuditLimit <= 0 {
+		return errors.New("debounce, interval, and audit-limit must be positive")
+	}
+	return nil
+}
+
+func validateRawSyncConnection(
+	server, deviceID, credential string,
+	allowInsecureHTTP bool,
+) error {
+	if strings.TrimSpace(server) == "" {
 		return errors.New("--server or AGENTSVIEW_RAW_SYNC_URL is required")
 	}
-	parsed, err := url.Parse(cfg.Server)
+	parsed, err := url.Parse(server)
 	if err != nil || parsed.Host == "" ||
 		(parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return errors.New("raw-sync server URL is invalid")
@@ -285,21 +313,18 @@ func validateRawSyncWatchConfig(cfg rawSyncWatchConfig, credential string) error
 		return errors.New("raw-sync server URL must not contain credentials")
 	}
 	if parsed.Scheme == "http" {
-		if !cfg.AllowInsecureHTTP {
+		if !allowInsecureHTTP {
 			return errors.New("raw-sync server URL must use HTTPS")
 		}
 		if !rawSyncLoopbackHost(parsed.Hostname()) {
 			return errors.New("insecure raw-sync HTTP is limited to loopback")
 		}
 	}
-	if strings.TrimSpace(cfg.DeviceID) == "" {
+	if strings.TrimSpace(deviceID) == "" {
 		return errors.New("--device-id or AGENTSVIEW_RAW_SYNC_DEVICE_ID is required")
 	}
 	if credential == "" {
 		return errors.New("AGENTSVIEW_RAW_SYNC_CREDENTIAL is required")
-	}
-	if cfg.Debounce <= 0 || cfg.Interval <= 0 || cfg.AuditLimit <= 0 {
-		return errors.New("debounce, interval, and audit-limit must be positive")
 	}
 	return nil
 }
@@ -361,23 +386,15 @@ func rawSyncProvidersAndRoots(
 			continue
 		}
 		def := factory.Definition()
-		configuredRoots := rawSyncFilesystemRoots(cfg.ResolveDirs(def.Type))
-		for index, root := range configuredRoots {
-			absoluteRoot, err := filepath.Abs(root)
-			if err != nil {
-				return nil, nil, fmt.Errorf(
-					"raw-sync resolve configured root for %s: %w", def.Type, err,
-				)
-			}
-			configuredRoots[index] = absoluteRoot
+		providerConfig, err := rawSyncProviderConfig(cfg, def.Type)
+		if err != nil {
+			return nil, nil, err
 		}
+		configuredRoots := providerConfig.Roots
 		if len(configuredRoots) == 0 {
 			continue
 		}
-		provider := factory.NewProvider(parser.ProviderConfig{
-			Roots: configuredRoots, Machine: cfg.InstallationID,
-			SourceMachines: cfg.SourceMachines[def.Type],
-		})
+		provider := factory.NewProvider(providerConfig)
 		watchRoots, err := parser.ResolveWatchRoots(ctx, provider)
 		if err != nil {
 			return nil, nil, fmt.Errorf("raw-sync watch roots for %s: %w", def.Type, err)
@@ -399,6 +416,12 @@ func rawSyncProvidersAndRoots(
 					return nil, nil, errors.New("raw-sync watch root index is invalid")
 				}
 				root := &roots[index]
+				root.MaxDepth = syncpkg.MergeWatchDepth(
+					root.Recursive, root.MaxDepth, planned.Recursive, planned.MaxDepth,
+				)
+				root.ExtraDirectories = syncpkg.MergeExtraDirectories(
+					root.ExtraDirectories, planned.ExtraDirectories,
+				)
 				root.Recursive = root.Recursive || planned.Recursive
 				root.Exists = root.Exists || exists
 				if !slices.Contains(root.Scopes, scope) {
@@ -409,11 +432,35 @@ func rawSyncProvidersAndRoots(
 			rootIndex[path] = len(roots)
 			roots = append(roots, syncpkg.WatchRoot{
 				Path: path, Recursive: planned.Recursive, Exists: exists,
-				Scopes: []syncpkg.WatchScope{scope},
+				MaxDepth: syncpkg.MergeWatchDepth(
+					planned.Recursive, planned.MaxDepth, false, 0,
+				),
+				ExtraDirectories: syncpkg.MergeExtraDirectories(nil, planned.ExtraDirectories),
+				Scopes:           []syncpkg.WatchScope{scope},
 			})
 		}
 	}
 	return providers, roots, nil
+}
+
+// rawSyncProviderConfig builds the provider configuration raw sync captures
+// with. Watch and backfill share it so both see roots in the same order, which
+// decides the owning root of a file under overlapping roots.
+func rawSyncProviderConfig(cfg config.Config, agent parser.AgentType) (parser.ProviderConfig, error) {
+	roots := rawSyncFilesystemRoots(cfg.ResolveDirs(agent))
+	for index, root := range roots {
+		absoluteRoot, err := filepath.Abs(root)
+		if err != nil {
+			return parser.ProviderConfig{}, fmt.Errorf(
+				"raw-sync resolve configured root for %s: %w", agent, err,
+			)
+		}
+		roots[index] = absoluteRoot
+	}
+	return parser.ProviderConfig{
+		Roots: roots, Machine: cfg.InstallationID,
+		SourceMachines: cfg.SourceMachines[agent],
+	}, nil
 }
 
 func rawSyncFilesystemRoots(roots []string) []string {
@@ -443,7 +490,7 @@ func rawSyncConfiguredRootForPath(configuredRoots []string, watchPath string) st
 }
 
 func runRawSyncStatus(ctx context.Context, out io.Writer) error {
-	cfg, err := config.LoadReadOnly()
+	cfg, err := config.LoadReadOnlyFor(config.ScopeLocal)
 	if err != nil {
 		return err
 	}
@@ -465,7 +512,7 @@ func runRawSyncStatus(ctx context.Context, out io.Writer) error {
 	return writeRawSyncStatus(out, status)
 }
 
-func writeRawSyncStatus(out io.Writer, status rawcheckpoint.ClientStatus) error {
+func writeRawSyncStatus(out io.Writer, status any) error {
 	payload, err := json.Marshal(status)
 	if err != nil {
 		return err

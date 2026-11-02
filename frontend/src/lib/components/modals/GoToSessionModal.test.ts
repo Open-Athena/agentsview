@@ -1,9 +1,9 @@
+import { reportErrorShown } from "../../utils/telemetry.js";
+vi.mock("../../utils/telemetry.js", () => ({ reportErrorShown: vi.fn() }));
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 import { ui } from "../../stores/ui.svelte.js";
-import { sessions } from "../../stores/sessions.svelte.js";
-import { router } from "../../stores/router.svelte.js";
 // @ts-ignore
 import GoToSessionModal from "./GoToSessionModal.svelte";
 
@@ -22,7 +22,6 @@ vi.mock("../../api/generated/index", () => ({
 }));
 
 vi.mock("../../api/runtime.js", () => ({
-
   isAbortError: vi.fn(
     (error: unknown) => error instanceof DOMException && error.name === "AbortError",
   ),
@@ -64,6 +63,7 @@ describe("GoToSessionModal", () => {
   let component: ReturnType<typeof mount> | undefined;
 
   beforeEach(() => {
+    vi.mocked(reportErrorShown).mockClear();
     document.body.innerHTML = "";
     ui.activeModal = "goToSession";
     harness.resolveSessionIds.mockReset();
@@ -149,7 +149,7 @@ describe("GoToSessionModal", () => {
   it.each([
     ["empty", "", "Enter a session ID or UUID."],
     ["unknown", UUID, "No session matches that ID or UUID."],
-  ] as const)("keeps the dialog open for %s input", async (_name, value, message) => {
+  ] as const)("suppresses error telemetry for %s input", async (_name, value, message) => {
     await open();
     await setInput(value);
 
@@ -158,13 +158,14 @@ describe("GoToSessionModal", () => {
     expect(document.querySelector('[role="alert"]')?.textContent).toContain(message);
     expect(ui.activeModal).toBe("goToSession");
     expect(harness.sessions.navigateToSession).not.toHaveBeenCalled();
+    expect(reportErrorShown).not.toHaveBeenCalled();
     expect(harness.router.navigateToSession).not.toHaveBeenCalled();
     if (_name === "empty") {
       expect(harness.resolveSessionIds).not.toHaveBeenCalled();
     }
   });
 
-  it("reports an ambiguous lookup result without changing the route", async () => {
+  it("shows an ambiguous lookup result without navigation or error telemetry", async () => {
     await open();
     harness.resolveSessionIds.mockResolvedValue({
       ids: [`codex:${UUID}`, `host~claude:${UUID}`],
@@ -176,6 +177,7 @@ describe("GoToSessionModal", () => {
     expect(document.querySelector('[role="alert"]')?.textContent).toContain(
       "Multiple sessions match that ID or UUID. Open the desired session from an existing link.",
     );
+    expect(reportErrorShown).not.toHaveBeenCalled();
     expect(ui.activeModal).toBe("goToSession");
     expect(harness.router.navigateToSession).not.toHaveBeenCalled();
   });
@@ -206,6 +208,7 @@ describe("GoToSessionModal", () => {
     expect(document.querySelector('[role="alert"]')?.textContent).toContain(
       "Could not look up that session. Try again.",
     );
+    expect(reportErrorShown).toHaveBeenCalledExactlyOnceWith("session");
     expect(input().value).toBe(UUID);
     expect(ui.activeModal).toBe("goToSession");
   });
@@ -216,10 +219,16 @@ describe("GoToSessionModal", () => {
     let resolveSecond!: (value: { ids: string[] }) => void;
     harness.resolveSessionIds
       .mockImplementationOnce(
-        () => new Promise<{ ids: string[] }>((resolve) => { resolveFirst = resolve; }),
+        () =>
+          new Promise<{ ids: string[] }>((resolve) => {
+            resolveFirst = resolve;
+          }),
       )
       .mockImplementationOnce(
-        () => new Promise<{ ids: string[] }>((resolve) => { resolveSecond = resolve; }),
+        () =>
+          new Promise<{ ids: string[] }>((resolve) => {
+            resolveSecond = resolve;
+          }),
       );
 
     await setInput(UUID);
@@ -235,7 +244,9 @@ describe("GoToSessionModal", () => {
     const latestUuid = UUID.replace("000", "001");
     resolveSecond({ ids: [`codex:${latestUuid}`] });
     await settle();
-    expect(harness.sessions.navigateToSession).toHaveBeenCalledExactlyOnceWith(`codex:${latestUuid}`);
+    expect(harness.sessions.navigateToSession).toHaveBeenCalledExactlyOnceWith(
+      `codex:${latestUuid}`,
+    );
     expect(harness.router.navigateToSession).toHaveBeenCalledExactlyOnceWith(`codex:${latestUuid}`);
   });
 
@@ -243,7 +254,10 @@ describe("GoToSessionModal", () => {
     await open();
     let resolve!: (value: { ids: string[] }) => void;
     harness.resolveSessionIds.mockImplementation(
-      () => new Promise<{ ids: string[] }>((done) => { resolve = done; }),
+      () =>
+        new Promise<{ ids: string[] }>((done) => {
+          resolve = done;
+        }),
     );
     await setInput(UUID);
     await pressKey("Enter");
@@ -259,7 +273,10 @@ describe("GoToSessionModal", () => {
     ui.activeModal = "goToSession";
     let resolveReplacement!: (value: { ids: string[] }) => void;
     harness.resolveSessionIds.mockImplementationOnce(
-      () => new Promise<{ ids: string[] }>((done) => { resolveReplacement = done; }),
+      () =>
+        new Promise<{ ids: string[] }>((done) => {
+          resolveReplacement = done;
+        }),
     );
     await open();
     await setInput(UUID);
@@ -276,7 +293,12 @@ describe("GoToSessionModal", () => {
     await open();
     const overlay = document.querySelector<HTMLElement>(".kit-modal-overlay")!;
 
-    overlay.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
+    // A full press on the overlay: kit-ui closes on the click that follows a
+    // press which starts and ends there, not on pointerdown alone.
+    const press = { bubbles: true, pointerId: 1 };
+    overlay.dispatchEvent(new PointerEvent("pointerdown", press));
+    overlay.dispatchEvent(new PointerEvent("pointerup", press));
+    overlay.dispatchEvent(new MouseEvent("click", { bubbles: true }));
 
     expect(ui.activeModal).toBeNull();
   });

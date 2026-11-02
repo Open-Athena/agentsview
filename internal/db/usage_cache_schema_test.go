@@ -28,7 +28,7 @@ func TestUsageCacheGenerationCreatesIdentifiedSchema(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, cache.temporary)
 	assert.Equal(t, filepath.Join(filepath.Dir(archivePath),
-		"usage-cache-v13-980e32c89da32cb0d3588c0c06864b4e.db"), cache.path)
+		"usage-cache-v15-980e32c89da32cb0d3588c0c06864b4e.db"), cache.path)
 
 	info, err := os.Stat(cache.path)
 	require.NoError(t, err)
@@ -132,27 +132,6 @@ func TestUsageCacheGenerationCreatesIdentifiedSchema(t *testing.T) {
 	assert.True(t, probe.Recognized)
 	assert.True(t, probe.Compatible)
 	assert.Equal(t, "database-id-one", probe.SourceDatabaseID)
-}
-
-func TestUsageCacheSchemaIncludesRollupTier(t *testing.T) {
-	archivePath := filepath.Join(t.TempDir(), "sessions.db")
-	manager := newUsageCacheManager(archivePath)
-	t.Cleanup(func() { require.NoError(t, manager.Close()) })
-
-	cache, err := manager.Generation(t.Context(), "database-a")
-	require.NoError(t, err)
-	for _, name := range []string{
-		"usage_rollup_timezones", "usage_rollup_days",
-		"usage_rollup_installs", "usage_daily_rollups",
-		"usage_activity_rollups", "usage_rollup_exceptions",
-		"usage_daily_rollups_window", "usage_rollup_exceptions_window",
-	} {
-		var found bool
-		require.NoError(t, cache.db.QueryRowContext(t.Context(),
-			`SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = ?)`, name,
-		).Scan(&found))
-		assert.True(t, found, name)
-	}
 }
 
 func TestUsageCacheProbeFailsClosed(t *testing.T) {

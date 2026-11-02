@@ -923,11 +923,7 @@ func sessionsFinal(root *db.Session, descendants []db.Session) bool {
 }
 
 func sessionFinal(session *db.Session) bool {
-	if session == nil || session.TerminationStatus == nil {
-		return false
-	}
-	status := parser.TerminationStatus(*session.TerminationStatus)
-	return status == parser.TerminationAwaitingUser || status == parser.TerminationClean
+	return session != nil && parser.TerminationComplete(session.TerminationStatus)
 }
 
 func sessionsHaveMalformedLines(root *db.Session, descendants []db.Session) bool {
@@ -1018,7 +1014,12 @@ func applyUsageResult(
 		}
 		usage := &TokenUsage{OutputTokens: &totals.OutputTokens}
 		if complete {
-			usage.InputTokens = &totals.InputTokens
+			input := totals.InputTokens
+			if Provider(provider) == ProviderCodex {
+				// Schema v1 reports Codex cache writes as unavailable, so they stay inside input.
+				input += totals.CacheCreationTokens
+			}
+			usage.InputTokens = &input
 			usage.CacheReadInputTokens = &totals.CacheReadTokens
 			if Provider(provider) == ProviderClaude {
 				usage.CacheCreationInputTokens = &totals.CacheCreationTokens

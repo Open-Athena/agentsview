@@ -17,6 +17,19 @@ func TestRawProjectionRejectsImageOffload(t *testing.T) {
 	require.ErrorContains(t, err, "tool_result_images = offload is not supported for hosted raw derivation")
 }
 
+func TestRawPayloadKeepsDialogueInDerivedState(t *testing.T) {
+	p := ingest.PreparedSession{Messages: []db.Message{{Ordinal: 0, Role: "assistant", Content: "rendered answer"}}}
+	original, err := encodeRawPayload(p)
+	require.NoError(t, err)
+	for _, dialogue := range []string{"answer", ""} {
+		p.Messages[0].DialogueText = new(dialogue)
+		encoded, err := encodeRawPayload(p)
+		require.NoError(t, err)
+		assert.Equal(t, original, encoded, "dialogue changes preserve the immutable payload")
+		assert.Equal(t, new(dialogue), p.Messages[0].DialogueText, "encoding preserves the caller's derived state")
+	}
+}
+
 func TestRawContentRevisionRetainsHiddenSemanticFields(t *testing.T) {
 	original := ingest.PreparedSession{Session: db.Session{ID: "physical", Machine: "device", SessionName: new("provider title")}, Messages: []db.Message{{Ordinal: 0, Role: "assistant", Content: "same", ToolCalls: []db.ToolCall{{ToolName: "Bash", InputJSON: `{"a":1,"b":2}`, ResultEvents: []db.ToolResultEvent{{Content: "same", RawContentDigest: []byte("transport")}}}}}}}
 	digest, err := rawContentRevision(original)
@@ -34,11 +47,19 @@ func TestRawContentRevisionRetainsHiddenSemanticFields(t *testing.T) {
 		p.Session.Machine = "other"
 		p.Session.FilePath = new("capture.jsonl")
 		p.Session.FileMtime = new(int64(99))
+		p.Session.TrashIncludesCodexPages = true
 		p.Messages[0].ToolCalls[0].ResultEvents[0].RawContentDigest = []byte("other transport")
 		p.Messages[0].ToolCalls[0].InputJSON = `{ "b": 2, "a": 1 }`
 		got, err := rawContentRevision(p)
 		require.NoError(t, err)
 		assert.Equal(t, digest, got)
+	})
+	t.Run("group metadata", func(t *testing.T) {
+		p := clone()
+		p.Session.GroupKey = "job-a"
+		got, err := rawContentRevision(p)
+		require.NoError(t, err)
+		assert.NotEqual(t, digest, got)
 	})
 	t.Run("derivation version metadata", func(t *testing.T) {
 		p := clone()
@@ -66,6 +87,16 @@ func TestRawContentRevisionRetainsHiddenSemanticFields(t *testing.T) {
 	t.Run("semantic tool path", func(t *testing.T) {
 		p := clone()
 		p.Messages[0].ToolCalls[0].FilePath = "src/changed.go"
+		got, err := rawContentRevision(p)
+		require.NoError(t, err)
+		assert.NotEqual(t, digest, got)
+	})
+	t.Run("pull request links", func(t *testing.T) {
+		p := clone()
+		p.Session.PRLinks = []db.PRLink{{
+			URL:  "https://github.com/acme/widgets/pull/7",
+			Host: "github.com", Repository: "acme/widgets", Number: 7,
+		}}
 		got, err := rawContentRevision(p)
 		require.NoError(t, err)
 		assert.NotEqual(t, digest, got)
@@ -101,6 +132,74 @@ func TestRawContentRevisionIgnoresOnlyRecencyDerivedState(t *testing.T) {
 	assert.NotEqual(t, stableSignal, semantic, "actual transcript semantics remain content")
 }
 
+func TestRawContentRevisionIgnoresDerivedFriction(t *testing.T) {
+	p := ingest.PreparedSession{
+		Session: db.Session{
+			FrictionCount: 1, FrictionRulesVersion: "friction-v1",
+			FrictionHash: "friction-hash",
+		},
+		Friction: db.SessionFrictionUpdate{
+			RulesVersion: "friction-v1",
+			Hash:         "friction-hash",
+			Findings: []db.FrictionFinding{{
+				SessionID: "captured-session", Kind: "error", Detector: "tool-error",
+				Text: "command failed", Fingerprint: "finding-fingerprint",
+			}},
+		},
+	}
+	first, err := rawContentRevision(p)
+	require.NoError(t, err)
+
+	changedRows := p
+	changedRows.Friction.Findings = append([]db.FrictionFinding(nil), p.Friction.Findings...)
+	changedRows.Friction.Findings[0].Text = "different projected row text"
+	rowsRevision, err := rawContentRevision(changedRows)
+	require.NoError(t, err)
+	assert.Equal(t, first, rowsRevision, "derived findings do not change source content")
+
+	changed := p
+	changed.Session.FrictionCount++
+	changed.Session.FrictionRulesVersion = "updated-rules"
+	changed.Session.FrictionHash = "updated-hash"
+	second, err := rawContentRevision(changed)
+	require.NoError(t, err)
+	assert.Equal(t, first, second, "derived summaries do not change source content")
+
+	changed = p
+	changed.Friction.Findings = append([]db.FrictionFinding(nil), p.Friction.Findings...)
+	changed.Friction.Findings[0].SessionID = "other-captured-session"
+	third, err := rawContentRevision(changed)
+	require.NoError(t, err)
+	assert.Equal(t, first, third, "source session IDs are transport metadata")
+}
+
+func TestRawContentRevisionIgnoresFrictionSubjectIDs(t *testing.T) {
+	messages := []db.Message{
+		{Ordinal: 0, Role: "assistant", Content: "Here is the first answer."},
+		{Ordinal: 1, Role: "user", Content: "no, you misunderstood the goal here"},
+		{Ordinal: 2, Role: "assistant", Content: "Here is the revised answer."},
+	}
+	prepared := func(id string) ingest.PreparedSession {
+		return ingest.PreparedSession{
+			Session:  db.Session{ID: id, Agent: "codex", Machine: "hosted"},
+			Messages: append([]db.Message(nil), messages...),
+		}
+	}
+	first := prepared("captured-private-session-a")
+	second := prepared("captured-private-session-b")
+
+	require.NoError(t, ingest.RefreshFriction(&first, ingest.ContentOptions{}))
+	require.NoError(t, ingest.RefreshFriction(&second, ingest.ContentOptions{}))
+	require.Len(t, first.Friction.Findings, 1)
+	require.Len(t, second.Friction.Findings, 1)
+	assert.NotEqual(t, first.Friction.Findings[0].Fingerprint, second.Friction.Findings[0].Fingerprint)
+	firstRevision, err := rawContentRevision(first)
+	require.NoError(t, err)
+	secondRevision, err := rawContentRevision(second)
+	require.NoError(t, err)
+	assert.Equal(t, firstRevision, secondRevision, "capture IDs do not change source content through derived findings")
+}
+
 func TestRawContentRevisionJSONRepresentation(t *testing.T) {
 	p := ingest.PreparedSession{Messages: []db.Message{{
 		Role:       "assistant",
@@ -110,7 +209,24 @@ func TestRawContentRevisionJSONRepresentation(t *testing.T) {
 	}}}
 	got, err := rawContentRevision(p)
 	require.NoError(t, err)
-	// Recorded with the original normalized-content-v1 encoder. Existing
-	// content identities must survive a change of JSON implementation.
+	// The original normalized-content-v1 digest must survive encoder changes.
 	assert.Equal(t, "d5c710716bc7b8a68d60e43d58192489be71935625e141f9eb6c9dae723c3a29", got)
+	key, err := rawMessageKey(p.Messages[0])
+	require.NoError(t, err)
+	p.Signals.ToolObservations = []db.ToolObservation{{Outcome: "empty", Repeat: "exact", SequenceEnding: new("abandoned")}}
+	call := &p.Messages[0].ToolCalls[0]
+	call.ObservedOutcome, call.ObservedRepeat, call.SequenceEnding = new("empty"), new("exact"), new("abandoned")
+	derived, err := rawContentRevision(p)
+	require.NoError(t, err)
+	assert.Equal(t, got, derived)
+	derivedKey, err := rawMessageKey(p.Messages[0])
+	require.NoError(t, err)
+	assert.Equal(t, key, derivedKey)
+	p.Messages[0].DialogueText = new("<>&\u2028\u2029")
+	projected, err := rawContentRevision(p)
+	require.NoError(t, err)
+	assert.Equal(t, got, projected, "local search projections preserve capture identity")
+	projectedKey, err := rawMessageKey(p.Messages[0])
+	require.NoError(t, err)
+	assert.Equal(t, key, projectedKey)
 }

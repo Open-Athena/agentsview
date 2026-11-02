@@ -13,18 +13,6 @@ import (
 	"go.kenn.io/agentsview/internal/money"
 )
 
-// activityReportRangeBoundsUTC returns the exact [start, end) UTC bounds
-// of the resolved range `q` as RFC3339 strings. It mirrors the SQLite and
-// DuckDB backends so the candidate-session predicate selects exactly the
-// sessions whose window intersects the range, with no padding slop.
-// PostgreSQL compares parsed instants (the bounds are cast to
-// timestamptz), so it keeps the zone suffix, unlike SQLite's zone-less
-// TEXT comparison.
-func activityReportRangeBoundsUTC(q activity.Query) (string, string) {
-	return q.RangeStart.UTC().Format(time.RFC3339),
-		q.RangeEnd.UTC().Format(time.RFC3339)
-}
-
 // GetActivityReport assembles a concurrency- and usage-oriented report
 // for the resolved range `q`, reading from the PostgreSQL store. It
 // mirrors the SQLite (*DB).GetActivityReport: sessions and activity come from
@@ -47,9 +35,24 @@ func (s *Store) GetActivityReport(
 	if err != nil {
 		return activity.Report{}, err
 	}
-	artifacts.Report.BySession = artifacts.Sessions
-	artifacts.Report.SessionsTotal = len(artifacts.Sessions)
-	return artifacts.Report, nil
+	return activity.ReportWithSessions(artifacts), nil
+}
+
+type activityReportBackend struct {
+	*Store
+	lowerBound, upperBound string
+}
+
+func (b activityReportBackend) ActivityReportUsage(
+	ctx context.Context, ids []string, q activity.Query,
+) ([]activity.UsageRow, *export.PricingBlock, error) {
+	return b.activityReportUsage(ctx, ids, b.lowerBound, b.upperBound, q)
+}
+
+func (b activityReportBackend) ActivityReportMessageCounts(
+	ctx context.Context, ids []string, q activity.Query, artifacts *activity.CandidateArtifacts,
+) error {
+	return b.activityReportMessageCounts(ctx, ids, q, artifacts)
 }
 
 func (s *Store) BuildActivityReportArtifacts(
@@ -58,82 +61,57 @@ func (s *Store) BuildActivityReportArtifacts(
 	q activity.Query,
 	onProgress activity.ProgressFunc,
 ) (activity.CandidateArtifacts, error) {
-	pgReportProgress(onProgress, activity.Progress{Phase: activity.ProgressLoadingSessions})
+	activity.ReportProgress(onProgress, activity.Progress{Phase: activity.ProgressLoadingSessions})
 	f.IncludeSubagents = true
 	f.IncludeForks = true
-	rangeStartUTC, rangeEndUTC := activityReportRangeBoundsUTC(q)
-	lowerBound := paddedUTCBound(q.RangeStart.UTC().Format(time.RFC3339), -14)
-	upperBound := paddedUTCBound(q.RangeEnd.UTC().Format(time.RFC3339), 14)
+	rangeStartUTC, rangeEndUTC := db.ActivityReportInstantBoundsUTC(q)
+	lowerBound := db.PaddedUTCBound(q.RangeStart.UTC().Format(time.RFC3339), -14)
+	upperBound := db.PaddedUTCBound(q.RangeEnd.UTC().Format(time.RFC3339), 14)
 
 	sessions, ids, err := s.activityReportSessions(
 		ctx, f, rangeStartUTC, rangeEndUTC)
 	if err != nil {
 		return activity.CandidateArtifacts{}, err
 	}
-	pgReportProgress(onProgress, activity.Progress{
+	activity.ReportProgress(onProgress, activity.Progress{
 		Phase: activity.ProgressLoadingUsage, SessionsTotal: len(sessions),
 	})
 
-	usage, pricing, err := s.activityReportUsage(ctx, ids, lowerBound, upperBound, q)
-	if err != nil {
-		return activity.CandidateArtifacts{}, err
+	backend := activityReportBackend{
+		Store:      s,
+		lowerBound: lowerBound, upperBound: upperBound,
 	}
-
-	rowsProcessed := int64(0)
-	source := s.activityReportCandidateSource(ids, q)
-	artifacts, err := activity.BuildCandidateArtifactsFromSourceWithSurvivorUsage(ctx, activity.Params{
-		RangeStart:    q.RangeStart,
-		RangeEnd:      q.RangeEnd,
-		Loc:           q.Loc,
-		EffectiveEnd:  q.EffectiveEnd,
-		Partial:       q.Partial,
-		GapCapSeconds: q.GapCapSeconds,
-		Bucket:        q.Bucket,
-	}, sessions, func(
-		ctx context.Context, yield func(activity.IntervalCandidate) error,
-	) error {
-		pgReportProgress(onProgress, activity.Progress{
-			Phase: activity.ProgressScanningActivity, SessionsTotal: len(sessions),
-		})
-		return source(ctx, func(candidate activity.IntervalCandidate) error {
-			rowsProcessed++
-			pgReportProgress(onProgress, activity.Progress{
-				Phase:         activity.ProgressScanningActivity,
-				SessionsTotal: len(sessions), RowsProcessed: rowsProcessed,
-			})
-			return yield(candidate)
-		})
-	}, usage)
-	if err != nil {
-		return activity.CandidateArtifacts{}, fmt.Errorf("aggregating pg activity report: %w", err)
-	}
-	pgReportProgress(onProgress, activity.Progress{
-		Phase: activity.ProgressFinalizing, SessionsTotal: len(sessions),
-		SessionsProcessed: len(sessions), RowsProcessed: rowsProcessed,
-	})
-	artifacts.Report.SchemaVersion = export.ActivityReportSchemaVersion
-	artifacts.Report.Pricing = pricing
-	projects, err := s.BuildProjectIdentityMap(ctx,
-		activityReportProjectLabels(sessions))
-	if err != nil {
-		return activity.CandidateArtifacts{}, err
-	}
-	artifacts.Report.BySession = artifacts.Sessions
-	activity.SanitizeProjectLabels(&artifacts.Report, projects)
-	artifacts.Sessions = artifacts.Report.BySession
-	artifacts.Report.BySession = []activity.SessionRow{}
-	artifacts.Report.Projects = export.ProjectMapForWire(projects)
-	pgReportProgress(onProgress, activity.Progress{
-		Phase: activity.ProgressDone, SessionsTotal: len(sessions),
-		SessionsProcessed: len(sessions), RowsProcessed: rowsProcessed,
-	})
-	return artifacts, nil
+	artifacts, _, err := activity.BuildReportArtifacts(
+		ctx, backend, sessions, ids, q, onProgress, "aggregating pg activity report")
+	return artifacts, err
 }
 
-func pgReportProgress(callback activity.ProgressFunc, progress activity.Progress) {
-	if callback != nil {
-		callback(progress)
+func (s *Store) activityReportMessageCounts(
+	ctx context.Context, ids []string, q activity.Query, artifacts *activity.CandidateArtifacts,
+) error {
+	if len(ids) == 0 {
+		return nil
 	}
+	rows, err := s.pg.QueryContext(ctx, `
+		SELECT session_id, role, timestamp FROM messages
+		WHERE session_id = ANY($1)
+			AND role IN ('user', 'assistant') AND is_system = false
+			AND COALESCE(source_subtype, '') <> 'tool_result'
+			AND timestamp >= $2 AND timestamp < $3`, ids, q.RangeStart, q.EffectiveEnd)
+	if err != nil {
+		return fmt.Errorf("querying pg activity message counts: %w", err)
+	}
+	defer rows.Close()
+	counts := activity.NewMessageAccumulator(q, artifacts)
+	for rows.Next() {
+		var sessionID, role string
+		var timestamp time.Time
+		if err := rows.Scan(&sessionID, &role, &timestamp); err != nil {
+			return fmt.Errorf("scanning pg activity message counts: %w", err)
+		}
+		counts.Add(sessionID, role, timestamp)
+	}
+	return rows.Err()
 }
 
 // GetSessionUsageRows returns the backend-priced usage rows for the supplied
@@ -194,8 +172,6 @@ func (s *Store) GetSessionUsageRows(
 		return pgSessionUsageRowLess(rowsAcc[i], rowsAcc[j], sessionOrder)
 	})
 	snapshotRows := make([]activity.UsageRow, len(rowsAcc))
-	rowContributes := make([]bool, len(rowsAcc))
-	rawOutputTokensBySession := make(map[string]int)
 	for i, o := range rowsAcc {
 		inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok := pgDailyUsageRowTokens(
 			pgDailyUsageScanRow{
@@ -210,6 +186,7 @@ func (s *Store) GetSessionUsageRows(
 			},
 		)
 		snapshotRows[i] = activity.UsageRow{
+			Model:               o.scan.model,
 			SessionID:           o.scan.sessionID,
 			Timestamp:           o.tsText,
 			MessageOrdinal:      o.ordinal,
@@ -227,62 +204,14 @@ func (s *Store) GetSessionUsageRows(
 			SourceUUID:      o.scan.sourceUUID,
 			UsageDedupKey:   o.scan.usageDedupKey,
 		}
-		rowContributes[i] = activity.UsageDataContributes(
+		snapshotRows[i].Contributes = activity.UsageDataContributes(
 			o.scan.cost.Valid, inputTok, outputTok, reasoningTok,
 			cacheCrTok, cacheRdTok,
 			pgUsageRowWebSearchRequests(o.scan.usageSource, o.scan.tokenJSON))
-		rawOutputTokensBySession[o.scan.sessionID] += outputTok
 	}
-	canonicalTokenCoverageBySession, err := activity.CanonicalSessionTokenCoverageContext(ctx, snapshotRows)
-	if err != nil {
-		return nil, err
-	}
-	snapshotMask, snapshotAttribution, snapshotWebSearchRequests := activity.ClaudeSnapshotSurvivorSelection(snapshotRows)
-	seen := make(map[pgUsageDedupToken]struct{})
-	deduplicatedOutputTokens := make(map[string]int)
-	discardedContributingSessions := make(map[string]struct{})
-	out := make([]activity.UsageRow, 0, len(rowsAcc))
-	for i, o := range rowsAcc {
-		if !snapshotMask[i] {
-			deduplicatedOutputTokens[o.scan.sessionID] += snapshotRows[i].OutputTokens
-			if rowContributes[i] {
-				discardedContributingSessions[o.scan.sessionID] = struct{}{}
-			}
-			continue
-		}
+	return activity.SelectSessionUsageRows(ctx, snapshotRows, func(i int, webSearches int) (activity.UsagePrice, error) {
+		o := rowsAcc[i]
 		r := o.scan
-		inputTok, outputTok, cacheCrTok, cacheRdTok, _ := pgDailyUsageRowTokens(
-			pgDailyUsageScanRow{
-				messageOrdinal:           r.messageOrdinal,
-				usageSource:              r.usageSource,
-				tokenJSON:                r.tokenJSON,
-				inputTokens:              r.inputTokens,
-				outputTokens:             r.outputTokens,
-				cacheCreationInputTokens: r.cacheCreationInputTokens,
-				cacheReadInputTokens:     r.cacheReadInputTokens,
-				reasoningTokens:          r.reasoningTokens,
-			},
-		)
-		attributionSessionID := snapshotAttribution[i]
-		if attributionSessionID != r.sessionID {
-			deduplicatedOutputTokens[r.sessionID] += outputTok
-			if rowContributes[i] {
-				discardedContributingSessions[r.sessionID] = struct{}{}
-			}
-		}
-		if key, ok := pgUsageDedupTokenForRow(
-			r.usageSource, r.agent, r.claudeMessageID,
-			r.claudeRequestID, r.sourceUUID, r.usageDedupKey,
-		); ok {
-			if _, dup := seen[key]; dup {
-				deduplicatedOutputTokens[r.sessionID] += outputTok
-				if rowContributes[i] {
-					discardedContributingSessions[r.sessionID] = struct{}{}
-				}
-				continue
-			}
-			seen[key] = struct{}{}
-		}
 		costRow := r
 		var sessionCost *money.Money
 		if r.costSource == db.CopilotReportedCostSource && r.cost.Valid {
@@ -292,66 +221,19 @@ func (s *Store) GetSessionUsageRows(
 			rateResolver.RecordUnattributedReported()
 		}
 		cost, priced, contributes, priceErr := pgSessionRowCostWithWebSearchRequests(
-			costRow, snapshotWebSearchRequests[i], rateResolver)
+			costRow, webSearches, rateResolver)
 		if priceErr != nil {
-			return nil, priceErr
+			return activity.UsagePrice{}, priceErr
 		}
 		costSource := export.CostSourceComputed
 		if costRow.cost.Valid {
 			costSource = export.CostSourceReported
 		}
-		out = append(out, activity.UsageRow{
-			SessionID:       attributionSessionID,
-			SourceSessionID: r.sessionID,
-			Model:           r.model,
-			Timestamp:       o.tsText,
-			OutputTokens:    outputTok,
-			Cost:            cost,
-			CostSource:      costSource,
-			SessionCost:     sessionCost,
-			Priced:          priced,
-			Contributes:     contributes,
-			Agent:           r.agent,
-			ProviderID:      r.providerID,
-			ClaudeMessageID: r.claudeMessageID,
-			ClaudeRequestID: r.claudeRequestID,
-			SourceUUID:      r.sourceUUID,
-			UsageDedupKey:   r.usageDedupKey,
-
-			UsageSource:         r.usageSource,
-			MessageOrdinal:      pgUsageRowMessageOrdinal(r.messageOrdinal),
-			InputTokens:         inputTok,
-			CacheCreationTokens: cacheCrTok,
-			CacheReadTokens:     cacheRdTok,
-			WebSearchRequests:   snapshotWebSearchRequests[i],
-		})
-	}
-	return &activity.SessionUsageRows{
-		Rows:                            out,
-		RawOutputTokensBySession:        rawOutputTokensBySession,
-		DeduplicatedOutputTokens:        deduplicatedOutputTokens,
-		DiscardedContributingSessions:   discardedContributingSessions,
-		CanonicalTokenCoverageBySession: canonicalTokenCoverageBySession,
-	}, nil
-}
-
-// pgNullInt64Pointer converts a nullable message ordinal into the pointer
-// shape SessionUsageBreakdownEntry uses.
-func pgNullInt64Pointer(v sql.NullInt64) *int {
-	if !v.Valid {
-		return nil
-	}
-	out := int(v.Int64)
-	return &out
-}
-
-// pgUsageRowMessageOrdinal renders a nullable message ordinal in
-// activity.UsageRow's COALESCE(message_ordinal, -1) convention.
-func pgUsageRowMessageOrdinal(v sql.NullInt64) int64 {
-	if !v.Valid {
-		return -1
-	}
-	return v.Int64
+		return activity.UsagePrice{
+			Cost: cost, CostSource: costSource, SessionCost: sessionCost,
+			Priced: priced, Contributes: contributes,
+		}, nil
+	})
 }
 
 func pgSessionUsageRowLess(
@@ -385,14 +267,6 @@ func pgSessionUsageRowLess(
 	return !a.scan.ts.Valid && a.tsText < b.tsText
 }
 
-func activityReportProjectLabels(sessions []activity.SessionMeta) []string {
-	set := make(map[string]struct{}, len(sessions))
-	for _, session := range sessions {
-		set[session.Project] = struct{}{}
-	}
-	return sortedStringSetKeys(set)
-}
-
 // activityReportSessions returns the candidate sessions whose window
 // overlaps the exact range [rangeStartUTC, rangeEndUTC), plus their
 // IDs. The ID set defines the scope for the activity and usage fetches.
@@ -410,7 +284,7 @@ func (s *Store) activityReportSessions(
 	ctx context.Context, f db.AnalyticsFilter, rangeStartUTC, rangeEndUTC string,
 ) ([]activity.SessionMeta, []string, error) {
 	pb := &paramBuilder{}
-	where := buildAnalyticsWhereWithDate(f, "", pb, false, "s.id")
+	where := buildAnalyticsWhereWithDate(f, "", pb, false, "s.id", s.sessionDialect())
 	lower := pb.add(rangeStartUTC)
 	upper := pb.add(rangeEndUTC)
 
@@ -926,7 +800,7 @@ func pgActivityReportRowStatusWithWebSearchRequests(
 	if err != nil {
 		return money.Money{}, false, false, err
 	}
-	requestScoped := pgUsageRowIsRequestScoped(r.usageSource, r.messageOrdinal)
+	requestScoped := db.UsageRowIsRequestScoped(r.usageSource, r.messageOrdinal)
 	cost, err = lookup.Rates.CostForTokensScoped(
 		requestScoped,
 		inTok, outTok, reasoningTok, crTok, cr1hTok, rdTok)
@@ -939,7 +813,7 @@ func pgActivityReportRowStatusWithWebSearchRequests(
 		return money.Money{}, false, false,
 			fmt.Errorf("pricing pg activity usage for model %q: %w", r.model, err)
 	}
-	pgRecordComputedUsagePricing(
+	db.RecordComputedUsagePricing(
 		pricing, r.model, pricedModel, lookup,
 		requestScoped, inTok, crTok, rdTok)
 	return cost, true, true, nil

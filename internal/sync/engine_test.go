@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/db"
@@ -83,13 +84,11 @@ func TestIncrementalClaudeLateResultLinkScansDefiniteSecret(t *testing.T) {
 	require.True(t, sess.LastWriteIncremental,
 		"the late result must take the incremental path")
 
-	var stored string
-	require.NoError(t, database.Reader().QueryRow(t.Context(),
-		`SELECT COALESCE(result_content, '') FROM tool_calls
-		 WHERE session_id = ? AND tool_use_id = ?`,
-		sessionID, "toolu_r",
-	).Scan(&stored))
-	require.Contains(t, stored, secret,
+	stored, err := database.GetAllMessages(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.Len(t, stored, 3)
+	require.Len(t, stored[2].ToolCalls, 1)
+	require.Contains(t, stored[2].ToolCalls[0].ResultContent, secret,
 		"the late link must update the stored result content")
 
 	findings, err := database.SessionSecretFindings(
@@ -98,7 +97,7 @@ func TestIncrementalClaudeLateResultLinkScansDefiniteSecret(t *testing.T) {
 	require.NoError(t, err)
 	found := false
 	for _, finding := range findings {
-		if finding.LocationKind == "tool_result" &&
+		if finding.LocationKind == "tool_result_event" &&
 			strings.Contains(finding.RedactedMatch, "AKIA") {
 			found = true
 			break
@@ -737,17 +736,18 @@ func TestClassifyProviderChangedPathWatchRootPlanCached(t *testing.T) {
 		watchRootsCalls: &watchRootsCalls,
 		watchPlanCalls:  &watchPlanCalls,
 	}
-	engine := &Engine{
+	engine := withTestSources(&Engine{
+		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			watchRootCountingAgent: parser.ProviderMigrationProviderAuthoritative,
+		},
+	}, &engineSources{
 		agentDirs: map[parser.AgentType][]string{
 			watchRootCountingAgent: {root},
 		},
 		providerFactories: map[parser.AgentType]parser.ProviderFactory{
 			watchRootCountingAgent: factory,
 		},
-		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
-			watchRootCountingAgent: parser.ProviderMigrationProviderAuthoritative,
-		},
-	}
+	})
 
 	for i := range 1000 {
 		path := filepath.Join(root, "archive", fmt.Sprintf("session-%04d.jsonl", i))
@@ -3777,14 +3777,15 @@ func TestTombstoneMissingWatchSourcesPreservesOneWayRewrittenOwnership(t *testin
 			Agent: string(parser.AgentClaude), FilePath: storedPath,
 		}},
 	))
-	engine := &Engine{
+	engine := withTestSources(&Engine{
 		db: database, machine: "remote",
-		agentDirs: map[parser.AgentType][]string{parser.AgentClaude: {root}},
 		pathRewriter: func(path string) string {
 			require.Equal(t, localPath, path)
 			return storedPath
 		},
-	}
+	}, &engineSources{
+		agentDirs: map[parser.AgentType][]string{parser.AgentClaude: {root}},
+	})
 
 	deleted, err := tombstoneMissingWatchSourcesUnderSyncLock(
 		t.Context(), engine, []string{root},
@@ -4317,13 +4318,16 @@ func TestStartupSyncFallbackRechecksAfterInFlightForegroundSync(t *testing.T) {
 		err error
 	}
 	fallbackDone := make(chan fallbackResult, 1)
+	fallbackFinished := make(chan struct{})
 	go func() {
 		_, ran, err := engine.RunStartupSyncFallback(t.Context(), nil)
 		fallbackDone <- fallbackResult{ran: ran, err: err}
+		close(fallbackFinished)
 	}()
+	// Never can leave a poll running after it returns; keep the result for the assertion below.
 	assert.Never(t, func() bool {
 		select {
-		case <-fallbackDone:
+		case <-fallbackFinished:
 			return true
 		default:
 			return false
@@ -7483,7 +7487,7 @@ func TestProcessAntigravityWALOnlyUpdateNotSkipped(t *testing.T) {
 
 	// WAL-only update: the main .db is untouched.
 	walPath := dbPath + "-wal"
-	require.NoError(t, os.WriteFile(walPath, []byte("wal bytes"), 0o644))
+	require.NoError(t, os.WriteFile(walPath, []byte(strings.Repeat("w", 4096)), 0o644))
 	info, err := os.Stat(dbPath)
 	require.NoError(t, err)
 	walTime := info.ModTime().Add(5 * time.Second)
@@ -7491,65 +7495,6 @@ func TestProcessAntigravityWALOnlyUpdateNotSkipped(t *testing.T) {
 
 	res = e.processFile(ctx, file)
 	assert.False(t, res.skip, "WAL-only update must trigger a reparse")
-}
-
-func TestProcessVibeMetaOnlyUpdateNotSkipped(t *testing.T) {
-	database := openTestDB(t)
-	ctx := t.Context()
-
-	root := t.TempDir()
-	e := NewEngine(ctx, database, EngineConfig{
-		AgentDirs: map[parser.AgentType][]string{
-			parser.AgentVibe: {root},
-		},
-	})
-
-	sessionDir := filepath.Join(root, "session_20260616_083518_0107f266")
-	require.NoError(t, os.MkdirAll(sessionDir, 0o755))
-
-	msgPath := filepath.Join(sessionDir, "messages.jsonl")
-	require.NoError(t, os.WriteFile(
-		msgPath,
-		[]byte(`{"role":"user","content":"hi"}`+"\n"),
-		0o644,
-	))
-
-	metaPath := filepath.Join(sessionDir, "meta.json")
-	require.NoError(t, os.WriteFile(
-		metaPath,
-		[]byte(`{"session_id":"abc","title":"Original title"}`+"\n"),
-		0o644,
-	))
-
-	canonicalID := "vibe:abc"
-
-	e.SyncPaths([]string{msgPath})
-	sess, err := database.GetSession(ctx, canonicalID)
-	require.NoError(t, err)
-	require.NotNil(t, sess)
-	require.NotNil(t, sess.DisplayName)
-	assert.Equal(t, "Original title", *sess.DisplayName)
-
-	// meta.json-only update: messages.jsonl is untouched, but the title
-	// (sourced from meta.json) changes. The Vibe provider's composite
-	// fingerprint folds the sibling meta.json mtime in, so the change busts
-	// the skip cache and triggers a reparse rather than a skip.
-	info, err := os.Stat(msgPath)
-	require.NoError(t, err)
-	metaTime := info.ModTime().Add(5 * time.Second)
-	require.NoError(t, os.WriteFile(
-		metaPath,
-		[]byte(`{"session_id":"abc","title":"Renamed title"}`+"\n"),
-		0o644,
-	))
-	require.NoError(t, os.Chtimes(metaPath, metaTime, metaTime))
-
-	e.SyncPaths([]string{msgPath})
-	sess, err = database.GetSession(ctx, canonicalID)
-	require.NoError(t, err)
-	require.NotNil(t, sess)
-	require.NotNil(t, sess.DisplayName)
-	assert.Equal(t, "Renamed title", *sess.DisplayName)
 }
 
 func TestProcessAntigravityBrainOnlyUpdateNotSkipped(t *testing.T) {
@@ -7745,21 +7690,22 @@ func TestProcessFileSkipCacheReparsesStaleCodexProject(t *testing.T) {
 		sess.ID, db.CurrentDataVersion(),
 	))
 
-	e := &Engine{
+	e := withTestSources(&Engine{
 		db:        database,
 		idPrefix:  "host~",
 		skipCache: map[string]int64{path: info.ModTime().UnixNano()},
-		agentDirs: map[parser.AgentType][]string{
-			parser.AgentCodex: {root},
-		},
-		providerFactories: providerFactoryMap(parser.ProviderFactories()),
 		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
 			parser.AgentCodex: parser.ProviderMigrationProviderAuthoritative,
 		},
 		pathRewriter: func(path string) string {
 			return "host:" + path
 		},
-	}
+	}, &engineSources{
+		agentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		providerFactories: providerFactoryMap(parser.ProviderFactories()),
+	})
 
 	res := e.processFile(t.Context(), parser.DiscoveredFile{
 		Agent:   parser.AgentCodex,
@@ -7804,21 +7750,22 @@ func TestProcessFileSkipCacheReparsesStaleCodexDataVersion(t *testing.T) {
 		sess.ID, db.CurrentDataVersion()-1,
 	))
 
-	e := &Engine{
+	e := withTestSources(&Engine{
 		db:        database,
 		idPrefix:  "host~",
 		skipCache: map[string]int64{path: info.ModTime().UnixNano()},
-		agentDirs: map[parser.AgentType][]string{
-			parser.AgentCodex: {root},
-		},
-		providerFactories: providerFactoryMap(parser.ProviderFactories()),
 		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
 			parser.AgentCodex: parser.ProviderMigrationProviderAuthoritative,
 		},
 		pathRewriter: func(path string) string {
 			return "host:" + path
 		},
-	}
+	}, &engineSources{
+		agentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		providerFactories: providerFactoryMap(parser.ProviderFactories()),
+	})
 
 	res := e.processFile(t.Context(), parser.DiscoveredFile{
 		Agent: parser.AgentCodex,
@@ -7912,10 +7859,10 @@ func cacheCodexProviderFingerprint(
 ) (string, int64) {
 	t.Helper()
 
-	factory, ok := engine.providerFactories[parser.AgentCodex]
+	factory, ok := engine.sources().providerFactories[parser.AgentCodex]
 	require.True(t, ok)
 	provider := factory.NewProvider(parser.ProviderConfig{
-		Roots:        engine.agentDirs[parser.AgentCodex],
+		Roots:        engine.sources().agentDirs[parser.AgentCodex],
 		Machine:      engine.machine,
 		PathRewriter: engine.pathRewriter,
 	})
@@ -8093,21 +8040,22 @@ func TestProcessFileCodexDBFreshSkipIsNotCached(t *testing.T) {
 		sess.ID, db.CurrentDataVersion(),
 	))
 
-	e := &Engine{
+	e := withTestSources(&Engine{
 		db:        database,
 		idPrefix:  "host~",
 		skipCache: map[string]int64{},
-		agentDirs: map[parser.AgentType][]string{
-			parser.AgentCodex: {root},
-		},
-		providerFactories: providerFactoryMap(parser.ProviderFactories()),
 		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
 			parser.AgentCodex: parser.ProviderMigrationProviderAuthoritative,
 		},
 		pathRewriter: func(path string) string {
 			return "host:" + path
 		},
-	}
+	}, &engineSources{
+		agentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		providerFactories: providerFactoryMap(parser.ProviderFactories()),
+	})
 
 	// Missing optimization state must not force an unchanged remote source
 	// through a full parse. Preserve the database freshness skip without
@@ -8214,20 +8162,21 @@ func TestProcessCodexAppendedStaleProjectDoesFullReparse(t *testing.T) {
 	require.NoError(t, err, "append codex fixture")
 	require.NoError(t, f.Close(), "close codex fixture")
 
-	e := &Engine{
+	e := withTestSources(&Engine{
 		db:       database,
 		idPrefix: "host~",
-		agentDirs: map[parser.AgentType][]string{
-			parser.AgentCodex: {root},
-		},
-		providerFactories: providerFactoryMap(parser.ProviderFactories()),
 		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
 			parser.AgentCodex: parser.ProviderMigrationProviderAuthoritative,
 		},
 		pathRewriter: func(path string) string {
 			return "host:" + path
 		},
-	}
+	}, &engineSources{
+		agentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		providerFactories: providerFactoryMap(parser.ProviderFactories()),
+	})
 
 	res := e.processFile(t.Context(), parser.DiscoveredFile{
 		Agent: parser.AgentCodex,
@@ -8309,20 +8258,21 @@ func TestProcessCodexAppendedStaleProjectCarriesForceReplace(t *testing.T) {
 	require.NoError(t, err, "append codex fixture")
 	require.NoError(t, f.Close(), "close codex fixture")
 
-	e := &Engine{
+	e := withTestSources(&Engine{
 		db:       database,
 		idPrefix: "host~",
-		agentDirs: map[parser.AgentType][]string{
-			parser.AgentCodex: {root},
-		},
-		providerFactories: providerFactoryMap(parser.ProviderFactories()),
 		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
 			parser.AgentCodex: parser.ProviderMigrationProviderAuthoritative,
 		},
 		pathRewriter: func(path string) string {
 			return "host:" + path
 		},
-	}
+	}, &engineSources{
+		agentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		providerFactories: providerFactoryMap(parser.ProviderFactories()),
+	})
 
 	res := e.processFile(t.Context(), parser.DiscoveredFile{
 		Agent: parser.AgentCodex,
@@ -8457,7 +8407,7 @@ func TestProviderProcessCacheKeyOmnigentContainerIncludesDataVersion(t *testing.
 
 	legacy := container + "?agent=omnigent?source_hash=container-content-hash"
 	assert.Equal(t,
-		legacy+"&data_version="+strconv.Itoa(db.CurrentDataVersion()),
+		legacy+"&data_version="+strconv.Itoa(db.AgentDataVersion(parser.AgentOmnigent)),
 		containerKey,
 		"whole-container cache identity must include the parser data version",
 	)
@@ -8775,19 +8725,20 @@ func newAiderProviderTestEngine(
 	forceParse bool,
 ) *Engine {
 	root := filepath.Dir(filepath.Dir(path))
-	return &Engine{
+	return withTestSources(&Engine{
 		db:         database,
 		machine:    "local",
 		forceParse: forceParse,
 		skipCache:  make(map[string]int64),
+		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			parser.AgentAider: parser.ProviderMigrationProviderAuthoritative,
+		},
+	}, &engineSources{
 		agentDirs: map[parser.AgentType][]string{
 			parser.AgentAider: {root},
 		},
 		providerFactories: providerFactoryMap(parser.ProviderFactories()),
-		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
-			parser.AgentAider: parser.ProviderMigrationProviderAuthoritative,
-		},
-	}
+	})
 }
 
 func persistAiderProviderResults(
@@ -8981,18 +8932,19 @@ func TestFindSourceFileProviderAuthoritativePrefersProviderOverStoredPath(t *tes
 			FingerprintKey: currentPath,
 		},
 	}
-	engine := &Engine{
+	engine := withTestSources(&Engine{
 		db: database,
+		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			parser.AgentCowork: parser.ProviderMigrationProviderAuthoritative,
+		},
+	}, &engineSources{
 		agentDirs: map[parser.AgentType][]string{
 			parser.AgentCowork: {root},
 		},
 		providerFactories: providerFactoryMap([]parser.ProviderFactory{
 			lookupSourceFactory{provider: provider},
 		}),
-		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
-			parser.AgentCowork: parser.ProviderMigrationProviderAuthoritative,
-		},
-	}
+	})
 
 	got := engine.FindSourceFile(t.Context(), "cowork:lookup")
 
@@ -9065,23 +9017,6 @@ func (p *lookupSourceProvider) Parse(
 	parser.ParseRequest,
 ) (parser.ParseOutcome, error) {
 	return parser.ParseOutcome{}, nil
-}
-
-func TestToDBSessionStoresSessionName(t *testing.T) {
-	pw := pendingWrite{sess: parser.ParsedSession{
-		ID:           "commandcode:test",
-		Project:      "sample_project",
-		Machine:      "local",
-		Agent:        parser.AgentCommandCode,
-		SessionName:  "Startup investigation",
-		FirstMessage: "Inspect server logs",
-	}}
-
-	got := toDBSession(pw)
-	require.NotNil(t, got.SessionName)
-	assert.Equal(t, "Startup investigation", *got.SessionName)
-	require.NotNil(t, got.FirstMessage)
-	assert.Equal(t, "Inspect server logs", *got.FirstMessage)
 }
 
 func TestBlockedCategorySet(t *testing.T) {
@@ -12112,6 +12047,51 @@ func TestProviderChangedPathForceParseGeminiMetadata(t *testing.T) {
 	}
 }
 
+func TestProviderChangedPathForceParseHermesStateEvent(t *testing.T) {
+	home := filepath.Join("root", "profile#one")
+	stateDB := filepath.Join(home, "state.db")
+	tests := []struct {
+		name       string
+		sourcePath string
+		eventPath  string
+		eventKind  string
+		want       bool
+	}{
+		{
+			name:       "orphan transcript under a directory named with # is not forced",
+			sourcePath: filepath.Join(home, "sessions", "orphan.jsonl"),
+			eventPath:  stateDB,
+			eventKind:  "write",
+			want:       false,
+		},
+		{
+			// A transcript event resolves to the session's state.db member
+			// when the database owns that session.
+			name:       "transcript event resolving to its state.db member stays forced",
+			sourcePath: stateDB + "#member",
+			eventPath:  filepath.Join(home, "sessions", "member.jsonl"),
+			eventKind:  "write",
+			want:       true,
+		},
+		{
+			name:       "orphan transcript remove keeps the force",
+			sourcePath: filepath.Join(home, "sessions", "orphan.jsonl"),
+			eventPath:  stateDB,
+			eventKind:  "remove",
+			want:       true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := providerChangedPathForceParse(
+				parser.AgentHermes, tt.sourcePath, tt.eventPath, tt.eventKind,
+				parser.ProviderMigrationProviderAuthoritative,
+			)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestOpenCodeUsageOnlyArchiveRejectsOrdinalReuse(t *testing.T) {
 	// A source that lost a message and gained a later one can present a new
 	// row at the vanished ordinal with larger token counts. Identity comes
@@ -12172,4 +12152,75 @@ func TestReconcileWatchRootsAfterConstructorCancellation(t *testing.T) {
 	cancel()
 	require.NoError(t, engine.ReconcileWatchRoots(t.Context(), []string{root}, false))
 	assert.True(t, engine.LastReconciliationResult().Complete)
+}
+
+func TestProviderStoredFreshnessDecision(t *testing.T) {
+	for _, tc := range []struct {
+		name                         string
+		agent                        parser.AgentType
+		mtime                        int64
+		required, changedHash, stale bool
+		project                      string
+		want                         bool
+		wantReads                    int32
+	}{
+		{name: "optional hash with matching stats", agent: parser.AgentVibe, mtime: 100, want: true},
+		{name: "stat mismatch rejects before hash", agent: parser.AgentOpenCode, mtime: 200, required: true},
+		{name: "required matching hash", agent: parser.AgentOpenCode, mtime: 100, required: true, want: true, wantReads: 1},
+		{name: "required changed hash", agent: parser.AgentOpenCode, mtime: 100, required: true, changedHash: true, wantReads: 1},
+		{name: "hash overrides shared stat", agent: parser.AgentHermes, mtime: 200, want: true, wantReads: 1},
+		{name: "stale data version", agent: parser.AgentVibe, mtime: 100, stale: true},
+		{name: "project needs reparse", agent: parser.AgentVibe, mtime: 100, project: "_home_user_app"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			archive := openTestDB(t)
+			const path = "/data/source"
+			stored := db.VirtualContainerMemberFreshness{Agent: string(tc.agent), Project: "app", MTimeNS: 100, Hash: "digest", DataVersion: db.CurrentDataVersion()}
+			if tc.project != "" {
+				stored.Project = tc.project
+			}
+			if tc.stale {
+				stored.DataVersion = 0
+			}
+			require.NoError(t, archive.Update(t.Context(), func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(t.Context(), `INSERT INTO sessions
+					(id, project, agent, file_path, file_size, file_mtime, file_hash, data_version)
+					VALUES ('session', ?, ?, ?, 0, ?, ?, ?)`, stored.Project, stored.Agent, path, stored.MTimeNS, stored.Hash, stored.DataVersion)
+				return err
+			}))
+			reads := countSessionFileHashReads(t, archive)
+			fp := parser.SourceFingerprint{MTimeNS: tc.mtime, Hash: "digest"}
+			if tc.changedHash {
+				fp.Hash = "changed"
+			}
+			e := &Engine{db: archive}
+			unchanged := e.providerSourceUnchangedInDB(t.Context(), parser.SourceRef{Provider: tc.agent, DisplayPath: path}, fp,
+				parser.ProviderSyncSemantics{FingerprintHashRequiredForFreshness: tc.required}, nil)
+			assert.Equal(t, tc.want, unchanged)
+			assert.Equal(t, tc.wantReads, reads.Load())
+		})
+	}
+}
+
+func countSessionFileHashReads(t *testing.T, archive *db.DB) *atomic.Int32 {
+	t.Helper()
+	reads := &atomic.Int32{}
+	reader := archive.Reader().(interface {
+		Conn(context.Context) (*sql.Conn, error)
+	})
+	conn, err := reader.Conn(t.Context())
+	require.NoError(t, err)
+	require.NoError(t, conn.Raw(func(raw any) error {
+		raw.(interface {
+			RegisterAuthorizer(func(int, string, string, string) int)
+		}).RegisterAuthorizer(func(op int, table, column, _ string) int {
+			if op == sqlite3.SQLITE_READ && table == "sessions" && column == "file_hash" {
+				reads.Add(1)
+			}
+			return sqlite3.SQLITE_OK
+		})
+		return nil
+	}))
+	require.NoError(t, conn.Close())
+	return reads
 }

@@ -106,11 +106,10 @@ func usageLocationName(location *time.Location) string {
 	}
 	normalized := filepath.ToSlash(resolved)
 	const marker = "/zoneinfo/"
-	index := strings.LastIndex(normalized, marker)
-	if index < 0 {
+	_, candidate, ok := strings.CutLast(normalized, marker)
+	if !ok {
 		return name
 	}
-	candidate := normalized[index+len(marker):]
 	if _, err := time.LoadLocation(candidate); err != nil {
 		return name
 	}
@@ -204,6 +203,7 @@ type usageRollupCall struct {
 
 type usageRollupObserver struct {
 	beforeEnsure  func()
+	beforeAttempt func(map[string]usageFillResult)
 	beforeInstall func([]usageRollupBuild)
 }
 
@@ -234,11 +234,12 @@ func (c *usageRollupCoordinator) Ensure(
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	pricingHash, err := usagePricingIdentity(snapshot.PricingRows)
+	// The catalog digest only keys single-flight; staleness is per session.
+	catalogHash, err := usagePricingIdentity(snapshot.PricingRows)
 	if err != nil {
 		return nil, usageRollupMetrics{}, fmt.Errorf("hashing usage pricing: %w", err)
 	}
-	key := usageRollupCallKey(snapshot, fills, pricingHash)
+	key := usageRollupCallKey(snapshot, fills, catalogHash)
 	c.mu.Lock()
 	call := c.calls[key]
 	if call == nil {
@@ -249,10 +250,10 @@ func (c *usageRollupCoordinator) Ensure(
 				c.observer.beforeEnsure()
 			}
 			call.installs, call.metrics, call.err = c.ensureNow(
-				c.ctx, snapshot, fills, resolver, pricingHash)
-			close(call.done)
+				c.ctx, snapshot, fills, resolver)
 			c.mu.Lock()
 			delete(c.calls, key)
+			close(call.done)
 			c.mu.Unlock()
 		}) {
 			delete(c.calls, key)
@@ -278,9 +279,9 @@ func (c *usageRollupCoordinator) Ensure(
 func (c *usageRollupCoordinator) ensureNow(
 	ctx context.Context, snapshot usageQuerySnapshot,
 	fills map[string]usageFillResult, resolver *export.PricingResolver,
-	pricingHash string,
 ) (map[string]usageRollupInstall, usageRollupMetrics, error) {
 	identity := usageTimezoneIdentityFor(snapshot.location, snapshot.Intervals)
+	pricing := newUsagePricingIdentities(resolver)
 	conn, err := c.cache.db.Conn(ctx)
 	if err != nil {
 		return nil, usageRollupMetrics{}, err
@@ -294,7 +295,7 @@ func (c *usageRollupCoordinator) ensureNow(
 	// failing the caller.
 	for attempt := 1; ; attempt++ {
 		installs, done, attemptMetrics, attemptErr := c.ensureAttempt(
-			ctx, conn, identity, snapshot, currentFills, resolver, pricingHash)
+			ctx, conn, identity, snapshot, currentFills, pricing)
 		metrics.DailyRows += attemptMetrics.DailyRows
 		metrics.ExceptionRows += attemptMetrics.ExceptionRows
 		metrics.ExceptionGroups += attemptMetrics.ExceptionGroups
@@ -322,10 +323,13 @@ func (c *usageRollupCoordinator) ensureNow(
 func (c *usageRollupCoordinator) ensureAttempt(
 	ctx context.Context, conn *sql.Conn, identity usageTimezoneIdentity,
 	snapshot usageQuerySnapshot, fills map[string]usageFillResult,
-	resolver *export.PricingResolver, pricingHash string,
+	pricing *usagePricingIdentities,
 ) (map[string]usageRollupInstall, bool, usageRollupMetrics, error) {
+	if c.observer.beforeAttempt != nil {
+		c.observer.beforeAttempt(fills)
+	}
 	installs, stale, err := readUsageRollupInstalls(
-		ctx, conn, identity, snapshot, fills, pricingHash)
+		ctx, conn, identity, snapshot, fills, pricing)
 	if err != nil || len(stale) == 0 {
 		cursorCurrent := installs[usageRollupCursorSessionID].FactRevision >=
 			snapshot.CursorHighWater
@@ -362,13 +366,13 @@ func (c *usageRollupCoordinator) ensureAttempt(
 	}
 	builds, err := buildUsageRollupSessions(
 		facts, staleSessions, staleVersions, staleFills, snapshot.location,
-		resolver, pricingHash, cross)
+		pricing, cross)
 	if err != nil {
 		return nil, false, usageRollupMetrics{}, err
 	}
 	if installs[usageRollupCursorSessionID].FactRevision < snapshot.CursorHighWater {
 		cursorBuild, cursorErr := loadCursorUsageRollupBuild(
-			ctx, conn, snapshot.CursorHighWater, snapshot.location, pricingHash)
+			ctx, conn, snapshot.CursorHighWater, snapshot.location, pricing)
 		if cursorErr != nil {
 			return nil, false, usageRollupMetrics{}, cursorErr
 		}
@@ -398,7 +402,7 @@ func (c *usageRollupCoordinator) ensureAttempt(
 		return nil, false, metrics, err
 	}
 	installs, stale, err = readUsageRollupInstalls(
-		ctx, conn, identity, snapshot, fills, pricingHash)
+		ctx, conn, identity, snapshot, fills, pricing)
 	if err != nil {
 		return nil, false, metrics, err
 	}
@@ -415,23 +419,14 @@ func (c *usageRollupCoordinator) ensureAttempt(
 func readCurrentUsageFillResults(
 	ctx context.Context, conn *sql.Conn, versions []usageSourceVersion,
 ) (map[string]usageFillResult, error) {
-	results := make(map[string]usageFillResult, len(versions))
+	results, err := readUsageCachedSessions(ctx, conn, usageSourceVersionIDs(versions))
+	if err != nil {
+		return nil, err
+	}
 	for _, version := range versions {
-		var result usageFillResult
-		err := conn.QueryRowContext(ctx, `SELECT source_sync_marker,
-			source_transcript_rev, usage_event_fingerprint, install_revision
-			FROM usage_cached_sessions WHERE session_id = ?`, version.SessionID).Scan(
-			&result.source.SyncMarker, &result.source.TranscriptRevision,
-			&result.source.UsageEventFingerprint, &result.InstallRevision)
-		if errors.Is(err, sql.ErrNoRows) {
+		if _, ok := results[version.SessionID]; !ok {
 			results[version.SessionID] = usageFillResult{Deleted: true}
-			continue
 		}
-		if err != nil {
-			return nil, err
-		}
-		result.source.SessionID = version.SessionID
-		results[version.SessionID] = result
 	}
 	return results, nil
 }
@@ -439,12 +434,12 @@ func readCurrentUsageFillResults(
 func readUsageRollupInstalls(
 	ctx context.Context, conn *sql.Conn, identity usageTimezoneIdentity,
 	snapshot usageQuerySnapshot, fills map[string]usageFillResult,
-	pricingHash string,
+	pricing *usagePricingIdentities,
 ) (map[string]usageRollupInstall, map[string]bool, error) {
 	query := `SELECT i.id, i.session_id,
 		i.fact_install_revision, i.install_revision, i.cached_at,
 		i.source_sync_marker, i.source_transcript_rev, i.usage_event_fingerprint,
-		i.baked_agent, i.baked_started_at, i.pricing_hash
+		i.baked_agent, i.baked_started_at, i.pricing_inputs, i.pricing_hash
 		FROM usage_rollup_timezones tz JOIN usage_rollup_installs i
 		  ON i.timezone_id = tz.id WHERE tz.timezone_key = ?`
 	args := []any{identity.Key}
@@ -460,7 +455,7 @@ func readUsageRollupInstalls(
 		scope = append(scope, version.SessionID)
 	}
 	if len(scope) < maxSQLVars {
-		placeholders, scopeArgs := inPlaceholders(scope)
+		placeholders, scopeArgs := InPlaceholders(scope)
 		query += ` AND i.session_id IN ` + placeholders
 		args = append(args, scopeArgs...)
 	}
@@ -472,23 +467,22 @@ func readUsageRollupInstalls(
 	installs := make(map[string]usageRollupInstall)
 	sources := make(map[string]usageSourceVersion)
 	baked := make(map[string][2]string)
-	pricing := make(map[string]string)
+	pricingInputs := make(map[string]string)
 	for rows.Next() {
 		var item usageRollupInstall
 		var source usageSourceVersion
-		var agent, startedAt, installedPricing string
+		var agent, startedAt, installedInputs string
 		if err := rows.Scan(&item.ID, &item.SessionID, &item.FactRevision,
 			&item.InstallRevision, &item.CachedAt, &source.SyncMarker,
 			&source.TranscriptRevision, &source.UsageEventFingerprint,
-			&agent, &startedAt, &installedPricing); err != nil {
+			&agent, &startedAt, &installedInputs, &item.PricingHash); err != nil {
 			_ = rows.Close()
 			return nil, nil, err
 		}
 		source.SessionID = item.SessionID
-		item.PricingHash = installedPricing
 		installs[item.SessionID], sources[item.SessionID] = item, source
 		baked[item.SessionID] = [2]string{agent, startedAt}
-		pricing[item.SessionID] = installedPricing
+		pricingInputs[item.SessionID] = installedInputs
 	}
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return nil, nil, err
@@ -510,8 +504,16 @@ func readUsageRollupInstalls(
 		}
 		if !ok || item.FactRevision != fill.InstallRevision ||
 			!sources[version.SessionID].Equal(fill.source) ||
-			baked[version.SessionID] != [2]string{session.Agent, session.StartedAt} ||
-			pricing[version.SessionID] != pricingHash {
+			baked[version.SessionID] != [2]string{session.Agent, session.StartedAt} {
+			stale[version.SessionID] = true
+			continue
+		}
+		// Only this session's own lookups decide pricing staleness.
+		expected, err := pricing.forEncoded(pricingInputs[version.SessionID])
+		if err != nil {
+			return nil, nil, err
+		}
+		if item.PricingHash != expected {
 			stale[version.SessionID] = true
 		}
 	}
@@ -550,35 +552,36 @@ func installUsageRollupBuilds(
 			"%w: dedup identities gained members during rollup build",
 			errUsageCacheSourceChanged)
 	}
+	sessionIDs := make([]string, 0, len(builds))
+	for _, build := range builds {
+		if build.SessionID != usageRollupCursorSessionID {
+			sessionIDs = append(sessionIDs, build.SessionID)
+		}
+	}
+	cachedSessions, err := readUsageCachedSessions(ctx, conn, sessionIDs)
+	if err != nil {
+		return err
+	}
 	for _, build := range builds {
 		if build.SessionID == usageRollupCursorSessionID {
 			continue
 		}
-		var current usageFillResult
-		err := conn.QueryRowContext(ctx, `SELECT source_sync_marker,
-			source_transcript_rev, usage_event_fingerprint, install_revision
-			FROM usage_cached_sessions WHERE session_id = ?`, build.SessionID).Scan(
-			&current.source.SyncMarker, &current.source.TranscriptRevision,
-			&current.source.UsageEventFingerprint, &current.InstallRevision)
-		current.source.SessionID = build.SessionID
-		if errors.Is(err, sql.ErrNoRows) || err == nil &&
-			(current.InstallRevision != build.FactRevision ||
-				!current.source.Equal(build.Source)) {
+		current, ok := cachedSessions[build.SessionID]
+		if !ok || current.InstallRevision != build.FactRevision ||
+			!current.source.Equal(build.Source) {
 			return fmt.Errorf(
 				"%w: usage facts changed during rollup build",
 				errUsageCacheSourceChanged)
 		}
-		if err != nil {
-			return err
-		}
 	}
+	// Background rebuilds install here too, so only a new zone takes the
+	// install time; recordUsageTimezoneRequest owns later recency stamps.
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if _, err := conn.ExecContext(ctx, `INSERT INTO usage_rollup_timezones(
 		timezone_key, timezone_name, interval_fingerprint, last_requested_at
 	) VALUES (?, ?, ?, ?) ON CONFLICT(timezone_key) DO UPDATE SET
 		timezone_name=excluded.timezone_name,
-		interval_fingerprint=excluded.interval_fingerprint,
-		last_requested_at=excluded.last_requested_at`,
+		interval_fingerprint=excluded.interval_fingerprint`,
 		identity.Key, identity.Name, identity.IntervalFingerprint, now); err != nil {
 		return err
 	}
@@ -625,20 +628,23 @@ func installUsageRollupBuilds(
 			_, err = conn.ExecContext(ctx, `UPDATE usage_rollup_installs SET
 				source_sync_marker=?, source_transcript_rev=?, usage_event_fingerprint=?,
 				fact_install_revision=?, baked_agent=?, baked_started_at=?,
-				pricing_hash=?, install_revision=?, cached_at=? WHERE id=?`,
+				pricing_inputs=?, pricing_hash=?, install_revision=?, cached_at=?
+				WHERE id=?`,
 				build.Source.SyncMarker, build.Source.TranscriptRevision,
 				build.Source.UsageEventFingerprint, build.FactRevision,
-				build.Agent, build.StartedAt, build.PricingHash,
+				build.Agent, build.StartedAt, build.PricingInputs, build.PricingHash,
 				nextRevision, now, installID)
 		} else {
 			result, insertErr := conn.ExecContext(ctx, `INSERT INTO usage_rollup_installs(
 				timezone_id, session_id, source_sync_marker, source_transcript_rev,
 				usage_event_fingerprint, fact_install_revision, baked_agent,
-				baked_started_at, pricing_hash, install_revision, cached_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, timezoneID, build.SessionID,
+				baked_started_at, pricing_inputs, pricing_hash, install_revision,
+				cached_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, timezoneID, build.SessionID,
 				build.Source.SyncMarker, build.Source.TranscriptRevision,
 				build.Source.UsageEventFingerprint, build.FactRevision,
-				build.Agent, build.StartedAt, build.PricingHash, nextRevision, now)
+				build.Agent, build.StartedAt, build.PricingInputs, build.PricingHash,
+				nextRevision, now)
 			if insertErr != nil {
 				return insertErr
 			}
@@ -748,12 +754,12 @@ func installUsageRollupDays(
 
 func usageRollupCallKey(
 	snapshot usageQuerySnapshot, fills map[string]usageFillResult,
-	pricingHash string,
+	catalogHash string,
 ) string {
 	digest := sha256.New()
 	writeUsageHashString(digest,
 		usageTimezoneIdentityFor(snapshot.location, snapshot.Intervals).Key)
-	writeUsageHashString(digest, pricingHash)
+	writeUsageHashString(digest, catalogHash)
 	writeUsageHashInt64(digest, snapshot.CursorHighWater)
 	sessions := make(map[string]usageQuerySession, len(snapshot.Sessions))
 	for _, session := range snapshot.Sessions {

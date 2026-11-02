@@ -50,21 +50,46 @@ The summary cards show:
 
 The report counts subagent sessions (for example Claude Code Task-tool agents)
 and fork sessions (rewound conversation branches) alongside their parent
-sessions, so **Total Cost** lines up with `agentsview usage daily` for the same
+sessions, so **Total Cost** lines up with `agentsview report usage daily` for the same
 day and timezone. Usage rows that recur across related sessions are deduplicated
 before totaling, the same rule the Usage page applies.
 
+Subagents include native child sessions and eligible `claude -p`, `codex exec`,
+or Grok headless runs. Claude Code `sdk-cli` workers
+qualify when their first real normalized prompt records `turnOrigin=sdk`.
+Human origin wins conflicting markers. A queued first prompt, missing or unknown
+origin, SDK library entrypoints, or an explicit provider kind blocks this
+inference. Human SDK conversations stay Interactive unless their prompts match
+an automation pattern. Known subagents keep that category even when their
+prompts match built-in or user `[automated]` patterns. Runs without a subagent
+relationship count as Automated when they carry a roborev tag or a matching
+first prompt.
+Prompt matching requires one or fewer real user messages.
+
+Parentless workers appear as sidebar roots. Flat lists, search, and CLI include
+them when children are requested. General stats and project, agent, and branch
+pickers exclude Subagents. Automation and one-shot filters still apply.
+Readable sources reparse once to recover classification evidence. Stored
+parentless non-interactive runs gain the Subagent relationship during each
+classification audit, including rows imported after initialization, even when
+their sources are unreadable. Historical worker repair can fail when sources are
+unreadable or deleted and archived rows, including replicas, lack worker
+evidence such as Claude SDK origin needed to distinguish workers from human SDK
+conversations or native Grok child-kind evidence omitted by older clients.
+Ambiguous rows keep their relationship. Classification audits preserve stored
+automation flags in usage-only archives. New writes classify current evidence.
+
 The session count separates subagents from interactive and automated
-conversations. A subagent counts only in the subagent category, even if its
-prompt also matches the automation classifier. Forks remain in the interactive
-or automated category. Costs, agent-minutes, and concurrency use the same three
-separate categories. Automation filters still use each session's automation
+conversations. Every known subagent counts as Subagents, including scripted
+workers whose parent disappears. Forks remain in the interactive or automated
+category. Costs, agent-minutes, and concurrency use the same three separate
+categories. Automation filters still use each session's automation
 flag, including subagents.
 
 If the selected range reaches into the future, the page marks it as partial and
 shows the report's current **as of** time.
 
-## Concurrency
+## Concurrency and messages
 
 The **Concurrency** chart is a stacked bar chart on one time axis. Each bucket
 is a single bar whose segments are **Interactive** in blue, **Subagents** in
@@ -76,18 +101,34 @@ label on the right gives the combined peak for the range. Interactive
 concurrency counts overlapping human-facing conversations; human attention is
 not measured.
 
+Switch the chart to **User messages** to see how often you send prompts, or
+**Assistant messages** to see agent output. Both views count timestamped
+transcript messages in the same time buckets as concurrency. Each view has its
+own scale, so high assistant volume cannot hide sparse user prompts. The label
+above the chart shows the bucket size and the total for the selected range.
+
+User messages count only interactive conversations; automated runs and subagent
+instructions are excluded. Assistant messages include all sessions selected by
+the page filters. Both counts exclude system entries and tool results. Assistant
+messages can contain tool calls or thinking; they are transcript messages, not
+completed turns. Messages without timestamps cannot be placed on the chart.
+Hover a bucket in either message view to compare both counts.
+
+![Activity showing assistant-message frequency](/docs/assets/generated/screenshots/activity-message-frequency.png)
+
 ![Weekly Activity concurrency chart](/docs/assets/generated/screenshots/activity-concurrency.png)
 
 Hover a bucket to see its time range, the stacked split at the combined peak,
-the combined peak, each class's own peak within the bucket, agent-minutes, input
-and output tokens, and cost. A class's own peak can exceed its segment when that
+the combined peak, each class's own peak within the bucket, agent-minutes,
+uncached input and output tokens, and cost. A class's own peak can exceed its segment when that
 class peaked at a different instant from the combined peak. The **All-session
 overlay** control draws a combined **Tokens** or **Cost** trend over the bars,
 with its own scale on the right. These usage totals include all three classes.
 
-Clicking a bucket filters the Sessions table to the sessions active in that time
-slot. Drag across buckets to select a range. Keyboard users can select with
-Enter or Space, extend with Shift+Arrow, and clear with Escape. Click the same
+Clicking a bucket filters the Sessions table to sessions with activity or counted
+messages in that time slot. This time filter stays the same when you switch
+chart metrics. Drag across buckets to select a range. Keyboard users can select
+with Enter or Space, extend with Shift+Arrow, and clear with Escape. Click the same
 bucket again, or dismiss the **Active:** badge in the table header, to clear the
 slot filter. Membership is computed by the same shared aggregator that builds
 the chart, then fetched as a bounded page; the browser no longer downloads every
@@ -102,13 +143,14 @@ active window.
 ![Weekly Activity sessions table](/docs/assets/generated/screenshots/activity-sessions.png)
 
 Click a session title to open that session in the transcript viewer. Column
-headers for **Project**, **Agent**, **Agent-min**, **Cost**, and **Window** are
+headers for **Session**, **Project**, **Agent**, **Model**, **Agent-min**, **Cost**, and **Window** are
 sortable; timing-only sorts keep untimed sessions at the bottom.
 
-The table initially includes at most 200 rows. Sorting, bucket filtering, and
-later pages run on the server, with a maximum page size of 500 rows. A loading
-indicator remains local to the table, so the report summary and chart stay
-visible while a page is fetched.
+The table initially includes at most 200 rows and loads more as you scroll.
+Sorting, bucket filtering, and later pages run on the server, with a maximum
+page size of 500 rows. A failed page load offers a retry. A loading indicator
+remains local to the table, so the report summary and chart stay visible while a
+page is fetched.
 
 Subagent sessions are marked with a **Subagent** badge; other automated sessions
 have an **Auto** badge. Untimed sessions can still carry cost if usage rows
@@ -169,13 +211,13 @@ GET /api/v1/activity/report
 The same report is available from the CLI:
 
 ```bash
-agentsview activity report --preset day --date 2026-06-20
-agentsview activity report --preset week --date 2026-06-20 --json
-agentsview activity report --preset custom \
+agentsview report activity --preset day --date 2026-06-20
+agentsview report activity --preset week --date 2026-06-20 --json
+agentsview report activity --preset custom \
   --from 2026-06-20T14:00:00Z \
   --to 2026-06-20T18:00:00Z \
   --bucket 15m
-agentsview activity report --preset month --date 2026-07-01 --json \
+agentsview report activity --preset month --date 2026-07-01 --json \
   --sessions-limit 200 --sessions-sort cost --sessions-direction desc
 ```
 
@@ -193,7 +235,7 @@ See [CLI Reference](/docs/commands/#agentsview-activity-report) and
 
 ### JSON Contract
 
-`agentsview activity report --json` and `/api/v1/activity/report` emit schema
+`agentsview report activity --json` and `/api/v1/activity/report` emit schema
 version 8. The report contains a bounded first page of sessions,
 `sessions_total`, `sessions_next_cursor`, and a signed `report_id` that keeps
 later pages tied to the report. It does not include the old `intervals` array.
@@ -253,7 +295,7 @@ ordering—agent-minutes descending, untimed sessions last, session ID ascending
 as the final tie-break—so their five-row human summary remains compatible. They
 cannot request later pages or consume progress.
 
-The activity report JSON, `agentsview usage daily --json`, and
+The activity report JSON, `agentsview report usage daily --json`, and
 `agentsview export sessions --format json|ndjson` are separate versioned
 surfaces. Usage and activity already emitted `schema_version: 1` before 0.38,
 and the session-summary v1 contract shipped in 0.37.1. Releases 0.38.0 and

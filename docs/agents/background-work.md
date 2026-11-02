@@ -11,8 +11,8 @@ added later. The scheduler owns jitter, cooldown recorded before attempts,
 capped failure backoff, `RetryAfterError`, and cancellation. Status is in memory
 only; `TriggerNow` bypasses cooldown.
 
-Pricing refresh uses the scheduler. Periodic session sync, vector embedding,
-and recall extraction still own their timing; migrating them is separate work.
+Pricing refresh uses the scheduler. Periodic session sync, vector embedding, and
+recall extraction still own their timing; migrating them is separate work.
 
 ## Memory and Work Bounds
 
@@ -21,22 +21,41 @@ and recall extraction still own their timing; migrating them is separate work.
 
 - Bound watcher, polling, and sync work by the changed batch, not the full
   archive. Do not scan or load every stored session for each filesystem event.
+
 - A rejected parser checkpoint forbids resuming from its cursor. It must not
   force a transcript rewrite when the full source hash and stored metadata
   still match. Filesystem device numbers can change across boots.
+
 - Declare costly scheduling inputs as provider capabilities. Compute them only
   for providers that use them, and default new capabilities to unsupported.
+
 - Add cardinality-scaling regressions for background paths. Compare small and
   large archives and prove that unchanged work per event stays bounded. Cover
   deletion, tombstones, and persistent archives in the same tests.
+
 - Diagnose long-running memory with allocation and CPU profiles, live heap,
   forced-GC heap, and operating-system physical or dirty memory. Raw RSS does
   not prove live memory because it includes clean reclaimable mappings.
+
 - Profile branch binaries only against isolated, production-scale database and
   source clones. Never use live archives or agent transcripts.
+
 - Observe retention long enough to reproduce the reported growth window. On
   macOS, record `vmmap` physical footprint and dirty memory. Use portable Go
   allocation and heap metrics on Linux and Windows.
+
+## Codex rollout compression
+
+Before changing rollout selection or accepting a compression-related review
+finding, read the pinned Codex sources in the
+[format provenance](../internal/session-format-sources.md#codex-codex).
+Compression and restoration change the representation of one rollout at the same
+path. Prefer its plain JSONL sibling when both forms exist.
+
+A test that writes different transcript contents under separate configured roots
+exercises AgentsView's import policy. It does not show that Codex creates that
+state. Establish the upstream producer path before reporting such a test as a
+Codex data-loss bug or a merge blocker.
 
 ## Usage cache backfill
 
@@ -54,11 +73,31 @@ and recall extraction still own their timing; migrating them is separate work.
   process-local timezone plus up to eight retained recently requested explicit
   timezones. Installed source and aggregate fingerprints, not a progress
   cursor, are the authoritative coverage records.
+- Served usage requests own timezone recency in
+  `usage_rollup_timezones.last_requested_at`, rewriting it at most once a
+  minute per zone. Rollup installs stamp only a zone's first row, so
+  background rebuilds never reorder which eight explicit zones stay warm.
 - A pass runs once and is never restarted because the archive was written while
   it ran. Each session's facts and source version come from one archive read
   transaction, so they are always paired correctly, and a session written
   during the pass is refilled by its own mutation notification. Do not
   reintroduce a restart loop over a moving source fingerprint.
+- After each notification batch, the daemon rebuilds filled sessions' daily
+  rollups and requeues invalidated dedup peers for the same timezones, in
+  chunks of 256. A failed rebuild is retried by the next write or usage
+  request. Cursor rollups stay with the request.
+- Session notifications that exceed the channel capacity retain their IDs in a
+  deduplicated overflow map capped at 1,024 IDs, including dedup peers.
+  Pending batches hold at most 2,048 IDs; backfill or requests cover dropped
+  IDs.
+- Notifications hold a daemon work lease through queueing and rebuilding until
+  the pending set, overflow and in-flight batch are empty.
+- A scheduled pricing refresh calls `RewarmUsageCache` once it returns, when the
+  stored catalog digest changed, including a partial refresh that also reports
+  an error. It starts the same coverage pass, which rebuilds only rollups
+  whose pricing lookups now resolve differently. A pass resolves prices from
+  the catalog it captured at start, so a re-warm that arrives during a pass
+  queues one additional pass if the active pass succeeds.
 - Sweep the archive deletion journal before and after the pass and between
   install batches. Queries also inner-join current archive sessions before
   ranking, so tombstone processing is hygiene rather than a correctness

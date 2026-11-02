@@ -150,7 +150,7 @@ func (p *positronProvider) parseSession(
 	}
 
 	// Reuse VSCode Copilot parsing logic since formats are identical.
-	sess, msgs, err := parseVSCodeCopilotData(data, path, project, machine)
+	sess, msgs, err := parseVSCodeCopilotData(data, path, project, machine, AgentPositron)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -596,6 +596,9 @@ func positronWorkspaceProject(root, hash string) string {
 
 func positronProviderCapabilities() Capabilities {
 	return Capabilities{
+		Sync: ProviderSyncSemantics{
+			FingerprintHashRequiredForFreshness: true,
+		},
 		Source: SourceCapabilities{
 			DiscoverSources:      CapabilitySupported,
 			StreamingDiscovery:   CapabilitySupported,
@@ -611,6 +614,7 @@ func positronProviderCapabilities() Capabilities {
 		},
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
+			SessionName:          CapabilitySupported,
 			ToolCalls:            CapabilitySupported,
 			ToolResults:          CapabilitySupported,
 			Thinking:             CapabilitySupported,

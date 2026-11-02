@@ -2,7 +2,9 @@ package vector
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"net/http"
 	"path/filepath"
 	"slices"
@@ -11,10 +13,14 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kit/embedclient"
+	"go.kenn.io/kit/embedconfig"
+	"go.kenn.io/kit/embedmodel"
 	kitvec "go.kenn.io/kit/vector"
 	"go.kenn.io/kit/vector/sqlitevec"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 )
 
 // fakeBuildEncoder returns a deterministic 3-dimensional encoder that never
@@ -49,13 +55,26 @@ func fakeGeneration(model string) kitvec.Generation {
 	return kitvec.Generation{Model: model, Dimensions: 3}
 }
 
+// legacySpace describes an embedding space the way agentsview's commands do:
+// the generation fingerprint agentsview stores is the descriptor's legacy
+// entry.
+func legacySpace(fingerprint string) embedmodel.Descriptor {
+	return embedmodel.Descriptor{
+		Model: embedconfig.Model{
+			Name: "fake-model", Dimensions: 3,
+			Metric: embedconfig.MetricCosine, Normalization: embedconfig.NormalizationNone,
+		},
+		Legacy: []string{fingerprint},
+	}
+}
+
 type failingRefreshSource struct {
 	unit db.EmbeddableUnit
 	err  error
 }
 
 func (s failingRefreshSource) ScanEmbeddableUnits(
-	_ context.Context, _ string, _ bool,
+	_ context.Context, _ string, _ bool, _ int,
 	fn func(db.EmbeddableUnit) error,
 ) (string, error) {
 	if err := fn(s.unit); err != nil {
@@ -116,7 +135,7 @@ func TestBuildFailureDoesNotAdvanceCompletedCorpusRevision(t *testing.T) {
 		BuildOptions{CorpusRevision: "revision-2"})
 	require.Error(t, err)
 
-	stale, err := ix.StaleActive(ctx, gen.Fingerprint(), "revision-2")
+	stale, err := ix.StaleActive(ctx, legacySpace(gen.Fingerprint()), "revision-2")
 	require.NoError(t, err)
 	assert.True(t, stale, "a failed fill must not mark the new corpus revision complete")
 }
@@ -140,7 +159,7 @@ func TestFailedFullRebuildClearsCompletedCorpusRevision(t *testing.T) {
 	})
 	require.Error(t, err)
 
-	stale, err := ix.StaleActive(ctx, gen.Fingerprint(), "revision-1")
+	stale, err := ix.StaleActive(ctx, legacySpace(gen.Fingerprint()), "revision-1")
 	require.NoError(t, err)
 	assert.True(t, stale,
 		"a failed full rebuild must not leave the reset generation marked complete")
@@ -150,7 +169,7 @@ func TestFailedFullRebuildClearsCompletedCorpusRevision(t *testing.T) {
 		CorpusRevision: "revision-1",
 	})
 	require.NoError(t, err)
-	stale, err = ix.StaleActive(ctx, gen.Fingerprint(), "revision-1")
+	stale, err = ix.StaleActive(ctx, legacySpace(gen.Fingerprint()), "revision-1")
 	require.NoError(t, err)
 	assert.False(t, stale, "a successful full rebuild restores the completed revision")
 }
@@ -178,7 +197,7 @@ func TestFailedFullRefreshClearsCompletedCorpusRevision(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "partially refreshed", row.content,
 		"the refresh must mutate the mirror before failing")
-	stale, err := ix.StaleActive(ctx, gen.Fingerprint(), "revision-1")
+	stale, err := ix.StaleActive(ctx, legacySpace(gen.Fingerprint()), "revision-1")
 	require.NoError(t, err)
 	assert.True(t, stale,
 		"a failed full refresh must not leave the partially changed mirror marked complete")
@@ -188,7 +207,7 @@ func TestFailedFullRefreshClearsCompletedCorpusRevision(t *testing.T) {
 		CorpusRevision: "revision-1",
 	})
 	require.NoError(t, err)
-	stale, err = ix.StaleActive(ctx, gen.Fingerprint(), "revision-1")
+	stale, err = ix.StaleActive(ctx, legacySpace(gen.Fingerprint()), "revision-1")
 	require.NoError(t, err)
 	assert.False(t, stale,
 		"a successful full refresh and fill restore the completed revision")
@@ -300,6 +319,32 @@ func TestBuildModelChangeBuildsSecondGenerationAndRetiresOld(t *testing.T) {
 	assert.Equal(t, string(sqlitevec.StateRetired), oldState, "old active generation is retired")
 }
 
+// TestBuildReturningToRetiredGenerationReusesItsVectors covers a
+// configuration that returns to an earlier embedding space. kit's sqlitevec
+// treats a retired generation as permanent; agentsview revives it, because it
+// never reclaims retired storage, so the earlier vectors are reused.
+func TestBuildReturningToRetiredGenerationReusesItsVectors(t *testing.T) {
+	ix := openTestIndex(t)
+	ctx := t.Context()
+	src := twoDocSource()
+	genA := fakeGeneration("model-a")
+	genB := fakeGeneration("model-b")
+
+	_, err := ix.Build(ctx, src, fakeBuildEncoder(), genA, BuildOptions{})
+	require.NoError(t, err)
+	_, err = ix.Build(ctx, src, fakeBuildEncoder(), genB, BuildOptions{})
+	require.NoError(t, err)
+
+	result, err := ix.Build(ctx, src, fakeBuildEncoder(), genA, BuildOptions{})
+	require.NoError(t, err)
+	assert.Zero(t, result.Fill.Documents, "the retired generation's vectors are reused")
+	assert.True(t, result.Activated)
+	active, ok, err := ix.ActiveFingerprint(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, genA.Fingerprint(), active)
+}
+
 func TestBuildFullRebuildSameFingerprintReembedsEverything(t *testing.T) {
 	ix := openTestIndex(t)
 	ctx := t.Context()
@@ -392,6 +437,130 @@ func TestBuildScopeChangeToIncludeAutomatedForcesFullRefreshAndEmbedsOlderDoc(t 
 		"the older automated doc must be picked up despite predating the stored refresh watermark")
 }
 
+func TestBuildMatchingClassifierAuditEmbedsLateWorker(t *testing.T) {
+	for _, automated := range []bool{true, false} {
+		t.Run(fmt.Sprintf("automation=%t", automated), func(t *testing.T) {
+			ctx := t.Context()
+			archive := dbtest.OpenTestDB(t)
+			seedEndedSession(t, archive, "human", "hello", "2024-01-02T00:00:00Z")
+			ix := openTestIndex(t)
+			gen := fakeGeneration("fake-model")
+			_, err := ix.Build(ctx, archive, fakeBuildEncoder(), gen, BuildOptions{})
+			require.NoError(t, err)
+			raw, err := sql.Open("sqlite3", archive.Path())
+			require.NoError(t, err)
+			defer raw.Close()
+			_, err = raw.ExecContext(ctx, `INSERT INTO sessions (id, machine, project, agent, session_kind, ended_at, user_message_count, is_automated)
+ VALUES ('late-worker', 'local', 'project', 'codex', 'non-interactive', '2024-01-01T00:00:00Z', 1, ?)`, automated)
+			require.NoError(t, err)
+			_, err = raw.ExecContext(ctx, `INSERT INTO messages (session_id, ordinal, role, content) VALUES ('late-worker', 0, 'user', 'older worker content')`)
+			require.NoError(t, err)
+			require.NoError(t, archive.Close())
+			repaired, err := db.Open(ctx, archive.Path())
+			require.NoError(t, err)
+			defer repaired.Close()
+			result, err := ix.Build(ctx, repaired, fakeBuildEncoder(), gen, BuildOptions{})
+			require.NoError(t, err)
+			assert.Equal(t, 1, result.Fill.Documents)
+			hits, err := ix.Search(ctx, fakeBuildEncoder(), "older worker content", 10)
+			require.NoError(t, err)
+			var found bool
+			for _, hit := range hits {
+				if hit.SessionID == "late-worker" {
+					found = true
+					assert.True(t, hit.Subordinate)
+				}
+			}
+			assert.True(t, found, "a repaired worker below the watermark becomes searchable")
+		})
+	}
+}
+
+func TestBuildClassifierChangeEmbedsOlderReclassifiedSession(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		includeAutomated bool
+	}{
+		{"audit before build", false},
+		{"build before reclassification", false},
+		{"audit before build", true},
+		{"build before reclassification", true},
+	} {
+		t.Run(fmt.Sprintf("all=%t/%s", tc.includeAutomated, tc.name), func(t *testing.T) {
+			ctx := t.Context()
+			previousMatches := db.UserAutomationExactMatches()
+			t.Cleanup(func() { db.SetUserAutomationExactMatches(previousMatches) })
+			db.SetUserAutomationExactMatches([]string{"older session content"})
+			archive := dbtest.OpenTestDB(t)
+			seedEndedSession(t, archive, "human", "hello", "2024-01-02T00:00:00Z")
+			seedEndedSession(t, archive, "unrelated", "unrelated old content", "2023-01-01T00:00:00Z")
+			seedEndedSession(t, archive, "reclassified", "older session content", "2024-01-01T00:00:00Z")
+			databaseID, err := archive.GetDatabaseID(ctx)
+			require.NoError(t, err)
+			ix := openTestIndex(t)
+			gen := fakeGeneration("fake-model")
+			result, err := ix.Build(ctx, archive, fakeBuildEncoder(), gen, BuildOptions{IncludeAutomated: tc.includeAutomated})
+			require.NoError(t, err)
+			wantIDs := []string{"human", "unrelated"}
+			if tc.includeAutomated {
+				wantIDs = append(wantIDs, "reclassified")
+			}
+			require.Equal(t, len(wantIDs), result.Fill.Documents)
+			require.ElementsMatch(t, wantIDs, mirrorSessionIDs(t, ix))
+			watermark, err := ix.refreshWatermark(ctx)
+			require.NoError(t, err)
+			require.Equal(t, "2024-01-02T00:00:00Z", watermark)
+			db.SetUserAutomationExactMatches(nil)
+			if tc.name == "build before reclassification" {
+				readOnlyArchive, err := db.OpenReadOnly(ctx, archive.Path())
+				require.NoError(t, err)
+				defer readOnlyArchive.Close()
+				result, err = ix.Build(ctx, readOnlyArchive, fakeBuildEncoder(), gen, BuildOptions{IncludeAutomated: tc.includeAutomated})
+				require.NoError(t, err)
+				require.Zero(t, result.Fill.Documents)
+				require.ElementsMatch(t, wantIDs, mirrorSessionIDs(t, ix))
+			}
+			require.NoError(t, archive.ForceBackfillIsAutomated(ctx))
+			currentID, err := archive.GetDatabaseID(ctx)
+			require.NoError(t, err)
+			require.Equal(t, databaseID, currentID)
+			result, err = ix.Build(ctx, archive, fakeBuildEncoder(), gen, BuildOptions{IncludeAutomated: tc.includeAutomated})
+			require.NoError(t, err)
+			wantEmbedded, wantUnchanged := 1, 1
+			if tc.includeAutomated {
+				wantEmbedded, wantUnchanged = 0, 2
+			}
+			assert.Equal(t, wantEmbedded, result.Fill.Documents)
+			assert.Equal(t, wantUnchanged, result.Refresh.Unchanged, "unrelated old transcripts stay below the watermark")
+			hits, err := ix.Search(ctx, fakeBuildEncoder(), "older session content", 10)
+			require.NoError(t, err)
+			var sessionIDs []string
+			for _, hit := range hits {
+				sessionIDs = append(sessionIDs, hit.SessionID)
+			}
+			assert.ElementsMatch(t, []string{"human", "reclassified", "unrelated"}, sessionIDs)
+
+			result, err = ix.Build(ctx, archive, fakeBuildEncoder(), gen, BuildOptions{IncludeAutomated: tc.includeAutomated})
+			require.NoError(t, err)
+			assert.Zero(t, result.Fill.Documents)
+			assert.Equal(t, 1, result.Refresh.Unchanged, "unchanged classifier returns to scanning at the watermark")
+			db.SetUserAutomationExactMatches([]string{"older session content"})
+			require.NoError(t, archive.ForceBackfillIsAutomated(ctx))
+			result, err = ix.Build(ctx, archive, fakeBuildEncoder(), gen, BuildOptions{IncludeAutomated: tc.includeAutomated})
+			require.NoError(t, err)
+			assert.Zero(t, result.Fill.Documents)
+			assert.Equal(t, wantUnchanged, result.Refresh.Unchanged)
+			assert.ElementsMatch(t, wantIDs, mirrorSessionIDs(t, ix), "classification also removes rows leaving default scope")
+			db.SetUserAutomationExactMatches([]string{"older session content", "unmatched prompt"})
+			require.NoError(t, archive.ForceBackfillIsAutomated(ctx))
+			result, err = ix.Build(ctx, archive, fakeBuildEncoder(), gen, BuildOptions{IncludeAutomated: tc.includeAutomated})
+			require.NoError(t, err)
+			assert.Zero(t, result.Fill.Documents)
+			assert.Equal(t, 1, result.Refresh.Unchanged, "pattern changes without repaired rows keep the incremental scan")
+		})
+	}
+}
+
 // TestBuildScopeChangeToExcludeAutomatedRemovesOutOfScopeMirrorRow covers the
 // narrowing direction: reverting to the default scope after building with
 // IncludeAutomated: true must reconcile the automated document's mirror row
@@ -477,7 +646,7 @@ func TestBuildLegacyMirrorMissingScopeKeyForcesFullRefresh(t *testing.T) {
 // TestCountPendingIncludesRevisionChangedDocs covers countPending's
 // BuildProgress.Total denominator: a document whose mirror content_hash
 // changed since it was last stamped must still count as pending, matching
-// the s.revision = d.content_hash predicate generationCoverageQuery's
+// the s.revision = d.content_hash predicate kit's Coverage
 // Missing column uses, or Total under-reports outstanding work.
 func TestCountPendingIncludesRevisionChangedDocs(t *testing.T) {
 	ix := openTestIndex(t)
@@ -642,7 +811,7 @@ func TestBuildEncoderErrorAbortsAndRetryResumesWithoutReembedding(t *testing.T) 
 		return out, nil
 	}
 
-	_, err := ix.Build(ctx, src, failOnBad, gen, BuildOptions{})
+	_, err := ix.Build(ctx, src, failOnBad, gen, BuildOptions{BatchSize: 1})
 	require.Error(t, err)
 
 	var stampCount int
@@ -651,7 +820,7 @@ func TestBuildEncoderErrorAbortsAndRetryResumesWithoutReembedding(t *testing.T) 
 	).Scan(&stampCount))
 	assert.Equal(t, 1, stampCount, "only the document before the failing one was stamped")
 
-	result, err := ix.Build(ctx, src, fakeBuildEncoder(), gen, BuildOptions{})
+	result, err := ix.Build(ctx, src, fakeBuildEncoder(), gen, BuildOptions{BatchSize: 1})
 	require.NoError(t, err)
 	assert.Equal(t, 2, result.Fill.Documents, "retry embeds only the two remaining documents")
 	assert.True(t, result.Activated)
@@ -672,7 +841,7 @@ func TestBuildRejectsInvalidEncoderOutput(t *testing.T) {
 
 	result, err := ix.Build(ctx, src, invalidEncoder, gen, BuildOptions{})
 
-	var invalidErr *InvalidEmbeddingError
+	var invalidErr *kitvec.InvalidVectorError
 	require.ErrorAs(t, err, &invalidErr)
 	assert.Zero(t, result.Fill.Documents)
 	var stamps, chunks int
@@ -713,7 +882,7 @@ func TestBuildSkipsPermanentlyRejectedDocumentAndContinues(t *testing.T) {
 	rejectPoison := func(_ context.Context, texts []string) ([][]float32, error) {
 		calls++
 		if slices.Contains(texts, "poison") {
-			return nil, &HTTPStatusError{Status: http.StatusBadRequest, Body: "token window overflow"}
+			return nil, &embedclient.APIError{StatusCode: http.StatusBadRequest, Reason: embedclient.ReasonInputTooLong}
 		}
 		out := make([][]float32, len(texts))
 		for i := range texts {
@@ -758,7 +927,7 @@ func TestBuildConfig404EncodeErrorAbortsAndLeavesDocumentsPending(t *testing.T) 
 	gen := fakeGeneration("fake-model")
 
 	notFound := func(_ context.Context, _ []string) ([][]float32, error) {
-		return nil, &HTTPStatusError{Status: http.StatusNotFound, Body: "not found"}
+		return nil, &embedclient.APIError{StatusCode: http.StatusNotFound}
 	}
 
 	result, err := ix.Build(ctx, src, notFound, gen, BuildOptions{})
@@ -784,17 +953,17 @@ func TestBuildConfig404EncodeErrorAbortsAndLeavesDocumentsPending(t *testing.T) 
 		"later builds must still see the same documents as pending")
 }
 
-func TestBuildSchema400EncodeErrorAbortsAndLeavesDocumentsPending(t *testing.T) {
+func TestBuildCredentialEncodeErrorAbortsAndLeavesDocumentsPending(t *testing.T) {
 	ix := openTestIndex(t)
 	ctx := t.Context()
 	src := twoDocSource()
 	gen := fakeGeneration("fake-model")
 
-	badSchema := func(_ context.Context, _ []string) ([][]float32, error) {
-		return nil, &HTTPStatusError{Status: http.StatusBadRequest, Body: "invalid input type"}
+	rejectedKey := func(_ context.Context, _ []string) ([][]float32, error) {
+		return nil, &embedclient.APIError{StatusCode: http.StatusUnauthorized}
 	}
 
-	result, err := ix.Build(ctx, src, badSchema, gen, BuildOptions{})
+	result, err := ix.Build(ctx, src, rejectedKey, gen, BuildOptions{})
 	require.Error(t, err)
 	assert.Equal(t, 0, result.Fill.Documents)
 	assert.Equal(t, 0, result.Fill.Skipped)
@@ -825,7 +994,7 @@ func TestBuild5xxEncodeErrorStillAbortsFill(t *testing.T) {
 
 	fail500 := func(_ context.Context, texts []string) ([][]float32, error) {
 		if slices.Contains(texts, "bad") {
-			return nil, &HTTPStatusError{Status: http.StatusInternalServerError, Body: "boom"}
+			return nil, &embedclient.APIError{StatusCode: http.StatusInternalServerError}
 		}
 		out := make([][]float32, len(texts))
 		for i := range texts {
@@ -836,16 +1005,9 @@ func TestBuild5xxEncodeErrorStillAbortsFill(t *testing.T) {
 
 	_, err := ix.Build(ctx, src, fail500, gen, BuildOptions{})
 	require.Error(t, err, "a transient (5xx) encode error must still abort the fill")
-	var statusErr *HTTPStatusError
+	var statusErr *embedclient.APIError
 	require.ErrorAs(t, err, &statusErr)
-	assert.Equal(t, http.StatusInternalServerError, statusErr.Status)
-}
-
-func TestPermanentEncodeErrorRejectsTypedNilStatusError(t *testing.T) {
-	var statusErr *HTTPStatusError
-	var err error = statusErr
-
-	assert.False(t, isPermanentEncodeError(err))
+	assert.Equal(t, http.StatusInternalServerError, statusErr.StatusCode)
 }
 
 // TestResolveBuildTargetRetiresOtherBuildingGeneration is the fix-3
@@ -864,7 +1026,7 @@ func TestResolveBuildTargetRetiresOtherBuildingGeneration(t *testing.T) {
 	require.NoError(t, err)
 
 	genB := fakeGeneration("model-b")
-	target, wasBuilding, err := ix.resolveBuildTarget(ctx, genB, genB.Fingerprint(), false)
+	target, wasBuilding, err := ix.resolveBuildTarget(ctx, genB, genB.Fingerprint(), embedmodel.Descriptor{}, false)
 	require.NoError(t, err)
 	assert.True(t, wasBuilding)
 	assert.Equal(t, genB.Fingerprint(), target)

@@ -62,8 +62,8 @@ func (c CodebuffFamilyMatch) CanonicalID() string {
 // every candidate canonical ID instead of silently picking one.
 //
 // Note: Freebuff is intentionally absent from parser.Registry, so
-// cfg.ResolveDirs(parser.AgentFreebuff) is empty whenever the user
-// has not set FREEBUFF_DIR explicitly. In that case callers
+// cfg.ResolveDirs(parser.AgentFreebuff) is always empty
+// (FREEBUFF_CONFIG_DIR re-roots the shared Codebuff entry). Callers
 // (e.g. cmd/agentsview/session_get.go resolveBareCodebuffID) must
 // test both AgentCodebuff and AgentFreebuff prefixes against the
 // service per matched (project, rawID) location, because the

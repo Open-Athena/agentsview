@@ -36,6 +36,9 @@ func newStatsCommand() *cobra.Command {
 		Args:         cobra.NoArgs,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := validateStatsCLIWindow(since, until, timezone); err != nil {
+				return err
+			}
 			svc, cleanup, err := openStatsService(cmd)
 			if err != nil {
 				return err
@@ -152,7 +155,7 @@ func registerStatsFlags(
 func openStatsService(
 	cmd *cobra.Command,
 ) (service.SessionService, func(), error) {
-	cfg, err := config.LoadPFlags(cmd.Flags())
+	cfg, err := config.LoadPFlagsFor(cmd.Flags(), config.ScopeLocal)
 	if err != nil {
 		return nil, nil, fmt.Errorf("loading config: %w", err)
 	}
@@ -441,6 +444,16 @@ func printOutcomeStats(w io.Writer, o *db.StatsOutcomeStats) {
 	if o.PRsMerged != nil {
 		fmt.Fprintf(w, "  PRs merged:          %s\n", fmtInt(*o.PRsMerged))
 	}
+	if len(o.Skipped) > 0 {
+		// Without these lines a total missing an unknown number of
+		// repositories reads exactly like a complete one.
+		fmt.Fprintln(w, "  Incomplete:")
+		for _, skipped := range o.Skipped {
+			fmt.Fprintf(w, "    %s (%s): %s\n",
+				skipped.Repo, skipped.Op,
+				strings.ReplaceAll(skipped.Reason, "\n", "\n      "))
+		}
+	}
 	fmt.Fprintln(w)
 }
 
@@ -636,4 +649,24 @@ func sortedInt64Map(m map[string]int64) []kvInt64 {
 		return out[i].key < out[j].key
 	})
 	return out
+}
+
+// Validate existing window syntax before resolving or starting the daemon.
+// Stats deliberately has a narrower duration grammar than session --since.
+func validateStatsCLIWindow(since, until, timezone string) error {
+	now := time.Now()
+	for _, point := range []struct{ name, value string }{{"since", since}, {"until", until}} {
+		if point.value == "" {
+			continue
+		}
+		if _, err := db.ParseWindowPoint(point.value, now); err != nil {
+			return cliValidationError(fmt.Errorf("invalid --%s: %w", point.name, err), "use --"+point.name+" with Nd, Nh, YYYY-MM-DD, or RFC3339")
+		}
+	}
+	if timezone != "" {
+		if _, err := time.LoadLocation(timezone); err != nil {
+			return cliValidationError(fmt.Errorf("invalid --timezone: %w", err), "use an IANA timezone such as America/New_York or UTC")
+		}
+	}
+	return nil
 }

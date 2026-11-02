@@ -9,7 +9,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Ports jilog detectors.rs tests :670-820 (coding corrections).
+// Adapted from jilog detectors.rs tests :670-820 (coding corrections). Fixtures
+// carry corrective wording because agentsview gates coding corrections on it.
 func TestDetectCorrections(t *testing.T) {
 	tests := []struct {
 		name string
@@ -23,82 +24,49 @@ func TestDetectCorrections(t *testing.T) {
 		},
 		{
 			"corrections_too_short_skipped",
-			[]Message{assistant("first"), user("just a short"), assistant("second")},
+			[]Message{assistant("first"), user("wrong one here"), assistant("second")},
 			[]string{},
 		},
 		{
 			"corrections_too_long_skipped",
-			[]Message{assistant("a"), user(strings.Repeat("x", 201)), assistant("b")},
+			[]Message{assistant("a"), user("wrong " + strings.Repeat("x", 195)), assistant("b")},
 			[]string{},
 		},
 		{
 			"corrections_exact_minimum_length",
-			[]Message{assistant("a"), user("123456789012345"), assistant("b")},
-			[]string{"123456789012345"},
+			[]Message{assistant("a"), user("wrong one here."), assistant("b")},
+			[]string{"wrong one here."},
 		},
 		{
 			"corrections_exact_maximum_length",
-			[]Message{assistant("a"), user(strings.Repeat("x", 200)), assistant("b")},
-			[]string{strings.Repeat("x", 200)},
+			[]Message{assistant("a"), user("wrong " + strings.Repeat("x", 194)), assistant("b")},
+			[]string{"wrong " + strings.Repeat("x", 194)},
 		},
 		{
 			"corrections_wrong_role_pattern_skipped",
-			[]Message{user("first message in transcript"), user("another short user message"), assistant("reply")},
+			[]Message{user("no, first message in transcript"), user("no, another short user message"), assistant("reply")},
 			[]string{},
 		},
 		{
 			"corrections_multiple_in_one_transcript",
-			[]Message{assistant("a1"), user("first correction please"), assistant("a2"), user("second correction please"), assistant("a3")},
-			[]string{"first correction please", "second correction please"},
+			[]Message{assistant("a1"), user("no, first correction please"), assistant("a2"), user("no, second correction please"), assistant("a3")},
+			[]string{"no, first correction please", "no, second correction please"},
 		},
 		{"corrections_empty_transcript/none", nil, []string{}},
 		{"corrections_empty_transcript/one", []Message{assistant("a")}, []string{}},
 		{"corrections_empty_transcript/two", []Message{assistant("a"), user("hi there friend")}, []string{}},
-		{
-			"corrections_tool_result_user_turn_excluded",
-			[]Message{assistant("ran it"), toolResultUser("(Bash completed with no output)"), assistant("next")},
-			[]string{},
-		},
-		{
-			"corrections_tool_result_error_user_turn_excluded",
-			[]Message{assistant("a"), toolResultUser("<tool_use_error>File has not been read yet. Read it first.</tool_use_error>"), assistant("b")},
-			[]string{},
-		},
-		{
-			"corrections_real_user_string_still_detected",
-			[]Message{assistant("first"), user("no, you misunderstood the goal here"), assistant("second")},
-			[]string{"no, you misunderstood the goal here"},
-		},
-		{
-			"corrections_digest_2026_06_24_fixture",
-			[]Message{
-				assistant("a0"),
-				toolResultUser("--- icon def block ---\n39:  const I = {};"),
-				assistant("a1"),
-				user("read the deck and make sure the edits land"),
-				assistant("a2"),
-				toolResultUser("<tool_use_error>File has not been read yet.</tool_use_error>"),
-				assistant("a3"),
-				user("yes - clean it up please"),
-				assistant("a4"),
-				toolResultUser("=== reverted ===\n## main...origin/main"),
-				assistant("a5"),
-				toolResultUser("(Bash completed with no output)"),
-				assistant("a6"),
-			},
-			[]string{"read the deck and make sure the edits land", "yes - clean it up please"},
-		},
 		// agentsview additions.
+		{"plain_instruction_skipped", []Message{assistant("a"), user("now run the tests"), assistant("b")}, []string{}},
 		{
 			"length_is_bytes_not_runes",
-			// 67 three-byte runes = 201 bytes: over the raw limit although 67 runes.
-			[]Message{assistant("a"), user(strings.Repeat("日", 67)), assistant("b")},
+			// 6 bytes + 65 three-byte runes = 201 bytes: over the raw limit although 71 runes.
+			[]Message{assistant("a"), user("wrong " + strings.Repeat("日", 65)), assistant("b")},
 			[]string{},
 		},
 		{
 			"trim_is_measured_but_context_is_untrimmed",
-			[]Message{assistant("a"), user("   exactly fifteen b   "), assistant("b")},
-			[]string{"   exactly fifteen b   "},
+			[]Message{assistant("a"), user("   wrong one here.   "), assistant("b")},
+			[]string{"   wrong one here.   "},
 		},
 		{
 			"system_role_breaks_the_window",
@@ -164,7 +132,6 @@ func TestDetectCorrectionsChat(t *testing.T) {
 			window("  no, that message was for the other group"),
 			[]string{"  no, that message was for the other group"},
 		},
-		{"chat_corrections_keep_length_window_and_tool_result_filter/too_short", window("no, stop"), []string{}},
 		{
 			"chat_corrections_keep_length_window_and_tool_result_filter/tool_echo",
 			[]Message{assistant("a"), toolResultUser("<tool_use_error>don't do that, wrong file</tool_use_error>"), assistant("b")},
@@ -180,10 +147,6 @@ func TestDetectCorrectionsChat(t *testing.T) {
 			}
 		})
 	}
-	// chat_corrections_require_corrective_language, second half: the same
-	// window IS a coding correction.
-	plain := []Message{assistant("Here is the summary you asked for."), user("thanks, that looks really great"), assistant("Happy to help.")}
-	assert.Len(t, DetectCorrections(plain, "s1"), 1)
 }
 
 func TestDetectCorrectionsChatMarkers(t *testing.T) {

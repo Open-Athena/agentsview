@@ -31,6 +31,7 @@ func (im Importer) ImportExtracted(
 		return stats, err
 	}
 	config.ArchiveContent = im.DB.ArchiveContent()
+	config.CompleteSourceMirror = im.completeSourceMirror
 
 	engine := syncpkg.NewEngine(ctx, im.DB, config)
 	defer engine.Close()
@@ -51,7 +52,7 @@ func (im Importer) ImportExtracted(
 	} else {
 		engineStats = engine.SyncAll(ctx, hostProgress(im.Host, im.Progress))
 	}
-	stats.SessionsSynced = engineStats.Synced
+	stats.SessionsSynced = engineStats.Synced + engineStats.TitlesUpdated
 	stats.SessionsTotal = engineStats.TotalSessions
 	stats.Skipped = engineStats.Skipped
 	stats.Failed = engineStats.Failed
@@ -82,7 +83,7 @@ func requireCompleteProcessing(stats syncpkg.SyncStats) error {
 }
 
 // importLayout maps stable remote paths to one prepared source root. Keeping
-// this mapping independent from Importer lets prepared HTTP imports and future
+// this mapping independent from Importer lets prepared remote imports and future
 // rebuild contributors share the exact engine inputs and cache translation.
 type importLayout struct {
 	engineDirs   map[parser.AgentType][]string
@@ -91,10 +92,11 @@ type importLayout struct {
 }
 
 type remotePathMap struct {
-	host       string
-	root       string
-	remoteDirs []string
-	localDirs  []string
+	host           string
+	root           string
+	remoteDirs     []string
+	localDirs      []string
+	forbiddenRoots []string
 }
 
 func newImportLayout(targets TargetSet, root string) (importLayout, error) {
@@ -102,6 +104,7 @@ func newImportLayout(targets TargetSet, root string) (importLayout, error) {
 		engineDirs: make(map[parser.AgentType][]string),
 	}
 	layout.paths.root = root
+	layout.paths.forbiddenRoots = targets.ForbiddenRoots
 	for agentType, agentDirList := range targets.Dirs {
 		for _, remoteDir := range agentDirList {
 			local, err := safeRemappedRemotePath(root, remoteDir)
@@ -186,6 +189,12 @@ func (p remotePathMap) storedPathResolver() func(string) (string, bool) {
 		) {
 			return "", false
 		}
+		remotePath, memberSuffix := splitHermesMemberPath(remotePath)
+		for _, forbiddenRoot := range p.forbiddenRoots {
+			if _, forbidden := remoteArchiveRel(forbiddenRoot, remotePath); forbidden {
+				return "", false
+			}
+		}
 		for i, remoteDir := range p.remoteDirs {
 			rel, withinRoot := remoteArchiveRel(remoteDir, remotePath)
 			if !withinRoot {
@@ -195,7 +204,7 @@ func (p remotePathMap) storedPathResolver() func(string) (string, bool) {
 			if err != nil {
 				return "", false
 			}
-			return local, true
+			return local + memberSuffix, true
 		}
 		return "", false
 	}
@@ -281,13 +290,14 @@ func translateRemoteCacheToTemp(
 	translated := make(map[string]int64, len(remoteCache))
 	for remoteKey, mtime := range remoteCache {
 		remotePath, suffix := syncpkg.SplitProviderSkipCachePath(remoteKey)
+		remotePath, memberSuffix := splitHermesMemberPath(remotePath)
 		for i, rd := range remoteDirs {
 			if rel, ok := remoteArchiveRel(rd, remotePath); ok {
 				local, err := safeLocalArchivePath(tempDirs[i], rel)
 				if err != nil {
 					break
 				}
-				translated[local+suffix] = mtime
+				translated[local+memberSuffix+suffix] = mtime
 				break
 			}
 		}

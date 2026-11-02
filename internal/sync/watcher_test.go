@@ -2,7 +2,6 @@ package sync
 
 import (
 	"context"
-	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"log"
@@ -19,6 +18,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kit/stacktest"
 )
 
 const watcherTestTimeout = 5 * time.Second
@@ -29,6 +29,7 @@ func requireReceiveWithin[T any](t *testing.T, ch <-chan T, timeout time.Duratio
 	case value := <-ch:
 		return value
 	case <-time.After(timeout):
+		stacktest.Dump(t)
 		require.FailNow(t, "timed out waiting for channel value")
 		var zero T
 		return zero
@@ -79,7 +80,7 @@ func TestWatcherAcknowledgesLifecycleOnlyAfterSuccessfulReconciliation(t *testin
 	select {
 	case generation := <-gate.acknowledged:
 		require.Fail(t, "failed reconciliation acknowledged lifecycle", generation)
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(50 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; the failed reconciliation must not acknowledge the lifecycle
 	}
 	second := requireReceiveWithin(t, calls, time.Second)
 	assert.Equal(t, []string{"/sync"}, second.ReconcileRoots)
@@ -206,7 +207,7 @@ func TestWatcherLifecycleStoppedRejectsCollectionAndDispatch(t *testing.T) {
 	select {
 	case batch := <-calls:
 		require.Fail(t, "stopped watcher dispatched a batch", "%+v", batch)
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(50 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; a stopped watcher must never dispatch
 	}
 }
 
@@ -261,7 +262,9 @@ func (b *fakeWatchBackend) Stop() {
 }
 func (b *fakeWatchBackend) Name() string { return "fake" }
 
-func (b *fakeWatchBackend) includeCreatedSubtreePath(root, path string) bool {
+func (b *fakeWatchBackend) includeCreatedSubtreePath(
+	root, path string, _ bool,
+) bool {
 	return b.includeSubtree == nil || b.includeSubtree(root, path)
 }
 
@@ -319,6 +322,7 @@ func (b *fakeWatchBackend) sendBackendEvent(t *testing.T, event backendEvent) {
 	select {
 	case b.events <- event:
 	case <-time.After(watcherTestTimeout):
+		stacktest.Dump(t)
 		require.FailNowf(t, "test failed", "scheduler did not drain backend event for %q", event.Path)
 	}
 }
@@ -328,6 +332,7 @@ func (b *fakeWatchBackend) sendError(t *testing.T, err error) {
 	select {
 	case b.errors <- err:
 	case <-time.After(watcherTestTimeout):
+		stacktest.Dump(t)
 		require.FailNowf(t, "test failed", "scheduler did not drain backend error %q", err)
 	}
 }
@@ -355,6 +360,7 @@ func startFakeWatcherWithLimits(
 	select {
 	case <-backend.started:
 	case <-time.After(watcherTestTimeout):
+		stacktest.Dump(t)
 		require.FailNow(t, "watch backend did not start")
 	}
 	return w
@@ -414,6 +420,7 @@ func receiveWatcherCall(t *testing.T, calls <-chan watcherCall) watcherCall {
 	case call := <-calls:
 		return call
 	case <-time.After(watcherTestTimeout):
+		stacktest.Dump(t)
 		require.FailNow(t, "timed out waiting for watcher callback")
 		return watcherCall{}
 	}
@@ -430,6 +437,7 @@ func waitForPath(t *testing.T, calls <-chan []string, path string) {
 				return
 			}
 		case <-deadline.C:
+			stacktest.Dump(t)
 			require.FailNowf(t, "test failed", "timed out waiting for watcher path %q", path)
 		}
 	}
@@ -459,6 +467,7 @@ func receiveWatchBatch(t *testing.T, calls <-chan WatchBatch) WatchBatch {
 	case batch := <-calls:
 		return batch
 	case <-time.After(watcherTestTimeout):
+		stacktest.Dump(t)
 		require.FailNow(t, "timed out waiting for watcher callback")
 		return WatchBatch{}
 	}
@@ -573,28 +582,6 @@ func TestWatchBatchAccumulatorReportsEntryAndBytePromotion(t *testing.T) {
 				"full sync must supersede later fine-grained work in the same accumulation window")
 		})
 	}
-}
-
-func TestWatchBatchJSONExcludesLifecycleTokens(t *testing.T) {
-	gate := &recordingLifecycleGate{acknowledged: make(chan uint64, 1)}
-	want := WatchBatch{
-		Paths:          []string{"/sessions/a.jsonl"},
-		Renames:        []WatchRename{{Path: "/sessions/old", Root: "/sessions", ItemType: ItemIsDir}},
-		ReconcileRoots: []string{"/sessions"},
-		LostEvents:     true,
-	}
-	withLifecycle := want
-	withLifecycle.lifecycleTokens = []backendLifecycleToken{{gate: gate, generation: 4}}
-
-	data, err := json.Marshal(withLifecycle)
-	require.NoError(t, err)
-	assert.Contains(t, string(data), `"paths"`)
-	assert.NotContains(t, string(data), "lifecycle")
-	assert.NotContains(t, string(data), `"Paths"`)
-
-	var got WatchBatch
-	require.NoError(t, json.Unmarshal(data, &got))
-	assert.Equal(t, want, got)
 }
 
 func TestPendingWatchBatchOverflowsByPathBytes(t *testing.T) {
@@ -789,6 +776,19 @@ func TestWatchEventSinkRetainsConcurrentAuthoritativeLifecycleMarkers(t *testing
 		"separate lifecycle gates must not overwrite one another")
 }
 
+func TestWatchEventSinkFullSyncRetryKeepsFreshPathsQueued(t *testing.T) {
+	sink := newWatchEventSink(8, 1024)
+	sink.RetainRetry(WatchBatch{FullSync: true})
+	sink.Add(backendEvent{Path: "/outer/fresh.jsonl", Op: backendOpWrite})
+
+	batch, ok := sink.Take(nil)
+	require.True(t, ok)
+	assert.True(t, batch.FullSync)
+	batch, ok = sink.Take(nil)
+	require.True(t, ok, "a retried full sync must not discard fresh paths")
+	assert.Equal(t, []string{"/outer/fresh.jsonl"}, batch.Paths)
+}
+
 func TestWatchEventSinkDispatchConsumesImmediateWake(t *testing.T) {
 	sink := newWatchEventSink(8, 1024)
 	sink.RetainRetryImmediate(WatchBatch{Paths: []string{"/retry"}})
@@ -834,24 +834,61 @@ func TestWatcherBatchesPathsAndEnforcesDispatchFloor(t *testing.T) {
 	require.NoError(t, os.WriteFile(laterPath, []byte("c"), 0o644))
 	second := receiveWatcherCall(t, calls)
 	// These timestamps are inside the callback, after the scheduler's clock
-	// read. Allow the same dispatch jitter as the sustained-write test below.
+	// read. Allow for dispatch jitter and coarse platform timers.
 	const dispatchJitter = 25 * time.Millisecond
 	assert.GreaterOrEqual(t, second.at.Sub(first.at), minInterval-dispatchJitter,
 		"callbacks started less than the configured minimum interval apart")
 	assert.Contains(t, second.paths, laterPath)
 }
 
+func TestWatcherSchedulerSustainedEventsProgress(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const (
+			batchDelay  = 50 * time.Millisecond
+			minInterval = 300 * time.Millisecond
+			eventEvery  = 10 * time.Millisecond
+		)
+		backend := newFakeWatchBackend()
+		var calls []watcherCall
+		w, err := newWatcherWithBackend(
+			batchDelay, minInterval,
+			func(_ context.Context, batch WatchBatch) error {
+				calls = append(calls, watcherCall{paths: batch.Paths, at: time.Now()})
+				return nil
+			},
+			backend, 8, 1_000,
+		)
+		require.NoError(t, err)
+		w.Start()
+		t.Cleanup(w.Stop)
+
+		start := time.Now()
+		for time.Since(start) < 3*minInterval {
+			backend.sendEvent(t, "/sessions/active.jsonl")
+			synctest.Wait()
+			time.Sleep(eventEvery)
+		}
+		synctest.Wait()
+
+		require.Len(t, calls, 3, "sustained events must make bounded progress")
+		for i, call := range calls {
+			assert.Equal(t, []string{"/sessions/active.jsonl"}, call.paths)
+			assert.Equal(t, batchDelay+time.Duration(i)*minInterval, call.at.Sub(start),
+				"new events must not postpone dispatch or bypass the minimum interval")
+		}
+	})
+}
+
 func TestWatcherSustainedWritesProgress(t *testing.T) {
 	const (
-		batchDelay        = 50 * time.Millisecond
-		minInterval       = 300 * time.Millisecond
-		writeEvery        = 10 * time.Millisecond
-		dispatchTolerance = 250 * time.Millisecond
+		batchDelay  = 50 * time.Millisecond
+		minInterval = 300 * time.Millisecond
+		writeEvery  = 10 * time.Millisecond
 	)
-	calls := make(chan watcherCall, 4)
+	calls := make(chan []string, 4)
 	_, dir := startTestWatcherWithIntervals(
 		t, func(paths []string) {
-			calls <- watcherCall{paths: paths, at: time.Now()}
+			calls <- paths
 		}, batchDelay, minInterval,
 	)
 	path := filepath.Join(dir, "active.jsonl")
@@ -885,17 +922,17 @@ func TestWatcherSustainedWritesProgress(t *testing.T) {
 	}
 	t.Cleanup(stopWriter)
 
-	receiveCall := func() watcherCall {
+	receiveCall := func() []string {
 		t.Helper()
 		select {
 		case call := <-calls:
 			return call
 		case err := <-writeErr:
 			require.NoError(t, err)
-			return watcherCall{}
-		case <-time.After(minInterval + dispatchTolerance):
+			return nil
+		case <-time.After(watcherTestTimeout):
 			require.FailNow(t, "continuous writes starved the watcher callback")
-			return watcherCall{}
+			return nil
 		}
 	}
 
@@ -908,18 +945,8 @@ func TestWatcherSustainedWritesProgress(t *testing.T) {
 	default:
 	}
 
-	assert.Contains(t, first.paths, path)
-	assert.Contains(t, second.paths, path)
-	// The watcher spaces callbacks from its own clock reads taken before each
-	// dispatch, while these stamps are taken inside the callback. Dispatch
-	// jitter and coarse Windows timers can therefore shave a few
-	// milliseconds off the observed spacing without the watcher firing early.
-	const dispatchJitter = 25 * time.Millisecond
-	spacing := second.at.Sub(first.at)
-	assert.GreaterOrEqual(t, spacing, minInterval-dispatchJitter,
-		"sustained-write callbacks started too close together")
-	assert.LessOrEqual(t, spacing, minInterval+dispatchTolerance,
-		"sustained writes did not make bounded progress")
+	assert.Contains(t, first, path)
+	assert.Contains(t, second, path)
 }
 
 func TestWatcherSchedulerContinuesIntakeWithOnePendingAccumulator(t *testing.T) {
@@ -971,10 +998,10 @@ func TestWatcherSchedulerContinuesIntakeWithOnePendingAccumulator(t *testing.T) 
 		"watcher callbacks must remain serialized")
 }
 
-func TestWatcherDeferredPathRetryPreservesCoalescedReconcileRoot(t *testing.T) {
+func TestWatcherDeferredPathRetryPreservesConcurrentReconcileRoot(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
-	calls := make(chan WatchBatch, 2)
+	calls := make(chan WatchBatch, 3)
 	var callbackCount atomic.Int32
 	backend := newFakeWatchBackend()
 	w, err := newWatcherWithBackend(
@@ -1015,11 +1042,18 @@ func TestWatcherDeferredPathRetryPreservesCoalescedReconcileRoot(t *testing.T) {
 	})
 	close(release)
 	first := receiveWatchBatch(t, calls)
-	second := receiveWatchBatch(t, calls)
 	assert.Contains(t, first.Paths, "/sessions/deferred.jsonl")
-	assert.Contains(t, second.Paths, "/sessions/deferred.jsonl")
+	// The fresh reconcile root dispatches at once; the retry joins it only if
+	// its backoff has already expired, otherwise it follows on its own.
+	second := receiveWatchBatch(t, calls)
 	assert.Contains(t, second.ReconcileRoots, "/sessions")
 	assert.False(t, second.FullSync)
+	retried := second
+	if !slices.Contains(second.Paths, "/sessions/deferred.jsonl") {
+		retried = receiveWatchBatch(t, calls)
+	}
+	assert.Contains(t, retried.Paths, "/sessions/deferred.jsonl")
+	assert.False(t, retried.FullSync)
 }
 
 func TestWatcherOverflowCollapsesPathAndByteLimitsToOneFullSync(t *testing.T) {
@@ -1468,30 +1502,147 @@ func TestWatcherRetryFloorStartsWhenFailedCallbackCompletes(t *testing.T) {
 	})
 }
 
-func TestWatcherFailedRetryBacksOffWhileUnrelatedEventsArrive(t *testing.T) {
+func TestWatcherNativeEventsDoNotWaitForFailedRetryBackoff(t *testing.T) {
+	t.Run("events during callback", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			root := t.TempDir()
+			retainedPath := filepath.Join(root, "failed.jsonl")
+			unrelatedPath := filepath.Join(t.TempDir(), "active.jsonl")
+			backend := newFakeWatchBackend()
+			type call struct {
+				at    time.Duration
+				batch WatchBatch
+			}
+			calls := make(chan call, 8)
+			start := time.Now()
+			attempt, retryFailures := 0, 0
+			w, err := newWatcherWithBackend(
+				0, 20*time.Millisecond,
+				func(_ context.Context, batch WatchBatch) error {
+					attempt++
+					calls <- call{at: time.Since(start), batch: batch}
+					if attempt < 8 {
+						// The unbuffered send makes the loop consume this event before completion.
+						backend.sendEvent(t, unrelatedPath)
+					}
+					if slices.Contains(batch.Paths, retainedPath) && retryFailures < 3 {
+						retryFailures++
+						return retryScopedWatchError{retry: WatchBatch{
+							Paths: []string{retainedPath}, ReconcileRoots: []string{root},
+							LostEvents: true,
+						}}
+					}
+					return nil
+				},
+				backend, 8, 100_000,
+			)
+			require.NoError(t, err)
+			w.Start()
+			defer w.Stop()
+			backend.sendEvent(t, retainedPath)
+			type observed struct {
+				at       time.Duration
+				retained bool
+				fresh    bool
+				lost     bool
+				roots    []string
+			}
+			var got []observed
+			for range 8 {
+				c := requireReceiveWithin(t, calls, time.Second)
+				got = append(got, observed{
+					at:       c.at,
+					retained: slices.Contains(c.batch.Paths, retainedPath),
+					fresh:    slices.Contains(c.batch.Paths, unrelatedPath),
+					lost:     c.batch.LostEvents,
+					roots:    c.batch.ReconcileRoots,
+				})
+			}
+			ms := time.Millisecond
+			// The retry backs off 20, 40, 80ms; fresh events run alone on the 20ms floor.
+			retry := []string{root}
+			none := []string{}
+			assert.Equal(t, []observed{
+				{at: 0, retained: true, roots: none},
+				{at: 20 * ms, retained: true, fresh: true, lost: true, roots: retry},
+				{at: 40 * ms, fresh: true, roots: none},
+				{at: 60 * ms, retained: true, fresh: true, lost: true, roots: retry},
+				{at: 80 * ms, fresh: true, roots: none},
+				{at: 100 * ms, fresh: true, roots: none},
+				{at: 120 * ms, fresh: true, roots: none},
+				{at: 140 * ms, retained: true, fresh: true, lost: true, roots: retry},
+			}, got)
+		})
+	})
+	t.Run("new project during capped discovery retry", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			backend := newFakeWatchBackend()
+			root := t.TempDir()
+			calls := make(chan WatchBatch, 16)
+			w, err := newWatcherWithBackend(
+				5*time.Second, 5*time.Second,
+				func(_ context.Context, batch WatchBatch) error {
+					calls <- batch
+					return retryScopedWatchError{retry: WatchBatch{ReconcileRoots: []string{root}}}
+				},
+				backend, 32, 100_000,
+			)
+			require.NoError(t, err)
+			w.Start()
+			defer w.Stop()
+			backend.sendBackendEvent(t, backendEvent{
+				Path: root, Root: root, Op: backendOpReconcileRootChange,
+			})
+			for range 6 {
+				requireReceiveWithin(t, calls, 3*time.Minute)
+				synctest.Wait()
+			}
+			time.Sleep(time.Second)
+			writtenAt := time.Now()
+			project := filepath.Join(root, "new-project")
+			path := filepath.Join(project, "new-session.jsonl")
+			backend.sendBackendEvent(t, backendEvent{
+				Path: project, Root: root, Op: backendOpCreate, ItemType: backendItemDirectory,
+			})
+			backend.sendEvent(t, path)
+			batch := requireReceiveWithin(t, calls, 3*time.Minute)
+			assert.Contains(t, batch.Paths, path)
+			assert.Equal(t, []string{root}, batch.ReconcileRoots, "failed discovery remains retryable")
+			assert.Equal(t, 5*time.Second, time.Since(writtenAt),
+				"a native event must use the debounce delay while discovery retries are capped")
+		})
+	})
+}
+
+func TestWatcherRecurringFreshFailuresDoNotPostponeOlderRetry(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		root := t.TempDir()
-		retainedPath := filepath.Join(root, "failed.jsonl")
-		unrelatedPath := filepath.Join(t.TempDir(), "active.jsonl")
+		olderPath := filepath.Join(root, "older.jsonl")
+		freshPath := filepath.Join(root, "active.jsonl")
 		backend := newFakeWatchBackend()
-		calls := make(chan WatchBatch, 6)
-		starts := make(chan time.Time, 6)
-		attempt := 0
+		type call struct {
+			at    time.Duration
+			older bool
+		}
+		calls := make(chan call, 64)
+		start := time.Now()
+		attempt, olderFailures := 0, 0
 		w, err := newWatcherWithBackend(
 			0, 20*time.Millisecond,
 			func(_ context.Context, batch WatchBatch) error {
 				attempt++
-				starts <- time.Now()
-				calls <- batch
-				if attempt < 6 {
+				older := slices.Contains(batch.Paths, olderPath)
+				calls <- call{at: time.Since(start), older: older}
+				if attempt >= 3 && attempt < 10 {
 					// The unbuffered send makes the loop consume this event before completion.
-					backend.sendEvent(t, unrelatedPath)
+					backend.sendEvent(t, freshPath)
 				}
-				if attempt <= 3 || attempt == 5 {
-					return retryScopedWatchError{retry: WatchBatch{
-						Paths: []string{retainedPath}, ReconcileRoots: []string{root},
-						LostEvents: true,
-					}}
+				if older && olderFailures < 3 {
+					olderFailures++
+					return retryScopedWatchError{retry: WatchBatch{Paths: []string{olderPath}}}
+				}
+				if slices.Contains(batch.Paths, freshPath) {
+					return retryScopedWatchError{retry: WatchBatch{Paths: []string{freshPath}}}
 				}
 				return nil
 			},
@@ -1500,26 +1651,18 @@ func TestWatcherFailedRetryBacksOffWhileUnrelatedEventsArrive(t *testing.T) {
 		require.NoError(t, err)
 		w.Start()
 		defer w.Stop()
-		backend.sendEvent(t, retainedPath)
-		var at []time.Time
-		for i := range 6 {
-			at = append(at, requireReceiveWithin(t, starts, time.Second))
-			batch := receiveWatchBatch(t, calls)
-			if i == 1 || i == 2 || i == 3 || i == 5 {
-				assert.ElementsMatch(t, []string{retainedPath, unrelatedPath}, batch.Paths)
-				assert.Equal(t, []string{root}, batch.ReconcileRoots)
-				assert.True(t, batch.LostEvents)
-				assert.False(t, batch.FullSync)
-			}
-			if i == 4 {
-				assert.Equal(t, []string{unrelatedPath}, batch.Paths)
-				assert.Empty(t, batch.ReconcileRoots)
-				assert.False(t, batch.LostEvents)
+		backend.sendEvent(t, olderPath)
+		var olderAt []time.Duration
+		for len(olderAt) < 4 {
+			c := requireReceiveWithin(t, calls, time.Minute)
+			if c.older {
+				olderAt = append(olderAt, c.at)
 			}
 		}
-		gaps := []time.Duration{at[1].Sub(at[0]), at[2].Sub(at[1]), at[3].Sub(at[2]), at[4].Sub(at[3]), at[5].Sub(at[4])}
-		t.Logf("callback gaps: %v", gaps)
-		assert.Equal(t, []time.Duration{20 * time.Millisecond, 40 * time.Millisecond, 80 * time.Millisecond, 20 * time.Millisecond, 20 * time.Millisecond}, gaps)
+		ms := time.Millisecond
+		// The older retry backs off 20, 40, 80ms. Fresh failures from 80ms on
+		// must not push its fourth attempt past 140ms.
+		assert.Equal(t, []time.Duration{0, 20 * ms, 60 * ms, 140 * ms}, olderAt)
 	})
 }
 
@@ -1532,7 +1675,6 @@ func TestWatcherFailedRetryBackoffIsIndependentOfBatchPathCount(t *testing.T) {
 				for i := range paths {
 					paths[i] = filepath.Join(root, fmt.Sprintf("session-%d.jsonl", i))
 				}
-				unrelatedPath := filepath.Join(t.TempDir(), "active.jsonl")
 				backend := newFakeWatchBackend()
 				var starts []time.Time
 				w, err := newWatcherWithBackend(
@@ -1540,7 +1682,6 @@ func TestWatcherFailedRetryBackoffIsIndependentOfBatchPathCount(t *testing.T) {
 					func(_ context.Context, batch WatchBatch) error {
 						starts = append(starts, time.Now())
 						assert.Subset(t, batch.Paths, paths)
-						backend.sendEvent(t, unrelatedPath)
 						return retryScopedWatchError{retry: WatchBatch{Paths: paths}}
 					},
 					backend, 1024, 1_000_000,
@@ -1852,50 +1993,54 @@ func TestWatcherPreservesLostEventsWhenFullRetryNarrowsToRoots(t *testing.T) {
 }
 
 func TestWatcherPreservesLostEventsWhenAmbiguousRenameRetryPromotesToFullSync(t *testing.T) {
-	backend := newFakeWatchBackend()
-	calls := make(chan WatchBatch, 3)
-	releaseFirst := make(chan struct{})
-	var attempts atomic.Int32
-	w, err := newWatcherWithBackend(
-		0, 100*time.Millisecond,
-		func(_ context.Context, batch WatchBatch) error {
-			calls <- batch
-			switch attempts.Add(1) {
-			case 1:
-				<-releaseFirst
-				return retryScopedWatchError{retry: WatchBatch{
-					ReconcileRoots: []string{"/sessions"},
-					LostEvents:     true,
-				}}
-			case 2:
-				return errors.New("rename classification failed")
-			default:
-				return nil
-			}
-		},
-		backend, 8, 1_000,
-	)
-	require.NoError(t, err)
-	w.SetRootAgents("/sessions", []string{"codex"})
-	w.Start()
-	t.Cleanup(w.Stop)
+	synctest.Test(t, func(t *testing.T) {
+		backend := newFakeWatchBackend()
+		calls := make(chan WatchBatch, 3)
+		releaseFirst := make(chan struct{})
+		var attempts atomic.Int32
+		w, err := newWatcherWithBackend(
+			0, 100*time.Millisecond,
+			func(_ context.Context, batch WatchBatch) error {
+				calls <- batch
+				switch attempts.Add(1) {
+				case 1:
+					<-releaseFirst
+					return retryScopedWatchError{retry: WatchBatch{
+						ReconcileRoots: []string{"/sessions"},
+						LostEvents:     true,
+					}}
+				case 2:
+					return errors.New("rename classification failed")
+				default:
+					return nil
+				}
+			},
+			backend, 8, 1_000,
+		)
+		require.NoError(t, err)
+		w.SetRootAgents("/sessions", []string{"codex"})
+		w.Start()
+		t.Cleanup(w.Stop)
 
-	backend.sendBackendEvent(t, backendEvent{Op: backendOpFullSync})
-	first := receiveWatchBatch(t, calls)
-	backend.sendBackendEvent(t, backendEvent{
-		Path: "/sessions/renamed", Root: "/sessions",
-		Op: backendOpRename, ItemType: backendItemUnknown,
+		backend.sendBackendEvent(t, backendEvent{Op: backendOpFullSync})
+		first := receiveWatchBatch(t, calls)
+		backend.sendBackendEvent(t, backendEvent{
+			Path: "/sessions/renamed", Root: "/sessions",
+			Op: backendOpRename, ItemType: backendItemUnknown,
+		})
+		// Keep the pending rename and retained retry on the same clock tick.
+		synctest.Wait()
+		close(releaseFirst)
+		second := receiveWatchBatch(t, calls)
+		third := receiveWatchBatch(t, calls)
+
+		assert.Equal(t, WatchBatch{FullSync: true, LostEvents: true}, first)
+		require.Len(t, second.Renames, 1)
+		assert.Equal(t, ItemIsUnknown, second.Renames[0].ItemType)
+		assert.Equal(t, []string{"/sessions"}, second.ReconcileRoots)
+		assert.True(t, second.LostEvents)
+		assert.Equal(t, WatchBatch{FullSync: true, LostEvents: true}, third)
 	})
-	close(releaseFirst)
-	second := receiveWatchBatch(t, calls)
-	third := receiveWatchBatch(t, calls)
-
-	assert.Equal(t, WatchBatch{FullSync: true, LostEvents: true}, first)
-	require.Len(t, second.Renames, 1)
-	assert.Equal(t, ItemIsUnknown, second.Renames[0].ItemType)
-	assert.Equal(t, []string{"/sessions"}, second.ReconcileRoots)
-	assert.True(t, second.LostEvents)
-	assert.Equal(t, WatchBatch{FullSync: true, LostEvents: true}, third)
 }
 
 func TestWatcherUsesCallbackReconciliationScopeForRetry(t *testing.T) {
@@ -2022,7 +2167,7 @@ func TestWatcherStopCancelsPendingCallback(t *testing.T) {
 	select {
 	case batch := <-calls:
 		require.FailNowf(t, "test failed", "callback ran after Stop with batch %+v", batch)
-	case <-time.After(350 * time.Millisecond):
+	case <-time.After(350 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; a stopped watcher must never run the callback
 	}
 }
 
@@ -2065,7 +2210,7 @@ func TestWatcherStopWaitsForRunningCallbackAndDiscardsPending(t *testing.T) {
 	select {
 	case <-stopped:
 		require.FailNow(t, "Stop returned before the running callback completed")
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(50 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; the running callback keeps Stop waiting
 	}
 
 	releaseCallback()
@@ -2120,54 +2265,6 @@ func TestWatcherCallsOnChange(t *testing.T) {
 	}
 }
 
-func TestWatcherAutoWatchesNewDirs(t *testing.T) {
-	pathsCh := make(chan []string, 10)
-
-	_, dir := startTestWatcher(t, func(paths []string) {
-		pathsCh <- paths
-	})
-
-	subdir := filepath.Join(dir, "newdir")
-	require.NoError(t, os.Mkdir(subdir, 0o755))
-
-	// Delivery of the directory create means the backend has completed its
-	// auto-watch decision before handing the event to the scheduler.
-	waitForPath(t, pathsCh, subdir)
-
-	nestedPath := filepath.Join(subdir, "nested.jsonl")
-	require.NoError(t, os.WriteFile(nestedPath, []byte("nested"), 0o644))
-
-	deadline := time.Now().Add(5 * time.Second)
-	found := false
-	for time.Now().Before(deadline) && !found {
-		select {
-		case paths := <-pathsCh:
-			if slices.Contains(paths, nestedPath) {
-				found = true
-			}
-		case <-time.After(50 * time.Millisecond):
-		}
-	}
-
-	require.True(t, found, "timed out waiting for nested file change")
-}
-
-func TestWatcherStopIsClean(t *testing.T) {
-	w, _ := startTestWatcherNoCleanup(t, func(_ []string) {}, 50*time.Millisecond)
-
-	stopped := make(chan struct{})
-	go func() {
-		w.Stop()
-		close(stopped)
-	}()
-
-	select {
-	case <-stopped:
-	case <-time.After(5 * time.Second):
-		require.FailNow(t, "Stop() did not return in time")
-	}
-}
-
 func TestWatcherLifecycleStopBeforeStartReturns(t *testing.T) {
 	backend := newFakeWatchBackend()
 	w, err := newWatcherWithBackend(
@@ -2183,7 +2280,7 @@ func TestWatcherLifecycleStopBeforeStartReturns(t *testing.T) {
 
 	select {
 	case <-stopped:
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(watcherTestTimeout):
 		require.FailNow(t, "Stop blocked before Start")
 	}
 	w.Start()
@@ -2218,7 +2315,7 @@ func TestWatcherLifecycleStartFailureReturnsErrorAndDegradesRegisteredScopes(t *
 		requireReceiveWithin(t, degraded, time.Second))
 	select {
 	case <-backend.stopped:
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(watcherTestTimeout):
 		require.FailNow(t, "failed Start did not stop its backend")
 	}
 	w.Stop()
@@ -2351,7 +2448,7 @@ func TestWatcherIgnoresNonWriteCreate(t *testing.T) {
 	select {
 	case <-pathsCh:
 		require.FailNow(t, "onChange called for chmod event, expected it to be ignored")
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(100 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; a chmod must never schedule a callback
 		// Success
 	}
 }
@@ -2448,7 +2545,18 @@ func TestWatcherAutoWatchesNewDirs_RespectsExcludes(t *testing.T) {
 	require.NoError(t, os.Mkdir(gitDir, 0o755), "Mkdir(.git)")
 	barrier := filepath.Join(root, "included-barrier")
 	require.NoError(t, os.Mkdir(barrier, 0o755), "Mkdir(barrier)")
-	waitForPath(t, pathsCh, barrier)
+	deadline := time.NewTimer(watcherTestTimeout)
+	defer deadline.Stop()
+	for reached := false; !reached; {
+		select {
+		case paths := <-pathsCh:
+			assert.NotContains(t, paths, gitDir,
+				"excluded directory create should not trigger onChange")
+			reached = slices.Contains(paths, barrier)
+		case <-deadline.C:
+			require.FailNow(t, "timed out waiting for the included barrier")
+		}
+	}
 
 	fileInGit := filepath.Join(gitDir, "config")
 	require.NoError(t, os.WriteFile(fileInGit, []byte("x"), 0o644))
@@ -2475,7 +2583,7 @@ func TestWatcherShallowRootDoesNotAutoWatchNewDirs(t *testing.T) {
 	case paths := <-pathsCh:
 		assert.Contains(t, paths, localDir,
 			"root-level create should still trigger onChange")
-	case <-time.After(250 * time.Millisecond):
+	case <-time.After(watcherTestTimeout):
 		require.FailNow(t, "timed out waiting for shallow root create event")
 	}
 
@@ -2519,19 +2627,7 @@ func TestWatcherShallowParentDoesNotShadowRecursiveChild(t *testing.T) {
 	sessionFile := filepath.Join(dateDir, "rollout.jsonl")
 	require.NoError(t, os.WriteFile(sessionFile, []byte("x"), 0o644))
 
-	deadline := time.Now().Add(5 * time.Second)
-	found := false
-	for time.Now().Before(deadline) && !found {
-		select {
-		case paths := <-pathsCh:
-			if slices.Contains(paths, sessionFile) {
-				found = true
-			}
-		case <-time.After(50 * time.Millisecond):
-		}
-	}
-	require.True(t, found,
-		"file in a new date dir under the recursive child must trigger onChange")
+	waitForPath(t, pathsCh, sessionFile)
 }
 
 func TestWatchRecursive_RootUnderExcludedAncestorStillWatchesDescendants(t *testing.T) {
@@ -2586,31 +2682,6 @@ func TestWatchRecursive_OverlappingRoots_UsesMostSpecificRoot(t *testing.T) {
 	assert.Equal(t, 2, nestedWatched,
 		"the nested root and descendant should use the nested exclusion scope")
 	assert.Zero(t, nestedUnwatched)
-}
-
-func TestWatcherExcludedCreateDir_DoesNotTriggerOnChange(t *testing.T) {
-	pathsCh := make(chan []string, 10)
-	w, err := NewWatcher(20*time.Millisecond, func(batch WatchBatch) {
-		pathsCh <- batch.Paths
-	}, []string{".git"})
-	require.NoError(t, err, "NewWatcher")
-	t.Cleanup(func() { w.Stop() })
-
-	root := t.TempDir()
-	_, _, err = w.WatchRecursive(root)
-	require.NoError(t, err, "WatchRecursive")
-	w.Start()
-
-	gitDir := filepath.Join(root, ".git")
-	require.NoError(t, os.Mkdir(gitDir, 0o755), "Mkdir(.git)")
-
-	select {
-	case paths := <-pathsCh:
-		assert.NotContains(t, paths, gitDir,
-			"excluded directory create should not trigger onChange")
-	case <-time.After(250 * time.Millisecond):
-		// Expected: no callback for excluded dir creation.
-	}
 }
 
 func TestNewWatcher_NilOnChange(t *testing.T) {

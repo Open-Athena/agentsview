@@ -35,12 +35,15 @@ var providerMigrationModes = map[AgentType]ProviderMigrationMode{
 	AgentIcodemate:      ProviderMigrationProviderAuthoritative,
 	AgentIflow:          ProviderMigrationProviderAuthoritative,
 	AgentAmp:            ProviderMigrationProviderAuthoritative,
+	AgentJunie:          ProviderMigrationProviderAuthoritative,
 	AgentZencoder:       ProviderMigrationProviderAuthoritative,
 	AgentVSCodeCopilot:  ProviderMigrationProviderAuthoritative,
 	AgentWindsurf:       ProviderMigrationProviderAuthoritative,
 	AgentTrae:           ProviderMigrationProviderAuthoritative,
 	AgentVSCopilot:      ProviderMigrationProviderAuthoritative,
 	AgentPi:             ProviderMigrationProviderAuthoritative,
+	AgentOMO:            ProviderMigrationProviderAuthoritative,
+	AgentFx:             ProviderMigrationProviderAuthoritative,
 	AgentTau:            ProviderMigrationProviderAuthoritative,
 	AgentPrimeAgent:     ProviderMigrationProviderAuthoritative,
 	AgentQwen:           ProviderMigrationProviderAuthoritative,
@@ -78,6 +81,7 @@ var providerMigrationModes = map[AgentType]ProviderMigrationMode{
 	AgentShelley:        ProviderMigrationProviderAuthoritative,
 	AgentAider:          ProviderMigrationProviderAuthoritative,
 	AgentOMP:            ProviderMigrationProviderAuthoritative,
+	AgentStepCode:       ProviderMigrationProviderAuthoritative,
 	AgentEvener:         ProviderMigrationProviderAuthoritative,
 	AgentReasonix:       ProviderMigrationProviderAuthoritative,
 	AgentRooCode:        ProviderMigrationProviderAuthoritative,
@@ -86,8 +90,10 @@ var providerMigrationModes = map[AgentType]ProviderMigrationMode{
 	AgentOmnigent:       ProviderMigrationProviderAuthoritative,
 	AgentCodebuff:       ProviderMigrationProviderAuthoritative,
 	AgentCrush:          ProviderMigrationProviderAuthoritative,
+	AgentMuse:           ProviderMigrationProviderAuthoritative,
 
 	AgentDeepSeekHarness: ProviderMigrationProviderAuthoritative,
+	AgentCodexCloud:      ProviderMigrationProviderAuthoritative,
 }
 
 // ProviderMigrationModes returns the current provider migration manifest.

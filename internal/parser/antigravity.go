@@ -33,12 +33,13 @@ var antigravityUUIDLikeRE = regexp.MustCompile(
 )
 
 // AntigravityFileInfo returns the effective file info for an IDE
-// session .db, combining the main file with its -wal/-shm sidecars,
+// session .db, combining the main file with its -wal sidecar,
 // the annotations/<id>.pbtxt sidecar, and the brain/<id> artifacts
 // the parse renders as messages. WAL-only commits and annotation or
 // brain updates do not touch the main file, so skip checks and
 // persisted file metadata must use this composite or live sessions
-// never reparse.
+// never reparse. The -shm index is left out; see
+// sqliteDBJournalSuffixes.
 func AntigravityFileInfo(path string) (os.FileInfo, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -51,17 +52,28 @@ func AntigravityFileInfo(path string) (os.FileInfo, error) {
 }
 
 func antigravityIDECompanionPaths(path string) []string {
+	if _, _, ok := antigravityBrainTranscriptConversation(path); ok {
+		// A brain transcript standing as its own session has no companions:
+		// it is the whole of what that session is parsed from.
+		return nil
+	}
 	id := strings.TrimSuffix(filepath.Base(path), ".db")
 	root := filepath.Dir(filepath.Dir(path))
 	companions := []string{
+		// No "-shm": the parse's own read-only open rewrites that index,
+		// so including it made every parse schedule the next one.
+		// Committed writes land in the main file or the -wal.
 		path + "-wal",
-		path + "-shm",
 		filepath.Join(root, "annotations", id+".pbtxt"),
 		// The agy-reader trajectory sidecar is a transcript source for
 		// IDE sessions too (see parseSession), so a sidecar write must
 		// change the fingerprint even when the database files themselves
 		// are untouched.
 		strings.TrimSuffix(path, ".db") + ".trajectory.json",
+		// The brain transcript is folded into this session's messages (see
+		// parseSession), so a transcript write must reparse the session even
+		// when the database files are untouched.
+		antigravityBrainTranscriptPath(root, id),
 	}
 	return append(companions, antigravityBrainCompanions(
 		filepath.Join(root, "brain", id),
@@ -74,6 +86,14 @@ func antigravityIDECompanionPaths(path string) []string {
 func (p *antigravityProvider) parseSession(ctx context.Context,
 	path, project, machine string,
 ) (*ParsedSession, []ParsedMessage, []ParsedUsageEvent, error) {
+	if _, id, ok := antigravityBrainTranscriptConversation(path); ok {
+		// A conversation with no database of its own: the brain's
+		// plaintext transcript is the session. It carries no token usage.
+		sess, msgs, err := parseAntigravityBrainTranscriptSession(
+			path, id, project, machine,
+		)
+		return sess, msgs, nil, err
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("stat %s: %w", path, err)
@@ -86,22 +106,10 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
 	}
 	root := filepath.Dir(filepath.Dir(path))
 
-	// Open read-only; SQLite session files have WAL/SHM
-	// sidecars that the driver expects in the same dir.
-	db, err := openSQLiteReadOnly(path, sqliteReadOptions{})
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf(
-			"open antigravity db %s: %w", path, err,
-		)
-	}
-	defer db.Close()
-
-	// Schema-fingerprint label for the producing agy build. Computed from
-	// the open DB so IDE and CLI classify identically; empty when the
-	// schema cannot be read.
-	sourceVersion := antigravitySourceVersion(ctx, db)
-
-	dbResult, err := loadAntigravityStepsWithRawCount(ctx, db)
+	// Open read-only (falling back to immutable=1 when a checkpointed WAL DB
+	// lives on a read-only mount without a .db-shm file).
+	dbResult, err := loadAntigravityCLIDBSteps(ctx, path)
+	sourceVersion := dbResult.sourceVersion
 	if err != nil {
 		// Fail closed on an unreadable steps table, deliberately: a
 		// covering sidecar cannot rescue an unreadable DB because
@@ -165,6 +173,16 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
 			filepath.Join(root, "brain", id),
 		)...,
 	)
+	// The brain's own transcript of this conversation, when it wrote one. It is
+	// folded in here rather than stored as a second session so one conversation
+	// stays one session.
+	brainMessages, err := collectAntigravityBrainTranscriptMessages(
+		antigravityBrainTranscriptPath(root, id),
+	)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, nil, nil, err
+	}
+	messages = append(messages, brainMessages...)
 
 	sort.SliceStable(messages, func(i, j int) bool {
 		return messages[i].Timestamp.Before(messages[j].Timestamp)
@@ -253,8 +271,14 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
 }
 
 type antigravityStepLoadResult struct {
-	messages    []ParsedMessage
-	usageEvents []ParsedUsageEvent
+	messages []ParsedMessage
+	steps    []antigravityLoadedStep
+	// metadataSteps carry gen_metadata usage for output steps the steps
+	// table has not written yet, so a brain transcript entry at that index
+	// can still claim the generation's model and tokens.
+	metadataSteps         []antigravityLoadedStep
+	usageEvents           []ParsedUsageEvent
+	usageEventStepIndices []int
 	// executors is retained for preferred trajectory sidecars so their
 	// generatorMetadata uses the same range-qualified model attribution as
 	// SQLite gen_metadata.
@@ -392,7 +416,7 @@ func loadAntigravityStepsWithRawCount(ctx context.Context,
 		}
 		stepPositions[idx] = len(steps)
 		steps = append(steps, antigravityLoadedStep{
-			kind: kind, msg: msg, decoded: decoded,
+			idx: idx, kind: kind, msg: msg, decoded: decoded,
 		})
 		result.rawStepCount++
 	}
@@ -405,18 +429,32 @@ func loadAntigravityStepsWithRawCount(ctx context.Context,
 			generation, steps, stepPositions,
 		)
 		executorModel := ""
-		if stepIndex, known := generation.maxStepIndex(); known {
-			executorModel = executorModelForStep(executors, stepIndex)
+		maxStepIdx, known := generation.maxStepIndex()
+		if known {
+			executorModel = executorModelForStep(executors, maxStepIdx)
 		}
 		if !found {
-			result.appendGenMetadataUsage(
-				generation.data, ParsedMessage{}, false, executorModel,
+			// The usage is recorded as an event only. When the
+			// generation's last step has no row yet, it is most likely the
+			// missing output, so a carrier at that index keeps the model
+			// and tokens for the brain transcript. A last step that exists
+			// but is not the planner gets nothing.
+			stepIdx := -1
+			if _, exists := stepPositions[maxStepIdx]; known && !exists {
+				stepIdx = maxStepIdx
+			}
+			genMsg := result.appendGenMetadataUsage(
+				stepIdx, generation.data, ParsedMessage{}, false, executorModel,
 			)
+			if stepIdx >= 0 {
+				result.metadataSteps = append(result.metadataSteps,
+					antigravityLoadedStep{idx: stepIdx, msg: genMsg})
+			}
 			continue
 		}
 		step := &steps[position]
 		step.msg = result.appendGenMetadataUsage(
-			generation.data, step.msg, step.decoded, executorModel,
+			step.idx, generation.data, step.msg, step.decoded, executorModel,
 		)
 	}
 	for _, step := range steps {
@@ -424,10 +462,12 @@ func loadAntigravityStepsWithRawCount(ctx context.Context,
 			result.messages = append(result.messages, step.msg)
 		}
 	}
+	result.steps = steps
 	return result, nil
 }
 
 type antigravityLoadedStep struct {
+	idx     int
 	kind    antigravityStepKind
 	msg     ParsedMessage
 	decoded bool
@@ -602,18 +642,29 @@ func generationPlannerStep(
 	steps []antigravityLoadedStep,
 	positions map[int]int,
 ) (int, bool) {
+	// An undecoded planner row still carries the usage so a brain
+	// transcript can claim it by step index. An undecoded row of any other
+	// kind is not chosen: its step_type column cannot show it is the output.
+	plannerPos := -1
 	for _, idx := range generation.stepIndices {
 		position, ok := positions[idx]
 		if !ok {
 			continue
 		}
 		step := steps[position]
-		if step.kind == antigravityStepKindPlannerResponse &&
-			step.decoded {
-			return position, true
+		if step.kind == antigravityStepKindPlannerResponse {
+			if step.decoded {
+				return position, true
+			}
+			if plannerPos < 0 {
+				plannerPos = position
+			}
 		}
 	}
 	if generation.hasStepIndices {
+		if plannerPos >= 0 {
+			return plannerPos, true
+		}
 		return 0, false
 	}
 	position, ok := positions[generation.idx]
@@ -632,12 +683,13 @@ func executorModelForStep(
 }
 
 // appendGenMetadataUsage records a usage event from one gen_metadata
-// payload and, when the step decoded into a message, attaches token
-// counts and the model name to the returned copy. Usage extraction is
-// deliberately independent of message decoding: a step the heuristic
-// cannot render can still be rescued by the CLI trajectory sidecar
-// transcript, and its usage must not be dropped.
+// payload and attaches token counts and the model name to the returned
+// message copy. Usage extraction is deliberately independent of message
+// decoding: a step the heuristic cannot render can still be rescued by
+// the CLI trajectory sidecar or brain transcript, and its usage must not
+// be dropped.
 func (r *antigravityStepLoadResult) appendGenMetadataUsage(
+	stepIdx int,
 	data []byte,
 	msg ParsedMessage,
 	decoded bool,
@@ -660,12 +712,11 @@ func (r *antigravityStepLoadResult) appendGenMetadataUsage(
 			if !msg.Timestamp.IsZero() {
 				occurredAt = msg.Timestamp.Format(time.RFC3339Nano)
 			}
-			msg.ContextTokens = context
-			msg.OutputTokens = block.TotalOutput
-			msg.HasContextTokens = context > 0
-			msg.HasOutputTokens = block.TotalOutput > 0
-
 		}
+		msg.ContextTokens = context
+		msg.OutputTokens = block.TotalOutput
+		msg.HasContextTokens = context > 0
+		msg.HasOutputTokens = block.TotalOutput > 0
 		r.usageEvents = append(r.usageEvents, ParsedUsageEvent{
 			Source:               "generation",
 			Model:                eventModel,
@@ -675,8 +726,9 @@ func (r *antigravityStepLoadResult) appendGenMetadataUsage(
 			ReasoningTokens:      0, // not available in gen_metadata
 			OccurredAt:           occurredAt,
 		})
+		r.usageEventStepIndices = append(r.usageEventStepIndices, stepIdx)
 	}
-	if decoded && genModel != "" {
+	if genModel != "" {
 		msg.Model = genModel
 	}
 	return msg

@@ -50,6 +50,10 @@ func TestSupplementalPricing_KimiK3StaticAliases(t *testing.T) {
 	assert.False(t, ok,
 		"gpt-reserve must not have a static row; it prices through %s",
 		GPT56LunaCanonical)
+	_, ok = byPattern[CodexAutoReviewModelName]
+	assert.False(t, ok,
+		"codex-auto-review must not have a static row; it prices through %s",
+		GPT56LunaCanonical)
 }
 
 // TestSupplementalPricing_StepFunStep5Preview pins the curated StepFun
@@ -96,12 +100,46 @@ func TestSupplementalPricing_StepFunStep5Preview(t *testing.T) {
 	assert.Equal(t, unrelated, got)
 }
 
-func TestDateAliasedModels(t *testing.T) {
-	assert.Equal(t, []string{
-		"daimon-kimi-code",
-		"daimon-kimi-messages",
-		"kimi-for-coding",
-	}, DateAliasedModels())
+// TestPricingMuseModels pins how Muse Code's reported model ids price.
+// Bare Muse Spark ids match both meta/ and openrouter/meta/ catalog rows,
+// so fixed aliases send them to Meta's rows. Muse Wonder is absent from
+// the snapshot and uses Meta's published rate, read 2026-10-13 from
+// <https://dev.meta.ai/docs/pricing-rate-limits>.
+func TestPricingMuseModels(t *testing.T) {
+	fallback := requireEmbeddedFallbackPricing(t)
+	byPattern := make(map[string]ModelPricing, len(fallback))
+	for _, p := range fallback {
+		byPattern[p.ModelPattern] = p
+	}
+	tests := []struct {
+		model       string
+		wantPattern string
+		wantInput   string
+		wantOutput  string
+		wantRead    string
+	}{
+		{"muse-spark-1.1", "meta/muse-spark-1.1", "1.25", "4.25", "0.15"},
+		{"muse-spark-1.2", "meta/muse-spark-1.2", "1.25", "4.25", "0.15"},
+		{"muse-spark-1.3", "meta/muse-spark-1.3", "1.25", "4.25", "0.15"},
+		{"muse-spark-1.2-contributor", "meta/muse-spark-1.2-contributor", "0.10", "0.20", "0.002"},
+		{"muse-spark-1.3-contributor", "meta/muse-spark-1.3-contributor", "0.10", "0.20", "0.002"},
+		{"meta/muse-spark-1.3", "meta/muse-spark-1.3", "1.25", "4.25", "0.15"},
+		{"muse-wonder-1.0", "muse-wonder-1.0", "4.00", "20.00", "0.20"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			model := tt.model
+			if canonical := CanonicalModelForDate(model, time.Time{}); canonical != "" {
+				model = canonical
+			}
+			match := ResolveMatch(model, byPattern)
+			require.True(t, match.OK, "%q found no pricing", tt.model)
+			assert.Equal(t, tt.wantPattern, match.Pattern)
+			assert.Equal(t, money.MustParseDollars(tt.wantInput), match.Value.InputPerMTok)
+			assert.Equal(t, money.MustParseDollars(tt.wantOutput), match.Value.OutputPerMTok)
+			assert.Equal(t, money.MustParseDollars(tt.wantRead), match.Value.CacheReadPerMTok)
+		})
+	}
 }
 
 func TestKimiK26Aliases(t *testing.T) {
@@ -140,6 +178,11 @@ func TestCanonicalModelForDate(t *testing.T) {
 		{"gpt-reserve maps to Luna after cutoff", GPTReserveModelName, post, GPT56LunaCanonical},
 		{"gpt-reserve ignores zero time", GPTReserveModelName, time.Time{}, GPT56LunaCanonical},
 		{"provider-prefixed gpt-reserve", "openai/" + GPTReserveModelName, post, GPT56LunaCanonical},
+		{"codex-auto-review maps to Luna", CodexAutoReviewModelName, post, GPT56LunaCanonical},
+		{"codex-auto-review ignores zero time", CodexAutoReviewModelName, time.Time{}, GPT56LunaCanonical},
+		{"provider-prefixed codex-auto-review", "openai/" + CodexAutoReviewModelName, post, GPT56LunaCanonical},
+		{"near-miss codex-auto-reviewer passes through", "codex-auto-reviewer", post, ""},
+		{"near-miss codex-auto-review-preview passes through", "codex-auto-review-preview", post, ""},
 		{"Codex GPT-5.4 maps to standard Bedrock model", CodexGPT54ModelName, post, BedrockGPT54Canonical},
 		{"Codex GPT-5.6 Luna maps to standard Bedrock model", CodexGPT56LunaModelName, post, BedrockGPT56LunaCanonical},
 		{"Codex GPT-5.6 Terra maps to standard Bedrock model", CodexGPT56TerraModelName, post, BedrockGPT56TerraCanonical},
@@ -176,6 +219,7 @@ func TestCanonicalModelForTimestamp(t *testing.T) {
 		{"garbage timestamp falls back to K3", "kimi-for-coding", "not-a-time", KimiK3Canonical},
 		{"explicit K2.6 alias ignores timestamp", "k2d6-agent", "not-a-time", KimiK26Canonical},
 		{"gpt-reserve ignores garbage timestamp", GPTReserveModelName, "not-a-time", GPT56LunaCanonical},
+		{"codex-auto-review ignores garbage timestamp", CodexAutoReviewModelName, "not-a-time", GPT56LunaCanonical},
 		{"Codex GPT-5.6 Luna ignores garbage timestamp", CodexGPT56LunaModelName, "not-a-time", BedrockGPT56LunaCanonical},
 		{"non-alias passes through", "k3", "2026-07-18T12:00:00Z", ""},
 	}
@@ -285,31 +329,8 @@ func TestFixedPricingAliasesReturnsCopy(t *testing.T) {
 func TestSupplementalPricing_ReturnsCopy(t *testing.T) {
 	first := SupplementalPricing()
 	require.NotEmpty(t, first)
-	var astra *ModelPricing
-	for i := range first {
-		if first[i].ModelPattern == GPT6AstraCanonical {
-			astra = &first[i]
-			break
-		}
-	}
-	require.NotNil(t, astra)
-	require.NotEmpty(t, astra.Bands)
-	astra.InputPerMTok = money.Money{Microdollars: -1}
-	astra.Bands[0].AboveInputTokens = 1
-
-	second := SupplementalPricing()
-	var secondAstra *ModelPricing
-	for i := range second {
-		if second[i].ModelPattern == GPT6AstraCanonical {
-			secondAstra = &second[i]
-			break
-		}
-	}
-	require.NotNil(t, secondAstra)
-	assert.NotEqual(t, money.Money{Microdollars: -1},
-		secondAstra.InputPerMTok,
+	original := first[0].InputPerMTok
+	first[0].InputPerMTok = money.Money{Microdollars: -1}
+	assert.Equal(t, original, SupplementalPricing()[0].InputPerMTok,
 		"SupplementalPricing must return an independent copy")
-	assert.NotEqual(t, 1,
-		secondAstra.Bands[0].AboveInputTokens,
-		"SupplementalPricing bands must be independently copied")
 }

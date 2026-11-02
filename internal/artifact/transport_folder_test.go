@@ -308,7 +308,7 @@ func TestPathsOverlapRejectsCaseAliasesOnEveryPlatform(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
-	overlap, err := pathsOverlap(
+	overlap, err := PathsOverlap(
 		filepath.Join(root, "Provider", "artifacts"),
 		filepath.Join(root, "provider"),
 	)
@@ -1387,7 +1387,7 @@ func TestFolderTransportExchangeLockProtectsActivePublishTemp(t *testing.T) {
 	require.True(t, locked)
 	t.Cleanup(func() { require.NoError(t, held.Unlock()) })
 
-	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond) //nolint:kennlint // deadlinetest: the deadline is the expected result; the held exchange lock blocks Exchange until the context ends
 	defer cancel()
 	_, err = transport.Exchange(
 		ctx,

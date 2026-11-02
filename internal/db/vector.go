@@ -11,7 +11,7 @@ import (
 // at all). Backends with more specific context wrap this classification with
 // SemanticUnavailableError.
 var ErrSemanticUnavailable = errors.New(
-	"semantic search not available: enable [vector] in config.toml and run 'agentsview embeddings build'")
+	"semantic search not available: enable [vector] in config.toml and run 'agentsview index embeddings build'")
 
 // SemanticUnavailableError carries a backend-specific reason while retaining
 // ErrSemanticUnavailable as its machine-readable classification. Its rendered
@@ -88,17 +88,23 @@ type UnitRef struct {
 // helpers). The concrete implementation is internal/vector's Index, wired in
 // at startup via SetVectorSearcher.
 type VectorSearcher interface {
-	// SemanticSearch embeds query and returns up to limit unit-level hits,
-	// best first.
-	SemanticSearch(ctx context.Context, query string, limit int) ([]VectorHit, error)
+	// PrepareSemanticSearch embeds query once for this request. The returned
+	// page function fetches up to limit unit-level hits, best first, and can
+	// run again with a larger limit. The int is the engine's KNN candidate
+	// ceiling, or zero when the engine has none.
+	PrepareSemanticSearch(ctx context.Context, query string) (VectorSearchPage, int, error)
 	// ResolveMessageUnits maps each ref to the unit containing it. The
 	// result is parallel to refs; a ref with no containing unit yields a
 	// zero UnitRef (DocKey == "").
 	ResolveMessageUnits(ctx context.Context, refs []MessageRef) ([]UnitRef, error)
 }
 
+// VectorSearchPage returns exhaustion measured before chunk rollup and hydration.
+type VectorSearchPage func(context.Context, int) ([]VectorHit, bool, error)
+
 // SemanticReadiness is a bounded, read-only snapshot of the semantic search
 // index. It deliberately contains no filesystem paths or provider secrets.
+// Producers set Generation only when Embedded and Missing are measured counts.
 type SemanticReadiness struct {
 	State      string
 	Reason     string

@@ -12,22 +12,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestZedProviderCapabilities(t *testing.T) {
-	factory, ok := ProviderFactoryByType(AgentZed)
-	require.True(t, ok)
-	require.NotNil(t, factory)
-	caps := factory.Capabilities()
-	assert.Equal(t, CapabilityUnsupported, caps.Content.Relationships)
-	assert.Equal(t, CapabilitySupported, caps.Content.AggregateUsageEvents)
-
-	provider, ok := NewProvider(AgentZed, ProviderConfig{
-		Roots:   []string{t.TempDir()},
-		Machine: "devbox",
-	})
-	require.True(t, ok)
-	require.NotNil(t, provider)
-}
-
 func TestZedProviderSourceMethods(t *testing.T) {
 	fixture := zedProviderReadFixture(t)
 	root := fixture.Root
@@ -70,6 +54,7 @@ func TestZedProviderSourceMethods(t *testing.T) {
 	assert.NotZero(t, fingerprint.MTimeNS)
 	assert.NotEmpty(t, fingerprint.Hash)
 
+	writeSourceFile(t, dbPath+"-wal", walWithFramesFixture)
 	changed, err := provider.SourcesForChangedPath(
 		t.Context(),
 		ChangedPathRequest{Path: dbPath + "-wal", EventKind: "write", WatchRoot: filepath.Dir(dbPath)},
@@ -240,7 +225,7 @@ func TestZedProviderFingerprintIncludesWALSiblings(t *testing.T) {
 	require.NoError(t, err)
 
 	walPath := dbPath + "-wal"
-	writeSourceFile(t, walPath, "wal")
+	writeSourceFile(t, walPath, walWithFramesFixture)
 	walTime := time.Unix(0, before.MTimeNS+int64(time.Second))
 	require.NoError(t, os.Chtimes(walPath, walTime, walTime))
 	after, err := provider.Fingerprint(t.Context(), sources[0])
@@ -493,22 +478,6 @@ func TestZedProviderIgnoresUnrelatedSidecarBasename(t *testing.T) {
 	assert.Empty(t, changed)
 }
 
-func TestShelleyProviderCapabilities(t *testing.T) {
-	factory, ok := ProviderFactoryByType(AgentShelley)
-	require.True(t, ok)
-	require.NotNil(t, factory)
-	caps := factory.Capabilities()
-	assert.Equal(t, CapabilitySupported, caps.Content.Relationships)
-	assert.Equal(t, CapabilityUnsupported, caps.Content.AggregateUsageEvents)
-
-	provider, ok := NewProvider(AgentShelley, ProviderConfig{
-		Roots:   []string{t.TempDir()},
-		Machine: "devbox",
-	})
-	require.True(t, ok)
-	require.NotNil(t, provider)
-}
-
 func TestShelleyProviderSourceMethods(t *testing.T) {
 	fixture := shelleyProviderReadFixture(t)
 	root := fixture.Root
@@ -550,6 +519,7 @@ func TestShelleyProviderSourceMethods(t *testing.T) {
 	assert.NotZero(t, fingerprint.MTimeNS)
 	assert.NotEmpty(t, fingerprint.Hash)
 
+	writeSourceFile(t, dbPath+"-wal", walWithFramesFixture)
 	changed, err := provider.SourcesForChangedPath(
 		t.Context(),
 		ChangedPathRequest{Path: dbPath + "-wal", EventKind: "write", WatchRoot: root},
@@ -644,7 +614,7 @@ func TestShelleyProviderFingerprintIncludesWALSiblings(t *testing.T) {
 	require.NoError(t, err)
 
 	walPath := dbPath + "-wal"
-	writeSourceFile(t, walPath, "wal")
+	writeSourceFile(t, walPath, walWithFramesFixture)
 	walTime := time.Unix(0, before.MTimeNS+int64(time.Second))
 	require.NoError(t, os.Chtimes(walPath, walTime, walTime))
 	after, err := provider.Fingerprint(t.Context(), sources[0])
@@ -901,6 +871,7 @@ func TestZedProviderIgnoresBareShmSiblingEvents(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, changed)
 
+	writeSourceFile(t, dbPath+"-wal", walWithFramesFixture)
 	changed, err = provider.SourcesForChangedPath(
 		t.Context(),
 		ChangedPathRequest{Path: dbPath + "-wal", EventKind: "write", WatchRoot: root},
@@ -953,6 +924,7 @@ func TestShelleyProviderIgnoresBareShmSiblingEvents(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, changed)
 
+	writeSourceFile(t, dbPath+"-wal", walWithFramesFixture)
 	changed, err = provider.SourcesForChangedPath(
 		t.Context(),
 		ChangedPathRequest{Path: dbPath + "-wal", EventKind: "write", WatchRoot: root},

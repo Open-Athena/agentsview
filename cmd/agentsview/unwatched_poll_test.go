@@ -15,6 +15,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kit/stacktest"
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
@@ -41,10 +42,9 @@ func reconcileGroupsSequentially(
 }
 
 type recordingUnwatchedPollSyncer struct {
-	mu           sync.Mutex
-	calls        [][]string
-	wake         chan struct{}
-	reconcileErr error
+	mu    sync.Mutex
+	calls [][]string
+	wake  chan struct{}
 }
 
 type blockingUnwatchedPollSyncer struct {
@@ -130,7 +130,7 @@ func (s *recordingUnwatchedPollSyncer) ReconcileProviderRoots(
 	case s.wake <- struct{}{}:
 	default:
 	}
-	return s.reconcileErr
+	return nil
 }
 
 func (s *recordingUnwatchedPollSyncer) ReconcileProviderRootsGrouped(
@@ -565,7 +565,7 @@ func TestUnwatchedPollPreservesSessionsUnderBlockedOverlappingScope(t *testing.T
 			Probe: filepath.Join(nested, "missing-subtree"),
 		},
 	}
-	groups := availableUnwatchedPollScopes(obligations)
+	groups, _ := availableUnwatchedPollScopes(obligations)
 	if err := pollUnwatchedScopesOnce(t.Context(), engine, groups); err != nil {
 		t.Logf("pollUnwatchedScopesOnce: %v", err)
 	}
@@ -775,19 +775,35 @@ func TestUnwatchedPollRemovingOneOverlappingObligationKeepsSharedRoot(t *testing
 }
 
 func TestUnwatchedPollEmptyObligationNeverExpandsToFullReconciliation(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		ticks := make(chan time.Time)
-		syncer := &recordingUnwatchedPollSyncer{wake: make(chan struct{}, 1)}
-		coordinator := newUnwatchedPollCoordinatorWithTicks(
-			t.Context(), syncer, ticks, func() {}, func(run func()) { run() }, nil, time.Now, time.After,
-		)
-		t.Cleanup(coordinator.Stop)
-		require.NoError(t, coordinator.AddObligation(pollingObligation{Key: "empty"}))
-
-		coordinator.requestPoll()
-		synctest.Wait()
-
-		assert.Empty(t, syncer.snapshot())
+	t.Run("empty poll", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			syncer := &recordingUnwatchedPollSyncer{wake: make(chan struct{}, 1)}
+			coordinator := newUnwatchedPollCoordinatorWithTicks(
+				t.Context(), syncer, make(chan time.Time), func() {},
+				func(run func()) { run() }, nil, time.Now, time.After,
+			)
+			t.Cleanup(coordinator.Stop)
+			require.NoError(t, coordinator.AddObligation(pollingObligation{Key: "empty"}))
+			coordinator.requestPoll()
+			synctest.Wait()
+			assert.Empty(t, syncer.snapshot(), "empty scopes must not trigger full reconciliation")
+			assert.Equal(t, []pollingObligation{{Key: "empty"}}, coordinator.currentPollObligations())
+		})
+	})
+	t.Run("empty folder release", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			syncer := &recordingUnwatchedPollSyncer{wake: make(chan struct{}, 1)}
+			coordinator := newUnwatchedPollCoordinatorWithTicks(
+				t.Context(), syncer, make(chan time.Time), func() {},
+				func(run func()) { run() }, nil, time.Now, time.After,
+			)
+			t.Cleanup(coordinator.Stop)
+			require.NoError(t, coordinator.AddObligation(pollingObligation{Key: "fsnotify-folder:empty"}))
+			require.NoError(t, coordinator.RemoveObligation("fsnotify-folder:empty"))
+			synctest.Wait()
+			assert.Empty(t, syncer.snapshot(), "empty release scopes must not trigger full reconciliation")
+			assert.Empty(t, coordinator.currentPollObligations())
+		})
 	})
 }
 
@@ -866,7 +882,7 @@ func TestUnwatchedPollAddObligationRacingStopReturnsOwnershipOrStopped(t *testin
 // availableUnwatchedPollRootsFlat is a test helper that flattens the
 // per-agent groups from availableUnwatchedPollScopes into one sorted []string.
 func availableUnwatchedPollRootsFlat(obligations []pollingObligation) []string {
-	groups := availableUnwatchedPollScopes(obligations)
+	groups, _ := availableUnwatchedPollScopes(obligations)
 	unique := make(map[string]struct{})
 	for _, roots := range groups {
 		for _, r := range roots {
@@ -976,7 +992,7 @@ func TestCrossAgentBlockingBothDirections(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			result := availableUnwatchedPollScopes(tc.obligations)
+			result, _ := availableUnwatchedPollScopes(tc.obligations)
 			roots := result[tc.wantAbsentAgent]
 			assert.NotContains(t, roots, tc.wantAbsentRoot,
 				"cross-agent blocking must prevent root from appearing in %q group",
@@ -995,6 +1011,7 @@ func requireReceivePollRoots(
 	case roots := <-results:
 		return roots
 	case <-time.After(timeout):
+		stacktest.Dump(t)
 		require.FailNow(t, "poll coordinator ownership did not arrive before timeout")
 		return nil
 	}
@@ -1017,6 +1034,7 @@ func requireReceivePollResult(
 	case err := <-results:
 		return err
 	case <-time.After(timeout):
+		stacktest.Dump(t)
 		require.FailNow(t, "poll coordinator result did not arrive before timeout")
 		return nil
 	}
@@ -1027,6 +1045,7 @@ func requirePollWithin(t *testing.T, ch <-chan struct{}, timeout time.Duration) 
 	select {
 	case <-ch:
 	case <-time.After(timeout):
+		stacktest.Dump(t)
 		require.FailNow(t, "poll did not run before timeout")
 	}
 }

@@ -184,6 +184,7 @@ func SanitizeMessage(m *Message) ValidationStats {
 	sanitizeLengthTrackedString(
 		&m.Content, &m.ContentLength, &stats,
 	)
+	sanitizeStringPtrField(m.DialogueText, &stats)
 	origThinkingLen := len(m.ThinkingText)
 	sanitizeStringField(&m.ThinkingText, &stats)
 	if removed := origThinkingLen - len(m.ThinkingText); removed > 0 {
@@ -199,6 +200,9 @@ func SanitizeMessage(m *Message) ValidationStats {
 			m.ContentLength -= removed
 		}
 	}
+	// Preserve the parser's classification even when dialogue equals Content.
+	// NULL also represents older or unclassified messages; collapsing an equal
+	// projection would make a dialogue-only reader unable to tell them apart.
 	sanitizeStringField(&m.ClaudeMessageID, &stats)
 	sanitizeStringField(&m.ClaudeRequestID, &stats)
 	sanitizeStringField(&m.SourceType, &stats)
@@ -329,6 +333,7 @@ func SanitizeSession(s *Session) ValidationStats {
 	var stats ValidationStats
 
 	sanitizeStringField(&s.Project, &stats)
+	sanitizeStringField(&s.GroupKey, &stats)
 	sanitizeStringField(&s.Machine, &stats)
 	sanitizeStringField(&s.Agent, &stats)
 	sanitizeStringField(&s.AgentLabel, &stats)
@@ -336,6 +341,11 @@ func SanitizeSession(s *Session) ValidationStats {
 	sanitizeStringField(&s.SessionKind, &stats)
 	sanitizeStringField(&s.Cwd, &stats)
 	sanitizeStringField(&s.GitBranch, &stats)
+	for i := range s.PRLinks {
+		sanitizeStringField(&s.PRLinks[i].URL, &stats)
+		sanitizeStringField(&s.PRLinks[i].Host, &stats)
+		sanitizeStringField(&s.PRLinks[i].Repository, &stats)
+	}
 	sanitizeStringField(&s.SourceSessionID, &stats)
 	sanitizeStringField(&s.SourceVersion, &stats)
 	sanitizeStringField(&s.TranscriptFidelity, &stats)
@@ -455,7 +465,7 @@ func clampTokens(p *int) bool {
 // BlankImplausibleTimestamp blanks a stored timestamp string in place
 // when it parses to a time outside the plausibility window, returning
 // whether it changed. An empty string is left empty (no change), and an
-// unparseable-but-nonempty value is left as-is: downstream localTime
+// unparseable-but-nonempty value is left as-is: downstream LocalTime
 // already treats both as invalid, so blanking only the parseable-yet-
 // absurd case avoids reformatting otherwise-untouched values.
 func BlankImplausibleTimestamp(p *string) bool {
@@ -488,7 +498,7 @@ func BlankImplausibleTimestampPtr(p *string) (*string, bool) {
 }
 
 // ParseStoredTimestamp parses a timestamp stored in the same formats
-// the read path (db.localTime) accepts.
+// the read path (db.LocalTime) accepts.
 func ParseStoredTimestamp(s string) (time.Time, bool) {
 	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
 		return t, true

@@ -1,109 +1,749 @@
 ---
-last_edited: 2026-09-21
+last_edited: 2026-11-01
 title: Changelog
 description: Release history for AgentsView
 ---
 
-The latest published release is
-[0.44.0](https://github.com/kenn-io/agentsview/releases/tag/v0.44.0).
+The latest release is
+[0.46.1](https://github.com/kenn-io/agentsview/releases/tag/v0.46.1).
 
 ## Unreleased
 
 **New features**
 
-- Verify conversation memory through an opt-in live release gate that records a
-  synthetic decision, starts a fresh Claude Code or Codex session, and requires
-  the client to search, read, answer accurately, and cite the source. Raw
-  traces stay in ignored local artifacts; the aggregate report records models,
-  client versions, tool use, latency, and tokens.
-- Diagnose conversation-memory setup with `agentsview doctor memory`. It reports
-  the selected archive's lexical and semantic readiness separately, then checks
-  the local native plugin, MCP profile, SessionStart hook, and conflicting
-  standalone skills without starting a daemon or changing the installation.
-- Conversation-memory clients can check archive and search readiness through
-  MCP `get_memory_status` or `GET /api/v1/memory/status`, including explicit
-  unknown source telemetry. Search responses carry a compact lexical and
-  semantic coverage snapshot with active vector-generation counts.
-- Install the native AgentsView Memory package in Claude Code or Codex to get
-  the recall skill, focused MCP server, Claude search agent, and a fail-open
-  session-start hook from one package. Local and hosted targets stay in local
-  runtime configuration, and startup reports duplicate standalone skills
-  without changing user-edited files.
-- Native conversation-memory integrations can use
-  `agentsview memory session-start` for local, hosted-contributor, and
-  hosted-reader lifecycle roles. The command wakes the configured ingestion
-  owner or checks the selected read target and returns within two seconds.
-- MCP clients can use `agentsview mcp --profile memory` to advertise only the
-  conversation readiness, evidence search, and read tools, reducing unrelated
-  tool choices while leaving the default full MCP surface unchanged.
-- Mount the writable SQLite server below a reverse-proxy URL prefix with
-  `agentsview serve --base-path`, including background serves. Keep
-  `--public-url` set to the browser origin; AgentsView adds the mount path to
-  assets, API requests, navigation, and its published browser URL.
-- Coding agents can now consult prior conversation evidence proactively when
-  earlier decisions or solutions may help. `agentsview skills install`
-  upgrades the existing recall skill for Claude and Agents/Codex, and Claude
-  also receives a bounded `agentsview-search-conversations` agent. That agent
-  can call only `mcp__agentsview__search_content` and
-  `mcp__agentsview__get_messages`, so a transcript cannot invoke built-in tools
-  or tools from any other MCP server. Register the AgentsView MCP server as
-  `agentsview`. Every generated artifact is listed and protected independently
-  from local edits.
-- Semantic and hybrid search work on a ClickHouse mirror. When `[vector]` is
-  enabled, `agentsview clickhouse push` copies the local embedding generation
-  into ClickHouse and `clickhouse serve` answers `--semantic`/`--hybrid` from
-  it. Set `push_vectors = false` under `[clickhouse]` or pass `--no-vectors`
-  to leave vectors out. See
-  [semantic search: ClickHouse](/docs/semantic-search/#clickhouse).
-- Agents can open recalled evidence against the exact transcript revision that
-  produced it. MCP message reads reject stale citations with `source_changed`,
-  and oversized messages now provide a revision-bound continuation cursor.
+- Hosted operators can retry failed raw parse jobs after fixing their cause with
+  `pg raw-reparse --repair`. Each bounded batch gives selected failed jobs at
+  this executable's processing version a fresh attempt budget.
+
+- `agentsview agents` lists every supported agent, where AgentsView looks for its
+  sessions, and which session details it reads, such as tool calls, thinking,
+  subagents, and token usage. Add `--json` for scripts. It works without a
+  daemon, configuration, or database.
+
+- `pg status` and `clickhouse status` show when the push watcher last pushed
+  successfully and, while pushes fail, since when and why. Run them with
+  `--max-stale 10m` from a timer or monitor to get an alert when pushes keep
+  failing for any reason, a push hangs, or the watcher stops pushing. Right
+  after a machine wakes from sleep, the check can fail until the watcher's
+  next push.
+- Assistants connected through MCP can now explain where one session's cost came
+  from. The new `get_session_usage` tool reports the same tokens and cost as
+  `agentsview session usage`, split by model and by request, with the most
+  expensive requests first on request. It reads the archive as stored and does
+  not refresh source files first.
+
+- You can now set the color of each message type in Settings > Appearance:
+  user messages, assistant text, thinking blocks, tool calls, and code blocks.
+  A color-blind safe preset and optional line patterns make the types easy to
+  tell apart without relying on hue. The setting warns when a chosen color
+  would make text hard to read in light, dark, or high-contrast mode.
+
+- Charts can use color-blind safe colors. Choose **Color-blind safe** under
+  **Settings > Appearance > Chart colors**, or set `chart_palette =
+  "colorblind"`. The skill trend, Trends, and Usage charts then use Petroff's
+  color sequences, which stay distinguishable with common forms of color
+  blindness. Past the tenth series, colors repeat with a pattern: hatched
+  Usage bars, areas, and treemap tiles, and dashed Trends lines.
+
+- Read usage for several sessions in one process with
+  `session usage-batch <id>...`. JSON returns one ordered result per requested
+  ID, including individual errors.
+
+- PostgreSQL and ClickHouse push services can use a separately managed
+  collector with `service install --no-start-daemon`, avoiding competing daemons
+  and archive write locks during restarts. The push service exits if no writable
+  daemon is running, and the service manager restarts it until the collector
+  answers. Reinstalling restarts the service with the new arguments.
+
+- When Friction Log review is enabled, AgentsView stores daily digests and
+  catches up on completed days missed while offline, including sessions that
+  arrive late within the configured backfill window. Digests retain findings,
+  usage, and pattern recurrence, and survive full resyncs that retain transcript
+  text. PostgreSQL hubs build their own digests.
+
+- Friction Log digests, findings, and recurring patterns can be read over the
+  HTTP API, and `POST /api/v1/friction/run` builds missing days on demand.
+  Digests come back as JSON or Markdown. PostgreSQL hubs serve the same routes;
+  DuckDB and ClickHouse mirrors answer 501 because they do not store friction
+  tables.
+
+- The **Friction Log page** opens the latest daily digest with P0 alerts and new
+  or recurring patterns first, then each kind of finding with a link to the
+  session message. The session signal panel lists the open session's findings,
+  and Quality links to the page.
+
+- `agentsview friction run`, `digest`, `findings`, and `patterns` build and read
+  the Friction Log from the terminal, and MCP clients can read digests and
+  recurring patterns with `get_friction_digest` and `list_friction_patterns`.
+
+- The Friction Log page can add an optional model-written summary of a digest
+  using the configured insight generator. The summary is saved with the digest,
+  is labeled as model-written, and cannot change findings, digests, or
+  recurrence.
+
+- AgentsView can check an optional Kata issue tracker connection, through a
+  local daemon or an HTTPS hub. Configure `[kata]`, then run
+  `agentsview kata status` or request `GET /api/v1/kata/status`. Issue filing is
+  not available yet. See [Kata](/docs/kata/).
+
+- Container deployments can pass the embeddings API key for PostgreSQL recipe
+  adoption in `AGENTSVIEW_EMBEDDINGS_API_KEY` instead of mounting a key file.
+  Setting it together with `AGENTSVIEW_EMBEDDINGS_API_KEY_FILE` stops startup.
+  Under `AGENTSVIEW_MODE`, a `[vector]` server that reads its key from
+  `AGENTSVIEW_EMBEDDINGS_API_KEY` through `api_key_env` now stops startup;
+  rename that variable.
 
 **Improvements**
 
-- Syncing uses less CPU to check transcript text for invalid characters. Clean
-  text is now checked in one pass and stored unchanged. In a full sync of a
-  950 MB local test corpus, total CPU time fell about 4%. Wall-clock time did
-  not change measurably.
-- Full syncs and archive rebuilds use less memory. They now write parsed
-  sessions to the database in smaller batches instead of holding more of them
-  in memory. In a full sync of a 2.1 GB local test corpus, peak memory fell
-  about 22%, from 441 MiB to 342 MiB. Each rebuild makes more, smaller write
-  transactions; total sync time did not change measurably.
-- `export day` and `export digest` build their hourly reports faster. Activity
-  for a day is now matched up once instead of once per hour. A benchmark day
-  with many long sessions exported about 63% faster and allocated about 77%
-  less memory. Typical benchmark days were up to about 17% faster, and output
-  is unchanged.
-- Profile the background sync workers that the server starts. Set
-  `AGENTSVIEW_SYNC_PROFILE_DIR` before starting the server, and each worker
-  writes `cpu.pprof` and `memory.pprof` to its own private folder there. Add
-  `AGENTSVIEW_SYNC_PROFILE_TRACE=true` to also write `runtime.trace`.
-  Profiling is off by default. If the folder cannot be created, the sync still
-  runs and the reason is written to `debug.log`.
-- CPU profiles and traces from `--cpuprofile` and `--trace` no longer include
-  the memory cleanup that runs while the heap profile is written.
-- Cost estimates find model prices faster. In a benchmark against the bundled
-  price catalog, one lookup took about two-thirds less time. Model names with
-  uppercase letters no longer cause hundreds of extra memory allocations per
-  lookup. The selected prices are unchanged.
-- Usage and cost totals are built faster, because each usage record's price is
-  now looked up once instead of twice. On a synthetic archive with about
-  105,000 usage records, rebuilding all saved daily totals took about 16% less
-  time. Stored totals and costs are unchanged.
-- Activity reports and session exports spend less time and memory removing
-  duplicate Claude usage records. Claude transcripts can record the same
-  response more than once, sometimes in more than one session. In a benchmark
-  where each response appeared once, this step ran about 66% faster with about
-  half the memory. Where each response appeared many times, it ran about 27%
-  faster. Totals are unchanged.
-- **Tool Usage** and **Top Skills** analytics load much faster from
-  `agentsview pg serve`. PostgreSQL now counts the tool calls itself instead of
-  sending every call to AgentsView. On a synthetic archive with about 219,000
-  tool calls, a one-year tools view went from 1.7 seconds to 0.13 seconds and
-  used about 99% less memory in AgentsView. Local dates and hours now come
-  from the PostgreSQL server's time zone data, which matches AgentsView's for
-  current time zones.
+- Session sidebars on hosted PostgreSQL avoid repeatedly resolving the same
+  parent links when counting roots and loading child trees, including pages
+  filtered by labels or pull requests.
+
+- The Recall corpus pane uses the shared page header for its title, description,
+  entry count, and refresh control. The title stays a second-level heading under
+  the Recall page title.
+- `pg push` saves download traffic when a session grows by comparing short
+  hashes with PostgreSQL instead of downloading the session's old text.
+  Sessions with rows written before control-character cleanup are rewritten once.
+- `pg push` reduces writes when a session grows by rewriting only the messages
+  from the first changed message onward instead of the whole session.
+- Homebrew installs built with `make homebrew` no longer replace themselves.
+  `agentsview update` stops and tells you to run `brew upgrade agentsview`;
+  `agentsview update --check` still reports new releases with the same advice.
+- Anonymous telemetry events now say which distribution built the binary, such
+  as `homebrew`. Source builds send an empty value. See
+  [Privacy and Telemetry](/docs/configuration/#privacy-and-telemetry).
+
+**Bug fixes**
+
+- Hosted PostgreSQL searches and session reads stay available while raw captures
+  arrive and transcripts are published. Each hosted read uses one database
+  snapshot for its content, public identities and related data.
+- DeepSeek Harness sessions that were missing from the archive now import. This
+  covers compressed session logs written without zstd content checksums, and
+  sessions that ran shell commands, which log `job/registered` and
+  `job/settled` events. The next sync picks up the affected sessions.
+- Codex fork imports notice new or moved parent pages on Linux even when the
+  directory timestamps stay unchanged. Unchanged folders keep their cached
+  filenames. Available Codex, TraeX and Augure Code sources are reprocessed on
+  upgrade to repair previously copied parent messages in place. Imports continue
+  by reading directory listings when Linux cannot allocate notifications.
+- Hosted transcript jobs whose workers keep stopping now fail with error class
+  `lease` after one run past `raw_max_attempts`, instead of retrying forever.
+  Workers from an older processing generation can no longer change a newer lease.
+- Crashed or still-running Copilot CLI sessions now show tokens and estimated
+  cost.
+- Oh My Pi subagent runs now appear under the correct parent, including runs
+  started by other subagents. Newer OMP transcripts that record parent file paths
+  are supported alongside older transcripts. Available OMP sources are
+  reprocessed on upgrade to repair existing links.
+- Oversized debug logs retain their last 10 MB in `debug.log.1` to help
+  investigate a stalled server. Successful rotation clears the active log;
+  a busy lock or failed backup leaves it intact.
+- Claude Code token and cost totals now include responses that contain only an
+  empty thinking block. These responses still show nothing in the transcript,
+  but their usage was dropped. Existing Claude-format sources are reprocessed on
+  upgrade to recover it.
+- Links with bare session UUIDs from Pi, OMP, Codex and other tools now open
+  matching sessions. Ambiguous IDs still require the full session ID.
+- Codex Fast usage estimates now use LiteLLM's matching Fast prices.
+  Run `agentsview sync` after an upgrade to reparse available rollouts before
+  using offline reports. Older rollouts without a tier record keep standard
+  rates. Ultrafast and other non-Fast tiers keep standard rates. Codex can omit
+  priority for unsupported models, so those estimates can exceed billed costs.
+- When an upgrade leaves the archive needing a full rebuild, the **Sync**
+  button now runs that rebuild on every server, and the status bar shows when a
+  sync fails instead of staying silent. A rebuild that does not finish is
+  reported as a failed sync rather than a success, so sessions missing from
+  updated parsers, such as newer OpenCode sessions, no longer go unnoticed.
+  `serve --no-sync` also says at startup when the archive needs a rebuild.
+- Usage notes keep a straight accent on the leading edge of the card. The
+  accent no longer bends around the card's rounded corners.
+- Command Code v3 sessions appear with their titles, tool calls, and token
+  costs. Forks count only new usage, and existing sessions are reprocessed
+  on upgrade.
+- PostgreSQL content searches in `fts` mode honor `AND`, `OR`, `NOT`, and
+  parentheses in quoted queries and report malformed expressions as input
+  errors.
+- Snippets for `fts` and hybrid searches that use `OR` or `NOT` now show the
+  word that matched. Before, a message that matched only a later `OR` term
+  could show an excerpt without it.
+- Foreground `agentsview serve` now exits with status 1 when a server is already
+  running so service managers retry. `serve --background` and `daemon start`
+  still exit with status 0.
+- Sync no longer fails every session when AgentsView runs inside a sandbox that
+  hands it an unusable temp directory, which mostly affects Windows. SQLite
+  needs a writable temp directory for every session write. When the inherited
+  one cannot be written, AgentsView now uses `tmp/` inside the data directory
+  and prints a warning that names both directories.
+- Claude Code channel questions appear in transcripts, search, and user-message
+  totals. Rewinding after a channel conversation keeps that conversation as a
+  separate fork and preserves the retry's session ID and saved items. Existing
+  Claude-format sources are reprocessed on upgrade.
+- VS Code Copilot sessions that fetched a web page now show their transcript
+  instead of a blank page. VS Code saves each web fetch as two tool calls with
+  the same ID, and AgentsView now keeps only the visible one. Existing VS Code
+  Copilot, Positron, and Windsurf sessions are reprocessed on upgrade.
+- VS Code Copilot and Positron replies now update when synced while the agent
+  is still answering. Existing sessions are reprocessed on upgrade to recover
+  replies stored before completion. Pins keep their notes as replies change.
+  During upgrades, full rebuilds, and PostgreSQL pushes, pins on older replies
+  keep their notes when the unchanged prompt and request timestamp uniquely
+  identify the reply, including pins saved only in PostgreSQL.
+- Kiro CLI subagent runs now appear as child sessions of the session that
+  started them, including subagents started by other subagents. The parent
+  transcript shows each delegation with its prompt and result, and links to the
+  subagent's session. A failed delegation counts as a tool failure in the
+  session's health signals. Existing Kiro sessions are reprocessed on upgrade
+  to pick up past subagent runs.
+- A forked Codex session now appears as a fork of the session it came from, the
+  way forks from other agents already do. Before, it showed up as an unrelated
+  top-level session. Existing Codex, TraeX, and Augure Code sessions are
+  reprocessed on upgrade.
+- Pi subagent runs started by pi-subagents 0.77.0 or later now show as
+  subagents instead of forks, so subagent filters and usage rollups include
+  them. Nested subagent runs also link to the run that started them rather than
+  to themselves. Existing Pi, OMO, Prime Agent, and StepCode sessions are
+  reprocessed on upgrade.
+
+## 0.46.1
+
+<small>2026-10-22</small>
+
+**Improvements**
+
+- Antigravity CLI sessions show plaintext transcripts with model and token usage
+  attached to the matching model replies.
+
+**Bug fixes**
+
+- Antigravity sessions parse again on read-only mounts, including read-only
+  Docker volumes.
+- Archived Antigravity CLI replies stay intact when the session database cannot
+  be read.
+- Repeated prompts remain separate turns in Antigravity CLI sessions. Existing
+  archives are reprocessed to recover missing turns.
+- Docker builds no longer fail because a required Claude.ai Chrome extension
+  file is missing.
+
+**Contributors**
+
+Thanks to [@azylman](https://github.com/azylman) for the Antigravity fixes in
+[#2337](https://github.com/kenn-io/agentsview/pull/2337), and
+[@wesm](https://github.com/wesm) for the container build fix in
+[#2404](https://github.com/kenn-io/agentsview/pull/2404).
+
+## 0.46.0
+
+<small>2026-10-22</small>
+
+**Upgrade notes**
+
+- The first startup rebuilds affected archives to preserve Codex undo history
+  and repair session identities. Existing history remains browsable with a
+  stale-data warning during full rebuilds; changes pause until the replacement
+  is ready. Allow time for the rebuild and subsequent mirror pushes. See
+  [archive upgrades](/docs/configuration/#database).
+- PostgreSQL, ClickHouse, and DuckDB mirrors need refreshed dialogue search
+  data. Hosted deployments must apply the new runtime grants before upgrading.
+  Follow [message search](/docs/session-api/#agentsview-session-search) and
+  [hosted provisioning](/docs/hosted-raw-sync/#provision-a-hosted-instance).
+- Containers now require a bearer token. Set `auth_token` in `/data/config.toml`
+  or mount a token file with `AGENTSVIEW_AUTH_TOKEN_FILE`. See
+  [container deployment](/docs/configuration/#container-deployment).
+- Reporting schema 3 remains the default. Schema 5 replaces the unreleased
+  schema 4; integrations adopting it must fetch new project keys and refresh
+  saved digests. See [reporting exports](/docs/reporting-export/).
+- Session summary exports now use schema 7. Consumers must accept
+  `model_usage: null` when Codex cloud token counts are unknown. Upgrade
+  [artifact folder sync](/docs/artifact-sync/) importers as well.
+- Hermes cron grouping can require a one-time full mirror transfer. Run
+  `agentsview duckdb push --full` once for an existing DuckDB mirror. Older
+  cron sessions whose original sources are gone remain individual sessions
+  unless they already have a stored job ID.
+- Restart MCP content searches begun before upgrading; use the new
+  continuation's `activity_cutoff` with its cursor.
+- On Windows, stop the daemon before downgrading to 0.45.x or earlier.
+
+**New features**
+
+- Sync Claude.ai chats through Chrome, including Google sign-in. Run
+  `agentsview chrome setup`, load the printed extension folder at
+  `chrome://extensions`, and restart AgentsView before using Import >
+  Claude.ai.
+
+- Import ChatGPT dot, Codex web, and Codex cloud task chats as searchable
+  sessions with the opt-in `codex-cloud` source. Chats without token counts
+  show OpenAI's plan usage figures. Configure this source on one machine only.
+
+- Record Codex cloud token usage with optional `live_tokens = true`. Capture
+  covers only turns heard live, and connecting can send queued messages.
+  Sessions with incomplete capture show a "partly captured" note.
+
+- Preserve a retired computer's Claude and Codex history with `archive capture`
+  and `archive import --seed`, including stars, pins, names, and original
+  files. Archive commands also extract originals and verify backups. Use a
+  separate data directory for new local sessions.
+
+- Sync remote Linux and macOS machines over SSH without manually installing
+  AgentsView or running a remote daemon. Set `transport = "ssh"` in the remote
+  host configuration. SSH authentication must work without a prompt.
+
+- Browse and search Muse Code sessions, including tool output, child sessions,
+  token usage, and costs.
+
+- Browse and search fx schema 4 sessions with tool output and child sessions.
+  Costs appear when an older fx version saved usage data.
+
+- Find sessions by label, linked pull request, or launcher. Claude Code pull
+  request links appear on session pages and in CLI, API, and MCP results.
+  Linked workers contribute to their launcher's total cost.
+
+- Group model variants in Usage with `[model_aliases]` in `config.toml`. Each
+  variant retains its own pricing before totals combine. Restart AgentsView
+  after editing the groups.
+
+- Narrow Usage totals and charts by selecting an item in the cost breakdown
+  panel. Open `hermes-cron` to compare individual jobs, with renamed jobs and
+  continued runs grouped together.
+
+- Analyze a session's tool effectiveness from its actions menu. Reports mark
+  conclusions as helped, did not help, or unclear and link each conclusion to
+  the calls it cites.
+
+- Compare empty-result, repeat-call, and recovery rates in Tool Usage under
+  project and date filters. Click a nonzero rate to inspect contributing
+  sessions and calls.
+
+- Ask connected assistants about file edits, tool calls, child sessions,
+  Activity reports, tool usage, and cost comparisons through eight new
+  read-only MCP tools. Built-in guide search works offline. `list_sessions`
+  also accepts `include_one_shot: true` for single-prompt sessions.
+
+- Remove an agent's archived history with `agentsview prune --agent <name>`. The
+  filter combines with project and date filters and includes matching sessions
+  in Trash. Prune also deletes matched source files, except shared app-owned
+  stores.
+
+- Sort Activity reports by Session or Model across pages. Cleanup, worktree
+  mapping, and session health tables also support sorting by their data
+  columns.
+
+- Build and push embeddings in one process with `pg push --embed`. Containers
+  accept deployment and embedding settings directly through environment
+  variables, and the container image now requires a bearer token.
+
+- Sign native HTTP reader and raw-sync requests with an independent HMAC key. A
+  separate machine listener enforces signatures, existing authentication, and
+  reader or contributor grants.
+
+- Export repository-scoped activity and usage with reporting schema 5. Known
+  repositories remain selectable when other sessions share their project name.
+  Integrations adopting schema 5 must fetch new project keys and refresh saved
+  digests. Schema 3 remains the default.
+
+- Record corrections, tool errors, workarounds, and repeated patterns with the
+  opt-in [Friction Log](/docs/configuration/#friction-log). Background review
+  stores findings for later reporting; it is off by default.
+
+**Improvements**
+
+- Browse and search the existing archive while a full rebuild runs. Results
+  carry a stale-data warning, and changes pause until the replacement is
+  ready. Failed startup rebuilds retry automatically.
+- Keep new local sessions arriving in the archive and UI while a PostgreSQL,
+  ClickHouse, or DuckDB push runs.
+- Resume interrupted full PostgreSQL and ClickHouse pushes and DuckDB rebuilds.
+  Recent sessions transfer first, and summaries show resumed progress and why
+  a full transfer runs. Passing `--full` discards unfinished progress and
+  starts over.
+- Load Usage and Activity faster on large archives. The daemon prepares daily
+  usage totals after sync, and the Usage page starts its model comparison
+  alongside totals.
+- Keep quick page reads responsive while slow SQLite analytics run. Large
+  session trees also load faster instead of remaining at "0 SESSIONS" or
+  "LOADING".
+- Keep semantic indexing up with long-running sessions by re-embedding only the
+  newest portion of an assistant run. The first build after upgrading
+  re-embeds oversized runs once.
+- Transfer less data during HTTP remote sync by leaving unchanged transcripts
+  out of downloads. Updated peers use Zstandard compression, and combined
+  rebuilds prepare several remote hosts at once.
+- Push ClickHouse embeddings in batches to reduce transfer time. Large archives
+  also support a configurable `push_batch_size` for session transfers, with
+  higher values using more memory.
+- Sync only changed Hermes and Augure Desktop sessions instead of rewriting
+  every session in their shared database. Unchanged remote imports also avoid
+  repeated parsing after a one-time refresh.
+- Show Antigravity IDE and local Qoder sessions by their app-saved titles,
+  including existing sessions. Names set in AgentsView take precedence. Qoder
+  renames appear at the next sync.
+- Show the recorded starting branch for Codex, TraeX, and Augure Code sessions.
+  Recorded repository identity also survives a missing checkout or changed
+  remote.
+- Use provider-reported billed costs for gptme messages when available,
+  including zero. Estimate-only messages retain catalog pricing, and
+  provider-routed model names resolve catalog prices.
+- Return stored session usage without waiting for full startup ingestion.
+  Targeted refresh failures retain those totals with a warning.
+- Reuse MCP daemon connections to reduce repeated discovery delays.
+- Refresh open session lists after imports, uploads, and restores.
+
+**Bug fixes**
+
+- Preserve Codex undo history and daily usage as linked continuations instead of
+  letting rollout files replace one another. Older Desktop undo files also
+  link back to their thread. The upgrade rebuilds existing archives and
+  preserves supported saved annotations.
+- Keep Codex rollouts under their own thread when a file contains another
+  thread's metadata, preventing one transcript from replacing another.
+- Read older Codex rollouts after Codex compresses them to `.jsonl.zst`.
+  Decoding failures leave archived messages intact.
+- Import current Mistral Vibe sessions from its unified store, including running
+  turns, tool output, child sessions, and token usage.
+- Import DeepSeek Harness v4 and newer TraeX transcripts with their messages,
+  tools, and usage. OpenClaw databases with compressed events also sync
+  without blocking healthy sessions.
+- Preserve both Cursor conversations when S3 imports contain the same session ID
+  in different projects.
+- Keep archived Claude and iCodeMate CLI tool output after Claude Code deletes
+  its external tool-result files.
+- Preserve Hermes and Augure Desktop's shared app database when pruning
+  sessions. Dry-run and deletion summaries report source files left in place.
+- Keep message jumps in view while nearby rows finish rendering. Background tabs
+  also release browser connections so new session tabs no longer hang at
+  "Loading messages...".
+- Limit SQLite message matches and snippets to conversation text after reparse.
+  Use `--in messages` for dialogue and `--in thinking` for reasoning. Ordinary
+  session search still includes the full transcript.
+- Fill MCP content-search pages with eligible older matches instead of excluding
+  active sessions after applying the limit. Restart searches begun before
+  upgrading.
+- Accept displayed machine names in filters across the web UI, CLI, API, and
+  MCP. Unknown or ambiguous names return an explanatory error.
+- Allow chart palette and zoom changes on read-only servers without editing
+  configuration files by hand.
+- Keep archive commands working when unrelated configuration sections are
+  invalid. SSH remote sync also ignores server-only configuration errors.
+- Stop repeated Antigravity and Gemini imports caused only by SQLite bookkeeping
+  changes. Recovered file watchers also stop rescanning the entire Claude
+  folder.
+- Avoid rewriting unchanged PostgreSQL messages and usage events during
+  metadata-only pushes. Shared PostgreSQL mirrors also stop reporting other
+  machines' unrelated vector sessions as conflicts.
+- Prepare ClickHouse usage totals on filesystems that cannot exchange tables,
+  including NFS. Unsupported-exchange errors appear once per server start
+  instead of on every push.
+- Produce stable reporting digests when several checkouts or worktrees share a
+  repository.
+- Wait through concurrent daemon restarts and preserve host daemon discovery
+  across process namespaces. Auto-starting commands report a held archive lock
+  instead of launching a server that cannot open it.
+- Keep Windows daemon commands from marking the entire data directory as changed
+  for backup and sync tools. Stop the daemon before downgrading to 0.45.x or
+  earlier.
+- Honor `DO_NOT_TRACK=1` and suppress telemetry in CI and non-release builds.
+  Browser telemetry also waits for the selected server's response before
+  sending further reports.
+- Reject compromised eMudhra/emSign certificate chains in HTTPS connections and
+  desktop updates. Linux and Windows desktop builds also update their bundled
+  trust roots.
+
+**Acknowledgements**
+
+- [@rodboev](https://github.com/rodboev) for Chrome Sync, fx support,
+  tool-effectiveness reports and rates, model aliases, Hermes cron costs,
+  faster reports, and archive and telemetry fixes.
+- [@cpcloud](https://github.com/cpcloud) for Codex cloud chats and live token
+  capture, resumable mirror pushes, continued local sync during pushes, and
+  ClickHouse transfer improvements.
+- [@wesm](https://github.com/wesm) for local archive capture and recovery, SSH
+  sync, Codex undo history, reporting repository identity, faster HTTP
+  transfers, and daemon fixes.
+- [@mariusvniekerk](https://github.com/mariusvniekerk) for Muse Code support,
+  session labels and pull-request links, launcher relationships, stable
+  reporting digests, and display settings on read-only servers.
+- [@salmonumbrella](https://github.com/salmonumbrella) for the expanded MCP
+  tools, native HTTP request signing, container deployment settings, Friction
+  Log processing, and dialogue-only message search.
+- [@suatkocar](https://github.com/suatkocar) for stable message jumps, releasing
+  hidden-tab connections, and faster session trees.
+- [@NicholasLea](https://github.com/NicholasLea) for Antigravity and Qoder
+  session titles.
+- [@EwenQuim](https://github.com/EwenQuim) for Mistral Vibe unified-store
+  support.
+- [@TimeToBuildBob](https://github.com/TimeToBuildBob) for gptme billed costs
+  and provider-routed model pricing.
+- [@godlockin](https://github.com/godlockin) for preserving shared app databases
+  during pruning and configuration lock handling.
+- [@iainlane](https://github.com/iainlane) for the Hermes per-session sync work
+  and avoiding PostgreSQL usage rewrites caused by timestamp formatting.
+- [@amahpour](https://github.com/amahpour) for excluding other machines' vector
+  sessions from PostgreSQL conflict counts.
+- [@macollins27](https://github.com/macollins27) for compressed Codex rollout
+  support.
+- [@hx-dl](https://github.com/hx-dl) for current TraeX transcript and
+  token-usage support.
+- [@rudycelekli](https://github.com/rudycelekli) for compressed OpenClaw
+  transcript events.
+- [@laugustyniak](https://github.com/laugustyniak) for recorded Codex starting
+  branches.
+- [@patrickzzz](https://github.com/patrickzzz) for single-prompt sessions in MCP
+  list results.
+- [@pascalwhoop](https://github.com/pascalwhoop) for Claude.ai usage counts
+  after shorter branch imports.
+- [@Uddoo](https://github.com/Uddoo) for avoiding Antigravity remote imports
+  triggered by WAL index changes.
+
+## 0.45.0
+
+<small>2026-10-09</small>
+
+**New features**
+
+- Choose Español in Settings. Browsers set to Spanish use it on first load.
+- Browse Junie CLI, OMO, and StepCode sessions with their usage and costs. Junie
+  ingestion excludes tool calls and IDE-only conversations. If you previously
+  used `PI_DIR` for OMO, remove that override to avoid indexing new sessions
+  twice.
+- Read Antigravity conversations from plaintext transcripts when no session
+  database exists, without a decryption key. These transcripts include reasoning
+  and tool calls but no token usage or cost.
+- See commits, lines added and removed, and files changed on the dashboard for
+  the selected dates. Load pull-request totals on demand after GitHub setup.
+- Switch the Activity timeline between concurrency, user-message frequency, and
+  assistant-message frequency.
+- Compare user, assistant, and other message counts in the Analytics timeline
+  with Absolute and Percent views. Other includes system entries and tool
+  results.
+- See all prompt tokens in the Usage page's Total Input card, including cache
+  reads and writes. The previous Input Tokens count is labeled Uncached Input.
+- Choose Smooth, Lines, or Bars for Cost Over Time. The chart remembers your
+  choice, shows zero-spend days, and supports dragging to select a date range.
+- Follow tool errors, retries, switches, and recovery in a session's tool
+  sequences panel. Each step links to its transcript call and shows available
+  timing and evidence. Opening the panel adds no token charges.
+- Give Claude Code and Codex access to past conversations through native
+  conversation-memory plugins. Session-start refresh and readiness diagnostics
+  help identify missing setup or search coverage.
+- Install proactive conversation recall with `agentsview skills install`. The
+  package guides agents to search relevant history, distinguish proposals from
+  accepted decisions, and cite transcript evidence.
+- Approve or archive extracted entries in Recall, the collection of memories
+  extracted from sessions. Review decisions survive later extraction changes.
+- Activate the first Recall collection before the initial backlog finishes, once
+  a session is complete and usable entries exist. Recent sessions extract first,
+  and later passes add to the active collection.
+- Extract Recall entries from several sessions at once by setting `concurrency`
+  on an extraction server. The default remains 1.
+- Choose the default CLI for generated insights with `[insights] default_agent`.
+  Leaving it unset keeps Claude as the default.
+- Replace selected ChatGPT or Claude.ai imports with
+  `agentsview import --replace <session-id>`. The old transcript moves to Trash
+  as a restorable copy, while the live session keeps its name and pins on
+  matching messages.
+- Identify refused ChatGPT and Claude.ai imports by session ID and reason. CLI
+  summaries separate changed history, shorter exports, trashed sessions, and
+  temporary failures.
+- Use semantic and hybrid search on ClickHouse mirrors. Embeddings upload with
+  `clickhouse push` when vector search is enabled; `--no-vectors` or
+  `push_vectors = false` opts out.
+- Browse hosted raw-sync uploads after the server parses them into PostgreSQL
+  sessions. This opt-in mode removes the need for a local SQLite archive or a
+  separate `pg push`.
+- Upload existing sources in a finite, resumable run with
+  `raw-sync backfill --run-id ID --provider NAME`. Start `raw-sync watch` after
+  the run completes to upload later changes.
+- Inspect hosted uploads and parsing with `raw-sync server-status` and the
+  raw-sync health API. Run `raw-sync clean-uploads` to expire upload sessions
+  and remove orphaned temporary files without starting the server.
+- Serve AgentsView under a reverse-proxy subpath with `serve --base-path`. Keep
+  `--public-url` origin-only.
+- Search several literal terms within one user/assistant exchange over MCP on
+  SQLite and PostgreSQL. Narrow results by session, branch, project, agent, or
+  date.
+- Read MCP search evidence from the same transcript revision, and continue
+  reading messages beyond the previous 20,000-character limit. Revision checks
+  report when the source changed.
+- Build clients for multiple machines with host keys and session titles in
+  search results, batch session lookup, and optional source size and
+  archive-update metadata.
+
+**Improvements**
+
+- Load Activity, Usage, and Analytics reports faster on ClickHouse with lower
+  memory use. Opened past-day reports survive restarts, and new pushes refresh
+  only changed sessions where possible. Upgraded deployments need a push to
+  complete new report data and access to `system.parts` for serving.
+- Load Tool Usage and Top Skills analytics faster on PostgreSQL, with less
+  memory use on large archives.
+- Load dashboard metadata with less database work on large SQLite archives. The
+  first writable startup builds an index before serving, so that startup takes
+  longer.
+- Open Usage after a price update without waiting for a full cache rebuild. Only
+  sessions using changed models rebuild, and rebuilding starts in the
+  background. The first startup after upgrading rebuilds the usage cache once.
+- Sync and rebuild large archives with less retained transcript data and less
+  repeated processing. Fresh archives defer the conversation export index until
+  the first export, and full resync removes the redundant stored copy of message
+  text.
+- Update Cursor IDE chats with less parsing and memory use. A database change
+  reparses only chats whose saved documents changed.
+- Keep file watching responsive on large Antigravity installs by skipping
+  generated directory trees. Windows watchers also use smaller change buffers,
+  reducing memory use.
+- Build hourly `export day` and `export digest` reports faster, especially for
+  long sessions.
+- See the current sync stage, subagent-repair counts, and notices when a sync
+  waits for another operation. Refresh controls show elapsed query time and a
+  live request timeline.
+- Load more Activity sessions as you scroll. New pages append to the table, and
+  failed loads offer a retry.
+- See agent-provided session titles consistently, with user-chosen names taking
+  precedence. First-message previews retain the user's actual prompt.
+- Read fuller Codebuff and Freebuff transcripts, including attachment markers,
+  errors, and answers to agent questions. Nested agents appear as linked
+  subagent sessions, and costs include every prompt's reported credits.
+- See OpenCode tool durations from dispatch to result, including permission
+  waits. Calls without a dispatch timestamp retain an unknown duration.
+- Extract fewer Recall procedure entries from work an agent only proposed.
+  Procedure extraction requires tool evidence in the relevant action window.
+  Upgrading re-extracts existing sessions.
+- Keep Recall vector and hybrid queries available while extraction adds entries.
+  The index may trail by 256 changes by default; hybrid search still finds newer
+  entries by keyword.
+- Configure embedding endpoints with HTTPS for public IP addresses and without
+  query strings. Builds leave documents pending when configuration, credentials,
+  or server failures prevent embedding.
+- Sync remote hosts over HTTP. SSH sync is removed; configure each remote with a
+  daemon URL and token. Existing archived sessions remain available.
+- Measure app opens, screen visits, core actions, and visible visit duration
+  through the existing telemetry opt-out. Daily daemon activity counts at most
+  once per installation per UTC day.
+- Diagnose desktop startup and database delays with logs that show backend port
+  selection, readiness results, stalled database checkpoints, and connection or
+  write-lock waits.
+
+**Bug fixes**
+
+- Re-import ChatGPT exports to append new messages, fill previously empty tool
+  results, and restore truncated message text while preserving existing message
+  IDs and pins.
+- Keep saved Claude.ai turns when a stale export contains fewer messages.
+  Shorter exports are refused unless you explicitly request replacement.
+- View, search, and copy raw Codex and Grok tool inputs. Codex patch edits also
+  appear in Recent Edits.
+- Keep both transcripts when Gemini CLI or Cursor files share a session ID,
+  instead of letting one overwrite the other.
+- Read Claude subagent continuations saved under another parent session. Pi
+  subagents in nested directories also appear and link to their parent when the
+  recorded layout identifies it.
+- Keep Claude messages from other sessions out of human prompt counts and
+  session-title selection. The transcript labels them "Message from another
+  session".
+- Count workers launched by another agent as Subagents on Activity, rather than
+  inflating the Interactive peak.
+- Price Codex cache writes at the cache-write rate and estimate auto-review
+  costs using GPT-5.6 Luna rates. Offline reports and exports also include
+  pricing for GPT-6 Astra, GPT-6 Sol, and GPT-6.1 Sol.
+- Retain reported costs when model filters contain spaces between model names or
+  are blank on SQLite and PostgreSQL.
+- Count every message in term trends for time zones where daylight saving time
+  skips local midnight.
+- Remove permanently deleted sessions from semantic search on the next embedding
+  build. Sessions removed by sync and later imported again receive embeddings
+  again.
+- Keep Cursor and Antigravity idle instead of repeatedly syncing unchanged
+  SQLite databases.
+- Show Cursor IDE sessions on the date of their earliest timestamped message.
+- Update active Codex Desktop sessions on macOS within about 30 seconds, even
+  without Codex history hints.
+- Start background serving on macOS without hanging on permission prompts for
+  external volumes. Enable `scan_protected_paths = true` to include Git details
+  from those locations.
+- Keep macOS file identities stable across reboots, avoiding repeated archive
+  reparses. Upgrading performs one initial reparse and raw-source capture.
+- Apply session-provider changes made in Settings without restarting the daemon.
+  Separate push-watch processes still require a restart.
+- Keep local sessions and reachable remotes syncing when another remote's
+  hostname cannot resolve. Sync failures retain their actionable error details.
+- Keep Linux servers discoverable after clock corrections, and let Windows
+  startup progress update while commands read it.
+- Detect same-size file replacements on Windows and sync Positron project
+  changes when file timestamps stay the same.
+- Open the desktop app against an authenticated local daemon without a readiness
+  timeout. The app also recovers after an observed backend outage while hidden
+  and avoids stale startup errors during an in-app update.
+- Replace a served DuckDB mirror with `duckdb push` on Windows without stopping
+  `duckdb serve`.
+- Load current SQLite-backed OpenClaw sessions and discover Hermes Agent
+  sessions in the default Windows location.
+- Report incomplete Git and pull-request totals in `agentsview stats`, and wait
+  beyond the former 30-second client timeout for slow results.
+- Count repositories once across clones and worktrees, and count each commit
+  once while retaining work from diverged branches.
+- Clear the minimum-prompt filter by clicking its selected value again. Usage
+  cards grow to contain wrapped text, and password-manager menus no longer cover
+  typeahead search boxes.
+- Refuse writable archives when the build cannot load their existing FTS5 index,
+  with an error that explains how to fix the executable.
+
+**Acknowledgements**
+
+- [@rodboev](https://github.com/rodboev) for session tool sequences,
+  message-role analytics, import replacement and refusal handling, hosted sync
+  diagnostics, and faster archive processing.
+- [@cpcloud](https://github.com/cpcloud) for Spanish localization, ClickHouse
+  semantic search and reporting performance, session titles, live query timing,
+  and Activity scrolling.
+- [@wesm](https://github.com/wesm) for Recall review, Activity message
+  frequency, sync progress, archive rebuilds, and daemon and remote sync fixes.
+- [@mariusvniekerk](https://github.com/mariusvniekerk) for faster dashboard and
+  PostgreSQL analytics, lower sync memory use, provider settings that apply
+  without a restart, and layout fixes.
+- [@salmonumbrella](https://github.com/salmonumbrella) for native conversation
+  memory, proactive recall, revision-bound MCP evidence, hosted session parsing,
+  resumable backfills, and fleet search APIs.
+- [@andrew05060414](https://github.com/andrew05060414) for ChatGPT and Claude.ai
+  re-import fixes, concurrent Recall extraction, preserving colliding session
+  files, and quieter Antigravity syncing.
+- [@macollins27](https://github.com/macollins27) for dashboard Git and
+  pull-request totals, Antigravity plaintext transcripts, earlier Recall
+  availability, Claude subagent continuations, and desktop recovery.
+- [@tunglambk](https://github.com/tunglambk) for nested Pi subagent discovery,
+  Codex patch paths in Recent Edits, more efficient Claude syncing, and a
+  clearable minimum-prompt filter.
+- [@prateek](https://github.com/prateek) for faster hosted upload
+  acknowledgements and preserving hosted sessions after their source leaves a
+  device.
+- [@alexkarpandrus](https://github.com/alexkarpandrus) for Junie CLI support.
+- [@kvnloo](https://github.com/kvnloo) for indexing OMO sessions as their own
+  agent.
+- [@BUKOWSKIREAL](https://github.com/BUKOWSKIREAL) for StepCode support.
+- [@scross01](https://github.com/scross01) for fuller Codebuff and Freebuff
+  transcripts and usage accounting.
+- [@mslynch](https://github.com/mslynch) for Smooth, Lines, and Bars styles in
+  Cost Over Time.
+- [@dcreager](https://github.com/dcreager) for serving AgentsView under
+  reverse-proxy subpaths.
+- [@LeonidasLux](https://github.com/LeonidasLux) for a configurable default
+  insight-generation agent.
+- [@danielhernik](https://github.com/danielhernik) for keeping Recall vector and
+  hybrid search available while extraction adds entries.
+- [@Technophobe01](https://github.com/Technophobe01) for keeping macOS file
+  identities stable across reboots.
+- [@colinmollenhour](https://github.com/colinmollenhour) for bounding idle
+  watcher work and retries of failed sources.
+- [@jerenrich](https://github.com/jerenrich) for updating active Codex sessions
+  without history hints.
+- [@kquinsland01](https://github.com/kquinsland01) for showing raw Codex tool
+  inputs.
+- [@pb3975](https://github.com/pb3975) for keeping Claude cross-session messages
+  out of human prompt counts.
+- [@gwtaylor](https://github.com/gwtaylor) for keeping password-manager menus
+  out of typeahead searches.
+- [@icesarani](https://github.com/icesarani) for restoring homepage navigation
+  from the documentation.
 
 ## 0.44.0
 
@@ -241,6 +881,10 @@ The latest published release is
 - Sync avoids repeatedly parsing unchanged malformed or missing source files
   where failure caching applies. Unrelated file events no longer bypass retry
   delays, and temporary lock-file changes no longer trigger session syncing.
+- The session list refreshes when sync repairs a subagent parent link, including
+  older self-parent links, even when no transcript changed.
+- Canceled syncs that saved session data retry unfinished parent links on the
+  next poll.
 - Configuration loading rejects unknown keys under `[vector]`, including
   misspelled or misplaced settings. Previously accepted configurations may now
   fail; correct or remove the named keys, even if vector search is disabled.
@@ -268,6 +912,9 @@ The latest published release is
 - Clicking the selected value in the session filter's minimum-prompts row clears
   the filter instead of leaving it set, so it can be turned off without
   clearing the other filters.
+- Transcripts that grow while a sync is reading them no longer cause a full
+  re-parse on the next sync. The incremental path now stores the file size and
+  modification time from the same read.
 
 **Acknowledgements**
 

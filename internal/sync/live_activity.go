@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"time"
 
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/ingest"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
@@ -21,6 +24,9 @@ const (
 	liveActivityMaxPathBytes   = 2 << 20
 	liveActivityMaxCursors     = 256
 	liveActivityMaxCursorBytes = liveActivityMaxPathBytes
+	// Stored activity this recent marks a source as possibly still growing.
+	liveActivityRecentWindow = 24 * time.Hour
+	liveActivityMaxRecent    = 256
 )
 
 type LiveActivitySource struct {
@@ -40,6 +46,23 @@ type LiveActivityLookup func(
 
 type LiveActivitySync func(context.Context, []string) error
 
+// LiveActivityRecentSession is a stored session whose source may still be
+// growing. LastActivity is its latest recorded activity; zero means unknown.
+type LiveActivityRecentSession struct {
+	FullID       string
+	Source       LiveActivitySource
+	LastActivity time.Time
+}
+
+// LiveActivityRecentLookup lists an agent's stored sessions active at or
+// after since, bounded by limit.
+type LiveActivityRecentLookup func(
+	ctx context.Context,
+	agent parser.AgentType,
+	since time.Time,
+	limit int,
+) ([]LiveActivityRecentSession, error)
+
 type LiveActivityTarget struct {
 	Provider parser.Provider
 	Hints    parser.ActivityHintProvider
@@ -50,6 +73,7 @@ type LiveActivityPollStats struct {
 	HintFiles      int
 	HintBytes      int
 	SessionLookups int
+	RecentSessions int
 	SourceStats    int
 	SyncPaths      int
 }
@@ -77,6 +101,7 @@ type liveActivityCursorKey struct {
 type LiveActivityPoller struct {
 	targets   []LiveActivityTarget
 	lookup    LiveActivityLookup
+	recent    LiveActivityRecentLookup
 	syncPaths LiveActivitySync
 	logf      func(string, ...any)
 
@@ -111,6 +136,137 @@ func NewLiveActivityPoller(
 		retries:   make(map[string]*liveActivityRetryEntry),
 		logged:    make(map[string]time.Time),
 	}
+}
+
+// DBLiveActivityLookup finds one stored session's source in the archive.
+func DBLiveActivityLookup(database *db.DB) LiveActivityLookup {
+	return func(
+		ctx context.Context,
+		fullSessionID string,
+	) (LiveActivitySource, bool, error) {
+		session, err := liveActivitySession(ctx, database, fullSessionID)
+		if err != nil {
+			return LiveActivitySource{}, false, err
+		}
+		if session == nil || session.FilePath == nil || *session.FilePath == "" {
+			return LiveActivitySource{}, false, nil
+		}
+		return storedLiveActivitySource(
+			*session.FilePath, session.FileSize, session.FileMtime,
+			session.FileInode, session.FileDevice,
+		), true, nil
+	}
+}
+
+// DBRecentSessionLookup lists recent sessions from the archive that local
+// roots produced: those attributed to localMachine or to the machine label of
+// one of the agent's configured roots in sourceMachines.
+func DBRecentSessionLookup(
+	database *db.DB,
+	localMachine string,
+	sourceMachines map[parser.AgentType]map[string]string,
+) LiveActivityRecentLookup {
+	return func(
+		ctx context.Context,
+		agent parser.AgentType,
+		since time.Time,
+		limit int,
+	) ([]LiveActivityRecentSession, error) {
+		machines := []string{localMachine}
+		for _, machine := range sourceMachines[agent] {
+			if !slices.Contains(machines, machine) {
+				machines = append(machines, machine)
+			}
+		}
+		rows, err := database.RecentSessionSources(
+			ctx, string(agent), machines, since, limit,
+		)
+		if err != nil {
+			return nil, err
+		}
+		sessions := make([]LiveActivityRecentSession, 0, len(rows))
+		for _, row := range rows {
+			// An unparseable ended_at leaves the zero time, which the poller
+			// treats as now.
+			lastActivity, _ := time.Parse(time.RFC3339Nano, row.EndedAt)
+			sessions = append(sessions, LiveActivityRecentSession{
+				FullID: row.ID,
+				Source: storedLiveActivitySource(
+					row.FilePath, row.FileSize, row.FileMtime,
+					row.FileInode, row.FileDevice,
+				),
+				LastActivity: lastActivity,
+			})
+		}
+		return sessions, nil
+	}
+}
+
+func storedLiveActivitySource(
+	path string, size, mtimeNS, inode, device *int64,
+) LiveActivitySource {
+	source := LiveActivitySource{Path: path}
+	if size != nil && mtimeNS != nil {
+		source.StoredSize = *size
+		source.StoredMTimeNS = *mtimeNS
+		source.HasStoredStat = true
+	}
+	if inode != nil && device != nil {
+		source.StoredInode = *inode
+		source.StoredDevice = *device
+		source.HasStoredIdentity = true
+	}
+	return source
+}
+
+// SetRecentLookup adds stored recent activity as a hint for producers without a hint log.
+func (p *LiveActivityPoller) SetRecentLookup(lookup LiveActivityRecentLookup) {
+	p.recent = lookup
+}
+
+func (p *LiveActivityPoller) addRecentSessions(
+	ctx context.Context,
+	now time.Time,
+	stats *LiveActivityPollStats,
+) []error {
+	errs := make([]error, 0)
+	if p.recent == nil {
+		return errs
+	}
+	since := now.Add(-liveActivityRecentWindow)
+	for targetIndex, target := range p.targets {
+		if ctx.Err() != nil {
+			return errs
+		}
+		agent := target.Provider.Definition().Type
+		recent, err := p.recent(ctx, agent, since, liveActivityMaxRecent)
+		if err != nil {
+			errs = append(errs, fmt.Errorf(
+				"list recent %s sessions: %w", agent, err,
+			))
+			continue
+		}
+		stats.RecentSessions += len(recent)
+		for _, session := range recent {
+			if session.FullID == "" || session.Source.Path == "" {
+				continue
+			}
+			// A hot entry's stat is newer than the stored row's unless the
+			// session has moved to another file, such as a Codex revert rollout.
+			if entry, hot := p.hot[session.FullID]; hot &&
+				entry.source.Path == filepath.Clean(session.Source.Path) {
+				continue
+			}
+			lastActivity := session.LastActivity
+			if lastActivity.IsZero() {
+				lastActivity = now
+			}
+			p.setHot(
+				session.FullID, targetIndex, session.Source, lastActivity,
+			)
+		}
+	}
+	return errs
 }
 
 func (p *LiveActivityPoller) PollOnce(
@@ -326,6 +482,10 @@ func (p *LiveActivityPoller) PollOnce(
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
+	pollErrors = append(pollErrors, p.addRecentSessions(ctx, now, &stats)...)
 	if err := ctx.Err(); err != nil {
 		return stats, err
 	}
@@ -696,4 +856,54 @@ func sortedLiveActivityKeys[V any](values map[string]V) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// liveActivitySession returns the stored session a hint names. Codex hints
+// name a thread, but after an undo Codex writes to the thread's newest revert
+// page (<thread>_<rollout>). Of the thread's rows whose file still exists, the
+// one written most recently on disk is returned. Stored mtimes cannot decide
+// this: Codex rows fold in session_index.jsonl's mtime, which a rename sets on
+// every file of the thread at once.
+func liveActivitySession(
+	ctx context.Context, database *db.DB, id string,
+) (*db.Session, error) {
+	session, err := database.GetSessionFull(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	agent, _ := parser.AgentByPrefix(id)
+	if session != nil {
+		agent.Type = parser.AgentType(session.Agent)
+	}
+	if !ingest.IsCodexFormatAgent(agent.Type) {
+		return session, nil
+	}
+	pageIDs, err := database.CodexRevertPageSessionIDs(ctx, id)
+	if err != nil || len(pageIDs) == 0 {
+		return session, err
+	}
+	newestMtime := sessionFileModTime(session)
+	for _, pageID := range pageIDs {
+		page, err := database.GetSessionFull(ctx, pageID)
+		if err != nil {
+			return nil, err
+		}
+		if mtime := sessionFileModTime(page); mtime > newestMtime {
+			session, newestMtime = page, mtime
+		}
+	}
+	return session, nil
+}
+
+// sessionFileModTime returns the on-disk mtime of a session's file, or -1
+// when the session has no file or the file cannot be read.
+func sessionFileModTime(session *db.Session) int64 {
+	if session == nil || session.FilePath == nil {
+		return -1
+	}
+	info, err := os.Stat(*session.FilePath)
+	if err != nil {
+		return -1
+	}
+	return info.ModTime().UnixNano()
 }

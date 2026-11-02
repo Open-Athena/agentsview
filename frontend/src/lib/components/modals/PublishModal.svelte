@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { errorTelemetry } from "../../utils/error-telemetry.js";
   import { onDestroy } from "svelte";
   import { Button, Modal, Spinner } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
@@ -15,6 +16,7 @@
   import type { PublishResponse } from "../../api/generated/index.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
   import { LatestRead } from "../../utils/latest-read.js";
+  import { reportTelemetry } from "../../utils/telemetry.js";
 
   type View = "setup" | "progress" | "success" | "error";
 
@@ -82,6 +84,7 @@
       view = "error";
       return;
     }
+    reportTelemetry("export_run", { format: target.kind === "insight" ? "insight_gist" : "gist" });
 
     if (target.kind === "insight") {
       view = "progress";
@@ -245,7 +248,7 @@
     </div>
 
   {:else if view === "error"}
-    <p class="modal-error-text">{errorMessage}</p>
+    <p class="modal-error-text" {@attach errorTelemetry("export")}>{errorMessage}</p>
   {/if}
 </Modal>
 

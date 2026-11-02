@@ -6,17 +6,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.kenn.io/docbank"
+	"go.kenn.io/docbank/docbank"
 	docsqlite "go.kenn.io/docbank/sqlite"
 	"go.kenn.io/docbank/sqlite/mattn"
 	"go.kenn.io/docbank/sqlite/modernc"
@@ -102,21 +100,6 @@ func TestNewIdentityValidatesCanonicalSHA256AndSize(t *testing.T) {
 			assert.ErrorIs(t, err, ErrArtifactInvalid)
 		})
 	}
-}
-
-func TestArtifactOpErrorPreservesCause(t *testing.T) {
-	t.Parallel()
-
-	ref := requireContractRef(t, contractOrigin, KindCheckpoints, "cp-0000000001.json")
-	err := &ArtifactOpError{Op: "open", Ref: ref, Err: context.Canceled}
-
-	require.ErrorIs(t, err, context.Canceled)
-	assert.Contains(t, err.Error(), "open")
-	assert.Contains(t, err.Error(), ref.Name)
-
-	transient := fmt.Errorf("writing artifact: %w", syscall.EAGAIN)
-	err = &ArtifactOpError{Op: "create", Ref: ref, Err: transient}
-	require.ErrorIs(t, err, syscall.EAGAIN)
 }
 
 type artifactStoreFactory func(t *testing.T) ArtifactStore

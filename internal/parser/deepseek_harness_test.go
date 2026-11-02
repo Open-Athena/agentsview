@@ -106,7 +106,7 @@ func TestDeepSeekHarnessLineReaderReturnsBlankLine(t *testing.T) {
 func TestDeepSeekHarnessPlainAndMultiframeZstdNormalizeTheSameSession(t *testing.T) {
 	records := deepSeekHarnessCompleteFixture("session:one", nil)
 
-	for _, compression := range []string{"plain", "zstd"} {
+	for _, compression := range []string{"plain", "zstd", "zstd-unchecked"} {
 		t.Run(compression, func(t *testing.T) {
 			root := t.TempDir()
 			path := writeDeepSeekHarnessFixture(
@@ -776,7 +776,7 @@ func TestDeepSeekHarnessSourceEventSeqs(t *testing.T) {
 func TestDeepSeekHarnessFormatErrorsAndCrashTails(t *testing.T) {
 	t.Run("foreign version", func(t *testing.T) {
 		records := deepSeekHarnessCompleteFixture("foreign", nil)
-		records[0].(map[string]any)["version"] = 4
+		records[0].(map[string]any)["version"] = deepSeekHarnessNewestFormatVersion + 1
 		path := writeDeepSeekHarnessFixture(t, t.TempDir(), "foreign", deepSeekHarnessFixtureCwd, "plain", records)
 		_, err := parseDeepSeekHarnessSession(t.Context(), path, "")
 		require.Error(t, err)
@@ -959,17 +959,21 @@ func TestDeepSeekHarnessFormatErrorsAndCrashTails(t *testing.T) {
 	})
 
 	t.Run("unsupported content block", func(t *testing.T) {
-		records := []any{
-			deepSeekHarnessFixtureHeader("unknown-block", deepSeekHarnessFixtureCwd, nil),
-			deepSeekHarnessFixtureEvent(0, "user/message", map[string]any{
-				"id": "u", "role": "user", "source": map[string]any{"kind": "user"},
-				"content": []any{map[string]any{"type": "future-block"}},
-			}, "append"),
+		for _, blockType := range []string{"future-block", "tool-addition", "tool-removal"} {
+			t.Run(blockType, func(t *testing.T) {
+				records := []any{
+					deepSeekHarnessFixtureHeader("unknown-block", deepSeekHarnessFixtureCwd, nil),
+					deepSeekHarnessFixtureEvent(0, "user/message", map[string]any{
+						"id": "u", "role": "user", "source": map[string]any{"kind": "user"},
+						"content": []any{map[string]any{"type": blockType, "toolName": "read"}},
+					}, "append"),
+				}
+				path := writeDeepSeekHarnessFixture(t, t.TempDir(), "unknown-block", deepSeekHarnessFixtureCwd, "plain", records)
+				_, err := parseDeepSeekHarnessSession(t.Context(), path, "")
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "unsupported content block")
+			})
 		}
-		path := writeDeepSeekHarnessFixture(t, t.TempDir(), "unknown-block", deepSeekHarnessFixtureCwd, "plain", records)
-		_, err := parseDeepSeekHarnessSession(t.Context(), path, "")
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "unsupported content block")
 	})
 
 	t.Run("raw torn line", func(t *testing.T) {
@@ -1028,32 +1032,21 @@ func TestDeepSeekHarnessFormatErrorsAndCrashTails(t *testing.T) {
 		assert.Equal(t, 1, result.Session.UserMessageCount)
 	})
 
-	t.Run("zstd torn frame", func(t *testing.T) {
-		records := deepSeekHarnessCompleteFixture("zstd-torn", nil)
-		path := writeDeepSeekHarnessFixture(t, t.TempDir(), "zstd-torn", deepSeekHarnessFixtureCwd, "zstd", records)
-		content, err := os.ReadFile(path)
-		require.NoError(t, err)
-		require.Greater(t, len(content), 16)
-		for removed := 1; removed <= 12; removed++ {
-			require.NoError(t, os.WriteFile(path, content[:len(content)-removed], 0o600))
-			result, parseErr := parseDeepSeekHarnessSession(t.Context(), path, "")
-			require.NoError(t, parseErr, "removed %d trailing bytes", removed)
-			assert.True(t, result.Session.IsTruncated)
-		}
-	})
-
-	t.Run("zstd frame without checksum", func(t *testing.T) {
-		records := deepSeekHarnessCompleteFixture("zstd-no-crc", nil)
-		path := writeDeepSeekHarnessFixture(t, t.TempDir(), "zstd-no-crc", deepSeekHarnessFixtureCwd, "zstd", records)
-		encoder, err := zstd.NewWriter(nil, zstd.WithEncoderCRC(false))
-		require.NoError(t, err)
-		encoded := encoder.EncodeAll(deepSeekHarnessFixtureBytes(t, records), nil)
-		encoder.Close()
-		require.NoError(t, os.WriteFile(path, encoded, 0o600))
-		_, err = parseDeepSeekHarnessSession(t.Context(), path, "")
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "without checksum")
-	})
+	for _, compression := range []string{"zstd", "zstd-unchecked"} {
+		t.Run(compression+" torn frame", func(t *testing.T) {
+			records := deepSeekHarnessCompleteFixture("zstd-torn", nil)
+			path := writeDeepSeekHarnessFixture(t, t.TempDir(), "zstd-torn", deepSeekHarnessFixtureCwd, compression, records)
+			content, err := os.ReadFile(path)
+			require.NoError(t, err)
+			require.Greater(t, len(content), 16)
+			for removed := 1; removed <= 12; removed++ {
+				require.NoError(t, os.WriteFile(path, content[:len(content)-removed], 0o600))
+				result, parseErr := parseDeepSeekHarnessSession(t.Context(), path, "")
+				require.NoError(t, parseErr, "removed %d trailing bytes", removed)
+				assert.True(t, result.Session.IsTruncated)
+			}
+		})
+	}
 
 	t.Run("zstd header frame has an event", func(t *testing.T) {
 		records := deepSeekHarnessCompleteFixture("zstd-header-frame", nil)
@@ -1097,8 +1090,8 @@ func TestDeepSeekHarnessFormatErrorsAndCrashTails(t *testing.T) {
 
 func TestDeepSeekHarnessProviderDiscoversAndMapsOneChangedPath(t *testing.T) {
 	root := t.TempDir()
-	records := deepSeekHarnessCompleteFixture("watch-id", nil)
-	path := writeDeepSeekHarnessFixture(t, root, "watch-id", deepSeekHarnessFixtureCwd, "plain", records)
+	records := deepSeekHarnessV4Fixture("watch-id")
+	path := writeDeepSeekHarnessVersionedFixture(t, root, "watch-id", deepSeekHarnessFixtureCwd, "plain", 4, records)
 	writeDeepSeekHarnessFixture(t, root, "other-id", deepSeekHarnessFixtureCwd, "plain", deepSeekHarnessCompleteFixture("other-id", nil))
 	require.NoError(t, os.WriteFile(filepath.Join(root, "unrelated.jsonl"), []byte("{}\n"), 0o600))
 
@@ -1437,8 +1430,10 @@ func writeDeepSeekHarnessFixture(
 	encodedID := encodeDeepSeekHarnessSegment(id)
 	dir := filepath.Join(root, "--workspace-example--", encodedID)
 	require.NoError(t, os.MkdirAll(dir, 0o755))
+	// "zstd-unchecked" writes frames without content checksums, which
+	// Harness builds may emit.
 	name := "session.jsonl"
-	if compression == "zstd" {
+	if strings.HasPrefix(compression, "zstd") {
 		name += ".zstd"
 	}
 	path := filepath.Join(dir, name)
@@ -1452,7 +1447,7 @@ func writeDeepSeekHarnessFixture(
 		require.NoError(t, os.WriteFile(path, bytes.Join(lines, nil), 0o600))
 		return path
 	}
-	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderCRC(true))
+	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderCRC(compression == "zstd"))
 	require.NoError(t, err)
 	defer encoder.Close()
 	var encoded []byte
@@ -1535,6 +1530,10 @@ func TestDeepSeekHarnessProviderPrefersNewestGeneration(t *testing.T) {
 		t, root, "generation-pick", deepSeekHarnessFixtureCwd, "zstd", 3,
 		deepSeekHarnessV3Fixture("generation-pick"),
 	)
+	v4Path := writeDeepSeekHarnessVersionedFixture(
+		t, root, "generation-pick", deepSeekHarnessFixtureCwd, "zstd", 4,
+		deepSeekHarnessV4Fixture("generation-pick"),
+	)
 	provider, ok := NewProvider(
 		AgentDeepSeekHarness,
 		ProviderConfig{Roots: []string{root}},
@@ -1544,14 +1543,20 @@ func TestDeepSeekHarnessProviderPrefersNewestGeneration(t *testing.T) {
 	discovered, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, discovered, 1)
-	assert.Equal(t, v3Path, discovered[0].DisplayPath)
+	assert.Equal(t, v4Path, discovered[0].DisplayPath)
+
+	found, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: "generation-pick"})
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, v4Path, found.DisplayPath)
 
 	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: discovered[0]})
 	require.NoError(t, err)
 	require.Len(t, outcome.Results, 1)
 	assert.Equal(t, "deepseek-harness:generation-pick", outcome.Results[0].Result.Session.ID)
-	assert.Equal(t, "3", outcome.Results[0].Result.Session.SourceVersion)
+	assert.Equal(t, "4", outcome.Results[0].Result.Session.SourceVersion)
 	assert.NotEqual(t, v0Path, discovered[0].DisplayPath)
+	assert.NotEqual(t, v3Path, discovered[0].DisplayPath)
 }
 
 func TestDeepSeekHarnessProviderIgnoresUnsupportedGeneration(t *testing.T) {
@@ -1583,21 +1588,6 @@ func TestDeepSeekHarnessProviderIgnoresUnsupportedGeneration(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, outcome.Results, 1)
 	assert.Equal(t, "3", outcome.Results[0].Result.Session.SourceVersion)
-}
-
-func TestDeepSeekHarnessRejectsUnsupportedGenerationByPath(t *testing.T) {
-	records := deepSeekHarnessV3Fixture("future-only")
-	header, ok := records[0].(map[string]any)
-	require.True(t, ok)
-	header["version"] = deepSeekHarnessNewestFormatVersion + 1
-	path := writeDeepSeekHarnessVersionedFixture(
-		t, t.TempDir(), "future-only", deepSeekHarnessFixtureCwd, "plain",
-		deepSeekHarnessNewestFormatVersion+1, records,
-	)
-
-	_, err := parseDeepSeekHarnessSession(t.Context(), path, "")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unsupported DeepSeek Harness session format version")
 }
 
 func TestDeepSeekHarnessV3AllowsLegacyTurnRestart(t *testing.T) {
@@ -1676,6 +1666,169 @@ func TestDeepSeekHarnessV3SeedCutExcludesInheritedTranscript(t *testing.T) {
 	assert.Equal(t, "child answer", result.Messages[1].Content)
 	assert.Empty(t, result.UsageEvents)
 	assert.Equal(t, TerminationAwaitingUser, result.Session.TerminationStatus)
+}
+
+func TestDeepSeekHarnessV4SessionParses(t *testing.T) {
+	path := writeDeepSeekHarnessVersionedFixture(
+		t, t.TempDir(), "v4-session", deepSeekHarnessFixtureCwd, "zstd", 4,
+		deepSeekHarnessV4Fixture("v4-session"),
+	)
+	result, err := parseDeepSeekHarnessSession(t.Context(), path, "")
+	require.NoError(t, err)
+	assert.Equal(t, "4", result.Session.SourceVersion)
+	require.Len(t, result.Messages, 5)
+	require.Len(t, result.Messages[3].ToolResults, 1)
+	assert.Equal(t, "call-1", result.Messages[3].ToolResults[0].ToolUseID)
+	assert.Contains(t, result.Messages[3].ToolResults[0].ContentRaw, "output")
+	developer := result.Messages[4]
+	assert.Equal(t, RoleSystem, developer.Role)
+	assert.True(t, developer.IsSystem)
+	assert.Equal(t, "tool-registry", developer.SourceType)
+	assert.Equal(t, "Use the read-only connection\nTool added: read\nTool removed: write", developer.Content)
+}
+
+func TestDeepSeekHarnessV4SessionWithJobEventsParses(t *testing.T) {
+	records := deepSeekHarnessV4Fixture("v4-jobs")
+	job := map[string]any{
+		"jobId": "pwsh-c76209594049476e", "owner": "session-v4-jobs",
+		"kind": "pwsh", "label": "Get-ChildItem", "startedAt": 1700000000013,
+		"toolCall": map[string]any{"callId": "call-1", "rootCallId": "call-1"},
+	}
+	settledJob := maps.Clone(job)
+	maps.Copy(settledJob, map[string]any{
+		"finishedAt": 1700000000014, "status": "completed", "cause": "producer",
+		"producerReported": true, "detail": "exit code: 0",
+	})
+	registered := deepSeekHarnessFixtureEvent(0, "job/registered", job, nil)
+	settled := deepSeekHarnessFixtureEvent(0, "job/settled", settledJob, nil)
+	// Producers write the job pair after the tool call and before its result.
+	records = append(records[:13], append([]any{registered, settled}, records[13:]...)...)
+	for index, record := range records[1:] {
+		record.(map[string]any)["seq"] = index
+		record.(map[string]any)["time"] = 1700000000001 + index
+	}
+	path := writeDeepSeekHarnessVersionedFixture(
+		t, t.TempDir(), "v4-jobs", deepSeekHarnessFixtureCwd, "zstd", 4, records,
+	)
+	result, err := parseDeepSeekHarnessSession(t.Context(), path, "")
+	require.NoError(t, err)
+	require.Len(t, result.Messages, 5)
+	require.Len(t, result.Messages[3].ToolResults, 1)
+	assert.Equal(t, "call-1", result.Messages[3].ToolResults[0].ToolUseID)
+}
+
+func TestDeepSeekHarnessV4ToolResultValidation(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		change    func(map[string]any)
+		wantError string
+	}{
+		{"empty output", func(m map[string]any) { m["content"] = []any{} }, ""},
+		{"error output", func(m map[string]any) { m["isError"] = true }, ""},
+		{"omitted error flag", func(m map[string]any) { delete(m, "isError") }, ""},
+		{"escaped tool role", func(m map[string]any) { m["role"] = jsontext.Value(`"t\u006fol"`) }, ""},
+		{"image output", func(m map[string]any) {
+			m["content"] = []any{map[string]any{"type": "image", "attachment": map[string]any{"id": "image-1"}}}
+		}, ""},
+		{"mismatched call", func(m map[string]any) { m["toolCallId"] = "other-call" }, "call id does not match"},
+		{"empty call", func(m map[string]any) { m["toolCallId"] = "" }, "invalid toolCallId"},
+		{"missing call", func(m map[string]any) { delete(m, "toolCallId") }, "invalid toolCallId"},
+		{"invalid error flag", func(m map[string]any) { m["isError"] = "true" }, "isError is not a boolean"},
+		{"null error flag", func(m map[string]any) { m["isError"] = nil }, "isError is not a boolean"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			records := deepSeekHarnessV4Fixture("v4-result")
+			message := records[13].(map[string]any)["data"].(map[string]any)["message"].(map[string]any)
+			test.change(message)
+			path := writeDeepSeekHarnessVersionedFixture(t, t.TempDir(), "v4-result", deepSeekHarnessFixtureCwd, "plain", 4, records)
+			result, err := parseDeepSeekHarnessSession(t.Context(), path, "")
+			if test.wantError != "" {
+				require.ErrorContains(t, err, test.wantError)
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, result.Messages[3].ToolResults, 1)
+			assert.Equal(t, "call-1", result.Messages[3].ToolResults[0].ToolUseID)
+		})
+	}
+}
+
+func TestDeepSeekHarnessV4DeveloperValidation(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		change    func(map[string]any)
+		wantError string
+	}{
+		{"closed step", func(data map[string]any) { data["step"] = 2 }, "names turn 1/step 2"},
+		{"missing tool name", func(data map[string]any) {
+			delete(data["message"].(map[string]any)["content"].([]any)[1].(map[string]any), "toolName")
+		}, "invalid toolName"},
+		{"empty tool name", func(data map[string]any) {
+			data["message"].(map[string]any)["content"].([]any)[2].(map[string]any)["toolName"] = ""
+		}, "invalid toolName"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			records := deepSeekHarnessV4Fixture("v4-developer")
+			for _, record := range records[1:] {
+				event := record.(map[string]any)
+				if event["type"] == "developer/message" {
+					test.change(event["data"].(map[string]any))
+				}
+			}
+			path := writeDeepSeekHarnessVersionedFixture(t, t.TempDir(), "v4-developer", deepSeekHarnessFixtureCwd, "plain", 4, records)
+			_, err := parseDeepSeekHarnessSession(t.Context(), path, "")
+			require.ErrorContains(t, err, test.wantError)
+		})
+	}
+}
+
+func TestDeepSeekHarnessV3ToolResultAllowsNullErrorFlag(t *testing.T) {
+	records := deepSeekHarnessV3Fixture("v3-null-error")
+	message := records[13].(map[string]any)["data"].(map[string]any)["message"].(map[string]any)
+	message["content"].([]any)[0].(map[string]any)["isError"] = nil
+	path := writeDeepSeekHarnessVersionedFixture(t, t.TempDir(), "v3-null-error", deepSeekHarnessFixtureCwd, "plain", 3, records)
+	_, err := parseDeepSeekHarnessSession(t.Context(), path, "")
+	require.NoError(t, err)
+}
+
+func deepSeekHarnessV4Fixture(id string) []any {
+	records := deepSeekHarnessV3Fixture(id)
+	records[0].(map[string]any)["version"] = 4
+	for _, record := range records[1:] {
+		event := record.(map[string]any)
+		if event["type"] == "system/message" {
+			event["data"].(map[string]any)["message"].(map[string]any)["source"] = map[string]any{"kind": "system-prompt"}
+		}
+	}
+	records[6].(map[string]any)["data"].(map[string]any)["header"].(map[string]any)["tools"] = []any{
+		map[string]any{"name": "read", "description": "Read a file", "parameters": map[string]any{"type": "object"}},
+	}
+	message := records[13].(map[string]any)["data"].(map[string]any)["message"].(map[string]any)
+	message["role"] = "tool"
+	block := message["content"].([]any)[0].(map[string]any)
+	message["toolCallId"], message["isError"], message["content"] = block["toolCallId"], block["isError"], block["content"]
+	developer := deepSeekHarnessFixtureEvent(13, "developer/message", map[string]any{
+		"turn": 1, "step": 1, "headerSeq": 5,
+		"message": map[string]any{
+			"id": "dev-1", "role": "developer", "source": map[string]any{"kind": "tool-registry"},
+			"content": []any{
+				map[string]any{"type": "text", "text": "Use the read-only connection"},
+				map[string]any{"type": "tool-addition", "toolName": "read"},
+				map[string]any{"type": "tool-removal", "toolName": "write"},
+			},
+		},
+	}, "append")
+	replacement := records[len(records)-1]
+	records = records[:len(records)-1]
+	records = append(records[:14], append([]any{developer, replacement}, records[14:]...)...)
+	for _, kind := range []string{"workspace/changes", "image/offload", "working-directory/change"} {
+		records = append(records, deepSeekHarnessFixtureEvent(0, kind, map[string]any{}, nil))
+	}
+	for index, record := range records[1:] {
+		record.(map[string]any)["seq"] = index
+		record.(map[string]any)["time"] = 1700000000001 + index
+	}
+	return records
 }
 
 func deepSeekHarnessV3Header(id, cwd string) map[string]any {
@@ -1808,6 +1961,40 @@ func deepSeekHarnessV3Fixture(id string) []any {
 	}
 	records[len(records)-1].(map[string]any)["sourceEventSeqs"] = []int{3}
 	return records
+}
+
+func TestDeepSeekHarnessJobEventsAreLogOnly(t *testing.T) {
+	baseline := deepSeekHarnessV4Fixture("jobs")
+	baselinePath := writeDeepSeekHarnessVersionedFixture(
+		t, t.TempDir(), "jobs", deepSeekHarnessFixtureCwd, "plain", 4, baseline,
+	)
+	baselineResult, err := parseDeepSeekHarnessSession(t.Context(), baselinePath, "")
+	require.NoError(t, err)
+
+	label := "go test ./internal/parser"
+	withJobs := deepSeekHarnessV4Fixture("jobs")
+	withJobs = append(
+		withJobs,
+		deepSeekHarnessFixtureEvent(0, "job/registered", map[string]any{
+			"jobId": "pwsh-1", "owner": "jobs", "kind": "pwsh",
+			"label": label, "startedAt": 1700000000000,
+		}, nil),
+		deepSeekHarnessFixtureEvent(0, "job/settled", map[string]any{
+			"jobId": "pwsh-1", "owner": "jobs", "kind": "pwsh",
+			"label": label, "startedAt": 1700000000000, "finishedAt": 1700000000002,
+			"status": "completed", "cause": "producer", "producerReported": true,
+		}, nil),
+	)
+	for index, record := range withJobs[1:] {
+		record.(map[string]any)["seq"] = index
+		record.(map[string]any)["time"] = 1700000000001 + index
+	}
+	path := writeDeepSeekHarnessVersionedFixture(
+		t, t.TempDir(), "jobs", deepSeekHarnessFixtureCwd, "plain", 4, withJobs,
+	)
+	result, err := parseDeepSeekHarnessSession(t.Context(), path, "")
+	require.NoError(t, err)
+	require.Len(t, result.Messages, len(baselineResult.Messages))
 }
 
 func writeDeepSeekHarnessVersionedFixture(

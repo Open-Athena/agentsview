@@ -291,6 +291,24 @@ describe("load", () => {
     expect(activity.lastUpdatedAt).toBe(stampedAt);
   });
 
+  it("clears the cached report after an invalid machine filter", async () => {
+    const diagnostic = 'unknown machine "Workstation"; known machines: id-a';
+    activity.setMachine("Workstation");
+    api.getActivityReport.mockResolvedValueOnce(makeReport());
+    await activity.load();
+    expect(activity.report).not.toBeNull();
+
+    api.getActivityReport.mockRejectedValueOnce(
+      new ApiError(400, diagnostic, "invalid_machine_filter"),
+    );
+    await activity.load({ background: true });
+
+    expect(activity.report).toBeNull();
+    expect(activity.error).toBe(diagnostic);
+    expect(activity.loading).toBe(false);
+    expect(activity.machine).toBe("Workstation");
+  });
+
   it("recomputes rolling custom ranges before refreshing", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
@@ -417,6 +435,72 @@ describe("session paging", () => {
     expect(activity.report?.report_id).toBe("replacement-report");
   });
 
+  it("appends a cursor page and starts a new list on sort or reload", async () => {
+    activity.report = makeReport({
+      report_id: "signed-report",
+      by_session: [{ session_id: "first" }] as Report["by_session"],
+      sessions_next_cursor: "page-2",
+      sessions_total: 3,
+    });
+    const startVersion = activity.sessionsListVersion;
+
+    api.getActivitySessions.mockResolvedValueOnce({
+      report_id: "signed-report",
+      sessions: [{ session_id: "second" }],
+      next_cursor: "page-3",
+      total: 3,
+    });
+    await activity.loadSessionPage({ cursor: "page-2" });
+
+    expect(activity.report?.by_session).toEqual([
+      { session_id: "first" },
+      { session_id: "second" },
+    ]);
+    expect(activity.report?.sessions_next_cursor).toBe("page-3");
+    expect(activity.report?.sessions_total).toBe(3);
+    expect(activity.sessionsListVersion).toBe(startVersion);
+
+    api.getActivitySessions.mockResolvedValueOnce({
+      report_id: "signed-report",
+      sessions: [{ session_id: "cheapest" }],
+      next_cursor: "cost-page-2",
+      total: 3,
+    });
+    await activity.loadSessionPage({ sort: "cost", direction: "asc" });
+
+    expect(activity.report?.by_session).toEqual([{ session_id: "cheapest" }]);
+    expect(activity.report?.sessions_next_cursor).toBe("cost-page-2");
+    expect(activity.sessionsListVersion).toBe(startVersion + 1);
+
+    api.getActivityReport.mockResolvedValueOnce(
+      makeReport({
+        report_id: "next-day",
+        by_session: [{ session_id: "tomorrow" }] as Report["by_session"],
+      }),
+    );
+    await activity.load();
+
+    expect(activity.report?.by_session).toEqual([{ session_id: "tomorrow" }]);
+    expect(activity.sessionsSort).toBe("agent_minutes");
+    expect(activity.sessionsListVersion).toBe(startVersion + 2);
+  });
+
+  it("keeps the loaded rows when a cursor page fails", async () => {
+    activity.report = makeReport({
+      report_id: "signed-report",
+      by_session: [{ session_id: "first" }] as Report["by_session"],
+      sessions_next_cursor: "page-2",
+    });
+    api.getActivitySessions.mockRejectedValueOnce(new ApiError(503, "temporarily unavailable"));
+
+    expect(await activity.loadSessionPage({ cursor: "page-2" })).toBe(false);
+
+    expect(activity.report?.by_session).toEqual([{ session_id: "first" }]);
+    expect(activity.report?.sessions_next_cursor).toBe("page-2");
+    expect(activity.sessionsError).toBe("temporarily unavailable");
+    expect(activity.sessionsLoading).toBe(false);
+  });
+
   it("replaces the embedded page with a server-filtered bucket range", async () => {
     activity.report = makeReport({
       report_id: "signed-report",
@@ -475,6 +559,46 @@ describe("session paging", () => {
 });
 
 describe("loadFilterOptions", () => {
+  it("loads machine choices after a rejected selector without clearing it", async () => {
+    activity.hydrateFromUrl({ machine: "unknown" });
+    api.getMachines
+      .mockRejectedValueOnce(new ApiError(400, "unknown machine", "invalid_machine_filter"))
+      .mockResolvedValueOnce({ machines: ["id-a"] });
+
+    await activity.loadFilterOptions();
+
+    expect(activity.machine).toBe("unknown");
+    expect(activity.machines).toEqual(["id-a"]);
+    expect(api.getMachines).toHaveBeenCalledTimes(2);
+    expect(api.getMachines.mock.lastCall?.[0]).toEqual({
+      include_one_shot: true,
+      include_automated: true,
+    });
+  });
+
+  it("resolves a whole machine URL label containing a comma to its ID", async () => {
+    await activity.loadFilterOptions();
+    activity.hydrateFromUrl({ machine: "Work, Linux" });
+    api.getMachines.mockResolvedValueOnce({
+      machines: ["id-a"],
+      resolved_machines: ["id-a"],
+    });
+
+    await activity.loadFilterOptions();
+
+    expect(api.getMachines.mock.lastCall?.[0]).toEqual({
+      include_one_shot: true,
+      include_automated: true,
+      machine: "Work, Linux",
+    });
+    expect(activity.machine).toBe("id-a");
+    expect(routerMod.router.replaceParams).toHaveBeenLastCalledWith({
+      preset: "day",
+      date: activity.date,
+      machine: "id-a",
+    });
+  });
+
   it("fetches options with one-shot + automated included and stores them", async () => {
     api.getProjects.mockResolvedValueOnce({
       projects: [{ name: "proj-a", count: 1 }],
@@ -782,12 +906,6 @@ describe("freshness state", () => {
     } finally {
       vi.useRealTimers();
     }
-  });
-
-  it("markNewData is a no-op before the first report loads", () => {
-    expect(activity.lastUpdatedAt).toBeNull();
-    activity.markNewData();
-    expect(activity.hasNewData).toBe(false);
   });
 
   it("does not stamp lastUpdatedAt when a load fails", async () => {

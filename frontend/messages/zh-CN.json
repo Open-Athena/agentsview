@@ -93,12 +93,18 @@
   "header_actions_refresh": "刷新",
   "header_actions_sync": "同步",
   "header_actions_import_unavailable": "只读模式下无法导入",
+  "header_actions_import_archive_only": "仅归档模式下无法导入",
   "header_actions_import_conversations": "导入对话",
   "header_actions_import": "导入",
+  "header_actions_import_claude_syncing": "Claude.ai 同步正在运行。打开导入可查看进度或停止同步。",
   "header_actions_toggle_theme": "切换主题",
   "header_actions_settings": "设置",
   "header_actions_keyboard_shortcuts": "键盘快捷键",
   "header_actions_keyboard_shortcuts_shortcut": "键盘快捷键 (?)",
+  "status_bar_archive_stale": "存档结果可能已过时。",
+  "status_bar_archive_rebuilding": "存档结果可能已过时。重建完成前，修改操作已暂停。",
+  "status_bar_archive_stale_rebuild": "存档结果可能已过时。点击以重建。",
+  "status_bar_sync_failed": "同步失败",
   "status_bar_sessions": [
     {
       "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
@@ -151,8 +157,10 @@
   "command_palette_search_error": "搜索不可用",
   "command_palette_search_failed": "搜索失败。请重试。",
   "command_palette_semantic_setup_title": "语义搜索尚未设置",
-  "command_palette_semantic_setup_config_step": "1. 在 config.toml 中添加 [vector] 部分，并根据你的嵌入服务器调整模型和端点（任何兼容 OpenAI 的端点均可，例如 Ollama）：",
-  "command_palette_semantic_setup_build_step": "2. 重启守护进程，然后构建索引：",
+  "command_palette_semantic_setup_config_step": "1. 将以下内容添加到 config.toml：",
+  "command_palette_semantic_setup_local": "已在 Ollama 中使用 Nomic？切换到共享本地服务器时，请使用完整配置示例以保留索引。",
+  "command_palette_semantic_setup_local_link": "服务器设置",
+  "command_palette_semantic_setup_build_step": "2. 重启守护进程，然后构建索引。CLI 会在首次下载前征求许可：",
   "command_palette_semantic_copy_config": "复制配置片段",
   "command_palette_semantic_copy_command": "复制命令",
   "command_palette_semantic_copied": "已复制！",
@@ -175,7 +183,6 @@
   "command_palette_recent_sessions": "最近会话",
   "session_breadcrumb_back_to_sessions": "返回会话列表",
   "session_breadcrumb_sessions": "会话",
-  "session_breadcrumb_session_health": "会话健康度",
   "session_breadcrumb_resume_session_in_terminal": "在终端继续会话",
   "session_breadcrumb_session_actions": "会话操作",
   "session_breadcrumb_resume_session": "继续会话",
@@ -371,9 +378,22 @@
       }
     }
   ],
+  "tool_block_image_alt": "工具输出中的图片",
+  "tool_block_image_open": "查看原尺寸图片",
+  "tool_block_image_close": "关闭原尺寸图片",
   "thinking_block_label": "思考",
   "compact_boundary_title": "上下文窗口在此处被压缩",
   "compact_boundary_label": "上下文已压缩",
+  "transcript_empty_messages": [
+    {
+      "declarations": ["input count", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{count} 条空消息"
+      }
+    }
+  ],
+  "transcript_empty_messages_title": "这些消息没有文本、思考内容或工具调用",
   "compact_boundary_show_full_summary": "显示完整摘要",
   "sidebar_session_count": [
     {
@@ -427,10 +447,18 @@
   "sidebar_filters_no_match": "无匹配",
   "sidebar_filters_no_agents": "无 agents",
   "sidebar_filters_machine": "Machine",
+  "sidebar_filters_machine_loading": "正在加载机器...",
+  "sidebar_filters_machine_update_failed": "无法更新机器筛选条件。请重试。",
   "sidebar_filters_search_machines": "搜索 machines...",
   "sidebar_filters_no_machines": "无 machines",
   "sidebar_filters_min_prompts": "最少提示数",
   "sidebar_filters_clear_filters": "清除筛选器",
+  "sidebar_filters_labels": "标签",
+  "sidebar_filters_label_input": "按标签筛选",
+  "sidebar_filters_label_placeholder": "添加标签，例如 ticket=example",
+  "sidebar_filters_pull_request": "拉取请求",
+  "sidebar_filters_pull_request_input": "按拉取请求筛选",
+  "sidebar_filters_pull_request_placeholder": "owner/repo#123",
   "sidebar_row_expand": "展开",
   "sidebar_row_collapse": "折叠",
   "sidebar_row_select_session": "选择会话",
@@ -461,6 +489,8 @@
   "shared_active_filters_clear_automated": "清除自动会话筛选器",
   "shared_active_filters_automated_included": "已包含自动会话",
   "shared_active_filters_remove_model": "移除 {model} model 筛选器",
+  "shared_active_filters_remove_label": "移除标签 {label} 筛选器",
+  "shared_active_filters_clear_pull_request": "清除拉取请求筛选器",
   "shared_active_filters_clear_all": "清除所有筛选器",
   "shared_active_filters_clear_all_label": "全部清除",
   "shared_range_select_date_range": "选择日期范围",
@@ -517,6 +547,9 @@
   "shared_refresh_step_skills": "技能",
   "shared_refresh_step_top_sessions": "热门会话",
   "shared_refresh_step_context_summary": "时间窗口概览",
+  "shared_refresh_step_attribution_summary": "成本归因",
+  "shared_refresh_step_reference_summary": "时间窗口成本归因",
+  "shared_refresh_step_zoom": "项目分组",
   "shared_refresh_step_signals": "信号",
   "shared_refresh_step_comparison": "对比",
   "shared_refresh_step_pairwise": "成对对比",
@@ -634,7 +667,9 @@
   "analytics_total_count": "共 {countLabel} 个",
   "analytics_projects_empty": "无项目数据",
   "analytics_activity_timeline_tooltip_value": "{label}：{value} {metric}",
-  "analytics_activity_timeline_tooltip_messages": "用户：{user} / assistant：{assistant}",
+  "analytics_activity_timeline_tooltip_messages": "用户：{user} / 助手：{assistant} / 其他：{other}",
+  "analytics_activity_timeline_mode_absolute": "绝对值",
+  "analytics_activity_timeline_mode_percent": "百分比",
   "analytics_metric_messages": "消息",
   "analytics_metric_sessions": "会话",
   "analytics_metric_output_tokens": "输出 Token",
@@ -761,7 +796,7 @@
   "usage_summary_total_cost": "总成本",
   "usage_summary_total_tokens": "总 Token",
   "usage_summary_copilot_ai_credits": "Copilot AI Credits",
-  "usage_summary_input_tokens": "输入 Token",
+  "usage_summary_total_input": "总输入",
   "usage_summary_daily_burn": "每日消耗",
   "usage_summary_daily_burn_tokens": "每日消耗",
   "usage_summary_peak_day": "峰值日期",
@@ -792,9 +827,15 @@
   "usage_tokens_attribution_title": "Token 归因",
   "usage_attribution_treemap": "矩形树图",
   "usage_attribution_list": "列表",
-  "usage_click_to_hide_hint": "点击可从图表隐藏",
-  "usage_click_to_hide": "点击隐藏 {label}",
-  "usage_hide_from_chart": "从图表隐藏 {label}",
+  "usage_label_scale_title": "标签大小比例",
+  "usage_label_scale_linear": "线性",
+  "usage_label_scale_sqrt": "平方根",
+  "usage_label_scale_log": "对数",
+  "usage_chart_style": "图表样式",
+  "usage_chart_style_smooth": "平滑",
+  "usage_chart_style_lines": "折线",
+  "usage_chart_style_bars": "柱状",
+  "usage_chart_day_label": "{date}：{value}",
   "usage_cache_efficiency_title": "缓存效率",
   "usage_cache_reads": "缓存读取",
   "usage_cache_writes": "缓存写入",
@@ -816,7 +857,7 @@
   "settings_search_empty": "没有匹配的设置",
   "settings_search_clear": "清除搜索",
   "settings_search_result": "显示：{category}",
-  "settings_search_keywords_appearance": "主题 对比度 布局 文本 字体 区块 theme contrast layout text font blocks 缩放 zoom",
+  "settings_search_keywords_appearance": "主题 对比度 布局 文本 字体 区块 theme contrast layout text font blocks 缩放 zoom 颜色 色盲 color",
   "settings_search_keywords_language": "语言 区域设置 翻译 language locale translation",
   "settings_search_keywords_date_ranges": "日期 范围 关联 页面 date range linked pages",
   "settings_search_keywords_terminal": "终端 恢复 启动 可执行文件 参数 剪贴板 terminal resume launch binary arguments clipboard",
@@ -1204,6 +1245,13 @@
   "activity_peak_at": "{time} 达到峰值 {count}",
   "activity_all_sessions_overlay": "所有会话叠加",
   "activity_class_split": "交互 {int} / 子代理 {sub} / 自动 {auto}",
+  "activity_message_bucket_label": "{range}，{metric}：{count}。筛选此时间段的会话。",
+  "activity_timeline_metric": "时间轴指标",
+  "activity_user_messages": "用户消息",
+  "activity_assistant_messages": "助手消息",
+  "activity_messages_per_interval": "每 {interval} 的消息数",
+  "activity_user_messages_help": "交互式会话中的提示词。不含自动运行、子代理、系统条目和工具结果。",
+  "activity_assistant_messages_help": "所选会话中的助手消息。不含系统条目和工具结果。",
   "activity_concurrency": "并发",
   "activity_overlay": "叠加",
   "activity_overlay_metric": "并发叠加指标",
@@ -1507,6 +1555,10 @@
   "session_vitals_repository_copied": "已复制存储库",
   "session_vitals_copy_worktree": "复制工作树",
   "session_vitals_worktree_copied": "已复制工作树",
+  "session_vitals_pull_requests": "拉取请求",
+  "session_vitals_open_pull_request": "在新标签页中打开 {pr}",
+  "session_vitals_labels": "标签",
+  "session_vitals_filter_by_label": "显示带有标签 {label} 的会话",
   "session_vitals_running": "运行中",
   "session_vitals_running_duration": "运行中 {duration}+",
   "session_vitals_tool_calls": "工具调用",
@@ -1613,6 +1665,14 @@
   "insights_page_template_tool_reliability": "工具可靠性",
   "insights_page_template_model_cost": "模型与成本",
   "insights_page_template_instruction_opportunities": "指令优化机会",
+  "insights_page_template_friction_review": "摩擦复盘",
+  "friction_review_summary_title": "模型撰写的摘要",
+  "friction_review_summary_notice": "由模型根据此日报的摘要和模式标题撰写。不会修改发现项、日报或问题。",
+  "friction_review_summary_empty": "此日报尚无摘要。",
+  "friction_review_summary_generate": "生成摘要",
+  "friction_review_summary_regenerate": "重新生成",
+  "friction_review_summary_generating": "正在生成：{phase}",
+  "friction_review_summary_unavailable": "此归档无法生成摘要。",
   "insights_page_scope_no_automated": "排除自动化",
   "insights_page_scope_both": "全部",
   "insights_page_scope_only_automated": "仅自动化",
@@ -1911,7 +1971,7 @@
   "settings_session_providers_enable_aria": "启用 {provider} 会话同步",
   "settings_session_providers_enabled": "已启用",
   "settings_session_providers_disabled": "已停用",
-  "settings_session_providers_restart_notice": "重启 AgentsView 守护进程以及任何单独的推送监视进程，以应用这些更改。",
+  "settings_session_providers_applied_notice": "AgentsView 已应用这些更改。请重启任何单独的推送监视进程，以便在其中也应用这些更改。",
   "settings_session_providers_save_failed": "无法更新会话提供商。之前的选择仍然有效。",
   "settings_session_providers_homes_title": "备用主目录",
   "settings_session_providers_homes_hint": "添加代理主目录，例如自定义的 {envVar}。AgentsView 会自动推导其会话目录。",
@@ -1936,6 +1996,7 @@
   "appearance_chart_palette": "图表配色",
   "appearance_chart_palette_agentsview": "Agentsview",
   "appearance_chart_palette_matplotlib": "Matplotlib",
+  "appearance_chart_palette_colorblind": "色盲友好",
   "appearance_message_layout": "消息布局",
   "appearance_block_visibility": "块可见性",
   "settings_github_token_saved": "GitHub 令牌已保存。",
@@ -2084,6 +2145,7 @@
   "system_boundary_interrupted": "请求中断",
   "system_boundary_task_notification": "任务通知",
   "system_boundary_stop_hook": "停止钩子反馈",
+  "system_boundary_peer_message": "来自其他会话的消息",
   "system_boundary_title": "系统边界：{subtype}",
   "system_boundary_show_content": "显示内容",
   "trash_loading": "正在加载回收站...",
@@ -2131,7 +2193,6 @@
   "usage_treemap": "树状图",
   "usage_list": "列表",
   "usage_no_data_period": "此时段无数据",
-  "usage_click_to_hide_item": "点击隐藏 {label}",
   "usage_cache_efficiency": "缓存效率",
   "usage_cost_over_time": "成本随时间变化",
   "filter_dropdown_all": "全部",
@@ -2173,7 +2234,6 @@
   "usage_pairwise_tokens_per_session": "每会话 Token",
   "usage_summary_unsupported_generic": "匹配会话未提供 token 用量数据。",
   "usage_copilot_credits": "Copilot AI 积分",
-  "usage_input_tokens": "输入 Token",
   "usage_cached_suffix": "+{tokens} 已缓存",
   "usage_output_tokens": "输出 Token",
   "usage_daily_burn": "每日消耗",
@@ -2203,7 +2263,6 @@
   "activity_loading_sessions": "正在加载会话…",
   "activity_loading_usage": "正在加载用量…",
   "activity_finalizing_report": "正在完成报告…",
-  "activity_next_sessions_page": "下一页会话",
   "activity_sessions_load_failed": "无法加载活动会话",
   "activity_report_load_failed": "无法加载活动报告",
   "session_activity_load_failed": "无法加载活动",
@@ -2295,5 +2354,693 @@
   "go_to_session_ambiguous": "有多个会话匹配此 ID 或 UUID。请通过现有链接打开目标会话。",
   "go_to_session_capped": "匹配此 ID 或 UUID 的会话太多。请通过现有链接打开目标会话。",
   "go_to_session_failed": "无法查找该会话。请重试。",
-  "shortcuts_go_to_session": "关闭查找后跳转到会话"
+  "shortcuts_go_to_session": "关闭查找后跳转到会话",
+  "analytics_outcome_title": "产出",
+  "analytics_outcome_repositories": "仓库",
+  "analytics_outcome_commits": "提交",
+  "analytics_outcome_loc_added": "新增行数",
+  "analytics_outcome_loc_removed": "删除行数",
+  "analytics_outcome_files_changed": "改动文件",
+  "analytics_outcome_prs_opened": "已开启的拉取请求",
+  "analytics_outcome_prs_merged": "已合并的拉取请求",
+  "analytics_outcome_include_prs": "包含拉取请求",
+  "analytics_outcome_include_prs_hint": "会按仓库逐个查询 GitHub，可能需要几分钟。",
+  "analytics_outcome_backend_unavailable": "此后端不支持成果总计。",
+  "analytics_outcome_configure_github": "请在设置中配置 GitHub，以加载拉取请求总数。",
+  "analytics_outcome_loading": "正在读取 git 历史...",
+  "analytics_outcome_empty": "此时间范围内没有 git 活动。",
+  "analytics_outcome_filters_unsupported": "清除机器、模型、终止状态、最少消息数、近期活动和时段筛选条件，以查看成果总计。",
+  "analytics_outcome_partial": "未计入：",
+  "analytics_outcome_partial_entry": "{repo}（{op}）：{reason}",
+  "session_breadcrumb_session_health_and_tool_sequences": "会话健康与工具序列",
+  "tool_sequences_title": "观察到的工具序列",
+  "tool_sequences_loading": "正在加载工具序列…",
+  "tool_sequences_error": "无法加载工具序列。",
+  "tool_sequences_unavailable": "此存档不记录对话记录的版本，因此无法显示工具序列。",
+  "tool_sequences_none_recorded": "本会话未记录工具调用。",
+  "tool_sequences_no_sequences": "没有工具调用返回错误或空结果。",
+  "tool_sequences_sequence_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} 个序列",
+        "countPlural=other": "{countLabel} 个序列"
+      }
+    }
+  ],
+  "tool_sequences_ending_recovered": "已恢复",
+  "tool_sequences_ending_abandoned": "已结束",
+  "tool_sequences_ending_open": "未结束",
+  "tool_sequences_ending_unknown": "未知",
+  "tool_sequences_recovered_explanation": "后续调用返回了内容。",
+  "tool_sequences_abandoned_explanation": "会话在错误或空结果后结束。",
+  "tool_sequences_open_explanation": "跟踪记录在序列完成前结束。",
+  "tool_sequences_unknown_explanation": "记录未显示此序列如何结束。",
+  "tool_sequences_outcome_errored": "错误",
+  "tool_sequences_outcome_empty": "空",
+  "tool_sequences_outcome_content": "有内容",
+  "tool_sequences_outcome_unknown": "未知",
+  "tool_sequences_repeat_identical": "相同输入",
+  "tool_sequences_repeat_near_identical": "相同输入，格式不同",
+  "tool_sequences_tool_changed": "切换了工具",
+  "tool_sequences_missing_identity": "没有工具调用 ID",
+  "tool_sequences_input": "输入",
+  "tool_sequences_no_input": "未记录输入。",
+  "tool_sequences_byte_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=one": "{countLabel} 字节", "countPlural=other": "{countLabel} 字节" }
+    }
+  ],
+  "tool_sequences_result": "结果",
+  "tool_sequences_result_unknown": "此结果不是文本，因此结果未知。",
+  "tool_sequences_result_unavailable": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "此处无法显示保留的 {countLabel} 字节结果文本。",
+        "countPlural=other": "此处无法显示保留的 {countLabel} 字节结果文本。"
+      }
+    }
+  ],
+  "tool_sequences_result_empty": "工具未返回任何内容。",
+  "tool_sequences_result_size_unknown": "结果大小未知。",
+  "tool_sequences_not_measured": "未测量",
+  "tool_sequences_duration": "耗时",
+  "tool_sequences_repeat_near_identical_title": "输入相同，但 JSON 格式不同",
+  "tool_sequences_flag_identical": "重复相同输入",
+  "tool_sequences_flag_near_identical": "格式不同的重复",
+  "tool_sequences_flag_tool_switch": "切换了工具",
+  "tool_sequences_sequence_calls": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "序列中 {countLabel} 次调用",
+        "countPlural=other": "序列中 {countLabel} 次调用"
+      }
+    }
+  ],
+  "tool_sequences_session_calls": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "会话中 {countLabel} 次工具调用",
+        "countPlural=other": "会话中 {countLabel} 次工具调用"
+      }
+    }
+  ],
+  "tool_sequences_legend": "结果颜色",
+  "tool_sequences_message": "消息 {ordinal}",
+  "tool_sequences_messages_range": "消息 {first}–{last}",
+  "tool_sequences_jump_label": "消息 {ordinal}：在对话中打开 {tool} 调用",
+  "tool_sequences_more_calls": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=one": "+{countLabel} 次", "countPlural=other": "+{countLabel} 次" }
+    }
+  ],
+  "tool_sequences_calls_hidden_between": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input from",
+        "input to",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "消息 {from} 和消息 {to} 之间还有 {countLabel} 次调用未显示。",
+        "countPlural=other": "消息 {from} 和消息 {to} 之间还有 {countLabel} 次调用未显示。"
+      }
+    }
+  ],
+  "tool_sequences_calls_in_row": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "连续 {countLabel} 次调用。",
+        "countPlural=other": "连续 {countLabel} 次调用。"
+      }
+    }
+  ],
+  "tool_sequences_showing_sequences": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input shownLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "显示 {countLabel} 个序列中的 {shownLabel} 个。其余序列在会话后面。",
+        "countPlural=other": "显示 {countLabel} 个序列中的 {shownLabel} 个。其余序列在会话后面。"
+      }
+    }
+  ],
+  "tool_sequences_calls_not_shown": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "此视图未显示序列中的 {countLabel} 次调用。",
+        "countPlural=other": "此视图未显示序列中的 {countLabel} 次调用。"
+      }
+    }
+  ],
+  "tool_sequences_preview_shows": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input shownLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "预览显示 {countLabel} 字节中的 {shownLabel} 字节。",
+        "countPlural=other": "预览显示 {countLabel} 字节中的 {shownLabel} 字节。"
+      }
+    }
+  ],
+  "tool_sequences_full_input_in_message": "完整输入在消息 {ordinal} 中。",
+  "tool_sequences_full_result_in_message": "完整结果在消息 {ordinal} 中。",
+  "tool_sequences_retry": "重试",
+  "import_claude_connect": "登录",
+  "import_claude_sync_running": "Chrome 同步已在进行中。",
+  "import_claude_sync": "同步",
+  "import_claude_chrome_title": "Chrome",
+  "import_claude_desktop_title": "账号",
+  "import_claude_status_disconnected": "未连接",
+  "import_claude_status_connected": "已连接",
+  "import_claude_status_signed_out": "未登录",
+  "import_claude_status_update": "需要更新",
+  "import_claude_stop": "停止",
+  "import_claude_terminal": "终端",
+  "import_claude_copy_command": "复制命令",
+  "import_claude_setup_load": "然后重启 AgentsView，打开 {url}，开启开发者模式，选择加载已解压的扩展程序，再选择命令显示的文件夹。",
+  "import_claude_open_chrome": "打开 Chrome 并启用 AgentsView 扩展程序。如果你在启动 AgentsView 之后运行了设置，请重启 AgentsView。",
+  "import_claude_tab_note": "如果没有打开 claude.ai 标签页，同步会在后台打开一个。同步后，该标签页会保持打开。",
+  "import_claude_signed_out": "请在安装了 AgentsView 扩展程序的 Chrome 个人资料中登录 claude.ai。请仅在一个 Chrome 个人资料中启用扩展程序。同步会使用最先连接的个人资料。",
+  "import_claude_reload_extension": "然后在 {url} 中重新加载扩展程序。",
+  "import_claude_update_app": "如果你升级了 AgentsView，请重启它。",
+  "import_claude_syncing": "正在同步...",
+  "import_claude_sync_background": "关闭此对话框后，同步仍会继续。",
+  "import_claude_sync_failed": "同步失败",
+  "import_claude_sign_in_failed": "登录失败",
+  "import_claude_desktop_note": "登录使用电子邮件验证码。Google 账号请在 Chrome 中通过网页界面同步。",
+  "usage_click_project": "点击聚焦 {label}，双击打开其分组和会话",
+  "usage_click_project_hint": "选择项目以筛选页面，打开项目可查看其分组和会话。",
+  "usage_click_to_focus": "点击聚焦 {label}",
+  "usage_click_to_focus_hint": "点击聚焦，再次点击清除",
+  "session_breadcrumb_tool_effectiveness": "分析工具效果",
+  "insights_page_tool_effectiveness": "工具效果",
+  "tool_effectiveness_model_assessment": "模型评估",
+  "tool_effectiveness_no_omissions": "模型输入没有省略任何内容。",
+  "tool_effectiveness_assessment_helped": "有帮助",
+  "tool_effectiveness_assessment_did_not_help": "没有帮助",
+  "tool_effectiveness_assessment_unknown": "不明确",
+  "tool_effectiveness_omission_budget_input": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input keptLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} 个调用输入被截断为最多 {keptLabel} 字节",
+        "countPlural=other": "{countLabel} 个调用输入被截断为最多 {keptLabel} 字节"
+      }
+    }
+  ],
+  "tool_effectiveness_omission_budget_result": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input keptLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} 个调用结果被截断为最多 {keptLabel} 字节",
+        "countPlural=other": "{countLabel} 个调用结果被截断为最多 {keptLabel} 字节"
+      }
+    }
+  ],
+  "tool_effectiveness_omission_unretained": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} 个调用结果未保留",
+        "countPlural=other": "{countLabel} 个调用结果未保留"
+      }
+    }
+  ],
+  "tool_effectiveness_omission_no_result": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} 个调用没有记录到结果",
+        "countPlural=other": "{countLabel} 个调用没有记录到结果"
+      }
+    }
+  ],
+  "tool_effectiveness_omission_previews": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input charsLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} 条消息以 {charsLabel} 字符预览显示",
+        "countPlural=other": "{countLabel} 条消息以 {charsLabel} 字符预览显示"
+      }
+    }
+  ],
+  "tool_effectiveness_details_unavailable": "报告详情不可用，因此显示已保存的文本。",
+  "tool_effectiveness_session_changed": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input currentLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "此报告生成后会话已更改：模型评估了 {countLabel} 次调用，会话现在有 {currentLabel} 次。",
+        "countPlural=other": "此报告生成后会话已更改：模型评估了 {countLabel} 次调用，会话现在有 {currentLabel} 次。"
+      }
+    }
+  ],
+  "tool_effectiveness_session_revised": "此报告生成后会话已更改，因此下方事实可能与模型评估的内容不同。",
+  "tool_sequences_message_call": "消息 {ordinal}，调用 {callNumber}",
+  "tool_sequences_jump_call_label": "消息 {ordinal}，调用 {callNumber}：在对话中打开 {tool} 调用",
+  "tool_effectiveness_calls_judged": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "已评估 {countLabel} 次调用",
+        "countPlural=other": "已评估 {countLabel} 次调用"
+      }
+    }
+  ],
+  "tool_effectiveness_conclusion_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} 条结论",
+        "countPlural=other": "{countLabel} 条结论"
+      }
+    }
+  ],
+  "tool_effectiveness_count_helped": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "有帮助 {countLabel}",
+        "countPlural=other": "有帮助 {countLabel}"
+      }
+    }
+  ],
+  "tool_effectiveness_count_did_not_help": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "无帮助 {countLabel}",
+        "countPlural=other": "无帮助 {countLabel}"
+      }
+    }
+  ],
+  "tool_effectiveness_count_unknown": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "不明确 {countLabel}",
+        "countPlural=other": "不明确 {countLabel}"
+      }
+    }
+  ],
+  "tool_effectiveness_calls_cited": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input citedLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "引用了 {countLabel} 次调用中的 {citedLabel} 次",
+        "countPlural=other": "引用了 {countLabel} 次调用中的 {citedLabel} 次"
+      }
+    }
+  ],
+  "tool_effectiveness_select_citation": "选择引用以查看调用",
+  "tool_effectiveness_citation_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} 条引用",
+        "countPlural=other": "{countLabel} 条引用"
+      }
+    }
+  ],
+  "tool_effectiveness_message_label": "消息",
+  "tool_effectiveness_message_no_call": "消息文本，无工具调用",
+  "tool_effectiveness_left_out": "未包含在模型输入中",
+  "tool_effectiveness_model_saw": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "模型看到 {countLabel} 字节",
+        "countPlural=other": "模型看到 {countLabel} 字节"
+      }
+    }
+  ],
+  "tool_effectiveness_open_session": "打开会话",
+  "tool_effectiveness_message_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} 条消息",
+        "countPlural=other": "{countLabel} 条消息"
+      }
+    }
+  ],
+  "analytics_tool_empty_rate": "空结果率",
+  "analytics_tool_repeat_rate": "重复率",
+  "analytics_tool_recovery_rate": "恢复率",
+  "analytics_tool_name": "工具",
+  "analytics_tool_coverage": "已分析",
+  "analytics_tool_sessions": "会话",
+  "analytics_tool_share": "占比",
+  "analytics_tool_unavailable": "不可用",
+  "analytics_tool_show_all": "显示所有工具",
+  "analytics_tool_show_less": "收起工具",
+  "analytics_tool_more_sessions": "更多会话",
+  "analytics_tool_empty_explanation": "已知结果中空结果为 {count}/{total}。",
+  "analytics_tool_repeat_explanation": "已分析调用中相同或近似的后续调用为 {count}/{total}。",
+  "analytics_tool_recovery_explanation": "已恢复序列为 {count}/{total}。未结束：{open}。未知：{unknown}。",
+  "analytics_tool_coverage_explanation": "已分析调用 / 所有调用。等待重新计算及尚未计算的旧会话缺少覆盖。",
+  "analytics_tool_recovery_note": "恢复表示后续调用返回了内容。恢复率归属于开始该序列的工具。",
+  "analytics_tool_evidence_count": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countLabel} 个会话"
+      }
+    }
+  ],
+  "analytics_tool_history_note": "比率不包括仍在重新计算或未保存工具结果的会话中的调用。",
+  "analytics_tool_rate_button_label": "{tool} {rate}：{value}",
+  "analytics_tool_latest_matching_call": "最近匹配调用：{date}",
+  "analytics_tool_matching_calls": "匹配调用：{count}",
+  "usage_all_projects": "所有项目",
+  "usage_clear_selection": "清除选择",
+  "usage_open_project": "打开",
+  "usage_loading": "正在加载...",
+  "plan_usage_title": "套餐用量",
+  "plan_usage_trigger_weekly": "套餐用量：每周 {percent}%",
+  "plan_usage_as_of": "套餐用量（截至 {time}）",
+  "plan_usage_not_checked": "套餐用量：尚未检查",
+  "plan_usage_still_updating": "套餐用量：仍在更新（截至 {time}）",
+  "plan_usage_not_reported_yet": "套餐用量：尚未报告（截至 {time}）",
+  "plan_usage_partial": "部分套餐用量（截至 {time}）",
+  "plan_usage_not_reported": "OpenAI 未报告",
+  "plan_usage_too_many_subagents": "子代理聊天过多，OpenAI 用量报告无法包含",
+  "plan_usage_could_not_check": "AgentsView 无法检查套餐用量",
+  "plan_usage_account_unavailable": "此账户无法获取用量",
+  "plan_usage_counted_under": "计入聊天 {title}",
+  "plan_usage_stale": "此后：{reason}（{time}）。这些数字可能已过时。",
+  "plan_usage_left_out_later": "OpenAI 用量报告未包含此聊天",
+  "plan_usage_weekly_share": "Codex 每周上限的 {percent}%",
+  "plan_usage_five_hour_share": "Codex 五小时上限的 {percent}%",
+  "plan_usage_credits": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countLabel} 积分"
+      }
+    }
+  ],
+  "plan_usage_credits_note": "积分按 OpenAI 用量报告提供的数值显示。",
+  "plan_usage_col_split": "模型、推理强度、速度",
+  "plan_usage_col_weekly": "每周",
+  "plan_usage_col_five_hour": "5 小时",
+  "plan_usage_col_credits": "积分",
+  "capture_tokens_live": "实时采集 token（截至 {time}）",
+  "capture_turns_not_captured": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countLabel} 轮未采集"
+      }
+    }
+  ],
+  "capture_turns_not_captured_covered": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input time",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countLabel} 轮未采集；{time} 之前的轮次已计入套餐用量"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_waiting": "Codex Cloud：等待首次同步",
+  "status_bar_codex_cloud_importing_found": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "Codex Cloud：正在导入，目前已发现 {countLabel} 个聊天"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_importing_progress": "Codex Cloud：正在导入 {imported}/{total} 个聊天",
+  "status_bar_codex_cloud_up_to_date": "Codex Cloud：截至 {time} 已是最新",
+  "status_bar_codex_cloud_retrying": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "Codex Cloud：{countLabel} 个聊天无法导入"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_error": "Codex Cloud：错误",
+  "status_bar_codex_cloud_off": "Codex Cloud：已关闭",
+  "status_bar_codex_cloud_config_error": "Codex Cloud：设置错误",
+  "status_bar_codex_cloud_live_attention": "Codex Cloud：实时令牌需要处理",
+  "status_bar_codex_cloud_oldest_failure": "最早的失败：{time}",
+  "status_bar_codex_cloud_last_success": "上次成功同步：{time}",
+  "status_bar_codex_cloud_homes": "Codex 主目录：{homes}",
+  "appearance_message_colors": "消息颜色",
+  "appearance_message_colors_description": "为每种消息类型设置独立的颜色。色盲友好预设使用在常见色觉缺陷下仍可区分的色调，并添加线条样式，使类型在形状和颜色上都有区别。",
+  "appearance_message_colors_preset": "消息颜色预设",
+  "appearance_message_colors_preset_default": "主题默认",
+  "appearance_message_colors_preset_colorblind": "色盲友好",
+  "appearance_message_colors_preset_custom": "自定义",
+  "appearance_message_colors_patterns": "除颜色外，还用线条样式标记消息类型",
+  "appearance_message_colors_reset_all": "恢复默认",
+  "appearance_message_colors_reset_role": "重置",
+  "appearance_message_colors_reset_role_label": "重置{role}的颜色",
+  "appearance_message_colors_role_label": "{role}的颜色",
+  "appearance_message_colors_picker": "打开取色器",
+  "appearance_message_colors_hex": "十六进制颜色",
+  "appearance_message_colors_warning_text": "在{modes}下文字可能难以阅读（{ratio}:1，需要 {required}:1）。",
+  "appearance_message_colors_warning_marker": "在{modes}下颜色标记可能难以看清（{ratio}:1，需要 {required}:1）。",
+  "appearance_message_colors_mode_light": "浅色模式",
+  "appearance_message_colors_mode_dark": "深色模式",
+  "appearance_message_colors_mode_high_contrast_light": "高对比度浅色模式",
+  "appearance_message_colors_mode_high_contrast_dark": "高对比度深色模式",
+  "appearance_message_colors_swatch_blue": "蓝色",
+  "appearance_message_colors_swatch_vermillion": "朱红色",
+  "appearance_message_colors_swatch_bluish_green": "蓝绿色",
+  "appearance_message_colors_swatch_reddish_purple": "紫红色",
+  "appearance_message_colors_swatch_dark_yellow": "暗黄色",
+  "appearance_message_colors_swatch_gray": "灰色",
+  "appearance_message_colors_preview": "预览",
+  "appearance_message_colors_preview_user": "日期测试为什么会失败？",
+  "appearance_message_colors_preview_assistant": "测试夹具要求 UTC，我已更新。",
+  "nav_friction": "摩擦日志",
+  "friction_page_help_docs": "摩擦日志的工作原理",
+  "friction_page_refresh": "刷新摩擦日志",
+  "friction_date_label": "摘要日期",
+  "friction_date_previous": "上一份摘要",
+  "friction_date_next": "下一份摘要",
+  "friction_date_no_match": "没有匹配的日期",
+  "friction_build_now": "立即生成",
+  "friction_build_title": "为每个尚无摘要的完整日期生成摘要",
+  "friction_build_done": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "已生成 {countNumber} 份摘要" }
+    }
+  ],
+  "friction_build_nothing": "每个完整日期都已有摘要。",
+  "friction_build_failed": "生成失败：{error}",
+  "friction_empty_title": "还没有摩擦摘要",
+  "friction_empty_hint": "每个本地日期结束后会自动生成摘要，每小时运行的任务会补上遗漏的日期。使用“立即生成”可马上生成缺少的日期。",
+  "friction_empty_hint_remote": "每个本地日期结束后会自动生成摘要，每小时运行的任务会补上遗漏的日期。要马上生成缺少的日期，请在运行 AgentsView 的机器上打开此页面，或在服务器上启用 require_auth。",
+  "friction_load_error": "无法加载摩擦日志",
+  "friction_retry": "重试",
+  "friction_digest_heading": "摩擦日志 — {date}",
+  "friction_digest_built": "生成于 {when}（{timezone}）",
+  "friction_p0_failed": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "在 {countNumber} 个会话中失败"
+      }
+    }
+  ],
+  "friction_clean_title": "未发现摩擦",
+  "friction_clean_hint": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "扫描的 {countNumber} 个会话中没有标记任何问题。"
+      }
+    }
+  ],
+  "friction_clean_no_sessions": "这一天没有活跃的会话。",
+  "friction_deferral_said": "推迟了工作：“{phrase}”",
+  "friction_pattern_retry_loop": "重试循环",
+  "friction_pattern_runaway_loop": "失控的工具循环",
+  "friction_pattern_edit_churn": "反复编辑",
+  "friction_pattern_mid_task_compaction": "任务中途压缩上下文",
+  "friction_pattern_context_pressure": "上下文压力",
+  "friction_pattern_iteration_runaway": "长时间运行且无用户输入",
+  "friction_digest_missing": "{date} 没有摘要。",
+  "friction_scanned": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "已扫描 {countNumber} 个会话" }
+    }
+  ],
+  "friction_headline_title": "需要关注",
+  "friction_p0_title": "在多个会话中失败的工具",
+  "friction_patterns_new": "新模式",
+  "friction_patterns_recurring": "反复出现的模式",
+  "friction_pattern_occurrences": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "出现 {countNumber} 次" }
+    }
+  ],
+  "friction_pattern_sessions": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "{countNumber} 个会话" }
+    }
+  ],
+  "friction_pattern_first_seen": "首次出现于 {date}",
+  "friction_section_corrections": "纠正",
+  "friction_section_errors": "错误",
+  "friction_section_workarounds": "临时方案",
+  "friction_section_deferrals": "推迟事项",
+  "friction_section_patterns": "模式",
+  "friction_section_frustration": "挫败",
+  "friction_section_interruptions": "中断",
+  "friction_interruption_count": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "中断 {countNumber} 次" }
+    }
+  ],
+  "friction_kind_correction": "纠正",
+  "friction_kind_error": "错误",
+  "friction_kind_workaround": "临时方案",
+  "friction_kind_deferral": "推迟事项",
+  "friction_kind_pattern": "模式",
+  "friction_kind_frustration": "挫败",
+  "friction_kind_interruption": "中断",
+  "friction_disabled_title": "此服务器已关闭摩擦日志",
+  "friction_disabled_hint": "此服务器不生成摘要。请在 config.toml 中设置 [friction] enabled = true 并重启守护进程。只读归档无法生成摘要。",
+  "friction_markdown_title": "Markdown",
+  "friction_markdown_show": "显示 Markdown",
+  "friction_markdown_copy": "复制 Markdown",
+  "friction_markdown_copied": "已复制 Markdown",
+  "friction_markdown_download": "下载 Markdown",
+  "friction_markdown_loading": "正在加载 Markdown…",
+  "friction_markdown_error": "无法加载 Markdown 摘要。",
+  "friction_open_session": "在第 {ordinal} 条消息处打开 {session}",
+  "friction_open_session_start": "打开 {session}",
+  "friction_quality_card_title": "摩擦日志",
+  "friction_quality_card_body": "在你的会话中发现的纠正、工具错误、临时方案、推迟事项和反复出现模式的每日摘要。",
+  "friction_quality_card_open": "打开摩擦日志",
+  "friction_session_title": "摩擦发现",
+  "friction_session_loading": "正在加载摩擦发现…",
+  "friction_session_error": "摩擦发现不可用。",
+  "friction_session_empty": "此会话中没有摩擦发现。",
+  "friction_session_jump": "消息 {ordinal}",
+  "friction_session_jump_title": "跳转到消息 {ordinal}"
 }

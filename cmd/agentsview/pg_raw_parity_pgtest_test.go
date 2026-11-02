@@ -18,7 +18,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
-	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/postgres"
 	"go.kenn.io/agentsview/internal/rawcapture"
@@ -26,6 +25,7 @@ import (
 	"go.kenn.io/agentsview/internal/rawderive"
 	"go.kenn.io/agentsview/internal/rawsync"
 	"go.kenn.io/agentsview/internal/rawtest"
+	"go.kenn.io/kit/stacktest"
 )
 
 type hostedCaptureClient struct {
@@ -59,7 +59,7 @@ func startParityRuntime(t *testing.T, policy config.ArchiveContent) (*replicaSer
 	cfg.DBPath = filepath.Join(cfg.DataDir, "sessions.db")
 	require.NoError(t, os.Mkdir(cfg.DBPath, 0700))
 	require.NoError(t, os.WriteFile(filepath.Join(cfg.DBPath, "sentinel"), []byte("not an archive"), 0600))
-	startup, err := prepareReplicaServeImpl(pgReplica{}, cfg, "")
+	startup, err := prepareReplicaServeImpl(pgReplica{}, cfg, "", nil)
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(startup.ctx)
 	startup.ctx = ctx
@@ -71,6 +71,7 @@ func startParityRuntime(t *testing.T, policy config.ArchiveContent) (*replicaSer
 		case err := <-finished:
 			assert.NoError(t, err)
 		case <-time.After(10 * time.Second):
+			stacktest.Dump(t)
 			t.Error("runtime failed to join")
 		}
 		startup.cleanup()
@@ -209,7 +210,7 @@ func TestHostedRuntimeCapturedParity(t *testing.T) {
 				ids = []string{"codex:" + rawtest.CodexToolsID}
 			}
 			oracle, engine := rawtest.Oracle(t, tc.agent, root, tc.policy, "")
-			require.Equal(t, len(ids), engine.SyncAll(t.Context(), nil).Synced)
+			require.Equal(t, len(ids), rawtest.SyncOracle(t, engine))
 			client := newHostedCaptureClient(t, startup, store, tc.agent, root)
 			receipt := client.capture(t)
 			waitCaptureJob(t, admin, receipt.ManifestID, "complete", 1)
@@ -220,6 +221,7 @@ func TestHostedRuntimeCapturedParity(t *testing.T) {
 				resolved, err := core.Resolve(t.Context(), id)
 				require.NoError(t, err)
 				rawtest.EqualUsageEvents(t, t.Context(), oracle, store.DB(), id, resolved.SessionID)
+				rawtest.EqualFriction(t, t.Context(), oracle, store.DB(), id, resolved.SessionID)
 			}
 			if tc.agent == parser.AgentCodex {
 				return
@@ -276,9 +278,9 @@ func TestHostedRuntimeCapturedParity(t *testing.T) {
 	}
 }
 
-// Equal device content coalesces, divergent content becomes explicitly
-// ambiguous, and a captured tombstone removes only that device's proof.
-func TestHostedRuntimeCapturedConflictAndRemoval(t *testing.T) {
+// Equal device copies coalesce, an appended copy extends the shared session,
+// and tombstones from both devices keep that session and its curation.
+func TestHostedRuntimeCapturedCopiesSurviveTombstones(t *testing.T) {
 	startup, store, admin := startParityRuntime(t, config.ArchiveContentFull)
 	rootA, rootB := t.TempDir(), t.TempDir()
 	rawtest.Claude(t, rootA)
@@ -294,43 +296,29 @@ func TestHostedRuntimeCapturedConflictAndRemoval(t *testing.T) {
 	require.NotNil(t, session)
 	require.NoError(t, store.RenameSession(t.Context(), rawtest.ClaudeID, new("Shared curation")))
 	rawtest.AppendClaude(t, pathB)
-	divergent := b.capture(t)
-	waitCaptureJob(t, admin, divergent.ManifestID, "complete", 1)
-	_, err = store.GetSession(t.Context(), rawtest.ClaudeID)
-	var conflict *db.SessionIdentityError
-	require.ErrorAs(t, err, &conflict)
-	assert.Equal(t, "ambiguous", conflict.State)
-	require.Len(t, conflict.Variants, 2)
-	var contents []string
-	for _, id := range conflict.Variants {
-		messages, err := store.GetAllMessages(t.Context(), id)
+	appended := b.capture(t)
+	waitCaptureJob(t, admin, appended.ManifestID, "complete", 1)
+	assertRetained := func(t *testing.T) {
+		t.Helper()
+		session, err := store.GetSession(t.Context(), rawtest.ClaudeID)
+		require.NoError(t, err)
+		require.NotNil(t, session)
+		require.NotNil(t, session.DisplayName)
+		assert.Equal(t, "Shared curation", *session.DisplayName)
+		messages, err := store.GetAllMessages(t.Context(), rawtest.ClaudeID)
 		require.NoError(t, err)
 		require.NotEmpty(t, messages)
-		contents = append(contents, messages[len(messages)-1].Content)
+		assert.Equal(t, "Recorded the failure.", messages[len(messages)-1].Content)
 	}
-	assert.ElementsMatch(t, []string{"The build failed.", "Recorded the failure."}, contents)
-	_, queued, err := b.checkpoint.QueueTombstone(t.Context(), rawcheckpoint.SourceIdentity{Provider: b.last.Provider, ConfiguredRootID: b.last.ConfiguredRootID, SourceKey: b.last.SourceKey})
-	require.NoError(t, err)
-	require.True(t, queued)
-	removed := b.flush(t)
-	waitCaptureJob(t, admin, removed.ManifestID, "complete", 1)
-	session, err = store.GetSession(t.Context(), rawtest.ClaudeID)
-	require.NoError(t, err)
-	require.NotNil(t, session)
-	require.NotNil(t, session.DisplayName)
-	assert.Equal(t, "Shared curation", *session.DisplayName)
-	messages, err := store.GetAllMessages(t.Context(), rawtest.ClaudeID)
-	require.NoError(t, err)
-	require.NotEmpty(t, messages)
-	assert.Equal(t, "The build failed.", messages[len(messages)-1].Content)
-	_, queued, err = a.checkpoint.QueueTombstone(t.Context(), rawcheckpoint.SourceIdentity{Provider: a.last.Provider, ConfiguredRootID: a.last.ConfiguredRootID, SourceKey: a.last.SourceKey})
-	require.NoError(t, err)
-	require.True(t, queued)
-	removed = a.flush(t)
-	waitCaptureJob(t, admin, removed.ManifestID, "complete", 1)
-	session, err = store.GetSession(t.Context(), rawtest.ClaudeID)
-	require.NoError(t, err)
-	assert.Nil(t, session)
+	assertRetained(t)
+	for _, client := range []*hostedCaptureClient{b, a} {
+		_, queued, err := client.checkpoint.QueueTombstone(t.Context(), rawcheckpoint.SourceIdentity{Provider: client.last.Provider, ConfiguredRootID: client.last.ConfiguredRootID, SourceKey: client.last.SourceKey})
+		require.NoError(t, err)
+		require.True(t, queued)
+		removed := client.flush(t)
+		waitCaptureJob(t, admin, removed.ManifestID, "complete", 1)
+		assertRetained(t)
+	}
 }
 
 // A missing fork parent is a real provider partial result: publish its visible
@@ -384,7 +372,7 @@ func TestHostedRuntimeCapturedPartialRetryExhaustion(t *testing.T) {
 	require.Greater(t, len(client.last.Entries), 1, "the parent must be captured as a companion")
 	waitCaptureJob(t, admin, recovered.ManifestID, "complete", 1)
 	oracle, engine := rawtest.Oracle(t, parser.AgentCodex, root, "", "")
-	require.Positive(t, engine.SyncAll(t.Context(), nil).Synced)
+	require.Positive(t, rawtest.SyncOracle(t, engine))
 	require.NoError(t, oracle.RenameSession(t.Context(), id, new("Partial curation")))
 	rawtest.EqualStored(t, t.Context(), oracle, store, id)
 }
@@ -401,7 +389,7 @@ func TestHostedRuntimeCapturedRelationships(t *testing.T) {
 			rawtest.Claude(t, root)
 			rawtest.ClaudeChild(t, root)
 			oracle, engine := rawtest.Oracle(t, parser.AgentClaude, root, "", "")
-			require.Equal(t, 2, engine.SyncAll(t.Context(), nil).Synced)
+			require.Equal(t, 2, rawtest.SyncOracle(t, engine))
 			client := newHostedCaptureClient(t, startup, store, parser.AgentClaude, root)
 			sources, err := parser.DiscoverRawCaptureSources(t.Context(), client.provider)
 			require.NoError(t, err)

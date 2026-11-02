@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/kit/embedconfig"
 	kitvec "go.kenn.io/kit/vector"
 	"go.kenn.io/kit/vector/sqlitevec"
 )
@@ -109,16 +110,24 @@ func TestSearchPageExhaustionUsesChunkCandidatesBeforeDocumentRollup(t *testing.
 	_, err := ix.Build(ctx, src, fakeSearchEncoder(), gen, BuildOptions{})
 	require.NoError(t, err)
 
-	hits, exhausted, err := ix.SearchPage(ctx, fakeSearchEncoder(), "alpha", 2)
+	encodes := 0
+	search, err := ix.PrepareSearch(ctx, func(ctx context.Context, texts []string) ([][]float32, error) {
+		encodes++
+		assert.Equal(t, []string{"alpha"}, texts)
+		return fakeSearchEncoder()(ctx, texts)
+	}, "alpha")
+	require.NoError(t, err)
+	hits, exhausted, err := search(ctx, 2)
 	require.NoError(t, err)
 	require.Len(t, hits, 1,
 		"two chunk candidates from one document must roll up to one hit")
 	assert.False(t, exhausted,
 		"a short rolled-up page does not prove the vector candidates were exhausted")
 
-	_, exhausted, err = ix.SearchPage(ctx, fakeSearchEncoder(), "alpha", 100)
+	_, exhausted, err = search(ctx, 100)
 	require.NoError(t, err)
 	assert.True(t, exhausted)
+	assert.Equal(t, 1, encodes)
 }
 
 func TestSearchRejectsCandidateCountAboveEngineKMax(t *testing.T) {
@@ -207,11 +216,11 @@ func TestStaleActiveTrueWhenFingerprintsDiffer(t *testing.T) {
 	_, err := ix.Build(ctx, src, fakeSearchEncoder(), gen, BuildOptions{})
 	require.NoError(t, err)
 
-	stale, err := ix.StaleActive(ctx, "some-other-fingerprint", "")
+	stale, err := ix.StaleActive(ctx, legacySpace("some-other-fingerprint"), "")
 	require.NoError(t, err)
 	assert.True(t, stale)
 
-	stale, err = ix.StaleActive(ctx, gen.Fingerprint(), "")
+	stale, err = ix.StaleActive(ctx, legacySpace(gen.Fingerprint()), "")
 	require.NoError(t, err)
 	assert.False(t, stale, "matching fingerprint is not stale")
 }
@@ -227,20 +236,32 @@ func TestStaleActiveRejectsNewerCorpusRevision(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	stale, err := ix.StaleActive(ctx, gen.Fingerprint(), "revision-1")
+	stale, err := ix.StaleActive(ctx, legacySpace(gen.Fingerprint()), "revision-1")
 	require.NoError(t, err)
 	assert.False(t, stale)
 
-	stale, err = ix.StaleActive(ctx, gen.Fingerprint(), "revision-2")
+	stale, err = ix.StaleActive(ctx, legacySpace(gen.Fingerprint()), "revision-2")
 	require.NoError(t, err)
 	assert.True(t, stale)
+
+	tolerant := func(completed, want string) bool {
+		return completed == "revision-1" && want == "revision-2"
+	}
+	stale, err = ix.StaleActiveWithin(ctx, legacySpace(gen.Fingerprint()), "revision-2", tolerant)
+	require.NoError(t, err)
+	assert.False(t, stale, "the caller's test accepts the lag")
+
+	stale, err = ix.StaleActiveWithin(ctx, legacySpace("some-other-fingerprint"), "revision-2",
+		func(string, string) bool { return true })
+	require.NoError(t, err)
+	assert.True(t, stale, "a different space is stale whatever the revision test says")
 }
 
 func TestStaleActiveFalseWhenNoActiveGeneration(t *testing.T) {
 	ix := openTestIndex(t)
 	ctx := t.Context()
 
-	stale, err := ix.StaleActive(ctx, "anything", "")
+	stale, err := ix.StaleActive(ctx, legacySpace("anything"), "")
 	require.NoError(t, err)
 	assert.False(t, stale, "no active generation means nothing to compare")
 }
@@ -919,14 +940,16 @@ func TestSearchReducedDimensionsEndToEnd(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	enc := NewEncoder(EncoderConfig{
-		Endpoint:          srv.URL + "/v1",
-		Model:             "matryoshka-model",
-		Dimension:         reducedDim,
-		RequestDimensions: true,
-		Timeout:           5 * time.Second,
-		MaxRetries:        1,
-	})
+	enc, err := NewEncoder(EncoderConfig{
+		Model: embedconfig.Model{
+			Name: "matryoshka-model", Dimensions: reducedDim, RequestDimensions: true,
+			Metric: embedconfig.MetricCosine, Normalization: embedconfig.NormalizationNone,
+		},
+		Deployment: embedconfig.Deployment{BaseURL: srv.URL + "/v1"},
+		Transport:  embedconfig.Transport{Timeout: 5 * time.Second},
+		MaxRetries: 1,
+	}, embedconfig.RoleDocument)
+	require.NoError(t, err)
 
 	ix := openTestIndex(t)
 	ctx := t.Context()

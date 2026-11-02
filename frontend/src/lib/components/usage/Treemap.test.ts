@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it } from "vite-plus/test";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 import { setLocale } from "../../i18n/index.js";
 import Treemap from "./Treemap.svelte";
@@ -20,7 +20,7 @@ describe("Treemap", () => {
             id: "alpha",
             label: "Alpha",
             value: 42,
-            color: "#1f77b4",
+            style: { color: "#1f77b4", fill: "solid" as const },
             meta: "Meta",
           },
         ],
@@ -28,8 +28,13 @@ describe("Treemap", () => {
     });
     await tick();
 
-    expect(document.querySelector(".tile title")?.textContent).toBe("Click to hide Alpha");
+    expect(document.querySelector(".tile title")?.textContent).toBe("Click to focus Alpha");
     const tile = document.querySelector<SVGGElement>(".tile");
+    expect(tile?.hasAttribute("role")).toBe(false);
+    expect(tile?.hasAttribute("tabindex")).toBe(false);
+    expect(tile?.hasAttribute("aria-pressed")).toBe(false);
+    // A role-less <g> takes its name from <title>; an aria-label there is not exposed reliably.
+    expect(tile?.hasAttribute("aria-label")).toBe(false);
     const clipPath = tile?.getAttribute("clip-path");
     expect(typeof clipPath).toBe("string");
     if (typeof clipPath !== "string") {
@@ -41,5 +46,83 @@ describe("Treemap", () => {
     expect(document.getElementById(clipId)?.querySelector("rect")).not.toBeNull();
 
     unmount(component);
+  });
+  it("selects with Enter and opens on double click", async () => {
+    const onSelect = vi.fn();
+    const onOpen = vi.fn();
+    const items = [
+      {
+        id: "alpha",
+        label: "Alpha",
+        value: 42,
+        style: { color: "#1f77b4", fill: "solid" as const },
+        selected: true,
+      },
+      {
+        id: "beta",
+        label: "Beta",
+        value: 21,
+        style: { color: "#ff7f0e", fill: "solid" as const },
+        dimmed: true,
+      },
+    ];
+    const component = mount(Treemap, { target: document.body, props: { items, onSelect } });
+    await tick();
+    const tiles = document.querySelectorAll(".tile");
+    expect(tiles).toHaveLength(2);
+    expect(tiles[0]!.getAttribute("aria-pressed")).toBe("true");
+    expect(tiles[1]!.classList.contains("dimmed")).toBe(true);
+    expect(tiles[1]!.querySelector("rect")!.getAttribute("fill")).toBe("#ff7f0e");
+    tiles[1]!.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }),
+    );
+    expect(onSelect).toHaveBeenCalledWith("beta");
+    tiles[0]!.dispatchEvent(new MouseEvent("click", { detail: 2, bubbles: true }));
+    await unmount(component);
+    const project = mount(Treemap, { target: document.body, props: { items, onSelect, onOpen } });
+    await tick();
+    const tile = document.querySelector(".tile")!;
+    tile.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }),
+    );
+    expect(onOpen).not.toHaveBeenCalled();
+    tile.dispatchEvent(new MouseEvent("click", { detail: 2, bubbles: true }));
+    tile.dispatchEvent(new MouseEvent("dblclick", { detail: 2, bubbles: true }));
+    expect(onOpen).toHaveBeenCalledWith("alpha");
+    expect(onSelect.mock.calls).toEqual([["beta"], ["alpha"], ["alpha"]]);
+    await unmount(project);
+  });
+  it("sizes labels by tile share on the chosen scale", async () => {
+    const items = [
+      {
+        id: "big",
+        label: "Big",
+        value: 80,
+        style: { color: "#1f77b4", fill: "solid" as const },
+      },
+      {
+        id: "small",
+        label: "Small",
+        value: 20,
+        style: { color: "#ff7f0e", fill: "solid" as const },
+      },
+    ];
+    const labelSizes = () =>
+      [...document.querySelectorAll<SVGTextElement>(".tile-label")].map((label) =>
+        parseFloat(label.style.fontSize),
+      );
+
+    const linear = mount(Treemap, {
+      target: document.body,
+      props: { items, labelScale: "linear" },
+    });
+    await tick();
+    expect(labelSizes()).toEqual([17, 12]);
+    unmount(linear);
+
+    const log = mount(Treemap, { target: document.body, props: { items, labelScale: "log" } });
+    await tick();
+    expect(labelSizes()).toEqual([18, 16]);
+    unmount(log);
   });
 });

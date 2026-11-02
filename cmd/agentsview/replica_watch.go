@@ -5,128 +5,146 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"slices"
 	"syscall"
 	"time"
 
 	"github.com/gofrs/flock"
+	"go.kenn.io/agentsview/internal/archivepush"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/storage"
-	syncpkg "go.kenn.io/agentsview/internal/sync"
-	"go.kenn.io/kit/daemon"
 )
 
-// replicaPusher runs a local sync then pushes to a replica, lazily
-// connecting and reconnecting after errors so a transiently
-// unreachable database never crashes the daemon.
+// replicaPusher pushes the archive to a replica from a watch process that
+// owns the archive. Its session keeps one connection and reconnects after
+// errors, so a replica that is unreachable for a while never stops the watch.
 type replicaPusher struct {
 	// label prefixes log lines, e.g. "pg watch".
 	label string
 	// displayName names the replica product in operator-facing warnings.
 	displayName string
-	localSync   func(context.Context) error
-	scopedSync  func(
-		context.Context, syncpkg.WatchBatch, *syncpkg.WatchRecoveryScope,
-		func() error,
-	) error
-	ensurePricing func(context.Context) error
-	connect       func(context.Context) (storage.Pusher, error)
-	target        storage.Pusher
-	// vectorReconcileNeeded is true until a generation-wide vector
-	// reconciliation succeeds in this watch process, and again after
-	// any push error or a vector phase that skipped or deferred work.
-	// While true, change pushes stay generation-wide so nothing waits
-	// on the interval floor unnecessarily; while false, change pushes
-	// scope their vector reads to the changed relational sessions.
-	vectorReconcileNeeded bool
-	// lastReconciledVectorGeneration is the replica generation id of the
-	// last clean generation-wide reconciliation in this process. A scoped
-	// push carrying it lets the vector phase promote itself to
-	// generation-wide when the active generation id differs, so a re-embed
-	// or a reset/drop-and-recreate (by any machine) never leaves a
-	// generation partially populated.
-	lastReconciledVectorGeneration int64
+	session     archivepush.ReplicaSession
+	vectors     vectorReconcile
 }
 
-// push performs one local-sync-then-push cycle. On any replica error it
-// drops the cached connection so the next call reconnects.
+// push copies the archive to the replica. Local sync runs separately, so the
+// push sends whatever the archive holds when it starts.
 func (p *replicaPusher) push(
 	ctx context.Context, reason pushReason, full bool,
 ) error {
-	return p.pushBatch(ctx, reason, full, nil, nil)
-}
-
-func (p *replicaPusher) pushBatch(
-	ctx context.Context,
-	reason pushReason,
-	full bool,
-	batch *syncpkg.WatchBatch,
-	recovery *syncpkg.WatchRecoveryScope,
-) error {
-	push := func() error { return p.pushAfterSync(ctx, reason, full) }
-	if batch != nil {
-		if p.scopedSync == nil {
-			return errors.New("scoped local sync is unavailable")
-		}
-		return p.scopedSync(ctx, *batch, recovery, push)
-	}
-	if err := p.localSync(ctx); err != nil {
-		return fmt.Errorf("local sync: %w", err)
-	}
-	return push()
-}
-
-func (p *replicaPusher) pushAfterSync(
-	ctx context.Context, reason pushReason, full bool,
-) error {
-	if p.ensurePricing != nil {
-		if err := p.ensurePricing(ctx); err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
+	return p.vectors.push(
+		p.label, p.displayName, reason, full,
+		func(opts storage.PushOptions) (storage.PushResult, error) {
+			// Name the step that failed: a connect error needs a different
+			// fix than an error partway through the copy.
+			var stage archivepush.Stage
+			onStage := p.session.OnStage
+			defer func() { p.session.OnStage = onStage }()
+			p.session.OnStage = func(s archivepush.Stage) func() {
+				stage = s
+				if onStage != nil {
+					return onStage(s)
+				}
+				return nil
 			}
-			log.Printf("warning: pricing refresh failed: %v", err)
-		}
+			res, err := p.session.Push(ctx, opts, nil)
+			if err == nil {
+				return res, nil
+			}
+			if stage == archivepush.StageConnect || stage == archivepush.StagePush {
+				err = fmt.Errorf("%s: %w", stage, err)
+			}
+			// The replica records a full push only once the copy starts.
+			if stage != archivepush.StagePush {
+				err = storage.PushNotStartedError{Err: err}
+			}
+			return res, err
+		},
+	)
+}
+
+// vectorReconcile decides, across the pushes of one watch process, when a
+// change push may limit its vector phase to the changed sessions. Both archive
+// owners use it: a local owner passes the decision to its pusher, and a daemon
+// owner sends it with each push request because the daemon builds a new
+// pusher for every request.
+type vectorReconcile struct {
+	// needed is true until a generation-wide vector reconciliation succeeds
+	// in this watch process, and again after any push error or a vector
+	// phase that skipped or deferred work. While true, change pushes stay
+	// generation-wide so nothing waits on the interval floor unnecessarily;
+	// while false, change pushes scope their vector reads to the changed
+	// relational sessions.
+	needed bool
+	// lastGeneration is the replica generation id of the last clean
+	// generation-wide reconciliation in this process. A scoped push carrying
+	// it lets the vector phase promote itself to generation-wide when the
+	// active generation id differs, so a re-embed or a reset/drop-and-recreate
+	// (by any machine) never leaves a generation partially populated.
+	lastGeneration int64
+	// fullPending keeps a full watch's generation-wide vector repair until
+	// a vector phase runs. repairSessions then keeps the repair for each
+	// session that phase deferred until the session's vectors push. Only a
+	// local owner sets fullPending; a daemon push request has no field for
+	// it.
+	fullPending    bool
+	repairSessions map[string]struct{}
+}
+
+// newVectorReconcile starts generation-wide: nothing has been reconciled yet.
+func newVectorReconcile() vectorReconcile {
+	return vectorReconcile{needed: true}
+}
+
+// options returns the push options for the next push. A pending vector repair
+// keeps the vector phase generation-wide.
+func (v *vectorReconcile) options(reason pushReason, full bool) storage.PushOptions {
+	repairPending := v.fullPending || len(v.repairSessions) > 0
+	return storage.PushOptions{
+		Full:                           full,
+		FullVectors:                    v.fullPending,
+		FullVectorSessions:             slices.Sorted(maps.Keys(v.repairSessions)),
+		ScopeVectorsToChangedSessions:  scopedVectorPush(reason, full, v.needed || repairPending),
+		LastReconciledVectorGeneration: v.lastGeneration,
 	}
-	if err := ctx.Err(); err != nil {
+}
+
+// record updates the state from the outcome of a push sent with opts.
+func (v *vectorReconcile) record(
+	opts storage.PushOptions, res storage.PushResult, err error,
+) {
+	if err != nil {
+		v.needed = true
+		return
+	}
+	if !res.Vectors.Skipped {
+		v.repairSessions = nextVectorRepair(
+			v.fullPending, v.repairSessions, res.Vectors.DeferredSessionIDs,
+		)
+		v.fullPending = false
+	}
+	v.needed, v.lastGeneration = nextVectorReconcile(
+		v.needed, v.lastGeneration, opts.ScopeVectorsToChangedSessions, res,
+	)
+}
+
+// push runs one watch push to a replica. send performs the push with the
+// options chosen here; the two archive owners differ only in how they send it.
+func (v *vectorReconcile) push(
+	label, displayName string, reason pushReason, full bool,
+	send func(storage.PushOptions) (storage.PushResult, error),
+) error {
+	opts := v.options(reason, full)
+	res, err := send(opts)
+	v.record(opts, res, err)
+	if err != nil {
 		return err
 	}
-	if p.target == nil {
-		t, err := p.connect(ctx)
-		if err != nil {
-			return fmt.Errorf("connect: %w", err)
-		}
-		p.target = t
-	}
-	if err := p.target.EnsureSchema(ctx); err != nil {
-		p.reset()
-		return fmt.Errorf("ensure schema: %w", err)
-	}
-	scoped := scopedVectorPush(reason, full, p.vectorReconcileNeeded)
-	res, err := p.target.PushWithOptions(ctx, storage.PushOptions{
-		Full:                           full,
-		ScopeVectorsToChangedSessions:  scoped,
-		LastReconciledVectorGeneration: p.lastReconciledVectorGeneration,
-	}, nil)
-	if err != nil {
-		p.vectorReconcileNeeded = true
-		p.reset()
-		return fmt.Errorf("push: %w", err)
-	}
-	p.vectorReconcileNeeded, p.lastReconciledVectorGeneration = nextVectorReconcile(
-		p.vectorReconcileNeeded,
-		p.lastReconciledVectorGeneration, scoped, res,
-	)
-	if res.Errors > 0 {
-		logReplicaWatchPushResult(p.label, p.displayName, res, reason)
-		log.Printf(
-			"%s: %d session(s) failed to push; will retry",
-			p.label, res.Errors,
-		)
-		return fmt.Errorf("%d session(s) failed to push", res.Errors)
-	}
-	logReplicaWatchPushResult(p.label, p.displayName, res, reason)
-	return nil
+	return completeReplicaWatchPush(label, displayName, res, reason)
 }
 
 // scopedVectorPush reports whether a push may scope its vector phase
@@ -162,6 +180,22 @@ func scopedVectorPush(
 // phase cannot promote if the generation was recreated meanwhile. Current
 // servers report a nonzero id on every clean unskipped phase, so scoping
 // resumes with the first response that carries one.
+// nextVectorRepair returns the sessions whose --full vector repair is still
+// owed after a vector phase that ran: every deferred session when the phase
+// was the generation-wide repair, else the owed sessions it deferred again.
+// A persistently failing session therefore keeps only its own repair open.
+func nextVectorRepair(
+	generationWide bool, owed map[string]struct{}, deferred []string,
+) map[string]struct{} {
+	next := make(map[string]struct{})
+	for _, id := range deferred {
+		if _, ok := owed[id]; generationWide || ok {
+			next[id] = struct{}{}
+		}
+	}
+	return next
+}
+
 func nextVectorReconcile(
 	current bool, lastGeneration int64,
 	scoped bool, res storage.PushResult,
@@ -205,13 +239,6 @@ func logReplicaWatchPushResult(
 	)
 }
 
-func (p *replicaPusher) reset() {
-	if p.target != nil {
-		_ = p.target.Close()
-		p.target = nil
-	}
-}
-
 // resolveWatchTarget validates the replica config and resolves the project
 // filters for a watch run.
 func resolveWatchTarget(
@@ -239,6 +266,9 @@ func resolveWatchTarget(
 	if err := backend.ValidateTarget(target.Target); err != nil {
 		return storage.ConfiguredReplica{}, nil, nil, err
 	}
+	if err := validateReplicaPushVectors(appCfg, cfg, target.Target.PushVectors); err != nil {
+		return storage.ConfiguredReplica{}, nil, nil, err
+	}
 	projects, exclude, err = resolvePushProjects(target, cfg)
 	if err != nil {
 		return storage.ConfiguredReplica{}, nil, nil, err
@@ -260,7 +290,7 @@ func runReplicaPushWatch(
 	targetName string,
 ) error {
 	name := backend.Name()
-	appCfg, err := config.LoadMinimal()
+	appCfg, err := config.LoadMinimalFor(replicaConfigScope(backend, &cfg))
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
@@ -269,71 +299,88 @@ func runReplicaPushWatch(
 	}
 	setupLogFileNamed(appCfg.DataDir, name+"-watch.log")
 
-	target, projects, exclude, err := resolveWatchTarget(
-		backend, appCfg, cfg, targetName,
-	)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	run, cleanup, err := prepareReplicaPushWatch(ctx, backend, appCfg, cfg, targetName, false)
 	if err != nil {
 		return err
 	}
+	defer cleanup()
+	return run()
+}
 
-	debounce := cfg.Debounce
-	if debounce <= 0 {
-		debounce = defaultWatchDebounce
+// prepareReplicaPushWatch acquires ownership without starting ingestion. The
+// caller must join run before cleanup closes the archive and releases ownership.
+func prepareReplicaPushWatch(
+	ctx context.Context, backend storage.Replica, appCfg config.Config,
+	cfg ReplicaPushConfig, targetName string, requireLocal bool,
+) (run func() error, cleanup func(), err error) {
+	name := backend.Name()
+	target, projects, exclude, err := resolveWatchTarget(backend, appCfg, cfg, targetName)
+	if err != nil {
+		return nil, nil, err
 	}
-	interval := cfg.Interval
-	if interval <= 0 {
-		interval = defaultWatchInterval
-	}
+	debounce, interval := watchTimings(cfg.Debounce, cfg.Interval)
 
 	// Single-instance guard: only one watcher per data dir.
-	lockPath, err := (daemon.RuntimeStore{
-		Dir:    appCfg.DataDir,
-		Prefix: name + "-watch",
-	}).LockPath()
-	if err != nil {
-		return err
-	}
+	lockPath := filepath.Join(appCfg.DataDir, name+"-watch.lock")
 	lock := flock.New(lockPath)
 	locked, err := lock.TryLock()
 	if err != nil {
-		return fmt.Errorf("locking %s: %w", lockPath, err)
+		return nil, nil, fmt.Errorf("locking %s: %w", lockPath, err)
 	}
 	if !locked {
-		return fmt.Errorf("already locked (%s)", lockPath)
+		return nil, nil, fmt.Errorf("already locked (%s)", lockPath)
 	}
-	defer func() {
+	unlock := func() {
 		if rerr := lock.Unlock(); rerr != nil {
 			log.Printf("%s watch: releasing lock: %v", name, rerr)
 		}
-	}()
-
-	ctx, stop := signal.NotifyContext(
-		context.Background(), os.Interrupt, syscall.SIGTERM,
-	)
-	defer stop()
+	}
 	wake, stopLifecycle, err := installReplicaWatchLifecycle(
 		appCfg.DataDir, name, target.Name,
 	)
 	if err != nil {
-		return fmt.Errorf("starting lifecycle notifications: %w", err)
+		unlock()
+		return nil, nil, fmt.Errorf("starting lifecycle notifications: %w", err)
 	}
-	defer stopLifecycle()
+
 	cfg.LifecycleWake = wake
+	cfg.Health = newReplicaWatchHealth(appCfg.DataDir, name, target, interval, time.Now)
 
 	log.Printf(
 		"%s watch: starting (machine=%q debounce=%s interval=%s)",
 		name, target.Target.MachineName, debounce, interval,
 	)
 
-	writer, cleanup, err := resolveArchiveWriteBackend(ctx, appCfg)
+	// --embed builds in this process, so it never auto-starts a daemon; a
+	// live daemon still wins the writer and rejects the request.
+	appCfg.NoDaemonAutostart = cfg.Embed || requireLocal
+	appCfg.RequireDaemon = cfg.NoStartDaemon
+	// A watcher that exits with an error records it as a failed push, so a
+	// service manager restarting it builds a failure streak instead of
+	// refreshing the watcher's start time on every attempt.
+	writer, closeWriter, err := resolveArchiveWriteBackend(ctx, appCfg, transportIntentLongLived)
 	if err != nil {
-		return fmt.Errorf("opening writer: %w", err)
+		err = fmt.Errorf("opening writer: %w", err)
+		cfg.Health.finish(err)
+		stopLifecycle()
+		unlock()
+		return nil, nil, err
 	}
-	defer cleanup()
-	if err := writer.ReplicaPushWatch(
-		ctx, backend, target, cfg, projects, exclude, debounce, interval,
-	); err != nil {
+	if _, local := writer.(*localArchiveWriteBackend); requireLocal && !local {
+		err := errors.New("push-watch requires the local archive writer")
+		cfg.Health.finish(err)
+		closeWriter()
+		stopLifecycle()
+		unlock()
+		return nil, nil, err
+	}
+	return func() error {
+		err := writer.ReplicaPushWatch(ctx, backend, target, cfg, projects, exclude, debounce, interval)
+		if err != nil && ctx.Err() == nil {
+			cfg.Health.finish(err)
+		}
 		return err
-	}
-	return nil
+	}, func() { closeWriter(); stopLifecycle(); unlock() }, nil
 }

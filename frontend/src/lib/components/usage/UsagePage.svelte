@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { modelPickerItems } from "../../utils/model-groups.js";
   import { Card } from "@kenn-io/kit-ui";
   import { onDestroy, onMount, tick, untrack } from "svelte";
   import {
@@ -14,6 +15,10 @@
     parseFiltersFromParams,
     splitExcludeProjectParam,
   } from "../../stores/sessions.svelte.js";
+  import {
+    SESSION_LABEL_PARAM,
+    SESSION_PR_PARAM,
+  } from "../../stores/sessionRouteParams.js";
   import { events } from "../../stores/events.svelte.js";
   import { router } from "../../stores/router.svelte.js";
   import { sync } from "../../stores/sync.svelte.js";
@@ -52,14 +57,14 @@
     type PanelDateState,
   } from "../../stores/yokedDates.svelte.js";
   import { m } from "../../i18n/index.js";
-  import { usageChartColorMaps } from "../../utils/usageChartColors.js";
+  import { usageChartStyleMaps } from "../../utils/usageChartStyles.js";
 
   let mounted = false;
   let unsubEvents: (() => void) | undefined;
 
-  const chartColorMaps = $derived(
-    usageChartColorMaps(
-      usage.timeSeriesSummary,
+  const chartStyleMaps = $derived(
+    usageChartStyleMaps(
+      usage.colorSummary,
       settings.chartPalette,
     ),
   );
@@ -68,10 +73,10 @@
   // available after filtering removes it or the page is remounted.
 
   $effect(() => {
-    const fromSummary = usage.summary?.projectTotals ?? [];
+    const fromSummary = (usage.attributionSummary ?? usage.summary)?.projectTotals ?? [];
     const counts = usage.isTimeRangeSummaryProvisional
       ? {}
-      : usage.summary?.sessionCounts.byProject ?? {};
+      : (usage.attributionSummary ?? usage.summary)?.sessionCounts.byProject ?? {};
     untrack(() => usage.mergeKnownProjects(fromSummary, counts));
   });
 
@@ -118,8 +123,7 @@
     }
   }
 
-  // Track every model we've seen in any summary response or
-  // model filter — never remove one. This keeps the model
+  // Track models from summary rows and applied filters. This keeps the model
   // dropdown usable when landing on a shared filtered URL.
   let knownModels: string[] = $state([]);
 
@@ -140,22 +144,18 @@
 
   // Seed from the filtered summary response.
   $effect(() => {
-    const fromSummary = (usage.summary?.modelTotals ?? [])
-      .map((m) => m.model);
+    const fromSummary = ((usage.attributionSummary ?? usage.summary)?.modelTotals ?? [])
+      .map((model) => model.model);
     untrack(() => mergeIntoKnownModels(fromSummary));
   });
 
-  // Seed from URL/local model filters before a response arrives.
   $effect(() => {
-    const filtered = usage.excludedModels;
-    untrack(() => {
-      if (!filtered) return;
-      mergeIntoKnownModels(filtered.split(","));
-    });
+    const filtered = usage.excludedModels.split(",").filter(Boolean);
+    untrack(() => mergeIntoKnownModels(filtered));
   });
 
   const modelItems = $derived(
-    knownModels.map((m) => ({ name: m })),
+    modelPickerItems(knownModels, usage.excludedModels, usage.modelAliases),
   );
   const unsupportedUsageMessage = $derived.by(() => {
     const kind = usage.isTimeRangeSummaryProvisional
@@ -336,17 +336,24 @@
         return;
       }
       if (hasSessionFilterKeys) {
-        const nextSessionParams = filtersToParams(
-          parseFiltersFromParams(supportedSessionParams),
-        );
         const currentSessionParams = filtersToParams(
           sessions.filters,
+        );
+        // Usage URLs carry only shared filters; keep the session list's
+        // own label and pull request filters across the hydration.
+        const hydratedParams = { ...supportedSessionParams };
+        for (const key of [SESSION_LABEL_PARAM, SESSION_PR_PARAM]) {
+          const value = currentSessionParams[key];
+          if (value) hydratedParams[key] = value;
+        }
+        const nextSessionParams = filtersToParams(
+          parseFiltersFromParams(hydratedParams),
         );
         if (
           JSON.stringify(nextSessionParams) !==
           JSON.stringify(currentSessionParams)
         ) {
-          sessions.initFromParams(supportedSessionParams);
+          sessions.initFromParams(hydratedParams);
           sessionChanged = true;
         }
       }
@@ -418,7 +425,7 @@
 
   $effect(() => {
     const signature = sessionFilterSignature;
-    const ready = urlInitRan && urlWritebackReady;
+    const ready = urlInitRan && urlWritebackReady && !sessions.machineFilterPending;
     untrack(() => {
       if (!ready || !signature || router.route !== "usage" || !mounted) {
         return;
@@ -426,7 +433,7 @@
       if (!initialFetchDone) {
         initialFetchDone = true;
       }
-      usage.fetchAll();
+      usage.fetchAll({ preserveTimeRange: true });
     });
   });
 
@@ -469,6 +476,7 @@
         <SessionFilterControl
           showDisplay={false}
           showStarred={false}
+          showLabelFilters={false}
           align="left"
           extraActive={usage.hasActiveFilters || !!sessions.filters.project}
           onClearExtra={() => {
@@ -487,6 +495,7 @@
 
       <FilterDropdown
         label={m.analytics_col_project()}
+        selectedLabel={usage.selectedProjectKey ? usage.focusLabel : ""}
         items={projectItems}
         excludedCsv={usage.excludedProjectKeys}
         unlistedExcludedCount={legacyExcludedProjectCount}
@@ -508,8 +517,10 @@
 
       <FilterDropdown
         label={m.usage_model()}
+        selectedLabel={usage.selectedModel}
         items={modelItems}
-        excludedCsv={usage.excludedModels}
+        excludedCsv={usage.displayedModels}
+        unlistedExcludedCount={usage.partlyExcludedModelCount}
         onToggle={(name) => usage.toggleModel(name)}
         onSelectAll={() => usage.selectAllModels()}
         onDeselectAll={() =>
@@ -530,10 +541,12 @@
     </div>
   </div>
 
+  <!-- Clear all also resets session filters, whose change effect does the one refresh. -->
   <SessionActiveFilters
-    onClearProjects={() => usage.selectAllProjects()}
-    onClearAgents={() => usage.selectAllAgents()}
-    onClearModels={() => usage.selectAllModels()}
+    onClearProjects={() => {
+      usage.clearTimeRange(false);
+      usage.clearFilters(false);
+    }}
   />
 
   <div
@@ -557,13 +570,13 @@
 
     <Card level="default" padding="none" class="chart-panel wide">
       <CostTimeSeriesChart
-        colorMap={chartColorMaps[usage.toggles.timeSeries.groupBy]}
+        styleMap={chartStyleMaps[usage.toggles.timeSeries.groupBy]}
       />
     </Card>
 
     <Card level="default" padding="none" class="chart-panel wide">
       <AttributionPanel
-        colorMap={chartColorMaps[usage.toggles.attribution.groupBy]}
+        styleMap={chartStyleMaps[usage.toggles.attribution.groupBy]}
       />
     </Card>
 
@@ -632,6 +645,8 @@
   .usage-content :global(.usage-note) {
     padding: 12px 14px;
     border-left: 4px solid var(--accent-blue);
+    border-start-start-radius: 0;
+    border-end-start-radius: 0;
     color: var(--text-secondary);
   }
 

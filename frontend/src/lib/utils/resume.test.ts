@@ -53,12 +53,13 @@ describe("buildResumeCommand", () => {
   });
 
   it("preserves remote Claude flags", () => {
-    expect(buildResumeCommand("claude", "devbox1~claude:abc-123", {
-      skipPermissions: true, forkSession: true, print: true,
-    })).toBe("claude --resume abc-123 --dangerously-skip-permissions --fork-session --print");
-  });
-  it("generates claude resume command", () => {
-    expect(buildResumeCommand("claude", "abc-123-def")).toBe("claude --resume abc-123-def");
+    expect(
+      buildResumeCommand("claude", "devbox1~claude:abc-123", {
+        skipPermissions: true,
+        forkSession: true,
+        print: true,
+      }),
+    ).toBe("claude --resume abc-123 --dangerously-skip-permissions --fork-session --print");
   });
 
   it("generates codex resume command", () => {
@@ -73,12 +74,30 @@ describe("buildResumeCommand", () => {
   });
 
   it("generates augure-code resume command with the vendor CLI name", () => {
-    expect(buildResumeCommand("augure-code", "augure-code:sess-1")).toBe(
-      "augure resume sess-1",
-    );
+    expect(buildResumeCommand("augure-code", "augure-code:sess-1")).toBe("augure resume sess-1");
     expect(buildResumeCommand("augure-code", "augure-code:run-1", { model: "ossington-5" })).toBe(
       "augure resume run-1 -m ossington-5",
     );
+  });
+
+  it("leaves possible collision IDs to the server for every agent", () => {
+    expect(buildResumeCommand("gemini", "gemini:abc_alt-0a1b2c3d4e5f6a7b")).toBeNull();
+    expect(buildResumeCommand("gemini", "host~gemini:abc_alt-0a1b2c3d4e5f6a7b")).toBeNull();
+    expect(buildResumeCommand("gemini", "gemini:abc_alt-notahash")).toBeNull();
+    expect(buildResumeCommand("amp", "amp:abc_alt-0a1b2c3d4e5f6a7b")).toBeNull();
+  });
+
+  it("resumes the thread of a Codex revert page", () => {
+    const thread = "11111111-1111-4111-8111-111111111111";
+    const page = `${thread}_22222222-2222-4222-8222-222222222222`;
+    expect(buildResumeCommand("codex", `codex:${page}`)).toBe(`codex resume ${thread}`);
+    expect(buildResumeCommand("traex", `traex:${page}`)).toBe(`traex resume ${thread}`);
+    expect(buildResumeCommand("augure-code", `augure-code:${page}`)).toBe(
+      `augure resume ${thread}`,
+    );
+    expect(buildResumeCommand("codex", `codex:${thread}`)).toBe(`codex resume ${thread}`);
+    expect(buildResumeCommand("augure-code", "augure-code:run_1")).toBe("augure resume run_1");
+    expect(buildResumeCommand("claude", page)).toBe(`claude --resume ${page}`);
   });
 
   it("pins Claude and Codex models with shell quoting", () => {
@@ -120,17 +139,13 @@ describe("buildResumeCommand", () => {
   });
 
   it("generates kiro resume command", () => {
-    expect(
-      buildResumeCommand("kiro", "kiro:session-1"),
-    ).toBe("kiro-cli chat --resume-id session-1");
+    expect(buildResumeCommand("kiro", "kiro:session-1")).toBe(
+      "kiro-cli chat --resume-id session-1",
+    );
   });
 
   it("returns null for pi (server-only resume)", () => {
     expect(buildResumeCommand("pi", "pi:session-1")).toBeNull();
-  });
-
-  it("strips agent prefix from compound IDs", () => {
-    expect(buildResumeCommand("codex", "codex:my-session-id")).toBe("codex resume my-session-id");
   });
 
   it("handles plain IDs without prefix", () => {
@@ -221,10 +236,22 @@ describe("buildResumeCommand", () => {
 
 describe("formatResumeResponseCommand", () => {
   it.each([
-    ["claude", "cd '/remote/project' && claude --resume abc-123", "cd '/remote/project' && claude --resume abc-123"],
-    ["kiro", "cd '/remote/project' && kiro-cli chat --resume-id abc-123", "cd '/remote/project' && kiro-cli chat --resume-id abc-123"],
+    [
+      "claude",
+      "cd '/remote/project' && claude --resume abc-123",
+      "cd '/remote/project' && claude --resume abc-123",
+    ],
+    [
+      "kiro",
+      "cd '/remote/project' && kiro-cli chat --resume-id abc-123",
+      "cd '/remote/project' && kiro-cli chat --resume-id abc-123",
+    ],
     ["pi", "cd '/project' && pi --session session-1", "cd '/project' && pi --session session-1"],
-    ["cursor", "cursor agent --resume abc-123", "cd '/remote/project' && cursor agent --resume abc-123"],
+    [
+      "cursor",
+      "cursor agent --resume abc-123",
+      "cd '/remote/project' && cursor agent --resume abc-123",
+    ],
     ["codex", "codex resume abc-123", "codex resume abc-123"],
   ])("remote cwd formatting for %s", (agent, command, expected) => {
     expect(formatResumeResponseCommand(agent, { command, cwd: "/remote/project" })).toBe(expected);

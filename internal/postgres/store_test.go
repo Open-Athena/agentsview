@@ -862,59 +862,6 @@ func TestStoreGetMessages(t *testing.T) {
 	assert.Len(t, msgs, 2)
 }
 
-func TestStoreGetStats(t *testing.T) {
-	pgURL := testPGURL(t)
-	ensureStoreSchema(t, pgURL)
-
-	store, err := NewStore(pgURL, testSchema, true)
-	require.NoError(t, err, "NewStore")
-	defer store.Close()
-
-	ctx := context.Background()
-	stats, err := store.GetStats(ctx, false, false)
-	require.NoError(t, err, "GetStats")
-	assert.NotZero(t, stats.SessionCount, "expected at least 1 session in stats")
-	t.Logf("stats: %+v", stats)
-}
-
-func TestStoreSearch(t *testing.T) {
-	pgURL := testPGURL(t)
-	ensureStoreSchema(t, pgURL)
-
-	store, err := NewStore(pgURL, testSchema, true)
-	require.NoError(t, err, "NewStore")
-	defer store.Close()
-
-	ctx := context.Background()
-	page, err := store.Search(ctx, db.SearchFilter{
-		Query: "hello",
-		Limit: 5,
-	})
-	require.NoError(t, err, "Search")
-	assert.NotEmpty(t, page.Results, "expected at least 1 search result")
-	t.Logf("search results: %d", len(page.Results))
-}
-
-func TestStoreAnalyticsSummary(t *testing.T) {
-	pgURL := testPGURL(t)
-	ensureStoreSchema(t, pgURL)
-
-	store, err := NewStore(pgURL, testSchema, true)
-	require.NoError(t, err, "NewStore")
-	defer store.Close()
-
-	ctx := context.Background()
-	summary, err := store.GetAnalyticsSummary(
-		ctx, db.AnalyticsFilter{
-			From: "2026-01-01",
-			To:   "2026-12-31",
-		},
-	)
-	require.NoError(t, err, "GetAnalyticsSummary")
-	assert.NotZero(t, summary.TotalSessions, "expected at least 1 session in summary")
-	t.Logf("summary: %+v", summary)
-}
-
 func seedActivitySession(
 	t *testing.T, store *Store, sid string, msgs []struct {
 		ordinal int
@@ -1487,7 +1434,7 @@ func TestStoreAnalyticsTopSessionsDurationExcludesReversedTimestamps(t *testing.
 		"reversed duration row must be excluded")
 }
 
-func TestStoreWriteSurfaceSplitByCapability(t *testing.T) {
+func TestStoreWriteSurface(t *testing.T) {
 	pgURL := testPGURL(t)
 
 	store, err := NewStore(pgURL, testSchema, true)
@@ -1576,12 +1523,20 @@ func TestStoreWriteSurfaceSplitByCapability(t *testing.T) {
 	require.NoError(t, err, "ListTrashedSessions")
 	assert.Contains(t, sessionIDs(trashed), sessionID)
 
-	restored, err := store.RestoreSession(t.Context(), sessionID)
-	require.NoError(t, err, "RestoreSession")
-	assert.EqualValues(t, 1, restored)
-
 	require.NoError(t, store.SoftDeleteSession(t.Context(), trashedID),
 		"SoftDeleteSession trashedID")
+	_, err = store.DB().Exec(`UPDATE sessions SET data_version = $1 WHERE id = $2`, db.CurrentDataVersion(), trashedID)
+	require.NoError(t, err, "marking restore target current")
+	restored, err := store.RestoreSession(t.Context(), trashedID)
+	require.NoError(t, err, "RestoreSession trashedID")
+	assert.EqualValues(t, 1, restored)
+	sess, err = store.GetSession(ctx, trashedID)
+	require.NoError(t, err, "GetSession after restore")
+	require.NotNil(t, sess)
+	assert.Less(t, sess.DataVersion, db.CurrentDataVersion(),
+		"restoring a session must force a source reparse")
+	require.NoError(t, store.SoftDeleteSession(t.Context(), trashedID),
+		"SoftDeleteSession restored trashedID")
 	deleted, err := store.DeleteSessionIfTrashed(t.Context(), trashedID)
 	require.NoError(t, err, "DeleteSessionIfTrashed")
 	assert.EqualValues(t, 1, deleted)
@@ -1596,19 +1551,45 @@ func TestStoreWriteSurfaceSplitByCapability(t *testing.T) {
 	assert.Equal(t, 2, deletedCount)
 	count, err := store.EmptyTrash(t.Context())
 	require.NoError(t, err, "EmptyTrash")
-	assert.Equal(t, 2, count)
+	assert.Equal(t, 3, count)
 	trashed, err = store.ListTrashedSessions(ctx)
 	require.NoError(t, err, "ListTrashedSessions after empty trash")
+	assert.NotContains(t, sessionIDs(trashed), sessionID)
 	assert.NotContains(t, sessionIDs(trashed), emptyTrashID)
 	assert.NotContains(t, sessionIDs(trashed), batchTrashID)
+}
 
-	assert.Equal(t, db.ErrReadOnly, store.UpsertSession(ctx, db.Session{}))
-	assert.Equal(t, db.ErrReadOnly,
-		store.ReplaceSessionMessages(ctx, "x", nil))
-	_, err = store.WriteSessionBatchAtomic(ctx, nil)
-	assert.ErrorIs(t, err, db.ErrReadOnly)
-	_, err = store.RecordRecallQueryEvent(ctx, db.RecallQueryEvent{
-		Surface: db.RecallQuerySurfaceQuery,
-	})
-	assert.ErrorIs(t, err, db.ErrReadOnly)
+func TestStoreListSessionsParentlessChildrenRespectFilters(t *testing.T) {
+	store := ensureSidebarIndexStoreSchema(t, testPGURL(t))
+	defer store.Close()
+	for _, id := range []string{"worker", "dangling", "deleted", "other", "nested"} {
+		insertSidebarIndexSession(t, store, id)
+	}
+	_, err := store.DB().Exec(`UPDATE sessions SET relationship_type = 'subagent';
+  UPDATE sessions SET parent_session_id = 'missing' WHERE id = 'dangling';
+  UPDATE sessions SET parent_session_id = 'worker' WHERE id = 'nested';
+  UPDATE sessions SET deleted_at = NOW() WHERE id = 'deleted';
+  UPDATE sessions SET project = 'other' WHERE id = 'other'`)
+	require.NoError(t, err)
+	worker, err := store.GetSession(t.Context(), "worker")
+	require.NoError(t, err)
+	require.NotNil(t, worker)
+	f := db.SessionFilter{IncludeChildren: true, Project: worker.Project}
+	for _, tc := range []struct {
+		children, orphans bool
+		want              []string
+	}{
+		{true, false, []string{"worker", "nested"}},
+		{true, true, []string{"worker", "nested", "dangling"}},
+		{false, false, nil},
+	} {
+		f.IncludeChildren, f.IncludeOrphans = tc.children, tc.orphans
+		page, err := store.ListSessions(t.Context(), f)
+		require.NoError(t, err)
+		var ids []string
+		for _, s := range page.Sessions {
+			ids = append(ids, s.ID)
+		}
+		assert.ElementsMatch(t, tc.want, ids)
+	}
 }

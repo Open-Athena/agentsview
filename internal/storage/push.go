@@ -14,10 +14,17 @@ type PushOptions struct {
 	// Full bypasses unchanged-fingerprint and unchanged-hash skips so
 	// every session is resent.
 	Full bool
+	// FullVectors bypasses unchanged-hash skips in the vector phase while
+	// sessions stay incremental.
+	FullVectors bool
+	// FullVectorSessions bypasses unchanged-hash skips for these sessions
+	// only, so a --full repair that a session deferred finishes once the
+	// session can be pushed.
+	FullVectorSessions []string
 	// ScopeVectorsToChangedSessions limits the vector phase's local
 	// hash read and replica state read to this push's changed relational
 	// sessions, instead of reconciling the whole generation. Ignored
-	// when the push runs (or is internally promoted to run) full, so
+	// when FullVectors is set or the push runs (or is promoted to run) full, so
 	// reset recovery and backfills keep generation-wide reconciliation.
 	ScopeVectorsToChangedSessions bool
 	// LastReconciledVectorGeneration is the replica generation id the
@@ -36,6 +43,9 @@ type PushProgress struct {
 	// a full push this covers every local session and can run for minutes),
 	// "" during the session/message push, and "vectors" during the vector
 	// phase, whose progress is carried by the Vector* fields.
+	// PushPhaseWaiting means a daemon push is waiting for another push to
+	// finish, PushPhaseRebuilt that its sync rebuilt the archive, and
+	// PushPhaseWaitingForSync that it is waiting for a local sync to finish.
 	Phase            string
 	SessionsDone     int
 	SessionsTotal    int
@@ -61,13 +71,17 @@ type PushResult struct {
 	// SkippedUnchanged counts in-scope sessions whose fingerprint already
 	// matched the replica. Backends that skip silently leave it zero.
 	SkippedUnchanged int
+	// SkippedResumed counts sessions a resumed full push left alone because
+	// the unfinished run it continues already pushed them as they are now.
+	SkippedResumed int
 	// DeletedStale counts replica sessions removed because they no longer
 	// exist locally or left the push scope.
 	DeletedStale int
 	Errors       int
 	Duration     time.Duration
 	// Full reports whether the push rewrote every in-scope session, and
-	// FullReason says why when the caller did not ask for it.
+	// FullReason says why when the caller did not ask for it. A requested
+	// full push that discarded an unfinished one says so in FullReason.
 	Full       bool
 	FullReason string
 	// Vectors summarizes the vector phase. A backend without one reports
@@ -113,11 +127,13 @@ type VectorPushResult struct {
 	// generation changed. The delta state is untouched, so the next
 	// generation-wide reconciliation sends them.
 	SessionsDeferred int
-	DocsPushed       int
-	ChunksPushed     int
-	DocsDeleted      int
-	SessionsEvicted  int
-	Conflicts        int
+	// DeferredSessionIDs names the sessions counted in SessionsDeferred.
+	DeferredSessionIDs []string
+	DocsPushed         int
+	ChunksPushed       int
+	DocsDeleted        int
+	SessionsEvicted    int
+	Conflicts          int
 	// GenerationID is the replica id of the generation this phase
 	// reconciled, zero when the phase was skipped or found no active
 	// generation. The watch orchestrator records it after a clean
@@ -135,3 +151,32 @@ func ValidateProjectFilters(projects, excludeProjects []string) error {
 	}
 	return nil
 }
+
+// DeferSession records that sessionID's vector reconciliation was deferred.
+func (r *VectorPushResult) DeferSession(sessionID string) {
+	r.SessionsDeferred++
+	r.DeferredSessionIDs = append(r.DeferredSessionIDs, sessionID)
+}
+
+// PushPhaseWaiting is the progress phase a daemon push reports while it
+// waits for another push to finish. The daemon runs one push at a time.
+const PushPhaseWaiting = "waiting"
+
+// PushNotStartedError marks a push error from before the push recorded a
+// full push it could resume. A watch keeps its --full request after one; any
+// other failed push resumes its recorded full push instead.
+type PushNotStartedError struct{ Err error }
+
+func (e PushNotStartedError) Error() string { return e.Err.Error() }
+func (e PushNotStartedError) Unwrap() error { return e.Err }
+
+// PushPhaseRebuilt is the progress phase a daemon push reports as soon as its
+// sync has rebuilt the archive. Every mirror pushes in full after a rebuild,
+// so a client whose stream ends after this report need not ask for --full
+// again. A client whose stream ends without it keeps its --full request.
+const PushPhaseRebuilt = "rebuilt"
+
+// PushPhaseWaitingForSync is the progress phase a daemon push reports when it
+// has waited a few seconds for a local sync to hand the archive writer back.
+// The push resumes once the sync finishes.
+const PushPhaseWaitingForSync = "waiting_for_sync"

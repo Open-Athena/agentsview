@@ -62,6 +62,25 @@ func (p *antigravityCLIProvider) SourcesForChangedPath(
 	return p.sources.SourcesForChangedPath(ctx, req)
 }
 
+func (p *antigravityCLIProvider) ChangedPathRelevance(
+	ctx context.Context,
+	req ChangedPathRequest,
+) (ChangedPathRelevance, error) {
+	if err := ctx.Err(); err != nil {
+		return ChangedPathUnclassified, err
+	}
+	for _, root := range p.sources.roots {
+		if req.WatchRoot != "" && !antigravityCLIWatchRootMatches(root, req.WatchRoot) {
+			continue
+		}
+		rel, ok := relUnder(root, filepath.Clean(req.Path))
+		if ok && antigravityConversationIndexPath(rel) {
+			return ChangedPathNonData, nil
+		}
+	}
+	return ChangedPathUnclassified, nil
+}
+
 func (p *antigravityCLIProvider) FindSource(
 	ctx context.Context,
 	req FindSourceRequest,
@@ -344,16 +363,26 @@ func (s antigravityCLISourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 	roots := make([]WatchRoot, 0, len(s.roots)*5)
 	for _, root := range s.roots {
 		roots = append(roots,
+			// brain/<id>/*.md and the plaintext transcript at
+			// brain/<id>/.system_generated/logs/transcript.jsonl are parsed.
 			WatchRoot{
-				Path:         filepath.Join(root, "brain"),
-				Recursive:    true,
-				IncludeGlobs: []string{"*.md", "*.md.metadata.json"},
-				DebounceKey:  string(AgentAntigravityCLI) + ":brain:" + root,
+				Path:      filepath.Join(root, "brain"),
+				Recursive: true,
+				MaxDepth:  1,
+				ExtraDirectories: []string{
+					"*/" + antigravityBrainGeneratedDir + "/" + antigravityBrainLogsDir,
+				},
+				IncludeGlobs: []string{
+					"*.md",
+					"*.md.metadata.json",
+					antigravityBrainTranscriptName,
+				},
+				DebounceKey: string(AgentAntigravityCLI) + ":brain:" + root,
 			},
 			WatchRoot{
 				Path:         filepath.Join(root, "conversations"),
 				Recursive:    false,
-				IncludeGlobs: []string{"*.db", "*.db-*", "*.pb", "*.trajectory.json"},
+				IncludeGlobs: []string{"*.db", "*.db-wal", "*.pb", "*.trajectory.json"},
 				DebounceKey:  string(AgentAntigravityCLI) + ":conversations:" + root,
 			},
 			WatchRoot{
@@ -513,7 +542,15 @@ func (s antigravityCLISourceSet) sourcesForChangedPath(
 			return []SourceRef{source}
 		}
 	}
-	if id, ok := antigravityBrainID(root, path); ok {
+	id, ok := antigravityBrainID(root, path)
+	if !ok {
+		if transcriptRoot, transcriptID, okTranscript := antigravityBrainTranscriptConversation(path); okTranscript &&
+			samePath(transcriptRoot, root) {
+			id = transcriptID
+			ok = true
+		}
+	}
+	if ok {
 		var sources []SourceRef
 		for _, sourcePath := range []string{
 			antigravityCLIConversationSource(root, id),
@@ -678,14 +715,16 @@ func antigravityCLISourcePathForEvent(root, path string) (string, string, bool) 
 	}
 	name := parts[1]
 	switch {
+	// A bare ".db-shm" event never resolves to the session: every parse's
+	// read-only open rewrites that index, so honoring it would make each
+	// parse schedule the next one. Committed writes land in the main file
+	// or the -wal.
 	case strings.HasSuffix(name, ".db") ||
-		strings.HasSuffix(name, ".db-wal") ||
-		strings.HasSuffix(name, ".db-shm"):
+		strings.HasSuffix(name, ".db-wal"):
 		if parts[0] != "conversations" {
 			return "", "", false
 		}
-		base := strings.TrimSuffix(strings.TrimSuffix(name, "-wal"), "-shm")
-		id := strings.TrimSuffix(base, ".db")
+		id := strings.TrimSuffix(strings.TrimSuffix(name, "-wal"), ".db")
 		if !IsValidSessionID(id) {
 			return "", "", false
 		}
@@ -771,6 +810,7 @@ func antigravityCLIProviderCapabilities() Capabilities {
 	source := jsonlFileProviderSourceCapabilities()
 	source.StreamingDiscovery = CapabilitySupported
 	source.ForceReplaceOnParse = CapabilitySupported
+	source.ChangedPathRelevance = CapabilitySupported
 	return Capabilities{
 		Source: source,
 		Content: ContentCapabilities{

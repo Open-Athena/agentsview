@@ -127,6 +127,8 @@ func (db *DB) queryUsageRollups(
 		}
 		timings.read = time.Since(readStarted)
 		if queryErr == nil {
+			cache.recordUsageTimezoneRequest(
+				ctx, usageTimezoneIdentityFor(snapshot.location, snapshot.Intervals))
 			release()
 			timings.logIfSlow(started)
 			return snapshot, facts, resolver, nil
@@ -173,7 +175,7 @@ func (db *DB) GetTopSessionsByCost(
 		if err != nil {
 			return nil, fmt.Errorf("summing top-session cost: %w", err)
 		}
-		if filter.Model == "" && filter.ExcludeModel == "" &&
+		if !filter.HasModelFilter() &&
 			group.AuthoritativeCostMicrodollars != nil {
 			value := money.Money{Microdollars: *group.AuthoritativeCostMicrodollars}
 			current.authoritative = &value
@@ -202,8 +204,14 @@ func (db *DB) GetTopSessionsByCost(
 			entry.Agent = session.Agent
 			entry.Project = session.Project
 			entry.StartedAt = session.StartedAt
+			entry.Machine = session.Machine
+			entry.GroupKey = session.GroupKey
+			entry.SessionName = session.SessionName
 		}
 		result = append(result, entry)
+	}
+	if filter.TopSessionsByGroup {
+		return GroupTopSessions(result, limit, filter.TopSessionsSort, filter.TopSessionsTokenTypes)
 	}
 	return SortAndLimitTopSessions(
 		result, limit, filter.TopSessionsSort, filter.TopSessionsTokenTypes,

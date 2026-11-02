@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+import { reportErrorShown } from "../../utils/telemetry.js";
+vi.mock("../../utils/telemetry.js", () => ({ reportErrorShown: vi.fn() }));
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 import { analytics } from "../../stores/analytics.svelte.js";
@@ -521,9 +523,20 @@ describe("QualityPage evidence navigation", () => {
     router.params = {};
   });
 
+  it("reports the analytics kind when signal evidence fails", async () => {
+    vi.spyOn(AnalyticsService, "getApiV1AnalyticsSignalSessions").mockRejectedValueOnce(
+      new Error("Evidence failed"),
+    );
+    component = mount(QualityPage, { target: document.body });
+    await flushEffects();
+    document.querySelector<HTMLButtonElement>(".driver-row")!.click();
+    await vi.waitFor(() => expect(reportErrorShown).toHaveBeenCalledExactlyOnceWith("analytics"));
+  });
+
   it("navigates with the clicked example's session and message ordinal", async () => {
     vi.spyOn(AnalyticsService, "getApiV1AnalyticsSignalSessions").mockResolvedValue({
       signal: "short_prompt_count",
+      total: 2,
       sessions: [
         {
           session_id: "first-session",

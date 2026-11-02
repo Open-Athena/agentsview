@@ -2,17 +2,21 @@ package parser
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/parsertest/hermesfixture"
 )
 
 func TestHermesProviderTranscriptSourceMethods(t *testing.T) {
@@ -122,7 +126,7 @@ func TestHermesProviderStateDBSourceMethods(t *testing.T) {
 	discovered, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, discovered, 1)
-	assert.Equal(t, stateDB, discovered[0].DisplayPath)
+	assert.Equal(t, VirtualSourcePath(stateDB, "child"), discovered[0].DisplayPath)
 
 	found, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
 		FullSessionID: "remote~hermes:child",
@@ -159,7 +163,7 @@ func TestHermesProviderStateDBSourceMethods(t *testing.T) {
 			)
 			require.NoError(t, err)
 			require.Len(t, changed, 1)
-			assert.Equal(t, stateDB, changed[0].DisplayPath)
+			assert.Equal(t, VirtualSourcePath(stateDB, "child"), changed[0].DisplayPath)
 		})
 	}
 
@@ -169,7 +173,7 @@ func TestHermesProviderStateDBSourceMethods(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.Len(t, changed, 1)
-	assert.Equal(t, stateDB, changed[0].DisplayPath)
+	assert.Equal(t, VirtualSourcePath(stateDB, "child"), changed[0].DisplayPath)
 
 	require.NoError(t, os.Remove(transcriptPath))
 	changed, err = provider.SourcesForChangedPath(
@@ -178,7 +182,7 @@ func TestHermesProviderStateDBSourceMethods(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.Len(t, changed, 1)
-	assert.Equal(t, stateDB, changed[0].DisplayPath)
+	assert.Equal(t, VirtualSourcePath(stateDB, "child"), changed[0].DisplayPath)
 
 	require.NoError(t, os.Remove(stateDB))
 	changed, err = provider.SourcesForChangedPath(
@@ -360,7 +364,7 @@ func TestHermesStreamingFallbackErrorPrecedence(t *testing.T) {
 		err := discoverer.DiscoverEach(ctx, func(SourceRef) error { return nil })
 
 		require.ErrorIs(t, err, fallbackErr)
-		assert.Contains(t, err.Error(), "query hermes sessions",
+		assert.Contains(t, err.Error(), "check hermes state schema",
 			"joined error must retain the original state failure")
 	})
 }
@@ -613,6 +617,86 @@ func TestHermesStateMemberFingerprintIncludesSelectedTranscriptMetadata(t *testi
 	assert.Equal(t, transcriptInfo.ModTime().UnixNano(), fingerprint.MTimeNS)
 }
 
+// TestHermesFingerprintsIgnoreTheLocalFolder pins fingerprints to the files
+// under the Hermes root, not to where that root sits on disk. Legacy HTTP
+// remote imports unpack every archive into a fresh folder, so a folder-bound
+// fingerprint would resync identical sessions on every import. Renaming a
+// file or changing its bytes must still change the fingerprint.
+func TestHermesFingerprintsIgnoreTheLocalFolder(t *testing.T) {
+	seed := t.TempDir()
+	createHermesStateDB(t, seed)
+	stateBytes, err := os.ReadFile(filepath.Join(seed, "state.db"))
+	require.NoError(t, err)
+	mtime := time.Date(2026, 5, 14, 14, 0, 0, 0, time.UTC)
+	transcript := hermesProviderJSONFixture("transcript question")
+	writeRoot := func(transcriptName, content string) string {
+		t.Helper()
+		root := t.TempDir()
+		require.NoError(t, os.MkdirAll(filepath.Join(root, "sessions"), 0o755))
+		files := map[string]string{
+			filepath.Join(root, "state.db"):                 string(stateBytes),
+			filepath.Join(root, "sessions", transcriptName): content,
+		}
+		for path, content := range files {
+			writeSourceFile(t, path, content)
+			require.NoError(t, os.Chtimes(path, mtime, mtime))
+		}
+		return root
+	}
+	archiveHash := func(root string) string {
+		t.Helper()
+		provider, ok := NewProvider(AgentHermes, ProviderConfig{Roots: []string{root}})
+		require.True(t, ok)
+		source, found, err := provider.(ReconciliationSourceResolver).SourceForReconciliation(
+			t.Context(), filepath.Join(root, "state.db"), "",
+		)
+		require.NoError(t, err)
+		require.True(t, found)
+		fp, err := provider.Fingerprint(t.Context(), source)
+		require.NoError(t, err)
+		return fp.Hash
+	}
+	// memberHashes returns the child member's hash with its transcript
+	// present, then again after the transcript vanishes while a reconciliation
+	// cache still lists it, which hashes the unreadable-candidate marker.
+	memberHashes := func(root string) (string, string) {
+		t.Helper()
+		provider, ok := NewProvider(AgentHermes, ProviderConfig{Roots: []string{root}})
+		require.True(t, ok)
+		source, found, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: "child"})
+		require.NoError(t, err)
+		require.True(t, found)
+		ctx, cleanup, err := WithReconciliationCache(t.Context())
+		require.NoError(t, err)
+		defer func() { require.NoError(t, cleanup()) }()
+		present, err := provider.Fingerprint(ctx, source)
+		require.NoError(t, err)
+		require.NoError(t, os.Remove(filepath.Join(root, "sessions", "session_child.json")))
+		vanished, err := provider.Fingerprint(ctx, source)
+		require.NoError(t, err)
+		require.NotEqual(t, present.Hash, vanished.Hash)
+		return present.Hash, vanished.Hash
+	}
+
+	first := writeRoot("session_child.json", transcript)
+	second := writeRoot("session_child.json", transcript)
+	assert.Equal(t, archiveHash(first), archiveHash(second),
+		"the archive fingerprint must not depend on the local folder")
+	renamed := writeRoot("session_other.json", transcript)
+	assert.NotEqual(t, archiveHash(first), archiveHash(renamed),
+		"renaming a transcript must change the archive fingerprint")
+	edited := writeRoot("session_child.json", strings.Replace(transcript, "question", "answers!", 1))
+	assert.NotEqual(t, archiveHash(first), archiveHash(edited),
+		"same-size content edits with the same mtime must change the archive fingerprint")
+
+	firstPresent, firstVanished := memberHashes(first)
+	secondPresent, secondVanished := memberHashes(second)
+	assert.Equal(t, firstPresent, secondPresent,
+		"the member fingerprint must not depend on the local folder")
+	assert.Equal(t, firstVanished, secondVanished,
+		"the unreadable-candidate marker must not depend on the local folder")
+}
+
 // TestHermesArchiveFingerprintIgnoresEmptyWAL pins fingerprint determinism
 // across a parse: opening state.db read-only creates a zero-length -wal as a
 // side effect, and if its mtime entered the fingerprint, the identity stored
@@ -627,12 +711,11 @@ func TestHermesArchiveFingerprintIgnoresEmptyWAL(t *testing.T) {
 
 	provider, ok := NewProvider(AgentHermes, ProviderConfig{Roots: []string{root}})
 	require.True(t, ok)
-	discovered, err := provider.Discover(t.Context())
+	discovered, found, err := provider.(ReconciliationSourceResolver).SourceForReconciliation(t.Context(), stateDB, "")
 	require.NoError(t, err)
-	require.Len(t, discovered, 1)
-	require.Equal(t, stateDB, discovered[0].DisplayPath)
+	require.True(t, found)
 
-	before, err := provider.Fingerprint(t.Context(), discovered[0])
+	before, err := provider.Fingerprint(t.Context(), discovered)
 	require.NoError(t, err)
 
 	walPath := stateDB + "-wal"
@@ -640,7 +723,7 @@ func TestHermesArchiveFingerprintIgnoresEmptyWAL(t *testing.T) {
 	walTime := time.Now().Add(2 * time.Second).Truncate(time.Second)
 	require.NoError(t, os.Chtimes(walPath, walTime, walTime))
 
-	after, err := provider.Fingerprint(t.Context(), discovered[0])
+	after, err := provider.Fingerprint(t.Context(), discovered)
 	require.NoError(t, err)
 	assert.Equal(t, before.Size, after.Size,
 		"a zero-length WAL must not change the archive size")
@@ -649,13 +732,13 @@ func TestHermesArchiveFingerprintIgnoresEmptyWAL(t *testing.T) {
 	assert.Equal(t, before.Hash, after.Hash,
 		"a zero-length WAL must not change the archive hash")
 
-	require.NoError(t, os.WriteFile(walPath, []byte("wal frames"), 0o644))
+	require.NoError(t, os.WriteFile(walPath, []byte(walWithFramesFixture), 0o644))
 	committedTime := walTime.Add(2 * time.Second)
 	require.NoError(t, os.Chtimes(walPath, committedTime, committedTime))
 
-	committed, err := provider.Fingerprint(t.Context(), discovered[0])
+	committed, err := provider.Fingerprint(t.Context(), discovered)
 	require.NoError(t, err)
-	assert.Equal(t, before.Size+int64(len("wal frames")), committed.Size,
+	assert.Equal(t, before.Size+int64(len(walWithFramesFixture)), committed.Size,
 		"a WAL with frames must add its size to the archive fingerprint")
 	assert.Equal(t, committedTime.UnixNano(), committed.MTimeNS,
 		"a WAL with frames must advance the archive freshness")
@@ -697,6 +780,64 @@ func TestHermesStateMemberFingerprintIncludesStateMetadataWhenTranscriptWins(t *
 		"state metadata used by parsing must participate even when transcript messages win")
 }
 
+func TestHermesStateMemberFingerprintIncludesCronAncestry(t *testing.T) {
+	for _, seeded := range []bool{false, true} {
+		t.Run(fmt.Sprintf("seeded=%t", seeded), func(t *testing.T) {
+			root := t.TempDir()
+			createHermesStateDB(t, root)
+			conn, err := sql.Open("sqlite3", filepath.Join(root, "state.db"))
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, conn.Close()) })
+			_, err = conn.ExecContext(t.Context(), `
+				UPDATE sessions SET source = 'cron' WHERE id = 'child';
+				INSERT INTO sessions (id, source, parent_session_id, started_at)
+				VALUES ('parent', 'cron', 'middle', 1), ('ordinary', 'cli', 'parent', 1);
+				INSERT INTO messages (session_id, role, content, timestamp)
+				VALUES ('ordinary', 'user', 'hello', 1)`)
+			require.NoError(t, err)
+			provider, ok := NewProvider(AgentHermes, ProviderConfig{Roots: []string{root}})
+			require.True(t, ok)
+			child, found, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: "child"})
+			require.NoError(t, err)
+			require.True(t, found)
+			ordinary, found, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: "ordinary"})
+			require.NoError(t, err)
+			require.True(t, found)
+			fingerprint := func(source SourceRef) string {
+				t.Helper()
+				ctx := t.Context()
+				if seeded {
+					var cleanup func() error
+					ctx, cleanup, err = WithReconciliationCache(ctx)
+					require.NoError(t, err)
+					defer func() { require.NoError(t, cleanup()) }()
+				}
+				fp, err := provider.Fingerprint(ctx, source)
+				require.NoError(t, err)
+				require.NotEmpty(t, fp.Hash)
+				if seeded {
+					direct, err := provider.Fingerprint(t.Context(), source)
+					require.NoError(t, err)
+					assert.Equal(t, direct.Hash, fp.Hash)
+				}
+				return fp.Hash
+			}
+			before := fingerprint(child)
+			ordinaryBefore := fingerprint(ordinary)
+			_, err = conn.ExecContext(t.Context(), `INSERT INTO sessions (id, source, parent_session_id, started_at)
+				VALUES ('middle', 'cron', 'cron_job-a_20261009_120000', 1)`)
+			require.NoError(t, err)
+			restored := fingerprint(child)
+			assert.NotEqual(t, before, restored, "restoring an intermediate ancestor must invalidate the unchanged child")
+			assert.Equal(t, ordinaryBefore, fingerprint(ordinary))
+			_, err = conn.ExecContext(t.Context(), `UPDATE sessions SET parent_session_id = 'cron_job-b_20261009_120000' WHERE id = 'middle'`)
+			require.NoError(t, err)
+			assert.NotEqual(t, restored, fingerprint(child), "changing an ancestor's parent must invalidate the unchanged child")
+			assert.Equal(t, ordinaryBefore, fingerprint(ordinary))
+		})
+	}
+}
+
 func TestHermesProviderArchiveWatchRoots(t *testing.T) {
 	root := t.TempDir()
 	sessionsDir := filepath.Join(root, "sessions")
@@ -735,7 +876,7 @@ func TestHermesProviderArchiveWatchRoots(t *testing.T) {
 			)
 			require.NoError(t, err)
 			require.Len(t, changed, 1)
-			assert.Equal(t, stateDB, changed[0].DisplayPath)
+			assert.Equal(t, VirtualSourcePath(stateDB, "child"), changed[0].DisplayPath)
 		})
 	}
 }
@@ -768,7 +909,7 @@ func TestHermesProviderDiscoversProfileCreatedAfterInitialization(t *testing.T) 
 	after, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, after, 1)
-	assert.Equal(t, stateDB, after[0].DisplayPath)
+	assert.Equal(t, VirtualSourcePath(stateDB, "child"), after[0].DisplayPath)
 
 	changed, err := provider.SourcesForChangedPath(
 		t.Context(),
@@ -780,7 +921,7 @@ func TestHermesProviderDiscoversProfileCreatedAfterInitialization(t *testing.T) 
 	)
 	require.NoError(t, err)
 	require.Len(t, changed, 1)
-	assert.Equal(t, stateDB, changed[0].DisplayPath)
+	assert.Equal(t, VirtualSourcePath(stateDB, "child"), changed[0].DisplayPath)
 
 	require.NoError(t, os.Remove(stateDB))
 	removed, err := provider.SourcesForChangedPath(
@@ -839,7 +980,7 @@ func TestHermesProfileChangedPathAllocationsStayBounded(t *testing.T) {
 }
 
 func TestHermesMemberCoreSeedRetainedIDBytesStayBounded(t *testing.T) {
-	measure := func(t *testing.T, sessionCount int) int64 {
+	measure := func(t *testing.T, source string, sessionCount int) int64 {
 		t.Helper()
 
 		root := t.TempDir()
@@ -854,9 +995,20 @@ func TestHermesMemberCoreSeedRetainedIDBytesStayBounded(t *testing.T) {
 		require.NoError(t, err)
 		for i := range sessionCount {
 			id := fmt.Sprintf("member-%06d", i)
+			parent := ""
+			if i%3 == 0 && source == "cron" {
+				id = fmt.Sprintf("cron_job-%06d_20261009_120000", i)
+			} else if i%3 == 1 {
+				parent = fmt.Sprintf("member-%06d", i-1)
+				if source == "cron" {
+					parent = fmt.Sprintf("cron_job-%06d_20261009_120000", i-1)
+				}
+			} else if i%3 == 2 {
+				parent = fmt.Sprintf("member-%06d", i-1)
+			}
 			_, err = tx.ExecContext(t.Context(), `INSERT INTO sessions
-				(id, source, started_at, estimated_cost_usd, actual_cost_usd)
-				VALUES (?, 'cli', ?, 0, 0)`, id, i)
+				(id, source, parent_session_id, started_at, estimated_cost_usd, actual_cost_usd)
+				VALUES (?, ?, ?, ?, 0, 0)`, id, source, parent, i)
 			require.NoError(t, err)
 			_, err = tx.ExecContext(t.Context(), `INSERT INTO messages
 				(session_id, role, content, timestamp)
@@ -880,11 +1032,88 @@ func TestHermesMemberCoreSeedRetainedIDBytesStayBounded(t *testing.T) {
 		return peak
 	}
 
-	small := measure(t, 3)
-	large := measure(t, 300)
-	assert.Positive(t, small, "the retained-ID allocation boundary must be observed")
-	assert.LessOrEqual(t, large, small*2,
-		"peak retained ID bytes must not scale with Hermes archive cardinality")
+	for _, source := range []string{"cli", "cron"} {
+		t.Run(source, func(t *testing.T) {
+			small := measure(t, source, 3)
+			large := measure(t, source, 300)
+			assert.Positive(t, small, "the retained-ID allocation boundary must be observed")
+			assert.LessOrEqual(t, large, small*2,
+				"peak retained ID bytes must not scale with Hermes archive cardinality")
+		})
+	}
+}
+
+// The reconciliation seed resolves cron ancestry per member on a shared
+// connection. Its digests must match the bulk parse, which resolves every
+// member against one in-memory parent map, including deep chains, cycles,
+// pruned parents, and non-cron members whose parent is a cron run.
+func TestHermesMemberCoreSeedMatchesBulkCronAncestry(t *testing.T) {
+	root := t.TempDir()
+	createHermesStateDB(t, root)
+	stateDB := filepath.Join(root, "state.db")
+	conn, err := sql.Open("sqlite3", stateDB)
+	require.NoError(t, err)
+	defer conn.Close()
+	insert := func(id, source, parent string) {
+		t.Helper()
+		_, err := conn.ExecContext(t.Context(), `INSERT INTO sessions
+			(id, source, parent_session_id, started_at, title)
+			VALUES (?, ?, NULLIF(?, ''), 1, 'Daily digest · Oct 07')`, id, source, parent)
+		require.NoError(t, err)
+	}
+	_, err = conn.ExecContext(t.Context(), "DELETE FROM messages; DELETE FROM sessions")
+	require.NoError(t, err)
+	insert("cron_job-a_20261007_120000", "cron", "")
+	parent := "cron_job-a_20261007_120000"
+	for i := range 300 {
+		id := fmt.Sprintf("hop-%03d", i)
+		insert(id, "cron", parent)
+		parent = id
+	}
+	insert("pruned-run-child", "cron", "cron_job-gone_20261001_120000")
+	insert("missing", "cron", "pruned")
+	insert("cycle", "cron", "cycle")
+	insert("loop-a", "cron", "loop-b")
+	insert("loop-b", "cron", "loop-a")
+	insert("ordinary", "cli", "cron_job-a_20261007_120000")
+	_, err = conn.ExecContext(t.Context(), `INSERT INTO messages(session_id, role, content, timestamp)
+		SELECT id, 'user', 'run message', started_at FROM sessions`)
+	require.NoError(t, err)
+
+	sessions, err := readHermesStateSessions(t.Context(), conn)
+	require.NoError(t, err)
+	messages, err := readHermesStateMessages(t.Context(), conn)
+	require.NoError(t, err)
+	parents := make(map[string]string, len(sessions))
+	for _, ss := range sessions {
+		parents[ss.id] = ss.parentSessionID
+	}
+	bulkJobs := make(map[string]string, len(sessions))
+	bulkDigests := make(map[string][]byte, len(sessions))
+	for _, ss := range sessions {
+		require.NoError(t, resolveHermesStateCronJob(&ss, func(id string) (string, error) { return parents[id], nil }))
+		bulkJobs[ss.id] = ss.cronJob
+		h := sha256.New()
+		require.NoError(t, addHermesStateSessionFingerprint(h, ss, messages[ss.id]))
+		bulkDigests[ss.id] = h.Sum(nil)
+	}
+	for id, job := range map[string]string{
+		"hop-299": "job-a", "pruned-run-child": "job-gone",
+		"missing": "", "cycle": "", "loop-a": "", "ordinary": "",
+	} {
+		assert.Equal(t, job, bulkJobs[id], id)
+	}
+
+	ctx, cleanup, err := WithReconciliationCache(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, cleanup()) })
+	require.NoError(t, seedHermesMemberCoresLocked(ctx, stateDB))
+	require.Len(t, bulkDigests, 307)
+	for id, want := range bulkDigests {
+		h, _, ok := cachedHermesMemberCore(ctx, hermesSource{Path: VirtualSourcePath(stateDB, id)})
+		require.True(t, ok, id)
+		assert.Equal(t, want, h.Sum(nil), id)
+	}
 }
 
 func TestHermesProviderArchiveWatchRootsBeforeArchiveComplete(t *testing.T) {
@@ -916,7 +1145,7 @@ func TestHermesProviderArchiveWatchRootsBeforeArchiveComplete(t *testing.T) {
 		)
 		require.NoError(t, err)
 		require.Len(t, changed, 1)
-		assert.Equal(t, stateDB, changed[0].DisplayPath)
+		assert.Equal(t, VirtualSourcePath(stateDB, "child"), changed[0].DisplayPath)
 	})
 
 	t.Run("direct state db root before file exists", func(t *testing.T) {
@@ -947,7 +1176,7 @@ func TestHermesProviderArchiveWatchRootsBeforeArchiveComplete(t *testing.T) {
 		)
 		require.NoError(t, err)
 		require.Len(t, changed, 1)
-		assert.Equal(t, stateDB, changed[0].DisplayPath)
+		assert.Equal(t, VirtualSourcePath(stateDB, "child"), changed[0].DisplayPath)
 	})
 
 	t.Run("sessions directory root before state db exists", func(t *testing.T) {
@@ -979,7 +1208,7 @@ func TestHermesProviderArchiveWatchRootsBeforeArchiveComplete(t *testing.T) {
 		)
 		require.NoError(t, err)
 		require.Len(t, changed, 1)
-		assert.Equal(t, stateDB, changed[0].DisplayPath)
+		assert.Equal(t, VirtualSourcePath(stateDB, "child"), changed[0].DisplayPath)
 	})
 }
 
@@ -1038,9 +1267,12 @@ func TestHermesProviderParseStateDB(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
 
+	fingerprint, err := provider.Fingerprint(t.Context(), sources[0])
+	require.NoError(t, err)
+
 	outcome, err := provider.Parse(t.Context(), ParseRequest{
 		Source:      sources[0],
-		Fingerprint: SourceFingerprint{Key: stateDB, Hash: "archive-hash"},
+		Fingerprint: fingerprint,
 	})
 	require.NoError(t, err)
 	require.True(t, outcome.ResultSetComplete)
@@ -1057,15 +1289,11 @@ func TestHermesProviderParseStateDB(t *testing.T) {
 	require.Len(t, result.Result.UsageEvents, 1)
 	assert.Len(t, result.Result.Messages, 2)
 
-	// The provider reproduces the legacy engine's stampHermesArchiveResults:
-	// every archive session's stored file identity is the state.db path with
-	// the aggregate (state.db plus transcripts) size and mtime, so a
-	// transcript-only change still refreshes the archive's freshness.
 	stateInfo, err := os.Stat(stateDB)
 	require.NoError(t, err)
 	transcriptInfo, err := os.Stat(transcriptPath)
 	require.NoError(t, err)
-	assert.Equal(t, stateDB, result.Result.Session.File.Path)
+	assert.Equal(t, VirtualSourcePath(stateDB, "child"), result.Result.Session.File.Path)
 	assert.Equal(t,
 		stateInfo.Size()+transcriptInfo.Size(),
 		result.Result.Session.File.Size,
@@ -1113,7 +1341,7 @@ func TestHermesDefaultRootsDiscoverWindowsStateDB(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, sources, 1)
 		assert.Equal(t, windowsRoot, sources[0].ConfiguredRoot)
-		assert.Equal(t, stateDB, sources[0].DisplayPath)
+		assert.Equal(t, VirtualSourcePath(stateDB, "child"), sources[0].DisplayPath)
 
 		outcome, err := provider.Parse(t.Context(), ParseRequest{
 			Source:      sources[0],
@@ -1130,7 +1358,7 @@ func TestHermesDefaultRootsDiscoverWindowsStateDB(t *testing.T) {
 		assert.Equal(t, "hermes:parent", result.Result.Session.ParentSessionID)
 		assert.Equal(t, RelContinuation, result.Result.Session.RelationshipType)
 		assert.Equal(t, "hermes-state-db", result.Result.Session.SourceVersion)
-		assert.Equal(t, stateDB, result.Result.Session.File.Path)
+		assert.Equal(t, VirtualSourcePath(stateDB, "child"), result.Result.Session.File.Path)
 	})
 
 	t.Run("streamed_state_member", func(t *testing.T) {
@@ -1227,6 +1455,25 @@ func TestHermesStateMembershipHonorsCallerCancellation(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 }
 
+func TestHermesStateMembershipReturnsQueryFailures(t *testing.T) {
+	root := t.TempDir()
+	createHermesStateDB(t, root)
+	stateDB := filepath.Join(root, "state.db")
+	conn, err := sql.Open("sqlite3", stateDB)
+	require.NoError(t, err)
+	_, err = conn.ExecContext(t.Context(), "DROP TABLE messages")
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+	membership, err := openHermesStateMembership(t.Context(), stateDB)
+	require.NoError(t, err)
+	t.Cleanup(membership.Close)
+
+	found, err := membership.Has(t.Context(), "child")
+
+	require.Error(t, err, "a failed messages query must not read as a missing member")
+	assert.False(t, found)
+}
+
 func TestHermesProviderFindSourceDoesNotReturnStateDBForMissingRawID(t *testing.T) {
 	root := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(root, "sessions"), 0o755))
@@ -1277,6 +1524,102 @@ func TestHermesProviderFindSourceFallsBackToTranscriptWhenStateDBUnreadable(t *t
 	assert.Equal(t, transcriptPath, source.DisplayPath)
 }
 
+func TestHermesProviderFindSourceResolvesStoredTranscriptInItsOwnRoot(t *testing.T) {
+	firstRoot := t.TempDir()
+	secondRoot := t.TempDir()
+	writeSourceFile(t, filepath.Join(firstRoot, "shared-id.jsonl"),
+		hermesProviderJSONLFixture("unrelated session in the first root"))
+	storedPath := filepath.Join(secondRoot, "shared-id.jsonl")
+	writeSourceFile(t, storedPath, hermesProviderJSONLFixture("archived session"))
+
+	provider, ok := NewProvider(AgentHermes, ProviderConfig{
+		Roots:   []string{firstRoot, secondRoot},
+		Machine: "devbox",
+	})
+	require.True(t, ok)
+
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
+		RawSessionID:   "shared-id",
+		StoredFilePath: storedPath,
+	})
+
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, storedPath, source.DisplayPath)
+}
+
+// A stored state.db path names the root that owns the session. When that
+// root no longer has the row, or the path is a legacy bare state.db, the
+// session-ID lookup must try the owning root before an unrelated root that
+// happens to hold the same ID.
+func TestHermesProviderFindSourcePrefersArchiveHintOwningRoot(t *testing.T) {
+	newRoots := func(t *testing.T) (firstRoot, secondRoot string) {
+		t.Helper()
+		firstRoot = t.TempDir()
+		secondRoot = t.TempDir()
+		for _, root := range []string{firstRoot, secondRoot} {
+			createHermesStateDB(t, root)
+		}
+		writeSourceFile(t, filepath.Join(firstRoot, "sessions", "shared-id.jsonl"),
+			hermesProviderJSONLFixture("unrelated session in the first root"))
+		return firstRoot, secondRoot
+	}
+	findSource := func(t *testing.T, roots []string, storedPath string) SourceRef {
+		t.Helper()
+		provider, ok := NewProvider(AgentHermes, ProviderConfig{
+			Roots:   roots,
+			Machine: "devbox",
+		})
+		require.True(t, ok)
+		source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
+			RawSessionID:   "shared-id",
+			StoredFilePath: storedPath,
+		})
+		require.NoError(t, err)
+		require.True(t, ok)
+		return source
+	}
+
+	t.Run("member whose row is gone uses its own root's transcript", func(t *testing.T) {
+		firstRoot, secondRoot := newRoots(t)
+		ownTranscript := filepath.Join(secondRoot, "sessions", "shared-id.jsonl")
+		writeSourceFile(t, ownTranscript, hermesProviderJSONLFixture("archived session"))
+
+		source := findSource(t, []string{firstRoot, secondRoot},
+			filepath.Join(secondRoot, "state.db")+"#shared-id")
+
+		assert.Equal(t, ownTranscript, source.DisplayPath)
+	})
+
+	t.Run("member whose state.db is deleted uses its own root's transcript", func(t *testing.T) {
+		firstRoot, secondRoot := newRoots(t)
+		stateDB := filepath.Join(secondRoot, "state.db")
+		require.NoError(t, os.Remove(stateDB))
+		ownTranscript := filepath.Join(secondRoot, "sessions", "shared-id.jsonl")
+		writeSourceFile(t, ownTranscript, hermesProviderJSONLFixture("archived session"))
+
+		source := findSource(t, []string{firstRoot, secondRoot}, stateDB+"#shared-id")
+
+		assert.Equal(t, ownTranscript, source.DisplayPath)
+	})
+
+	t.Run("legacy bare state.db hint uses its own root's member", func(t *testing.T) {
+		firstRoot, secondRoot := newRoots(t)
+		stateDB := filepath.Join(secondRoot, "state.db")
+		conn, err := sql.Open("sqlite3", stateDB)
+		require.NoError(t, err)
+		_, err = conn.ExecContext(t.Context(), `
+			INSERT INTO sessions (id, source, started_at)
+			VALUES ('shared-id', 'cli', 1778767200.0)`)
+		require.NoError(t, err)
+		require.NoError(t, conn.Close())
+
+		source := findSource(t, []string{firstRoot, secondRoot}, stateDB)
+
+		assert.Equal(t, stateDB+"#shared-id", source.DisplayPath)
+	})
+}
+
 func hermesProviderJSONLFixture(firstMessage string) string {
 	return `{"role":"session_meta","platform":"cli","timestamp":"2026-05-14T10:00:00.000000"}` + "\n" +
 		`{"role":"user","content":"` + firstMessage + `","timestamp":"2026-05-14T10:01:00.000000"}` + "\n" +
@@ -1293,4 +1636,302 @@ func hermesProviderJSONFixture(firstMessage string) string {
 			{"role":"assistant","content":"Done.","timestamp":"2026-05-14T10:02:00Z"}
 		]
 	}`
+}
+
+func TestHermesCronStateGroups(t *testing.T) {
+	root := t.TempDir()
+	createHermesStateDB(t, root)
+	stateDB := filepath.Join(root, "state.db")
+	conn, err := sql.Open("sqlite3", stateDB)
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = conn.ExecContext(t.Context(), `INSERT INTO sessions(id, source, parent_session_id, started_at, title) VALUES
+        ('cron_job-a_20261007_120000', 'cron', NULL, 1, 'Daily digest · Oct 07'),
+        ('cron_job-a_20261008_120000', 'cron', NULL, 2, 'Research digest · Oct 08'),
+        ('middle', 'cron', 'cron_job-a_20261008_120000', 3, 'Research digest · Oct 08'),
+        ('tip', 'cron', 'middle', 4, 'Research digest · Oct 08'),
+        ('ordinary', 'cli', 'cron_job-a_20261007_120000', 5, 'CLI session'),
+        ('missing', 'cron', 'pruned', 6, 'Unknown · Oct 08'),
+        ('cycle', 'cron', 'cycle', 7, 'Unknown · Oct 08');
+        INSERT INTO messages(session_id, role, content, timestamp) SELECT id, 'user', 'run message', started_at FROM sessions;`)
+	require.NoError(t, err)
+	parent := "cron_job-a_20261007_120000"
+	for i := range 180 {
+		id := fmt.Sprintf("hop-%d", i)
+		_, err = conn.ExecContext(t.Context(), `INSERT INTO sessions(id, source, parent_session_id, started_at, title) VALUES (?, 'cron', ?, 8, 'Daily digest · Oct 07');`, id, parent)
+		require.NoError(t, err)
+		_, err = conn.ExecContext(t.Context(), `INSERT INTO messages(session_id, role, content, timestamp) VALUES (?, 'user', 'run message', 8);`, id)
+		require.NoError(t, err)
+		parent = id
+	}
+	provider := newHermesTestProvider(t, root)
+	source, found, err := provider.SourceForReconciliation(t.Context(), filepath.Join(root, "state.db"), "")
+	require.NoError(t, err)
+	require.True(t, found)
+	bulk, err := provider.Parse(t.Context(), ParseRequest{Source: source})
+	require.NoError(t, err)
+	require.Len(t, bulk.Results, 188)
+	for _, tc := range []struct{ id, key string }{
+		{"cron_job-a_20261007_120000", "job-a"},
+		{"cron_job-a_20261008_120000", "job-a"},
+		{"tip", "job-a"},
+		{"hop-179", "job-a"},
+		{"ordinary", ""},
+		{"missing", ""},
+		{"cycle", ""},
+	} {
+		t.Run(tc.id, func(t *testing.T) {
+			source, found, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: tc.id})
+			require.NoError(t, err)
+			require.True(t, found)
+			member, err := provider.Parse(t.Context(), ParseRequest{Source: source})
+			require.NoError(t, err)
+			require.Len(t, member.Results, 1)
+			sessions := []ParsedSession{member.Results[0].Result.Session}
+			for _, result := range bulk.Results {
+				if result.Result.Session.SourceSessionID == tc.id {
+					sessions = append(sessions, result.Result.Session)
+				}
+			}
+			require.Len(t, sessions, 2)
+			for _, session := range sessions {
+				job, _, _ := strings.Cut(session.GroupKey, ":")
+				assert.Equal(t, tc.key, job)
+			}
+			assert.Equal(t, sessions[0].GroupKey, sessions[1].GroupKey)
+		})
+	}
+	for _, tc := range []struct {
+		id, source, group string
+		keepStored        bool
+	}{
+		{"cron_job-1_20261007_120000", "cron", "job-1", false},
+		{"child", "cron", "", true},
+		{"cron_job-1_20261007_120000", "cli", "", false},
+	} {
+		for _, agent := range []AgentType{AgentHermes, AgentAugureDesktop} {
+			for _, source := range []string{"cron", "cli", ""} {
+				if agent == AgentHermes && source == "" {
+					continue
+				}
+				t.Run(string(agent)+"/"+tc.id+"/transcript="+tc.source+"/state="+source, func(t *testing.T) {
+					name := "session_" + tc.id + ".json"
+					body := fmt.Sprintf(`{"platform":%q,"messages":[{"role":"user","content":"hello"}]}`, tc.source)
+					root := t.TempDir()
+					createHermesStateDB(t, root)
+					conn, err := sql.Open("sqlite3", filepath.Join(root, "state.db"))
+					require.NoError(t, err)
+					_, err = conn.ExecContext(t.Context(), `DELETE FROM messages; DELETE FROM sessions`)
+					require.NoError(t, err)
+					_, err = conn.ExecContext(t.Context(), `INSERT INTO sessions (id, source, started_at) VALUES (?, ?, 1791374400)`, tc.id, source)
+					require.NoError(t, err)
+					require.NoError(t, conn.Close())
+					sessionsDir := filepath.Join(root, "sessions")
+					require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+					require.NoError(t, os.WriteFile(filepath.Join(sessionsDir, name), []byte(body), 0o644))
+					provider, ok := NewProvider(agent, ProviderConfig{Roots: []string{root}, Machine: "local"})
+					require.True(t, ok)
+					sources, err := provider.Discover(t.Context())
+					require.NoError(t, err)
+					require.Len(t, sources, 1)
+					outcome, err := provider.Parse(t.Context(), ParseRequest{Source: sources[0]})
+					require.NoError(t, err)
+					require.Len(t, outcome.Results, 1)
+					parsed := outcome.Results[0].Result
+					assert.Equal(t, string(agent)+":"+tc.id, parsed.Session.ID)
+					require.Len(t, parsed.Messages, 1)
+					assert.Equal(t, "hello", parsed.Messages[0].Content)
+					wantGroup, wantKeep := tc.group, tc.keepStored
+					switch source {
+					case "cli":
+						wantGroup, wantKeep = "", false
+						assert.Equal(t, string(agent)+"-cli", parsed.Session.Project)
+					case "cron":
+						wantGroup, wantKeep = "job-1", false
+						assert.Equal(t, string(agent)+"-cron", parsed.Session.Project)
+						if tc.id == "child" {
+							wantGroup, wantKeep = "", true
+						}
+					default:
+						assert.Equal(t, string(agent)+"-"+tc.source, parsed.Session.Project)
+					}
+					job, _, _ := strings.Cut(parsed.Session.GroupKey, ":")
+					assert.Equal(t, wantGroup, job)
+					assert.Equal(t, wantKeep, parsed.Session.KeepStoredGroupKey)
+				})
+			}
+		}
+	}
+	t.Run("home scopes", func(t *testing.T) {
+		var homeKeys []string
+		for _, profile := range []string{"", "", "profile-a", "profile-a", "profile-b", `remote:C:\profiles\a`, `remote:C:\profiles\b`} {
+			root := t.TempDir()
+			sessionsDir := filepath.Join(root, "sessions")
+			require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+			createHermesStateDB(t, root)
+			conn, err := sql.Open("sqlite3", filepath.Join(root, "state.db"))
+			require.NoError(t, err)
+			_, err = conn.ExecContext(t.Context(), `UPDATE sessions SET id = 'cron_job-1_20261006_120000', source = 'cron', parent_session_id = NULL; UPDATE messages SET session_id = 'cron_job-1_20261006_120000'`)
+			require.NoError(t, err)
+			require.NoError(t, conn.Close())
+			for _, transcript := range []struct{ name, body string }{
+				{"session_cron_job-1_20261007_120000.json", `{"platform":"cron","messages":[{"role":"user","content":"hello"}]}`},
+				{"cron_job-1_20261008_120000.jsonl", "{\"role\":\"session_meta\",\"platform\":\"cron\"}\n{\"role\":\"user\",\"content\":\"hello\"}\n"},
+			} {
+				path := filepath.Join(sessionsDir, transcript.name)
+				require.NoError(t, os.WriteFile(path, []byte(transcript.body), 0o644))
+			}
+			provider := newHermesTestProvider(t, root)
+			if profile != "" {
+				provider.Config.PathRewriter = func(path string) string {
+					relative, err := filepath.Rel(root, path)
+					require.NoError(t, err)
+					if strings.HasPrefix(profile, "remote:") {
+						return profile + `\` + strings.ReplaceAll(filepath.ToSlash(relative), "/", `\`)
+					}
+					return "capture://" + profile + "/" + filepath.ToSlash(relative)
+				}
+			}
+			sources, err := provider.Discover(t.Context())
+			require.NoError(t, err)
+			require.Len(t, sources, 3)
+			var key string
+			for _, source := range sources {
+				outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
+				require.NoError(t, err)
+				require.Len(t, outcome.Results, 1)
+				for _, result := range outcome.Results {
+					group := result.Result.Session.GroupKey
+					if key == "" {
+						key = group
+					}
+					assert.Equal(t, key, group)
+				}
+			}
+			homeKeys = append(homeKeys, key)
+		}
+		assert.NotEqual(t, homeKeys[0], homeKeys[1])
+		assert.Equal(t, homeKeys[2], homeKeys[3])
+		assert.NotEqual(t, homeKeys[2], homeKeys[4])
+		assert.NotEqual(t, homeKeys[5], homeKeys[6])
+	})
+}
+
+func TestHermesChangedPathIgnoresReaderWALEvents(t *testing.T) {
+	for _, agent := range []AgentType{AgentHermes, AgentAugureDesktop} {
+		t.Run(string(agent), func(t *testing.T) {
+			root := t.TempDir()
+			createHermesStateDB(t, root)
+			stateDB := filepath.Join(root, "state.db")
+			walPath := stateDB + "-wal"
+			provider, ok := NewProvider(agent, ProviderConfig{Roots: []string{root}})
+			require.True(t, ok)
+			for _, event := range []string{"create", "write", "remove"} {
+				t.Run(event, func(t *testing.T) {
+					require.NoError(t, os.WriteFile(walPath, nil, 0o600))
+					if event == "remove" {
+						require.NoError(t, os.Remove(walPath))
+					}
+					scans := 0
+					ctx := WithSharedContainerScanObserver(t.Context(), func() { scans++ })
+					sources, err := provider.SourcesForChangedPath(ctx, ChangedPathRequest{
+						Path: walPath, EventKind: event, WatchRoot: root,
+					})
+					require.NoError(t, err)
+					assert.Empty(t, sources, "a reader's empty WAL must not schedule another container scan")
+					assert.Zero(t, scans)
+				})
+			}
+			conn, err := sql.Open("sqlite3", stateDB)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, conn.Close()) })
+			_, err = conn.ExecContext(t.Context(), "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; UPDATE sessions SET title='Committed title' WHERE id='child'")
+			require.NoError(t, err)
+			sources, err := provider.SourcesForChangedPath(t.Context(), ChangedPathRequest{
+				Path: walPath, EventKind: "write", WatchRoot: root,
+			})
+			require.NoError(t, err)
+			require.Len(t, sources, 1, "committed WAL frames must still refresh their members")
+			assert.Equal(t, VirtualSourcePath(stateDB, "child"), sources[0].DisplayPath)
+		})
+	}
+}
+
+func TestHermesStandaloneEventsPreferJSONL(t *testing.T) {
+	for _, agent := range []AgentType{AgentHermes, AgentAugureDesktop} {
+		t.Run(string(agent), func(t *testing.T) {
+			root := t.TempDir()
+			createHermesStateDB(t, root)
+			dir := filepath.Join(root, "sessions")
+			jsonlPath := filepath.Join(dir, "standalone.jsonl")
+			jsonPath := filepath.Join(dir, "session_standalone.json")
+			writeSourceFile(t, jsonlPath, hermesProviderJSONLFixture("current prompt"))
+			writeSourceFile(t, jsonPath, hermesProviderJSONFixture("stale prompt"))
+			provider, ok := NewProvider(agent, ProviderConfig{Roots: []string{root}})
+			require.True(t, ok)
+			for _, test := range []struct {
+				path, event, want string
+			}{
+				{path: jsonPath, event: "write", want: jsonlPath},
+				{path: jsonlPath, event: "remove", want: jsonPath},
+			} {
+				if test.event == "remove" {
+					require.NoError(t, os.Remove(jsonlPath))
+				}
+				sources, err := provider.SourcesForChangedPath(t.Context(), ChangedPathRequest{
+					Path: test.path, EventKind: test.event, WatchRoot: dir,
+				})
+				require.NoError(t, err)
+				require.Len(t, sources, 1)
+				assert.Equal(t, test.want, sources[0].DisplayPath)
+			}
+		})
+	}
+}
+
+func TestHermesLedgerFingerprintChangesOnlyItsMember(t *testing.T) {
+	root := t.TempDir()
+	createHermesStateDB(t, root)
+	stateDB := filepath.Join(root, "state.db")
+	conn, err := sql.Open("sqlite3", stateDB)
+	require.NoError(t, err)
+	defer conn.Close()
+	hermesfixture.CreateLedger(t, conn)
+	_, err = conn.ExecContext(t.Context(), `INSERT INTO sessions (id, source, model, started_at) VALUES ('sibling', 'cli', 'main', 1778767200)`)
+	require.NoError(t, err)
+	provider, ok := NewProvider(AgentHermes, ProviderConfig{Roots: []string{root}, Machine: "test"})
+	require.True(t, ok)
+	fingerprints := func() map[string]string {
+		t.Helper()
+		ctx, cleanup, err := WithReconciliationCache(t.Context())
+		require.NoError(t, err)
+		defer func() { require.NoError(t, cleanup()) }()
+		require.NoError(t, seedHermesMemberCoresLocked(ctx, stateDB))
+		out := map[string]string{}
+		for _, id := range []string{"child", "sibling"} {
+			source, found, err := provider.FindSource(t.Context(), FindSourceRequest{FullSessionID: "hermes:" + id})
+			require.NoError(t, err)
+			require.True(t, found)
+			direct, err := provider.Fingerprint(t.Context(), source)
+			require.NoError(t, err)
+			seeded, err := provider.Fingerprint(ctx, source)
+			require.NoError(t, err)
+			assert.Equal(t, direct.Hash, seeded.Hash)
+			out[id] = direct.Hash
+		}
+		return out
+	}
+	before := fingerprints()
+	for _, query := range []string{
+		`INSERT INTO session_model_usage (session_id, model, task, input_tokens) VALUES ('child', 'review', 'background_review', 20)`,
+		`UPDATE session_model_usage SET input_tokens = 30`,
+		`DELETE FROM session_model_usage`,
+	} {
+		_, err := conn.ExecContext(t.Context(), query)
+		require.NoError(t, err)
+		after := fingerprints()
+		assert.NotEqual(t, before["child"], after["child"])
+		assert.Equal(t, before["sibling"], after["sibling"])
+		before = after
+	}
 }

@@ -18,14 +18,18 @@ import (
 // rates. Version 3 removed moonshot/kimi-k3 after LiteLLM added it.
 // Version 4 adds namespaced Codex mappings and a temporary Bedrock Astra
 // fallback until the pinned LiteLLM snapshot includes it. Version 5 adds
-// a StepFun step-5-preview row, which the pinned snapshot lacks.
-const supplementalVersion = "5"
+// a StepFun step-5-preview row, which the pinned snapshot lacks. Version 6
+// removes the temporary Bedrock Astra row now supplied by the snapshot.
+// Version 7 adds a Muse Wonder row, which the pinned snapshot lacks.
+const supplementalVersion = "7"
 
 // Canonical pricing models runtime aliases resolve to.
 // KimiK26Canonical exists in the embedded LiteLLM snapshot;
 // KimiK3Canonical is seeded by the supplemental set below because the
 // LiteLLM catalog lists only the provider-qualified Kimi K3 name.
-// GPT56LunaCanonical is the catalog id for Codex Luna Reserve (gpt-reserve).
+// GPT56LunaCanonical is the catalog id for Codex Luna Reserve (gpt-reserve) and
+// Codex auto-review (codex-auto-review), which Codex runs on GPT-5.6 Luna under
+// API-key and Bedrock auth.
 // The Bedrock constants are the standard catalog rows for namespaced Codex
 // models that otherwise collide with provider-qualified variants.
 // GPT6AstraCanonical is the catalog id for Codex's namespaced Astra model.
@@ -38,6 +42,7 @@ const (
 	BedrockGPT56TerraCanonical = "bedrock_mantle/openai.gpt-5.6-terra"
 	GPT6AstraCanonical         = "bedrock_mantle/openai.gpt-6-astra"
 	GPTReserveModelName        = "gpt-reserve"
+	CodexAutoReviewModelName   = "codex-auto-review"
 	CodexGPT54ModelName        = "openai.gpt-5.4"
 	CodexGPT56LunaModelName    = "openai.gpt-5.6-luna"
 	CodexGPT56TerraModelName   = "openai.gpt-5.6-terra"
@@ -79,16 +84,25 @@ type FixedPricingAlias struct {
 // fixedPricingAliases are timestamp-independent reported names that need a
 // curated catalog target. Codex writes gpt-reserve for Luna Reserve turns and
 // namespaced model ids that can collide with provider-qualified rows; Kimi Work
-// writes k2d6-agent for the K2.6 era. A static supplemental rate row for these
-// names would hide later catalog updates for the canonical model, including
-// Pydantic time-window rates for GPT-5.6 Luna.
+// writes k2d6-agent for the K2.6 era. Codex also writes codex-auto-review for
+// auto-review threads and doesn't say which model serves them. Muse Code
+// writes bare Muse Spark ids that match both the meta/ and openrouter/meta/
+// catalog rows, so they map to Meta's own rows. A static supplemental rate
+// row for these names would hide later catalog updates for the canonical
+// model, including Pydantic time-window rates for GPT-5.6 Luna.
 var fixedPricingAliases = []FixedPricingAlias{
 	{Name: "k2d6-agent", Canonical: KimiK26Canonical},
 	{Name: GPTReserveModelName, Canonical: GPT56LunaCanonical},
+	{Name: CodexAutoReviewModelName, Canonical: GPT56LunaCanonical},
 	{Name: CodexGPT54ModelName, Canonical: BedrockGPT54Canonical, Exact: true},
 	{Name: CodexGPT56LunaModelName, Canonical: BedrockGPT56LunaCanonical, Exact: true},
 	{Name: CodexGPT56TerraModelName, Canonical: BedrockGPT56TerraCanonical, Exact: true},
 	{Name: CodexAstraModelName, Canonical: GPT6AstraCanonical, Exact: true},
+	{Name: "muse-spark-1.1", Canonical: "meta/muse-spark-1.1", Exact: true},
+	{Name: "muse-spark-1.2", Canonical: "meta/muse-spark-1.2", Exact: true},
+	{Name: "muse-spark-1.3", Canonical: "meta/muse-spark-1.3", Exact: true},
+	{Name: "muse-spark-1.2-contributor", Canonical: "meta/muse-spark-1.2-contributor", Exact: true},
+	{Name: "muse-spark-1.3-contributor", Canonical: "meta/muse-spark-1.3-contributor", Exact: true},
 }
 
 // DateAliasedModels returns the sorted unqualified date-ambiguous
@@ -137,8 +151,8 @@ func fixedCanonicalModel(model string) string {
 }
 
 func pricingAliasName(model string) string {
-	if idx := strings.LastIndex(model, "/"); idx != -1 {
-		return model[idx+1:]
+	if _, after, ok := strings.CutLast(model, "/"); ok {
+		return after
 	}
 	return model
 }
@@ -195,20 +209,6 @@ func CanonicalModelForTimestamp(model, ts string) string {
 // still overwrites them if upstream lists the real models.
 var supplementalPricing = []ModelPricing{
 	{
-		ModelPattern:         GPT6AstraCanonical,
-		InputPerMTok:         money.MustParseDollars("11.00"),
-		OutputPerMTok:        money.MustParseDollars("55.00"),
-		CacheCreationPerMTok: money.MustParseDollars("13.75"),
-		CacheReadPerMTok:     money.MustParseDollars("1.10"),
-		Bands: []PricingBand{{
-			AboveInputTokens:     272_000,
-			InputPerMTok:         money.MustParseDollars("22.00"),
-			OutputPerMTok:        money.MustParseDollars("82.50"),
-			CacheCreationPerMTok: money.MustParseDollars("27.50"),
-			CacheReadPerMTok:     money.MustParseDollars("2.20"),
-		}},
-	},
-	{
 		ModelPattern:         "k3",
 		InputPerMTok:         money.MustParseDollars("3.00"),
 		OutputPerMTok:        money.MustParseDollars("15.00"),
@@ -239,6 +239,17 @@ var supplementalPricing = []ModelPricing{
 		OutputPerMTok:        money.MustParseDollars("2.70"),
 		CacheCreationPerMTok: money.MustParseDollars("1.00"),
 		CacheReadPerMTok:     money.MustParseDollars("0.05"),
+	},
+	{
+		// Meta publishes muse-wonder-1.0 at input 4.00, cached input 0.20,
+		// and output 20.00 USD per MTok; read 2026-10-13 from
+		// https://dev.meta.ai/docs/pricing-rate-limits. No cache-write fee
+		// is listed, so cache creation bills at the input rate.
+		ModelPattern:         "muse-wonder-1.0",
+		InputPerMTok:         money.MustParseDollars("4.00"),
+		OutputPerMTok:        money.MustParseDollars("20.00"),
+		CacheCreationPerMTok: money.MustParseDollars("4.00"),
+		CacheReadPerMTok:     money.MustParseDollars("0.20"),
 	},
 }
 

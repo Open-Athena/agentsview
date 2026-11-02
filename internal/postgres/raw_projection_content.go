@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/ingest"
@@ -47,6 +48,11 @@ func rawBaseAlias(m rawsync.CanonicalManifest, s db.Session) string {
 }
 
 func encodeRawPayload(p ingest.PreparedSession) ([]byte, error) {
+	// Dialogue belongs to mutable derived state, outside immutable content.
+	p.Messages = slices.Clone(p.Messages)
+	for i := range p.Messages {
+		p.Messages[i].DialogueText = nil
+	}
 	var b bytes.Buffer
 	err := gob.NewEncoder(&b).Encode(p)
 	return b.Bytes(), err
@@ -88,6 +94,8 @@ func rawContentRevision(p ingest.PreparedSession) (string, error) {
 	s.DataVersion = 0
 	s.SecretsRulesVersion = ""
 	s.QualitySignalVersion = 0
+	// Labels belong to the SQLite archive owner, never to a transcript.
+	s.Labels = nil
 	// Recency-derived state is published separately from immutable content.
 	s.SignalsPendingSince, s.HealthScore, s.HealthGrade = nil, nil, nil
 	s.Outcome, s.OutcomeConfidence = "", ""
@@ -144,6 +152,11 @@ func rawContentRevision(p ingest.PreparedSession) (string, error) {
 	return rawDigest("normalized-content-v1", string(encoded)), nil
 }
 
+var (
+	rawSessionType         = reflect.TypeFor[db.Session]()
+	rawPostV1SessionFields = map[string]bool{"PRLinks": true, "Labels": true}
+)
+
 func rawCanonicalValue(v reflect.Value, field string) (any, error) {
 	if !v.IsValid() {
 		return nil, nil
@@ -184,9 +197,29 @@ func rawCanonicalValue(v reflect.Value, field string) (any, error) {
 		out := map[string]any{}
 		for i := range v.NumField() {
 			f := v.Type().Field(i)
-			// This transient projection marker adds no content to the existing
-			// normalized-content-v1 representation.
-			if !f.IsExported() || f.Name == "UsageAutomationProjected" {
+			// Projection bookkeeping and inherited trash scope add no content.
+			// Omit empty GroupKey and PlanUsage values so existing revisions stay stable. Derived tool
+			// observation fields preserve the historical normalized-content-v1 representation.
+			// DialogueText is a derived search projection; reparses refresh it in place.
+			if !f.IsExported() || f.Name == "UsageAutomationProjected" || f.Name == "TrashIncludesCodexPages" ||
+				(v.Type() == reflect.TypeFor[db.Message]() && f.Name == "DialogueText") ||
+				(v.Type() == rawSessionType && f.Name == "SourceMachines") ||
+				f.Name == "ToolObservations" || f.Name == "ObservedOutcome" || f.Name == "ObservedRepeat" || f.Name == "SequenceEnding" ||
+				(v.Type() == reflect.TypeFor[db.Session]() && f.Name == "GroupKey" && v.Field(i).IsZero()) ||
+				(v.Type() == reflect.TypeFor[ingest.PreparedSession]() && f.Name == "PlanUsage" && v.Field(i).IsZero()) {
+				continue
+			}
+			// Session fields added after normalized-content-v1 was recorded
+			// stay out of the representation while empty, so sessions without
+			// them keep their existing content identity.
+			if v.Type() == rawSessionType && rawPostV1SessionFields[f.Name] &&
+				v.Field(i).Len() == 0 {
+				continue
+			}
+			// Friction is derived after content identity is assigned; including it
+			// would make finding subjects participate in their own session ID.
+			if f.Name == "Friction" || f.Name == "FrictionCount" ||
+				f.Name == "FrictionRulesVersion" || f.Name == "FrictionHash" {
 				continue
 			}
 			// The fork-local private flag is curation state, not content;

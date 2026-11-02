@@ -17,6 +17,57 @@ import (
 	"go.kenn.io/agentsview/internal/money"
 )
 
+func TestVerifyUsageRollupQueryChecksEveryChunk(t *testing.T) {
+	database := testDB(t)
+	snapshot, err := database.captureUsageQuery(
+		t.Context(), UsageFilter{}, usageQueryKindToken)
+	require.NoError(t, err)
+	cache, err := database.usageCache.Generation(t.Context(), snapshot.DatabaseID)
+	require.NoError(t, err)
+	tx, err := cache.db.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	defer tx.Rollback()
+	_, err = tx.ExecContext(t.Context(), `INSERT INTO usage_rollup_timezones
+		VALUES (1, 'UTC', 'UTC', '', '')`)
+	require.NoError(t, err)
+	installs := make(map[string]usageRollupInstall)
+	for i := range maxSQLVars + 2 {
+		sessionID := "session-" + strconv.Itoa(i)
+		if i == maxSQLVars+1 {
+			sessionID = usageRollupCursorSessionID
+			snapshot.CursorHighWater = 1
+		} else {
+			snapshot.Sessions = append(snapshot.Sessions,
+				usageQuerySession{ID: sessionID})
+		}
+		install := usageRollupInstall{
+			ID: int64(i + 1), InstallRevision: int64(i + 10),
+			PricingHash: "pricing-" + strconv.Itoa(i),
+		}
+		_, err := tx.ExecContext(t.Context(), `INSERT INTO usage_rollup_installs(
+			id, timezone_id, session_id, source_sync_marker, source_transcript_rev,
+			usage_event_fingerprint, fact_install_revision, baked_agent,
+			baked_started_at, pricing_inputs, pricing_hash, install_revision, cached_at
+		) VALUES (?, 1, ?, '', '', '', 1, '', '', '', ?, ?, '')`,
+			install.ID, sessionID, install.PricingHash, install.InstallRevision)
+		require.NoError(t, err)
+		installs[sessionID] = install
+	}
+	require.NoError(t, tx.Commit())
+	conn, err := cache.db.Conn(t.Context())
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = verifyUsageRollupQuery(
+		t.Context(), conn, "UTC", snapshot, installs)
+	require.NoError(t, err)
+	_, err = conn.ExecContext(t.Context(), `UPDATE usage_rollup_installs
+		SET install_revision = install_revision + 1 WHERE session_id = ?`,
+		usageRollupCursorSessionID)
+	require.NoError(t, err)
+	_, err = verifyUsageRollupQuery(t.Context(), conn, "UTC", snapshot, installs)
+	assert.ErrorIs(t, err, errUsageCacheSourceChanged)
+}
+
 func TestUsageRollupDailyMatchesFacts(t *testing.T) {
 	database := openDailyUsageFixtureDB(t)
 	for _, filter := range []UsageFilter{
@@ -130,14 +181,20 @@ func TestUsageRollupDailyMatchesLastCopilotReportedCost(t *testing.T) {
 			},
 		},
 	))
-	filter := UsageFilter{
-		From: "2026-08-10", To: "2026-08-10", Timezone: "UTC",
+	for _, filter := range []UsageFilter{{}, {Model: " , "}, {ExcludeModel: " , "}, {Model: " , ", ExcludeModel: " , "}} {
+		filter.From, filter.To, filter.Timezone = "2026-08-10", "2026-08-10", "UTC"
+		legacy := getDailyUsageLegacyForRollupTest(t, database, filter)
+		rollup := getDailyUsageRollupForTest(t, database, filter)
+		assert.Equal(t, money.MustParseDollars("3.00"), legacy.Totals.TotalCost)
+		assert.Equal(t, legacy, rollup)
+		legacyTop, err := database.getTopSessionsByCostLegacy(t.Context(), filter, 10)
+		require.NoError(t, err)
+		top, err := database.GetTopSessionsByCost(t.Context(), filter, 10)
+		require.NoError(t, err)
+		require.Len(t, top, 1)
+		assert.Equal(t, money.MustParseDollars("3.00"), top[0].Cost)
+		assert.Equal(t, legacyTop, top)
 	}
-
-	legacy := getDailyUsageLegacyForRollupTest(t, database, filter)
-	rollup := getDailyUsageRollupForTest(t, database, filter)
-	assert.Equal(t, money.MustParseDollars("3.00"), legacy.Totals.TotalCost)
-	assert.Equal(t, legacy, rollup)
 }
 
 func countUsageRollupExceptionRows(t *testing.T, database *DB) int {

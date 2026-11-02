@@ -9,12 +9,120 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/testjsonl"
 )
+
+func TestClaudeProviderScopedDiscoveryBoundsTraversal(t *testing.T) {
+	base := filepath.Clean(t.TempDir())
+	for i := range 128 {
+		writeSourceFile(t, filepath.Join(base, fmt.Sprintf("sibling-%d", i), "other.jsonl"), claudeProviderFixture("other"))
+	}
+	for _, mode := range []string{"project", "subagents", "file", "gone", "ancestor file", "unreadable scope", "overlap", "multi-root", "unreadable nested", "symlink", "yield error", "root yield error", "file yield error"} {
+		t.Run(mode, func(t *testing.T) {
+			root := base
+			if mode == "symlink" || mode == "root yield error" {
+				root = filepath.Clean(t.TempDir())
+			}
+			project := filepath.Join(root, "target")
+			if mode == "symlink" {
+				require.NoError(t, os.Symlink(filepath.Clean(t.TempDir()), project))
+			}
+			main := filepath.Join(project, "session-main.jsonl")
+			subagents := filepath.Join(project, "session-main", "subagents")
+			child := filepath.Join(subagents, "agent-child.jsonl")
+			healthy := filepath.Join(root, "healthy", "session-healthy.jsonl")
+			writeSourceFile(t, main, claudeProviderFixture("main"))
+			writeSourceFile(t, child, claudeProviderFixture("child"))
+			writeSourceFile(t, filepath.Join(project, "blocked"), "file")
+			roots := []string{root}
+			if mode == "multi-root" {
+				roots = append(roots, filepath.Clean(t.TempDir()))
+				healthy = filepath.Join(roots[1], "healthy", "session-healthy.jsonl")
+			}
+			writeSourceFile(t, healthy, claudeProviderFixture("healthy"))
+			bounded := mode == "project" || mode == "subagents" || mode == "file" || mode == "gone" || mode == "ancestor file" || mode == "unreadable scope"
+			requested := []string{subagents, project, filepath.Dir(healthy)}
+			want := []string{main, child, healthy}
+			switch mode {
+			case "project":
+				requested, want = []string{project}, []string{main, child}
+			case "subagents":
+				requested, want = []string{subagents}, []string{child}
+			case "file", "file yield error":
+				requested, want = []string{main}, []string{main}
+			case "gone":
+				requested, want = []string{filepath.Join(root, "gone")}, nil
+			case "ancestor file":
+				requested, want = []string{filepath.Join(project, "blocked", "subagents")}, nil
+			case "unreadable scope":
+				requested, want = []string{project}, nil
+			case "unreadable nested":
+				want = []string{main, healthy}
+			case "root yield error":
+				requested = []string{root}
+			}
+			provider, ok := NewProvider(AgentClaude, ProviderConfig{Roots: roots})
+			require.True(t, ok)
+			var scopes []ReconciliationScope
+			for _, path := range requested {
+				plan, err := provider.ResolveReconciliationScopes(t.Context(), ReconciliationScopeRequest{Roots: []string{path}})
+				require.NoError(t, err)
+				scopes = append(scopes, plan.Scopes...)
+			}
+			reads := make(map[string]int)
+			ctx := withStreamingDirectoryReader(t.Context(), func(ctx context.Context, path string, yield func(os.DirEntry) error) error {
+				reads[path]++
+				if mode == "unreadable scope" && path == project || mode == "unreadable nested" && path == subagents {
+					return os.ErrPermission
+				}
+				return streamDirectoryEntriesDirect(ctx, path, yield)
+			})
+			var paths []string
+			stop := errors.New("consumer stopped")
+			err := provider.(ScopedStreamingDiscoverer).DiscoverScopesEach(ctx, scopes, func(source SourceRef) error {
+				paths = append(paths, source.DisplayPath)
+				wantRoot, wantProject := root, "target"
+				if source.DisplayPath == healthy {
+					wantRoot, wantProject = roots[len(roots)-1], "healthy"
+				}
+				assert.Equal(t, wantRoot, source.Opaque.(claudeSource).Root)
+				assert.Equal(t, wantProject, source.ProjectHint)
+				if strings.HasSuffix(mode, "yield error") {
+					return stop
+				}
+				return nil
+			})
+			switch mode {
+			case "unreadable scope", "unreadable nested":
+				require.ErrorIs(t, err, os.ErrPermission)
+				assert.ElementsMatch(t, want, paths)
+			case "yield error", "root yield error", "file yield error":
+				require.Equal(t, stop, err)
+				assert.Len(t, paths, 1)
+			default:
+				require.NoError(t, err)
+				assert.ElementsMatch(t, want, paths)
+			}
+			if bounded {
+				assert.LessOrEqual(t, len(reads), 3, "discovery work must stay constant as siblings grow")
+				for path := range reads {
+					assert.True(t, reconciliationScopeWithinOrSame(path, requested[0]), "read outside the requested subtree: %s", path)
+				}
+			}
+			if mode == "multi-root" {
+				assert.Equal(t, map[string]int{project: 1, filepath.Dir(subagents): 1, subagents: 1, filepath.Dir(healthy): 1}, reads)
+			}
+			for path, count := range reads {
+				assert.Equal(t, 1, count, "repeated directory read: %s", path)
+			}
+		})
+	}
+}
 
 func TestClaudeProviderSourceMethods(t *testing.T) {
 	root := t.TempDir()
@@ -275,6 +383,49 @@ func TestClaudeProviderStreamingDiscoveryPropagatesProjectSymlinkErrors(t *testi
 }
 
 func TestClaudeRawCaptureRootReplacementIsIncomplete(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		file bool
+		err  error
+	}{
+		{name: "project temporarily vanishes after enumeration", err: os.ErrNotExist},
+		{name: "project temporarily becomes a file after enumeration", file: true, err: syscall.ENOTDIR},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			root := filepath.Join(base, "sessions")
+			project := filepath.Join(root, "project")
+			writeSourceFile(t, filepath.Join(project, "session-main.jsonl"), claudeProviderFixture("hello claude"))
+			provider, ok := NewProvider(AgentClaude, ProviderConfig{Roots: []string{root}})
+			require.True(t, ok)
+			ctx := withStreamingDirectoryReader(t.Context(), func(ctx context.Context, path string, yield func(os.DirEntry) error) error {
+				return streamDirectoryEntriesDirect(ctx, path, func(entry os.DirEntry) error {
+					if path != root || entry.Name() != "project" {
+						return yield(entry)
+					}
+					moved := filepath.Join(base, "moved-project")
+					require.NoError(t, os.Rename(project, moved))
+					if tc.file {
+						require.NoError(t, os.WriteFile(project, []byte("replacement"), 0o600))
+					}
+					err := yield(entry)
+					if tc.file {
+						require.NoError(t, os.Remove(project))
+					}
+					require.NoError(t, os.Rename(moved, project))
+					return err
+				})
+			})
+
+			discovery, err := DiscoverRawCaptureSources(ctx, provider)
+
+			require.ErrorIs(t, err, tc.err)
+			var incomplete DiscoveryIncompleteError
+			require.ErrorAs(t, err, &incomplete)
+			assert.False(t, discovery.Complete)
+		})
+	}
+
 	base := t.TempDir()
 	root := filepath.Join(base, "sessions")
 	require.NoError(t, os.Mkdir(root, 0o700))
@@ -388,7 +539,11 @@ func TestClaudeProviderParseAdoptsAITitle(t *testing.T) {
 		{name: "rename after title", extra: []string{`{"type":"ai-title","aiTitle":"Generated"}`, `{"type":"system","content":"<command-name>/rename</command-name><command-args>Renamed</command-args>"}`}, want: "Renamed"},
 		{name: "empty rename clears title", extra: []string{`{"type":"ai-title","aiTitle":"Generated"}`, `{"type":"system","content":"<command-name>/rename</command-name><command-args></command-args>"}`}, want: ""},
 		{name: "invalid titles keep fallback", extra: []string{`{"type":"ai-title","aiTitle":""}`, `{"type":"ai-title","aiTitle":42}`, `{"type":"ai-title"}`, `{malformed`}, want: ""},
-		{name: "compatible fields stay decoys", extra: []string{`{"type":"custom-title","customTitle":"Custom"}`, `{"type":"user","sessionName":"Session"}`}, want: ""},
+		{name: "custom title beats ai title", extra: []string{`{"type":"custom-title","customTitle":" Custom "}`, `{"type":"ai-title","aiTitle":"Generated"}`}, want: "Custom"},
+		{name: "custom title after rename wins", extra: []string{`{"type":"system","content":"<command-name>/rename</command-name><command-args>Renamed</command-args>"}`, `{"type":"custom-title","customTitle":"Custom"}`}, want: "Custom"},
+		{name: "rename after custom title wins", extra: []string{`{"type":"custom-title","customTitle":"Custom"}`, `{"type":"system","content":"<command-name>/rename</command-name><command-args>Renamed</command-args>"}`}, want: "Renamed"},
+		{name: "invalid custom titles keep ai title", extra: []string{`{"type":"ai-title","aiTitle":"Generated"}`, `{"type":"custom-title","customTitle":""}`, `{"type":"custom-title","customTitle":42}`, `{"type":"custom-title"}`}, want: "Generated"},
+		{name: "agent name and session name stay decoys", extra: []string{`{"type":"agent-name","agentName":"Agent"}`, `{"type":"user","sessionName":"Session"}`}, want: ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -468,7 +623,7 @@ func TestClaudeProviderUploadAndTitleBoundaries(t *testing.T) {
 	assert.Equal(t, "Uploaded question", results[0].Session.FirstMessage)
 }
 
-func TestClaudeProviderIncrementalAITitleEscalation(t *testing.T) {
+func TestClaudeProviderIncrementalTitleEscalation(t *testing.T) {
 	emptyName := ""
 	existingName := "Existing title"
 	tests := []struct {
@@ -526,6 +681,37 @@ func TestClaudeProviderIncrementalAITitleEscalation(t *testing.T) {
 			appended:     `{"type":"ai-title"}`,
 			wantStatus:   IncrementalApplied,
 			wantConsumed: int64(len(`{"type":"ai-title"}`) + 1),
+			wantMessages: 0,
+		},
+		{
+			name:         "custom title differs from stored name",
+			storedName:   &existingName,
+			appended:     `{"type":"custom-title","customTitle":"Renamed"}`,
+			wantStatus:   IncrementalNeedsFullParse,
+			wantForce:    true,
+			wantMessages: 0,
+		},
+		{
+			name:         "custom title repeats stored name",
+			storedName:   &existingName,
+			appended:     `{"type":"custom-title","customTitle":"Existing title"}`,
+			wantStatus:   IncrementalApplied,
+			wantConsumed: int64(len(`{"type":"custom-title","customTitle":"Existing title"}`) + 1),
+			wantMessages: 0,
+		},
+		{
+			name:         "custom title without stored name",
+			appended:     `{"type":"custom-title","customTitle":"Renamed"}`,
+			wantStatus:   IncrementalApplied,
+			wantConsumed: int64(len(`{"type":"custom-title","customTitle":"Renamed"}`) + 1),
+			wantMessages: 0,
+		},
+		{
+			name:         "empty custom title",
+			storedName:   &existingName,
+			appended:     `{"type":"custom-title","customTitle":""}`,
+			wantStatus:   IncrementalApplied,
+			wantConsumed: int64(len(`{"type":"custom-title","customTitle":""}`) + 1),
 			wantMessages: 0,
 		},
 		{
@@ -735,6 +921,7 @@ func TestClaudeProviderParseIncremental(t *testing.T) {
 	root := t.TempDir()
 	sourcePath := filepath.Join(root, "-Users-dev-code-demo", "inc.jsonl")
 	initial := testjsonl.JoinJSONL(
+		`{"type":"agent-setting","entrypoint":"sdk-cli"}`,
 		testjsonl.ClaudeUserJSON("hello world", tsEarly),
 		testjsonl.ClaudeAssistantJSON("hi there", tsEarlyS1),
 	)
@@ -768,11 +955,13 @@ func TestClaudeProviderParseIncremental(t *testing.T) {
 	outcome, status, err := provider.ParseIncremental(
 		t.Context(),
 		IncrementalRequest{
-			Source:       source,
-			Fingerprint:  SourceFingerprint{Key: sourcePath, Size: currentInfo.Size()},
-			SessionID:    "inc",
-			Offset:       info.Size(),
-			StartOrdinal: 2,
+			Source:                 source,
+			Fingerprint:            SourceFingerprint{Key: sourcePath, Size: currentInfo.Size()},
+			SessionID:              "inc",
+			Offset:                 info.Size(),
+			StartOrdinal:           2,
+			StoredEntrypoint:       "sdk-cli",
+			StoredUserMessageCount: 1,
 		},
 	)
 	require.NoError(t, err)
@@ -786,6 +975,41 @@ func TestClaudeProviderParseIncremental(t *testing.T) {
 	assert.Equal(t, 3, outcome.Messages[1].Ordinal)
 	assert.Equal(t, RoleAssistant, outcome.Messages[1].Role)
 	assert.Contains(t, outcome.Messages[1].Content, "got it")
+}
+
+func TestClaudeProviderFirstPromptReparseEligibleKinds(t *testing.T) {
+	for _, tc := range []struct {
+		kind string
+		want IncrementalStatus
+	}{
+		{"", IncrementalNeedsFullParse},
+		{SessionKindRoborev, IncrementalApplied},
+		{SessionKindNonInteractive, IncrementalApplied},
+	} {
+		t.Run("kind="+tc.kind, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "project", "first.jsonl")
+			initial := `{"type":"agent-setting","entrypoint":"sdk-cli"}` + "\n"
+			prompt := `{"type":"user","uuid":"first","turnOrigin":"sdk","message":{"content":"Review the change."}}` + "\n"
+			writeSourceFile(t, path, initial+prompt)
+			provider, ok := NewProvider(AgentClaude, ProviderConfig{Roots: []string{root}, Machine: "local"})
+			require.True(t, ok)
+			source, found, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: "first"})
+			require.NoError(t, err)
+			require.True(t, found)
+			outcome, status, err := provider.ParseIncremental(t.Context(), IncrementalRequest{
+				Source: source, Fingerprint: SourceFingerprint{Key: path, Size: int64(len(initial) + len(prompt))},
+				SessionID: "first", Offset: int64(len(initial)), StoredEntrypoint: "sdk-cli", StoredSessionKind: tc.kind,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, status)
+			assert.Equal(t, tc.want == IncrementalNeedsFullParse, outcome.ForceReplace)
+			if tc.want == IncrementalApplied {
+				require.Len(t, outcome.Messages, 1)
+				assert.Equal(t, "Review the change.", outcome.Messages[0].Content)
+			}
+		})
+	}
 }
 
 func TestClaudeProviderParseIncrementalWebSearchResultNeedsFullParse(t *testing.T) {

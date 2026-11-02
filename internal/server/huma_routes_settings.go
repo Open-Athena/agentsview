@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
+	syncpkg "go.kenn.io/agentsview/internal/sync"
 
 	"github.com/danielgtaylor/huma/v2"
 )
@@ -81,6 +83,10 @@ func (s *Server) humaGetSettings(
 		if !def.FileBased && def.EnvVar == "" {
 			continue
 		}
+		// AgentsView writes these roots itself; there is nothing to configure.
+		if def.DataDirRoot != "" {
+			continue
+		}
 		d := s.cfg.ConfiguredDirs(def.Type)
 		if d == nil {
 			d = []string{}
@@ -113,13 +119,14 @@ func (s *Server) humaGetSettings(
 			CustomBin:  tc.CustomBin,
 			CustomArgs: tc.CustomArgs,
 		},
-		Host:             s.cfg.Host,
-		Port:             s.cfg.Port,
-		ChartPalette:     s.cfg.ResolvedChartPalette(),
-		ZoomLevel:        s.cfg.ZoomLevel,
-		ToolResultImages: toolResultImagesValue(s.cfg.ToolResultImages),
-		RequireAuth:      s.cfg.RequireAuth,
-		ReadOnly:         s.db.ReadOnly(),
+		Host:                s.cfg.Host,
+		Port:                s.cfg.Port,
+		ChartPalette:        s.cfg.ResolvedChartPalette(),
+		ZoomLevel:           s.cfg.ZoomLevel,
+		ToolResultImages:    toolResultImagesValue(s.cfg.ToolResultImages),
+		InsightDefaultAgent: resolvedInsightDefaultAgent(s.cfg),
+		RequireAuth:         s.cfg.RequireAuth,
+		ReadOnly:            s.db.ReadOnly(),
 	}
 	if isLocalhostContext(ctx) {
 		resp.AuthToken = s.cfg.AuthToken
@@ -133,7 +140,11 @@ func (s *Server) humaUpdateSettings(
 	ctx context.Context,
 	in *settingsInput,
 ) (*jsonOutput[settingsResponse], error) {
-	if s.db.ReadOnly() {
+	// A read-only store blocks writes to session data, not to config.toml.
+	// Display preferences only change how this server renders data, so they
+	// stay editable; fields that change ingestion, archive content, or
+	// access control do not.
+	if s.db.ReadOnly() && !in.Body.displayOnly() {
 		return nil, apiError(http.StatusNotImplemented,
 			"settings cannot be modified in read-only mode")
 	}
@@ -177,7 +188,10 @@ func (s *Server) humaUpdateSettings(
 		patch["require_auth"] = *in.Body.RequireAuth
 	}
 	if len(patch) > 0 {
+		s.settingsApplyMu.Lock()
+		defer s.settingsApplyMu.Unlock()
 		s.mu.Lock()
+		rollback := s.ingestionRollbackLocked(patch)
 		err := s.cfg.SaveSettings(patch)
 		if err == nil && s.cfg.RequireAuth {
 			err = s.cfg.EnsureAuthToken()
@@ -186,8 +200,80 @@ func (s *Server) humaUpdateSettings(
 		if err != nil {
 			return nil, internalError("save settings", err)
 		}
+		if err := s.applyIngestionSettings(ctx, rollback); err != nil {
+			return nil, err
+		}
 	}
 	return s.humaGetSettings(ctx, &emptyInput{})
+}
+
+// applyIngestionSettings hands saved provider settings to the running daemon
+// so enabling a provider or adding a home takes effect without a restart. If
+// the daemon cannot apply them, it restores the previous provider settings so
+// the saved file, the response, and the running engine agree.
+func (s *Server) applyIngestionSettings(
+	ctx context.Context, rollback map[string]any,
+) error {
+	if s.ingestionReloader == nil || len(rollback) == 0 {
+		return nil
+	}
+	reloaded, err := s.ingestionReloader(ctx)
+	if err != nil {
+		s.mu.Lock()
+		restoreErr := s.cfg.SaveSettings(rollback)
+		s.mu.Unlock()
+		if restoreErr != nil {
+			log.Printf("restore session provider settings: %v", restoreErr)
+		}
+		return internalError("apply session provider settings", err)
+	}
+	s.mu.Lock()
+	s.cfg.AdoptSessionSources(reloaded)
+	s.activeDisabledAgents = append(
+		[]parser.AgentType(nil), reloaded.DisabledAgents...,
+	)
+	onDemand := s.onDemandEngine
+	s.mu.Unlock()
+	if onDemand != nil {
+		// Reconfiguring waits for an in-flight manual sync, so it runs in the
+		// background. Each update reads the latest adopted settings, so the
+		// last one to run applies the newest selection.
+		go func() {
+			s.onDemandReconfigureMu.Lock()
+			defer s.onDemandReconfigureMu.Unlock()
+			cfg := s.ingestionConfig()
+			onDemand.ReconfigureSources(syncpkg.SourceConfig{
+				AgentDirs:        cfg.AgentDirs,
+				SourceMachines:   cfg.SourceMachines,
+				ProviderMetadata: cfg.ProviderMetadata,
+				DisabledAgents:   cfg.DisabledAgents,
+			})
+		}()
+	}
+	return nil
+}
+
+// ingestionRollbackLocked returns the settings patch that restores the
+// current provider selection for the provider keys patch changes, or nil when
+// patch changes none. Callers hold s.mu.
+func (s *Server) ingestionRollbackLocked(patch map[string]any) map[string]any {
+	rollback := make(map[string]any)
+	if _, ok := patch["disabled_agents"]; ok {
+		rollback["disabled_agents"] = append(
+			[]parser.AgentType{}, s.cfg.DisabledAgents...,
+		)
+	}
+	if homes, ok := patch["agent_homes"].(map[parser.AgentType][]string); ok {
+		previous := make(map[parser.AgentType][]string, len(homes))
+		for agent := range homes {
+			previous[agent] = append([]string{}, s.cfg.ConfiguredAgentHomes(agent)...)
+		}
+		rollback["agent_homes"] = previous
+	}
+	if len(rollback) == 0 {
+		return nil
+	}
+	return rollback
 }
 
 func (s *Server) localWorktreeMappingHumaDB() (*db.DB, string, error) {
@@ -216,7 +302,7 @@ func (s *Server) humaListWorktreeMappings(
 	if machine == "" {
 		machine = localMachine
 	}
-	machine, err = db.ResolveMachineFilter(ctx, localDB, machine)
+	machine, err = db.ResolveMachineAliases(ctx, localDB, machine)
 	if err != nil {
 		return nil, serverError(err)
 	}

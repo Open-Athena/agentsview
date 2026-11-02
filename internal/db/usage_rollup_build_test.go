@@ -370,7 +370,7 @@ func TestBuildUsageDailyContributionsRecordsDiscardedSnapshots(t *testing.T) {
 		[]usageRollupFact{loser, winner}, newUsageDedupIdentitySet(),
 	)
 	require.Empty(t, exceptions)
-	daily, err := buildUsageDailyContributions(survivors, resolver)
+	daily, _, err := buildUsageDailyContributions(survivors, resolver)
 	require.NoError(t, err)
 	require.Len(t, daily, 1)
 	assert.Equal(t, int64(20), daily[0].OutputTokens)
@@ -389,12 +389,15 @@ func TestBuildUsageDailyContributionsPricesBeforeSumming(t *testing.T) {
 		},
 	}})
 
-	daily, err := buildUsageDailyContributions(
+	daily, inputs, err := buildUsageDailyContributions(
 		[]usageRollupSurvivor{{Fact: first}, {Fact: second}}, resolver,
 	)
 	require.NoError(t, err)
 	require.Len(t, daily, 1)
 	assert.Equal(t, int64(2), daily[0].CostMicrodollars)
+	assert.Equal(t, []usagePricingInput{{
+		ReportedModel: "model-a", CanonicalModel: "model-a",
+	}}, inputs, "both facts share one pricing lookup")
 }
 
 func rollupSnapshotFact(
@@ -432,7 +435,7 @@ func rollupGeneralFact(
 	}
 }
 
-func TestPriceCopilotStoreRequestsWithoutMessageOrdinal(t *testing.T) {
+func TestPriceCopilotRequestsWithoutMessageOrdinal(t *testing.T) {
 	resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
 		ModelPattern: "gpt-5.4",
 		Rates: export.ModelRates{
@@ -445,17 +448,19 @@ func TestPriceCopilotStoreRequestsWithoutMessageOrdinal(t *testing.T) {
 	}})
 	for _, tc := range []struct {
 		name             string
+		source           string
 		inputs           []int64
 		wantMicrodollars int64
 	}{
-		{"one large call", []int64{300_000}, 1_500_000},
-		{"two smaller calls", []int64{150_000, 150_000}, 750_000},
+		{"session-store/one large call", "session-store", []int64{300_000}, 1_500_000},
+		{"session-store/two smaller calls", "session-store", []int64{150_000, 150_000}, 750_000},
+		{"usage-record/one large call", "usage-record", []int64{300_000}, 1_500_000},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var total int64
 			for _, input := range tc.inputs {
 				fact, ok := usagefacts.FromEvent(usagefacts.EventInput{
-					Source: "session-store", Model: "gpt-5.4", InputTokens: input,
+					Source: tc.source, Model: "gpt-5.4", InputTokens: input,
 				})
 				require.True(t, ok)
 				got, err := priceUsageFact(usagePriceInput{ReportedModel: fact.Model, Fact: fact}, resolver)

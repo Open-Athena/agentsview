@@ -17,7 +17,7 @@ import (
 func reconcilePinnedMessages(
 	ctx context.Context, tx *sql.Tx, sessionID string,
 ) error {
-	pins, err := snapshotPinnedMessages(ctx, tx, sessionID)
+	pins, err := snapshotPinnedMessages(ctx, tx, sessionID, 0)
 	if err != nil {
 		return err
 	}
@@ -563,7 +563,7 @@ func TestRestorePinnedMessagesPreservesPinCreatedAfterSnapshot(t *testing.T) {
 
 	tx, err := pg.BeginTx(ctx, nil)
 	require.NoError(t, err, "begin tx")
-	pins, err := snapshotPinnedMessages(ctx, tx, "pg-pin-snapshot-race")
+	pins, err := snapshotPinnedMessages(ctx, tx, "pg-pin-snapshot-race", 0)
 	if err != nil {
 		_ = tx.Rollback()
 		t.Fatalf("snapshotPinnedMessages: %v", err)
@@ -636,7 +636,7 @@ func TestPinMessageSerializesWithSessionReplacement(t *testing.T) {
 	store, err := NewStore(pgURL, schema, true)
 	require.NoError(t, err, "NewStore")
 	defer store.Close()
-	store.pg.SetMaxOpenConns(1)
+	store.DB().SetMaxOpenConns(1)
 	_, err = store.pg.ExecContext(ctx, `SET lock_timeout = '50ms'`)
 	require.NoError(t, err, "set lock timeout")
 
@@ -856,7 +856,7 @@ func TestRestorePinnedMessagesUsesResolvedAnchorOrdinalForNewDuplicateUUID(t *te
 	tx, err := pg.BeginTx(ctx, nil)
 	require.NoError(t, err, "begin tx")
 	pins, err := snapshotPinnedMessages(
-		ctx, tx, "pg-pin-shifted-duplicate",
+		ctx, tx, "pg-pin-shifted-duplicate", 0,
 	)
 	if err != nil {
 		_ = tx.Rollback()
@@ -954,7 +954,7 @@ func restoreIdenticalDuplicatePins(
 
 	tx, err := pg.BeginTx(ctx, nil)
 	require.NoError(t, err, "begin tx")
-	pins, err := snapshotPinnedMessages(ctx, tx, sessionID)
+	pins, err := snapshotPinnedMessages(ctx, tx, sessionID, 0)
 	if err != nil {
 		_ = tx.Rollback()
 		t.Fatalf("snapshotPinnedMessages: %v", err)
@@ -1090,7 +1090,7 @@ func TestRestorePinnedMessagesFollowsShiftedEqualLegacyMessages(
 
 	tx, err := pg.BeginTx(ctx, nil)
 	require.NoError(t, err, "begin tx")
-	pins, err := snapshotPinnedMessages(ctx, tx, sessionID)
+	pins, err := snapshotPinnedMessages(ctx, tx, sessionID, 0)
 	if err != nil {
 		_ = tx.Rollback()
 		t.Fatalf("snapshotPinnedMessages: %v", err)

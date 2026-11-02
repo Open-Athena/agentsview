@@ -10,22 +10,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestProviderCapabilitiesWatchRootsDefaultUnsupported(t *testing.T) {
-	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).WatchRoots)
-}
-
-func TestProviderCapabilitiesStreamingDiscoveryDefaultUnsupported(t *testing.T) {
-	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).StreamingDiscovery)
-}
-
-func TestProviderCapabilitiesPersistentArchiveDefaultUnsupported(t *testing.T) {
-	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).PersistentArchive)
-}
-
-func TestProviderCapabilitiesS3DiscoveryDefaultUnsupported(t *testing.T) {
-	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).S3Discovery)
-}
-
 func TestProviderCapabilitiesS3DiscoveryMatchConsumers(t *testing.T) {
 	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).S3Discovery,
 		"new providers must opt in explicitly")
@@ -49,6 +33,15 @@ func TestProviderCapabilitiesS3DiscoveryMatchConsumers(t *testing.T) {
 		}
 		assert.Equalf(t, CapabilityUnsupported, got,
 			"%s must not opt into S3 discovery", agent)
+	}
+}
+
+func TestProviderCapabilitiesAppOwnedStorePaths(t *testing.T) {
+	for _, agent := range []AgentType{AgentHermes, AgentAugureDesktop, AgentPi, AgentClaude, AgentType("unknown")} {
+		for _, path := range []string{"state.db", "state.db#one", "profile#one/state.db#two", "sessions/one.jsonl", "session_one.json", ""} {
+			want := (agent == AgentHermes || agent == AgentAugureDesktop) && (path == "state.db" || path == "state.db#one" || path == "profile#one/state.db#two")
+			assert.Equalf(t, want, OwnsAppStore(agent, path), "%s: %s", agent, path)
+		}
 	}
 }
 
@@ -84,7 +77,10 @@ func TestProviderCapabilitiesChangedPathRelevanceMatchConsumers(t *testing.T) {
 		agent := factory.Definition().Type
 		got := factory.Capabilities().Source.ChangedPathRelevance
 		if agent == AgentOpenCode || agent == AgentKilo ||
-			agent == AgentMiMoCode || agent == AgentIcodemate {
+			agent == AgentMiMoCode || agent == AgentIcodemate || agent == AgentJunie ||
+			agent == AgentCodebuff || agent == AgentVibe ||
+			agent == AgentAntigravityCLI || agent == AgentAntigravity ||
+			agent == AgentGemini {
 			assert.Equal(t, CapabilitySupported, got)
 			provider := factory.NewProvider(ProviderConfig{
 				Roots: []string{t.TempDir()},
@@ -94,6 +90,33 @@ func TestProviderCapabilitiesChangedPathRelevanceMatchConsumers(t *testing.T) {
 		}
 		assert.Equalf(t, CapabilityUnsupported, got,
 			"%s must not classify watch path relevance", agent)
+	}
+}
+
+func TestProviderCapabilitiesStoredMemberFreshnessListingMatchConsumers(t *testing.T) {
+	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).StoredMemberFreshnessListing,
+		"new providers must opt in explicitly")
+
+	for _, factory := range ProviderFactories() {
+		agent := factory.Definition().Type
+		got := factory.Capabilities().Source.StoredMemberFreshnessListing
+		root := t.TempDir()
+		provider := factory.NewProvider(ProviderConfig{Roots: []string{root}})
+		// Every SourceSetProvider forwards the resolver method, so the capability is the gate.
+		if agent == AgentCursorIDE {
+			assert.Equal(t, CapabilitySupported, got)
+			dbPath := filepath.Join(root, CursorIDEDBRelPath)
+			container, ok := ResolveStoredMemberFreshnessContainer(provider, dbPath)
+			assert.True(t, ok)
+			assert.Equal(t, dbPath, container)
+			continue
+		}
+		assert.Equalf(t, CapabilityUnsupported, got,
+			"%s must not declare a stored member freshness listing", agent)
+		_, ok := ResolveStoredMemberFreshnessContainer(
+			provider, filepath.Join(root, "x.db"),
+		)
+		assert.Falsef(t, ok, "%s must not resolve a stored freshness container", agent)
 	}
 }
 

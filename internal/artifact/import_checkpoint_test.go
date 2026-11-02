@@ -78,14 +78,14 @@ func TestFutureArtifactVersionErrorsIdentifyDependencyKind(t *testing.T) {
 
 	t.Run("manifest", func(t *testing.T) {
 		_, err := decodeManifestWithLimits(
-			[]byte(`{"origin":"contract-a1b2c3","v":5}`),
+			fmt.Appendf(nil, `{"origin":"contract-a1b2c3","v":%d}`, manifestFormatVersion+1),
 			productionArtifactLimits(),
 		)
 		require.ErrorIs(t, err, errFutureArtifactVersion)
 		var future *futureArtifactVersionError
 		require.ErrorAs(t, err, &future)
 		assert.Equal(t, Kind(KindManifests), future.Kind)
-		assert.Equal(t, 5, future.Version)
+		assert.Equal(t, manifestFormatVersion+1, future.Version)
 	})
 
 	t.Run("segment", func(t *testing.T) {
@@ -104,6 +104,16 @@ func TestFutureArtifactVersionErrorsIdentifyDependencyKind(t *testing.T) {
 		assert.Equal(t, Kind(KindSegments), future.Kind)
 		assert.Equal(t, messageSegmentFormatVersion+1, future.Version)
 	})
+}
+
+func TestFutureManifestWithOtherPlanUsageShapeWaits(t *testing.T) {
+	t.Parallel()
+
+	_, err := decodeManifestWithLimits(
+		fmt.Appendf(nil, `{"origin":"contract-a1b2c3","plan_usage":[],"v":%d}`, manifestFormatVersion+1),
+		productionArtifactLimits(),
+	)
+	require.ErrorIs(t, err, errFutureArtifactVersion)
 }
 
 func TestFutureSegmentVersionPrecedesCurrentRecordLimit(t *testing.T) {
@@ -160,6 +170,28 @@ func TestImportCollectionBoundaries(t *testing.T) {
 		require.NoError(t, err)
 		_, err = decodeManifestWithLimits(body, limits)
 		require.Error(t, err)
+	})
+
+	t.Run("manifest plan usage groups", func(t *testing.T) {
+		limits := productionArtifactLimits()
+		limits.planUsageGroups = 2
+		m := importTestManifest("session")
+		m.PlanUsage = &artifactPlanUsage{
+			Groups: make([]db.SessionPlanUsageGroup, 2),
+		}
+		body, err := canonicalJSON(m)
+		require.NoError(t, err)
+		decoded, err := decodeManifestWithLimits(body, limits)
+		require.NoError(t, err)
+		require.NotNil(t, decoded.PlanUsage)
+		assert.Len(t, decoded.PlanUsage.Groups, 2)
+
+		m.PlanUsage.Groups = append(m.PlanUsage.Groups, db.SessionPlanUsageGroup{})
+		body, err = canonicalJSON(m)
+		require.NoError(t, err)
+		_, err = decodeManifestWithLimits(body, limits)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "manifest plan usage group limit exceeded")
 	})
 
 	t.Run("manifest segments", func(t *testing.T) {

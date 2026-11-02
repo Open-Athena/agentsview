@@ -1,5 +1,5 @@
 // ABOUTME: Builds and serves the agentsview MCP server (stdio or
-// ABOUTME: StreamableHTTP) over the supported read-only retrieval tools.
+// ABOUTME: StreamableHTTP) over the supported read-only history tools.
 package mcp
 
 import (
@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"go.kenn.io/agentsview/internal/apiclient"
 	"go.kenn.io/agentsview/internal/mcpdiscovery"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -24,14 +25,25 @@ import (
 // Tool names. The same constant is used to register a tool and to refer
 // to it in tests.
 const (
-	ToolSearchSessions     = "search_sessions"
-	ToolQueryRecall        = "query_recall"
-	ToolListSessions       = "list_sessions"
-	ToolGetSessionOverview = "get_session_overview"
-	ToolGetMessages        = "get_messages"
-	ToolSearchContent      = "search_content"
-	ToolGetMemoryStatus    = "get_memory_status"
-	ToolGetUsageSummary    = "get_usage_summary"
+	ToolSearchSessions       = "search_sessions"
+	ToolQueryRecall          = "query_recall"
+	ToolListSessions         = "list_sessions"
+	ToolGetSessionOverview   = "get_session_overview"
+	ToolGetMessages          = "get_messages"
+	ToolSearchContent        = "search_content"
+	ToolGetMemoryStatus      = "get_memory_status"
+	ToolGetUsageSummary      = "get_usage_summary"
+	ToolGetSessionUsage      = "get_session_usage"
+	ToolGetToolCalls         = "get_tool_calls"
+	ToolGetRecentEdits       = "get_recent_edits"
+	ToolGetChildSessions     = "get_child_sessions"
+	ToolCompareUsage         = "compare_usage"
+	ToolGetActivityReport    = "get_activity_report"
+	ToolGetToolUsage         = "get_tool_usage"
+	ToolGetQualitySignals    = "get_quality_signals"
+	ToolSearchDocs           = "search_docs"
+	ToolGetFrictionDigest    = "get_friction_digest"
+	ToolListFrictionPatterns = "list_friction_patterns"
 )
 
 // Profile selects the tools advertised by an MCP server while keeping their
@@ -93,6 +105,20 @@ func newServer(opts ServeOptions) *mcp.Server {
 		Version: version,
 	}, &mcp.ServerOptions{Instructions: "Use returned web_url values when linking to recorded sessions."})
 
+	s.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(ctx context.Context, method string, request mcp.Request) (mcp.Result, error) {
+			if method != "tools/call" {
+				return next(ctx, method, request)
+			}
+			ctx, stale := apiclient.TrackArchiveFreshness(ctx, nil)
+			result, err := next(ctx, method, request)
+			if call, ok := result.(*mcp.CallToolResult); ok && call != nil && stale() {
+				call.Content = append(call.Content, &mcp.TextContent{Text: "Warning: " + apiclient.ArchiveStaleWarning})
+			}
+			return result, err
+		}
+	})
+
 	t := &toolset{svc: opts.Service, now: opts.Now, version: version}
 	readOnly := &mcp.ToolAnnotations{ReadOnlyHint: true}
 	memoryOnly := opts.Profile == ProfileMemory
@@ -128,10 +154,11 @@ func newServer(opts ServeOptions) *mcp.Server {
 
 		mcp.AddTool(s, &mcp.Tool{
 			Name: ToolListSessions,
-			Description: "List recorded agent sessions with filters (project, agent, machine, date range). " +
+			Description: "List recorded agent sessions with filters (project, agent, machine, date range, labels, pull request). " +
 				"Returns compact metadata rows, newest first. For prior-work questions, prefer search_content " +
 				"with mode hybrid or semantic when a vector search index is configured; use search_sessions " +
-				"for keyword search.",
+				"for keyword search. One-shot and automated sessions are excluded by default; " +
+				"set include_one_shot or include_automated to include them.",
 			Annotations: readOnly,
 		}, t.listSessions)
 
@@ -165,7 +192,7 @@ func newServer(opts ServeOptions) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: ToolSearchContent,
-		Description: "Search raw session text, including tool inputs and results. When a vector search index is " +
+		Description: "Search raw session text, including thinking, tool inputs, and results. When a vector search index is " +
 			"configured, prefer mode hybrid (semantic similarity plus keywords) or semantic for finding " +
 			"prior work and answering contextual questions, especially when the exact wording is unknown. " +
 			"If these modes report not available, use terms when every literal term must occur within one " +
@@ -182,9 +209,100 @@ func newServer(opts ServeOptions) *mcp.Server {
 		mcp.AddTool(s, &mcp.Tool{
 			Name: ToolGetUsageSummary,
 			Description: "Aggregate token usage and cost across all agents: totals plus per-day breakdown, " +
-				"filterable by project, agent, machine, and date range.",
+				"filterable by project, agent, machine, and date range. Use get_session_usage for one " +
+				"session's breakdown.",
 			Annotations: readOnly,
 		}, t.usageSummary)
+
+		mcp.AddTool(s, &mcp.Tool{
+			Name: ToolGetSessionUsage,
+			Description: "Explain one session's token usage and cost, the same report as `agentsview session " +
+				"usage`. Call it after get_activity_report with sessions_sort cost finds an expensive " +
+				"session. Returns total output and peak context tokens, cost and its " +
+				"source, models with no known price, input, output, and cache read and write tokens and " +
+				"cost per model, and a page of per-request rows (breakdown_sort cost puts the most " +
+				"expensive requests first). Totals include subagent sessions unless own_only is set. " +
+				"Reads the archive as stored without refreshing source files.",
+			Annotations: readOnly,
+		}, t.sessionUsage)
+
+		mcp.AddTool(s, &mcp.Tool{
+			Name: ToolGetToolCalls,
+			Description: "List the tool calls one session made, in order: tool name, category, input, and " +
+				"result size. Filter by category (for example Edit, Write, or Bash) to see what the agent " +
+				"ran or changed. Inputs have secret-shaped values masked and are cut to max_input_chars.",
+			Annotations: readOnly,
+		}, t.toolCalls)
+
+		mcp.AddTool(s, &mcp.Tool{
+			Name: ToolGetRecentEdits,
+			Description: "Find which sessions edited a file. Returns files whose path contains path, newest " +
+				"edit first, each with its recent Edit and Write calls and the session that made each one.",
+			Annotations: readOnly,
+		}, t.recentEdits)
+
+		mcp.AddTool(s, &mcp.Tool{
+			Name:        ToolGetChildSessions,
+			Description: "List the sub-agent and fork sessions started from one session.",
+			Annotations: readOnly,
+		}, t.childSessions)
+
+		mcp.AddTool(s, &mcp.Tool{
+			Name: ToolCompareUsage,
+			Description: "Compare token usage and cost between two models or two projects over one date " +
+				"range. Returns each side's totals and the differences between them.",
+			Annotations: readOnly,
+		}, t.compareUsage)
+
+		mcp.AddTool(s, &mcp.Tool{
+			Name: ToolGetActivityReport,
+			Description: "Report agent time, sessions, and cost for a day, week, month, or custom range: " +
+				"totals, the busiest moment, breakdowns by project, model, and agent, and a page of the " +
+				"sessions in the range. Page through the sessions with sessions_cursor. Call " +
+				"get_session_usage on a session to see where its cost came from.",
+			Annotations: readOnly,
+		}, t.activityReport)
+
+		mcp.AddTool(s, &mcp.Tool{
+			Name: ToolGetToolUsage,
+			Description: "Show which tools agents call and how often, by category, agent, and tool name, " +
+				"with a weekly trend. Use get_quality_signals for tool failures and retries.",
+			Annotations: readOnly,
+		}, t.toolUsage)
+
+		mcp.AddTool(s, &mcp.Tool{
+			Name: ToolGetQualitySignals,
+			Description: "Show where agents struggled: health grades, outcomes, tool failures and retries, " +
+				"edit churn, context pressure, and prompt quality, by agent and project. Set signal to " +
+				"also get example sessions for one signal.",
+			Annotations: readOnly,
+		}, t.qualitySignals)
+
+		mcp.AddTool(s, &mcp.Tool{
+			Name: ToolSearchDocs,
+			Description: "Search the AgentsView guides for setup, configuration, MCP, sync, search, and " +
+				"usage reporting. Returns matching sections with links to the published pages.",
+			Annotations: readOnly,
+		}, searchDocs)
+	}
+
+	if !memoryOnly && service.SupportsFriction(opts.Service) {
+		mcp.AddTool(s, &mcp.Tool{
+			Name: ToolGetFrictionDigest,
+			Description: "Read one dated Friction Log digest: heuristic findings (user corrections, " +
+				"tool errors, workarounds, deferrals, health patterns, frustration, interruptions) and P0 " +
+				"alerts for one local day. " +
+				"format markdown returns the rendered digest; summary returns the counts-only object. " +
+				"Findings are deterministic heuristics, not ground truth.",
+			Annotations: readOnly,
+		}, t.frictionDigest)
+		mcp.AddTool(s, &mcp.Tool{
+			Name: ToolListFrictionPatterns,
+			Description: "List recurring friction patterns ranked by occurrences across digests, with " +
+				"first/last seen dates, distinct session counts, and a web_url for the latest occurrence. " +
+				"Filter by kind or since (YYYY-MM-DD).",
+			Annotations: readOnly,
+		}, t.listFrictionPatterns)
 	}
 
 	return s

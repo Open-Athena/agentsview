@@ -35,6 +35,10 @@ const services = vi.hoisted(() => {
   };
 });
 
+const reportTelemetry = vi.hoisted(() => vi.fn());
+const reportErrorShown = vi.hoisted(() => vi.fn());
+vi.mock("../../utils/telemetry.js", () => ({ reportTelemetry, reportErrorShown }));
+
 const sessionState = vi.hoisted(() => ({
   sessions: {
     activeSessionId: "session-123",
@@ -102,6 +106,31 @@ describe("PublishModal", () => {
     ui.clearPublishTarget();
     ui.publishSecret = false;
     document.body.innerHTML = "";
+  });
+
+  it("counts a displayed publish failure", async () => {
+    reportErrorShown.mockClear();
+    services.postApiV1SessionsByIdPublish.mockRejectedValueOnce(new Error("Publish failed"));
+    ui.activeModal = "publish";
+    component = mount(PublishModal, { target: document.body });
+    services.resolveConfig({ configured: true });
+    await flushAsync();
+    expect(document.querySelector(".modal-error-text")?.textContent).toBe("Publish failed");
+    expect(reportErrorShown).toHaveBeenCalledExactlyOnceWith("export");
+  });
+
+  it.each([
+    [null, "gist"],
+    [{ kind: "insight" as const, id: 42 }, "insight_gist"],
+  ])("reports export_run when publishing %o", async (target, format) => {
+    reportTelemetry.mockClear();
+    if (target) ui.setPublishTarget(target);
+    ui.activeModal = "publish";
+    component = mount(PublishModal, { target: document.body });
+    services.resolveConfig({ configured: true });
+    await flushAsync();
+
+    expect(reportTelemetry).toHaveBeenCalledExactlyOnceWith("export_run", { format });
   });
 
   it("does not publish the active session after an insight publish closes during setup", async () => {

@@ -12,8 +12,3 @@ func (s *Store) GetLongestUserPrompts(
 ) ([]db.LongestUserPrompt, error) {
 	return []db.LongestUserPrompt{}, nil
 }
-
-// SetSessionPrivate is a local redaction control; the replica is read-only.
-func (s *Store) SetSessionPrivate(_ context.Context, _ string, _ bool) error {
-	return db.ErrReadOnly
-}
