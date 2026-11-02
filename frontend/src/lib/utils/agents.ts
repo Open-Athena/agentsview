@@ -8,9 +8,11 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
   { name: "claude", color: "var(--accent-blue)" },
   { name: "cowork", color: "var(--accent-sky)", label: "Claude Cowork" },
   { name: "codex", color: "var(--accent-green)" },
+  { name: "traex", color: "var(--accent-coral)", label: "TraeX" },
   { name: "copilot", color: "var(--accent-amber)" },
   { name: "devin", color: "var(--accent-red)", label: "Devin" },
   { name: "gemini", color: "var(--accent-rose)" },
+  { name: "gemini-apps", color: "var(--accent-rose)", label: "Gemini Apps" },
   { name: "opencode", color: "var(--accent-purple)" },
   { name: "kilo", color: "var(--accent-purple)", label: "Kilo" },
   { name: "kilo-legacy", color: "var(--accent-purple)", label: "Kilo (legacy)" },
@@ -41,6 +43,11 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
     name: "deepseek-tui",
     color: "var(--accent-cyan)",
     label: "DeepSeek TUI",
+  },
+  {
+    name: "deepseek-harness",
+    color: "var(--accent-cyan)",
+    label: "DeepSeek Harness",
   },
   {
     name: "openclaw",
@@ -86,6 +93,8 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
   { name: "roocode", color: "var(--accent-rose)", label: "RooCode" },
   { name: "poolside", color: "var(--accent-cyan)", label: "Poolside" },
   { name: "omnigent", color: "var(--accent-teal)", label: "Omnigent" },
+  { name: "codebuff", color: "var(--accent-amber)", label: "Codebuff" },
+  { name: "freebuff", color: "var(--accent-sky)", label: "Freebuff" },
 ];
 
 const agentColorMap = new Map(
@@ -116,7 +125,7 @@ export function agentColor(agent: string): string {
   return agentColorMap.get(agent) ?? defaultFillColor;
 }
 
-export function accentForeground(color: string): string {
+function accentForeground(color: string): string {
   return accentForegroundMap.get(color) ?? "var(--accent-blue-foreground)";
 }
 

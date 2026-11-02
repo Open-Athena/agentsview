@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"embed"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -91,14 +91,6 @@ func initFallbackPricing() {
 	slices.SortFunc(merged, func(a, b ModelPricing) int {
 		return strings.Compare(a.ModelPattern, b.ModelPattern)
 	})
-	// The bundled snapshot (and the curated supplemental aliases) ship only
-	// the 5m cache-write rate (LiteLLM exposes no 1h rate, and the pinned
-	// artifact predates the fork's 1h column). Derive the 1h rate at load so
-	// the offline fallback prices 1h ephemeral cache writes correctly,
-	// matching the live LiteLLM path.
-	for i := range merged {
-		catalog.Fill1hCacheRate(&merged[i])
-	}
 	fallbackPricing = merged
 	FallbackVersion = snapshot.Version
 	SeedVersion = snapshot.Version + "+supplemental-" + supplementalVersion

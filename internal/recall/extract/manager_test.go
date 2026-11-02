@@ -3,7 +3,7 @@ package extract
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"net/http"
@@ -185,7 +185,7 @@ func modelServer(
 					Content string `json:"content"`
 				} `json:"messages"`
 			}
-			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			if err := json.UnmarshalRead(r.Body, &payload); err != nil {
 				t.Errorf("decoding request: %v", err)
 			}
 			text := payload.Messages[len(payload.Messages)-1].Content
@@ -983,6 +983,7 @@ func TestManagerTryPassDropsWhenBusy(t *testing.T) {
 	}()
 	// The first model call proves the background pass holds the pass lock.
 	<-inFlight
+	require.ErrorIs(t, m.Activate(ctx), ErrPassRunning)
 	started, _, err := m.TryPass(ctx, PassOptions{})
 	if err != nil {
 		t.Fatalf("TryPass: %v", err)

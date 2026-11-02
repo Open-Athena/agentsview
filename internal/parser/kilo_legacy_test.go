@@ -5,7 +5,7 @@
 package parser
 
 import (
-	"encoding/json"
+	"encoding/json/v2"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -464,6 +464,21 @@ func TestParseKiloLegacyMCPToolCallUnit(t *testing.T) {
 	require.NotNil(t, tcLegacy)
 	assert.Equal(t, "readFile", tcLegacy.ToolName)
 	assert.Equal(t, "Read", tcLegacy.Category)
+}
+
+func TestBuildKiloLegacyMCPInputJSONDeterministic(t *testing.T) {
+	assert.Equal(t, `{"a":1,"z":2}`, buildKiloLegacyMCPInputJSON(
+		map[string]any{
+			"arguments": map[string]any{"z": 2, "a": 1},
+		},
+	))
+	assert.Equal(t,
+		`{"arguments":"invalid","serverName":"srv","toolName":"tool"}`,
+		buildKiloLegacyMCPInputJSON(map[string]any{
+			"type": "use_mcp_tool", "toolName": "tool",
+			"serverName": "srv", "arguments": "invalid",
+		}),
+	)
 }
 
 func TestParseKiloLegacySessionCompactBoundaryEmitted(t *testing.T) {

@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"log"
@@ -103,29 +103,29 @@ type Message struct {
 	Content   string `json:"content"`
 	// ThinkingText holds the concatenated text of all thinking
 	// blocks for this message; "" if none.
-	ThinkingText      string          `json:"thinking_text"`
-	Timestamp         string          `json:"timestamp"`
-	HasThinking       bool            `json:"has_thinking"`
-	HasToolUse        bool            `json:"has_tool_use"`
-	ContentLength     int             `json:"content_length"`
-	Model             string          `json:"model"`
-	TokenUsage        json.RawMessage `json:"token_usage,omitempty"`
-	ContextTokens     int             `json:"context_tokens"`
-	OutputTokens      int             `json:"output_tokens"`
-	HasContextTokens  bool            `json:"has_context_tokens"`
-	HasOutputTokens   bool            `json:"has_output_tokens"`
-	ClaudeMessageID   string          `json:"claude_message_id,omitempty"`
-	ClaudeRequestID   string          `json:"claude_request_id,omitempty"`
-	ToolCalls         []ToolCall      `json:"tool_calls,omitempty"`
-	ToolResults       []ToolResult    `json:"-"`         // transient, for pairing
-	IsSystem          bool            `json:"is_system"` // persisted, filters search/analytics
-	SourceType        string          `json:"source_type,omitempty"`
-	SourceSubtype     string          `json:"source_subtype,omitempty"`
-	PromptSource      string          `json:"prompt_source,omitempty"`
-	SourceUUID        string          `json:"source_uuid,omitempty"`
-	SourceParentUUID  string          `json:"source_parent_uuid,omitempty"`
-	IsSidechain       bool            `json:"is_sidechain,omitempty"`
-	IsCompactBoundary bool            `json:"is_compact_boundary,omitempty"`
+	ThinkingText      string         `json:"thinking_text"`
+	Timestamp         string         `json:"timestamp"`
+	HasThinking       bool           `json:"has_thinking"`
+	HasToolUse        bool           `json:"has_tool_use"`
+	ContentLength     int            `json:"content_length"`
+	Model             string         `json:"model"`
+	TokenUsage        jsontext.Value `json:"token_usage,omitempty"`
+	ContextTokens     int            `json:"context_tokens"`
+	OutputTokens      int            `json:"output_tokens"`
+	HasContextTokens  bool           `json:"has_context_tokens"`
+	HasOutputTokens   bool           `json:"has_output_tokens"`
+	ClaudeMessageID   string         `json:"claude_message_id,omitempty"`
+	ClaudeRequestID   string         `json:"claude_request_id,omitempty"`
+	ToolCalls         []ToolCall     `json:"tool_calls,omitempty"`
+	ToolResults       []ToolResult   `json:"-"`         // transient, for pairing
+	IsSystem          bool           `json:"is_system"` // persisted, filters search/analytics
+	SourceType        string         `json:"source_type,omitempty"`
+	SourceSubtype     string         `json:"source_subtype,omitempty"`
+	PromptSource      string         `json:"prompt_source,omitempty"`
+	SourceUUID        string         `json:"source_uuid,omitempty"`
+	SourceParentUUID  string         `json:"source_parent_uuid,omitempty"`
+	IsSidechain       bool           `json:"is_sidechain,omitempty"`
+	IsCompactBoundary bool           `json:"is_compact_boundary,omitempty"`
 }
 
 type ModelCount struct {
@@ -729,7 +729,7 @@ func parseEndedAt(s string) (time.Time, error) {
 // transaction. Returns a slice of message IDs parallel to the
 // input msgs slice. The caller must hold db.mu.
 func insertMessagesTx(
-	tx *sql.Tx, msgs []Message,
+	tx transactionQueries, msgs []Message,
 ) ([]int64, error) {
 	ids := make([]int64, len(msgs))
 	nextID, err := nextMessageIDTx(tx)
@@ -764,7 +764,7 @@ func insertMessagesTx(
 	return ids, nil
 }
 
-func nextMessageIDTx(tx *sql.Tx) (int64, error) {
+func nextMessageIDTx(tx transactionQueries) (int64, error) {
 	var n sql.NullInt64
 	if err := tx.QueryRow("SELECT MAX(id) FROM messages").Scan(&n); err != nil {
 		return 0, fmt.Errorf("reading next message id: %w", err)
@@ -794,7 +794,7 @@ func multiRowPlaceholders(rows, cols int) string {
 }
 
 func insertToolCallsChunkTx(
-	tx *sql.Tx, calls []ToolCall,
+	tx transactionQueries, calls []ToolCall,
 ) error {
 	args := make([]any, 0, len(calls)*12)
 	for _, tc := range calls {
@@ -828,7 +828,7 @@ func insertToolCallsChunkTx(
 }
 
 func insertToolResultEventsChunkTx(
-	tx *sql.Tx, rows []toolResultEventRow,
+	tx transactionQueries, rows []toolResultEventRow,
 ) error {
 	args := make([]any, 0, len(rows)*12)
 	for _, r := range rows {
@@ -877,7 +877,7 @@ func nilIfZero(n int) any {
 // insertToolCallsTx batch-inserts tool calls within an
 // existing transaction.
 func insertToolCallsTx(
-	tx *sql.Tx, calls []ToolCall,
+	tx transactionQueries, calls []ToolCall,
 ) error {
 	for start := 0; start < len(calls); start += toolCallInsertRowsPerStmt {
 		end := min(start+toolCallInsertRowsPerStmt, len(calls))
@@ -889,7 +889,7 @@ func insertToolCallsTx(
 }
 
 func insertToolResultEventsTx(
-	tx *sql.Tx, rows []toolResultEventRow,
+	tx transactionQueries, rows []toolResultEventRow,
 ) error {
 	for start := 0; start < len(rows); start += toolResultEventInsertRowsPerStmt {
 		end := min(start+toolResultEventInsertRowsPerStmt, len(rows))
@@ -942,7 +942,8 @@ func (db *DB) InsertMessages(msgs []Message) error {
 	if err := insertToolResultEventsTx(tx, events); err != nil {
 		return err
 	}
-	for _, sessionID := range messageSessionIDs(msgs) {
+	sessionIDs := messageSessionIDs(msgs)
+	for _, sessionID := range sessionIDs {
 		if err := bumpTranscriptRevisionTx(tx, sessionID); err != nil {
 			return err
 		}
@@ -955,7 +956,11 @@ func (db *DB) InsertMessages(msgs []Message) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	db.notifyUsageSessions(sessionIDs)
+	return nil
 }
 
 // invalidateSessionSignalsTx zeroes quality_signal_version so the
@@ -1049,6 +1054,7 @@ func (db *DB) WriteSessionIncremental(
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing incremental write tx: %w", err)
 	}
+	db.notifyUsageSessions([]string{sessionID})
 	return nil
 }
 
@@ -1106,23 +1112,33 @@ func (db *DB) LastClaudeMessageID(sessionID string) string {
 	return s.String
 }
 
-// savedPin captures the minimal pin state needed to re-attach a pin
-// after a full message replacement. source_uuid is the preferred
-// identifier because it survives rewrites where the ordinal stream
-// shifts (e.g. when newly-emitted compact-boundary messages are
-// inserted between previously-seen rows). The ordinal is kept as a
-// fallback for legacy pins on rows that lack a source_uuid.
+// savedPin captures the message identity needed to re-attach a pin
+// after a full message replacement. source_uuid is preferred because
+// it survives ordinal shifts. Role and content, together with the
+// pin's occurrence rank inside its identity group, guard the
+// fallback used for legacy rows and ambiguous source UUIDs: rank
+// follows a message across ordinal shifts that leave the group
+// intact, where a saved ordinal would name a different occurrence.
 type savedPin struct {
-	sourceUUID string
-	ordinal    int
-	note       *string
-	createdAt  string
+	sourceUUID          string
+	role                string
+	content             string
+	ordinal             int
+	sourceUUIDCount     int
+	sourceIdentityCount int
+	sourceIdentityRank  int
+	legacyIdentityCount int
+	legacyIdentityRank  int
+	messageFound        int
+	note                *string
+	createdAt           string
 }
 
 // ReplaceSessionMessages deletes existing and inserts new messages
 // in a single transaction. Any existing pins are preserved by
 // re-attaching them to the new message rows that share the same
-// ordinal (pins for ordinals that no longer exist are dropped).
+// unambiguous message identity (pins whose message no longer exists
+// are dropped).
 func (db *DB) ReplaceSessionMessages(
 	sessionID string, msgs []Message,
 ) error {
@@ -1158,6 +1174,15 @@ func (db *DB) ReplaceSessionMessages(
 		return fmt.Errorf("beginning tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if useDiff {
+		needsPinRemap, err := messageDiffNeedsPinRemapTx(tx, plan)
+		if err != nil {
+			return err
+		}
+		if needsPinRemap {
+			useDiff = false
+		}
+	}
 	queueGenerationBefore, queueExistedBefore, err := artifactExportGenerationTx(
 		tx, sessionID,
 	)
@@ -1197,8 +1222,10 @@ func (db *DB) ReplaceSessionMessages(
 	// clear them and reset the scan state (empty version => secrets scan
 	// --backfill re-scans). ReplaceSessionContent does not call this method; it
 	// supplies fresh findings via replaceSecretFindingsTx directly.
-	if err := replaceSecretFindingsTx(tx, sessionID, nil, 0, ""); err != nil {
-		return err
+	if transcriptChanged {
+		if err := replaceSecretFindingsTx(tx, sessionID, nil, 0, ""); err != nil {
+			return err
+		}
 	}
 	if err := invalidateSessionSignalsTx(tx, sessionID); err != nil {
 		return err
@@ -1211,6 +1238,7 @@ func (db *DB) ReplaceSessionMessages(
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	db.notifyUsageSessions([]string{sessionID})
 	pendingRecallRevocations.flush()
 	return nil
 }
@@ -1250,22 +1278,46 @@ func replaceSessionMessagesTx(
 	return restorePinsTx(tx, sessionID, pins)
 }
 
-func bumpTranscriptRevisionTx(tx *sql.Tx, sessionID string) error {
+// bumpTranscriptRevisionTx advances the transcript revision for a
+// mutated existing session. Touching local_modified_at fires the
+// sync_marker trigger so push targets re-select the session.
+func bumpTranscriptRevisionTx(tx transactionQueries, sessionID string) error {
+	return bumpTranscriptRevision(tx, sessionID, true)
+}
+
+// bumpInsertedTranscriptRevisionTx advances the revision for a session
+// inserted in this same transaction. The INSERT trigger already stamped
+// sync_marker, so skipping the local_modified_at touch avoids a
+// redundant trigger recompute on every bulk-loaded session.
+func bumpInsertedTranscriptRevisionTx(tx transactionQueries, sessionID string) error {
+	return bumpTranscriptRevision(tx, sessionID, false)
+}
+
+func bumpTranscriptRevision(
+	tx transactionQueries, sessionID string, touchModified bool,
+) error {
 	// Advancing the revision also revokes secret-scan freshness in the same
 	// transaction: the mutated transcript has content the recorded scan
 	// never saw, and consumers that require a current scan (extraction's
 	// privacy boundary) must fail closed until a rescan re-stamps it. The
 	// incremental sync path re-scans in a separate later write; the atomic
 	// replace path re-stamps inside this same transaction.
-	result, err := tx.Exec(
-		`UPDATE sessions
+	query := `UPDATE sessions
+		 SET transcript_revision = CAST(
+			CAST(transcript_revision AS INTEGER) + 1 AS TEXT
+		 ),
+		     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+		     secrets_rules_version = ''
+		 WHERE id = ?`
+	if !touchModified {
+		query = `UPDATE sessions
 		 SET transcript_revision = CAST(
 			CAST(transcript_revision AS INTEGER) + 1 AS TEXT
 		 ),
 		     secrets_rules_version = ''
-		 WHERE id = ?`,
-		sessionID,
-	)
+		 WHERE id = ?`
+	}
+	result, err := tx.Exec(query, sessionID)
 	if err != nil {
 		return fmt.Errorf(
 			"bumping transcript revision for %s: %w", sessionID, err,
@@ -1286,7 +1338,7 @@ func bumpTranscriptRevisionTx(tx *sql.Tx, sessionID string) error {
 	return nil
 }
 
-func sessionHasFTSTx(tx *sql.Tx) (bool, error) {
+func sessionHasFTSTx(tx transactionQueries) (bool, error) {
 	var ftsCount int
 	if err := tx.QueryRow(
 		`SELECT count(*) FROM sqlite_master
@@ -1298,7 +1350,7 @@ func sessionHasFTSTx(tx *sql.Tx) (bool, error) {
 }
 
 func deleteSessionMessageRowsTx(
-	tx *sql.Tx, sessionID string,
+	tx transactionQueries, sessionID string,
 ) error {
 	hasFTS, err := sessionHasFTSTx(tx)
 	if err != nil {
@@ -1335,7 +1387,7 @@ func deleteSessionMessageRowsTx(
 	return nil
 }
 
-func deleteSessionMessagesTx(tx *sql.Tx, sessionID string) error {
+func deleteSessionMessagesTx(tx transactionQueries, sessionID string) error {
 	if _, err := tx.Exec(
 		"DELETE FROM tool_calls WHERE session_id = ?",
 		sessionID,
@@ -1376,6 +1428,15 @@ func (db *DB) ReplaceSessionContent(
 		return fmt.Errorf("beginning tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if useDiff {
+		needsPinRemap, err := messageDiffNeedsPinRemapTx(tx, plan)
+		if err != nil {
+			return err
+		}
+		if needsPinRemap {
+			useDiff = false
+		}
+	}
 	queueGenerationBefore, queueExistedBefore, err := artifactExportGenerationTx(
 		tx, sessionID,
 	)
@@ -1429,12 +1490,13 @@ func (db *DB) ReplaceSessionContent(
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	db.notifyUsageSessions([]string{sessionID})
 	pendingRecallRevocations.flush()
 	return nil
 }
 
 func updateSessionAutomationFromMessagesTx(
-	tx *sql.Tx, sessionID string,
+	tx transactionQueries, sessionID string,
 ) error {
 	want, rowAutomated, ok, err := sessionAutomationStateTx(
 		tx, sessionID,
@@ -1449,7 +1511,7 @@ func updateSessionAutomationFromMessagesTx(
 }
 
 func setSessionAutomationFromMessagesTx(
-	tx *sql.Tx, sessionID string,
+	tx transactionQueries, sessionID string,
 ) error {
 	want, rowAutomated, ok, err := sessionAutomationStateTx(
 		tx, sessionID,
@@ -1461,7 +1523,7 @@ func setSessionAutomationFromMessagesTx(
 }
 
 func sessionAutomationStateTx(
-	tx *sql.Tx, sessionID string,
+	tx transactionQueries, sessionID string,
 ) (want, rowAutomated, ok bool, err error) {
 	var (
 		firstMessage     sql.NullString
@@ -1507,7 +1569,7 @@ func sessionAutomationStateTx(
 }
 
 func setSessionAutomationTx(
-	tx *sql.Tx, sessionID string, isAutomated bool,
+	tx transactionQueries, sessionID string, isAutomated bool,
 ) error {
 	if _, err := tx.Exec(`
 		UPDATE sessions
@@ -1524,14 +1586,61 @@ func setSessionAutomationTx(
 	return nil
 }
 
-func savePinsTx(tx *sql.Tx, sessionID string) ([]savedPin, error) {
+func savePinsTx(tx transactionQueries, sessionID string) ([]savedPin, error) {
 	// Save existing pins before deletion. The ON DELETE CASCADE on
 	// pinned_messages.message_id would otherwise wipe them when
 	// messages are deleted below. source_uuid comes from the joined
 	// message row; LEFT JOIN keeps pins on legacy rows whose
-	// message_id no longer resolves cleanly.
+	// message_id no longer resolves cleanly. The counts capture whether
+	// source_uuid, or source_uuid plus role and content, uniquely identify
+	// the old message before it is deleted.
 	pinRows, err := tx.Query(`
 		SELECT p.ordinal, COALESCE(m.source_uuid, ''),
+			COALESCE(m.role, ''), COALESCE(m.content, ''),
+			CASE WHEN m.id IS NULL THEN 0 ELSE 1 END,
+			(
+				SELECT COUNT(*)
+				FROM messages same_uuid
+				WHERE same_uuid.session_id = m.session_id
+					AND same_uuid.source_uuid = m.source_uuid
+					AND m.source_uuid != ''
+			),
+			(
+				SELECT COUNT(*)
+				FROM messages same_identity
+				WHERE same_identity.session_id = m.session_id
+					AND same_identity.source_uuid = m.source_uuid
+					AND same_identity.role = m.role
+					AND same_identity.content = m.content
+					AND m.source_uuid != ''
+			),
+			(
+				SELECT COUNT(*)
+				FROM messages identity_rank
+				WHERE identity_rank.session_id = m.session_id
+					AND identity_rank.source_uuid = m.source_uuid
+					AND identity_rank.role = m.role
+					AND identity_rank.content = m.content
+					AND identity_rank.ordinal <= m.ordinal
+					AND m.source_uuid != ''
+			),
+			(
+				SELECT COUNT(*)
+				FROM messages legacy_identity
+				WHERE legacy_identity.session_id = m.session_id
+					AND legacy_identity.role = m.role
+					AND legacy_identity.content = m.content
+					AND legacy_identity.is_system = 0
+			),
+			(
+				SELECT COUNT(*)
+				FROM messages legacy_rank
+				WHERE legacy_rank.session_id = m.session_id
+					AND legacy_rank.role = m.role
+					AND legacy_rank.content = m.content
+					AND legacy_rank.is_system = 0
+					AND legacy_rank.ordinal <= m.ordinal
+			),
 			p.note, p.created_at
 		FROM pinned_messages p
 		LEFT JOIN messages m ON m.id = p.message_id
@@ -1546,7 +1655,11 @@ func savePinsTx(tx *sql.Tx, sessionID string) ([]savedPin, error) {
 	for pinRows.Next() {
 		var sp savedPin
 		if err := pinRows.Scan(
-			&sp.ordinal, &sp.sourceUUID, &sp.note, &sp.createdAt,
+			&sp.ordinal, &sp.sourceUUID, &sp.role, &sp.content,
+			&sp.messageFound, &sp.sourceUUIDCount,
+			&sp.sourceIdentityCount, &sp.sourceIdentityRank,
+			&sp.legacyIdentityCount, &sp.legacyIdentityRank,
+			&sp.note, &sp.createdAt,
 		); err != nil {
 			return nil, fmt.Errorf("scanning pin: %w", err)
 		}
@@ -1559,42 +1672,158 @@ func savePinsTx(tx *sql.Tx, sessionID string) ([]savedPin, error) {
 }
 
 func restorePinsTx(
-	tx *sql.Tx, sessionID string, pins []savedPin,
+	tx transactionQueries, sessionID string, pins []savedPin,
 ) error {
-	// Re-attach saved pins. Prefer source_uuid (stable across
-	// ordinal-shifting rewrites) and fall back to ordinal for
-	// legacy pins whose source row predates the source_uuid column.
-	// Pins whose row no longer exists by either key are silently
-	// dropped.
+	// Re-attach saved pins only when the old and new message identities
+	// are both unambiguous. A unique source_uuid may move to another
+	// ordinal. Duplicate UUIDs and legacy UUID-less rows must retain
+	// their role, content, and occurrence rank inside an equally sized
+	// identity group. A legacy UUID-less row may gain a provider UUID
+	// while retaining that fallback identity. Otherwise the pin is
+	// dropped rather than duplicated or attached to an unrelated
+	// message.
 	for _, sp := range pins {
-		if sp.sourceUUID != "" {
-			res, err := tx.Exec(`
-				INSERT OR IGNORE INTO pinned_messages
-					(session_id, message_id, ordinal, note, created_at)
-				SELECT ?, m.id, m.ordinal, ?, ?
-				FROM messages m
-				WHERE m.session_id = ? AND m.source_uuid = ?`,
-				sessionID, sp.note, sp.createdAt, sessionID, sp.sourceUUID,
-			)
-			if err != nil {
-				return fmt.Errorf(
-					"restoring pin uuid=%s: %w", sp.sourceUUID, err,
-				)
-			}
-			if n, _ := res.RowsAffected(); n > 0 {
-				continue
-			}
+		if sp.messageFound == 0 {
+			continue
 		}
-		if _, err := tx.Exec(`
+		var err error
+		if sp.sourceUUID != "" {
+			err = restorePinBySourceUUIDTx(tx, sessionID, sp)
+		} else {
+			err = restoreLegacyPinByRankTx(tx, sessionID, sp)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func restorePinBySourceUUIDTx(
+	tx transactionQueries, sessionID string, sp savedPin,
+) error {
+	if sp.sourceUUIDCount == 1 {
+		res, err := tx.Exec(`
 			INSERT OR IGNORE INTO pinned_messages
 				(session_id, message_id, ordinal, note, created_at)
 			SELECT ?, m.id, m.ordinal, ?, ?
 			FROM messages m
-			WHERE m.session_id = ? AND m.ordinal = ?`,
-			sessionID, sp.note, sp.createdAt, sessionID, sp.ordinal,
-		); err != nil {
-			return fmt.Errorf("restoring pin ord=%d: %w", sp.ordinal, err)
+			WHERE m.session_id = ? AND m.source_uuid = ?
+				AND (
+					SELECT COUNT(*)
+					FROM messages same_uuid
+					WHERE same_uuid.session_id = m.session_id
+						AND same_uuid.source_uuid = m.source_uuid
+				) = 1`,
+			sessionID, sp.note, sp.createdAt,
+			sessionID, sp.sourceUUID,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"restoring unique pin uuid=%s: %w",
+				sp.sourceUUID, err,
+			)
 		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf(
+				"checking restored pin uuid=%s: %w",
+				sp.sourceUUID, err,
+			)
+		}
+		if n > 0 {
+			return nil
+		}
+	}
+	// Identical (uuid, role, content) rows are distinguishable only by
+	// position, so require the identity multiplicity to be unchanged
+	// and re-attach at the pin's occurrence rank inside the group.
+	// Rank, unlike the saved ordinal, follows the pinned occurrence
+	// across shifts caused by rows inserted before the group. A
+	// different count means duplicates were inserted or removed and
+	// the rank no longer identifies an occurrence, so the pin is
+	// dropped instead.
+	if _, err := tx.Exec(`
+		INSERT OR IGNORE INTO pinned_messages
+			(session_id, message_id, ordinal, note, created_at)
+		SELECT ?, m.id, m.ordinal, ?, ?
+		FROM messages m
+		WHERE m.session_id = ?
+			AND m.source_uuid = ?
+			AND m.role = ? AND m.content = ?
+			AND (
+				SELECT COUNT(*)
+				FROM messages same_identity
+				WHERE same_identity.session_id = m.session_id
+					AND same_identity.source_uuid = m.source_uuid
+					AND same_identity.role = m.role
+					AND same_identity.content = m.content
+			) = ?
+			AND (
+				SELECT COUNT(*)
+				FROM messages identity_rank
+				WHERE identity_rank.session_id = m.session_id
+					AND identity_rank.source_uuid = m.source_uuid
+					AND identity_rank.role = m.role
+					AND identity_rank.content = m.content
+					AND identity_rank.ordinal <= m.ordinal
+			) = ?`,
+		sessionID, sp.note, sp.createdAt, sessionID,
+		sp.sourceUUID, sp.role, sp.content,
+		sp.sourceIdentityCount, sp.sourceIdentityRank,
+	); err != nil {
+		return fmt.Errorf(
+			"restoring ambiguous pin uuid=%s ord=%d: %w",
+			sp.sourceUUID, sp.ordinal, err,
+		)
+	}
+	return nil
+}
+
+// restoreLegacyPinByRankTx re-attaches a UUID-less pin to the visible
+// row holding the pin's role, content, and occurrence rank within the
+// visible (role, content) group, provided the group kept its size.
+// Rank follows the pinned occurrence across ordinal shifts; matching
+// the saved ordinal instead could attach the pin to an earlier equal
+// message that shifted into its place. A changed group size — or an
+// edit to the pinned message itself — means the pinned message can no
+// longer be identified and the pin is dropped.
+func restoreLegacyPinByRankTx(
+	tx transactionQueries, sessionID string, sp savedPin,
+) error {
+	_, err := tx.Exec(`
+		INSERT OR IGNORE INTO pinned_messages
+			(session_id, message_id, ordinal, note, created_at)
+		SELECT ?, m.id, m.ordinal, ?, ?
+		FROM messages m
+		WHERE m.session_id = ?
+			AND m.is_system = 0
+			AND m.role = ? AND m.content = ?
+			AND (
+				SELECT COUNT(*)
+				FROM messages legacy_identity
+				WHERE legacy_identity.session_id = m.session_id
+					AND legacy_identity.role = m.role
+					AND legacy_identity.content = m.content
+					AND legacy_identity.is_system = 0
+			) = ?
+			AND (
+				SELECT COUNT(*)
+				FROM messages legacy_rank
+				WHERE legacy_rank.session_id = m.session_id
+					AND legacy_rank.role = m.role
+					AND legacy_rank.content = m.content
+					AND legacy_rank.is_system = 0
+					AND legacy_rank.ordinal <= m.ordinal
+			) = ?`,
+		sessionID, sp.note, sp.createdAt, sessionID,
+		sp.role, sp.content,
+		sp.legacyIdentityCount, sp.legacyIdentityRank,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"restoring legacy pin ord=%d: %w", sp.ordinal, err,
+		)
 	}
 	return nil
 }
@@ -1851,7 +2080,7 @@ func scanMessages(rows *sql.Rows) ([]Message, error) {
 			return nil, fmt.Errorf("scanning message: %w", err)
 		}
 		if tokenUsage != "" {
-			m.TokenUsage = json.RawMessage(tokenUsage)
+			m.TokenUsage = jsontext.Value(tokenUsage)
 		}
 		msgs = append(msgs, m)
 	}
@@ -2190,24 +2419,14 @@ func (db *DB) SetToolCallSubagentSession(
 		if err := bumpTranscriptRevisionTx(tx, sessionID); err != nil {
 			return err
 		}
-		// Bump local_modified_at so the sync_marker trigger fires and push
-		// targets re-select the session: the linkage lands in mirrored
-		// data (tool_calls.subagent_session_id and transcript_revision)
-		// but touches no sync_marker signal on its own (see
-		// LinkSubagentSessions for the same pattern).
-		if _, err := tx.Exec(
-			`UPDATE sessions
-			    SET local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-			  WHERE id = ?`,
-			sessionID,
-		); err != nil {
-			return fmt.Errorf(
-				"bumping local_modified_at for %s after subagent link: %w",
-				sessionID, err,
-			)
-		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if changed {
+		db.notifyUsageSessions([]string{sessionID})
+	}
+	return nil
 }
 
 func applyToolCallSubagentLinkTx(
@@ -2418,7 +2637,7 @@ func (db *DB) GetMessageByOrdinal(
 		return nil, err
 	}
 	if tokenUsage != "" {
-		m.TokenUsage = json.RawMessage(tokenUsage)
+		m.TokenUsage = jsontext.Value(tokenUsage)
 	}
 	return &m, nil
 }

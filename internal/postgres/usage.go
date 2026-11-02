@@ -62,7 +62,11 @@ func paddedUTCBound(ts string, hours int) string {
 	if err != nil {
 		return ts
 	}
-	return t.Add(time.Duration(hours) * time.Hour).Format(time.RFC3339)
+	padded := t.Add(time.Duration(hours) * time.Hour)
+	if padded.Year() < 1 {
+		padded = time.Date(1, time.January, 1, 0, 0, 0, 0, time.UTC)
+	}
+	return padded.Format(time.RFC3339)
 }
 
 func appendPGUsageBranchFilterClauses(
@@ -226,6 +230,7 @@ SELECT
 	m.ordinal AS message_ordinal,
 	'message' AS usage_source,
 	COALESCE(m.timestamp, s.started_at) AS ts,
+	m.timestamp AS pricing_ts,
 	m.model,
 	m.token_usage,
 	0 AS input_tokens,
@@ -259,6 +264,7 @@ SELECT
 	ue.message_ordinal,
 	ue.source AS usage_source,
 	COALESCE(ue.occurred_at, s.started_at) AS ts,
+	ue.occurred_at AS pricing_ts,
 	ue.model,
 	'' AS token_usage,
 	ue.input_tokens,
@@ -304,6 +310,7 @@ SELECT
 	m.ordinal AS message_ordinal,
 	'message' AS usage_source,
 	COALESCE(m.timestamp, s.started_at) AS ts,
+	m.timestamp AS pricing_ts,
 	m.model,
 	m.token_usage,
 	0 AS input_tokens,
@@ -331,6 +338,7 @@ SELECT
 	ue.message_ordinal,
 	ue.source AS usage_source,
 	COALESCE(ue.occurred_at, s.started_at) AS ts,
+	ue.occurred_at AS pricing_ts,
 	ue.model,
 	'' AS token_usage,
 	ue.input_tokens,
@@ -360,6 +368,7 @@ SELECT
 	m.ordinal AS message_ordinal,
 	'message' AS usage_source,
 	COALESCE(m.timestamp, s.started_at) AS ts,
+	m.timestamp AS pricing_ts,
 	m.model,
 	m.token_usage,
 	0 AS input_tokens,
@@ -386,6 +395,7 @@ SELECT
 	ue.message_ordinal,
 	ue.source AS usage_source,
 	COALESCE(ue.occurred_at, s.started_at) AS ts,
+	ue.occurred_at AS pricing_ts,
 	ue.model,
 	'' AS token_usage,
 	ue.input_tokens,
@@ -494,6 +504,7 @@ type pgUsageScanRow struct {
 	messageOrdinal           sql.NullInt64
 	usageSource              string
 	ts                       sql.NullTime
+	pricingTS                sql.NullTime
 	model                    string
 	tokenJSON                string
 	inputTokens              int
@@ -523,6 +534,7 @@ type pgDailyUsageScanRow struct {
 	messageOrdinal           sql.NullInt64
 	usageSource              string
 	ts                       sql.NullTime
+	pricingTS                sql.NullTime
 	model                    string
 	tokenJSON                string
 	webSearchRequests        sql.NullInt64
@@ -556,6 +568,7 @@ SELECT
 	u.message_ordinal,
 	u.usage_source,
 	u.ts,
+	u.pricing_ts,
 	u.model,
 	u.token_usage,
 	u.input_tokens,
@@ -643,6 +656,7 @@ SELECT
 	u.message_ordinal,
 	u.usage_source,
 	u.ts,
+	u.pricing_ts,
 	u.model,
 	u.token_usage,
 	` + webSearchColumn + ` AS web_search_requests,
@@ -790,6 +804,7 @@ SELECT
 	NULL::INT AS message_ordinal,
 	'cursor' AS usage_source,
 	cu.occurred_at AS ts,
+	cu.occurred_at AS pricing_ts,
 	cu.model,
 	'' AS token_usage,
 	cu.input_tokens,
@@ -984,6 +999,7 @@ func scanPGUsageRow(rows *sql.Rows) (pgUsageScanRow, error) {
 		&r.messageOrdinal,
 		&r.usageSource,
 		&r.ts,
+		&r.pricingTS,
 		&r.model,
 		&r.tokenJSON,
 		&r.inputTokens,
@@ -1023,6 +1039,7 @@ func scanPGDailyUsageRowWithMachine(
 		&r.messageOrdinal,
 		&r.usageSource,
 		&r.ts,
+		&r.pricingTS,
 		&r.model,
 		&r.tokenJSON,
 		&r.webSearchRequests,
@@ -1049,19 +1066,6 @@ func scanPGDailyUsageRowWithMachine(
 
 func pgTokenJSONCount(usage gjson.Result, key string) int {
 	return db.ClampPlausibleTokens(usage.Get(key).Int())
-}
-
-// pgCacheWriteSplit extracts the 5m/1h ephemeral cache-write token split from a
-// message-source usage JSON blob. Pre-TTL-split logs report only the aggregate
-// cache_creation_input_tokens count; when neither TTL bucket is present the
-// whole aggregate bills at the 5m rate (matching prior all-5m behavior).
-func pgCacheWriteSplit(usage gjson.Result, aggregate int) (cr5m, cr1h int) {
-	cr5m = int(usage.Get("cache_creation.ephemeral_5m_input_tokens").Int())
-	cr1h = int(usage.Get("cache_creation.ephemeral_1h_input_tokens").Int())
-	if cr5m+cr1h == 0 {
-		cr5m = aggregate
-	}
-	return cr5m, cr1h
 }
 
 // pgUsageRowWebSearchRequests returns how many billed Anthropic
@@ -1133,6 +1137,13 @@ func pgUsageLookupModel(model string, ts sql.NullTime) string {
 	return model
 }
 
+func pgUsagePricingTimestamp(ts sql.NullTime) time.Time {
+	if !ts.Valid {
+		return time.Time{}
+	}
+	return ts.Time
+}
+
 func pgDailyUsageAmounts(
 	r pgDailyUsageScanRow, pricing *export.PricingResolver,
 ) (
@@ -1142,18 +1153,13 @@ func pgDailyUsageAmounts(
 ) {
 	inputTok, outputTok, cacheCrTok, cacheRdTok, reasoningTok :=
 		pgDailyUsageRowTokens(r)
-	// Split the cache-creation total by ephemeral TTL so the two are priced
-	// at their separate rates. Message sources carry the breakdown; others
-	// keep everything in the 5m bucket (the legacy rate).
-	var cacheWr5mTok, cacheWr1hTok int
-	if r.usageSource == "message" {
-		cacheWr5mTok, cacheWr1hTok = pgCacheWriteSplit(gjson.Parse(r.tokenJSON), cacheCrTok)
-	} else {
-		cacheWr5mTok = cacheCrTok
-	}
+	cacheCr1hTok := pgUsageRowCacheCreation1hTokens(
+		r.usageSource, r.tokenJSON, cacheCrTok)
 
-	pricedModel, lookup := pricing.Resolve(
-		r.model, pgUsageLookupModel(r.model, r.ts))
+	pricedModel, lookup := pricing.ResolveAt(
+		r.model, pgUsageLookupModel(r.model, r.pricingTS),
+		pgUsagePricingTimestamp(r.pricingTS),
+	)
 	rates := lookup.Rates
 	requestScoped := pgUsageRowIsRequestScoped(r.usageSource, r.messageOrdinal)
 	if r.cost.Valid && r.costSource != db.CopilotReportedCostSource {
@@ -1162,7 +1168,8 @@ func pgDailyUsageAmounts(
 	} else {
 		cost, err = rates.CostForTokensScoped(
 			requestScoped,
-			inputTok, outputTok, reasoningTok, cacheWr5mTok, cacheWr1hTok, cacheRdTok)
+			inputTok, outputTok, reasoningTok, cacheCrTok, cacheCr1hTok,
+			cacheRdTok)
 		if err != nil {
 			return 0, 0, 0, 0, money.Money{}, money.Money{},
 				fmt.Errorf("pricing pg usage row for model %q: %w", r.model, err)
@@ -1190,22 +1197,22 @@ func pgDailyUsageAmounts(
 		return 0, 0, 0, 0, money.Money{}, money.Money{},
 			fmt.Errorf("deriving pg cache read rate for model %q: %w", r.model, err)
 	}
-	cr5mRate, err := money.Sub(
+	creationRate, err := money.Sub(
 		selectedRates.InputPerMTok, selectedRates.CacheWritePerMTok)
 	if err != nil {
 		return 0, 0, 0, 0, money.Money{}, money.Money{},
-			fmt.Errorf("deriving pg 5m cache creation rate for model %q: %w", r.model, err)
+			fmt.Errorf("deriving pg cache creation rate for model %q: %w", r.model, err)
 	}
-	cr1hRate, err := money.Sub(
-		selectedRates.InputPerMTok, selectedRates.CacheWrite1hPerMTok)
+	creation1hRate, err := money.Sub(
+		selectedRates.InputPerMTok, selectedRates.EffectiveCacheWrite1hPerMTok())
 	if err != nil {
 		return 0, 0, 0, 0, money.Money{}, money.Money{},
 			fmt.Errorf("deriving pg 1h cache creation rate for model %q: %w", r.model, err)
 	}
 	savings, err = money.SignedCostPerMillion([]money.RatedTokens{
 		{Tokens: int64(cacheRdTok), Rate: readRate},
-		{Tokens: int64(cacheWr5mTok), Rate: cr5mRate},
-		{Tokens: int64(cacheWr1hTok), Rate: cr1hRate},
+		{Tokens: int64(cacheCrTok - cacheCr1hTok), Rate: creationRate},
+		{Tokens: int64(cacheCr1hTok), Rate: creation1hRate},
 	})
 	if err != nil {
 		return 0, 0, 0, 0, money.Money{}, money.Money{},
@@ -1234,6 +1241,23 @@ func pgDailyUsageRowTokens(
 				r.cacheCreationInputTokens, r.cacheReadInputTokens)
 	}
 	return
+}
+
+// pgUsageRowCacheCreation1hTokens returns the clamped 1h-TTL subset of a
+// message row's cache-write tokens from the nested cache_creation
+// breakdown. Usage events never carry the breakdown. It mirrors
+// db.clampedCacheCreation1hTokens: the flat counter stays authoritative,
+// so the subset never exceeds it.
+func pgUsageRowCacheCreation1hTokens(
+	usageSource, tokenJSON string, cacheCrTok int,
+) int {
+	if usageSource != "message" {
+		return 0
+	}
+	cr1h := pgTokenJSONCount(
+		gjson.Parse(tokenJSON),
+		"cache_creation.ephemeral_1h_input_tokens")
+	return min(cr1h, cacheCrTok)
 }
 
 func pgUsageRowIsRequestScoped(
@@ -1299,7 +1323,6 @@ func pgSessionRowCostWithWebSearchRequests(
 ) (cost money.Money, priced, contributes bool, err error) {
 	var inTok, outTok, crTok, rdTok int
 	reasoningTok := r.reasoningTokens
-	var cr5mTok, cr1hTok int
 	if r.usageSource == "message" {
 		usage := gjson.Parse(r.tokenJSON)
 		inTok = pgTokenJSONCount(usage, "input_tokens")
@@ -1307,16 +1330,18 @@ func pgSessionRowCostWithWebSearchRequests(
 		crTok = pgTokenJSONCount(usage, "cache_creation_input_tokens")
 		rdTok = pgTokenJSONCount(usage, "cache_read_input_tokens")
 		reasoningTok = pgTokenJSONCount(usage, "reasoning_tokens")
-		cr5mTok, cr1hTok = pgCacheWriteSplit(usage, crTok)
 	} else {
 		inTok, outTok, crTok, rdTok = pgUsageEventRowTokens(
 			r.usageSource,
 			r.inputTokens, r.outputTokens,
 			r.cacheCreationInputTokens, r.cacheReadInputTokens)
-		cr5mTok, cr1hTok = crTok, 0
 	}
-	pricedModel, lookup := pricing.Resolve(
-		r.model, pgUsageLookupModel(r.model, r.ts))
+	cr1hTok := pgUsageRowCacheCreation1hTokens(
+		r.usageSource, r.tokenJSON, crTok)
+	pricedModel, lookup := pricing.ResolveAt(
+		r.model, pgUsageLookupModel(r.model, r.pricingTS),
+		pgUsagePricingTimestamp(r.pricingTS),
+	)
 	if r.cost.Valid {
 		pricing.RecordResolvedReported(r.model, pricedModel, lookup)
 		return money.Money{Microdollars: r.cost.Int64}, true, true, nil
@@ -1337,7 +1362,7 @@ func pgSessionRowCostWithWebSearchRequests(
 	requestScoped := pgUsageRowIsRequestScoped(r.usageSource, r.messageOrdinal)
 	cost, err = lookup.Rates.CostForTokensScoped(
 		requestScoped,
-		inTok, outTok, reasoningTok, cr5mTok, cr1hTok, rdTok)
+		inTok, outTok, reasoningTok, crTok, cr1hTok, rdTok)
 	if err != nil {
 		return money.Money{}, false, false,
 			fmt.Errorf("pricing pg session usage for model %q: %w", r.model, err)
@@ -2463,89 +2488,6 @@ func (s *Store) GetUsageSessionCounts(
 	return out, nil
 }
 
-// GetLongestUserPrompts returns the top `limit` longest user-role
-// messages by content_length. Mirrors the SQLite implementation;
-// PG uses $1/$2 placeholders.
-func (s *Store) GetLongestUserPrompts(
-	ctx context.Context, limit int, project string,
-) ([]db.LongestUserPrompt, error) {
-	if limit <= 0 {
-		limit = 20
-	}
-	const previewChars = 200
-
-	pb := &paramBuilder{}
-	query := `
-		SELECT
-			m.session_id,
-			COALESCE(sess.project, '') AS project,
-			m.ordinal,
-			m.content_length,
-			substring(m.content FROM 1 FOR ` +
-		pb.add(previewChars) + `) AS preview,
-			COALESCE(m.timestamp, '') AS timestamp
-		FROM messages m
-		JOIN sessions sess ON sess.id = m.session_id
-		WHERE m.role = 'user'
-		  AND m.is_system = false
-		  AND sess.deleted_at IS NULL
-		  AND COALESCE(sess.relationship_type, '') != 'subagent'
-		  AND m.content NOT LIKE '<task-notification>%'
-		  AND m.content NOT LIKE '<system-reminder>%'
-		  AND m.content NOT LIKE '<command-name>%'
-		  AND m.content NOT LIKE '<local-command-stdout>%'`
-
-	if project != "" {
-		var projects []string
-		for p := range strings.SplitSeq(project, ",") {
-			if p = strings.TrimSpace(p); p != "" {
-				projects = append(projects, p)
-			}
-		}
-		if len(projects) == 1 {
-			query += " AND sess.project = " + pb.add(projects[0])
-		} else if len(projects) > 1 {
-			parts := make([]string, len(projects))
-			for i, p := range projects {
-				parts[i] = pb.add(p)
-			}
-			query += " AND sess.project IN (" +
-				strings.Join(parts, ",") + ")"
-		}
-	}
-
-	query += " ORDER BY m.content_length DESC, m.id DESC LIMIT " +
-		pb.add(limit)
-
-	rows, err := s.pg.QueryContext(ctx, query, pb.args...)
-	if err != nil {
-		return nil, fmt.Errorf(
-			"querying longest user prompts: %w", err,
-		)
-	}
-	defer rows.Close()
-
-	var out []db.LongestUserPrompt
-	for rows.Next() {
-		var p db.LongestUserPrompt
-		if err := rows.Scan(
-			&p.SessionID, &p.Project, &p.Ordinal,
-			&p.ContentLength, &p.Preview, &p.Timestamp,
-		); err != nil {
-			return nil, fmt.Errorf(
-				"scanning longest prompt row: %w", err,
-			)
-		}
-		out = append(out, p)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf(
-			"iterating longest prompt rows: %w", err,
-		)
-	}
-	return out, nil
-}
-
 // appendPGUsageMatchingActivityClauses requires the session to have at
 // least one row that GetUsageMatchingSessionCount's bounded branch would
 // count, mirroring appendUsageMatchingActivityClauses in internal/db so
@@ -2637,4 +2579,87 @@ WHERE `+where, pb.args...).Scan(&count)
 		return 0, fmt.Errorf("iterating matching usage sessions: %w", err)
 	}
 	return len(seen), nil
+}
+
+// GetLongestUserPrompts returns the top `limit` longest user-role
+// messages by content_length. Mirrors the SQLite implementation;
+// PG uses $1/$2 placeholders.
+func (s *Store) GetLongestUserPrompts(
+	ctx context.Context, limit int, project string,
+) ([]db.LongestUserPrompt, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	const previewChars = 200
+
+	pb := &paramBuilder{}
+	query := `
+		SELECT
+			m.session_id,
+			COALESCE(sess.project, '') AS project,
+			m.ordinal,
+			m.content_length,
+			substring(m.content FROM 1 FOR ` +
+		pb.add(previewChars) + `) AS preview,
+			COALESCE(m.timestamp, '') AS timestamp
+		FROM messages m
+		JOIN sessions sess ON sess.id = m.session_id
+		WHERE m.role = 'user'
+		  AND m.is_system = false
+		  AND sess.deleted_at IS NULL
+		  AND COALESCE(sess.relationship_type, '') != 'subagent'
+		  AND m.content NOT LIKE '<task-notification>%'
+		  AND m.content NOT LIKE '<system-reminder>%'
+		  AND m.content NOT LIKE '<command-name>%'
+		  AND m.content NOT LIKE '<local-command-stdout>%'`
+
+	if project != "" {
+		var projects []string
+		for p := range strings.SplitSeq(project, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				projects = append(projects, p)
+			}
+		}
+		if len(projects) == 1 {
+			query += " AND sess.project = " + pb.add(projects[0])
+		} else if len(projects) > 1 {
+			parts := make([]string, len(projects))
+			for i, p := range projects {
+				parts[i] = pb.add(p)
+			}
+			query += " AND sess.project IN (" +
+				strings.Join(parts, ",") + ")"
+		}
+	}
+
+	query += " ORDER BY m.content_length DESC, m.id DESC LIMIT " +
+		pb.add(limit)
+
+	rows, err := s.pg.QueryContext(ctx, query, pb.args...)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"querying longest user prompts: %w", err,
+		)
+	}
+	defer rows.Close()
+
+	var out []db.LongestUserPrompt
+	for rows.Next() {
+		var p db.LongestUserPrompt
+		if err := rows.Scan(
+			&p.SessionID, &p.Project, &p.Ordinal,
+			&p.ContentLength, &p.Preview, &p.Timestamp,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"scanning longest prompt row: %w", err,
+			)
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"iterating longest prompt rows: %w", err,
+		)
+	}
+	return out, nil
 }

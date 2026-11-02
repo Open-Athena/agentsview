@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -53,6 +54,13 @@ type ProviderFactory interface {
 type ProviderConfig struct {
 	Roots   []string
 	Machine string
+	// StableSourceSnapshots reports that source files cannot change during
+	// parsing. Bounded capture enables it after copying quiescent transcripts
+	// so providers can classify an invalid end-of-file record as durable.
+	StableSourceSnapshots bool
+	// SourceMachines labels configured roots with their source machine. A
+	// provider must treat roots owned by another machine as remote metadata.
+	SourceMachines map[string]string
 	// PathRewriter maps an on-disk source path to its canonical stored form.
 	// It is non-nil only during remote (SSH) sync, where source files are read
 	// from a temporary extraction directory but must keep a stable identity
@@ -76,6 +84,7 @@ type ProviderConfig struct {
 // Clone returns an independent config snapshot.
 func (cfg ProviderConfig) Clone() ProviderConfig {
 	cfg.Roots = cfg.RootsCopy()
+	cfg.SourceMachines = maps.Clone(cfg.SourceMachines)
 	return cfg
 }
 
@@ -225,6 +234,32 @@ type StoredSourceHintScope struct {
 // affect one changed path without reading the archive database.
 type StoredSourceHintScopeProvider interface {
 	StoredSourceHintScopes(ChangedPathRequest) []StoredSourceHintScope
+}
+
+// MultiFileStatHasher is an optional capability for providers whose on-disk
+// source layout spans multiple sibling files (Codebuff's
+// chat-messages.json plus run-state.json and chat-meta.json in the same
+// directory, for example). It computes a stable per-component stat digest
+// that the engine's stat-only pre-check compares against a value persisted
+// in the provider_freshness side-table so warm sync over an unchanged
+// archive can short-circuit to zero provider.Fingerprint calls while still
+// catching same-size companion rewrites, offsetting size deltas, and
+// sibling-only directory mutations.
+//
+// Implementations live on the provider implementation; the engine type-
+// asserts a constructed provider against MultiFileStatHasher and caches
+// the result. Single-file providers whose Fingerprint content-hashes the
+// source (Claude, Codex) also implement it: their digest folds the
+// change-time term, so a persisted stat digest preserves in-place-rewrite
+// detection across process restarts without re-reading unchanged content
+// on every pass. Providers that implement neither behavior take the
+// existing stat-only composite path.
+type MultiFileStatHasher interface {
+	// ComputeMultiFileStatHash stats the chat path plus any companion
+	// siblings declared by the provider and returns a stable per-source
+	// digest. The hasher performs its own os.Stat so the engine does not
+	// need to supply FileInfo.
+	ComputeMultiFileStatHash(chatPath string) uint64
 }
 
 // ProviderBase is embedded by concrete providers to make optional source
@@ -568,6 +603,28 @@ func containerAwareReconciliationScopePlan(
 	return plan
 }
 
+// SourceCwdState identifies the authority a provider has for a source's local
+// working directory. Providers that do not participate leave the state at its
+// zero value.
+type SourceCwdState uint8
+
+const (
+	SourceCwdUnspecified SourceCwdState = iota
+	SourceCwdResolved
+	SourceCwdNone
+	SourceCwdAmbiguous
+	SourceCwdUnavailable
+	SourceCwdRemote
+)
+
+// SourceCwdResolution carries optional, provider-derived Cwd metadata. Path is
+// populated only for SourceCwdResolved; the other states describe what the
+// provider knows without exposing provider-specific filesystem knowledge.
+type SourceCwdResolution struct {
+	State SourceCwdState
+	Path  string
+}
+
 // SourceRef is the engine-visible handle for provider-owned source data. It is
 // the only source identity the engine should carry between discovery, changed
 // path classification, lookup, fingerprinting, parsing, skip-cache checks, and
@@ -601,6 +658,9 @@ type SourceRef struct {
 	ReconciliationIdentity string
 	// ProjectHint is advisory metadata for UI grouping and may be empty.
 	ProjectHint string
+	// CwdResolution is optional source metadata used by generic sync freshness
+	// and write preparation. Its zero value preserves existing provider behavior.
+	CwdResolution SourceCwdResolution
 	// DiscoveryMTimeNS is an optional per-source modification time in Unix
 	// nanoseconds captured at discovery. Providers whose sources are virtual --
 	// a shared store fanned out to one source per session, where DisplayPath is
@@ -869,6 +929,9 @@ type ParseRequest struct {
 	Fingerprint SourceFingerprint
 	Machine     string
 	ForceParse  bool
+	// StoredPathResolver maps a canonical remote companion path back to the
+	// materialized file used by this parse.
+	StoredPathResolver func(string) (string, bool)
 }
 
 // ParseOutcome is the full-parse provider output. It is meaningful only when
@@ -999,6 +1062,14 @@ const (
 	IncrementalNeedsFullParse
 )
 
+// ErrIncrementalNeedsFullParse signals that a provider declined the
+// appended tail and the caller must fall back to a full parse that
+// replaces stored rows. It is provider-agnostic; parser-internal
+// fallbacks (Claude, Codex) are mapped to it at the provider seam.
+var ErrIncrementalNeedsFullParse = fmt.Errorf(
+	"incremental parse: appended lines require a replacing full parse",
+)
+
 // ProviderFactories returns one provider factory for every registered agent.
 func ProviderFactories() []ProviderFactory {
 	factories := make([]ProviderFactory, 0, len(Registry))
@@ -1029,6 +1100,8 @@ func providerFactoryForDef(def AgentDef) ProviderFactory {
 		return newCommandCodeProviderFactory(def)
 	case AgentCodex:
 		return newCodexProviderFactory(def)
+	case AgentTraeX:
+		return newTraeXProviderFactory(def)
 	case AgentCopilot:
 		return newCopilotProviderFactory(def)
 	case AgentCowork:
@@ -1041,6 +1114,8 @@ func providerFactoryForDef(def AgentDef) ProviderFactory {
 		return newImportOnlyProviderFactory(def)
 	case AgentDeepSeekTUI:
 		return newDeepSeekTUIProviderFactory(def)
+	case AgentDeepSeekHarness:
+		return newDeepSeekHarnessProviderFactory(def)
 	case AgentForge:
 		return newForgeProviderFactory(def)
 	case AgentDevin:
@@ -1057,6 +1132,8 @@ func providerFactoryForDef(def AgentDef) ProviderFactory {
 		return newGptmeProviderFactory(def)
 	case AgentGemini:
 		return newGeminiProviderFactory(def)
+	case AgentGeminiApps:
+		return newImportOnlyProviderFactory(def)
 	case AgentKimi:
 		return newKimiProviderFactory(def)
 	case AgentKimiWork:
@@ -1129,6 +1206,8 @@ func providerFactoryForDef(def AgentDef) ProviderFactory {
 		return newZedProviderFactory(def)
 	case AgentRooCode:
 		return newRooCodeProviderFactory(def)
+	case AgentCodebuff:
+		return newCodebuffProviderFactory(def)
 	default:
 		panic("missing provider factory for " + string(def.Type))
 	}

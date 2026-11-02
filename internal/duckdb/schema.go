@@ -13,10 +13,9 @@ import (
 // SchemaVersion is the version of the DuckDB mirror schema created by
 // createSchema. The mirror schema is create-only: there are no in-place
 // migrations between versions. A version mismatch means the mirror file
-// must be rebuilt with 'agentsview duckdb push --full'. v10 adds the usage
-// accounting rebuild boundary on top of schema v9's session launch and prompt
-// provenance columns.
-const SchemaVersion = 10
+// must be rebuilt with 'agentsview duckdb push --full'. v12 adds the 1h
+// cache-write rate columns on top of v11's raw GenAI pricing document.
+const SchemaVersion = 12
 
 const schemaVersionMetadataKey = "agentsview_schema_version"
 
@@ -434,6 +433,7 @@ var mirrorTables = []tableSpec{
 			input_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
 			output_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
 			cache_creation_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+			cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
 			cache_read_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
 			updated_at TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY (model_pattern, above_input_tokens),
@@ -445,7 +445,27 @@ var mirrorTables = []tableSpec{
 			{"input_microdollars_per_mtok", "input_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
 			{"output_microdollars_per_mtok", "output_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
 			{"cache_creation_microdollars_per_mtok", "cache_creation_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
+			{"cache_creation_1h_microdollars_per_mtok", "cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
 			{"cache_read_microdollars_per_mtok", "cache_read_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0"},
+			{"updated_at", "updated_at TEXT NOT NULL DEFAULT ''"},
+		},
+	},
+	{
+		name: "genai_pricing",
+		create: `CREATE TABLE IF NOT EXISTS genai_pricing (
+			singleton SMALLINT PRIMARY KEY CHECK (singleton = 1),
+			version TEXT NOT NULL,
+			source_ref TEXT NOT NULL DEFAULT '',
+			source TEXT NOT NULL CHECK (source IN ('embedded', 'fetched')),
+			data_json BLOB NOT NULL,
+			updated_at TEXT NOT NULL DEFAULT ''
+		)`,
+		columns: []columnSpec{
+			{"singleton", "singleton SMALLINT"},
+			{"version", "version TEXT NOT NULL"},
+			{"source_ref", "source_ref TEXT NOT NULL DEFAULT ''"},
+			{"source", "source TEXT NOT NULL"},
+			{"data_json", "data_json BLOB NOT NULL"},
 			{"updated_at", "updated_at TEXT NOT NULL DEFAULT ''"},
 		},
 	},

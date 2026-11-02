@@ -7,7 +7,8 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"encoding/base64"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -309,13 +310,6 @@ func TestStoreListTrashedSessionsOrdersNewestFirstAndCapsAt500(t *testing.T) {
 			TIMESTAMP '2026-01-01 00:00:00' + INTERVAL (i) SECOND
 		FROM range(600) t(i)`)
 	require.NoError(t, err)
-	// A recoverable source-missing tombstone newer than all user trash: if
-	// deletion_cause filtering regressed it would surface as the first row.
-	_, err = duck.ExecContext(ctx, `
-		INSERT INTO sessions (id, project, deleted_at, deletion_cause)
-		VALUES ('tombstone', 'trash-parity',
-			TIMESTAMP '2026-02-01 00:00:00', 'source_missing')`)
-	require.NoError(t, err)
 	_, err = duck.ExecContext(ctx,
 		`INSERT INTO sessions (id, project) VALUES ('active', 'trash-parity')`)
 	require.NoError(t, err)
@@ -323,7 +317,7 @@ func TestStoreListTrashedSessionsOrdersNewestFirstAndCapsAt500(t *testing.T) {
 	trashed, err := store.ListTrashedSessions(ctx)
 	require.NoError(t, err)
 	// Same cap and ordering as the SQLite and PG stores: newest 500 by
-	// deleted_at, excluding active rows and source-missing tombstones.
+	// deleted_at, excluding active rows.
 	require.Len(t, trashed, 500)
 	assert.Equal(t, "trash-599", trashed[0].ID)
 	assert.Equal(t, "trash-100", trashed[499].ID)
@@ -1224,7 +1218,7 @@ func TestDuckDailyAndSessionUsageApplyPricingBandsOnlyToRequests(t *testing.T) {
 	msg := syncMessage(
 		sessionID, 0, "assistant", "request", "2026-03-12T10:00:00.000Z")
 	msg.Model = "banded-model"
-	msg.TokenUsage = json.RawMessage(`{"input_tokens":300000}`)
+	msg.TokenUsage = jsontext.Value(`{"input_tokens":300000}`)
 	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{{
 		Session:  syncSession(sessionID, "proj", "banded", "2026-03-12T10:00:00.000Z", 1),
 		Messages: []db.Message{msg},
@@ -2544,7 +2538,7 @@ func TestDailyUsageHandlesBlankMessageTimestampWithoutSessionStart(t *testing.T)
 				Role:       "assistant",
 				Timestamp:  "",
 				Model:      "claude-test",
-				TokenUsage: json.RawMessage(`{"input_tokens":100,"output_tokens":50}`),
+				TokenUsage: jsontext.Value(`{"input_tokens":100,"output_tokens":50}`),
 			},
 			{
 				SessionID:  sessionID,
@@ -2552,7 +2546,7 @@ func TestDailyUsageHandlesBlankMessageTimestampWithoutSessionStart(t *testing.T)
 				Role:       "assistant",
 				Timestamp:  "",
 				Model:      "claude-test",
-				TokenUsage: json.RawMessage(`{"input_tokens":200,"output_tokens":75}`),
+				TokenUsage: jsontext.Value(`{"input_tokens":200,"output_tokens":75}`),
 			},
 		},
 		DataVersion:     1,
@@ -2680,7 +2674,7 @@ func TestSessionUsagePrefersCompleteClaudeSnapshot(t *testing.T) {
 		"2026-01-13T00:00:00.000Z")
 	first.ClaudeMessageID = "msg-stream"
 	first.ClaudeRequestID = "req-stream"
-	first.TokenUsage = json.RawMessage(
+	first.TokenUsage = jsontext.Value(
 		`{"input_tokens":1000,"output_tokens":5}`)
 	first.OutputTokens = 5
 	second := syncMessage(
@@ -2688,7 +2682,7 @@ func TestSessionUsagePrefersCompleteClaudeSnapshot(t *testing.T) {
 		"2026-01-13T00:01:00.000Z")
 	second.ClaudeMessageID = "msg-stream"
 	second.ClaudeRequestID = "req-stream"
-	second.TokenUsage = json.RawMessage(
+	second.TokenUsage = jsontext.Value(
 		`{"input_tokens":1000,"output_tokens":631}`)
 	second.OutputTokens = 631
 
@@ -2741,7 +2735,7 @@ func TestUsageAggregatesPreferCompleteClaudeSnapshotAcrossSessions(t *testing.T)
 		"2026-01-13T00:00:00.000Z")
 	first.ClaudeMessageID = "msg-stream"
 	first.ClaudeRequestID = "req-stream"
-	first.TokenUsage = json.RawMessage(
+	first.TokenUsage = jsontext.Value(
 		`{"input_tokens":1000,"output_tokens":5}`)
 	first.OutputTokens = 5
 	second := syncMessage(
@@ -2749,7 +2743,7 @@ func TestUsageAggregatesPreferCompleteClaudeSnapshotAcrossSessions(t *testing.T)
 		"2026-01-13T00:01:00.000Z")
 	second.ClaudeMessageID = "msg-stream"
 	second.ClaudeRequestID = "req-stream"
-	second.TokenUsage = json.RawMessage(
+	second.TokenUsage = jsontext.Value(
 		`{"input_tokens":1000,"output_tokens":631}`)
 	second.OutputTokens = 631
 
@@ -2856,7 +2850,7 @@ func TestUsageSessionCountsFilterAfterCrossSessionSnapshotSelection(
 		"count-parent", 0, "assistant", "partial",
 		"2026-01-13T00:00:00.000Z")
 	partial.Model = "partial-model"
-	partial.TokenUsage = json.RawMessage(`{"input_tokens":10,"output_tokens":5}`)
+	partial.TokenUsage = jsontext.Value(`{"input_tokens":10,"output_tokens":5}`)
 	partial.OutputTokens = 5
 	partial.ClaudeMessageID = "count-message"
 	partial.ClaudeRequestID = "count-request"
@@ -2864,7 +2858,7 @@ func TestUsageSessionCountsFilterAfterCrossSessionSnapshotSelection(
 		"count-child", 0, "assistant", "complete",
 		"2026-01-13T00:01:00.000Z")
 	complete.Model = "complete-model"
-	complete.TokenUsage = json.RawMessage(
+	complete.TokenUsage = jsontext.Value(
 		`{"input_tokens":1000,"output_tokens":631}`)
 	complete.OutputTokens = 631
 	complete.ClaudeMessageID = "count-message"
@@ -2908,7 +2902,7 @@ func TestUsageAggregatesPreferLatestEqualOutputSnapshot(t *testing.T) {
 	zMessage.Model = "claude-test"
 	zMessage.ClaudeMessageID = "msg-tie"
 	zMessage.ClaudeRequestID = "req-tie"
-	zMessage.TokenUsage = json.RawMessage(
+	zMessage.TokenUsage = jsontext.Value(
 		`{"input_tokens":900,"output_tokens":100}`)
 	zMessage.OutputTokens = 100
 	aMessage := syncMessage(
@@ -2916,7 +2910,7 @@ func TestUsageAggregatesPreferLatestEqualOutputSnapshot(t *testing.T) {
 	aMessage.Model = "claude-test"
 	aMessage.ClaudeMessageID = "msg-tie"
 	aMessage.ClaudeRequestID = "req-tie"
-	aMessage.TokenUsage = json.RawMessage(
+	aMessage.TokenUsage = jsontext.Value(
 		`{"input_tokens":10,"output_tokens":100}`)
 	aMessage.OutputTokens = 100
 
@@ -3168,7 +3162,7 @@ func TestDuckDBDailyUsageKeepsAuthoritativeCostSessionScoped(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
-		ModelPattern:  "claude-sonnet-4-6",
+		ModelPattern:  "authoritative-cost-model",
 		InputPerMTok:  money.MustParseDollars("10"),
 		OutputPerMTok: money.MustParseDollars("20"),
 	}}))
@@ -3187,7 +3181,7 @@ func TestDuckDBDailyUsageKeepsAuthoritativeCostSessionScoped(t *testing.T) {
 		{
 			Session: authoritative,
 			UsageEvents: []db.UsageEvent{{
-				Source: "shutdown", Model: "claude-sonnet-4-6",
+				Source: "shutdown", Model: "authoritative-cost-model",
 				InputTokens: 1000, OutputTokens: 500,
 				Cost: &reportedCost, CostStatus: "exact",
 				CostSource: db.CopilotReportedCostSource,
@@ -3199,7 +3193,7 @@ func TestDuckDBDailyUsageKeepsAuthoritativeCostSessionScoped(t *testing.T) {
 		{
 			Session: estimated,
 			UsageEvents: []db.UsageEvent{{
-				Source: "shutdown", Model: "claude-sonnet-4-6",
+				Source: "shutdown", Model: "authoritative-cost-model",
 				InputTokens: 1000, OutputTokens: 500,
 				OccurredAt: "2026-01-18T01:01:00.000Z",
 				DedupKey:   "estimated",
@@ -3296,6 +3290,114 @@ func TestDuckDBCostOnlyReportedSessionMatchesSQLite(t *testing.T) {
 		"the row-count path must exclude cost-only reported rows")
 }
 
+// TestDuckDBCostOnlyCodebuffSessionHasTokenDataFalse pins the backend
+// parity rule surfaced by roborev on ab050f8: a Codebuff session whose
+// contributor rows report only explicitCost (cost_source !=
+// 'copilot-reported', zero billable tokens) must NOT flip HasTokenData.
+// (*Store).sessionUsage computes HasTokenData from the session flags
+// alone, matching SQLite and Postgres; a row-derived `hasRows ||`
+// term previously spilled cost-only contributor rows into
+// HasTokenData. Mirrors the copilot pattern in
+// TestDuckDBCostOnlyReportedSessionMatchesSQLite but uses a
+// non-copilot cost_source so the row passes the `contributes = true`
+// gate (the copilot path early-returns).
+func TestDuckDBCostOnlyCodebuffSessionHasTokenDataFalse(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	reportedCost := money.MustParseDollars("0.0250")
+	sess := syncSession(
+		"codebuff:cost-only", "alpha", "cost only",
+		"2026-01-18T00:00:00.000Z", 0)
+	sess.Agent = "codebuff"
+	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{{
+		Session: sess,
+		UsageEvents: []db.UsageEvent{{
+			Source:     "shutdown",
+			Model:      "codebuff-base",
+			Cost:       &reportedCost,
+			CostStatus: "exact",
+			// Anything other than db.CopilotReportedCostSource causes
+			// the SQL to set reported_cost_rows = 1, keeping the row
+			// out of the copilot early-return and inside the
+			// contributes=true branch that previously leaked into
+			// HasTokenData.
+			CostSource: "provider",
+			OccurredAt: "2026-01-18T00:01:00.000Z",
+			DedupKey:   "codebuff-cost-only",
+		}},
+		DataVersion: 1, ReplaceMessages: true,
+	}})
+	require.NoError(t, err)
+
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
+	require.NoError(t, err)
+	store := NewStoreFromDB(syncer.DB())
+
+	got, err := store.GetSessionUsage(ctx, sess.ID, true)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.True(t, got.HasCost, "cost-only Codebuff row must still report HasCost")
+	assert.Equal(t, reportedCost, got.Cost)
+	assert.False(t, got.HasTokenData,
+		"a cost-only Codebuff row is not token data; the hasRows || "+
+			"sess.HasTotalOutputTokens || sess.HasPeakContextTokens "+
+			"short-circuit in (*Store).sessionUsage is the regression "+
+			"this test pins")
+}
+
+// TestDuckDBTokenRowsWithoutSessionFlagsMatchSQLite pins HasTokenData
+// parity with SQLite and PostgreSQL for the inverse of the cost-only
+// case: a session whose usage_events rows DO carry billable tokens but
+// whose session row has HasTotalOutputTokens and HasPeakContextTokens
+// false. SQLite (internal/db) and PostgreSQL compute HasTokenData from
+// the session flags alone, so both report false here; DuckDB must
+// agree instead of deriving true from the token-bearing rows.
+func TestDuckDBTokenRowsWithoutSessionFlagsMatchSQLite(t *testing.T) {
+	ctx := context.Background()
+	local := newLocalDB(t)
+	// syncSession leaves TotalOutputTokens/PeakContextTokens and both
+	// Has* flags at their zero values, and with no messages in the
+	// batch the sanitizer keeps them false even though the usage
+	// event below carries tokens.
+	sess := syncSession(
+		"duck-flags-off", "alpha", "tokens without flags",
+		"2026-01-18T00:00:00.000Z", 0)
+	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{{
+		Session: sess,
+		UsageEvents: []db.UsageEvent{{
+			Source: "shutdown", Model: "claude-sonnet-4-6",
+			InputTokens: 1000, OutputTokens: 500,
+			OccurredAt: "2026-01-18T00:01:00.000Z",
+			DedupKey:   "flags-off",
+		}},
+		DataVersion: 1, ReplaceMessages: true,
+	}})
+	require.NoError(t, err)
+
+	want, err := local.GetSessionUsage(ctx, sess.ID, true)
+	require.NoError(t, err)
+	require.NotNil(t, want)
+	require.False(t, want.HasTokenData,
+		"SQLite computes HasTokenData from session flags only")
+
+	syncer := newInMemoryTestSync(t, local, SyncOptions{})
+	require.NoError(t, createSchema(ctx, syncer.DB()))
+	_, err = syncer.pushEverything(ctx, nil)
+	require.NoError(t, err)
+	store := NewStoreFromDB(syncer.DB())
+
+	got, err := store.GetSessionUsage(ctx, sess.ID, true)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.False(t, got.HasTokenData,
+		"DuckDB must compute HasTokenData from session flags only, "+
+			"not from token-bearing usage rows, to match SQLite and "+
+			"PostgreSQL")
+	assert.Equal(t, want.HasTokenData, got.HasTokenData)
+}
+
 func TestDailyUsageCostsReasoningOnlyRows(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
@@ -3360,7 +3462,7 @@ func TestDailyUsageCostsMessageReasoningTokens(t *testing.T) {
 	ctx := context.Background()
 	local := newLocalDB(t)
 	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
-		ModelPattern:  "gpt-5.4",
+		ModelPattern:  "reasoning-model",
 		InputPerMTok:  money.MustParseDollars("1"),
 		OutputPerMTok: money.MustParseDollars("2"),
 	}}))
@@ -3368,8 +3470,8 @@ func TestDailyUsageCostsMessageReasoningTokens(t *testing.T) {
 	msg := syncMessage(
 		"duck-message-reasoning", 0, "assistant", "message reasoning",
 		"2026-01-19T00:01:00.000Z")
-	msg.Model = "gpt-5.4"
-	msg.TokenUsage = json.RawMessage(
+	msg.Model = "reasoning-model"
+	msg.TokenUsage = jsontext.Value(
 		`{"input_tokens":1000,"output_tokens":0,"reasoning_tokens":500}`)
 	_, err := local.WriteSessionBatchAtomic([]db.SessionBatchWrite{{
 		Session: syncSession(

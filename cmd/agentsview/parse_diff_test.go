@@ -3,10 +3,12 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,12 +18,67 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
+	"go.kenn.io/agentsview/internal/importer"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/testjsonl"
 )
+
+const geminiAppsCLIHTML = `<html><head><title>My Activity History</title></head><body><div class="outer-cell"><div class="header-cell"><h3>Gemini Apps</h3><p>Prompted</p><p>Jan 2, 2025, 3:04:05 PM EDT</p></div><div class="content-cell"><p>cli prompt</p><p>cli answer</p></div></div></body></html>`
+
+func TestGeminiAppsImportDispatchesDirectAndZipSources(t *testing.T) {
+	database := dbtest.OpenTestDB(t)
+	direct := filepath.Join(t.TempDir(), "activity.html")
+	require.NoError(t, os.WriteFile(direct, []byte(geminiAppsCLIHTML), 0o644))
+
+	stats, err := runImportDispatch(
+		context.Background(), database, "gemini-apps", direct, t.TempDir(), "test-machine",
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.Imported)
+
+	archivePath := filepath.Join(t.TempDir(), "takeout.zip")
+	archiveFile, err := os.Create(archivePath)
+	require.NoError(t, err)
+	zipWriter := zip.NewWriter(archiveFile)
+	entry, err := zipWriter.Create("Takeout/My Activity/Gemini Apps/activity.html")
+	require.NoError(t, err)
+	_, err = entry.Write([]byte(geminiAppsCLIHTML))
+	require.NoError(t, err)
+	require.NoError(t, zipWriter.Close())
+	require.NoError(t, archiveFile.Close())
+
+	source, cleanup, err := resolveImportSource(archivePath)
+	require.NoError(t, err)
+	require.NotNil(t, cleanup)
+	defer cleanup()
+	stats, err = runImportDispatch(
+		context.Background(), database, "gemini-apps", source, t.TempDir(), "test-machine",
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.Skipped)
+
+	_, err = runImportDispatch(
+		context.Background(), database, "gemini-apps",
+		filepath.Join(t.TempDir(), "missing.html"), t.TempDir(), "test-machine",
+	)
+	assert.ErrorContains(t, err, "stat import source")
+
+	nonPrompt := filepath.Join(t.TempDir(), "non-prompt.html")
+	require.NoError(t, os.WriteFile(
+		nonPrompt,
+		[]byte(strings.Replace(geminiAppsCLIHTML, "<p>Prompted</p>", "<p>Canvas</p>", 1)),
+		0o644,
+	))
+	stats, err = runImportDispatch(
+		context.Background(), database, "gemini-apps", nonPrompt, t.TempDir(), "test-machine",
+	)
+	assert.ErrorContains(t, err, "no admissible Prompted records")
+	assert.Equal(t, 1, stats.Skipped)
+	assert.Equal(t, "\rDone: 1 processed (1 skipped)\n", formatImportFailureSummary(stats))
+	assert.Empty(t, formatImportFailureSummary(importer.ImportStats{}))
+}
 
 // isolateParseDiffEnv points the data dir, HOME, and every per-agent
 // directory override at empty temp dirs so end-to-end runs never
@@ -150,6 +207,11 @@ func TestParseDiffAgentTypes(t *testing.T) {
 		{
 			name:    "import-only agent",
 			in:      []string{"claude-ai"},
+			wantErr: "is not supported by parse-diff",
+		},
+		{
+			name:    "Gemini Apps import-only agent",
+			in:      []string{"gemini-apps"},
 			wantErr: "is not supported by parse-diff",
 		},
 	}
@@ -846,7 +908,7 @@ func TestParseDiff_JSONSessionsAndDBPath(t *testing.T) {
 	out, err := executeCommand(newRootCommand(), "parse-diff", "--json")
 	require.NoError(t, err)
 
-	var got map[string]json.RawMessage
+	var got map[string]jsontext.Value
 	require.NoError(t, json.Unmarshal([]byte(out), &got))
 
 	// A clean run must serialize an empty array, never null, so jq
@@ -864,23 +926,21 @@ func TestParseDiff_JSONSessionsAndDBPath(t *testing.T) {
 
 // TestDoParseDiff_FailOnChangeDirections exercises both directions of
 // the exit-code conjunction (cfg.FailOnChange && report.HasFailures()).
-// A stored session at the current data version whose source file no
-// longer emits it is a presence change, so HasFailures() is true; the
-// flag then decides the exit. Staging it via a valid source file plus a
-// phantom stored row keeps the test independent of the parser's session
-// ID derivation.
+// A stored session whose first message differs from a fresh parse makes
+// HasFailures() true; the flag then decides the exit.
 func TestDoParseDiff_FailOnChangeDirections(t *testing.T) {
 	// Isolate every other agent's directory env var to a temp path so an
 	// inherited dir from the developer or CI environment cannot be scanned and
 	// trip --fail-on-change with an unrelated parse error. The data dir and
-	// Claude dir are then overridden to the paths this test controls.
+	// Claude dir is then overridden to the path this test controls.
 	isolateParseDiffEnv(t)
 	dataDir := os.Getenv("AGENTSVIEW_DATA_DIR")
 	require.NotEmpty(t, dataDir)
 	claudeDir := t.TempDir()
 	t.Setenv("CLAUDE_PROJECTS_DIR", claudeDir)
 
-	// A valid Claude source file so discovery and parse succeed.
+	// Sync a valid Claude source so the stored file fingerprint exactly matches
+	// the source that parse-diff will inspect.
 	projDir := filepath.Join(claudeDir, "-home-proj")
 	require.NoError(t, os.MkdirAll(projDir, 0o755))
 	srcPath := filepath.Join(projDir, "real-session.jsonl")
@@ -890,17 +950,23 @@ func TestDoParseDiff_FailOnChangeDirections(t *testing.T) {
 		String()
 	require.NoError(t, os.WriteFile(srcPath, []byte(content), 0o644))
 
-	// A phantom stored row under that file at the current data version:
-	// the re-parse never emits this id, so it reports as a presence
-	// change (HasFailures() == true).
 	d := dbtest.OpenTestDBAt(t, filepath.Join(dataDir, "sessions.db"))
-	require.NoError(t, d.UpsertSession(db.Session{
-		ID: "phantom-session", Project: "proj", Machine: "m",
-		Agent: "claude", MessageCount: 4, UserMessageCount: 2,
-		FilePath: &srcPath,
+	engine := sync.NewEngine(d, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {claudeDir},
+		},
+		Machine: "local",
+	})
+	stats := engine.SyncAll(context.Background(), nil)
+	require.Equal(t, 1, stats.Synced, "one session synced")
+	require.NoError(t, d.Update(func(tx *sql.Tx) error {
+		_, err := tx.Exec(
+			"UPDATE sessions SET first_message = ? WHERE id = ?",
+			"drifted first message", "real-session",
+		)
+		return err
 	}))
-	require.NoError(t,
-		d.SetSessionDataVersion("phantom-session", db.CurrentDataVersion()))
+	engine.Close()
 	require.NoError(t, d.Close())
 
 	var failBuf bytes.Buffer
@@ -908,7 +974,7 @@ func TestDoParseDiff_FailOnChangeDirections(t *testing.T) {
 		FailOnChange: true, Stdout: &failBuf, Stderr: &failBuf,
 	})
 	assert.True(t, failed,
-		"a presence change with --fail-on-change must fail")
+		"a changed session with --fail-on-change must fail")
 	assert.Contains(t, failBuf.String(), "sessions changed")
 
 	var cleanBuf bytes.Buffer

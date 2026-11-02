@@ -39,7 +39,6 @@
   } from "../../stores/ui.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { sync } from "../../stores/sync.svelte.js";
-  import { settings } from "../../stores/settings.svelte.js";
   import { router, type Route } from "../../stores/router.svelte.js";
   import { SNAPSHOT } from "../../utils/snapshot.js";
   import { viewMeta } from "../../stores/viewMeta.svelte.js";
@@ -91,22 +90,14 @@
     "trends",
     "recall",
     "pinned",
-    "insights",
+    "quality",
     "trash",
     "recent-edits",
     "data",
   ] as const;
 
-  const recallAvailable = $derived(
-    !sync.readOnly &&
-      !settings.readOnly &&
-      (sync.serverVersion !== null ||
-        (settings.loaded && settings.error === null)),
-  );
-
   // Published snapshots expose only the read-only browsing tabs; the
-  // curation/management routes are hidden (matches the elided nav in the
-  // pre-kit-ui header).
+  // curation/management routes are hidden.
   const SNAPSHOT_TABS = new Set(["sessions", "usage", "activity"]);
   const tabs: TopBarTab[] = $derived(
     [
@@ -114,11 +105,9 @@
       { id: "usage", label: m.nav_usage() },
       { id: "activity", label: m.nav_activity() },
       { id: "trends", label: m.nav_trends() },
-      ...(recallAvailable
-        ? [{ id: "recall", label: m.nav_recall() }]
-        : []),
+      { id: "recall", label: m.nav_recall() },
       { id: "pinned", label: m.nav_pinned() },
-      { id: "insights", label: m.nav_insights() },
+      { id: "quality", label: m.nav_quality() },
       { id: "trash", label: m.nav_trash() },
       { id: "recent-edits", label: m.nav_recent_edits() },
       { id: "data", label: m.nav_data() },

@@ -1,7 +1,9 @@
 package parser
 
 import (
-	"encoding/json"
+	"context"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"strings"
 	"time"
 
@@ -16,8 +18,10 @@ const (
 	AgentOpenClaude     AgentType = "openclaude"
 	AgentCowork         AgentType = "cowork"
 	AgentCodex          AgentType = "codex"
+	AgentTraeX          AgentType = "traex"
 	AgentCopilot        AgentType = "copilot"
 	AgentGemini         AgentType = "gemini"
+	AgentGeminiApps     AgentType = "gemini-apps"
 	AgentMiMoCode       AgentType = "mimocode"
 	AgentOpenCode       AgentType = "opencode"
 	AgentKilo           AgentType = "kilo"
@@ -71,7 +75,11 @@ const (
 	AgentRooCode        AgentType = "roocode"
 	AgentPoolside       AgentType = "poolside"
 	AgentOmnigent       AgentType = "omnigent"
+	AgentCodebuff       AgentType = "codebuff"
+	AgentFreebuff       AgentType = "freebuff"
 )
+
+const AgentDeepSeekHarness AgentType = "deepseek-harness"
 
 // AgentDef describes a supported coding agent's filesystem
 // layout, configuration keys, and session ID conventions.
@@ -166,6 +174,30 @@ var Registry = []AgentDef{
 		IDPrefix:              "codex:",
 		FileBased:             true,
 		ShallowWatchRootsFunc: ResolveCodexShallowWatchRoots,
+	},
+	{
+		// TRAE CLI 2.0 is a closed-source fork of codex-rs and writes
+		// byte-compatible rollout JSONL, so it reuses the Codex parser
+		// through a relabel hook. It is a distinct agent rather than a
+		// Codex source because resuming needs `traex resume` and the two
+		// tools keep separate session archives. Unlike the Trae IDE entry
+		// below, nothing here is encrypted, so remote sync is not excluded.
+		Type:        AgentTraeX,
+		DisplayName: "TraeX",
+		EnvVar:      "TRAEX_SESSIONS_DIR",
+		ConfigKey:   "traex_sessions_dirs",
+		DefaultDirs: []string{
+			".trae/cli/sessions",
+			// `traex archive <id>` moves a rollout out of the dated tree into
+			// this flat directory, exactly as `codex archive` does.
+			".trae/cli/archived_sessions",
+		},
+		IDPrefix:  "traex:",
+		FileBased: true,
+		// No ShallowWatchRootsFunc: that hook exists for Codex's sibling
+		// session_index.jsonl, which TraeX never writes. Watching
+		// ~/.trae/cli shallowly would deliver nothing but churn from the
+		// SQLite WALs TRAE CLI keeps there.
 	},
 	{
 		Type:         AgentCopilot,
@@ -474,6 +506,16 @@ var Registry = []AgentDef{
 		FileBased: true,
 	},
 	{
+		Type:              AgentDeepSeekHarness,
+		DisplayName:       "DeepSeek Harness",
+		EnvVar:            "DEEPSEEK_HARNESS_SESSIONS_DIR",
+		DefaultRootEnvVar: "DSH_HOME",
+		ConfigKey:         "deepseek_harness_sessions_dirs",
+		DefaultDirs:       []string{".dsh/sessions"},
+		IDPrefix:          "deepseek-harness:",
+		FileBased:         true,
+	},
+	{
 		Type:        AgentOpenClaw,
 		DisplayName: "OpenClaw",
 		EnvVar:      "OPENCLAW_DIR",
@@ -542,12 +584,18 @@ var Registry = []AgentDef{
 		FileBased:   false,
 	},
 	{
+		Type:        AgentGeminiApps,
+		DisplayName: "Gemini Apps",
+		IDPrefix:    "gemini-apps:",
+		FileBased:   false,
+	},
+	{
 		Type:        AgentKiro,
 		DisplayName: "Kiro",
 		EnvVar:      "KIRO_SESSIONS_DIR",
 		ConfigKey:   "kiro_dirs",
 		DefaultDirs: []string{
-			".kiro/sessions/cli",
+			".kiro/sessions",
 			".local/share/kiro-cli",
 		},
 		IDPrefix:  "kiro:",
@@ -763,12 +811,9 @@ var Registry = []AgentDef{
 		DisplayName: "Qoder",
 		EnvVar:      "QODER_PROJECTS_DIR",
 		ConfigKey:   "qoder_project_dirs",
-		DefaultDirs: []string{
-			".qoder/projects",
-			".qoderwork/projects",
-		},
-		IDPrefix:  "qoder:",
-		FileBased: true,
+		DefaultDirs: qoderDefaultDirs(),
+		IDPrefix:    "qoder:",
+		FileBased:   true,
 	},
 	{
 		// Shelley (exe.dev) stores all conversations in a single
@@ -830,7 +875,7 @@ var Registry = []AgentDef{
 		DisplayName:    "IcodeMate",
 		EnvVar:         "ICODEMATE_DIR",
 		ConfigKey:      "icodemate_dirs",
-		DefaultDirs:    []string{".local/share/icodemate"},
+		DefaultDirs:    []string{".local/share/icodemate", ".icodemate/cli/projects"},
 		IDPrefix:       "icodemate:",
 		WatchSubdirs:   []string{"storage/session_diff"},
 		FileBased:      true,
@@ -894,17 +939,30 @@ var Registry = []AgentDef{
 		// allowlisted export schema.
 		RemoteSyncExcluded: true,
 	},
-}
-
-// NonFileBackedAgents returns agent types where FileBased is false.
-func NonFileBackedAgents() []AgentType {
-	var agents []AgentType
-	for _, def := range Registry {
-		if !def.FileBased {
-			agents = append(agents, def.Type)
-		}
-	}
-	return agents
+	{
+		// Codebuff and Freebuff share the same on-disk layout under
+		// ~/.config/manicode/projects/<project>/chats/<timestamp>/. Each
+		// session directory holds chat-messages.json (primary),
+		// run-state.json (model/token metadata), and chat-meta.json.
+		// Freebuff sessions do carry their own agent type: the parser
+		// sets Agent = AgentFreebuff and emits freebuff:-prefixed IDs
+		// when run-state.json agentType contains "free". Freebuff has
+		// no separate registry entry or provider factory, though; sync
+		// canonicalizes freebuff onto this Codebuff def (AgentByPrefix
+		// maps freebuff: IDs here), which avoids double-discovery and
+		// skip-cache contention over the shared roots.
+		Type:              AgentCodebuff,
+		DisplayName:       "Codebuff",
+		EnvVar:            "CODEBUFF_DIR",
+		ConfigKey:         "codebuff_dirs",
+		DefaultDirs:       []string{".config/manicode/projects"},
+		IDPrefix:          "codebuff:",
+		FileBased:         true,
+		PeriodicReconcile: true,
+		Usage: UsageCapabilities{
+			NoPerMessageTokenData: true,
+		},
+	},
 }
 
 // AgentByType returns the AgentDef for the given type.
@@ -927,16 +985,23 @@ func RemoteSyncExcludedAgent(agent AgentType) bool {
 // AgentNameLacksPerMessageTokenData reports whether the named agent
 // records no per-message token data. Names match registry types
 // exactly and unknown names fail closed; CSV filter parsing trims its
-// parts before calling.
+// parts before calling. Freebuff is treated as a Codebuff alias.
 func AgentNameLacksPerMessageTokenData(agent string) bool {
 	def, ok := AgentByType(AgentType(agent))
+	if !ok && AgentType(agent) == AgentFreebuff {
+		def, ok = AgentByType(AgentCodebuff)
+	}
 	return ok && def.Usage.NoPerMessageTokenData
 }
 
 // AgentNameUsesAICredits reports whether the named agent's cost is
-// denominated in AI credits rather than USD.
+// denominated in AI credits rather than USD. Freebuff is treated as
+// a Codebuff alias.
 func AgentNameUsesAICredits(agent string) bool {
 	def, ok := AgentByType(AgentType(agent))
+	if !ok && AgentType(agent) == AgentFreebuff {
+		def, ok = AgentByType(AgentCodebuff)
+	}
 	return ok && def.Usage.AICreditsDenominated
 }
 
@@ -1009,6 +1074,16 @@ func StripHostPrefix(id string) (host, rawID string) {
 // stripped before matching.
 func AgentByPrefix(sessionID string) (AgentDef, bool) {
 	_, rawID := StripHostPrefix(sessionID)
+	// Freebuff shares the Codebuff provider but emits sessions with the
+	// "freebuff:" prefix. Return a copy with the freebuff prefix so
+	// callers that strip the prefix (FindSourceFile, ProviderNormalizeRawSessionID)
+	// work correctly.
+	if strings.HasPrefix(rawID, string(AgentFreebuff)+":") {
+		if def, ok := AgentByType(AgentCodebuff); ok {
+			def.IDPrefix = string(AgentFreebuff) + ":"
+			return def, true
+		}
+	}
 	for _, def := range Registry {
 		if def.IDPrefix != "" &&
 			strings.HasPrefix(rawID, def.IDPrefix) {
@@ -1057,6 +1132,10 @@ const (
 	TranscriptFidelitySummary = "summary"
 )
 
+// SessionKindNonInteractive marks a provider session whose durable metadata
+// identifies a non-interactive invocation.
+const SessionKindNonInteractive = "non-interactive"
+
 // FileInfo holds file system metadata for a session source file.
 type FileInfo struct {
 	Path   string
@@ -1075,9 +1154,9 @@ type ParsedSession struct {
 	Agent      AgentType
 	AgentLabel string
 	Entrypoint string
-	// SessionKind is the top-level Claude Code session-kind marker
-	// (e.g. "bg" for background/headless sessions); empty for
-	// interactive sessions and for agents that do not emit it.
+	// SessionKind is a provider-owned top-level session classification marker
+	// (for example, Claude Code "bg" or Grok "non-interactive"); empty for
+	// interactive sessions and for agents that do not emit one.
 	SessionKind      string
 	ParentSessionID  string
 	RelationshipType RelationshipType
@@ -1101,11 +1180,16 @@ type ParsedSession struct {
 	IsTruncated             bool
 	FirstMessage            string
 	SessionName             string
-	StartedAt               time.Time
-	EndedAt                 time.Time
-	MessageCount            int
-	UserMessageCount        int
-	File                    FileInfo
+	// SessionNamePresent distinguishes an explicitly present provider title
+	// (including a blank title) from no title signal. Codex needs this because
+	// current releases may omit session_index.jsonl entirely, while an older
+	// index entry with a blank thread_name explicitly clears a stored title.
+	SessionNamePresent bool
+	StartedAt          time.Time
+	EndedAt            time.Time
+	MessageCount       int
+	UserMessageCount   int
+	File               FileInfo
 
 	// TerminationStatus describes how the session appears to have
 	// ended. Empty string = unknown (parser did not classify, or
@@ -1188,7 +1272,7 @@ type ParsedMessage struct {
 	ToolResults   []ParsedToolResult
 
 	Model            string
-	TokenUsage       json.RawMessage
+	TokenUsage       jsontext.Value
 	ContextTokens    int
 	OutputTokens     int
 	HasContextTokens bool
@@ -1253,8 +1337,21 @@ func accumulateMessageTokenUsage(
 	sess *ParsedSession,
 	messages []ParsedMessage,
 ) {
+	_ = accumulateMessageTokenUsageContext(
+		context.Background(), sess, messages,
+	)
+}
+
+func accumulateMessageTokenUsageContext(
+	ctx context.Context,
+	sess *ParsedSession,
+	messages []ParsedMessage,
+) error {
 	sess.aggregateTokenPresenceKnown = true
-	for _, m := range messages {
+	for i, m := range messages {
+		if err := contextErrEvery(ctx, i); err != nil {
+			return err
+		}
 		if m.HasOutputTokens {
 			sess.HasTotalOutputTokens = true
 			sess.TotalOutputTokens += m.OutputTokens
@@ -1266,6 +1363,7 @@ func accumulateMessageTokenUsage(
 			}
 		}
 	}
+	return ctx.Err()
 }
 
 // applyUsageEventTokenTotals recomputes session token totals from the
@@ -1310,7 +1408,21 @@ func applyUsageEventTokenTotals(
 func UsageEventTokenAggregate(
 	events []ParsedUsageEvent,
 ) (totalOut int, hasOut bool, peakCtx int, hasCtx bool) {
+	totalOut, hasOut, peakCtx, hasCtx, _ = UsageEventTokenAggregateContext(
+		context.Background(), events,
+	)
+	return
+}
+
+// UsageEventTokenAggregateContext is the bounded form of the canonical
+// event-derived token rollup.
+func UsageEventTokenAggregateContext(
+	ctx context.Context, events []ParsedUsageEvent,
+) (totalOut int, hasOut bool, peakCtx int, hasCtx bool, err error) {
 	for _, ev := range events {
+		if err = ctx.Err(); err != nil {
+			return
+		}
 		if ev.OutputTokens > 0 {
 			hasOut = true
 			totalOut += ev.OutputTokens
@@ -1325,7 +1437,8 @@ func UsageEventTokenAggregate(
 			}
 		}
 	}
-	return totalOut, hasOut, peakCtx, hasCtx
+	err = ctx.Err()
+	return
 }
 
 // InferTokenPresence determines whether context/output tokens were
@@ -1345,7 +1458,7 @@ func InferTokenPresence(
 		return hasContext, hasOutput
 	}
 
-	var payload map[string]json.RawMessage
+	var payload map[string]jsontext.Value
 	if err := json.Unmarshal(tokenUsage, &payload); err != nil {
 		return hasContext, hasOutput
 	}
@@ -1395,13 +1508,27 @@ func (s ParsedSession) AggregateTokenPresence() (bool, bool) {
 func (s ParsedSession) TokenCoverage(
 	msgs []ParsedMessage,
 ) (bool, bool) {
+	hasTotal, hasPeak, _ := s.TokenCoverageContext(
+		context.Background(), msgs,
+	)
+	return hasTotal, hasPeak
+}
+
+// TokenCoverageContext reports aggregate coverage while allowing bounded
+// transcript preparation to stop between messages.
+func (s ParsedSession) TokenCoverageContext(
+	ctx context.Context, msgs []ParsedMessage,
+) (bool, bool, error) {
 	hasTotal, hasPeak := s.AggregateTokenPresence()
 	for _, m := range msgs {
+		if err := ctx.Err(); err != nil {
+			return false, false, err
+		}
 		msgHasCtx, msgHasOut := m.TokenPresence()
 		hasTotal = hasTotal || msgHasOut
 		hasPeak = hasPeak || msgHasCtx
 	}
-	return hasTotal, hasPeak
+	return hasTotal, hasPeak, ctx.Err()
 }
 
 // ParseResult pairs a parsed session with its messages.

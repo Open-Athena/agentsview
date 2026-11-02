@@ -81,15 +81,37 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- mirrored to PG/DuckDB.
     last_write_incremental INTEGER NOT NULL DEFAULT 0,
     deleted_at  TEXT,
-    -- NULL remains the established user-trash representation; source_missing
-    -- is recoverable when the file reappears.
+    -- Retained for compatibility with older archives and mirrors. New source
+    -- availability state is stored independently in source_missing_at.
     deletion_cause TEXT,
+    -- SQLite-only sync state. A missing source must not hide or trash the
+    -- archived session; it only prevents freshness checks from skipping a
+    -- reparse when that source returns.
+    source_missing_at TEXT,
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     termination_status TEXT,
     secret_leak_count INTEGER NOT NULL DEFAULT 0,
     secrets_rules_version TEXT NOT NULL DEFAULT '',
     sync_marker TEXT
 );
+
+-- provider_freshness stores per-component stat digests that providers
+-- with multi-file on-disk layouts (currently Codebuff and Freebuff)
+-- compute for the engine's stat-only freshness pre-check. The
+-- (agent, file_path) composite key isolates the namespace per provider
+-- so a future multi-file agent (Omnigent, Zed virtual paths, etc.)
+-- can opt in without schema changes. stat_hash is INTEGER (signed
+-- in SQLite but always non-negative; FNV-1a 64 outputs that fit the
+-- same int64 representation).
+CREATE TABLE IF NOT EXISTS provider_freshness (
+    agent         TEXT NOT NULL,
+    file_path     TEXT NOT NULL,
+    stat_hash     INTEGER NOT NULL,
+    updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (agent, file_path)
+);
+CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
+    ON provider_freshness(updated_at);
 
 -- Messages table with ordinal for efficient range queries
 CREATE TABLE IF NOT EXISTS messages (
@@ -1136,15 +1158,11 @@ CREATE TABLE IF NOT EXISTS model_pricing (
     model_pattern    TEXT PRIMARY KEY,
     input_microdollars_per_mtok   INTEGER NOT NULL DEFAULT 0,
     output_microdollars_per_mtok  INTEGER NOT NULL DEFAULT 0,
-    -- cache_creation_microdollars_per_mtok is the 5-minute ephemeral
-    -- cache-write rate (Anthropic: 1.25x input).
-    -- cache_creation_1h_microdollars_per_mtok is the 1-hour rate (2x input).
-    -- Per-message usage reports the split via
-    -- usage.cache_creation.ephemeral_{5m,1h}_input_tokens; aggregated
-    -- sources (Codex usage_events) fall back to the 5m rate.
-    cache_creation_microdollars_per_mtok    INTEGER NOT NULL DEFAULT 0,
+    cache_creation_microdollars_per_mtok INTEGER NOT NULL DEFAULT 0,
+    -- 1-hour-TTL cache-write rate; 0 means none published and 1h writes
+    -- bill at cache_creation_microdollars_per_mtok.
     cache_creation_1h_microdollars_per_mtok INTEGER NOT NULL DEFAULT 0,
-    cache_read_microdollars_per_mtok        INTEGER NOT NULL DEFAULT 0,
+    cache_read_microdollars_per_mtok     INTEGER NOT NULL DEFAULT 0,
     updated_at       TEXT NOT NULL
         DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
@@ -1156,10 +1174,21 @@ CREATE TABLE IF NOT EXISTS model_pricing_bands (
     input_microdollars_per_mtok INTEGER NOT NULL,
     output_microdollars_per_mtok INTEGER NOT NULL,
     cache_creation_microdollars_per_mtok INTEGER NOT NULL,
+    cache_creation_1h_microdollars_per_mtok INTEGER NOT NULL DEFAULT 0,
     cache_read_microdollars_per_mtok INTEGER NOT NULL,
     updated_at TEXT NOT NULL
         DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     PRIMARY KEY (model_pattern, above_input_tokens)
+);
+
+CREATE TABLE IF NOT EXISTS genai_pricing (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    version TEXT NOT NULL,
+    source_ref TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL CHECK (source IN ('embedded', 'fetched')),
+    data_json BLOB NOT NULL,
+    updated_at TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
 -- Git aggregation TTL cache: memoizes `git log --numstat` and

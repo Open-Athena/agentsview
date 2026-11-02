@@ -22,6 +22,12 @@ func TestProviderSyncSemanticsDeclarations(t *testing.T) {
 			FingerprintHashRequiredForFreshness: true,
 			SkipCacheFreshWithoutStoredRow:      true,
 		},
+		// TraeX shares the Codex provider, so it must share its semantics.
+		AgentTraeX: {
+			FingerprintHashInCacheKey:           true,
+			FingerprintHashRequiredForFreshness: true,
+			SkipCacheFreshWithoutStoredRow:      true,
+		},
 		AgentDevin: {
 			FingerprintHashInCacheKey:           true,
 			FingerprintHashRequiredForFreshness: true,
@@ -48,7 +54,8 @@ func TestProviderSyncSemanticsDeclarations(t *testing.T) {
 			UnchangedResults: UnchangedResultMTime,
 		},
 		AgentKiro: {
-			UnchangedResults: UnchangedResultMTime,
+			UnchangedResults:                    UnchangedResultMTimeAndHash,
+			FingerprintHashRequiredForFreshness: true,
 		},
 		AgentTrae: {
 			UnchangedResults: UnchangedResultMTimeAndHash,
@@ -84,6 +91,14 @@ func TestProviderSyncSemanticsDeclarations(t *testing.T) {
 			FingerprintHashInCacheKey:           true,
 			FingerprintHashRequiredForFreshness: true,
 			UnchangedResults:                    UnchangedResultMTimeAndHash,
+		},
+		// Codebuff requires the per-component stat-hash digest (persisted in
+		// the provider_freshness side-table) before a warm pass may consider a
+		// source fresh; the side-table row is the only signal that sees
+		// companion-file rewrites, offsetting size deltas, and sibling-only
+		// directory mutations.
+		AgentCodebuff: {
+			FingerprintHashRequiredForFreshness: true,
 		},
 	}
 

@@ -5,6 +5,7 @@ export const SESSION_ANALYTICS_WINDOW_PARAM = "window_days";
 /** True when URL params contain session filter keys (deep-link). */
 export const SESSION_FILTER_KEYS: ReadonlySet<string> = new Set([
   "project",
+  "starred",
   "machine",
   "agent",
   "termination",
@@ -129,7 +130,7 @@ export function sessionRouteParamsForFilters(
   return next;
 }
 
-export function currentSessionRouteParams(
+function currentSessionRouteParams(
   currentParams: Record<string, string>,
 ): Record<string, string> {
   const next: Record<string, string> = {};

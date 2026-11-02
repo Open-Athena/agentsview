@@ -34,11 +34,13 @@ session history.
 
 ## Install
 
+### macOs/ Linux
 ```bash
-# macOS / Linux
 curl -fsSL https://agentsview.io/install.sh | bash
+```
 
-# Windows
+### Windows
+```bash
 powershell -ExecutionPolicy ByPass -c "irm https://agentsview.io/install.ps1 | iex"
 ```
 
@@ -231,7 +233,7 @@ agentsview usage statusline
 
 Features:
 
-- Automatic pricing via LiteLLM rates (with offline fallback)
+- Automatic pricing via LiteLLM and OpenRouter rates (with offline fallback)
 - Authoritative Copilot CLI billing totals when session logs provide them
 - Prompt-caching-aware cost calculation (cache creation / read tokens)
 - Per-model breakdown with `--breakdown`
@@ -274,6 +276,11 @@ return `404`.
 
 The deprecated alias `agentsview token-use <id>` remains available for
 compatibility and now also reports cost estimates.
+
+For one exact non-interactive `claude -p` or `codex exec --json` execution in
+CI, use `agentsview capture run`. It preserves the child streams and exit
+outcome, writes a separate versioned usage result, and starts no daemon, web
+server, or watcher. See [One-shot CI capture](https://agentsview.io/one-shot-capture/).
 
 ## Session Stats
 
@@ -359,6 +366,7 @@ thread JSON files.
 | Cortex Code           | `~/.snowflake/cortex/conversations/`                                                                                                                                                                                                                 |
 | Cursor                | `~/.cursor/projects/`                                                                                                                                                                                                                                |
 | DeepSeek TUI          | `~/.codewhale/sessions/`, `~/.deepseek/sessions/`                                                                                                                                                                                                    |
+| DeepSeek Harness      | `~/.dsh/sessions/` (or `$DSH_HOME/sessions/`)                                                                                                                                                                                                        |
 | Forge                 | `~/.forge/`                                                                                                                                                                                                                                          |
 | Gemini CLI            | `~/.gemini/`                                                                                                                                                                                                                                         |
 | Goose                 | `~/.local/share/goose/sessions/` (macOS and Linux), `%APPDATA%\\Block\\goose\\data\\sessions\\` (Windows)                                                                                                                                            |
@@ -395,6 +403,7 @@ thread JSON files.
 | Visual Studio Copilot | `%LOCALAPPDATA%\\Temp\\VSGitHubCopilotLogs\\traces\\` (Windows), `~/Library/Caches/VSGitHubCopilotLogs/traces/` (macOS), `~/.cache/VSGitHubCopilotLogs/traces/` (Linux)                                                                              |
 | Windsurf              | `~/Library/Application Support/Windsurf/User/` (macOS), `~/.config/Windsurf/User/` (Linux), `%APPDATA%\\Windsurf\\User\\` (Windows)                                                                                                                  |
 | Trae                  | `%APPDATA%\\Trae\\User\\` (Windows), `~/Library/Application Support/Trae/User/` (macOS), `~/.config/Trae/User/` (Linux)                                                                                                                              |
+| TraeX (TRAE CLI)      | `~/.trae/cli/sessions/`, `~/.trae/cli/archived_sessions/`                                                                                                                                                                                            |
 | Warp                  | `~/.warp/` (platform-dependent)                                                                                                                                                                                                                      |
 | WorkBuddy             | `~/.workbuddy/projects/`                                                                                                                                                                                                                             |
 | ZCode                 | `~/.zcode/cli/db/`, `~/.zcode/cli/`                                                                                                                                                                                                                  |
@@ -700,7 +709,7 @@ ______________________________________________________________________
 
 ## Development
 
-Requires Go 1.26+ (CGO), Node.js 22+.
+Requires Go 1.27+ (CGO), Node.js 22+.
 
 ```bash
 make dev            # Go server (dev mode)

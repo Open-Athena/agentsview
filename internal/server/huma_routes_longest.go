@@ -11,7 +11,7 @@ import (
 // content length, optionally scoped to a comma-separated project list.
 func (s *Server) registerMessagesRoutes() {
 	group := newRouteGroup(s.api, "/api/v1/messages", "Messages")
-	get(s, group, "/longest", "Longest user prompts", s.humaLongestPrompts)
+	s.get(group, "/longest", "Longest user prompts", s.humaLongestPrompts)
 }
 
 type longestPromptsInput struct {

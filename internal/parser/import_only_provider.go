@@ -21,10 +21,8 @@ func (f importOnlyProviderFactory) Capabilities() Capabilities {
 func (f importOnlyProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
 	base := importOnlyProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Config: cfg,
-		},
+		Def:    cloneAgentDef(f.def),
+		Config: cfg,
 	}
 
 	switch f.def.Type {
@@ -32,6 +30,8 @@ func (f importOnlyProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 		return &chatGPTImportOnlyProvider{importOnlyProvider: base}
 	case AgentClaudeAI:
 		return &claudeAIImportOnlyProvider{importOnlyProvider: base}
+	case AgentGeminiApps:
+		return &geminiAppsImportOnlyProvider{importOnlyProvider: base}
 	default:
 		return &base
 	}
@@ -53,5 +53,9 @@ type chatGPTImportOnlyProvider struct {
 }
 
 type claudeAIImportOnlyProvider struct {
+	importOnlyProvider
+}
+
+type geminiAppsImportOnlyProvider struct {
 	importOnlyProvider
 }

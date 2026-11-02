@@ -256,7 +256,8 @@ func TestReplaceSessionMessagesKeepsPinOnMergedRow(t *testing.T) {
 	d := testDB(t)
 	v1 := []Message{
 		diffTestMsg("pin-s", 0, "user", "hello"),
-		diffTestMsg("pin-s", 1, "assistant", "partial"),
+		diffTestMsg("pin-s", 1, "assistant", "partial",
+			func(m *Message) { m.SourceUUID = "pin-tail" }),
 	}
 	seedDiffSession(t, d, "pin-s", v1)
 	ids := messageIDsByOrdinal(t, d, "pin-s")
@@ -267,7 +268,8 @@ func TestReplaceSessionMessagesKeepsPinOnMergedRow(t *testing.T) {
 
 	v2 := []Message{
 		v1[0],
-		diffTestMsg("pin-s", 1, "assistant", "partial now complete"),
+		diffTestMsg("pin-s", 1, "assistant", "partial now complete",
+			func(m *Message) { m.SourceUUID = "pin-tail" }),
 		diffTestMsg("pin-s", 2, "user", "more"),
 	}
 	require.NoError(t, d.ReplaceSessionMessages("pin-s", v2))
@@ -279,4 +281,116 @@ func TestReplaceSessionMessagesKeepsPinOnMergedRow(t *testing.T) {
 		note,
 	).Scan(&n))
 	assert.Equal(t, 1, n, "pin on the merged row must survive")
+}
+
+// TestReplaceSessionMessagesKeepsPinOnCompletedRow covers a pinned
+// partial response without a usable UUID whose content is completed by
+// a later parse: the extension keeps ordinal, role, and uuid, so the
+// row identity is preserved and the pin must survive the in-place
+// merge instead of being remapped and dropped.
+func TestReplaceSessionMessagesKeepsPinOnCompletedRow(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		sourceUUIDs []string
+	}{
+		{
+			name:        "empty UUID",
+			sourceUUIDs: []string{"", "", ""},
+		},
+		{
+			name:        "duplicate UUID",
+			sourceUUIDs: []string{"tail", "duplicate", "duplicate"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDB(t)
+			v1 := []Message{
+				diffTestMsg("pin-complete", 0, "user", "first"),
+				diffTestMsg("pin-complete", 1, "assistant", "partial"),
+				diffTestMsg("pin-complete", 2, "user", "last"),
+			}
+			for i := range v1 {
+				v1[i].SourceUUID = tc.sourceUUIDs[i]
+			}
+			seedDiffSession(t, d, "pin-complete", v1)
+			ids := messageIDsByOrdinal(t, d, "pin-complete")
+			_, err := d.PinMessage("pin-complete", ids[1], nil)
+			require.NoError(t, err, "PinMessage")
+
+			v2 := append([]Message(nil), v1...)
+			v2[1].Content = "partial now complete"
+			v2[1].ContentLength = len(v2[1].Content)
+			require.NoError(t,
+				d.ReplaceSessionMessages("pin-complete", v2))
+
+			pins, err := d.ListPinnedMessages(
+				context.Background(), "pin-complete", "",
+			)
+			require.NoError(t, err, "ListPinnedMessages")
+			require.Len(t, pins, 1,
+				"the completed row must keep its pin")
+			assert.Equal(t, 1, pins[0].Ordinal,
+				"pin stays on the completed message")
+		})
+	}
+}
+
+func TestReplaceSessionMessagesDropsPinOnAmbiguousChangedRow(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		sourceUUIDs []string
+	}{
+		{
+			name:        "empty UUID",
+			sourceUUIDs: []string{"", "", ""},
+		},
+		{
+			name:        "duplicate UUID",
+			sourceUUIDs: []string{"duplicate", "duplicate", "tail"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDB(t)
+			v1 := []Message{
+				diffTestMsg("pin-ambiguous", 0, "user", "first"),
+				diffTestMsg("pin-ambiguous", 1, "assistant", "pinned"),
+				diffTestMsg("pin-ambiguous", 2, "user", "last"),
+			}
+			for i := range v1 {
+				v1[i].SourceUUID = tc.sourceUUIDs[i]
+			}
+			seedDiffSession(t, d, "pin-ambiguous", v1)
+			ids := messageIDsByOrdinal(t, d, "pin-ambiguous")
+			_, err := d.PinMessage("pin-ambiguous", ids[1], nil)
+			require.NoError(t, err, "PinMessage")
+
+			v2 := append([]Message(nil), v1...)
+			v2[1].Content = "unrelated replacement"
+			v2[1].ContentLength = len(v2[1].Content)
+			require.NoError(t,
+				d.ReplaceSessionMessages("pin-ambiguous", v2))
+
+			pins, err := d.ListPinnedMessages(
+				context.Background(), "pin-ambiguous", "",
+			)
+			require.NoError(t, err, "ListPinnedMessages")
+			assert.Empty(t, pins,
+				"an ambiguous identity change must not inherit the pin")
+		})
+	}
+}
+
+func TestMessagePinIdentityStableRequiresSameUniqueUUID(t *testing.T) {
+	old := diffTestMsg("pin-identity", 1, "assistant", "old content",
+		func(m *Message) { m.SourceUUID = "uuid-old" })
+	incoming := diffTestMsg(
+		"pin-identity", 1, "assistant", "replacement content",
+		func(m *Message) { m.SourceUUID = "uuid-new" },
+	)
+
+	assert.False(t, messagePinIdentityStable(
+		old, incoming,
+		map[string]int{"uuid-old": 1},
+		map[string]int{"uuid-new": 1},
+	), "different unique UUIDs are different pin identities")
 }

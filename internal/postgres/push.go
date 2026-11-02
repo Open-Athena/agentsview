@@ -6,7 +6,8 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"log"
@@ -19,18 +20,20 @@ import (
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/jsonutil"
 )
 
 const (
-	lastPushBoundaryStateKey           = "last_push_boundary_state"
-	lastPushSourceArchiveIDKey         = "pg_source_archive_id_v1"
-	lastPushTargetFingerprintKey       = "pg_target_fingerprint_v1"
-	sessionAliasBackfillStateKey       = "pg_session_alias_backfill_v1"
-	legacyProjectIdentityStateKey      = "project_identity_publication_revision_v2"
-	projectIdentityPublicationStateKey = "project_identity_publication_revision_v3"
-	transcriptRevisionBackfillStateKey = "pg_transcript_revision_backfill_v1"
-	sessionProvenanceBackfillStateKey  = "pg_session_provenance_backfill_v2"
-	unfilteredPublicationScope         = "all-projects"
+	lastPushBoundaryStateKey               = "last_push_boundary_state"
+	lastPushSourceArchiveIDKey             = "pg_source_archive_id_v1"
+	lastPushTargetFingerprintKey           = "pg_target_fingerprint_v1"
+	sessionAliasBackfillStateKey           = "pg_session_alias_backfill_v1"
+	legacyProjectIdentityStateKey          = "project_identity_publication_revision_v2"
+	projectIdentityPublicationStateKey     = "project_identity_publication_revision_v3"
+	transcriptRevisionBackfillStateKey     = "pg_transcript_revision_backfill_v1"
+	sessionProvenanceBackfillStateKey      = "pg_session_provenance_backfill_v2"
+	timestampNormalizationBackfillStateKey = "pg_timestamp_normalization_backfill_v1"
+	unfilteredPublicationScope             = "all-projects"
 )
 
 // pushMarkerIDStateKey names the local sync-state entry holding this DB's
@@ -58,6 +61,21 @@ type PushResult struct {
 	Errors           int
 	Duration         time.Duration
 	Vectors          VectorPushResult
+}
+
+type pushResultJSON PushResult
+
+func (r PushResult) MarshalJSONTo(out *jsontext.Encoder) error {
+	return jsonutil.MarshalDurationFields(out, pushResultJSON(r))
+}
+
+func (r *PushResult) UnmarshalJSONFrom(in *jsontext.Decoder) error {
+	var decoded pushResultJSON
+	if err := jsonutil.UnmarshalDurationFields(in, &decoded); err != nil {
+		return err
+	}
+	*r = PushResult(decoded)
+	return nil
 }
 
 // pushPrepareProgressStride bounds how many sessions the fingerprint loop
@@ -289,6 +307,17 @@ func (s *Sync) PushWithOptions(
 	if transcriptRevisionBackfillNeeded {
 		log.Printf(
 			"pgsync: transcript revision backfill marker missing; forcing full push",
+		)
+	}
+	timestampNormalizationBackfillNeeded := false
+	full, timestampNormalizationBackfillNeeded, err =
+		applyTimestampNormalizationBackfillRequirement(state, full)
+	if err != nil {
+		return result, err
+	}
+	if timestampNormalizationBackfillNeeded {
+		log.Printf(
+			"pgsync: timestamp normalization backfill marker missing; forcing full push",
 		)
 	}
 	if full {
@@ -561,6 +590,11 @@ func (s *Sync) PushWithOptions(
 		); err != nil {
 			return result, err
 		}
+		if err := completeTimestampNormalizationBackfill(
+			state, timestampNormalizationBackfillNeeded, result,
+		); err != nil {
+			return result, err
+		}
 		if err := s.syncProjectIdentityObservations(
 			ctx, full, identityRefreshSessionIDs,
 		); err != nil {
@@ -688,6 +722,11 @@ func (s *Sync) PushWithOptions(
 	}
 	if err := completeTranscriptRevisionBackfill(
 		state, transcriptRevisionBackfillNeeded, result,
+	); err != nil {
+		return result, err
+	}
+	if err := completeTimestampNormalizationBackfill(
+		state, timestampNormalizationBackfillNeeded, result,
 	); err != nil {
 		return result, err
 	}
@@ -922,6 +961,14 @@ func (s *Sync) syncProjectIdentityObservations(
 		ctx, tx, archiveID, databaseGeneration, publicationScope, snapshots,
 	); err != nil {
 		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO sync_metadata (key, value) VALUES ($1, '1')
+		ON CONFLICT (key) DO UPDATE SET
+			value = (sync_metadata.value::bigint + 1)::text`,
+		activityReportProjectIdentityGenerationKey,
+	); err != nil {
+		return fmt.Errorf("advancing activity report identity generation: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing project identity observation sync: %w", err)
@@ -1666,6 +1713,35 @@ func completeTranscriptRevisionBackfill(
 	return markTranscriptRevisionBackfillDone(local)
 }
 
+func applyTimestampNormalizationBackfillRequirement(
+	local syncStateStore, full bool,
+) (bool, bool, error) {
+	done, err := local.GetSyncState(timestampNormalizationBackfillStateKey)
+	if err != nil {
+		return full, false, fmt.Errorf(
+			"reading %s: %w", timestampNormalizationBackfillStateKey, err,
+		)
+	}
+	if done == "1" {
+		return full, false, nil
+	}
+	return true, true, nil
+}
+
+func completeTimestampNormalizationBackfill(
+	local syncStateStore, needed bool, result PushResult,
+) error {
+	if !needed || result.Errors > 0 {
+		return nil
+	}
+	if err := local.SetSyncState(timestampNormalizationBackfillStateKey, "1"); err != nil {
+		return fmt.Errorf(
+			"updating %s: %w", timestampNormalizationBackfillStateKey, err,
+		)
+	}
+	return nil
+}
+
 func persistPushTargetFingerprint(
 	local syncStateStore,
 	fingerprint string,
@@ -2166,17 +2242,17 @@ func nilStr(s *string) any {
 	return v
 }
 
-// nilStrTS converts a nil or empty *string timestamp to a
-// *time.Time for PG TIMESTAMPTZ columns.
-func nilStrTS(s *string) any {
-	if s == nil || *s == "" {
-		return nil
+// optionalSQLiteTimestamp converts an empty SQLite timestamp to SQL NULL and
+// rejects non-empty values that would otherwise be silently mirrored as NULL.
+func optionalSQLiteTimestamp(value string) (any, error) {
+	if value == "" {
+		return nil, nil
 	}
-	t, ok := ParseSQLiteTimestamp(*s)
+	t, ok := ParseSQLiteTimestamp(value)
 	if !ok {
-		return nil
+		return nil, fmt.Errorf("invalid SQLite timestamp %q", value)
 	}
-	return t
+	return t, nil
 }
 
 // pushSession upserts a single session into PG.
@@ -2187,7 +2263,25 @@ func (s *Sync) pushSession(
 	ctx context.Context, tx *sql.Tx, sess db.Session, markerID string,
 	legacyMarkerMachines []string,
 ) error {
-	createdAt, _ := ParseSQLiteTimestamp(sess.CreatedAt)
+	createdAt, ok := ParseSQLiteTimestamp(sess.CreatedAt)
+	if !ok {
+		return fmt.Errorf(
+			"parsing session %s created_at: invalid SQLite timestamp %q",
+			sess.ID, sess.CreatedAt,
+		)
+	}
+	startedAt, err := optionalSQLiteTimestamp(stringValue(sess.StartedAt))
+	if err != nil {
+		return fmt.Errorf("parsing session %s started_at: %w", sess.ID, err)
+	}
+	endedAt, err := optionalSQLiteTimestamp(stringValue(sess.EndedAt))
+	if err != nil {
+		return fmt.Errorf("parsing session %s ended_at: %w", sess.ID, err)
+	}
+	deletedAt, err := optionalSQLiteTimestamp(stringValue(sess.DeletedAt))
+	if err != nil {
+		return fmt.Errorf("parsing session %s deleted_at: %w", sess.ID, err)
+	}
 	isAutomated := sess.IsAutomated
 	pushedMachine := pushedSessionMachine(sess, s.machine)
 	var existingMachine sql.NullString
@@ -2441,10 +2535,10 @@ func (s *Sync) pushSession(
 		nilStr(sess.DisplayName),
 		nilStr(sess.SessionName),
 		createdAt,
-		nilStrTS(sess.StartedAt),
-		nilStrTS(sess.EndedAt),
-		nilStrTS(sess.DeletedAt),
-		nilStrTS(sess.DeletedAt),
+		startedAt,
+		endedAt,
+		deletedAt,
+		deletedAt,
 		nilStr(sess.DeletionCause),
 		sess.MessageCount, sess.UserMessageCount,
 		sess.TotalOutputTokens, sess.PeakContextTokens,
@@ -2552,6 +2646,13 @@ func (s *Sync) pushMessages(
 		)
 	}
 	if localCount == 0 {
+		if err := lockPinnedMessagesSession(ctx, tx, sessionID); err != nil {
+			return 0, err
+		}
+		savedPins, err := snapshotPinnedMessages(ctx, tx, sessionID)
+		if err != nil {
+			return 0, err
+		}
 		if _, err := tx.ExecContext(ctx,
 			`DELETE FROM tool_result_events WHERE session_id = $1`,
 			sessionID,
@@ -2584,8 +2685,8 @@ func (s *Sync) pushMessages(
 		if err := s.replaceUsageEvents(ctx, tx, sessionID); err != nil {
 			return 0, err
 		}
-		if err := reconcilePinnedMessages(
-			ctx, tx, sessionID,
+		if err := restorePinnedMessages(
+			ctx, tx, sessionID, savedPins,
 		); err != nil {
 			return 0, err
 		}
@@ -2804,6 +2905,13 @@ func (s *Sync) pushMessages(
 		}
 	}
 
+	if err := lockPinnedMessagesSession(ctx, tx, sessionID); err != nil {
+		return 0, err
+	}
+	savedPins, err := snapshotPinnedMessages(ctx, tx, sessionID)
+	if err != nil {
+		return 0, err
+	}
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM tool_result_events
 		WHERE session_id = $1
@@ -2877,7 +2985,9 @@ func (s *Sync) pushMessages(
 		startOrdinal = nextOrdinal
 	}
 
-	if err := reconcilePinnedMessages(ctx, tx, sessionID); err != nil {
+	if err := restorePinnedMessages(
+		ctx, tx, sessionID, savedPins,
+	); err != nil {
 		return count, err
 	}
 
@@ -2909,177 +3019,407 @@ func (s *Sync) replaceUsageEvents(
 	return nil
 }
 
-func reconcilePinnedMessages(
-	ctx context.Context, tx *sql.Tx, sessionID string,
-) error {
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE pinned_messages p
-		SET source_uuid = m.source_uuid
-		FROM messages m
-		WHERE p.session_id = $1
-			AND m.session_id = p.session_id
-			AND m.ordinal = p.message_id
-			AND p.source_uuid = ''
-			AND m.source_uuid <> ''`,
-		sessionID,
-	); err != nil {
-		return fmt.Errorf(
-			"backfilling pg pin source_uuid: %w", err,
-		)
-	}
+type savedPostgresPin struct {
+	id                  int64
+	ordinal             int
+	anchorOrdinal       int
+	sourceUUID          string
+	role                string
+	content             string
+	sourceUUIDCount     int
+	sourceIdentityCount int
+	sourceIdentityRank  int
+	legacyIdentityCount int
+	legacyIdentityRank  int
+	messageFound        bool
+	note                sql.NullString
+	createdAt           time.Time
+}
 
-	// Move shifted source-backed pins out of the real ordinal range
-	// first. Pins already on their resolved target stay in place so
-	// duplicate repairs prefer the current target row's metadata.
-	// When multiple messages share a source_uuid (the schema allows
-	// it), prefer the message at the pin's current message_id so a
-	// correctly-placed pin is not relocated to a different duplicate.
-	if _, err := tx.ExecContext(ctx, `
-		WITH matched AS (
-			SELECT DISTINCT ON (p.id)
-				p.id, p.message_id, p.ordinal,
-				m.ordinal AS target_ordinal
-			FROM pinned_messages p
-			JOIN messages m
-				ON m.session_id = p.session_id
-				AND m.source_uuid = p.source_uuid
-			WHERE p.session_id = $1
-				AND p.source_uuid <> ''
-			ORDER BY p.id,
-				CASE WHEN m.ordinal = p.message_id THEN 0 ELSE 1 END,
-				m.ordinal
-		),
-		numbered AS (
-			SELECT id,
-				ROW_NUMBER() OVER (ORDER BY id) AS temp_ordinal
-			FROM matched
-			WHERE target_ordinal <> message_id
-				OR target_ordinal <> ordinal
-		)
-		UPDATE pinned_messages p
-		SET message_id = (-2000000000 + numbered.temp_ordinal::INT),
-			ordinal = (-2000000000 + numbered.temp_ordinal::INT)
-		FROM numbered
-		WHERE p.id = numbered.id`,
-		sessionID,
-	); err != nil {
-		return fmt.Errorf(
-			"staging pg pins for source_uuid realignment: %w", err,
-		)
-	}
+type resolvedPostgresPin struct {
+	saved      savedPostgresPin
+	target     int
+	sourceUUID string
+}
 
-	if _, err := tx.ExecContext(ctx, `
-		WITH matched AS (
-			SELECT DISTINCT ON (p.id)
-				p.id, p.message_id, p.created_at,
-				m.ordinal AS target_ordinal
-			FROM pinned_messages p
-			JOIN messages m
-				ON m.session_id = p.session_id
-				AND m.source_uuid = p.source_uuid
-			WHERE p.session_id = $1
-				AND p.source_uuid <> ''
-			ORDER BY p.id,
-				CASE WHEN m.ordinal = p.message_id THEN 0 ELSE 1 END,
-				m.ordinal
-		),
-		ranked AS (
-			SELECT id, target_ordinal,
-				ROW_NUMBER() OVER (
-					PARTITION BY target_ordinal
-					ORDER BY
-						(message_id = target_ordinal) DESC,
-						created_at DESC,
-						id DESC
-				) AS target_rank
-			FROM matched
-		)
-		DELETE FROM pinned_messages p
-		USING ranked r
-		WHERE p.session_id = $1
-			AND r.target_rank = 1
-			AND p.message_id = r.target_ordinal
-			AND p.id <> r.id`,
-		sessionID,
-	); err != nil {
-		return fmt.Errorf(
-			"clearing pg pin target conflicts: %w", err,
-		)
-	}
-
-	if _, err := tx.ExecContext(ctx, `
-		WITH matched AS (
-			SELECT DISTINCT ON (p.id)
-				p.id, p.message_id, p.created_at,
-				m.ordinal AS target_ordinal
-			FROM pinned_messages p
-			JOIN messages m
-				ON m.session_id = p.session_id
-				AND m.source_uuid = p.source_uuid
-			WHERE p.session_id = $1
-				AND p.source_uuid <> ''
-			ORDER BY p.id,
-				CASE WHEN m.ordinal = p.message_id THEN 0 ELSE 1 END,
-				m.ordinal
-		),
-		ranked AS (
-			SELECT id, target_ordinal,
-				ROW_NUMBER() OVER (
-					PARTITION BY target_ordinal
-					ORDER BY
-						(message_id = target_ordinal) DESC,
-						created_at DESC,
-						id DESC
-				) AS target_rank
-			FROM matched
-		)
-		UPDATE pinned_messages p
-		SET message_id = r.target_ordinal,
-			ordinal = r.target_ordinal
-		FROM ranked r
-		WHERE p.id = r.id
-			AND r.target_rank = 1`,
-		sessionID,
-	); err != nil {
-		return fmt.Errorf(
-			"realigning pg pins by source_uuid: %w", err,
-		)
-	}
-
-	// Prune pins whose anchor no longer exists. For source-backed
-	// pins (source_uuid <> '') the canonical anchor is source_uuid,
-	// so a pin must be dropped when no message in this session has
-	// that source_uuid — otherwise a stale pin can survive on top
-	// of an unrelated message that now occupies the same ordinal.
-	// The ordinal-NOT-EXISTS clause additionally removes legacy
-	// pins (source_uuid = '') with a stale ordinal and clears any
-	// non-rank-1 duplicate left at the sentinel ordinal by step 2.
-	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM pinned_messages p
-		WHERE p.session_id = $1
+// snapshotPinnedMessagesQuery captures each pin plus the identity of
+// the message it anchors, before that message is deleted. A populated
+// pin source_uuid is the durable anchor and may legitimately disagree
+// with message_id after an older ordinal-shifting reconciliation.
+// Resolve it when unique and snapshot that resolved row's anchor
+// ordinal; for duplicates, accept only the row still at the recorded
+// ordinal. Keep the recorded ordinal separately so conflict resolution
+// can distinguish a shifted stale pin from a pin already stored on the
+// resolved target. UUID-less legacy pins continue to anchor by
+// message_id.
+const snapshotPinnedMessagesQuery = `
+		SELECT p.id, p.message_id,
+			COALESCE(anchored.ordinal, p.message_id), p.note, p.created_at,
+			CASE WHEN p.source_uuid <> ''
+				THEN anchored.ordinal IS NOT NULL
+				ELSE current_message.ordinal IS NOT NULL
+			END,
+			CASE WHEN p.source_uuid <> ''
+				THEN p.source_uuid
+				ELSE COALESCE(current_message.source_uuid, '')
+			END,
+			COALESCE(
+				CASE WHEN p.source_uuid <> ''
+					THEN anchored.role
+					ELSE current_message.role
+				END,
+				''
+			),
+			COALESCE(
+				CASE WHEN p.source_uuid <> ''
+					THEN anchored.content
+					ELSE current_message.content
+				END,
+				''
+			),
+			CASE WHEN p.source_uuid <> '' THEN (
+				SELECT COUNT(*)
+				FROM messages same_uuid
+				WHERE same_uuid.session_id = p.session_id
+					AND same_uuid.source_uuid = p.source_uuid
+			) ELSE (
+				SELECT COUNT(*)
+				FROM messages same_uuid
+				WHERE same_uuid.session_id = p.session_id
+					AND same_uuid.source_uuid = current_message.source_uuid
+					AND current_message.source_uuid <> ''
+			) END,
+			CASE WHEN p.source_uuid <> '' THEN (
+				SELECT COUNT(*)
+				FROM messages same_identity
+				WHERE same_identity.session_id = p.session_id
+					AND same_identity.source_uuid = p.source_uuid
+					AND same_identity.role = anchored.role
+					AND same_identity.content = anchored.content
+			) ELSE (
+				SELECT COUNT(*)
+				FROM messages same_identity
+				WHERE same_identity.session_id = p.session_id
+					AND same_identity.source_uuid = current_message.source_uuid
+					AND same_identity.role = current_message.role
+					AND same_identity.content = current_message.content
+					AND current_message.source_uuid <> ''
+			) END,
+			CASE WHEN p.source_uuid <> '' THEN (
+				SELECT COUNT(*)
+				FROM messages identity_rank
+				WHERE identity_rank.session_id = p.session_id
+					AND identity_rank.source_uuid = p.source_uuid
+					AND identity_rank.role = anchored.role
+					AND identity_rank.content = anchored.content
+					AND identity_rank.ordinal <= anchored.ordinal
+			) ELSE (
+				SELECT COUNT(*)
+				FROM messages identity_rank
+				WHERE identity_rank.session_id = p.session_id
+					AND identity_rank.source_uuid = current_message.source_uuid
+					AND identity_rank.role = current_message.role
+					AND identity_rank.content = current_message.content
+					AND identity_rank.ordinal <= current_message.ordinal
+					AND current_message.source_uuid <> ''
+			) END,
+			(
+				SELECT COUNT(*)
+				FROM messages legacy_identity
+				WHERE legacy_identity.session_id = p.session_id
+					AND legacy_identity.role = current_message.role
+					AND legacy_identity.content = current_message.content
+					AND NOT legacy_identity.is_system
+			),
+			(
+				SELECT COUNT(*)
+				FROM messages legacy_rank
+				WHERE legacy_rank.session_id = p.session_id
+					AND legacy_rank.role = current_message.role
+					AND legacy_rank.content = current_message.content
+					AND NOT legacy_rank.is_system
+					AND legacy_rank.ordinal <= current_message.ordinal
+			)
+		FROM pinned_messages p
+		LEFT JOIN messages current_message
+			ON current_message.session_id = p.session_id
+			AND current_message.ordinal = p.message_id
+		LEFT JOIN messages anchored
+			ON anchored.session_id = p.session_id
+			AND p.source_uuid <> ''
+			AND anchored.source_uuid = p.source_uuid
 			AND (
-				(
-					p.source_uuid <> ''
-					AND NOT EXISTS (
-						SELECT 1 FROM messages m
-						WHERE m.session_id = p.session_id
-							AND m.source_uuid = p.source_uuid
-					)
-				)
-				OR NOT EXISTS (
-					SELECT 1 FROM messages m
-					WHERE m.session_id = p.session_id
-						AND m.ordinal = p.message_id
-				)
-			)`,
-		sessionID,
-	); err != nil {
-		return fmt.Errorf(
-			"pruning stale pg pins: %w", err,
-		)
+				anchored.ordinal = p.message_id
+				OR (
+					SELECT COUNT(*)
+					FROM messages anchor_count
+					WHERE anchor_count.session_id = p.session_id
+						AND anchor_count.source_uuid = p.source_uuid
+				) = 1
+			)
+		WHERE p.session_id = $1
+		ORDER BY p.id
+		FOR UPDATE OF p`
+
+func snapshotPinnedMessages(
+	ctx context.Context, tx *sql.Tx, sessionID string,
+) ([]savedPostgresPin, error) {
+	rows, err := tx.QueryContext(
+		ctx, snapshotPinnedMessagesQuery, sessionID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("snapshotting pg pins: %w", err)
+	}
+	defer rows.Close()
+
+	var pins []savedPostgresPin
+	for rows.Next() {
+		var pin savedPostgresPin
+		if err := rows.Scan(
+			&pin.id, &pin.ordinal, &pin.anchorOrdinal,
+			&pin.note, &pin.createdAt,
+			&pin.messageFound, &pin.sourceUUID,
+			&pin.role, &pin.content,
+			&pin.sourceUUIDCount, &pin.sourceIdentityCount,
+			&pin.sourceIdentityRank,
+			&pin.legacyIdentityCount, &pin.legacyIdentityRank,
+		); err != nil {
+			return nil, fmt.Errorf("scanning pg pin snapshot: %w", err)
+		}
+		pins = append(pins, pin)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating pg pin snapshots: %w", err)
+	}
+	return pins, nil
+}
+
+// restorePinnedMessages re-attaches the snapshotted pins to the new
+// message rows through the guarded identity rules; pins whose message
+// can no longer be identified are dropped.
+func restorePinnedMessages(
+	ctx context.Context, tx *sql.Tx, sessionID string,
+	pins []savedPostgresPin,
+) error {
+	// Delete only rows captured and locked by the snapshot. The session
+	// row lock taken before the snapshot (lockPinnedMessagesSession)
+	// serializes PinMessage/UnpinMessage against this window, so no
+	// same-binary writer can commit a pin between snapshot and restore.
+	// The ON CONFLICT DO NOTHING below is defense-in-depth for writers
+	// that do not take that lock (e.g. an older binary sharing the same
+	// database): such a pin survives and wins any target conflict
+	// because it represents the newer user action.
+	for _, pin := range pins {
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM pinned_messages
+			WHERE session_id = $1 AND id = $2`,
+			sessionID, pin.id,
+		); err != nil {
+			return fmt.Errorf(
+				"clearing snapshotted pg pin id=%d: %w", pin.id, err,
+			)
+		}
 	}
 
+	resolved := make(map[int]resolvedPostgresPin)
+	for _, pin := range pins {
+		target, sourceUUID, ok, err := resolvePinnedMessageTarget(
+			ctx, tx, sessionID, pin,
+		)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		candidate := resolvedPostgresPin{
+			saved: pin, target: target, sourceUUID: sourceUUID,
+		}
+		current, exists := resolved[target]
+		if !exists || preferResolvedPostgresPin(candidate, current) {
+			resolved[target] = candidate
+		}
+	}
+
+	ordinals := make([]int, 0, len(resolved))
+	for ordinal := range resolved {
+		ordinals = append(ordinals, ordinal)
+	}
+	sort.Ints(ordinals)
+	for _, ordinal := range ordinals {
+		pin := resolved[ordinal]
+		var note any
+		if pin.saved.note.Valid {
+			note = pin.saved.note.String
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO pinned_messages (
+				id, session_id, message_id, ordinal,
+				source_uuid, note, created_at
+			)
+			VALUES ($1, $2, $3, $3, $4, $5, $6)
+			ON CONFLICT (session_id, message_id) DO NOTHING`,
+			pin.saved.id, sessionID, pin.target,
+			pin.sourceUUID, note, pin.saved.createdAt,
+		); err != nil {
+			return fmt.Errorf(
+				"restoring pg pin ord=%d: %w", pin.target, err,
+			)
+		}
+	}
 	return nil
+}
+
+func resolvePinnedMessageTarget(
+	ctx context.Context, tx *sql.Tx, sessionID string,
+	pin savedPostgresPin,
+) (int, string, bool, error) {
+	if !pin.messageFound {
+		return 0, "", false, nil
+	}
+	if pin.sourceUUID != "" {
+		if pin.sourceUUIDCount == 1 {
+			target, sourceUUID, ok, err := scanPinnedMessageTarget(
+				tx.QueryRowContext(ctx, `
+					SELECT m.ordinal, m.source_uuid
+					FROM messages m
+					WHERE m.session_id = $1
+						AND m.source_uuid = $2
+						AND (
+							SELECT COUNT(*)
+							FROM messages same_uuid
+							WHERE same_uuid.session_id = m.session_id
+								AND same_uuid.source_uuid = m.source_uuid
+						) = 1`,
+					sessionID, pin.sourceUUID,
+				),
+			)
+			if err != nil {
+				return 0, "", false, fmt.Errorf(
+					"resolving unique pg pin uuid=%s: %w",
+					pin.sourceUUID, err,
+				)
+			}
+			if ok {
+				return target, sourceUUID, true, nil
+			}
+		}
+		// Identical (uuid, role, content) rows are distinguishable only
+		// by position, so require the identity multiplicity to be
+		// unchanged and re-attach at the pin's occurrence rank inside
+		// the group. Rank, unlike the saved ordinal, follows the
+		// pinned occurrence across shifts caused by rows inserted
+		// before the group. A different count means duplicates were
+		// inserted or removed and the rank no longer identifies an
+		// occurrence, so the pin is dropped.
+		target, sourceUUID, ok, err := scanPinnedMessageTarget(
+			tx.QueryRowContext(ctx, `
+				SELECT m.ordinal, m.source_uuid
+				FROM messages m
+				WHERE m.session_id = $1
+					AND m.source_uuid = $2
+					AND m.role = $3
+					AND m.content = $4
+					AND (
+						SELECT COUNT(*)
+						FROM messages same_identity
+						WHERE same_identity.session_id = m.session_id
+							AND same_identity.source_uuid = m.source_uuid
+							AND same_identity.role = m.role
+							AND same_identity.content = m.content
+					) = $5
+					AND (
+						SELECT COUNT(*)
+						FROM messages identity_rank
+						WHERE identity_rank.session_id = m.session_id
+							AND identity_rank.source_uuid = m.source_uuid
+							AND identity_rank.role = m.role
+							AND identity_rank.content = m.content
+							AND identity_rank.ordinal <= m.ordinal
+					) = $6`,
+				sessionID, pin.sourceUUID,
+				pin.role, pin.content,
+				pin.sourceIdentityCount, pin.sourceIdentityRank,
+			),
+		)
+		if err != nil {
+			return 0, "", false, fmt.Errorf(
+				"resolving ambiguous pg pin uuid=%s ord=%d: %w",
+				pin.sourceUUID, pin.anchorOrdinal, err,
+			)
+		}
+		return target, sourceUUID, ok, nil
+	}
+
+	// A UUID-less pin re-attaches to the visible row holding its role,
+	// content, and occurrence rank within the visible (role, content)
+	// group, provided the group kept its size. Rank follows the pinned
+	// occurrence across ordinal shifts; matching the saved ordinal
+	// instead could attach the pin to an earlier equal message that
+	// shifted into its place.
+	target, sourceUUID, ok, err := scanPinnedMessageTarget(
+		tx.QueryRowContext(ctx, `
+			SELECT m.ordinal, m.source_uuid
+			FROM messages m
+			WHERE m.session_id = $1
+				AND m.role = $2
+				AND m.content = $3
+				AND NOT m.is_system
+				AND (
+					SELECT COUNT(*)
+					FROM messages legacy_identity
+					WHERE legacy_identity.session_id = m.session_id
+						AND legacy_identity.role = m.role
+						AND legacy_identity.content = m.content
+						AND NOT legacy_identity.is_system
+				) = $4
+				AND (
+					SELECT COUNT(*)
+					FROM messages legacy_rank
+					WHERE legacy_rank.session_id = m.session_id
+						AND legacy_rank.role = m.role
+						AND legacy_rank.content = m.content
+						AND NOT legacy_rank.is_system
+						AND legacy_rank.ordinal <= m.ordinal
+				) = $5`,
+			sessionID, pin.role, pin.content,
+			pin.legacyIdentityCount, pin.legacyIdentityRank,
+		),
+	)
+	if err != nil {
+		return 0, "", false, fmt.Errorf(
+			"resolving legacy pg pin ord=%d: %w", pin.ordinal, err,
+		)
+	}
+	return target, sourceUUID, ok, nil
+}
+
+func scanPinnedMessageTarget(
+	row *sql.Row,
+) (int, string, bool, error) {
+	var ordinal int
+	var sourceUUID string
+	if err := row.Scan(&ordinal, &sourceUUID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, "", false, nil
+		}
+		return 0, "", false, err
+	}
+	return ordinal, sourceUUID, true, nil
+}
+
+func preferResolvedPostgresPin(
+	candidate, current resolvedPostgresPin,
+) bool {
+	candidateAtTarget := candidate.saved.ordinal == candidate.target
+	currentAtTarget := current.saved.ordinal == current.target
+	if candidateAtTarget != currentAtTarget {
+		return candidateAtTarget
+	}
+	if !candidate.saved.createdAt.Equal(current.saved.createdAt) {
+		return candidate.saved.createdAt.After(current.saved.createdAt)
+	}
+	return candidate.saved.id > current.saved.id
 }
 
 func pgMessageTokenFingerprint(
@@ -3406,13 +3746,12 @@ func bulkInsertMessages(
 				p+16, p+17, p+18, p+19, p+20,
 				p+21, p+22, p+23, p+24,
 			)
-			var ts any
-			if m.Timestamp != "" {
-				if t, ok := ParseSQLiteTimestamp(
-					m.Timestamp,
-				); ok {
-					ts = t
-				}
+			ts, err := optionalSQLiteTimestamp(m.Timestamp)
+			if err != nil {
+				return fmt.Errorf(
+					"parsing message %s ordinal %d timestamp: %w",
+					sessionID, m.Ordinal, err,
+				)
 			}
 			// Sanitize every parser-derived string, not just
 			// content: model and source fields come from
@@ -3480,11 +3819,12 @@ func bulkInsertUsageEvents(
 				p, p+1, p+2, p+3, p+4, p+5, p+6,
 				p+7, p+8, p+9, p+10, p+11, p+12, p+13,
 			)
-			var occurred any
-			if ev.OccurredAt != "" {
-				if t, ok := ParseSQLiteTimestamp(ev.OccurredAt); ok {
-					occurred = t
-				}
+			occurred, err := optionalSQLiteTimestamp(ev.OccurredAt)
+			if err != nil {
+				return fmt.Errorf(
+					"parsing usage event %s occurred_at: %w",
+					ev.SessionID, err,
+				)
 			}
 			var ordinal any
 			if ev.MessageOrdinal != nil {
@@ -3693,11 +4033,12 @@ func bulkInsertToolResultEvents(
 				p, p+1, p+2, p+3, p+4, p+5,
 				p+6, p+7, p+8, p+9, p+10, p+11,
 			)
-			var ts any
-			if r.ev.Timestamp != "" {
-				if t, ok := ParseSQLiteTimestamp(r.ev.Timestamp); ok {
-					ts = t
-				}
+			ts, err := optionalSQLiteTimestamp(r.ev.Timestamp)
+			if err != nil {
+				return fmt.Errorf(
+					"parsing tool result event %s ordinal %d timestamp: %w",
+					sessionID, r.ordinal, err,
+				)
 			}
 			args = append(args,
 				sessionID,

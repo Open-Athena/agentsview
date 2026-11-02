@@ -14,9 +14,11 @@ describe("KNOWN_AGENTS", () => {
       "claude",
       "cowork",
       "codex",
+      "traex",
       "copilot",
       "devin",
       "gemini",
+      "gemini-apps",
       "opencode",
       "kilo",
       "kilo-legacy",
@@ -32,6 +34,7 @@ describe("KNOWN_AGENTS", () => {
       "qwen",
       "qwenpaw",
       "deepseek-tui",
+      "deepseek-harness",
       "openclaw",
       "qclaw",
       "iflow",
@@ -52,6 +55,8 @@ describe("KNOWN_AGENTS", () => {
       "roocode",
       "poolside",
       "omnigent",
+      "codebuff",
+      "freebuff",
     ]);
   });
 
@@ -69,6 +74,9 @@ describe("agentColor", () => {
     );
     expect(agentColor("codex")).toBe(
       "var(--accent-green)",
+    );
+    expect(agentColor("traex")).toBe(
+      "var(--accent-coral)",
     );
     expect(agentColor("copilot")).toBe(
       "var(--accent-amber)",
@@ -110,6 +118,9 @@ describe("agentColor", () => {
       "var(--accent-cyan)",
     );
     expect(agentColor("deepseek-tui")).toBe(
+      "var(--accent-cyan)",
+    );
+    expect(agentColor("deepseek-harness")).toBe(
       "var(--accent-cyan)",
     );
     expect(agentColor("vscode-copilot")).toBe(
@@ -208,10 +219,12 @@ describe("agentLabel", () => {
     expect(agentLabel("qwen")).toBe("Qwen Code");
     expect(agentLabel("qwenpaw")).toBe("QwenPaw");
     expect(agentLabel("deepseek-tui")).toBe("DeepSeek TUI");
+    expect(agentLabel("deepseek-harness")).toBe("DeepSeek Harness");
     expect(agentLabel("prime-agent")).toBe("Prime Agent");
     expect(agentLabel("qoder")).toBe("Qoder");
     expect(agentLabel("roocode")).toBe("RooCode");
     expect(agentLabel("omnigent")).toBe("Omnigent");
+    expect(agentLabel("traex")).toBe("TraeX");
   });
 
   it("capitalizes simple agent names", () => {

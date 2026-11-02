@@ -2,7 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"log"
@@ -181,9 +182,8 @@ func runUsageDaily(cfg UsageDailyConfig) {
 	}
 
 	if cfg.JSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(result); err != nil {
+		enc := jsontext.NewEncoder(os.Stdout, jsontext.WithIndent("  "))
+		if err := json.MarshalEncode(enc, result); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
@@ -312,9 +312,8 @@ func runUsageProjects(cfg UsageProjectsConfig) {
 	}
 
 	if cfg.JSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(out); err != nil {
+		enc := jsontext.NewEncoder(os.Stdout, jsontext.WithIndent("  "))
+		if err := json.MarshalEncode(enc, out); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
@@ -427,9 +426,8 @@ func runUsageLongestPrompts(cfg UsageLongestPromptsConfig) {
 	}
 
 	if cfg.JSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(rows); err != nil {
+		enc := jsontext.NewEncoder(os.Stdout, jsontext.WithIndent("  "))
+		if err := json.MarshalEncode(enc, rows); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
@@ -517,14 +515,13 @@ func runUsageStatusline(cfg UsageStatuslineConfig) {
 func printUsageStatuslineJSON(
 	result db.DailyUsageResult, agent, date string,
 ) {
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
+	enc := jsontext.NewEncoder(os.Stdout, jsontext.WithIndent("  "))
 	report := usageStatuslineReport{
 		Date:  date,
 		Cost:  result.Totals.TotalCost,
 		Agent: agent,
 	}
-	if err := enc.Encode(report); err != nil {
+	if err := json.MarshalEncode(enc, report); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
@@ -584,7 +581,9 @@ func ensureFreshData(
 		engine := sync.NewEngine(database, sync.EngineConfig{
 			AgentDirs:          appCfg.AgentDirs,
 			SourceMachines:     appCfg.SourceMachines,
+			DisabledAgents:     appCfg.DisabledAgents,
 			IncludeCwdPrefixes: appCfg.SyncIncludeCwdPrefixes,
+			ScanProtectedPaths: appCfg.ScanProtectedPaths,
 			Machine:            appCfg.LocalMachineName,
 		})
 		defer engine.Close()
@@ -609,7 +608,9 @@ func ensureFreshData(
 	engine := sync.NewEngine(database, sync.EngineConfig{
 		AgentDirs:          appCfg.AgentDirs,
 		SourceMachines:     appCfg.SourceMachines,
+		DisabledAgents:     appCfg.DisabledAgents,
 		IncludeCwdPrefixes: appCfg.SyncIncludeCwdPrefixes,
+		ScanProtectedPaths: appCfg.ScanProtectedPaths,
 		Machine:            appCfg.LocalMachineName,
 	})
 	defer engine.Close()
@@ -672,7 +673,7 @@ func seedPricing(
 
 func ensurePricing(database *db.DB, offline bool) {
 	if _, err := pricingrefresh.Ensure(
-		database, offline, pricing.FetchLiteLLMPricing, time.Now(),
+		database, offline, pricing.FetchCatalog, time.Now(),
 	); err != nil {
 		fmt.Fprintf(os.Stderr,
 			"warning: pricing refresh failed: %v\n", err)
@@ -714,20 +715,22 @@ func fallbackPricingRates(
 		bands := make([]export.PricingBand, len(p.Bands))
 		for i, band := range p.Bands {
 			bands[i] = export.PricingBand{
-				AboveInputTokens:  band.AboveInputTokens,
-				InputPerMTok:      band.InputPerMTok,
-				OutputPerMTok:     band.OutputPerMTok,
-				CacheWritePerMTok: band.CacheCreationPerMTok,
-				CacheReadPerMTok:  band.CacheReadPerMTok,
+				AboveInputTokens:    band.AboveInputTokens,
+				InputPerMTok:        band.InputPerMTok,
+				OutputPerMTok:       band.OutputPerMTok,
+				CacheWritePerMTok:   band.CacheCreationPerMTok,
+				CacheWrite1hPerMTok: band.CacheCreation1hPerMTok,
+				CacheReadPerMTok:    band.CacheReadPerMTok,
 			}
 		}
 		rates[p.ModelPattern] = export.ModelRates{
-			InputPerMTok:      p.InputPerMTok,
-			OutputPerMTok:     p.OutputPerMTok,
-			CacheWritePerMTok: p.CacheCreationPerMTok,
-			CacheReadPerMTok:  p.CacheReadPerMTok,
-			Source:            export.PricingRowSourceEmbedded,
-			Bands:             bands,
+			InputPerMTok:        p.InputPerMTok,
+			OutputPerMTok:       p.OutputPerMTok,
+			CacheWritePerMTok:   p.CacheCreationPerMTok,
+			CacheWrite1hPerMTok: p.CacheCreation1hPerMTok,
+			CacheReadPerMTok:    p.CacheReadPerMTok,
+			Source:              export.PricingRowSourceEmbedded,
+			Bands:               bands,
 		}
 	}
 	for model, rate := range custom {
@@ -740,6 +743,9 @@ func fallbackPricingRates(
 			},
 			CacheWritePerMTok: money.Money{
 				Microdollars: rate.CacheCreationMicrodollarsPerMTok,
+			},
+			CacheWrite1hPerMTok: money.Money{
+				Microdollars: rate.CacheCreation1hMicrodollarsPerMTok,
 			},
 			CacheReadPerMTok: money.Money{
 				Microdollars: rate.CacheReadMicrodollarsPerMTok,
@@ -813,7 +819,7 @@ func fetchHTTPDailyUsage(
 		Daily         []db.DailyUsageEntry              `json:"daily"`
 		SessionCounts db.UsageSessionCounts             `json:"sessionCounts"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &out); err != nil {
 		return db.DailyUsageResult{}, err
 	}
 	if out.Projects == nil {

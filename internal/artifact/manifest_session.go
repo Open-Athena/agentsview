@@ -46,7 +46,7 @@ type manifestSession struct {
 	HealthScore            *int     `json:"health_score,omitempty"`
 	HealthGrade            *string  `json:"health_grade,omitempty"`
 	SecretLeakCount        int      `json:"secret_leak_count"`
-	Private                bool     `json:"private,omitempty"`
+	Private                bool     `json:"private,omitzero"`
 
 	// Quality signals are deliberately absent from this DTO: db.Session's
 	// quality_signals pointer is load-path-transient (JSON decodes set it,
@@ -60,8 +60,8 @@ type manifestSession struct {
 	SourceSessionID      string `json:"source_session_id,omitempty"`
 	SourceVersion        string `json:"source_version,omitempty"`
 	TranscriptFidelity   string `json:"transcript_fidelity,omitempty"`
-	ParserMalformedLines int    `json:"parser_malformed_lines,omitempty"`
-	IsTruncated          bool   `json:"is_truncated,omitempty"`
+	ParserMalformedLines int    `json:"parser_malformed_lines,omitzero"`
+	IsTruncated          bool   `json:"is_truncated,omitzero"`
 
 	DeletedAt          *string `json:"deleted_at,omitempty"`
 	TerminationStatus  *string `json:"termination_status,omitempty"`

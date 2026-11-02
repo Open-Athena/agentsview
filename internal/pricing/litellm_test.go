@@ -39,12 +39,6 @@ func TestParseLiteLLMPricing(t *testing.T) {
 		money.Money{Microdollars: 3_750_000},
 		found.CacheCreationPerMTok,
 	)
-	// LiteLLM exposes only the 5m rate; the 1h rate is derived as 8/5 of it
-	// (Anthropic: 5m = 1.25x input, 1h = 2x input; 2/1.25 = 8/5).
-	assert.Equal(t,
-		money.Money{Microdollars: 6_000_000},
-		found.CacheCreation1hPerMTok,
-	)
 	assert.Equal(t,
 		money.Money{Microdollars: 300_000},
 		found.CacheReadPerMTok,

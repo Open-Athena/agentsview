@@ -63,7 +63,7 @@ from GitHub Releases, verifies the SHA-256 checksum, and installs the binary.
 
 ### Build from source
 
-Requires Go 1.26+ with CGO and Node.js 22+:
+Requires Go 1.27+ with CGO and Node.js 22+:
 
 ```bash
 git clone https://github.com/kenn-io/agentsview.git
@@ -244,6 +244,7 @@ export COPILOT_DIR=~/custom/copilot
 export CORTEX_DIR=~/custom/cortex
 export CURSOR_PROJECTS_DIR=~/custom/cursor/projects
 export DEEPSEEK_TUI_SESSIONS_DIR=~/custom/deepseek/sessions
+export DEEPSEEK_HARNESS_SESSIONS_DIR=~/custom/deepseek-harness/sessions
 export FORGE_DIR=~/custom/forge
 export GEMINI_DIR=~/custom/gemini
 export GOOSE_PATH_ROOT=~/custom/goose
@@ -286,11 +287,12 @@ export ZENCODER_DIR=~/custom/zencoder/sessions
 agentsview serve
 ```
 
-For Claude and Codex, custom roots may also be `s3://` URIs:
+For Claude, Codex, and Cursor, custom roots may also be `s3://` URIs:
 
 ```toml
 claude_project_dirs = ["s3://agent-archive/laptop/raw/claude"]
 codex_sessions_dirs = ["s3://agent-archive/laptop/raw/codex"]
+cursor_project_dirs = ["s3://agent-archive/laptop/raw/cursor"]
 ```
 
 Set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, and optionally

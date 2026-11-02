@@ -15,7 +15,10 @@ import { pins } from "./lib/stores/pins.svelte.js";
 import { router } from "./lib/stores/router.svelte.js";
 import { rollingRange } from "./lib/utils/dates.js";
 import { sessionTiming } from "./lib/stores/sessionTiming.svelte.js";
-import { sessions } from "./lib/stores/sessions.svelte.js";
+import {
+  createSessionsStore,
+  sessions,
+} from "./lib/stores/sessions.svelte.js";
 import { settings } from "./lib/stores/settings.svelte.js";
 import { starred } from "./lib/stores/starred.svelte.js";
 import { sync } from "./lib/stores/sync.svelte.js";
@@ -26,6 +29,7 @@ import type { Message } from "./lib/api/types.js";
 import { hasVisibleSegments } from "./lib/utils/content-parser.js";
 import sourceRaw from "./App.svelte?raw";
 import { SESSION_FILTER_KEYS } from "./lib/stores/sessionRouteParams.js";
+import { SessionsService } from "./lib/api/generated/index.js";
 // @ts-ignore
 import App, { findUserPromptOrdinal } from "./App.svelte";
 
@@ -55,6 +59,36 @@ async function selectRelativeRange(days: number) {
   await flushEffects();
 }
 
+function stubAppDependencies() {
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  );
+  vi.spyOn(settings, "load").mockResolvedValue();
+  vi.spyOn(starred, "load").mockResolvedValue();
+  vi.spyOn(sync, "loadStatus").mockResolvedValue();
+  vi.spyOn(sync, "loadStats").mockResolvedValue();
+  vi.spyOn(sync, "loadVersion").mockResolvedValue();
+  vi.spyOn(sync, "checkForUpdate").mockResolvedValue();
+  vi.spyOn(sync, "startPolling").mockImplementation(() => {});
+  vi.spyOn(sync, "watchSession").mockImplementation(() => {});
+  vi.spyOn(sessions, "loadProjects").mockResolvedValue();
+  vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+  vi.spyOn(sessions, "attachSidebar").mockReturnValue(() => {});
+  vi.spyOn(sessions, "loadChildSessions").mockResolvedValue();
+  vi.spyOn(messages, "loadSession").mockResolvedValue();
+  vi.spyOn(sessionTiming, "load").mockResolvedValue();
+  vi.spyOn(pins, "loadForSession").mockResolvedValue();
+  vi.spyOn(analytics, "fetchAll").mockResolvedValue();
+  vi.spyOn(analytics, "fetchSignalsForQuality").mockResolvedValue();
+  vi.spyOn(insights, "load").mockResolvedValue();
+  vi.spyOn(usage, "fetchAll").mockResolvedValue();
+}
+
 afterEach(() => {
   if (component) {
     unmount(component);
@@ -69,10 +103,15 @@ afterEach(() => {
   router.route = "sessions";
   router.params = {};
   router.sessionId = null;
+  router.isRootPath = false;
   sessions.activeSessionId = null;
   sessions.filters.date = "";
   sessions.filters.dateFrom = "";
   sessions.filters.dateTo = "";
+  sessions.filters.includeOneShot = true;
+  sessions.filters.includeAutomated = false;
+  starred.filterOnly = false;
+  sessions.initFromParams({});
   sessions.filters.project = "";
   analytics.applyRollingWindow(365);
   usage.isPinned = false;
@@ -98,7 +137,7 @@ function appSourceSlice(startMarker: string, endMarker: string): string {
 }
 
 describe("App Recall availability", () => {
-  it("does not query Recall when a read-only backend opens the direct route", async () => {
+  it("opens Generated insights without querying the corpus on a read-only backend", async () => {
     vi.stubGlobal(
       "ResizeObserver",
       class {
@@ -142,9 +181,7 @@ describe("App Recall availability", () => {
     component = mount(App, { target: document.body });
     await flushEffects();
 
-    expect(document.body.textContent).toContain(
-      "Recall is unavailable in read-only mode.",
-    );
+    expect(document.body.textContent).toContain("Generated insights");
     expect(
       fetchSpy.mock.calls.some(([input]) =>
         String(input).includes("/recall/"),
@@ -647,6 +684,710 @@ describe("App session URL date state", () => {
     expect(undoBlock).not.toContain("await sessions.restoreSession(last.id);");
   });
 });
+
+describe("App root Sessions landing", () => {
+  function setRootUrl(params: Record<string, string> = {}) {
+    const query = new URLSearchParams(params).toString();
+    window.history.replaceState(null, "", query ? `/?${query}` : "/");
+    router.route = "sessions";
+    router.params = params;
+    router.sessionId = null;
+    router.isRootPath = true;
+  }
+
+  it("resets filters without changing the bare root URL or saved value", async () => {
+    stubAppDependencies();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    const saved = JSON.stringify({
+      version: 2,
+      project: "saved-project",
+      agent: "codex",
+    });
+    localStorage.setItem("session-filters", saved);
+    sessions.initFromParams({ project: "saved-project", agent: "codex" });
+    setRootUrl();
+
+    component = mount(App, { target: document.body });
+    await flushEffects();
+
+    expect(sessions.filters.project).toBe("");
+    expect(sessions.filters.agent).toBe("");
+    expect(window.location.pathname).toBe("/");
+    expect(window.location.search).toBe("");
+    expect(localStorage.getItem("session-filters")).toBe(saved);
+  });
+
+  it("clears starred-only filtering when entering the root landing", async () => {
+    stubAppDependencies();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    starred.filterOnly = true;
+    setRootUrl();
+
+    component = mount(App, { target: document.body });
+    await flushEffects();
+
+    expect(starred.filterOnly).toBe(false);
+    expect(window.location.pathname).toBe("/");
+    expect(window.location.search).toBe("");
+  });
+
+  it("promotes a starred-only toggle from root to Sessions", async () => {
+    stubAppDependencies();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    setRootUrl();
+
+    component = mount(App, { target: document.body });
+    await flushEffects();
+
+    starred.filterOnly = true;
+    await flushEffects();
+
+    expect(window.location.pathname).toBe("/sessions");
+    expect(window.location.search).toBe("?starred=true");
+    expect(router.isRootPath).toBe(false);
+  });
+
+  it("normalizes a starred-only root deep link to Sessions", async () => {
+    stubAppDependencies();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    setRootUrl({ starred: "true" });
+
+    component = mount(App, { target: document.body });
+    await flushEffects();
+
+    expect(starred.filterOnly).toBe(true);
+    expect(window.location.pathname).toBe("/sessions");
+    expect(window.location.search).toBe("?starred=true");
+    expect(router.isRootPath).toBe(false);
+  });
+
+  it("persists defaults after starred-only is toggled in a root-derived detail", async () => {
+    stubAppDependencies();
+    vi.spyOn(SessionsService, "getApiV1SessionsSidebarIndex")
+      .mockResolvedValue({
+        sessions: [],
+        total: 0,
+        next_cursor: null,
+      } as never);
+    vi.spyOn(sessions, "navigateToSession").mockImplementation(async (id) => {
+      sessions.activeSessionId = id;
+    });
+    const saved = JSON.stringify({
+      version: 2,
+      project: "saved-project",
+      agent: "codex",
+    });
+    localStorage.setItem("session-filters", saved);
+    sessions.initFromParams({ project: "saved-project", agent: "codex" });
+    setRootUrl();
+
+    component = mount(App, { target: document.body });
+    await flushEffects();
+    router.navigateToSession("session-a");
+    await flushEffects();
+
+    starred.filterOnly = true;
+    await flushEffects();
+    expect(router.params.starred).toBe("true");
+
+    starred.filterOnly = false;
+    await flushEffects();
+    expect(router.params.starred).toBeUndefined();
+
+    sessions.deselectSession();
+    await flushEffects();
+    expect(window.location.pathname).toBe("/sessions");
+
+    const reloaded = createSessionsStore();
+    expect(reloaded.filters.project).toBe("");
+    expect(reloaded.filters.agent).toBe("");
+  });
+
+  it("keeps sticky parameters on the root landing URL", async () => {
+    stubAppDependencies();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    setRootUrl({ desktop: "1" });
+
+    component = mount(App, { target: document.body });
+    await flushEffects();
+
+    expect(router.isRootPath).toBe(true);
+    expect(window.location.pathname).toBe("/");
+    expect(window.location.search).toBe("?desktop=1");
+  });
+
+  it("preserves the shared date yoke while resetting root session filters", async () => {
+    stubAppDependencies();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    sessions.initFromParams({
+      date_from: "2026-06-01",
+      date_to: "2026-06-30",
+    });
+    yokedDates.setEnabled(true);
+    yokedDates.updateFromPanel({
+      from: "2026-06-01",
+      to: "2026-06-30",
+      mode: "fixed",
+    });
+    setRootUrl();
+
+    component = mount(App, { target: document.body });
+    await flushEffects();
+
+    expect(sessions.filters.dateFrom).toBe("");
+    expect(sessions.filters.dateTo).toBe("");
+    expect(yokedDates.range).toMatchObject({
+      from: "2026-06-01",
+      to: "2026-06-30",
+      mode: "fixed",
+    });
+    expect(JSON.parse(localStorage.getItem("yoked-dates") ?? "{}").range)
+      .toMatchObject({
+        from: "2026-06-01",
+        to: "2026-06-30",
+        mode: "fixed",
+      });
+  });
+
+  it("keeps root URL, yoke, and saved filters through analytics refresh", async () => {
+    stubAppDependencies();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    const saved = JSON.stringify({
+      version: 2,
+      project: "saved-project",
+      agent: "codex",
+    });
+    localStorage.setItem("session-filters", saved);
+    sessions.initFromParams({ project: "saved-project", agent: "codex" });
+    yokedDates.setEnabled(true);
+    yokedDates.updateFromPanel({
+      from: "2026-06-01",
+      to: "2026-06-30",
+      mode: "fixed",
+    });
+    setRootUrl();
+
+    component = mount(App, { target: document.body });
+    await flushEffects();
+
+    const refresh = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Refresh analytics"]',
+    );
+    expect(refresh).not.toBeNull();
+    refresh!.click();
+    await flushEffects();
+
+    expect(window.location.pathname).toBe("/");
+    expect(window.location.search).toBe("");
+    expect(yokedDates.range).toMatchObject({
+      from: "2026-06-01",
+      to: "2026-06-30",
+      mode: "fixed",
+    });
+    expect(localStorage.getItem("session-filters")).toBe(saved);
+    expect(JSON.parse(localStorage.getItem("yoked-dates") ?? "{}").range)
+      .toMatchObject({
+        from: "2026-06-01",
+        to: "2026-06-30",
+        mode: "fixed",
+      });
+  });
+
+  it("treats filter-bearing root URLs as explicit deep links", async () => {
+    stubAppDependencies();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    setRootUrl({ project: "explicit-project" });
+
+    component = mount(App, { target: document.body });
+    await flushEffects();
+
+    expect(sessions.filters.project).toBe("explicit-project");
+    expect(window.location.pathname).toBe("/sessions");
+    expect(window.location.search).toBe("?project=explicit-project");
+    expect(router.isRootPath).toBe(false);
+  });
+
+  it("restores saved filters on direct root-to-list navigation", async () => {
+    stubAppDependencies();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    const saved = JSON.stringify({
+      version: 2,
+      project: "saved-project",
+      agent: "codex",
+    });
+    localStorage.setItem("session-filters", saved);
+    sessions.initFromParams({ project: "saved-project", agent: "codex" });
+    setRootUrl();
+
+    component = mount(App, { target: document.body });
+    await flushEffects();
+    expect(sessions.filters.project).toBe("");
+
+    router.navigate("sessions");
+    await flushEffects();
+
+    expect(window.location.pathname).toBe("/sessions");
+    expect(sessions.filters.project).toBe("saved-project");
+    expect(sessions.filters.agent).toBe("codex");
+  });
+
+  it("restores saved filters after visiting another route from root", async () => {
+    stubAppDependencies();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    const saved = JSON.stringify({
+      version: 2,
+      project: "saved-project",
+      agent: "codex",
+    });
+    localStorage.setItem("session-filters", saved);
+    sessions.initFromParams({ project: "saved-project", agent: "codex" });
+    setRootUrl();
+
+    component = mount(App, { target: document.body });
+    await flushEffects();
+    expect(sessions.filters.project).toBe("");
+
+    router.navigate("usage");
+    await flushEffects();
+    router.navigate("sessions");
+    await flushEffects();
+
+    expect(window.location.pathname).toBe("/sessions");
+    expect(sessions.filters.project).toBe("saved-project");
+    expect(sessions.filters.agent).toBe("codex");
+  });
+
+  it("restores saved filters after root detail visits another route", async () => {
+    stubAppDependencies();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    vi.spyOn(sessions, "navigateToSession").mockImplementation(async (id) => {
+      sessions.activeSessionId = id;
+    });
+    const saved = JSON.stringify({
+      version: 2,
+      project: "saved-project",
+      agent: "codex",
+    });
+    localStorage.setItem("session-filters", saved);
+    sessions.initFromParams({ project: "saved-project", agent: "codex" });
+    setRootUrl();
+
+    component = mount(App, { target: document.body });
+    await flushEffects();
+    expect(sessions.filters.project).toBe("");
+
+    router.navigateToSession("session-a");
+    await flushEffects();
+    router.navigate("usage");
+    await flushEffects();
+    router.navigate("sessions");
+    await flushEffects();
+
+    expect(window.location.pathname).toBe("/sessions");
+    expect(sessions.filters.project).toBe("saved-project");
+    expect(sessions.filters.agent).toBe("codex");
+  });
+
+  it("restores saved filters when opening a session from Usage after root", async () => {
+    stubAppDependencies();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    vi.spyOn(sessions, "navigateToSession").mockImplementation(async (id) => {
+      sessions.activeSessionId = id;
+    });
+    const saved = JSON.stringify({
+      version: 2,
+      project: "saved-project",
+      agent: "codex",
+    });
+    localStorage.setItem("session-filters", saved);
+    sessions.initFromParams({ project: "saved-project", agent: "codex" });
+    setRootUrl();
+
+    component = mount(App, { target: document.body });
+    await flushEffects();
+    expect(sessions.filters.project).toBe("");
+
+    router.navigate("usage");
+    await flushEffects();
+    router.navigateToSession("session-a");
+    await flushEffects();
+    sessions.deselectSession();
+    await flushEffects();
+
+    expect(window.location.pathname).toBe("/sessions");
+    expect(sessions.filters.project).toBe("saved-project");
+    expect(sessions.filters.agent).toBe("codex");
+  });
+
+  it("keeps root unfiltered when returning from Usage with a shared date range", async () => {
+    stubAppDependencies();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    window.history.replaceState(null, "", "/usage");
+    router.route = "usage";
+    router.params = {};
+    router.sessionId = null;
+    router.isRootPath = false;
+    yokedDates.setEnabled(true);
+    yokedDates.updateFromPanel({
+      from: "2026-06-01",
+      to: "2026-06-30",
+      mode: "fixed",
+    });
+
+    component = mount(App, { target: document.body });
+    await flushEffects();
+
+    window.history.replaceState(null, "", "/");
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    await flushEffects();
+
+    expect(router.isRootPath).toBe(true);
+    expect(window.location.pathname).toBe("/");
+    expect(sessions.filters.dateFrom).toBe("");
+    expect(sessions.filters.dateTo).toBe("");
+  });
+
+  it("keeps root restoration pending through non-session URL parameters", async () => {
+    stubAppDependencies();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    const saved = JSON.stringify({
+      version: 2,
+      project: "saved-project",
+      agent: "codex",
+    });
+    localStorage.setItem("session-filters", saved);
+    sessions.initFromParams({ project: "saved-project", agent: "codex" });
+    setRootUrl();
+
+    component = mount(App, { target: document.body });
+    await flushEffects();
+    expect(sessions.filters.project).toBe("");
+
+    router.navigate("usage", { window_days: "30" });
+    await flushEffects();
+    router.navigate("sessions");
+    await flushEffects();
+
+    expect(window.location.pathname).toBe("/sessions");
+    expect(sessions.filters.project).toBe("saved-project");
+    expect(sessions.filters.agent).toBe("codex");
+  });
+
+  it("promotes divergent root filters and resets them on root popstate", async () => {
+    stubAppDependencies();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    const saved = JSON.stringify({
+      version: 2,
+      project: "saved-project",
+      agent: "codex",
+    });
+    localStorage.setItem("session-filters", saved);
+    sessions.initFromParams({ project: "saved-project", agent: "codex" });
+    setRootUrl();
+
+    component = mount(App, { target: document.body });
+    await flushEffects();
+    const historyLength = window.history.length;
+
+    sessions.filters.project = "chosen-project";
+    await flushEffects();
+
+    expect(window.location.pathname).toBe("/sessions");
+    expect(window.location.search).toBe("?project=chosen-project");
+    expect(window.history.length).toBeGreaterThan(historyLength);
+    expect(router.isRootPath).toBe(false);
+
+    window.history.replaceState(null, "", "/");
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    await flushEffects();
+
+    expect(router.isRootPath).toBe(true);
+    expect(sessions.filters.project).toBe("");
+    expect(localStorage.getItem("session-filters")).toBe(saved);
+  });
+
+  it("pushes date-filter promotion from root and restores the unfiltered root on Back", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-04-25T12:00:00"));
+    stubAppDependencies();
+    const analyticsFetchRanges: Array<{
+      from: string;
+      to: string;
+      isPinned: boolean;
+      windowDays: number;
+    }> = [];
+    vi.mocked(analytics.fetchAll).mockImplementation(() => {
+      analyticsFetchRanges.push({
+        from: analytics.from,
+        to: analytics.to,
+        isPinned: analytics.isPinned,
+        windowDays: analytics.windowDays,
+      });
+      return Promise.resolve();
+    });
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    yokedDates.setEnabled(true);
+    setRootUrl();
+
+    component = mount(App, { target: document.body });
+    await flushEffects();
+    const historyLength = window.history.length;
+
+    await selectRelativeRange(30);
+
+    expect(window.location.pathname).toBe("/sessions");
+    expect(router.params.window_days).toBe("30");
+    expect(window.history.length).toBeGreaterThan(historyLength);
+    const preservedYoke = { ...yokedDates.range! };
+    analyticsFetchRanges.length = 0;
+
+    window.history.replaceState(null, "", "/");
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    await flushEffects();
+
+    expect(router.isRootPath).toBe(true);
+    expect(sessions.filters.dateFrom).toBe("");
+    expect(sessions.filters.dateTo).toBe("");
+    expect(
+      document.querySelector(".kit-date-range-picker__trigger-label")
+        ?.textContent,
+    ).toBe("Last year");
+    expect(analyticsFetchRanges).toEqual([
+      {
+        from: "2025-04-26",
+        to: "2026-04-25",
+        isPinned: false,
+        windowDays: 365,
+      },
+    ]);
+    expect(yokedDates.range).toEqual(preservedYoke);
+  });
+
+  it("restores shared dates after Back returns a root detail to the landing", async () => {
+    stubAppDependencies();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    vi.spyOn(sessions, "navigateToSession").mockImplementation(async (id) => {
+      sessions.activeSessionId = id;
+    });
+    yokedDates.setEnabled(true);
+    yokedDates.updateFromPanel({
+      from: "2026-06-01",
+      to: "2026-06-30",
+      mode: "fixed",
+    });
+    setRootUrl();
+
+    component = mount(App, { target: document.body });
+    await flushEffects();
+
+    router.navigateToSession("session-a");
+    await flushEffects();
+    expect(window.location.pathname).toBe("/sessions/session-a");
+
+    window.history.back();
+    await vi.waitFor(() => {
+      expect(router.isRootPath).toBe(true);
+    });
+    await flushEffects();
+    expect(window.location.pathname).toBe("/");
+    expect(sessions.filters.dateFrom).toBe("");
+    expect(sessions.filters.dateTo).toBe("");
+
+    sessions.filters.project = "chosen-project";
+    await flushEffects();
+
+    const params = new URLSearchParams(window.location.search);
+    expect(window.location.pathname).toBe("/sessions");
+    expect(params.get("project")).toBe("chosen-project");
+    expect(params.get("date_from")).toBe("2026-06-01");
+    expect(params.get("date_to")).toBe("2026-06-30");
+    expect(sessions.filters.dateFrom).toBe("2026-06-01");
+    expect(sessions.filters.dateTo).toBe("2026-06-30");
+  });
+
+  it("restores shared dates when a filter changes in a root-derived detail", async () => {
+    stubAppDependencies();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    vi.spyOn(sessions, "navigateToSession").mockImplementation(async (id) => {
+      sessions.activeSessionId = id;
+    });
+    yokedDates.setEnabled(true);
+    yokedDates.updateFromPanel({
+      from: "2026-06-01",
+      to: "2026-06-30",
+      mode: "fixed",
+    });
+    setRootUrl();
+
+    component = mount(App, { target: document.body });
+    await flushEffects();
+    router.navigateToSession("session-a");
+    await flushEffects();
+
+    sessions.filters.project = "chosen-project";
+    await flushEffects();
+
+    const params = new URLSearchParams(window.location.search);
+    expect(window.location.pathname).toBe("/sessions/session-a");
+    expect(params.get("project")).toBe("chosen-project");
+    expect(params.get("date_from")).toBe("2026-06-01");
+    expect(params.get("date_to")).toBe("2026-06-30");
+    expect(sessions.filters.dateFrom).toBe("2026-06-01");
+    expect(sessions.filters.dateTo).toBe("2026-06-30");
+  });
+
+  it("restores shared dates when a filter changes after a root detail closes", async () => {
+    stubAppDependencies();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    vi.spyOn(sessions, "navigateToSession").mockImplementation(async (id) => {
+      sessions.activeSessionId = id;
+    });
+    yokedDates.setEnabled(true);
+    yokedDates.updateFromPanel({
+      from: "2026-06-01",
+      to: "2026-06-30",
+      mode: "fixed",
+    });
+    setRootUrl();
+
+    component = mount(App, { target: document.body });
+    await flushEffects();
+    router.navigateToSession("session-a");
+    await flushEffects();
+    sessions.deselectSession();
+    await flushEffects();
+    expect(window.location.pathname).toBe("/sessions");
+    expect(window.location.search).toBe("");
+
+    sessions.filters.project = "chosen-project";
+    await flushEffects();
+
+    const params = new URLSearchParams(window.location.search);
+    expect(window.location.pathname).toBe("/sessions");
+    expect(params.get("project")).toBe("chosen-project");
+    expect(params.get("date_from")).toBe("2026-06-01");
+    expect(params.get("date_to")).toBe("2026-06-30");
+    expect(sessions.filters.dateFrom).toBe("2026-06-01");
+    expect(sessions.filters.dateTo).toBe("2026-06-30");
+  });
+
+  it("preserves starred-only filtering when selecting a session date range", async () => {
+    stubAppDependencies();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    window.history.replaceState(null, "", "/sessions?starred=true");
+    router.route = "sessions";
+    router.params = { starred: "true" };
+    router.sessionId = null;
+    router.isRootPath = false;
+
+    component = mount(App, { target: document.body });
+    await flushEffects();
+    expect(starred.filterOnly).toBe(true);
+
+    await selectRelativeRange(30);
+
+    const params = new URLSearchParams(window.location.search);
+    expect(window.location.pathname).toBe("/sessions");
+    expect(params.get("starred")).toBe("true");
+    expect(params.get("window_days")).toBe("30");
+    expect(starred.filterOnly).toBe(true);
+  });
+
+  it("keeps saved filters through consecutive root-derived detail exits", async () => {
+    stubAppDependencies();
+    const actualAttachSidebar = sessions.attachSidebar.bind(sessions);
+    const sidebarIndex = vi
+      .spyOn(SessionsService, "getApiV1SessionsSidebarIndex")
+      .mockImplementation(() => Promise.resolve({
+        sessions: [],
+        total: 0,
+        next_cursor: null,
+      }) as never);
+    vi.spyOn(sessions, "navigateToSession").mockImplementation(async (id) => {
+      sessions.activeSessionId = id;
+    });
+    const saved = JSON.stringify({
+      version: 2,
+      project: "saved-project",
+      agent: "codex",
+    });
+    localStorage.setItem("session-filters", saved);
+    sessions.initFromParams({ project: "saved-project", agent: "codex" });
+    yokedDates.setEnabled(true);
+    yokedDates.updateFromPanel({
+      from: "2026-06-01",
+      to: "2026-06-30",
+      mode: "fixed",
+    });
+    setRootUrl();
+
+    component = mount(App, { target: document.body });
+    await flushEffects();
+    expect(localStorage.getItem("session-filters")).toBe(saved);
+    expect(window.location.search).toBe("");
+    const detach = actualAttachSidebar();
+
+    sidebarIndex.mockClear();
+    router.navigateToSession("session-a");
+    await flushEffects();
+    expect(localStorage.getItem("session-filters")).toBe(saved);
+    expect(window.location.search).toBe("");
+    sessions.refreshSidebarIfAttached();
+    await vi.waitFor(() => {
+      expect(sidebarIndex).toHaveBeenCalled();
+    });
+    expect(localStorage.getItem("session-filters")).toBe(saved);
+
+    sessions.deselectSession();
+    await flushEffects();
+
+    expect(window.location.pathname).toBe("/sessions");
+    expect(window.location.search).toBe("");
+    expect(sessions.filters.project).toBe("");
+    expect(yokedDates.range).toMatchObject({
+      from: "2026-06-01",
+      to: "2026-06-30",
+      mode: "fixed",
+    });
+    expect(localStorage.getItem("session-filters")).toBe(saved);
+
+    const refresh = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Refresh analytics"]',
+    );
+    expect(refresh).not.toBeNull();
+    refresh!.click();
+    await flushEffects();
+
+    expect(window.location.pathname).toBe("/sessions");
+    expect(window.location.search).toBe("");
+    expect(yokedDates.range).toMatchObject({
+      from: "2026-06-01",
+      to: "2026-06-30",
+      mode: "fixed",
+    });
+    expect(localStorage.getItem("session-filters")).toBe(saved);
+
+    router.navigateToSession("session-b");
+    await flushEffects();
+    expect(window.location.search).toBe("");
+    expect(localStorage.getItem("session-filters")).toBe(saved);
+
+    sessions.deselectSession();
+    await flushEffects();
+
+    expect(window.location.pathname).toBe("/sessions");
+    expect(window.location.search).toBe("");
+    expect(sessions.filters.project).toBe("");
+    expect(yokedDates.range).toMatchObject({
+      from: "2026-06-01",
+      to: "2026-06-30",
+      mode: "fixed",
+    });
+    expect(localStorage.getItem("session-filters")).toBe(saved);
+    detach();
+  });
+});
+
 function message(
   ordinal: number,
   role: Message["role"],
@@ -754,12 +1495,12 @@ describe("App analytics date navigation", () => {
     vi.spyOn(sessionTiming, "load").mockResolvedValue();
     vi.spyOn(pins, "loadForSession").mockResolvedValue();
     vi.spyOn(analytics, "fetchAll").mockResolvedValue();
-    vi.spyOn(analytics, "fetchSignalsForInsights").mockResolvedValue();
+    vi.spyOn(analytics, "fetchSignalsForQuality").mockResolvedValue();
     vi.spyOn(insights, "load").mockResolvedValue();
     vi.spyOn(usage, "fetchAll").mockResolvedValue();
 
-    window.history.replaceState(null, "", "/insights");
-    router.route = "insights";
+    window.history.replaceState(null, "", "/quality");
+    router.route = "quality";
     router.params = {};
     router.sessionId = null;
     yokedDates.setEnabled(true);
@@ -842,11 +1583,11 @@ describe("App analytics date navigation", () => {
       sessions.activeSessionId = id;
     });
     vi.spyOn(analytics, "fetchAll").mockResolvedValue();
-    vi.spyOn(analytics, "fetchSignalsForInsights").mockResolvedValue();
+    vi.spyOn(analytics, "fetchSignalsForQuality").mockResolvedValue();
     vi.spyOn(insights, "load").mockResolvedValue();
 
-    window.history.replaceState(null, "", "/insights");
-    router.route = "insights";
+    window.history.replaceState(null, "", "/quality");
+    router.route = "quality";
     router.params = {};
     router.sessionId = null;
     yokedDates.setEnabled(true);
@@ -905,11 +1646,11 @@ describe("App analytics date navigation", () => {
     vi.spyOn(sessions, "loadAgents").mockResolvedValue();
     vi.spyOn(sessions, "attachSidebar").mockReturnValue(() => {});
     vi.spyOn(analytics, "fetchAll").mockResolvedValue();
-    vi.spyOn(analytics, "fetchSignalsForInsights").mockResolvedValue();
+    vi.spyOn(analytics, "fetchSignalsForQuality").mockResolvedValue();
     vi.spyOn(insights, "load").mockResolvedValue();
 
-    window.history.replaceState(null, "", "/insights");
-    router.route = "insights";
+    window.history.replaceState(null, "", "/quality");
+    router.route = "quality";
     router.params = {};
     router.sessionId = null;
     analyticsPageDates.retain(
@@ -975,7 +1716,7 @@ describe("App analytics date navigation", () => {
     vi.spyOn(sessions, "loadAgents").mockResolvedValue();
     vi.spyOn(sessions, "attachSidebar").mockReturnValue(() => {});
     vi.spyOn(analytics, "fetchAll").mockResolvedValue();
-    vi.spyOn(analytics, "fetchSignalsForInsights").mockResolvedValue();
+    vi.spyOn(analytics, "fetchSignalsForQuality").mockResolvedValue();
     vi.spyOn(insights, "load").mockResolvedValue();
 
     window.history.replaceState(null, "", "/sessions");
@@ -989,7 +1730,7 @@ describe("App analytics date navigation", () => {
     await flushEffects();
     await selectRelativeRange(30);
 
-    router.navigate("insights");
+    router.navigate("quality");
     await flushEffects();
     sessionLoadDates.length = 0;
     const dateFiltersAtRouteReplace: Array<{
@@ -1037,7 +1778,7 @@ describe("App analytics date navigation", () => {
     expect(router.params).toEqual({});
   });
 
-  it("shares a retained Insights range after linking is enabled", async () => {
+  it("shares a retained Quality range after linking is enabled", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-07-10T12:00:00"));
     vi.stubGlobal(
@@ -1060,12 +1801,12 @@ describe("App analytics date navigation", () => {
     vi.spyOn(sessions, "loadAgents").mockResolvedValue();
     vi.spyOn(sessions, "attachSidebar").mockReturnValue(() => {});
     vi.spyOn(analytics, "fetchAll").mockResolvedValue();
-    vi.spyOn(analytics, "fetchSignalsForInsights").mockResolvedValue();
+    vi.spyOn(analytics, "fetchSignalsForQuality").mockResolvedValue();
     vi.spyOn(insights, "load").mockResolvedValue();
     vi.spyOn(usage, "fetchAll").mockResolvedValue();
 
-    window.history.replaceState(null, "", "/insights");
-    router.route = "insights";
+    window.history.replaceState(null, "", "/quality");
+    router.route = "quality";
     router.params = {};
     router.sessionId = null;
     analytics.applyRollingWindow(365);
@@ -1078,7 +1819,7 @@ describe("App analytics date navigation", () => {
     router.navigate("settings");
     await flushEffects();
     yokedDates.setEnabled(true);
-    router.navigate("insights");
+    router.navigate("quality");
     await flushEffects();
     router.navigate("usage");
     await flushEffects();

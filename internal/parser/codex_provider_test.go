@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,6 +96,79 @@ func TestCodexProviderSourceMethods(t *testing.T) {
 	assert.Equal(t, "Renamed title", result.Result.Session.SessionName)
 	assert.Equal(t, fingerprint.Hash, result.Result.Session.File.Hash)
 	assert.Len(t, result.Result.Messages, 1)
+}
+
+func TestCodexProviderUnresolvedParentNeedsRetry(t *testing.T) {
+	root := t.TempDir()
+	const childID = "22222222-2222-4222-8222-222222222222"
+	const parentID = "11111111-1111-4111-8111-111111111111"
+	content := testjsonl.JoinJSONL(
+		testjsonl.CodexForkedSessionMetaJSON(
+			childID, parentID, "/workspace/project", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexTurnContextWithIDJSON("gpt-5.4", "child-turn", tsEarlyS1),
+		testjsonl.CodexMsgJSON("user", "child task", tsEarlyS1),
+		testjsonl.CodexMsgJSON("assistant", "child answer", tsEarlyS5),
+	)
+	writeCodexProviderSessionContent(t, root, childID, content)
+	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	source := requireCodexProviderSource(t, provider, childID)
+
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
+
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	result := outcome.Results[0]
+	assert.Equal(t, DataVersionNeedsRetry, result.DataVersion)
+	assert.Contains(t, result.RetryReason, "parent turns")
+	require.Len(t, result.Result.Messages, 2)
+	assert.Equal(t, "child task", result.Result.Messages[0].Content)
+	assert.Equal(t, "child answer", result.Result.Messages[1].Content)
+}
+
+func TestCodexProviderUnresolvedParentWithoutFinalNewlineNeedsRetry(t *testing.T) {
+	root := t.TempDir()
+	const childID = "22222222-2222-4222-8222-222222222222"
+	const parentID = "11111111-1111-4111-8111-111111111111"
+	content := strings.TrimSuffix(testjsonl.JoinJSONL(
+		testjsonl.CodexForkedSessionMetaJSON(
+			childID, parentID, "/workspace/project", "codex_cli_rs", tsEarly,
+		),
+	), "\n")
+	writeCodexProviderSessionContent(t, root, childID, content)
+	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	source := requireCodexProviderSource(t, provider, childID)
+
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
+
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	assert.Equal(t, DataVersionNeedsRetry, outcome.Results[0].DataVersion)
+}
+
+func TestCodexProviderChildOnlySubagentWithoutParentStaysCurrent(t *testing.T) {
+	root := t.TempDir()
+	const childID = "22222222-2222-4222-8222-222222222222"
+	const parentID = "11111111-1111-4111-8111-111111111111"
+	content := testjsonl.JoinJSONL(
+		testjsonl.CodexSubagentSessionMetaJSON(
+			childID, parentID, "/workspace/project", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexTurnContextWithIDJSON("gpt-5.4", "child-turn", tsEarlyS1),
+		testjsonl.CodexMsgJSON("user", "child task", tsEarlyS1),
+	)
+	writeCodexProviderSessionContent(t, root, childID, content)
+	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	source := requireCodexProviderSource(t, provider, childID)
+
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
+
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	assert.Equal(t, DataVersionCurrent, outcome.Results[0].DataVersion)
 }
 
 func TestCodexActivityHintsUseConfiguredRootParent(t *testing.T) {
@@ -319,6 +393,28 @@ func TestCodexProviderFullParseSnapshotExcludesLaterGrowth(t *testing.T) {
 	assert.Equal(t, int64(len(tail)), outcome.ConsumedBytes)
 }
 
+func TestCodexFullParseHonorsContextBetweenLines(t *testing.T) {
+	root := t.TempDir()
+	uuid := "019eb791-cf7d-75c1-8439-9ed74c1229ed"
+	path := writeCodexProviderSession(t, root, uuid, "question")
+	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	concrete, ok := provider.(*codexProvider)
+	require.True(t, ok)
+	snapshot, err := os.Open(path)
+	require.NoError(t, err)
+	defer snapshot.Close()
+	info, err := snapshot.Stat()
+	require.NoError(t, err)
+	ctx := newCancelOnErrCheckContext(t, 4)
+
+	_, _, err = concrete.parseSessionSnapshotContext(
+		ctx, path, "local", false, snapshot, info,
+	)
+
+	require.ErrorIs(t, err, context.Canceled)
+}
+
 func TestCodexProviderFullParseSnapshotKeepsDescriptorIdentityAfterReplacement(
 	t *testing.T,
 ) {
@@ -526,6 +622,50 @@ func TestCodexProviderIncrementalSnapshotKeepsCapturedEOFConservative(t *testing
 	)
 	assert.False(t, oldStaged)
 	assert.False(t, newStaged)
+}
+
+func TestCodexProviderIncrementalAppendedSessionMetaNeedsFullParse(t *testing.T) {
+	root := t.TempDir()
+	childID := "019eb791-cf7d-75c1-8439-9ed74c1229f3"
+	parentID := "019eb791-cb95-7a14-830f-9968e582f290"
+	prefix := testjsonl.JoinJSONL(
+		testjsonl.CodexSubagentSessionMetaJSON(
+			childID, parentID, "/workspace/project-a", "codex_cli_rs", tsEarly,
+		),
+	)
+	path := writeCodexProviderSessionContent(t, root, childID, prefix)
+	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	source := requireCodexProviderSource(t, provider, childID)
+	initialFingerprint, err := provider.Fingerprint(context.Background(), source)
+	require.NoError(t, err)
+
+	appendCodexProviderContent(t, path, testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			parentID, "/workspace/project-a", "codex_cli_rs", tsEarly,
+		),
+		testjsonl.CodexMsgJSON(
+			"assistant", "replayed parent answer", tsEarlyS5,
+		),
+	))
+	currentFingerprint, err := provider.Fingerprint(context.Background(), source)
+	require.NoError(t, err)
+
+	outcome, status, err := provider.ParseIncremental(
+		context.Background(),
+		IncrementalRequest{
+			Source:       source,
+			Fingerprint:  currentFingerprint,
+			SessionID:    "codex:" + childID,
+			Offset:       initialFingerprint.Size,
+			StartOrdinal: 0,
+		},
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, IncrementalNeedsFullParse, status)
+	assert.True(t, outcome.ForceReplace)
+	assert.Empty(t, outcome.Messages)
 }
 
 func TestCodexProviderIncrementalRejectsFingerprintIdentityMismatch(t *testing.T) {
@@ -885,7 +1025,6 @@ func TestCodexProviderTokenCountCursorParity(t *testing.T) {
 				testjsonl.CodexMsgJSON("assistant", "tail answer", "2024-01-01T10:00:05Z"),
 				tc.tailToken,
 			)
-
 			fullRoot := t.TempDir()
 			writeCodexProviderSessionContent(
 				t, fullRoot, tc.uuid, prefix+tail,

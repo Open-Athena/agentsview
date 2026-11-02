@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"go.kenn.io/agentsview/internal/config"
@@ -12,8 +14,9 @@ import (
 )
 
 type serveRuntimeOptions struct {
-	Mode          string
-	RequestedPort int
+	Mode           string
+	RequestedPort  int
+	OnCaddyStarted func(int)
 }
 
 type serveRuntime struct {
@@ -33,7 +36,10 @@ func prepareServeRuntimeConfig(
 		requestedPort = cfg.Port
 	}
 
-	port := server.FindAvailablePort(cfg.Host, cfg.Port)
+	port, err := server.FindAvailablePort(cfg.Host, cfg.Port)
+	if err != nil {
+		return cfg, err
+	}
 	if port != cfg.Port {
 		if cfg.Port == 0 {
 			fmt.Printf("Using available port %d\n", port)
@@ -73,8 +79,8 @@ func startServerWithOptionalCaddy(
 		serveErrCh <- srv.ListenAndServe()
 	}()
 
-	if err := waitForLocalPort(
-		ctx, cfg.Host, cfg.Port, 5*time.Second, serveErrCh,
+	if err := waitForBackendReady(
+		ctx, cfg, srv, 5*time.Second, serveErrCh,
 	); err != nil {
 		shutdownCtx, cancel := context.WithTimeout(
 			context.Background(), 5*time.Second,
@@ -90,7 +96,9 @@ func startServerWithOptionalCaddy(
 	var caddy *managedCaddy
 	if cfg.Proxy.Mode == "caddy" {
 		var err error
-		caddy, err = startManagedCaddy(ctx, cfg, opts.Mode)
+		caddy, err = startManagedCaddy(
+			ctx, cfg, opts.Mode, opts.OnCaddyStarted,
+		)
 		if err != nil {
 			shutdownCtx, cancel := context.WithTimeout(
 				context.Background(), 5*time.Second,
@@ -137,6 +145,95 @@ func startServerWithOptionalCaddy(
 		ServeErrCh: serveErrCh,
 		Caddy:      caddy,
 	}, nil
+}
+
+// waitForBackendReady waits until the started HTTP server proves that the
+// readiness request reached this Server instance. The proof uses a temporary
+// server-held secret, so a colliding listener never receives the persistent
+// bearer token.
+func waitForBackendReady(
+	ctx context.Context,
+	cfg config.Config,
+	srv *server.Server,
+	timeout time.Duration,
+	errCh <-chan error,
+) error {
+	if err := srv.EnableStartupProbe(); err != nil {
+		return err
+	}
+	defer srv.DisableStartupProbe()
+
+	deadline := time.Now().Add(timeout)
+	address := net.JoinHostPort(
+		probeHostForDial(cfg.Host), strconv.Itoa(cfg.Port),
+	)
+	probeURL := "http://" + address + srv.StartupProbePath()
+	transport := &http.Transport{}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   200 * time.Millisecond,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	var lastErr error
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-errCh:
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if err == nil {
+				return fmt.Errorf(
+					"service exited before becoming ready on %s",
+					address,
+				)
+			}
+			return err
+		default:
+		}
+		challenge, expectedProof, err := srv.StartupProbeChallenge()
+		if err != nil {
+			return err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
+		if err != nil {
+			return fmt.Errorf("create startup probe request: %w", err)
+		}
+		server.SetStartupProbeChallenge(req, challenge)
+		resp, err := client.Do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusNoContent {
+				err = fmt.Errorf(
+					"startup probe on %s returned status %d",
+					address, resp.StatusCode,
+				)
+			} else if !server.ValidStartupProbeResponse(resp, expectedProof) {
+				err = fmt.Errorf("startup probe on %s returned an invalid proof", address)
+			} else {
+				return nil
+			}
+		}
+		lastErr = err
+		timer := time.NewTimer(50 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("timed out waiting for %s", address)
+	}
+	return lastErr
 }
 
 func waitForServerRuntime(

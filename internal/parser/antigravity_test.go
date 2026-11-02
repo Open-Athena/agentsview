@@ -6,7 +6,7 @@ import (
 	"crypto/cipher"
 	"database/sql"
 	"encoding/binary"
-	"encoding/json"
+	"encoding/json/v2"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -2656,6 +2656,172 @@ func TestAntigravityTokenUsage(t *testing.T) {
 	assert.True(t, sess.HasPeakContextTokens)
 }
 
+func TestAntigravityCLIGenerationMetadataMapsToPlannerStepAndExecutorModel(t *testing.T) {
+	tests := []struct {
+		name            string
+		generationModel string
+		modelField      int
+		executorModel   string
+		wantModel       string
+	}{
+		{
+			name:            "base slug gains executor effort",
+			generationModel: "gemini-3.7-flash",
+			modelField:      agChatModelMetadataResponseModelField,
+			executorModel:   "gemini-3.7-flash-high",
+			wantModel:       "gemini-3.7-flash-high",
+		},
+		{
+			name:            "different executor base is ignored",
+			generationModel: "claude-sonnet-4-6",
+			modelField:      agChatModelMetadataResponseModelField,
+			executorModel:   "gemini-3.7-flash-high",
+			wantModel:       "claude-sonnet-4-6",
+		},
+		{
+			name:            "display label stays authoritative",
+			generationModel: "Gemini 3.7 Flash (High)",
+			modelField:      agChatModelMetadataModelDisplayNameField,
+			executorModel:   "gemini-3.7-flash-medium",
+			wantModel:       "Gemini 3.7 Flash (High)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			id := "55555555-6666-7777-8888-cccccccccccc"
+			mustMkdir(t, filepath.Join(root, "conversations"))
+			dbPath := filepath.Join(root, "conversations", id+".db")
+
+			db, err := sql.Open("sqlite3", dbPath)
+			require.NoError(t, err)
+			defer db.Close()
+
+			createAntigravityStepTables(t, db)
+			mustExec(t, db, `CREATE TABLE gen_metadata (
+				idx integer, data blob, size integer, PRIMARY KEY (idx))`)
+			mustExec(t, db, `CREATE TABLE executor_metadata (
+				idx integer, data blob, size integer, PRIMARY KEY (idx))`)
+
+			tsEarly := encodePB([]pbField{{
+				num: 1, wire: pbWireVarint, varint: 1779000000,
+			}})
+			userPayload := encodePB([]pbField{
+				{num: 5, wire: pbWireBytes, bytes: tsEarly},
+				{
+					num:   17,
+					wire:  pbWireBytes,
+					bytes: []byte("user question text goes here and is long"),
+				},
+			})
+			tsLate := encodePB([]pbField{{
+				num: 1, wire: pbWireVarint, varint: 1779000100,
+			}})
+			plannerPayload := encodePB([]pbField{
+				{num: 1, wire: pbWireVarint, varint: 15},
+				{num: 5, wire: pbWireBytes, bytes: tsLate},
+				{
+					num:   17,
+					wire:  pbWireBytes,
+					bytes: []byte("assistant response body goes here and is long"),
+				},
+			})
+			mustExec(t, db,
+				`INSERT INTO steps (idx, step_type, step_payload) VALUES (0, 14, ?)`,
+				userPayload)
+			mustExec(t, db,
+				`INSERT INTO steps (idx, step_type, step_payload) VALUES (3, 132, ?)`,
+				plannerPayload)
+
+			genData := createAntigravityMockGenMetadataForSteps(
+				t, 2400, 180, 0, tt.generationModel, tt.modelField, 3,
+			)
+			mustExec(t, db,
+				`INSERT INTO gen_metadata (idx, data, size) VALUES (7, ?, ?)`,
+				genData, len(genData))
+			executorData := createAntigravityMockExecutorMetadata(
+				3, tt.executorModel,
+			)
+			mustExec(t, db,
+				`INSERT INTO executor_metadata (idx, data, size) VALUES (0, ?, ?)`,
+				executorData, len(executorData))
+
+			_, msgs, usageEvents, _, err :=
+				parseAntigravityCLITestSessionWithStatus(
+					t, dbPath, "test-project", "test-machine",
+				)
+			require.NoError(t, err)
+			require.Len(t, msgs, 2)
+			assert.Equal(t, tt.wantModel, msgs[1].Model)
+			assert.Equal(t, 2400, msgs[1].ContextTokens)
+			assert.Equal(t, 180, msgs[1].OutputTokens)
+
+			require.Len(t, usageEvents, 1)
+			assert.Equal(t, tt.wantModel, usageEvents[0].Model)
+			assert.Equal(t, 2400, usageEvents[0].InputTokens)
+			assert.Equal(t, 180, usageEvents[0].OutputTokens)
+			occurredAt, err := time.Parse(
+				time.RFC3339Nano, usageEvents[0].OccurredAt,
+			)
+			require.NoError(t, err)
+			assert.Equal(t, int64(1779000100), occurredAt.Unix())
+		})
+	}
+}
+
+func TestExtractAntigravityStepIndicesDistinguishesAbsentAndMalformed(t *testing.T) {
+	tests := []struct {
+		name        string
+		data        []byte
+		wantIndices []int
+		wantPresent bool
+		wantValid   bool
+	}{
+		{
+			name: "absent uses legacy mapping",
+			data: encodePB([]pbField{{
+				num:   agChatModelMetadataResponseModelField,
+				wire:  pbWireBytes,
+				bytes: []byte("gemini-3.7-flash"),
+			}}),
+			wantValid: true,
+		},
+		{
+			name: "packed indices",
+			data: encodePB([]pbField{{
+				num:  agCortexStepGeneratorMetadataStepIndicesField,
+				wire: pbWireBytes,
+				bytes: append(
+					encodeVarint(148), encodeVarint(149)...,
+				),
+			}}),
+			wantIndices: []int{148, 149},
+			wantPresent: true,
+			wantValid:   true,
+		},
+		{
+			name: "malformed packed indices",
+			data: encodePB([]pbField{{
+				num:   agCortexStepGeneratorMetadataStepIndicesField,
+				wire:  pbWireBytes,
+				bytes: []byte{0x80},
+			}}),
+			wantPresent: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			indices, present, valid :=
+				extractAntigravityStepIndices(tt.data)
+			assert.Equal(t, tt.wantIndices, indices)
+			assert.Equal(t, tt.wantPresent, present)
+			assert.Equal(t, tt.wantValid, valid)
+		})
+	}
+}
+
 // TestAntigravityTokenUsageCachedTokens verifies the gen_metadata path
 // when cache-read tokens are present. ContextTokens is the full context
 // window (uncached input + cache-read), InputTokens carries just the
@@ -3155,40 +3321,161 @@ func createAntigravityMockGenMetadata(t *testing.T, uncachedInput, totalOutput, 
 }
 
 func createAntigravityMockGenMetadataWithField(t *testing.T, fieldNum int, uncachedInput, totalOutput, cacheRead int, model string) []byte {
-	// Build token usage inner block with remapped field semantics
-	// cross-validated against sidecar ground truth:
-	//   f2 = uncached input (inputTokens)
-	//   f3 = total output including thinking (outputTokens)
-	//   f4 = absent (never carries semantics)
-	//   f5 = cache-read (cacheReadTokens, present when > 0)
-	usageInner := encodePB([]pbField{
-		{num: 1, wire: pbWireVarint, varint: uint64(fieldNum)},
-		{num: 2, wire: pbWireVarint, varint: uint64(uncachedInput)},
-		{num: 3, wire: pbWireVarint, varint: uint64(totalOutput)},
-	})
+	return createAntigravityMockGenMetadataData(
+		t, fieldNum, uncachedInput, totalOutput, cacheRead,
+		model, agChatModelMetadataModelDisplayNameField,
+	)
+}
+
+func createAntigravityMockGenMetadataForSteps(
+	t *testing.T,
+	uncachedInput, totalOutput, cacheRead int,
+	model string,
+	modelField int,
+	stepIndices ...int,
+) []byte {
+	t.Helper()
+	usageFields := []pbField{
+		{num: agModelUsageStatsModelField, wire: pbWireVarint, varint: 1020},
+		{
+			num:    agModelUsageStatsInputTokensField,
+			wire:   pbWireVarint,
+			varint: uint64(uncachedInput),
+		},
+		{
+			num:    agModelUsageStatsOutputTokensField,
+			wire:   pbWireVarint,
+			varint: uint64(totalOutput),
+		},
+	}
 	if cacheRead > 0 {
-		usageInner = encodePB([]pbField{
-			{num: 1, wire: pbWireVarint, varint: uint64(fieldNum)},
-			{num: 2, wire: pbWireVarint, varint: uint64(uncachedInput)},
-			{num: 3, wire: pbWireVarint, varint: uint64(totalOutput)},
-			{num: 5, wire: pbWireVarint, varint: uint64(cacheRead)},
+		usageFields = append(usageFields, pbField{
+			num:    agModelUsageStatsCacheReadTokensField,
+			wire:   pbWireVarint,
+			varint: uint64(cacheRead),
+		})
+	}
+	chatModelFields := []pbField{{
+		num:   agChatModelMetadataUsageField,
+		wire:  pbWireBytes,
+		bytes: encodePB(usageFields),
+	}}
+	if model != "" {
+		chatModelFields = append(chatModelFields, pbField{
+			num: modelField, wire: pbWireBytes, bytes: []byte(model),
 		})
 	}
 
-	// Build Field 2 (Nested message) of Field 17
-	f17Inner := encodePB([]pbField{
-		{num: 2, wire: pbWireBytes, bytes: usageInner},
+	var packedStepIndices []byte
+	for _, idx := range stepIndices {
+		packedStepIndices = append(
+			packedStepIndices, encodeVarint(uint64(idx))...,
+		)
+	}
+	// Put plausible model and usage decoys outside chat_model and before the
+	// real metadata. The current-schema decoder must follow the descriptor path
+	// instead of accepting the first recursively matching field numbers.
+	decoyUsage := encodePB([]pbField{
+		{num: agModelUsageStatsModelField, wire: pbWireVarint, varint: 1020},
+		{num: agModelUsageStatsInputTokensField, wire: pbWireVarint, varint: 1},
+		{num: agModelUsageStatsOutputTokensField, wire: pbWireVarint, varint: 1},
 	})
+	legacyDecoyWrapper := encodePB([]pbField{{
+		num: 2, wire: pbWireBytes, bytes: decoyUsage,
+	}})
+	return encodePB([]pbField{
+		{
+			num:   agChatModelMetadataModelDisplayNameField,
+			wire:  pbWireBytes,
+			bytes: []byte("wrong top-level model"),
+		},
+		{num: 17, wire: pbWireBytes, bytes: legacyDecoyWrapper},
+		{
+			num:   agCortexStepGeneratorMetadataChatModelField,
+			wire:  pbWireBytes,
+			bytes: encodePB(chatModelFields),
+		},
+		{
+			num:   agCortexStepGeneratorMetadataStepIndicesField,
+			wire:  pbWireBytes,
+			bytes: packedStepIndices,
+		},
+	})
+}
 
-	// Build top-level fields: Field 17 (Nested bytes), Field 21 (String bytes)
-	topFields := []pbField{
-		{num: 17, wire: pbWireBytes, bytes: f17Inner},
+func createAntigravityMockGenMetadataData(
+	t *testing.T,
+	fieldNum, uncachedInput, totalOutput, cacheRead int,
+	model string,
+	modelField int,
+) []byte {
+	t.Helper()
+	// Older records use unknown wrappers around a ModelUsageStats payload.
+	usageFields := []pbField{
+		{
+			num:    agModelUsageStatsModelField,
+			wire:   pbWireVarint,
+			varint: uint64(fieldNum),
+		},
+		{
+			num:    agModelUsageStatsInputTokensField,
+			wire:   pbWireVarint,
+			varint: uint64(uncachedInput),
+		},
+		{
+			num:    agModelUsageStatsOutputTokensField,
+			wire:   pbWireVarint,
+			varint: uint64(totalOutput),
+		},
 	}
+	if cacheRead > 0 {
+		usageFields = append(usageFields, pbField{
+			num:    agModelUsageStatsCacheReadTokensField,
+			wire:   pbWireVarint,
+			varint: uint64(cacheRead),
+		})
+	}
+	usageInner := encodePB(usageFields)
+	f17Inner := encodePB([]pbField{{
+		num: 2, wire: pbWireBytes, bytes: usageInner,
+	}})
+
+	topFields := []pbField{{
+		num: 17, wire: pbWireBytes, bytes: f17Inner,
+	}}
 	if model != "" {
-		topFields = append(topFields, pbField{num: 21, wire: pbWireBytes, bytes: []byte(model)})
+		topFields = append(topFields, pbField{
+			num: modelField, wire: pbWireBytes, bytes: []byte(model),
+		})
 	}
-
 	return encodePB(topFields)
+}
+
+func createAntigravityMockExecutorMetadata(
+	lastStepIndex int, modelName string,
+) []byte {
+	plannerConfig := encodePB([]pbField{{
+		num:   agCascadePlannerConfigModelNameField,
+		wire:  pbWireBytes,
+		bytes: []byte(modelName),
+	}})
+	cascadeConfig := encodePB([]pbField{{
+		num:   agCascadeConfigPlannerConfigField,
+		wire:  pbWireBytes,
+		bytes: plannerConfig,
+	}})
+	return encodePB([]pbField{
+		{
+			num:    agExecutorMetadataLastStepIndexField,
+			wire:   pbWireVarint,
+			varint: uint64(lastStepIndex),
+		},
+		{
+			num:   agExecutorMetadataCascadeConfigField,
+			wire:  pbWireBytes,
+			bytes: cascadeConfig,
+		},
+	})
 }
 
 // TestExtractTokenUsageFalsePositiveGuards verifies that decoy blocks

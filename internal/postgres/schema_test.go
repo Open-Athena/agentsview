@@ -580,11 +580,12 @@ func TestEnsureSchemaChecksDataVersionBeforeDDL(t *testing.T) {
 		"EnsureSchema must not mutate PG before data-version refusal")
 }
 
-func TestSyncEnsureSchemaSkipsDDLWhenSchemaCompatible(t *testing.T) {
+func TestSyncEnsureSchemaSkipsLegacyDDLWhenSchemaCompatible(t *testing.T) {
 	pg, state := newSchemaProbeDB(t, nil)
 	state.existingTables = map[string]bool{
 		"model_pricing":                                   true,
 		"model_pricing_bands":                             true,
+		"genai_pricing":                                   true,
 		"source_archives":                                 true,
 		"source_project_identity_observations":            true,
 		"source_project_identity_observation_scopes":      true,
@@ -602,14 +603,18 @@ func TestSyncEnsureSchemaSkipsDDLWhenSchemaCompatible(t *testing.T) {
 	require.NoError(t, syncer.EnsureSchema(context.Background()))
 
 	executed := strings.ToLower(state.executedSQL())
-	assert.NotContains(t, executed, "create index",
-		"compatible PG schema must skip index DDL")
+	assert.NotContains(t, executed, "create table if not exists sessions",
+		"compatible PG schema must skip legacy table DDL")
+	assert.NotContains(t, executed, "create index if not exists idx_sessions_parent",
+		"compatible PG schema must skip legacy index DDL")
 	assert.NotContains(t, executed, "alter index",
-		"compatible PG schema must skip index DDL")
-	assert.NotContains(t, executed, "create table",
-		"compatible PG schema must skip table DDL")
+		"compatible PG schema must skip legacy index migrations")
 	assert.Equal(t, 0, state.alterTableExecCount(),
 		"compatible PG schema must not run column migrations")
+	assert.Contains(t, executed, "create table if not exists raw_objects",
+		"raw custody tables must be bootstrapped independently")
+	assert.Contains(t, executed, "create index if not exists idx_raw_ingest_jobs_ready",
+		"raw custody indexes must be bootstrapped independently")
 	assert.Contains(t, executed, "insert into sync_metadata",
 		"compatible PG schema must still run row-level data repairs")
 }
@@ -619,6 +624,7 @@ func TestEnsureSchemaScrubsProjectIdentityGitRemoteCredentials(t *testing.T) {
 	state.existingTables = map[string]bool{
 		"model_pricing":                                   true,
 		"model_pricing_bands":                             true,
+		"genai_pricing":                                   true,
 		"source_archives":                                 true,
 		"source_project_identity_observations":            true,
 		"source_project_identity_observation_scopes":      true,
@@ -957,6 +963,8 @@ func TestSyncEnsureSchemaRunsDDLWhenMappingTableMissing(t *testing.T) {
 	// a table to write into.
 	state.existingTables = map[string]bool{
 		"model_pricing":                             true,
+		"model_pricing_bands":                       true,
+		"genai_pricing":                             true,
 		"source_archives":                           true,
 		"source_project_identity_observations":      true,
 		"source_session_project_identity_snapshots": true,
@@ -992,6 +1000,8 @@ func TestSyncEnsureSchemaRunsDDLWhenDedupIndexMissing(t *testing.T) {
 	// usage rows. The fast path must fall back to EnsureSchema.
 	state.existingTables = map[string]bool{
 		"model_pricing":       true,
+		"model_pricing_bands": true,
+		"genai_pricing":       true,
 		"cursor_usage_events": true,
 	}
 	syncer := &Sync{pg: pg, schema: "agentsview"}
@@ -1117,6 +1127,9 @@ func TestEnsureSchemaGroupsMissingColumnMigrationsByTable(t *testing.T) {
 			"call_index", "file_path",
 		},
 		"model_pricing": {
+			"cache_creation_1h_microdollars_per_mtok",
+		},
+		"model_pricing_bands": {
 			"cache_creation_1h_microdollars_per_mtok",
 		},
 	})

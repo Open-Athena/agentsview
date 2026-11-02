@@ -3,7 +3,7 @@
 package main
 
 import (
-	"encoding/json"
+	"encoding/json/v2"
 	"log"
 	"os"
 	"path/filepath"
@@ -26,6 +26,7 @@ const startupDetailThrottle = time.Second
 
 type startupState struct {
 	PID              int       `json:"pid"`
+	Version          string    `json:"version,omitempty"`
 	StartedAt        time.Time `json:"started_at"`
 	Phase            string    `json:"phase"`
 	Detail           string    `json:"detail,omitempty"`
@@ -75,7 +76,11 @@ func newStartupStateWriter(
 		now:  now,
 	}
 	w.state.PID = os.Getpid()
+	w.state.Version = version
 	w.state.StartedAt = now()
+	if createTime, ok := processCreateTimeMillis(w.state.PID); ok {
+		w.state.CreateTime = strconv.FormatInt(createTime, 10)
+	}
 	if runningAsBackgroundChild() {
 		// Only a background child's output lands in serve.log; a
 		// foreground serve prints to the invoking terminal.
@@ -97,6 +102,24 @@ func (w *startupStateWriter) SetPhase(phase string) {
 	}
 	w.state.Phase = phase
 	w.state.Detail = ""
+	w.write()
+}
+
+// SetCaddyProcess publishes the managed proxy identity as soon as it starts,
+// before the daemon runtime record exists. This lets daemon stop clean up the
+// proxy even when startup is interrupted before runtime publication.
+func (w *startupStateWriter) SetCaddyProcess(pid int) {
+	if w == nil || pid <= 0 {
+		return
+	}
+	createTime := ""
+	if created, ok := processCreateTimeMillis(pid); ok {
+		createTime = strconv.FormatInt(created, 10)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.state.CaddyPID = pid
+	w.state.CaddyCreateTime = createTime
 	w.write()
 }
 

@@ -521,7 +521,6 @@ func TestProcessFileProviderAuthoritativeUsesInjectedProvider(t *testing.T) {
 }
 
 func TestProcessFileProviderAuthoritativeKeepsRetryStatePerResult(t *testing.T) {
-
 	root := t.TempDir()
 	sourcePath, fingerprint := writeProcessProviderSource(t, root, "retry.jsonl")
 	provider := newProcessFixtureProvider(
@@ -565,6 +564,54 @@ func TestProcessFileProviderAuthoritativeKeepsRetryStatePerResult(t *testing.T) 
 	assert.False(t, res.needsRetryForSession("cowork:current"))
 	assert.True(t, res.needsRetryForSession("cowork:retry"))
 	assert.False(t, res.suppressesPresenceSweepForRetry())
+}
+
+func TestSyncSingleSessionKeepsRetryStatePerResult(t *testing.T) {
+	root := t.TempDir()
+	sourcePath, fingerprint := writeProcessProviderSource(t, root, "retry.jsonl")
+	provider := newProcessFixtureProvider(
+		processFixtureSource(sourcePath),
+		fingerprint,
+		parser.ParseOutcome{
+			Results: []parser.ParseResultOutcome{
+				{
+					Result: processFixtureResult(
+						"cowork:current",
+						parser.AgentCowork,
+						"fixture-project",
+						sourcePath,
+						fingerprint,
+					),
+					DataVersion: parser.DataVersionCurrent,
+				},
+				{
+					Result: processFixtureResult(
+						"cowork:retry",
+						parser.AgentCowork,
+						"fixture-project",
+						sourcePath,
+						fingerprint,
+					),
+					DataVersion: parser.DataVersionNeedsRetry,
+				},
+			},
+			ResultSetComplete: true,
+		},
+	)
+	engine := newProcessFixtureEngine(t, root, provider)
+
+	_, _, err := engine.processAndWriteSessionFile(
+		context.Background(),
+		parser.DiscoveredFile{Path: sourcePath, Agent: parser.AgentCowork},
+		"cowork:current",
+	)
+	require.NoError(t, err)
+	assert.Equal(t, db.CurrentDataVersion(),
+		engine.db.GetSessionDataVersion("cowork:current"),
+		"a sibling retry must not leave the valid session stale")
+	assert.Less(t, engine.db.GetSessionDataVersion("cowork:retry"),
+		db.CurrentDataVersion(),
+		"the retrying session must remain stale")
 }
 
 func TestSyncSingleSessionPartialFullWritesQueueNewChild(t *testing.T) {
@@ -808,7 +855,10 @@ func TestProcessFileProviderAuthoritativeUsesSkipReasonCacheKey(t *testing.T) {
 	assert.True(t, res.skip)
 	assert.True(t, res.cacheSkip)
 	assert.False(t, res.noCacheSkip)
-	assert.Equal(t, source.FingerprintKey, res.skipCacheKey(sourcePath))
+	assert.Equal(t,
+		providerAgentSkipCacheKey(source.FingerprintKey, parser.AgentCowork),
+		res.skipCacheKey(sourcePath),
+	)
 }
 
 func TestProcessFileProviderAuthoritativeForceParseAllowsStaleSourceLookup(t *testing.T) {
@@ -1670,18 +1720,16 @@ func newProcessFixtureProvider(
 	outcome parser.ParseOutcome,
 ) *processFixtureProvider {
 	return &processFixtureProvider{
-		ProviderBase: parser.ProviderBase{
-			Def: parser.AgentDef{
-				Type:        parser.AgentCowork,
-				DisplayName: "Cowork",
-				IDPrefix:    "cowork:",
-				FileBased:   true,
-			},
-			Caps: parser.Capabilities{
-				Source: parser.SourceCapabilities{
-					FindSource:           parser.CapabilitySupported,
-					CompositeFingerprint: parser.CapabilitySupported,
-				},
+		Def: parser.AgentDef{
+			Type:        parser.AgentCowork,
+			DisplayName: "Cowork",
+			IDPrefix:    "cowork:",
+			FileBased:   true,
+		},
+		Caps: parser.Capabilities{
+			Source: parser.SourceCapabilities{
+				FindSource:           parser.CapabilitySupported,
+				CompositeFingerprint: parser.CapabilitySupported,
 			},
 		},
 		source:      source,
@@ -1711,12 +1759,17 @@ type processFixtureProvider struct {
 	parser.ProviderBase
 
 	source        parser.SourceRef
+	discovered    []parser.SourceRef
 	findFound     bool
 	fingerprint   parser.SourceFingerprint
 	outcome       parser.ParseOutcome
 	calls         []string
 	findRequests  []parser.FindSourceRequest
 	parseRequests []parser.ParseRequest
+}
+
+func (p *processFixtureProvider) Discover(context.Context) ([]parser.SourceRef, error) {
+	return append([]parser.SourceRef(nil), p.discovered...), nil
 }
 
 func (p *processFixtureProvider) FindSource(

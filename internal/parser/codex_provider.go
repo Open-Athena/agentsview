@@ -2,7 +2,8 @@ package parser
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,16 +14,60 @@ import (
 
 var _ Provider = (*codexProvider)(nil)
 var _ ActivityHintProvider = (*codexProvider)(nil)
+var _ S3Provider = (*codexProvider)(nil)
+var _ RawCaptureProvider = (*codexProvider)(nil)
+
+// codexProviderSpec parameterizes the one shared Codex-format provider
+// implementation for Codex and its TraeX fork. Both reuse the same
+// discovery, source-lookup, fingerprinting, and parsing code; they differ
+// only in the agent label and ID prefix applied via relabel. TraeX parses
+// through the Codex rollout reader and then relabels the result onto its
+// own agent and ID prefix.
+type codexProviderSpec struct {
+	agent AgentType
+	// relabel rewrites a parsed Codex-format result onto this agent's
+	// identity, and is nil for Codex itself. The session is nil on the
+	// incremental path, which keeps the stored session ID and only needs
+	// the appended message rows relabeled.
+	relabel func(*ParsedSession, []ParsedMessage)
+}
+
+func codexProviderSpecForAgent(agent AgentType) codexProviderSpec {
+	switch agent {
+	case AgentTraeX:
+		return codexProviderSpec{
+			agent:   AgentTraeX,
+			relabel: relabelCodexResultAsTraeX,
+		}
+	default:
+		return codexProviderSpec{agent: AgentCodex}
+	}
+}
 
 type codexProviderFactory struct {
-	def         AgentDef
-	cursorCache *codexCursorCache
+	def             AgentDef
+	spec            codexProviderSpec
+	cursorCache     *codexCursorCache
+	parentTurnCache *codexParentTurnCache
 }
 
 func newCodexProviderFactory(def AgentDef) ProviderFactory {
 	return &codexProviderFactory{
-		def:         cloneAgentDef(def),
-		cursorCache: newProductionCodexCursorCache(),
+		def:             cloneAgentDef(def),
+		spec:            codexProviderSpecForAgent(AgentCodex),
+		cursorCache:     newProductionCodexCursorCache(),
+		parentTurnCache: newCodexProductionParentTurnCache(),
+	}
+}
+
+// newTraeXProviderFactory serves TRAE CLI's rollout archive with the Codex
+// provider, relabeling every parsed session onto the traex: ID prefix.
+func newTraeXProviderFactory(def AgentDef) ProviderFactory {
+	return &codexProviderFactory{
+		def:             cloneAgentDef(def),
+		spec:            codexProviderSpecForAgent(AgentTraeX),
+		cursorCache:     newProductionCodexCursorCache(),
+		parentTurnCache: newCodexProductionParentTurnCache(),
 	}
 }
 
@@ -31,26 +76,34 @@ func (f *codexProviderFactory) Definition() AgentDef {
 }
 
 func (f *codexProviderFactory) Capabilities() Capabilities {
-	return codexProviderCapabilities()
+	caps := codexProviderCapabilities()
+	if f.spec.agent == AgentCodex {
+		caps.Source.S3Discovery = CapabilitySupported
+	} else {
+		caps.RawCapture = RawCaptureCapabilities{}
+	}
+	return caps
 }
 
 func (f *codexProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
 	return &codexProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   codexProviderCapabilities(),
-			Config: cfg,
-		},
-		sources:     newCodexSourceSet(cfg.Roots),
-		cursorCache: f.cursorCache,
+		Def:             cloneAgentDef(f.def),
+		Caps:            f.Capabilities(),
+		Config:          cfg,
+		spec:            f.spec,
+		sources:         newCodexSourceSet(f.spec.agent, cfg.Roots),
+		cursorCache:     f.cursorCache,
+		parentTurnCache: f.parentTurnCache,
 	}
 }
 
 type codexProvider struct {
 	ProviderBase
-	sources     codexSourceSet
-	cursorCache *codexCursorCache
+	spec            codexProviderSpec
+	sources         codexSourceSet
+	cursorCache     *codexCursorCache
+	parentTurnCache *codexParentTurnCache
 }
 
 func (p *codexProvider) Discover(ctx context.Context) ([]SourceRef, error) {
@@ -194,6 +247,77 @@ func (p *codexProvider) Fingerprint(
 	return p.sources.Fingerprint(ctx, source)
 }
 
+func (p *codexProvider) PlanRawCapture(
+	ctx context.Context,
+	source SourceRef,
+) (RawCapturePlan, error) {
+	if err := ctx.Err(); err != nil {
+		return RawCapturePlan{}, err
+	}
+	if p.spec.agent != AgentCodex {
+		return RawCapturePlan{}, invalidRawCapturePlan("provider does not own Codex raw companions")
+	}
+	src, ok := source.Opaque.(codexSource)
+	if !ok || src.Root == "" || src.Path == "" || isS3URI(src.Root) {
+		return RawCapturePlan{}, invalidRawCapturePlan("codex source is not a local discovered transcript")
+	}
+	captureRoot := filepath.Clean(src.Root)
+	indexPath := codexSessionIndexPath(src.Path)
+	if indexPath != "" {
+		// The provider reads this named sibling as session metadata, so raw
+		// capture widens only far enough to preserve the same parse inputs.
+		captureRoot = filepath.Dir(indexPath)
+	}
+	rel, err := filepath.Rel(captureRoot, src.Path)
+	if err != nil {
+		return RawCapturePlan{}, invalidRawCapturePlan(
+			"resolve Codex source path: %s", rawCaptureFilesystemError(err),
+		)
+	}
+	entries := []RawCaptureEntry{{
+		Path:       filepath.ToSlash(rel),
+		LocalPath:  src.Path,
+		Appendable: true,
+	}}
+	if indexPath != "" {
+		info, err := os.Stat(indexPath)
+		switch {
+		case err == nil && info.Mode().IsRegular():
+			entries = append(entries, RawCaptureEntry{
+				Path:      CodexSessionIndexFilename,
+				LocalPath: indexPath,
+			})
+		case errors.Is(err, os.ErrNotExist):
+		case err != nil:
+			return RawCapturePlan{}, invalidRawCapturePlan(
+				"stat Codex session index: %s", rawCaptureFilesystemError(err),
+			)
+		default:
+			return RawCapturePlan{}, invalidRawCapturePlan("Codex session index is not a regular file")
+		}
+	}
+	return RawCapturePlan{
+		ConfiguredRoot: src.Root,
+		CaptureRoot:    captureRoot,
+		SourceKey:      source.Key,
+		Entries:        entries,
+	}, nil
+}
+
+// ComputeMultiFileStatHash implements parser.MultiFileStatHasher over the
+// rollout transcript plus its session_index.jsonl sidecar, mirroring the
+// sidecar folding of the verified-source gate: an index-only change (a
+// thread title rename) breaks the digest even when the transcript is
+// byte-identical, so the warm short-circuit can never mask a metadata
+// refresh. An absent index contributes a stable (0, 0, 0) tuple, which
+// matches modern Codex releases that no longer write the index. The
+// digest persists stat-verified freshness in provider_freshness across
+// process restarts, sparing a fresh engine the full-content hash that
+// Fingerprint performs for every unchanged rollout.
+func (p *codexProvider) ComputeMultiFileStatHash(chatPath string) uint64 {
+	return fileStatTupleDigest(0xC2, chatPath, codexSessionIndexPath(chatPath))
+}
+
 func (p *codexProvider) Parse(
 	ctx context.Context,
 	req ParseRequest,
@@ -205,11 +329,12 @@ func (p *codexProvider) Parse(
 	if !ok {
 		return ParseOutcome{}, fmt.Errorf("codex source path unavailable")
 	}
-	if req.ForceParse {
+	if req.ForceParse && p.spec.agent == AgentCodex {
 		EvictCodexSessionIndexForSession(path)
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
-	sess, msgs, err := p.parseSession(path, machine, false)
+	parentID, parentResolved := p.codexParentResolution(ctx, path)
+	sess, msgs, err := p.parseSessionContext(ctx, path, machine, false)
 	if err != nil {
 		return ParseOutcome{}, err
 	}
@@ -219,17 +344,25 @@ func (p *codexProvider) Parse(
 			SkipReason:        SkipNoSession,
 		}, nil
 	}
+	if p.spec.relabel != nil {
+		p.spec.relabel(sess, msgs)
+	}
 	if req.Fingerprint.Hash != "" {
 		sess.File.Hash = req.Fingerprint.Hash
 	}
+	result := ParseResultOutcome{
+		Result: ParseResult{
+			Session:  *sess,
+			Messages: msgs,
+		},
+		DataVersion: DataVersionCurrent,
+	}
+	if parentID != "" && !parentResolved {
+		result.DataVersion = DataVersionNeedsRetry
+		result.RetryReason = "codex parent turns unresolved for " + parentID
+	}
 	return ParseOutcome{
-		Results: []ParseResultOutcome{{
-			Result: ParseResult{
-				Session:  *sess,
-				Messages: msgs,
-			},
-			DataVersion: DataVersionCurrent,
-		}},
+		Results:           []ParseResultOutcome{result},
 		ResultSetComplete: true,
 		// A requested full parse is the authoritative message set, so
 		// force-replace the stored rows; this remains distinct from the provider's
@@ -326,6 +459,10 @@ func (p *codexProvider) ParseIncremental(
 		result.cursor,
 	)
 
+	if p.spec.relabel != nil {
+		p.spec.relabel(nil, result.messages)
+	}
+
 	totalOut, peakCtx, hasTotalOut, hasPeakCtx :=
 		codexProviderTokenTotals(result.messages)
 	termination := codexIncrementalTermination(result.cursor.lastTaskEvent)
@@ -352,11 +489,28 @@ type codexSource struct {
 }
 
 type codexSourceSet struct {
+	// agent labels the sources this set emits. Codex-format forks share
+	// the layout but must not share a discovery namespace: keying sources
+	// by agent keeps a TraeX UUID from colliding with a Codex one.
+	agent AgentType
 	roots []string
 }
 
-func newCodexSourceSet(roots []string) codexSourceSet {
-	return codexSourceSet{roots: cleanJSONLRoots(roots)}
+func newCodexSourceSet(agent AgentType, roots []string) codexSourceSet {
+	if agent == "" {
+		agent = AgentCodex
+	}
+	return codexSourceSet{agent: agent, roots: cleanJSONLRoots(roots)}
+}
+
+// ownsCodexSidecars reports whether this source set's agent is the one that
+// owns Codex's out-of-band files: the session_index.jsonl sidecar and the
+// s3://.../raw/codex/... archive layout. Only Codex does. A fork writes
+// neither, so it must not watch, fan out on, or import them -- importing an
+// s3:// root through the Codex S3 scanner would stamp AgentCodex and silently
+// move the sessions into Codex's identity namespace.
+func (s codexSourceSet) ownsCodexSidecars() bool {
+	return s.agent == AgentCodex
 }
 
 func (s codexSourceSet) Discover(ctx context.Context) ([]SourceRef, error) {
@@ -371,8 +525,11 @@ func (s codexSourceSet) DiscoverEach(
 			return err
 		}
 		if strings.HasPrefix(root, "s3://") {
-			for _, file := range discoverCodexS3(root) {
-				if err := yield(s3SourceRefFromDiscoveredFile(file)); err != nil {
+			if !s.ownsCodexSidecars() {
+				continue
+			}
+			for _, file := range s3PrefixScan(root, codexS3Scanner()) {
+				if err := yield(s3SourceRefFromDiscoveredFile(root, file)); err != nil {
 					return err
 				}
 			}
@@ -422,8 +579,11 @@ func (s codexSourceSet) discover(
 			// payload. Each object is its own session keyed by URI, so the
 			// live-over-archived preference (which inspects a local codexSource
 			// layout) does not apply here.
-			for _, file := range discoverCodexS3(root) {
-				source := s3SourceRefFromDiscoveredFile(file)
+			if !s.ownsCodexSidecars() {
+				continue
+			}
+			for _, file := range s3PrefixScan(root, codexS3Scanner()) {
+				source := s3SourceRefFromDiscoveredFile(root, file)
 				if _, ok := byKey[source.Key]; ok {
 					continue
 				}
@@ -556,12 +716,18 @@ func (s codexSourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 	roots := make([]WatchRoot, 0, len(s.roots)*2)
 	seenShallow := make(map[string]struct{})
 	for _, root := range s.roots {
+		if isS3URI(root) {
+			continue
+		}
 		roots = append(roots, WatchRoot{
 			Path:         root,
 			Recursive:    true,
 			IncludeGlobs: []string{"*.jsonl"},
-			DebounceKey:  string(AgentCodex) + ":sessions:" + root,
+			DebounceKey:  string(s.agent) + ":sessions:" + root,
 		})
+		if !s.ownsCodexSidecars() {
+			continue
+		}
 		for _, shallow := range ResolveCodexShallowWatchRoots(root) {
 			shallow = filepath.Clean(shallow)
 			if _, ok := seenShallow[shallow]; ok {
@@ -572,7 +738,7 @@ func (s codexSourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 				Path:         shallow,
 				Recursive:    false,
 				IncludeGlobs: []string{CodexSessionIndexFilename},
-				DebounceKey:  string(AgentCodex) + ":index:" + shallow,
+				DebounceKey:  string(s.agent) + ":index:" + shallow,
 			})
 		}
 	}
@@ -586,7 +752,8 @@ func (s codexSourceSet) SourcesForChangedPath(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if filepath.Base(req.Path) == CodexSessionIndexFilename {
+	if s.ownsCodexSidecars() &&
+		filepath.Base(req.Path) == CodexSessionIndexFilename {
 		return s.sourcesForIndexPath(ctx, req.Path)
 	}
 	for _, root := range s.roots {
@@ -670,15 +837,19 @@ func (s codexSourceSet) Fingerprint(
 	if info.IsDir() {
 		return SourceFingerprint{}, fmt.Errorf("stat %s: source is a directory", path)
 	}
-	hash, err := hashJSONLSourceFile(path)
+	hash, err := hashJSONLSourceFileContext(ctx, path)
 	if err != nil {
 		return SourceFingerprint{}, err
 	}
 	inode, device := sourceFileIdentity(info)
+	mtime := info.ModTime().UnixNano()
+	if s.agent == AgentCodex {
+		mtime = CodexEffectiveMtime(path, mtime)
+	}
 	return SourceFingerprint{
 		Key:     firstNonEmptyJSONLString(source.FingerprintKey, source.Key, path),
 		Size:    info.Size(),
-		MTimeNS: CodexEffectiveMtime(path, info.ModTime().UnixNano()),
+		MTimeNS: mtime,
 		Inode:   inode,
 		Device:  device,
 		Hash:    hash,
@@ -743,8 +914,8 @@ func (s codexSourceSet) sourceRef(
 		return SourceRef{}, false
 	}
 	return SourceRef{
-		Provider:       AgentCodex,
-		Key:            codexSourceKey(uuid),
+		Provider:       s.agent,
+		Key:            codexSourceKey(s.agent, uuid),
 		DisplayPath:    path,
 		FingerprintKey: path,
 		Opaque: codexSource{
@@ -770,7 +941,7 @@ func (s codexSourceSet) directPathSource(
 		return SourceRef{}, false
 	}
 	return SourceRef{
-		Provider:       AgentCodex,
+		Provider:       s.agent,
 		Key:            path,
 		DisplayPath:    path,
 		FingerprintKey: path,
@@ -809,16 +980,18 @@ func (s codexSourceSet) canonicalSource(
 	return best, true, nil
 }
 
-func codexSourceKey(uuid string) string {
-	return string(AgentCodex) + ":" + uuid
+func codexSourceKey(agent AgentType, uuid string) string {
+	return string(agent) + ":" + uuid
 }
 
-// CodexSourceKey is the discovery identity of a Codex session UUID. Every
-// on-disk copy of a duplicated UUID shares this key, so the sync engine's
-// reconciliation index resolves same-UUID replacements with one bounded
-// lookup instead of an archive walk.
-func CodexSourceKey(uuid string) string {
-	return codexSourceKey(uuid)
+// CodexSourceKey is the discovery identity of a Codex-format session UUID
+// under the given agent. Every on-disk copy of a duplicated UUID shares this
+// key, so the sync engine's reconciliation index resolves same-UUID
+// replacements with one bounded lookup instead of an archive walk. The agent
+// keeps Codex and its TraeX fork in separate identity namespaces even when
+// both archives happen to hold the same UUID.
+func CodexSourceKey(agent AgentType, uuid string) string {
+	return codexSourceKey(agent, uuid)
 }
 
 func preferCodexSource(candidate, current SourceRef) bool {
@@ -883,6 +1056,7 @@ func codexProviderCapabilities() Capabilities {
 			ExcludedSessions:     CapabilityNotApplicable,
 			ForceReplaceOnParse:  CapabilitySupported,
 			VerifiedLocalStat:    CapabilitySupported,
+			MultiFileStatHash:    CapabilitySupported,
 		},
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
@@ -903,6 +1077,12 @@ func codexProviderCapabilities() Capabilities {
 			FingerprintHashInCacheKey:           true,
 			FingerprintHashRequiredForFreshness: true,
 			SkipCacheFreshWithoutStoredRow:      true,
+		},
+		RawCapture: RawCaptureCapabilities{
+			Support:  CapabilitySupported,
+			Shape:    RawCaptureShapeFiles,
+			Append:   RawCaptureAppendOne,
+			Snapshot: RawCaptureSnapshotNone,
 		},
 	}
 }

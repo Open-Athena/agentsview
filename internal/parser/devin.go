@@ -3,7 +3,8 @@ package parser
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"math"
@@ -241,8 +242,7 @@ func newDevinTranscriptError(op string, cause error) error {
 }
 
 func devinTranscriptCauseMessage(cause error) string {
-	var pathErr *os.PathError
-	if errors.As(cause, &pathErr) {
+	if pathErr, ok := errors.AsType[*os.PathError](cause); ok {
 		if pathErr.Op != "" && pathErr.Err != nil {
 			return pathErr.Op + ": " + pathErr.Err.Error()
 		}
@@ -833,7 +833,7 @@ func parseDevinStep(step gjson.Result, ordinal int, model string) (ParsedMessage
 }
 
 func devinTokenUsageFromMetrics(metrics gjson.Result) (
-	json.RawMessage, int, int, bool, bool,
+	jsontext.Value, int, int, bool, bool,
 ) {
 	if !metrics.Exists() || metrics.Type != gjson.JSON {
 		return nil, 0, 0, false, false
@@ -864,7 +864,7 @@ func devinTokenUsageFromMetrics(metrics gjson.Result) (
 	if hasCached {
 		payload["cache_read_input_tokens"] = cached
 	}
-	raw, err := json.Marshal(payload)
+	raw, err := json.Marshal(payload, json.Deterministic(true))
 	if err != nil {
 		return nil, 0, 0, false, false
 	}

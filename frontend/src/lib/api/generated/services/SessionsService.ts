@@ -114,6 +114,7 @@ export class SessionsService {
     includeOneShot,
     includeAutomated,
     includeChildren,
+    includeSource,
     outcome,
     healthGrade,
     cursor,
@@ -190,6 +191,10 @@ export class SessionsService {
      */
     includeChildren?: boolean,
     /**
+     * Include source file paths
+     */
+    includeSource?: boolean,
+    /**
      * Filter by detected outcome
      */
     outcome?: string,
@@ -250,6 +255,7 @@ export class SessionsService {
         'include_one_shot': includeOneShot,
         'include_automated': includeAutomated,
         'include_children': includeChildren,
+        'include_source': includeSource,
         'outcome': outcome,
         'health_grade': healthGrade,
         'cursor': cursor,
@@ -328,6 +334,7 @@ export class SessionsService {
     includeOneShot,
     includeAutomated,
     includeChildren,
+    includeSource,
     outcome,
     healthGrade,
     cursor,
@@ -404,6 +411,10 @@ export class SessionsService {
      */
     includeChildren?: boolean,
     /**
+     * Include source file paths
+     */
+    includeSource?: boolean,
+    /**
      * Filter by detected outcome
      */
     outcome?: string,
@@ -464,6 +475,7 @@ export class SessionsService {
         'include_one_shot': includeOneShot,
         'include_automated': includeAutomated,
         'include_children': includeChildren,
+        'include_source': includeSource,
         'outcome': outcome,
         'health_grade': healthGrade,
         'cursor': cursor,
@@ -498,6 +510,7 @@ export class SessionsService {
   public static postApiV1SessionsUpload({
     project,
     machine = 'remote',
+    allowShorter,
     formData,
   }: {
     /**
@@ -508,6 +521,10 @@ export class SessionsService {
      * Machine name for imported session
      */
     machine?: string,
+    /**
+     * Permit replacing an existing session with fewer messages
+     */
+    allowShorter?: boolean,
     formData?: {
       file: Blob;
     },
@@ -518,6 +535,7 @@ export class SessionsService {
       query: {
         'project': project,
         'machine': machine,
+        'allow_shorter': allowShorter,
       },
       formData: formData,
       mediaType: 'multipart/form-data',

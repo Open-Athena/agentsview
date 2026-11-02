@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"io/fs"
@@ -10,6 +12,7 @@ import (
 	"net/http"
 	httppprof "net/http/pprof"
 	"net/url"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,8 +25,10 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/insight"
+	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/postgres"
 	"go.kenn.io/agentsview/internal/pricingrefresh"
+	"go.kenn.io/agentsview/internal/rawsync"
 	"go.kenn.io/agentsview/internal/recall/extract"
 	"go.kenn.io/agentsview/internal/remotesync"
 	"go.kenn.io/agentsview/internal/service"
@@ -47,7 +52,10 @@ type VersionInfo struct {
 // Bump it when a client-visible contract cannot be decoded safely by an older
 // CLI or daemon.
 const (
-	APIVersion = 6
+	APIVersion = 7
+	// ScopedWatchPushAPIVersion is the first daemon API that accepts bounded
+	// watcher batches and their authoritative recovery scope on push requests.
+	ScopedWatchPushAPIVersion = 7
 	// SubagentUsageAPIVersion is the first daemon API that guarantees
 	// combined session-usage scope and targeted descendant synchronization.
 	SubagentUsageAPIVersion = 6
@@ -58,22 +66,32 @@ const daemonService = "agentsview"
 const (
 	defaultInsightLogDrainTimeout    = 2 * time.Second
 	defaultInsightLogStopWaitTimeout = 500 * time.Millisecond
+	defaultHTTPReadTimeout           = 10 * time.Second
+	corsAllowedRequestHeaders        = "Content-Type, Authorization, " +
+		service.SemanticSearchIntentHeader + ", " + rawSyncDeviceIDHeader +
+		", " + rawSyncUploadOffsetHeader
+	corsExposedResponseHeaders = rawSyncUploadOffsetHeader + ", " +
+		rawSyncUploadLengthHeader + ", " + rawSyncUploadCompleteHeader + ", Location"
 )
 
 // Server is the HTTP server that serves the SPA and REST API.
 type Server struct {
-	mu             gosync.RWMutex
-	cfg            config.Config
-	db             db.Store
-	engine         *sync.Engine
-	onDemandEngine *sync.Engine
-	sessions       service.SessionService
-	broadcaster    *Broadcaster
-	mux            *http.ServeMux
-	api            huma.API
-	httpSrv        *http.Server
-	version        VersionInfo
-	dataDir        string
+	mu                    gosync.RWMutex
+	cfg                   config.Config
+	activeDisabledAgents  []parser.AgentType
+	db                    db.Store
+	activityReports       *activityReportCache
+	activityReportFlights *activityReportBuildGroup
+	engine                *sync.Engine
+	onDemandEngine        *sync.Engine
+	sessions              service.SessionService
+	broadcaster           *Broadcaster
+	mux                   *http.ServeMux
+	api                   huma.API
+	httpSrv               *http.Server
+	startupProbeKey       []byte
+	version               VersionInfo
+	dataDir               string
 
 	httpRemoteCleanupRegistry *remotesync.CleanupRegistry
 
@@ -88,6 +106,7 @@ type Server struct {
 
 	insightLogDrainTimeout    time.Duration
 	insightLogStopWaitTimeout time.Duration
+	httpReadTimeout           time.Duration
 
 	// handlerDelay is injected before each timeout-wrapped
 	// handler, used only by tests to guarantee handlers
@@ -113,8 +132,9 @@ type Server struct {
 	// activity would otherwise surface. Called synchronously; it must not
 	// block.
 	sessionMutationNotify func()
-	// recallCorpusMutationNotify, when set, is called after an import adds or
-	// supersedes accepted recall entries so semantic mirrors can refresh.
+	// recallCorpusMutationNotify, when set, is called after an import or
+	// extraction-generation action changes accepted recall entries so semantic
+	// mirrors can refresh.
 	recallCorpusMutationNotify func()
 	recallExtractionStatus     RecallExtractionStatusProvider
 
@@ -154,8 +174,34 @@ type Server struct {
 	localResyncRunner LocalResyncRunner
 
 	artifactExchangeRunner ArtifactExchangeRunner
+	rawSyncDeviceAuth      RawSyncDeviceAuth
+	rawSyncCustody         RawSyncCustody
+	rawSyncSchemaOnly      bool
+	rawSyncUploads         RawSyncUploads
 
 	ensurePricing func(context.Context, *db.DB) error
+}
+
+type insightGenerationOptionsContextKey struct{}
+
+func (s *Server) currentInsightGenerateOptions(
+	ctx context.Context,
+) insight.GenerateOptions {
+	if options, ok := ctx.Value(insightGenerationOptionsContextKey{}).(insight.GenerateOptions); ok {
+		return options
+	}
+	s.mu.RLock()
+	cfg := s.cfg
+	s.mu.RUnlock()
+	return insightGenerateOptions(cfg)
+}
+
+func (s *Server) defaultInsightGenerateStream(
+	ctx context.Context, agent, prompt string, onLog insight.LogFunc,
+) (insight.Result, error) {
+	return insight.GenerateStreamWithOptions(
+		ctx, agent, prompt, onLog, s.currentInsightGenerateOptions(ctx),
+	)
 }
 
 // New creates a new Server.
@@ -182,28 +228,22 @@ func New(
 
 	s := &Server{
 		cfg:                       cfg,
+		activeDisabledAgents:      append([]parser.AgentType(nil), cfg.DisabledAgents...),
 		db:                        database,
+		activityReports:           newActivityReportCache(),
+		activityReportFlights:     newActivityReportBuildGroup(),
 		engine:                    engine,
 		sessions:                  sessions,
 		mux:                       http.NewServeMux(),
 		httpRemoteCleanupRegistry: new(remotesync.CleanupRegistry),
 		insightLogDrainTimeout:    defaultInsightLogDrainTimeout,
 		insightLogStopWaitTimeout: defaultInsightLogStopWaitTimeout,
+		httpReadTimeout:           defaultHTTPReadTimeout,
 		ensurePricing:             pricingrefresh.EnsureCurrent,
-		generateStreamFunc: func(
-			ctx context.Context, agent, prompt string,
-			onLog insight.LogFunc,
-		) (insight.Result, error) {
-			return insight.GenerateStreamWithOptions(
-				ctx, agent, prompt, onLog,
-				insight.GenerateOptions{
-					Agents: insightAgentConfig(cfg.Agent),
-				},
-			)
-		},
-		spaFS:      dist,
-		spaHandler: http.FileServerFS(dist),
+		spaFS:                     dist,
+		spaHandler:                http.FileServerFS(dist),
 	}
+	s.generateStreamFunc = s.defaultInsightGenerateStream
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -217,8 +257,102 @@ func New(
 	return s
 }
 
+func insightGenerateOptions(cfg config.Config) insight.GenerateOptions {
+	opts := insight.GenerateOptions{Agents: insightAgentConfig(cfg.Agent)}
+	if strings.TrimSpace(cfg.Insights.Endpoint) != "" &&
+		strings.TrimSpace(cfg.Insights.Model) != "" {
+		opts.Endpoint = &insight.EndpointConfig{
+			Endpoint:  cfg.Insights.Endpoint,
+			Model:     cfg.Insights.Model,
+			APIKey:    cfg.Insights.APIKey(),
+			AllowHTTP: cfg.Insights.AllowHTTP,
+		}
+	}
+	return opts
+}
+
+// ingestionConfig returns the daemon-start configuration for local filesystem
+// provider selection. Settings updates are persisted and reflected by GET
+// immediately, but the running local engine, watchers, and polling keep one
+// provider set until restart. Remote import and export ignore DisabledAgents.
+func (s *Server) ingestionConfig() config.Config {
+	s.mu.RLock()
+	cfg := s.cfg
+	s.mu.RUnlock()
+	cfg.DisabledAgents = append(
+		[]parser.AgentType(nil), s.activeDisabledAgents...,
+	)
+	return cfg
+}
+
 // Option configures a Server.
 type Option func(*Server)
+
+// RawSyncDeviceAuth exchanges device credentials and authenticates scoped
+// raw-transport tokens.
+type RawSyncDeviceAuth interface {
+	AuthenticateCredential(
+		context.Context, string, string,
+	) (rawsync.AuthIdentity, error)
+	IssueToken(
+		context.Context, string, string, rawsync.DeviceTokenScope,
+	) (rawsync.IssuedDeviceToken, error)
+	AuthenticateToken(
+		context.Context, string, rawsync.DeviceTokenScope,
+	) (rawsync.AuthIdentity, error)
+}
+
+// RawSyncCustody exposes authenticated raw-custody control-plane operations.
+type RawSyncCustody interface {
+	MissingObjects(
+		context.Context,
+		rawsync.AuthIdentity,
+		parser.AgentType,
+		[]rawsync.ObjectRef,
+	) ([]rawsync.ObjectRef, error)
+	CommitManifest(
+		context.Context,
+		rawsync.AuthIdentity,
+		rawsync.Manifest,
+	) (rawsync.CommitResult, error)
+}
+
+// RawSyncUploads exposes authenticated resumable raw-object transfers.
+type RawSyncUploads interface {
+	Start(
+		context.Context,
+		rawsync.AuthIdentity,
+		parser.AgentType,
+		rawsync.ObjectRef,
+	) (rawsync.UploadSession, bool, error)
+	Status(
+		context.Context,
+		rawsync.AuthIdentity,
+		string,
+	) (rawsync.UploadSession, error)
+	Append(
+		context.Context,
+		rawsync.AuthIdentity,
+		string,
+		int64,
+		[]byte,
+	) (rawsync.UploadSession, error)
+}
+
+// WithRawSyncServices enables authenticated raw-sync machine routes.
+func WithRawSyncServices(auth RawSyncDeviceAuth, custody RawSyncCustody) Option {
+	return func(s *Server) {
+		s.rawSyncDeviceAuth = auth
+		s.rawSyncCustody = custody
+	}
+}
+
+// WithRawSyncUploads enables the scoped resumable raw-object data plane.
+func WithRawSyncUploads(uploads RawSyncUploads) Option {
+	return func(s *Server) {
+		s.rawSyncUploads = uploads
+	}
+}
 
 func insightAgentConfig(
 	cfg map[string]config.AgentConfig,
@@ -356,8 +490,8 @@ func WithSessionMutationNotifier(fn func()) Option {
 }
 
 // WithRecallCorpusMutationNotifier registers fn to run after a successful
-// import changes the accepted recall corpus. fn must not block; a scheduler's
-// coalescing Notify method is the intended shape.
+// import or generation action changes the accepted recall corpus. fn must not
+// block; a scheduler's coalescing Notify method is the intended shape.
 func WithRecallCorpusMutationNotifier(fn func()) Option {
 	return func(s *Server) { s.recallCorpusMutationNotify = fn }
 }
@@ -366,6 +500,14 @@ func WithRecallCorpusMutationNotifier(fn func()) Option {
 // the Recall page. The model-backed manager satisfies this interface directly.
 type RecallExtractionStatusProvider interface {
 	Status(context.Context) (extract.Status, error)
+}
+
+// RecallExtractionLifecycleController supplies the guarded generation
+// mutations exposed by the Recall page. The model-backed manager implements
+// this interface without exposing force retirement.
+type RecallExtractionLifecycleController interface {
+	Activate(context.Context) error
+	Retire(context.Context, string) error
 }
 
 // WithRecallExtractionStatusProvider exposes extraction coverage through the
@@ -416,6 +558,18 @@ func (s *Server) humaConfig() huma.Config {
 		version = "dev"
 	}
 	cfg := huma.DefaultConfig("AgentsView API", version)
+	jsonFormat := huma.Format{
+		Marshal: func(w io.Writer, value any) error {
+			return json.MarshalWrite(w, value)
+		},
+		Unmarshal: func(data []byte, value any) error {
+			return json.Unmarshal(data, value)
+		},
+	}
+	cfg.Formats = map[string]huma.Format{
+		"application/json": jsonFormat,
+		"json":             jsonFormat,
+	}
 	cfg.Info.Description = "HTTP API for browsing, searching, syncing, and managing local agent sessions."
 	cfg.OpenAPIPath = "/api/openapi"
 	cfg.DocsPath = ""
@@ -425,6 +579,10 @@ func (s *Server) humaConfig() huma.Config {
 		"#/components/schemas/",
 		agentsViewSchemaNamer,
 	)
+	cfg.Components.Schemas.RegisterTypeAlias(
+		reflect.TypeFor[jsontext.Value](),
+		reflect.TypeFor[humaArbitraryJSON](),
+	)
 	if s.basePath != "" {
 		cfg.Servers = []*huma.Server{{
 			URL:         s.basePath,
@@ -432,6 +590,14 @@ func (s *Server) humaConfig() huma.Config {
 		}}
 	}
 	return cfg
+}
+
+// humaArbitraryJSON gives Huma the OpenAPI shape for jsontext.Value. Runtime
+// encoding still uses jsontext.Value directly through JSON v2.
+type humaArbitraryJSON []byte
+
+func (humaArbitraryJSON) Schema(huma.Registry) *huma.Schema {
+	return &huma.Schema{}
 }
 
 func (s *Server) routes() {
@@ -463,6 +629,14 @@ func (s *Server) routes() {
 		"GET /api/v1/recall/extraction/progress",
 		s.handleRecallExtractionProgress,
 	))
+	s.mux.Handle("POST /api/v1/recall/extraction/activate", s.withTimeout(
+		"POST /api/v1/recall/extraction/activate",
+		s.handleRecallExtractionActivate,
+	))
+	s.mux.Handle("POST /api/v1/recall/extraction/generations/{fingerprint}/retire", s.withTimeout(
+		"POST /api/v1/recall/extraction/generations/{fingerprint}/retire",
+		s.handleRecallExtractionRetire,
+	))
 	s.mux.Handle("POST /api/v1/recall/query", s.withTimeout(
 		"POST /api/v1/recall/query",
 		s.handleQueryRecallEntries,
@@ -479,6 +653,7 @@ func (s *Server) routes() {
 			s.handleArtifactExchange,
 		)
 	}
+	s.registerStartupProbeRoute()
 
 	// SPA fallback: serve embedded frontend
 	// Do not use timeout handler for static assets to avoid buffering.
@@ -1066,7 +1241,7 @@ func (s *Server) Serve(ln net.Listener) error {
 	srv := &http.Server{
 		Addr:        addr,
 		Handler:     s.Handler(),
-		ReadTimeout: 10 * time.Second,
+		ReadTimeout: s.httpReadTimeout,
 		IdleTimeout: 120 * time.Second,
 	}
 	if s.baseCtx != nil {
@@ -1078,6 +1253,15 @@ func (s *Server) Serve(ln net.Listener) error {
 	s.mu.Lock()
 	s.httpSrv = srv
 	s.mu.Unlock()
+	if cache := s.activityReports; cache != nil {
+		cacheCtx := context.Background()
+		if s.baseCtx != nil {
+			cacheCtx = s.baseCtx
+		}
+		cacheCtx, stopCache := context.WithCancel(cacheCtx)
+		go cache.Run(cacheCtx)
+		defer stopCache()
+	}
 	log.Printf("Starting server at http://%s", addr)
 	return srv.Serve(ln)
 }
@@ -1104,30 +1288,110 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return err
 }
 
-// FindAvailablePort finds an available port starting from the
-// given port, binding to the specified host.
-func FindAvailablePort(host string, start int) int {
+// FindAvailablePort finds an available port starting from the given port,
+// binding to the specified host. It returns an error instead of reusing an
+// occupied port when the candidate range is exhausted.
+func FindAvailablePort(host string, start int) (int, error) {
+	return findAvailablePort(host, start, selectEphemeralPort)
+}
+
+func findAvailablePort(
+	host string,
+	start int,
+	selectEphemeral func(string) (int, error),
+) (int, error) {
 	if start == 0 {
-		addr := net.JoinHostPort(host, "0")
-		ln, err := net.Listen("tcp", addr)
-		if err == nil {
-			defer ln.Close()
-			if tcpAddr, ok := ln.Addr().(*net.TCPAddr); ok {
-				return tcpAddr.Port
+		if !isWildcardListenHost(host) {
+			return selectEphemeral(host)
+		}
+		probes := listenProbes(host)
+		for range 100 {
+			port, err := selectEphemeral(host)
+			if err != nil {
+				return 0, err
+			}
+			if listenProbesFree(probes, port) {
+				return port, nil
 			}
 		}
-		return start
+		return 0, fmt.Errorf(
+			"no available ephemeral port on %s after 100 attempts", host,
+		)
 	}
 
-	for port := start; port < start+100; port++ {
-		addr := net.JoinHostPort(host, strconv.Itoa(port))
-		ln, err := net.Listen("tcp", addr)
-		if err == nil {
-			ln.Close()
-			return port
+	probes := listenProbes(host)
+	last := min(start+99, 65535)
+	for port := start; port <= last; port++ {
+		if listenProbesFree(probes, port) {
+			return port, nil
 		}
 	}
-	return start
+	return 0, fmt.Errorf(
+		"no available port on %s in range %d-%d", host, start, last,
+	)
+}
+
+func selectEphemeralPort(host string) (int, error) {
+	addr := net.JoinHostPort(host, "0")
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return 0, fmt.Errorf("select ephemeral port on %s: %w", host, err)
+	}
+	defer ln.Close()
+	if tcpAddr, ok := ln.Addr().(*net.TCPAddr); ok {
+		return tcpAddr.Port, nil
+	}
+	return 0, fmt.Errorf("listener on %s did not return a TCP address", host)
+}
+
+type listenProbe struct {
+	network string
+	host    string
+}
+
+func isWildcardListenHost(host string) bool {
+	return host == "" || host == "0.0.0.0" || host == "::"
+}
+
+// listenProbes returns the bind attempts that must all succeed before a
+// port counts as available on host. Wildcard hosts probe the IPv4 and IPv6
+// wildcard addresses separately: a combined dual-stack listen can succeed
+// on one family while an unrelated process still owns the port on the
+// other (observed on macOS), handing out a port the server cannot fully
+// claim. A family that cannot bind at all (for example IPv6-disabled
+// hosts) is excluded from the check rather than treated as occupied.
+func listenProbes(host string) []listenProbe {
+	if !isWildcardListenHost(host) {
+		return []listenProbe{{network: "tcp", host: host}}
+	}
+	var probes []listenProbe
+	for _, probe := range []listenProbe{
+		{network: "tcp4", host: "0.0.0.0"},
+		{network: "tcp6", host: "::"},
+	} {
+		ln, err := net.Listen(probe.network, net.JoinHostPort(probe.host, "0"))
+		if err != nil {
+			continue
+		}
+		ln.Close()
+		probes = append(probes, probe)
+	}
+	if len(probes) == 0 {
+		return []listenProbe{{network: "tcp", host: host}}
+	}
+	return probes
+}
+
+func listenProbesFree(probes []listenProbe, port int) bool {
+	for _, probe := range probes {
+		addr := net.JoinHostPort(probe.host, strconv.Itoa(port))
+		ln, err := net.Listen(probe.network, addr)
+		if err != nil {
+			return false
+		}
+		ln.Close()
+	}
+	return true
 }
 
 // isMutating returns true for HTTP methods that change state.
@@ -1155,12 +1419,13 @@ func corsMiddleware(
 				ensureVaryHeader(w.Header(), "Origin")
 				w.Header().Set(
 					"Access-Control-Allow-Methods",
-					"GET, POST, PUT, PATCH, DELETE, OPTIONS",
+					"GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
 				)
 				w.Header().Set(
 					"Access-Control-Allow-Headers",
-					"Content-Type, Authorization, "+service.SemanticSearchIntentHeader,
+					corsAllowedRequestHeaders,
 				)
+				w.Header().Set("Access-Control-Expose-Headers", corsExposedResponseHeaders)
 				if r.Method == http.MethodOptions {
 					w.WriteHeader(http.StatusNoContent)
 					return
@@ -1192,12 +1457,13 @@ func corsMiddleware(
 			ensureVaryHeader(w.Header(), "Origin")
 			w.Header().Set(
 				"Access-Control-Allow-Methods",
-				"GET, POST, PUT, PATCH, DELETE, OPTIONS",
+				"GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
 			)
 			w.Header().Set(
 				"Access-Control-Allow-Headers",
-				"Content-Type, Authorization, "+service.SemanticSearchIntentHeader,
+				corsAllowedRequestHeaders,
 			)
+			w.Header().Set("Access-Control-Expose-Headers", corsExposedResponseHeaders)
 			if r.Method == http.MethodOptions {
 				if !safeForReads {
 					http.Error(

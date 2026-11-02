@@ -250,20 +250,32 @@ func TestDaemonStopUsesStartupStateFallbackWhileStarting(t *testing.T) {
 	deps, out := daemonCommandTestDeps(t)
 	deps.isStarting = func(string) bool { return true }
 	deps.readStartupState = func(string) *startupState {
-		return &startupState{PID: 77, Phase: "starting HTTP server"}
+		return &startupState{
+			PID: 77, Version: "v1.2.3-test", CreateTime: "123456789",
+			Phase: "starting HTTP server", CaddyPID: 88,
+			CaddyCreateTime: "222222222",
+		}
 	}
 	var stopped daemon.RuntimeRecord
-	deps.writableRuntime = func(string, string) *DaemonRuntime {
-		return &DaemonRuntime{Record: testWritableRecord(77, ""), RuntimeFallback: true}
+	deps.stopTargetConfirmed = func(rec daemon.RuntimeRecord, _ string) bool {
+		return rec.PID == 77 && rec.Metadata[runtimeCreateTime] == "123456789"
 	}
 	deps.stopProcess = func(rec daemon.RuntimeRecord, _ time.Duration) error {
 		stopped = rec
+		return nil
+	}
+	var cleaned daemon.RuntimeRecord
+	deps.stopCaddy = func(_ io.Writer, rec daemon.RuntimeRecord) error {
+		cleaned = rec
 		return nil
 	}
 
 	err := executeDaemonCommand(t, *deps, out, "stop")
 	require.NoError(t, err)
 	assert.Equal(t, 77, stopped.PID)
+	assert.Equal(t, "v1.2.3-test", stopped.Version)
+	assert.Equal(t, "88", cleaned.Metadata[runtimeCaddyPID])
+	assert.Equal(t, "222222222", cleaned.Metadata[runtimeCaddyCreateTime])
 	assert.Contains(t, out.String(), "Stopped agentsview (pid 77).")
 	assert.NotContains(t, out.String(), "starting up")
 }
@@ -441,9 +453,12 @@ func TestDaemonStatusRendersStoppedStartingReadOnlyAndIncompatible(t *testing.T)
 		{name: "starting", setup: func(d *daemonCommandDeps) {
 			d.isStarting = func(string) bool { return true }
 			d.readStartupState = func(string) *startupState {
-				return &startupState{PID: 9, StartedAt: time.Unix(100, 0), Phase: "sync", LogPath: "/tmp/log"}
+				return &startupState{
+					PID: 9, Version: "v1.2.3-starting", StartedAt: time.Unix(100, 0),
+					Phase: "sync", LogPath: "/tmp/log",
+				}
 			}
-		}, wanted: []string{"starting", "pid:     9", "phase:   sync", "/tmp/log"}},
+		}, wanted: []string{"starting", "pid:     9", "version: v1.2.3-starting", "phase:   sync", "/tmp/log"}},
 		{name: "read only", setup: func(d *daemonCommandDeps) {
 			d.statusRecords = func(string, string) ([]daemon.RuntimeRecord, error) {
 				rec := testWritableRecord(10, "/runtime/10.json")
@@ -1047,13 +1062,14 @@ func TestDaemonRestartFailurePathsSignalNobody(t *testing.T) {
 func TestDaemonRestartUsesStartupStateFallbackWhileStarting(t *testing.T) {
 	deps, out := daemonCommandTestDeps(t)
 	deps.isStarting = func(string) bool { return true }
-	deps.writableRuntime = func(string, string) *DaemonRuntime {
-		return &DaemonRuntime{
-			Record:          testWritableRecord(113, ""),
-			Host:            "127.0.0.1",
-			Port:            8113,
-			RuntimeFallback: true,
+	deps.readStartupState = func(string) *startupState {
+		return &startupState{
+			PID: 113, Version: "v1.2.3-test", CreateTime: "987654321",
+			Phase: "initial sync",
 		}
+	}
+	deps.stopTargetConfirmed = func(rec daemon.RuntimeRecord, _ string) bool {
+		return rec.PID == 113 && rec.Metadata[runtimeCreateTime] == "987654321"
 	}
 	var stopped daemon.RuntimeRecord
 	deps.stopProcess = func(rec daemon.RuntimeRecord, _ time.Duration) error {

@@ -19,8 +19,10 @@ var providerMigrationModes = map[AgentType]ProviderMigrationMode{
 	AgentOpenClaude:     ProviderMigrationProviderAuthoritative,
 	AgentCowork:         ProviderMigrationProviderAuthoritative,
 	AgentCodex:          ProviderMigrationProviderAuthoritative,
+	AgentTraeX:          ProviderMigrationProviderAuthoritative,
 	AgentCopilot:        ProviderMigrationProviderAuthoritative,
 	AgentGemini:         ProviderMigrationProviderAuthoritative,
+	AgentGeminiApps:     ProviderMigrationImportOnly,
 	AgentOpenHands:      ProviderMigrationProviderAuthoritative,
 	AgentCursor:         ProviderMigrationProviderAuthoritative,
 	AgentMiMoCode:       ProviderMigrationProviderAuthoritative,
@@ -74,6 +76,9 @@ var providerMigrationModes = map[AgentType]ProviderMigrationMode{
 	AgentRooCode:        ProviderMigrationProviderAuthoritative,
 	AgentPoolside:       ProviderMigrationProviderAuthoritative,
 	AgentOmnigent:       ProviderMigrationProviderAuthoritative,
+	AgentCodebuff:       ProviderMigrationProviderAuthoritative,
+
+	AgentDeepSeekHarness: ProviderMigrationProviderAuthoritative,
 }
 
 // ProviderMigrationModes returns the current provider migration manifest.
@@ -164,6 +169,15 @@ func validateProviderMigrationMode(
 				}
 			}
 		}
+		if caps.S3Discovery == CapabilitySupported {
+			provider := factory.NewProvider(ProviderConfig{})
+			if _, ok := provider.(S3Provider); !ok {
+				return fmt.Errorf(
+					"%s: S3 discovery capability requires S3Provider",
+					def.Type,
+				)
+			}
+		}
 	case ProviderMigrationImportOnly:
 		if !isImportOnlyAgentType(def.Type) {
 			return fmt.Errorf(
@@ -180,7 +194,7 @@ func validateProviderMigrationMode(
 
 func isImportOnlyAgentType(agent AgentType) bool {
 	switch agent {
-	case AgentClaudeAI, AgentChatGPT:
+	case AgentClaudeAI, AgentChatGPT, AgentGeminiApps:
 		return true
 	default:
 		return false

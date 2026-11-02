@@ -6,7 +6,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"slices"
 	"sort"
@@ -31,16 +31,22 @@ func (s *Sync) syncModelPricing(ctx context.Context) error {
 		prices = duckFallbackPricingRows()
 	}
 	if len(prices) == 0 {
-		return nil
+		return s.syncGenAIPricing(ctx)
 	}
 
 	existing, err := s.listDuckModelPricing(ctx)
 	if err != nil {
 		return err
 	}
-	_, prices = db.FilterChangedModelPricing(existing, prices)
-	if len(prices) == 0 {
-		return nil
+	prices, removePatterns, err := db.PlanModelPricingSync(existing, prices)
+	if err != nil {
+		return fmt.Errorf("planning duckdb pricing sync: %w", err)
+	}
+	if len(prices) == 0 && len(removePatterns) == 0 {
+		return s.syncGenAIPricing(ctx)
+	}
+	if err := s.removeDuckModelPricing(ctx, removePatterns); err != nil {
+		return err
 	}
 
 	tx, err := s.duck.BeginTx(ctx, nil)
@@ -95,17 +101,179 @@ func (s *Sync) syncModelPricing(ctx context.Context) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing duckdb pricing sync: %w", err)
 	}
+	return s.syncGenAIPricing(ctx)
+}
+
+type duckGenAIPricingQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+type duckGenAIPricingRow interface {
+	Scan(...any) error
+}
+
+func embeddedDuckGenAIPricingDocument() db.GenAIPricingDocument {
+	embedded := pricingpkg.EmbeddedGenAIDocument()
+	return db.GenAIPricingDocument{
+		Version: embedded.Version, SourceRef: embedded.SourceRef,
+		Source: db.GenAIPricingSourceEmbedded, Data: embedded.RawJSON(),
+	}
+}
+
+func loadDuckGenAIPricing(
+	ctx context.Context, q duckGenAIPricingQuerier,
+) (*db.GenAIPricingDocument, error) {
+	return scanDuckGenAIPricing(q.QueryRowContext(ctx, `
+		SELECT version, source_ref, source, data_json, updated_at
+		FROM genai_pricing WHERE singleton = 1`))
+}
+
+func scanDuckGenAIPricing(
+	row duckGenAIPricingRow,
+) (*db.GenAIPricingDocument, error) {
+	var document db.GenAIPricingDocument
+	err := row.Scan(
+		&document.Version, &document.SourceRef, &document.Source,
+		&document.Data, &document.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading duckdb GenAI pricing document: %w", err)
+	}
+	return &document, nil
+}
+
+func duckGenAIEffectivePricingRow(
+	document *db.GenAIPricingDocument,
+) (export.EffectivePricingRow, error) {
+	if document == nil {
+		embedded := pricingpkg.EmbeddedGenAIDocument()
+		return export.EffectivePricingRow{
+			GenAI: embedded.Prices, GenAIVersion: embedded.Version,
+			GenAISource: export.PricingRowSourceEmbedded,
+		}, nil
+	}
+	parsed, err := pricingpkg.ParseGenAIDocument(
+		document.Data, document.Version, document.SourceRef,
+	)
+	if err != nil {
+		return export.EffectivePricingRow{}, fmt.Errorf(
+			"parsing duckdb GenAI pricing document: %w", err,
+		)
+	}
+	var updatedAt *time.Time
+	if parsedTime, parseErr := time.Parse(
+		time.RFC3339Nano, document.UpdatedAt,
+	); parseErr == nil {
+		utc := parsedTime.UTC()
+		updatedAt = &utc
+	}
+	source := export.PricingRowSourceFetched
+	if document.Source == db.GenAIPricingSourceEmbedded {
+		source = export.PricingRowSourceEmbedded
+	}
+	return export.EffectivePricingRow{
+		GenAI: parsed.Prices, GenAIVersion: parsed.Version,
+		GenAISource: source, GenAIUpdatedAt: updatedAt,
+	}, nil
+}
+
+func (s *Sync) syncGenAIPricing(ctx context.Context) error {
+	document, err := s.local.GetGenAIPricing(ctx)
+	if err != nil {
+		return fmt.Errorf("reading local GenAI pricing document: %w", err)
+	}
+	if document == nil {
+		embedded := embeddedDuckGenAIPricingDocument()
+		document = &embedded
+	}
+	tx, err := s.duck.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning duckdb GenAI pricing sync: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	existing, err := loadDuckGenAIPricing(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if db.GenAIPricingDocumentsEqual(existing, document) {
+		return nil
+	}
+	if err := s.execMutation(ctx, tx, `
+		INSERT INTO genai_pricing
+			(singleton, version, source_ref, source, data_json, updated_at)
+		VALUES (1, ?, ?, ?, ?, ?)
+		ON CONFLICT(singleton) DO UPDATE SET
+			version = excluded.version,
+			source_ref = excluded.source_ref,
+			source = excluded.source,
+			data_json = excluded.data_json,
+			updated_at = excluded.updated_at`,
+		document.Version, document.SourceRef, document.Source,
+		document.Data, document.UpdatedAt,
+	); err != nil {
+		return fmt.Errorf("upserting duckdb GenAI pricing document: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing duckdb GenAI pricing sync: %w", err)
+	}
+	return nil
+}
+
+// removeDuckModelPricing deletes retired pricing rows, committing the
+// band rows before the parent rows: DuckDB rejects deleting a parent row
+// in the same transaction that deleted its children. The mirror is
+// disposable, so a crash between the two leaves nothing worse than a
+// band-less row the next push deletes again.
+func (s *Sync) removeDuckModelPricing(
+	ctx context.Context, patterns []string,
+) error {
+	if len(patterns) == 0 {
+		return nil
+	}
+	for _, table := range []string{"model_pricing_bands", "model_pricing"} {
+		tx, err := s.duck.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("beginning duckdb %s delete: %w", table, err)
+		}
+		for i := 0; i < len(patterns); i += duckPricingUpsertBatch {
+			end := min(i+duckPricingUpsertBatch, len(patterns))
+			query, args := duckPricingDeleteStatement(table, patterns[i:end])
+			if err := s.execMutation(ctx, tx, query, args...); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf(
+					"deleting duckdb %s rows starting at %d: %w",
+					table, i, err,
+				)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("committing duckdb %s delete: %w", table, err)
+		}
+	}
 	return nil
 }
 
 func duckPricingBandDeleteStatement(prices []db.ModelPricing) (string, []any) {
-	placeholders := make([]string, len(prices))
-	args := make([]any, len(prices))
+	patterns := make([]string, len(prices))
 	for i, price := range prices {
-		placeholders[i] = "?"
-		args[i] = price.ModelPattern
+		patterns[i] = price.ModelPattern
 	}
-	return `DELETE FROM model_pricing_bands WHERE model_pattern IN (` +
+	return duckPricingDeleteStatement("model_pricing_bands", patterns)
+}
+
+func duckPricingDeleteStatement(
+	table string, patterns []string,
+) (string, []any) {
+	placeholders := make([]string, len(patterns))
+	args := make([]any, len(patterns))
+	for i, pattern := range patterns {
+		placeholders[i] = "?"
+		args[i] = pattern
+	}
+	return `DELETE FROM ` + table + ` WHERE model_pattern IN (` +
 		strings.Join(placeholders, ", ") + `)`, args
 }
 
@@ -120,15 +288,16 @@ func duckPricingBandInsertStatement(bands []duckModelPricingBand) (string, []any
 	b.WriteString(`INSERT INTO model_pricing_bands (
 		model_pattern, above_input_tokens,
 		input_microdollars_per_mtok, output_microdollars_per_mtok,
-		cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok,
-		updated_at
+		cache_creation_microdollars_per_mtok,
+		cache_creation_1h_microdollars_per_mtok,
+		cache_read_microdollars_per_mtok, updated_at
 	) VALUES `)
-	args := make([]any, 0, len(bands)*7)
+	args := make([]any, 0, len(bands)*8)
 	for i, item := range bands {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		b.WriteString("(?, ?, ?, ?, ?, ?, ?)")
+		b.WriteString("(?, ?, ?, ?, ?, ?, ?, ?)")
 		updatedAt := item.band.UpdatedAt
 		if updatedAt == "" {
 			updatedAt = item.updatedAt
@@ -139,6 +308,7 @@ func duckPricingBandInsertStatement(bands []duckModelPricingBand) (string, []any
 			item.band.InputPerMTok.Microdollars,
 			item.band.OutputPerMTok.Microdollars,
 			item.band.CacheCreationPerMTok.Microdollars,
+			item.band.CacheCreation1hPerMTok.Microdollars,
 			item.band.CacheReadPerMTok.Microdollars,
 			updatedAt,
 		)
@@ -192,6 +362,7 @@ func (s *Sync) listDuckModelPricing(ctx context.Context) ([]db.ModelPricing, err
 			b.above_input_tokens, b.input_microdollars_per_mtok,
 			b.output_microdollars_per_mtok,
 			b.cache_creation_microdollars_per_mtok,
+			b.cache_creation_1h_microdollars_per_mtok,
 			b.cache_read_microdollars_per_mtok, b.updated_at
 		 FROM model_pricing p
 		 LEFT JOIN model_pricing_bands b ON b.model_pattern = p.model_pattern
@@ -206,7 +377,8 @@ func (s *Sync) listDuckModelPricing(ctx context.Context) ([]db.ModelPricing, err
 	byPattern := make(map[string]int)
 	for rows.Next() {
 		var p db.ModelPricing
-		var threshold, input, output, cacheCreation, cacheRead sql.NullInt64
+		var threshold, input, output, cacheCreation, cacheCreation1h,
+			cacheRead sql.NullInt64
 		var bandUpdatedAt sql.NullString
 		if err := rows.Scan(
 			&p.ModelPattern,
@@ -220,6 +392,7 @@ func (s *Sync) listDuckModelPricing(ctx context.Context) ([]db.ModelPricing, err
 			&input,
 			&output,
 			&cacheCreation,
+			&cacheCreation1h,
 			&cacheRead,
 			&bandUpdatedAt,
 		); err != nil {
@@ -240,12 +413,13 @@ func (s *Sync) listDuckModelPricing(ctx context.Context) ([]db.ModelPricing, err
 				)
 			}
 			out[i].Bands = append(out[i].Bands, db.PricingBand{
-				AboveInputTokens:     aboveInputTokens,
-				InputPerMTok:         money.Money{Microdollars: input.Int64},
-				OutputPerMTok:        money.Money{Microdollars: output.Int64},
-				CacheCreationPerMTok: money.Money{Microdollars: cacheCreation.Int64},
-				CacheReadPerMTok:     money.Money{Microdollars: cacheRead.Int64},
-				UpdatedAt:            bandUpdatedAt.String,
+				AboveInputTokens:       aboveInputTokens,
+				InputPerMTok:           money.Money{Microdollars: input.Int64},
+				OutputPerMTok:          money.Money{Microdollars: output.Int64},
+				CacheCreationPerMTok:   money.Money{Microdollars: cacheCreation.Int64},
+				CacheCreation1hPerMTok: money.Money{Microdollars: cacheCreation1h.Int64},
+				CacheReadPerMTok:       money.Money{Microdollars: cacheRead.Int64},
+				UpdatedAt:              bandUpdatedAt.String,
 			})
 		}
 	}
@@ -583,12 +757,13 @@ func duckFallbackPricingRows() []db.ModelPricing {
 		bands := make([]db.PricingBand, len(p.Bands))
 		for j, band := range p.Bands {
 			bands[j] = db.PricingBand{
-				AboveInputTokens:     band.AboveInputTokens,
-				InputPerMTok:         band.InputPerMTok,
-				OutputPerMTok:        band.OutputPerMTok,
-				CacheCreationPerMTok: band.CacheCreationPerMTok,
-				CacheReadPerMTok:     band.CacheReadPerMTok,
-				UpdatedAt:            now,
+				AboveInputTokens:       band.AboveInputTokens,
+				InputPerMTok:           band.InputPerMTok,
+				OutputPerMTok:          band.OutputPerMTok,
+				CacheCreationPerMTok:   band.CacheCreationPerMTok,
+				CacheCreation1hPerMTok: band.CacheCreation1hPerMTok,
+				CacheReadPerMTok:       band.CacheReadPerMTok,
+				UpdatedAt:              now,
 			}
 		}
 		out[i] = db.ModelPricing{

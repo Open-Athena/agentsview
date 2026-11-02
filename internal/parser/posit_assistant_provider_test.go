@@ -11,9 +11,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// Fixture directory names are short stand-ins for the UUIDs and workspace
+// hashes Posit Assistant writes in production. Full-length IDs pushed the
+// deepest testdata path past the Windows 260-character MAX_PATH limit when
+// the repository is checked out under a deep CI workspace prefix.
 const (
-	positAssistantTestMainID = "11111111-1111-4111-8111-111111111111"
-	positAssistantTestSubID  = "22222222-2222-4222-8222-222222222222"
+	positAssistantTestMainID = "11111111"
+	positAssistantTestSubID  = "22222222"
 )
 
 func positAssistantTestRoot(t *testing.T) string {
@@ -51,15 +55,15 @@ func TestPositAssistantProviderDiscoverAndWatch(t *testing.T) {
 		byPath[source.DisplayPath] = source
 	}
 	mainPath := positAssistantTestConvPath(
-		root, "a1b2c3d4e5f60718293a4b5c", positAssistantTestMainID,
+		root, "a1b2c3d4", positAssistantTestMainID,
 		"conversation.json",
 	)
 	subPath := positAssistantTestConvPath(
-		root, "a1b2c3d4e5f60718293a4b5c", positAssistantTestMainID,
+		root, "a1b2c3d4", positAssistantTestMainID,
 		"subagents", positAssistantTestSubID, "conversation.json",
 	)
 	defaultPath := positAssistantTestConvPath(
-		root, "default", "33333333-3333-4333-8333-333333333333",
+		root, "default", "33333333",
 		"conversation.json",
 	)
 	require.Contains(t, byPath, mainPath)
@@ -89,7 +93,7 @@ func TestPositAssistantProviderFindSource(t *testing.T) {
 				FullSessionID: "host~posit-assistant:" + positAssistantTestMainID,
 			},
 			wantPath: positAssistantTestConvPath(
-				root, "a1b2c3d4e5f60718293a4b5c", positAssistantTestMainID,
+				root, "a1b2c3d4", positAssistantTestMainID,
 				"conversation.json",
 			),
 			wantOK: true,
@@ -98,7 +102,7 @@ func TestPositAssistantProviderFindSource(t *testing.T) {
 			name: "nested subagent by raw session ID",
 			req:  FindSourceRequest{RawSessionID: positAssistantTestSubID},
 			wantPath: positAssistantTestConvPath(
-				root, "a1b2c3d4e5f60718293a4b5c", positAssistantTestMainID,
+				root, "a1b2c3d4", positAssistantTestMainID,
 				"subagents", positAssistantTestSubID, "conversation.json",
 			),
 			wantOK: true,
@@ -129,7 +133,7 @@ func TestPositAssistantProviderClassifiesChangedPaths(t *testing.T) {
 	require.True(t, ok)
 
 	mainConvPath := positAssistantTestConvPath(
-		root, "a1b2c3d4e5f60718293a4b5c", positAssistantTestMainID,
+		root, "a1b2c3d4", positAssistantTestMainID,
 		"conversation.json",
 	)
 	mainConvDir := filepath.Dir(mainConvPath)
@@ -151,18 +155,18 @@ func TestPositAssistantProviderClassifiesChangedPaths(t *testing.T) {
 		},
 		{
 			name: "workspace manifest re-emits all workspace conversations",
-			path: filepath.Join(root, "a1b2c3d4e5f60718293a4b5c", "workspace.json"),
+			path: filepath.Join(root, "a1b2c3d4", "workspace.json"),
 			wantPaths: []string{
 				mainConvPath,
 				positAssistantTestConvPath(
-					root, "a1b2c3d4e5f60718293a4b5c", positAssistantTestMainID,
+					root, "a1b2c3d4", positAssistantTestMainID,
 					"subagents", positAssistantTestSubID, "conversation.json",
 				),
 			},
 		},
 		{
 			name:      "workspace index is not a session source",
-			path:      filepath.Join(root, "a1b2c3d4e5f60718293a4b5c", "index.json"),
+			path:      filepath.Join(root, "a1b2c3d4", "index.json"),
 			wantPaths: nil,
 		},
 	}
@@ -205,7 +209,7 @@ func TestPositAssistantProviderParseMainConversation(t *testing.T) {
 	)
 	require.NoError(t, err)
 	wsInfo, err := os.Stat(
-		filepath.Join(root, "a1b2c3d4e5f60718293a4b5c", "workspace.json"),
+		filepath.Join(root, "a1b2c3d4", "workspace.json"),
 	)
 	require.NoError(t, err)
 	assert.Equal(t, source.DisplayPath, fingerprint.Key)
@@ -344,7 +348,7 @@ func TestPositAssistantProviderParseDefaultWorkspace(t *testing.T) {
 	require.True(t, ok)
 
 	source, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
-		RawSessionID: "33333333-3333-4333-8333-333333333333",
+		RawSessionID: "33333333",
 	})
 	require.NoError(t, err)
 	require.True(t, ok)
@@ -495,6 +499,110 @@ func TestPositAssistantProviderParseSparseTokenUsage(t *testing.T) {
 		"usage objects without recognized token fields must not mark coverage")
 	assert.False(t, empty.HasOutputTokens)
 	assert.False(t, empty.HasContextTokens)
+}
+
+func TestPositAssistantProviderNormalizesInferredCacheWrites(t *testing.T) {
+	tests := []struct {
+		name        string
+		positai     string
+		wantModel   string
+		wantUsage   string
+		wantContext int
+		wantOutput  int
+	}{
+		{
+			name:        "GLM inferred cache write",
+			positai:     `"modelId":"glm-4.7","usage":{"inputTokens":0,"outputTokens":7,"cacheReadTokens":20,"cacheWriteTokens":80}`,
+			wantModel:   "glm-4.7",
+			wantUsage:   `{"input_tokens":80,"output_tokens":7,"cache_read_input_tokens":20}`,
+			wantContext: 100,
+			wantOutput:  7,
+		},
+		{
+			name:        "provider-qualified Gemma inferred cache write",
+			positai:     `"modelId":"google/gemma-3-27b-it","usage":{"inputTokens":5,"outputTokens":7,"cacheReadTokens":20,"cacheWriteTokens":80}`,
+			wantModel:   "google/gemma-3-27b-it",
+			wantUsage:   `{"input_tokens":85,"output_tokens":7,"cache_read_input_tokens":20}`,
+			wantContext: 105,
+			wantOutput:  7,
+		},
+		{
+			name:        "provider-qualified Kimi inferred cache write",
+			positai:     `"modelId":"moonshotai/kimi-k2.5","usage":{"inputTokens":0,"outputTokens":7,"cacheReadTokens":20,"cacheWriteTokens":80}`,
+			wantModel:   "moonshotai/kimi-k2.5",
+			wantUsage:   `{"input_tokens":80,"output_tokens":7,"cache_read_input_tokens":20}`,
+			wantContext: 100,
+			wantOutput:  7,
+		},
+		{
+			name:        "Claude real cache write",
+			positai:     `"modelId":"claude-sonnet-4-6","usage":{"inputTokens":5,"outputTokens":7,"cacheReadTokens":20,"cacheWriteTokens":80}`,
+			wantModel:   "claude-sonnet-4-6",
+			wantUsage:   `{"input_tokens":5,"output_tokens":7,"cache_read_input_tokens":20,"cache_creation_input_tokens":80}`,
+			wantContext: 105,
+			wantOutput:  7,
+		},
+		{
+			name:        "missing model preserves producer buckets",
+			positai:     `"usage":{"inputTokens":5,"outputTokens":7,"cacheReadTokens":20,"cacheWriteTokens":80}`,
+			wantUsage:   `{"input_tokens":5,"output_tokens":7,"cache_read_input_tokens":20,"cache_creation_input_tokens":80}`,
+			wantContext: 105,
+			wantOutput:  7,
+		},
+		{
+			name:        "unrecognized model preserves producer buckets",
+			positai:     `"modelId":"custom-auto-model","usage":{"inputTokens":5,"outputTokens":7,"cacheReadTokens":20,"cacheWriteTokens":80}`,
+			wantModel:   "custom-auto-model",
+			wantUsage:   `{"input_tokens":5,"output_tokens":7,"cache_read_input_tokens":20,"cache_creation_input_tokens":80}`,
+			wantContext: 105,
+			wantOutput:  7,
+		},
+		{
+			name:        "fully cached zero-valued prompt split",
+			positai:     `"modelId":"glm-4.7","usage":{"inputTokens":0,"outputTokens":0,"cacheReadTokens":100,"cacheWriteTokens":0}`,
+			wantModel:   "glm-4.7",
+			wantUsage:   `{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":100}`,
+			wantContext: 100,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			convDir := filepath.Join(root, "ws1", "99999999-9999-4999-8999-999999999999")
+			writeSourceFile(t, filepath.Join(convDir, "conversation.json"), `{
+				"schemaVersion":"3",
+				"root":{"id":"99999999-9999-4999-8999-999999999999","timestamp":1735689600000,"metadata":{"kind":"main"}},
+				"messages":[{"id":"n1","parentId":"99999999-9999-4999-8999-999999999999","isActive":true,"lmMessageIds":[0,1],"timestamp":1735689600000}]
+			}`)
+			writeSourceFile(t, filepath.Join(convDir, "lm-messages.jsonl"),
+				`{"id":0,"message":{"role":"user","content":"hi"}}`+"\n"+
+					`{"id":1,"message":{"role":"assistant","content":[{"type":"text","text":"done"}],"providerOptions":{"providerMetadata":{"positai":{`+tt.positai+`}}}}}`+"\n")
+
+			provider, ok := NewProvider(AgentPositAssistant, ProviderConfig{
+				Roots: []string{root},
+			})
+			require.True(t, ok)
+			discovered, err := provider.Discover(context.Background())
+			require.NoError(t, err)
+			require.Len(t, discovered, 1)
+			outcome, err := provider.Parse(context.Background(), ParseRequest{
+				Source: discovered[0],
+			})
+			require.NoError(t, err)
+			require.Len(t, outcome.Results, 1)
+			messages := outcome.Results[0].Result.Messages
+			require.Len(t, messages, 2)
+			assistant := messages[1]
+
+			assert.Equal(t, tt.wantModel, assistant.Model)
+			assert.JSONEq(t, tt.wantUsage, string(assistant.TokenUsage))
+			assert.Equal(t, tt.wantContext, assistant.ContextTokens)
+			assert.True(t, assistant.HasContextTokens)
+			assert.Equal(t, tt.wantOutput, assistant.OutputTokens)
+			assert.True(t, assistant.HasOutputTokens)
+		})
+	}
 }
 
 func TestPositAssistantProviderClassifiesDeletedPaths(t *testing.T) {

@@ -217,6 +217,9 @@ func (d *DB) CopyOrphanedDataFromExcluding(
 		); err != nil {
 			return 0, fmt.Errorf("sanitizing orphaned data: %w", err)
 		}
+		if err := clearCopiedSelfParents(ctx, tx, "_orphaned_ids"); err != nil {
+			return 0, err
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -276,10 +279,15 @@ func (d *DB) CopyTrashedDataFrom(sourcePath string) (int, error) {
 		return 0, nil
 	}
 
+	trashFilter := "deleted_at IS NOT NULL"
+	if oldDBHasColumn(ctx, tx, "sessions", "deletion_cause") {
+		trashFilter += " AND (deletion_cause IS NULL" +
+			" OR deletion_cause <> '" + legacyDeletionCauseSourceMissing + "')"
+	}
 	if _, err := tx.ExecContext(ctx, `
 		CREATE TEMP TABLE _trashed_ids AS
 		SELECT id FROM old_db.sessions
-		WHERE deleted_at IS NOT NULL
+		WHERE `+trashFilter+`
 		  AND id NOT IN (SELECT id FROM main.excluded_sessions)`); err != nil {
 		return 0, fmt.Errorf(
 			"identifying trashed sessions: %w", err,
@@ -491,6 +499,27 @@ func (d *DB) CopySyncStateFrom(sourcePath string) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing sync state copy: %w", err)
+	}
+	return nil
+}
+
+// clearCopiedSelfParents applies the self-parent repair to the sessions just
+// copied from the source archive. The fresh archive's one-time
+// repairLegacySelfParentedSessions pass usually runs before orphans are
+// copied, so a self-parented row from an older source would otherwise
+// survive the rebuild.
+func clearCopiedSelfParents(
+	ctx context.Context,
+	tx *sql.Tx,
+	tempIDsTable string,
+) error {
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE main.sessions
+		SET parent_session_id = NULLIF(parser_parent_session_id, id),
+		local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		WHERE id IN (SELECT id FROM `+tempIDsTable+`)
+		  AND parent_session_id IS id`); err != nil {
+		return fmt.Errorf("clearing copied self-parented sessions: %w", err)
 	}
 	return nil
 }
@@ -1112,10 +1141,9 @@ func (d *DB) CopySessionMetadataFrom(
 	defer func() { _ = tx.Rollback() }()
 
 	// Copy user-managed metadata from the quiesced old DB. User-owned
-	// deleted_at is copied for all rows. Recoverable source_missing state is
-	// already carried by the pre-sync trash/orphan copy and must not re-hide a
-	// row that the fresh sync revived after its source reappeared. display_name
-	// is overlaid ONLY for
+	// deleted_at is copied for all rows. Legacy source_missing deletion state
+	// must not re-hide a row that the fresh sync revived after its source
+	// reappeared. display_name is overlaid ONLY for
 	// user-owned rows: the fresh DB already holds re-parsed session_name
 	// values, so agent-owned and cleared rows must keep the fresh value.
 	// Probe columns first so older source DBs don't abort.
@@ -1127,12 +1155,12 @@ func (d *DB) CopySessionMetadataFrom(
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE main.sessions
 			SET deleted_at = CASE
-					WHEN old_s.deletion_cause = '`+deletionCauseSourceMissing+`'
+					WHEN old_s.deletion_cause = '`+legacyDeletionCauseSourceMissing+`'
 					THEN main.sessions.deleted_at
 					ELSE old_s.deleted_at
 				END,
 				deletion_cause = CASE
-					WHEN old_s.deletion_cause = '`+deletionCauseSourceMissing+`'
+					WHEN old_s.deletion_cause = '`+legacyDeletionCauseSourceMissing+`'
 					THEN main.sessions.deletion_cause
 					ELSE old_s.deletion_cause
 				END
@@ -1188,24 +1216,191 @@ func (d *DB) CopySessionMetadataFrom(
 	}
 
 	// Copy pinned messages (table may not exist in older DBs).
-	// Map old message_id to new message_id via the
-	// (session_id, ordinal) natural key, since auto-increment
-	// IDs differ between DBs.
+	// Auto-increment message IDs differ between DBs, so old
+	// message_id must be re-resolved against the fresh rows.
+	// Prefer the source_uuid natural key: a re-parse can insert or
+	// drop rows (e.g. the v88 IDE-envelope split), shifting ordinals
+	// so that the old (session_id, ordinal) key lands on an unrelated
+	// row. The uuid must be unique on BOTH sides: a duplicate in the
+	// old DB means the uuid does not identify which message the pin
+	// was on, so transferring it to a lone same-uuid survivor could
+	// misattach a pin whose real target was removed by the re-parse.
+	// Duplicated uuids fall back to the pin's occurrence rank inside
+	// its (uuid, role, content) group, requiring the group to keep its
+	// size on both sides: rank follows the pinned occurrence across
+	// ordinal shifts, while a changed group size means the rank no
+	// longer identifies an occurrence. Legacy pins whose source row
+	// has no source_uuid fall back the same way over the visible
+	// (role, content) group. A nonempty uuid with no safe
+	// match means the pinned message is gone: the pin is dropped rather
+	// than silently attached to whatever now occupies its ordinal.
 	if oldDBHasTable(ctx, tx, "pinned_messages") {
+		hasSourceUUID := oldDBHasColumn(
+			ctx, tx, "messages", "source_uuid",
+		)
+		if hasSourceUUID {
+			if _, err := tx.ExecContext(ctx, `
+				INSERT OR IGNORE INTO main.pinned_messages
+					(session_id, message_id, ordinal, note, created_at)
+				SELECT
+					op.session_id, new_m.id, new_m.ordinal,
+					op.note, op.created_at
+				FROM old_db.pinned_messages op
+				JOIN old_db.messages old_m
+					ON old_m.id = op.message_id
+				JOIN main.messages new_m
+					ON new_m.session_id = old_m.session_id
+					AND new_m.source_uuid = old_m.source_uuid
+				WHERE op.session_id IN (
+					SELECT id FROM main.sessions
+				)
+				AND old_m.source_uuid != ''
+				AND (
+					SELECT COUNT(*) FROM main.messages x
+					WHERE x.session_id = old_m.session_id
+					AND x.source_uuid = old_m.source_uuid
+				) = 1
+				AND (
+					SELECT COUNT(*) FROM old_db.messages y
+					WHERE y.session_id = old_m.session_id
+					AND y.source_uuid = old_m.source_uuid
+				) = 1`); err != nil {
+				return fmt.Errorf(
+					"copying pinned messages by source uuid: %w", err,
+				)
+			}
+		}
+		// Rank fallback for duplicated uuids: identical (uuid, role,
+		// content) rows are distinguishable only by position, so a pin
+		// transfers to the row holding the same occurrence rank inside
+		// its identity group, provided the group kept its size on both
+		// sides. Rank, unlike the old ordinal, follows the pinned
+		// occurrence across shifts caused by rows inserted before the
+		// group; a changed group size means the rank no longer
+		// identifies an occurrence and the pin is dropped. When the
+		// uuid was unique the source_uuid pass already restored the
+		// same row and INSERT OR IGNORE dedupes.
+		if hasSourceUUID {
+			if _, err := tx.ExecContext(ctx, `
+				INSERT OR IGNORE INTO main.pinned_messages
+					(session_id, message_id, ordinal, note, created_at)
+				SELECT
+					op.session_id, new_m.id, new_m.ordinal,
+					op.note, op.created_at
+				FROM old_db.pinned_messages op
+				JOIN old_db.messages old_m
+					ON old_m.id = op.message_id
+				JOIN main.messages new_m
+					ON new_m.session_id = old_m.session_id
+					AND new_m.source_uuid = old_m.source_uuid
+					AND new_m.role = old_m.role
+					AND new_m.content = old_m.content
+				WHERE op.session_id IN (
+					SELECT id FROM main.sessions
+				)
+				AND old_m.source_uuid != ''
+				AND (
+					SELECT COUNT(*) FROM old_db.messages y
+					WHERE y.session_id = old_m.session_id
+					AND y.source_uuid = old_m.source_uuid
+					AND y.role = old_m.role
+					AND y.content = old_m.content
+				) = (
+					SELECT COUNT(*) FROM main.messages x
+					WHERE x.session_id = old_m.session_id
+					AND x.source_uuid = old_m.source_uuid
+					AND x.role = old_m.role
+					AND x.content = old_m.content
+				)
+				AND (
+					SELECT COUNT(*) FROM old_db.messages y2
+					WHERE y2.session_id = old_m.session_id
+					AND y2.source_uuid = old_m.source_uuid
+					AND y2.role = old_m.role
+					AND y2.content = old_m.content
+					AND y2.ordinal <= old_m.ordinal
+				) = (
+					SELECT COUNT(*) FROM main.messages x2
+					WHERE x2.session_id = old_m.session_id
+					AND x2.source_uuid = old_m.source_uuid
+					AND x2.role = old_m.role
+					AND x2.content = old_m.content
+					AND x2.ordinal <= new_m.ordinal
+				)`); err != nil {
+				return fmt.Errorf(
+					"copying duplicated-uuid pinned messages: %w", err,
+				)
+			}
+		}
+		// Rank fallback for legacy pins without a uuid, mirroring
+		// restoreLegacyPinByRankTx: the pin transfers to the visible
+		// row holding its role, content, and occurrence rank within
+		// the visible (role, content) group, provided the group kept
+		// its size on both sides. Rank follows the pinned occurrence
+		// across shifts from rows the re-parse inserted (e.g. hidden
+		// IDE-envelope rows); a changed group size means the rank no
+		// longer identifies an occurrence and the pin is dropped. A
+		// legacy row may gain a provider uuid in the fresh DB while
+		// retaining this fallback identity. Old archives may predate
+		// the is_system column; without it every old row counts as
+		// visible.
+		legacyOnly := ""
+		if hasSourceUUID {
+			legacyOnly = `
+			AND (old_m.source_uuid IS NULL
+				OR old_m.source_uuid = '')`
+		}
+		oldMVisible, oldYVisible, oldY2Visible := "", "", ""
+		if oldDBHasColumn(ctx, tx, "messages", "is_system") {
+			oldMVisible = `
+			AND old_m.is_system = 0`
+			oldYVisible = `
+				AND y.is_system = 0`
+			oldY2Visible = `
+				AND y2.is_system = 0`
+		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT OR IGNORE INTO main.pinned_messages
 				(session_id, message_id, ordinal, note, created_at)
 			SELECT
-				op.session_id, new_m.id, op.ordinal,
+				op.session_id, new_m.id, new_m.ordinal,
 				op.note, op.created_at
 			FROM old_db.pinned_messages op
 			JOIN old_db.messages old_m
 				ON old_m.id = op.message_id
 			JOIN main.messages new_m
 				ON new_m.session_id = old_m.session_id
-				AND new_m.ordinal = old_m.ordinal
+				AND new_m.role = old_m.role
+				AND new_m.content = old_m.content
+				AND new_m.is_system = 0
 			WHERE op.session_id IN (
 				SELECT id FROM main.sessions
+			)`+legacyOnly+oldMVisible+`
+			AND (
+				SELECT COUNT(*) FROM old_db.messages y
+				WHERE y.session_id = old_m.session_id
+				AND y.role = old_m.role
+				AND y.content = old_m.content`+oldYVisible+`
+			) = (
+				SELECT COUNT(*) FROM main.messages x
+				WHERE x.session_id = old_m.session_id
+				AND x.role = old_m.role
+				AND x.content = old_m.content
+				AND x.is_system = 0
+			)
+			AND (
+				SELECT COUNT(*) FROM old_db.messages y2
+				WHERE y2.session_id = old_m.session_id
+				AND y2.role = old_m.role
+				AND y2.content = old_m.content
+				AND y2.ordinal <= old_m.ordinal`+oldY2Visible+`
+			) = (
+				SELECT COUNT(*) FROM main.messages x2
+				WHERE x2.session_id = old_m.session_id
+				AND x2.role = old_m.role
+				AND x2.content = old_m.content
+				AND x2.is_system = 0
+				AND x2.ordinal <= new_m.ordinal
 			)`); err != nil {
 			return fmt.Errorf("copying pinned messages: %w", err)
 		}
@@ -1242,7 +1437,9 @@ func (d *DB) CopySessionMetadataFrom(
 	// makes journal continuity across the swap worthless, which is why the
 	// publication-revision counters are not copied either — the fresh
 	// database's own trigger-maintained counters stand, and the fresh
-	// journal rows they stamp are only ever consumed relative to them.
+	// journal rows they stamp are only ever consumed relative to them. Remote
+	// import data versions also identify the physical database generation; a
+	// remote contributor must establish them again in the replacement.
 	if oldDBHasTable(ctx, tx, "archive_metadata") {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO main.archive_metadata (key, value, created_at, updated_at)
@@ -1254,6 +1451,7 @@ func (d *DB) CopySessionMetadataFrom(
 				'session_deletion_publication_revision',
 				'worktree_mapping_publication_revision'
 			)
+			AND key NOT GLOB 'remote_import_data_version:*'
 			ON CONFLICT(key) DO UPDATE SET
 				value = excluded.value,
 				created_at = excluded.created_at,
@@ -1506,6 +1704,9 @@ func orphanSessionCols(ctx context.Context, tx *sql.Tx) string {
 	if oldDBHasColumn(ctx, tx, "sessions", "deletion_cause") {
 		cols = append(cols, "deletion_cause")
 	}
+	if oldDBHasColumn(ctx, tx, "sessions", "source_missing_at") {
+		cols = append(cols, "source_missing_at")
+	}
 	cols = append(cols, "created_at")
 	for _, c := range []string{
 		"total_output_tokens", "peak_context_tokens",
@@ -1542,8 +1743,9 @@ func orphanSessionCols(ctx context.Context, tx *sql.Tx) string {
 // reconcileTranscriptRevisionsTx preserves read-progress identity across a
 // full resync. Reparsed sessions start with fresh local counters, so matching
 // transcript rows inherit the old counter and changed rows advance it once.
-// The comparison covers the user-visible message and tool-result fields while
-// deliberately excluding session metadata and token/source bookkeeping.
+// The comparison covers the same persisted transcript identity used by the
+// incremental message-diff path, including usage and provider dedup identities.
+// Session metadata and parser-only source bookkeeping remain excluded.
 func reconcileTranscriptRevisionsTx(
 	ctx context.Context, tx *sql.Tx,
 ) error {
@@ -1553,6 +1755,8 @@ func reconcileTranscriptRevisionsTx(
 	for table, columns := range map[string][]string{
 		"messages": {
 			"thinking_text", "is_system", "model",
+			"token_usage", "claude_message_id", "claude_request_id",
+			"source_uuid",
 			"context_tokens", "output_tokens",
 			"has_context_tokens", "has_output_tokens",
 			"source_subtype", "prompt_source", "is_compact_boundary",
@@ -1580,14 +1784,16 @@ func reconcileTranscriptRevisionsTx(
 			SELECT CASE WHEN
 				NOT EXISTS (
 					SELECT ordinal, role, content, thinking_text, timestamp,
-						has_thinking, has_tool_use, is_system, model,
+						has_thinking, has_tool_use, is_system, model, token_usage,
+						claude_message_id, claude_request_id, source_uuid,
 						context_tokens, output_tokens, has_context_tokens,
 						has_output_tokens, source_subtype, prompt_source,
 						is_compact_boundary
 					FROM main.messages WHERE session_id = current.id
 					EXCEPT
 					SELECT ordinal, role, content, thinking_text, timestamp,
-						has_thinking, has_tool_use, is_system, model,
+						has_thinking, has_tool_use, is_system, model, token_usage,
+						claude_message_id, claude_request_id, source_uuid,
 						context_tokens, output_tokens, has_context_tokens,
 						has_output_tokens, source_subtype, prompt_source,
 						is_compact_boundary
@@ -1595,14 +1801,16 @@ func reconcileTranscriptRevisionsTx(
 				)
 				AND NOT EXISTS (
 					SELECT ordinal, role, content, thinking_text, timestamp,
-						has_thinking, has_tool_use, is_system, model,
+						has_thinking, has_tool_use, is_system, model, token_usage,
+						claude_message_id, claude_request_id, source_uuid,
 						context_tokens, output_tokens, has_context_tokens,
 						has_output_tokens, source_subtype, prompt_source,
 						is_compact_boundary
 					FROM old_db.messages WHERE session_id = current.id
 					EXCEPT
 					SELECT ordinal, role, content, thinking_text, timestamp,
-						has_thinking, has_tool_use, is_system, model,
+						has_thinking, has_tool_use, is_system, model, token_usage,
+						claude_message_id, claude_request_id, source_uuid,
 						context_tokens, output_tokens, has_context_tokens,
 						has_output_tokens, source_subtype, prompt_source,
 						is_compact_boundary
@@ -2206,35 +2414,11 @@ func copyPinnedMessagesForIDs(
 		return nil
 	}
 
-	// Re-map old message IDs to the newly inserted message rows.
-	// Prefer source_uuid when available because it survives ordinal
-	// shifts, then fall back to the same (session_id, ordinal)
-	// natural key used by tool call copying.
-	if oldDBHasColumn(ctx, tx, "messages", "source_uuid") {
-		if _, err := tx.ExecContext(ctx, `
-			INSERT OR IGNORE INTO main.pinned_messages
-				(session_id, message_id, ordinal, note, created_at)
-			SELECT
-				op.session_id, new_m.id, new_m.ordinal,
-				op.note, op.created_at
-			FROM old_db.pinned_messages op
-			JOIN old_db.messages old_m
-				ON old_m.id = op.message_id
-			JOIN main.messages new_m
-				ON new_m.session_id = old_m.session_id
-				AND new_m.source_uuid = old_m.source_uuid
-			WHERE op.session_id IN (
-				SELECT id FROM `+tempIDsTable+`
-			)
-			  AND old_m.source_uuid IS NOT NULL
-			  AND old_m.source_uuid <> ''`,
-		); err != nil {
-			return fmt.Errorf(
-				"copying pinned messages by source_uuid: %w", err,
-			)
-		}
-	}
-
+	// Re-map old message IDs to the newly inserted message rows. These
+	// orphaned messages were copied verbatim above, so their ordinals
+	// cannot shift. source_uuid is not a safe key here because providers
+	// can duplicate it across messages; joining on it would turn one pin
+	// into one pin for every matching row.
 	if _, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO main.pinned_messages
 			(session_id, message_id, ordinal, note, created_at)
@@ -2251,7 +2435,7 @@ func copyPinnedMessagesForIDs(
 			SELECT id FROM `+tempIDsTable+`
 		)`,
 	); err != nil {
-		return fmt.Errorf("copying pinned messages by ordinal: %w", err)
+		return fmt.Errorf("copying pinned messages: %w", err)
 	}
 	return nil
 }

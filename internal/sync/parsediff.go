@@ -71,8 +71,8 @@ func (e *Engine) ParseDiff(ctx context.Context, opts ParseDiffOptions) (*ParseDi
 	}
 
 	// Discovery mirrors syncAllLocked's file phase: provider discovery over
-	// the configured dirs per agent, then dedupe and the legacy-Kiro shadow
-	// filter. Provider discovery already enumerates shared-SQLite sources
+	// the configured dirs per agent, then dedupe. Provider discovery already
+	// arbitrates Kiro shared-SQLite sources intrinsically and enumerates
 	// (Kiro's data.sqlite3, db-mode OpenCode's opencode.db) per session, so
 	// no separate db-source synthesis is needed.
 	var files []parser.DiscoveredFile
@@ -84,7 +84,6 @@ func (e *Engine) ParseDiff(ctx context.Context, opts ParseDiffOptions) (*ParseDi
 		files = append(files, providerFiles...)
 	}
 	files = dedupeDiscoveredFiles(files)
-	files = e.filterShadowedLegacyKiroFiles(files)
 
 	// Newest first by source mtime (composite stats for virtual
 	// paths), tie-broken by path so the --limit sample is stable.
@@ -228,8 +227,10 @@ func (e *Engine) parseDiffProviderSources(
 		return nil, nil
 	}
 	provider := factory.NewProvider(parser.ProviderConfig{
-		Roots:   roots,
-		Machine: e.machine,
+		Roots:          roots,
+		Machine:        e.machine,
+		SourceMachines: e.sourceMachines[agentType],
+		PathRewriter:   e.pathRewriter,
 	})
 	sources, err := provider.Discover(ctx)
 	if err != nil {
@@ -266,6 +267,8 @@ func (e *Engine) parseDiffProviderSources(
 			discovered.SourceSize = s3.Size
 			discovered.SourceMtime = s3.MtimeNS
 			discovered.SourceFingerprint = s3.Fingerprint
+			discovered.TranscriptSize = s3.TranscriptSize
+			discovered.TranscriptMtime = s3.TranscriptMtimeNS
 			if discovered.Project == "" {
 				discovered.Project = s3.Project
 			}
@@ -392,6 +395,17 @@ func sortAndLimitParseDiffFiles(
 // reliability (parseDiffSourceReliableForRaced) and skip-cache/data-version
 // freshness are unaffected.
 func parseDiffDiscoveryMtime(f parser.DiscoveredFile) (int64, bool) {
+	// Codebuff/Freebuff session mtime is a composite of the primary
+	// chat-messages.json mtime plus any companion file (run-state.json,
+	// chat-meta.json) and directory mtime. The provider's DiscoveryMTimeNS
+	// stamps only the primary file's mtime, so a companion-only change
+	// would leave the ordering value stale and could drop a recently
+	// rewritten session from a --limit sample. Fall through to
+	// discoveredFileMtime for these agents so the composite freshness
+	// is used for ordering.
+	if f.Agent == parser.AgentCodebuff || f.Agent == parser.AgentFreebuff {
+		return 0, false
+	}
 	if f.ProviderSource == nil || f.ProviderSource.DiscoveryMTimeNS == 0 {
 		return 0, false
 	}
@@ -529,7 +543,18 @@ func (e *Engine) parseDiffSourceReliableForRaced(
 	// non-virtual DB path rather than trusting a shared store's composite mtime.
 	def, ok := parser.AgentByType(agent)
 	if !ok {
-		return false
+		// Freebuff shares the Codebuff provider and on-disk layout
+		// but is not a standalone entry in the parser Registry.
+		// Map it to the Codebuff definition so the raced guard
+		// applies to Freebuff sessions: their source is the same
+		// literal chat-messages.json file, and the composite
+		// companion mtime is the same per-session race signal.
+		if agent == parser.AgentFreebuff {
+			def, ok = parser.AgentByType(parser.AgentCodebuff)
+		}
+		if !ok {
+			return false
+		}
 	}
 	return def.FileBased && e.parseDiffAgentDiscoverable(def)
 }
@@ -544,6 +569,8 @@ func (e *Engine) parseDiffSourceReliableForRaced(
 //   - Codex deliberately uses the transcript mtime only. Its
 //     session_index.jsonl is global to every Codex session, so an unrelated
 //     title/index write must not mask transcript-derived parser drift.
+//     Codex-format forks join it: they write no index file, so the transcript
+//     stat is already their whole story.
 //   - OpenHands folds base_state.json/TASKS.json/events/* (OpenHandsSnapshot).
 //   - Copilot folds workspace.yaml (copilotEffectiveMtime).
 //
@@ -555,32 +582,41 @@ func (e *Engine) parseDiffSourceReliableForRaced(
 func parseDiffLiveMtime(
 	agent parser.AgentType, path string,
 ) (int64, error) {
-	switch agent {
-	case parser.AgentCodex:
+	switch {
+	case isCodexFormatAgent(agent):
 		info, err := os.Stat(path)
 		if err != nil {
 			return 0, err
 		}
 		return info.ModTime().UnixNano(), nil
-	case parser.AgentOpenHands:
+	case agent == parser.AgentOpenHands:
 		snapshot, err := parser.OpenHandsSnapshot(path)
 		if err != nil {
 			return 0, err
 		}
 		return snapshot.Mtime, nil
-	case parser.AgentCopilot:
+	case agent == parser.AgentCopilot:
 		info, err := os.Stat(path)
 		if err != nil {
 			return 0, err
 		}
 		return copilotEffectiveMtime(path, info), nil
+	case agent == parser.AgentCodebuff, agent == parser.AgentFreebuff:
+		// Codebuff and Freebuff share the same on-disk layout with
+		// companion files (run-state.json, chat-meta.json) that can
+		// change independently of chat-messages.json. Use the composite
+		// companion freshness so a companion-only rewrite is detected
+		// as a race rather than reported as drift.
+		return discoveredFileMtime(parser.DiscoveredFile{
+			Path: path, Agent: agent,
+		})
 	}
 	return discoveredFileMtime(parser.DiscoveredFile{
 		Path: path, Agent: agent,
 	})
 }
 
-// parseDiffCodexTranscriptChangedSinceStored reports whether the Codex
+// parseDiffCodexTranscriptChangedSinceStored reports whether a Codex-format
 // transcript differs from the archived source snapshot on a size basis Codex
 // has historically stored. Full parses store the raw file size, while
 // incremental parses can store only the parser-consumed JSONL boundary when a
@@ -594,7 +630,7 @@ func parseDiffLiveMtime(
 func parseDiffCodexTranscriptChangedSinceStored(
 	stored *db.Session, parsed parser.ParsedSession,
 ) bool {
-	if stored == nil || parsed.Agent != parser.AgentCodex {
+	if stored == nil || !isCodexFormatAgent(parsed.Agent) {
 		return false
 	}
 	if stored.FileSize == nil {
@@ -672,10 +708,13 @@ func (e *Engine) parseDiffCollectFile(
 
 	for _, pr := range job.results {
 		pw := pendingWrite{
-			sess:        pr.Session,
-			msgs:        pr.Messages,
-			usageEvents: pr.UsageEvents,
-			needsRetry:  job.needsRetryForSession(pr.Session.ID),
+			sess:                pr.Session,
+			msgs:                pr.Messages,
+			usageEvents:         pr.UsageEvents,
+			needsRetry:          job.needsRetryForSession(pr.Session.ID),
+			sourceCwdResolution: job.sourceCwdResolution,
+			sourceCwdStored:     job.sourceCwdStored,
+			sourceCwdStoredOK:   job.sourceCwdStoredOK,
 		}
 		preserved, err := e.preserveUnavailableSourceProjects(
 			ctx, []pendingWrite{pw},
@@ -684,7 +723,12 @@ func (e *Engine) parseDiffCollectFile(
 			return err
 		}
 		pw = preserved[0]
-		prepared, msgs, verdict := e.prepareSessionWrite(pw, resolver)
+		prepared, msgs, verdict, err := e.prepareSessionWriteContext(
+			ctx, pw, resolver,
+		)
+		if err != nil {
+			return err
+		}
 		id := prepared.ID
 		if verdict != sessionWriteOK {
 			// prepareSessionWrite returns a zero session on veto;
@@ -701,8 +745,12 @@ func (e *Engine) parseDiffCollectFile(
 		compare := verdict == sessionWriteOK && !pw.needsRetry &&
 			stored != nil && stored.DeletedAt == nil
 		if compare {
-			events, _ := toDBUsageEvents(id, pw.usageEvents)
-			var err error
+			events, _, err := toDBUsageEventsContext(
+				ctx, id, pw.usageEvents,
+			)
+			if err != nil {
+				return err
+			}
 			fields, err = e.compareStoredSession(
 				ctx, stored, prepared, msgs, events,
 			)
@@ -754,7 +802,7 @@ func (e *Engine) parseDiffCollectFile(
 				pw.sess.Agent, pw.sess.File.Path,
 			)
 			liveOK := err == nil
-			if liveOK && pw.sess.Agent != parser.AgentCodex &&
+			if liveOK && !isCodexFormatAgent(pw.sess.Agent) &&
 				pw.sess.File.Mtime > liveMtime {
 				liveMtime = pw.sess.File.Mtime
 			}
@@ -915,21 +963,34 @@ func (e *Engine) parseDiffCollectFile(
 		report.Totals.ExcludedByParser++
 	}
 
-	// Virtual members gone from a still-existing shared container are
-	// tombstone-bound on a real sync; mark them visited so the presence
-	// sweep does not misreport them as parser drift.
+	// Virtual members gone from a still-existing shared container are marked
+	// source-missing on a real sync only when their archived CWD passes the active
+	// allow-list. Mark both source-missing and policy-preserved members visited so
+	// the presence sweep does not misreport them as parser drift.
 	for _, member := range job.sourceMissingMembers {
 		stored := storedByID[member.sessionID]
 		if stored == nil {
 			continue
 		}
 		visited[stored.ID] = true
+		if !e.cwdFilter.allows(stored.Cwd) {
+			report.Sessions = append(report.Sessions, SessionDiff{
+				SessionID:         stored.ID,
+				Agent:             stored.Agent,
+				FilePath:          member.filePath,
+				Class:             DiffSkipped,
+				Reason:            "member source missing (policy-preserved by CWD filter)",
+				StoredDataVersion: stored.DataVersion,
+			})
+			report.Totals.Skipped++
+			continue
+		}
 		report.Sessions = append(report.Sessions, SessionDiff{
 			SessionID:         stored.ID,
 			Agent:             stored.Agent,
 			FilePath:          member.filePath,
 			Class:             DiffExcluded,
-			Reason:            "member source missing (would tombstone)",
+			Reason:            "member source missing (would record source state)",
 			StoredDataVersion: stored.DataVersion,
 		})
 		report.Totals.ExcludedByParser++

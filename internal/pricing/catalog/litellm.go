@@ -3,7 +3,8 @@ package catalog
 import (
 	"cmp"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,59 +24,31 @@ const litellmPricingFile = "model_prices_and_context_window.json"
 const litellmURL = litellmBaseURL + "main/" + litellmPricingFile
 
 // ModelPricing holds per-model token pricing in cost per million tokens.
-//
-// CacheCreationPerMTok is the 5-minute ephemeral cache-write rate
-// (Anthropic: 1.25x input). CacheCreation1hPerMTok is the 1-hour
-// ephemeral cache-write rate (Anthropic: 2x input, ~1.6x the 5m rate).
-// LiteLLM's catalog exposes only the 5m rate, so 1h is derived as
-// cache1hRatio x the 5m rate; the bundled snapshot overlay sets explicit
-// 1h values for Anthropic models.
+// CacheCreation1hPerMTok prices 1-hour-TTL cache writes; zero means the
+// catalog publishes no separate 1h rate and writes bill at
+// CacheCreationPerMTok.
 type ModelPricing struct {
-	ModelPattern         string
-	InputPerMTok         money.Money
-	OutputPerMTok        money.Money
-	CacheCreationPerMTok money.Money
-	// CacheCreation1hPerMTok is the 1-hour ephemeral cache-write rate
-	// (Anthropic: 2x input, exactly 8/5 of the 5m rate). LiteLLM exposes
-	// only the 5m rate, so 1h is derived by Fill1hCacheRate; the bundled
-	// snapshot overlay sets explicit 1h values for Anthropic models.
+	ModelPattern           string
+	InputPerMTok           money.Money
+	OutputPerMTok          money.Money
+	CacheCreationPerMTok   money.Money
 	CacheCreation1hPerMTok money.Money
 	CacheReadPerMTok       money.Money
 	Bands                  []PricingBand
 }
 
-// Fill1hCacheRate derives the 1h ephemeral cache-write rate from the 5m rate
-// for entries that carry a 5m rate but no explicit 1h rate. The Anthropic
-// ratio is exactly 8/5 (1h = 2x input, 5m = 1.25x input), computed in money
-// terms via multiply-by-8 then divide-by-5. Shared by the LiteLLM parser and
-// the snapshot generator's overlay so both sources ship a 1h rate.
-func Fill1hCacheRate(p *ModelPricing) {
-	if p.CacheCreation1hPerMTok == (money.Money{}) &&
-		p.CacheCreationPerMTok.Microdollars > 0 {
-		eightX := money.Money{
-			Microdollars: p.CacheCreationPerMTok.Microdollars * 8,
-		}
-		p.CacheCreation1hPerMTok, _ = money.Divide(eightX, 5)
-	}
-}
-
 type PricingBand struct {
-	AboveInputTokens     int         `json:"above_input_tokens"`
-	InputPerMTok         money.Money `json:"input_per_mtok"`
-	OutputPerMTok        money.Money `json:"output_per_mtok"`
-	CacheCreationPerMTok money.Money `json:"cache_creation_per_mtok"`
-	CacheReadPerMTok     money.Money `json:"cache_read_per_mtok"`
+	AboveInputTokens       int         `json:"above_input_tokens"`
+	InputPerMTok           money.Money `json:"input_per_mtok"`
+	OutputPerMTok          money.Money `json:"output_per_mtok"`
+	CacheCreationPerMTok   money.Money `json:"cache_creation_per_mtok"`
+	CacheCreation1hPerMTok money.Money `json:"cache_creation_1h_per_mtok"`
+	CacheReadPerMTok       money.Money `json:"cache_read_per_mtok"`
 }
 
 var inputThresholdRatePattern = regexp.MustCompile(
 	`^input_cost_per_token_above_([0-9]+)(k?)_tokens$`,
 )
-
-// FetchLiteLLMPricing downloads the LiteLLM pricing JSON
-// and parses it into ModelPricing entries.
-func FetchLiteLLMPricing() ([]ModelPricing, error) {
-	return FetchLiteLLMPricingContext(context.Background())
-}
 
 // FetchLiteLLMPricingContext downloads the LiteLLM pricing JSON and binds the
 // request lifetime to ctx.
@@ -135,7 +108,7 @@ func fetchLiteLLMPricing(
 func ParseLiteLLMPricing(
 	data []byte,
 ) ([]ModelPricing, error) {
-	var raw map[string]map[string]json.RawMessage
+	var raw map[string]map[string]jsontext.Value
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parsing litellm JSON: %w", err)
 	}
@@ -157,23 +130,28 @@ func ParseLiteLLMPricing(
 		if err != nil {
 			return nil, fmt.Errorf("parsing %s cache creation price: %w", model, err)
 		}
+		cacheCreation1h, _, err := parseOptionalRate(
+			fields, "cache_creation_input_token_cost_above_1hr")
+		if err != nil {
+			return nil, fmt.Errorf("parsing %s 1h cache creation price: %w", model, err)
+		}
 		cacheRead, _, err := parseOptionalRate(fields, "cache_read_input_token_cost")
 		if err != nil {
 			return nil, fmt.Errorf("parsing %s cache read price: %w", model, err)
 		}
 
 		p := ModelPricing{
-			ModelPattern:         model,
-			InputPerMTok:         input,
-			OutputPerMTok:        output,
-			CacheCreationPerMTok: cacheCreation,
-			CacheReadPerMTok:     cacheRead,
+			ModelPattern:           model,
+			InputPerMTok:           input,
+			OutputPerMTok:          output,
+			CacheCreationPerMTok:   cacheCreation,
+			CacheCreation1hPerMTok: cacheCreation1h,
+			CacheReadPerMTok:       cacheRead,
 		}
 		p.Bands, err = parsePricingBands(model, fields, p)
 		if err != nil {
 			return nil, err
 		}
-		Fill1hCacheRate(&p)
 		prices = append(prices, p)
 	}
 	return prices, nil
@@ -181,7 +159,7 @@ func ParseLiteLLMPricing(
 
 func parsePricingBands(
 	model string,
-	fields map[string]json.RawMessage,
+	fields map[string]jsontext.Value,
 	base ModelPricing,
 ) ([]PricingBand, error) {
 	var bands []PricingBand
@@ -215,11 +193,12 @@ func parsePricingBands(
 
 		suffix := strings.TrimPrefix(key, "input_cost_per_token")
 		band := PricingBand{
-			AboveInputTokens:     threshold,
-			InputPerMTok:         input,
-			OutputPerMTok:        base.OutputPerMTok,
-			CacheCreationPerMTok: base.CacheCreationPerMTok,
-			CacheReadPerMTok:     base.CacheReadPerMTok,
+			AboveInputTokens:       threshold,
+			InputPerMTok:           input,
+			OutputPerMTok:          base.OutputPerMTok,
+			CacheCreationPerMTok:   base.CacheCreationPerMTok,
+			CacheCreation1hPerMTok: base.CacheCreation1hPerMTok,
+			CacheReadPerMTok:       base.CacheReadPerMTok,
 		}
 		companions := []struct {
 			prefix string
@@ -227,6 +206,7 @@ func parsePricingBands(
 		}{
 			{prefix: "output_cost_per_token", dest: &band.OutputPerMTok},
 			{prefix: "cache_creation_input_token_cost", dest: &band.CacheCreationPerMTok},
+			{prefix: "cache_creation_input_token_cost_above_1hr", dest: &band.CacheCreation1hPerMTok},
 			{prefix: "cache_read_input_token_cost", dest: &band.CacheReadPerMTok},
 		}
 		for _, companion := range companions {
@@ -299,26 +279,25 @@ func parseThreshold(raw string, thousands bool) (int, error) {
 }
 
 func parseOptionalRate(
-	fields map[string]json.RawMessage,
+	fields map[string]jsontext.Value,
 	key string,
 ) (money.Money, bool, error) {
 	raw, ok := fields[key]
 	if !ok || string(raw) == "null" {
 		return money.Money{}, false, nil
 	}
-	var value json.Number
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return money.Money{}, false, err
+	if raw.Kind() != jsontext.KindNumber {
+		return money.Money{}, false, fmt.Errorf("pricing rate is not a JSON number")
 	}
-	rate, err := parsePerTokenRate(value)
+	rate, err := parsePerTokenRate(string(raw))
 	if err != nil {
 		return money.Money{}, false, err
 	}
 	return rate, true, nil
 }
 
-func parsePerTokenRate(value json.Number) (money.Money, error) {
-	microdollars, err := money.ParseScaledDecimal(value.String(), 12)
+func parsePerTokenRate(value string) (money.Money, error) {
+	microdollars, err := money.ParseScaledDecimal(value, 12)
 	if err != nil {
 		return money.Money{}, err
 	}

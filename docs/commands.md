@@ -5,6 +5,33 @@ description: All AgentsView commands, flags, and environment variables
 
 ## Commands
 
+### `agentsview capture`
+
+Capture and export the usage of one exact non-interactive automation run
+without starting the daemon, server, web interface, or watchers:
+
+```bash
+agentsview capture run \
+  --provider claude \
+  --occurrence build-42 \
+  --capture-dir ./capture-build-42 \
+  --result ./usage-build-42.json \
+  -- claude -p "Diagnose the build failure."
+
+agentsview capture report \
+  --capture-dir ./capture-build-42 \
+  --result ./usage-build-42.json
+```
+
+`capture run` supports direct `claude -p` and `codex exec --json` producer
+adapters. It leaves child standard input, output, error, and exit outcome
+intact. The result always uses a separate file; recovery-only `capture report`
+may use `--result -` for standard output. See
+[One-shot CI capture](/one-shot-capture/) for the result contract, retry
+behavior, failure codes, and a complete GitHub Actions job.
+
+______________________________________________________________________
+
 ### `agentsview daemon`
 
 Manage the detached writable SQLite server:
@@ -217,12 +244,13 @@ directories on the remote machine, transfers the source session data locally,
 and indexes it into your local archive. SSH remote sync is deprecated and
 receives only critical fixes; use configured HTTP remote sync for new setups.
 
-Local sync can also read configured Claude and Codex roots from S3-compatible
-object storage. Add `s3://` entries to `claude_project_dirs` or
-`codex_sessions_dirs` in `~/.agentsview/config.toml`, then run `agentsview sync`
-normally. This is not SSH remote sync: object storage is treated as a read-only
-session source, using object size and `LastModified` metadata to skip unchanged
-sessions and downloading only objects that need parsing. See
+Local sync can also read configured Claude, Codex, and Cursor roots from
+S3-compatible object storage. Add `s3://` entries to `claude_project_dirs`,
+`codex_sessions_dirs`, or `cursor_project_dirs` in `~/.agentsview/config.toml`,
+then run `agentsview sync` normally. This is not SSH remote sync: object
+storage is treated as a read-only session source, using object size and
+`LastModified` metadata to skip unchanged sessions and downloading only objects
+that need parsing. See
 [Configuration — S3-Compatible Session Sources](/configuration/#s3-compatible-session-sources).
 
 #### Configured Remote Hosts
@@ -252,13 +280,17 @@ rebuilds FTS once, and atomically swaps the completed archive into place. SSH
 hosts run through their existing active-archive path only after that swap.
 
 `--full` reparses every discovered local and remote session, but it does not
-force unchanged HTTP mirror files to be transferred again. Manifest-capable
-spokes still send only changed files; older HTTP-capable spokes fall back to
-their existing full-archive endpoint. An HTTP preparation or contributor
-failure aborts the combined rebuild without replacing the active archive or
-running SSH. Ordinary incremental and post-swap SSH failures retain per-host
-reporting, and the command exits non-zero if any host failed. See
-[Incremental Sync](/remote-access/#incremental-sync).
+force unchanged manifest-capable files to transfer again. Directory-scoped and
+verbatim curated content still use delta transfer. Windsurf's sanitized curated
+export remains a separate full-archive transfer on every sync. HTTP collectors
+and spokes must use the same remote-sync protocol version; incompatible peers
+fail before exchanging targets or archive data. A configured HTTP host that is
+offline, unreachable, or times out is skipped; reachable HTTP hosts still join
+the combined rebuild. Other HTTP preparation or contributor failures abort the
+combined rebuild without replacing the active archive or running SSH. Ordinary
+incremental and post-swap SSH failures retain per-host reporting, and the
+command exits non-zero for any failure other than an unavailable configured
+HTTP host. See [Incremental Sync](/remote-access/#incremental-sync).
 
 `agentsview sync --host X` syncs one host, not the whole configured list. When
 the local daemon knows a configured host with that identity, it uses the stored
@@ -277,12 +309,21 @@ the list, since remote sessions are namespaced by host.
 
 During HTTP remote sync, the collector prints durable phase lines for resolving
 remote roots, fetching and comparing the manifest, transferring and extracting
-changed files, processing each contributor, rebuilding FTS, and swapping the
-database. Archive downloads also show live compressed-byte progress when the
-remote daemon provides a `Content-Length` header. The new phases and bulk-ingest
-path come from the collector; a spoke upgrade is needed only for manifest-delta
-transfer. If an upgraded binary does not show those phases, restart the local
-collector daemon.
+changed files, planning pending paths, processing affected sources, rebuilding
+FTS, and swapping the database. Pending paths can outnumber processed sources:
+deletions participate in recovery and cache invalidation but usually do not
+produce an import source. Provider fallback is identified explicitly, and its
+discovered sources determine the processing denominator.
+
+The final per-host line reports changed sessions, ordinary unchanged skips, and
+error-suppressed pending entries. A retained-journal line means recovery work
+will be replayed; cancellation, processing failure, cache-persistence failure,
+retirement failure, and a rebuild awaiting its database swap remain distinct.
+Individual source paths are omitted from normal output. Archive downloads also
+show live compressed-byte progress when the remote daemon provides a
+`Content-Length` header. These phases come from the collector; a spoke upgrade
+is needed only for manifest-delta transfer. If an upgraded binary does not show
+them, restart the local collector daemon.
 
 ______________________________________________________________________
 
@@ -386,7 +427,7 @@ agentsview usage daily [flags]
 | `--all`       | `false`       | Scan all history; overrides the default 30-day window                    |
 | `--agent`     |               | Filter by agent name                                                     |
 | `--breakdown` | `false`       | Show per-model rows and populate detailed JSON breakdown arrays          |
-| `--offline`   | `false`       | Skip the LiteLLM pricing fetch; use embedded fallback                    |
+| `--offline`   | `false`       | Skip the pricing catalog fetch; use embedded fallback                    |
 | `--no-sync`   | `false`       | Skip the on-demand sync pass before querying                             |
 | `--timezone`  | system        | IANA timezone name for date bucketing                                    |
 
@@ -622,8 +663,10 @@ ______________________________________________________________________
 
 ### `agentsview pg serve`
 
-Start a read-only web UI backed by PostgreSQL. See [PostgreSQL Sync](/pg-sync/)
-for full documentation.
+Start a read-only session web UI backed by PostgreSQL. On a writable PostgreSQL
+schema, the same server also registers the partial [hosted raw-sync control
+plane](/hosted-raw-sync/#http-control-plane). See [PostgreSQL Sync](/pg-sync/)
+for full server documentation.
 
 ```bash
 agentsview pg serve [flags]
@@ -881,7 +924,7 @@ ______________________________________________________________________
 
 ### `agentsview import`
 
-Import Claude.ai or ChatGPT conversations into the local database. See
+Import Claude.ai, ChatGPT, or Gemini Apps conversations into the local database. See
 [Chat Import](/chat-import/) for full documentation.
 
 ```bash
@@ -890,10 +933,11 @@ agentsview import --type <type> <path>
 
 | Flag     | Default | Description                                      |
 | -------- | ------- | ------------------------------------------------ |
-| `--type` |         | Import type: `claude-ai` or `chatgpt` (required) |
+| `--type` |         | Import type: `claude-ai`, `chatgpt`, or `gemini-apps` (required) |
 
-The path can be a `.zip` file, a `conversations.json` file (Claude.ai only), or
-a directory containing the extracted export.
+The path can be a `.zip` file, a `conversations.json` file (Claude.ai only), a
+Gemini Apps `MyActivity.html` file, or a directory containing the extracted
+export.
 
 **Examples:**
 
@@ -901,6 +945,7 @@ a directory containing the extracted export.
 agentsview import --type claude-ai ~/Downloads/claude.zip
 agentsview import --type chatgpt ~/Downloads/chatgpt.zip
 agentsview import --type claude-ai ./conversations.json
+agentsview import --type gemini-apps ~/Downloads/takeout.zip
 ```
 
 ______________________________________________________________________
@@ -1242,6 +1287,8 @@ agentsview help
 | `CORTEX_DIR`                      | `~/.snowflake/cortex/conversations`                  | Cortex Code conversations directory                                                                 |
 | `CURSOR_PROJECTS_DIR`             | `~/.cursor/projects`                                 | Cursor transcripts directory                                                                        |
 | `DEEPSEEK_TUI_SESSIONS_DIR`       | `~/.codewhale/sessions` and `~/.deepseek/sessions`   | DeepSeek TUI sessions directory                                                                     |
+| `DEEPSEEK_HARNESS_SESSIONS_DIR`   | `~/.dsh/sessions`                                    | DeepSeek Harness sessions directory                                                                 |
+| `DSH_HOME`                        | unset                                                | DeepSeek Harness home that re-roots the default `sessions/` discovery path                          |
 | `FORGE_DIR`                       | `~/.forge`                                           | Forge directory (contains `.forge.db`)                                                              |
 | `GEMINI_DIR`                      | `~/.gemini`                                          | Gemini CLI directory                                                                                |
 | `GOOSE_PATH_ROOT`                 | (platform-specific)                                  | Goose path root; sessions are read from `<root>/data/sessions/sessions.db`                          |
@@ -1268,7 +1315,7 @@ agentsview help
 | `POSIT_ASSISTANT_DIR`             | `~/.posit/assistant/workspaces`                      | Posit Assistant workspaces directory                                                                |
 | `POSITRON_DIR`                    | (platform-specific)                                  | Positron Assistant user directory                                                                   |
 | `QCLAW_DIR`                       | `~/.qclaw/agents`                                    | QClaw agents directory                                                                              |
-| `QODER_PROJECTS_DIR`              | `~/.qoder/projects` and `~/.qoderwork/projects`      | Qoder projects directory                                                                            |
+| `QODER_PROJECTS_DIR`              | Legacy and platform-specific roots                   | Qoder projects directory; see [Session Discovery](/configuration/#session-discovery)                 |
 | `QWEN_PROJECTS_DIR`               | `~/.qwen/projects`                                   | Qwen Code projects directory                                                                        |
 | `QWENPAW_DIR`                     | `~/.copaw/workspaces`                                | QwenPaw workspaces directory                                                                        |
 | `REASONIX_DIR`                    | `~/.reasonix` and `~/AppData/Roaming/reasonix`       | Reasonix data directory                                                                             |

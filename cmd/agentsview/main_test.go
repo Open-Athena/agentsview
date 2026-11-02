@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
@@ -32,6 +33,99 @@ import (
 	agentsync "go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/testjsonl"
 )
+
+type cursorSecretRecorder struct {
+	secret []byte
+}
+
+type usageCacheBackfillRecorder struct {
+	started  chan struct{}
+	release  chan struct{}
+	waited   chan struct{}
+	observer func()
+}
+
+func (recorder *usageCacheBackfillRecorder) SetUsageCacheBackfillStarted(
+	observer func(),
+) {
+	recorder.observer = observer
+}
+
+func (recorder *usageCacheBackfillRecorder) StartUsageCacheBackfill(
+	context.Context,
+) error {
+	close(recorder.started)
+	if recorder.observer != nil {
+		recorder.observer()
+	}
+	return nil
+}
+
+func (recorder *usageCacheBackfillRecorder) WaitUsageCacheBackfill(
+	context.Context,
+) error {
+	close(recorder.waited)
+	<-recorder.release
+	return nil
+}
+
+func TestServeStartsUsageCacheBackfill(t *testing.T) {
+	recorder := &usageCacheBackfillRecorder{
+		started: make(chan struct{}), release: make(chan struct{}),
+		waited: make(chan struct{}),
+	}
+	idle := server.NewIdleTracker(time.Minute, func() {})
+	startDaemonUsageCacheBackfill(context.Background(), recorder, idle)
+	select {
+	case <-recorder.started:
+	case <-time.After(time.Second):
+		t.Fatal("usage cache backfill did not start")
+	}
+	select {
+	case <-recorder.waited:
+	case <-time.After(time.Second):
+		t.Fatal("usage cache backfill was not joined by tracked work")
+	}
+	close(recorder.release)
+}
+
+// Foreground servers and daemons with idle timeout disabled pass a nil
+// tracker; the backfill must still start and join its wait goroutine.
+func TestServeStartsUsageCacheBackfillWithoutIdleTracker(t *testing.T) {
+	recorder := &usageCacheBackfillRecorder{
+		started: make(chan struct{}), release: make(chan struct{}),
+		waited: make(chan struct{}),
+	}
+	startDaemonUsageCacheBackfill(context.Background(), recorder, nil)
+	select {
+	case <-recorder.started:
+	case <-time.After(time.Second):
+		t.Fatal("usage cache backfill did not start")
+	}
+	select {
+	case <-recorder.waited:
+	case <-time.After(time.Second):
+		t.Fatal("usage cache backfill was not awaited without an idle tracker")
+	}
+	close(recorder.release)
+}
+
+func (recorder *cursorSecretRecorder) SetCursorSecret(secret []byte) {
+	recorder.secret = append([]byte(nil), secret...)
+}
+
+func TestApplyRequiredCursorSecret(t *testing.T) {
+	recorder := &cursorSecretRecorder{}
+	err := applyRequiredCursorSecret(recorder, config.Config{})
+	assert.ErrorContains(t, err, "cursor secret is not configured")
+
+	want := []byte("configured cursor secret")
+	err = applyRequiredCursorSecret(recorder, config.Config{
+		CursorSecret: base64.StdEncoding.EncodeToString(want),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, want, recorder.secret)
+}
 
 func TestRuntimeWarningHelper(t *testing.T) {
 	logOutput := captureLogOutput(t)
@@ -277,7 +371,8 @@ func TestRunPGRuntimeWarningHelperProcess(t *testing.T) {
 		t, filepath.Join(os.Getenv("AGENTSVIEW_DATA_DIR"), "pg.db"),
 	)
 	ctx, cancel := context.WithCancel(context.Background())
-	port := server.FindAvailablePort("127.0.0.1", 0)
+	port, err := server.FindAvailablePort("127.0.0.1", 0)
+	require.NoError(t, err)
 	appCfg := config.Config{
 		Host:    "127.0.0.1",
 		Port:    port,
@@ -600,6 +695,23 @@ func TestCollectWatchRootsPreservesDirsSharingWatchRoot(t *testing.T) {
 	assert.Equal(t, []watchScope{{agent: parser.AgentCodex, syncDir: archivedDir}}, archived.scopes)
 	assert.Equal(t, []string{archivedDir}, archived.pendingPollingDirs)
 	assert.Empty(t, archived.persistentPollingDirs)
+}
+
+func TestCollectWatchRootsOmitsLocallyDisabledProvider(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Config{
+		DisabledAgents: []parser.AgentType{parser.AgentGemini},
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentGemini: {root},
+		},
+	}
+
+	roots, unwatched, symlinkGated, persistent := collectWatchRoots(cfg)
+
+	assert.Empty(t, roots)
+	assert.Empty(t, unwatched)
+	assert.Empty(t, symlinkGated)
+	assert.Empty(t, persistent)
 }
 
 func TestCollectWatchRootsPollsRecursiveSymlinkProviderRoot(t *testing.T) {
@@ -1546,7 +1658,7 @@ func TestOpenCodeFormatMissingRootsUseNativeLifecycleWithoutPolling(t *testing.T
 
 			roots, unwatched, _, persistentDirAgents := collectWatchRoots(cfg)
 			require.Len(t, roots, rootCount)
-			results := make([]agentsync.RecursiveWatchResult, rootCount)
+			results := make([]agentsync.RecursiveWatchResult, len(roots))
 			for i := range results {
 				results[i] = agentsync.RecursiveWatchResult{
 					Watched:                   1,
@@ -2742,11 +2854,17 @@ func TestSyncWatchBatch(t *testing.T) {
 	})
 }
 
-type stubRetryRootsError struct{ roots []string }
+type stubRetryRootsError struct {
+	paths    []string
+	roots    []string
+	overflow bool
+}
 
 func (e *stubRetryRootsError) Error() string { return "reconciliation incomplete" }
 
 func (e *stubRetryRootsError) ReconciliationRetryRoots() []string { return e.roots }
+func (e *stubRetryRootsError) ReconciliationRetryPaths() []string { return e.paths }
+func (e *stubRetryRootsError) ReconciliationRetryOverflow() bool  { return e.overflow }
 
 // TestGapReconciliationRetryBatch pins the startup-gap classification: a gap
 // reconciliation error carrying retry roots yields a scoped retry batch, and
@@ -2758,6 +2876,22 @@ func TestGapReconciliationRetryBatch(t *testing.T) {
 	assert.Equal(t, agentsync.WatchBatch{
 		ReconcileRoots: []string{"/b", "/a"},
 	}, scoped)
+
+	typed := gapReconciliationRetryBatch(fmt.Errorf(
+		"gap: %w", &stubRetryRootsError{
+			paths: []string{"/sessions/child.jsonl", "/sessions/child.jsonl"},
+			roots: []string{"/sessions/root"},
+		},
+	))
+	assert.Equal(t, agentsync.WatchBatch{
+		Paths:          []string{"/sessions/child.jsonl"},
+		ReconcileRoots: []string{"/sessions/root"},
+	}, typed)
+
+	overflow := gapReconciliationRetryBatch(fmt.Errorf(
+		"gap: %w", &stubRetryRootsError{paths: []string{"/child"}, overflow: true},
+	))
+	assert.Equal(t, agentsync.WatchBatch{FullSync: true}, overflow)
 
 	full := gapReconciliationRetryBatch(errors.New("plain failure"))
 	assert.Equal(t, agentsync.WatchBatch{FullSync: true}, full)
@@ -3032,8 +3166,8 @@ func TestReconcileRootPathsDefersUnstatableSymlinkTargetScope(t *testing.T) {
 // A watcher overflow forces a full recovery over every configured root. A
 // configured root that is a symlink whose target was removed streams an empty
 // discovery without error, so the recovery must defer that scope instead of
-// tombstoning every baselined session beneath it, while genuine deletions
-// under present roots still tombstone.
+// marking every baselined session beneath it source-missing, while genuine
+// deletions under present roots still update source state.
 func TestSyncWatchBatchFullRecoveryDefersBrokenSymlinkRoot(t *testing.T) {
 	dataDir := t.TempDir()
 	claudeRoot := t.TempDir()
@@ -3109,24 +3243,34 @@ func TestSyncWatchBatchFullRecoveryDefersBrokenSymlinkRoot(t *testing.T) {
 		func() watchRecoveryScope { return probeWatchRecoveryScope(cfg) },
 	))
 
-	survivor, err := database.GetSession(t.Context(), "codex:"+codexUUID)
+	survivor, err := database.GetSessionFull(t.Context(), "codex:"+codexUUID)
 	require.NoError(t, err)
-	assert.NotNil(t, survivor,
-		"sessions under a broken symlink root must not be tombstoned by an unrelated overflow")
+	require.NotNil(t, survivor,
+		"sessions under a broken symlink root must survive an unrelated overflow")
+	assert.Nil(t, survivor.SourceMissingAt,
+		"a deferred broken-symlink root must not change source state")
 	kept, err := database.GetSession(t.Context(), "claude-kept")
 	require.NoError(t, err)
 	assert.NotNil(t, kept)
 	deleted, err := database.GetSession(t.Context(), "claude-deleted")
 	require.NoError(t, err)
-	assert.Nil(t, deleted,
-		"a genuine deletion under a present root must still tombstone")
+	assert.NotNil(t, deleted,
+		"a missing source under a present root must remain browsable")
+	archived, err := database.GetSessionFull(t.Context(), "claude-deleted")
+	require.NoError(t, err)
+	require.NotNil(t, archived)
+	assert.Nil(t, archived.DeletedAt)
+	assert.Nil(t, archived.DeletionCause)
+	assert.NotNil(t, archived.SourceMissingAt,
+		"a genuine deletion under a present root must update source state")
 }
 
 // A watcher overflow forces a full recovery over every configured root. A
 // root whose physical path is unavailable (unmounted volume, deleted provider
 // dir) streams an empty discovery without error, so the recovery must defer
-// that scope instead of tombstoning every baselined session beneath it, while
-// genuine deletions under present roots still tombstone.
+// that scope instead of marking every baselined session beneath it
+// source-missing, while genuine deletions under present roots still update
+// source state.
 func TestSyncWatchBatchFullRecoveryDefersUnavailableRoots(t *testing.T) {
 	dataDir := t.TempDir()
 	claudeRoot := t.TempDir()
@@ -3198,22 +3342,26 @@ func TestSyncWatchBatchFullRecoveryDefersUnavailableRoots(t *testing.T) {
 		func() watchRecoveryScope { return probeWatchRecoveryScope(cfg) },
 	))
 
-	survivor, err := database.GetSession(t.Context(), "codex:"+codexUUID)
+	survivor, err := database.GetSessionFull(t.Context(), "codex:"+codexUUID)
 	require.NoError(t, err)
-	assert.NotNil(t, survivor,
-		"sessions under an unavailable root must not be tombstoned by an unrelated overflow")
+	require.NotNil(t, survivor,
+		"sessions under an unavailable root must survive an unrelated overflow")
+	assert.Nil(t, survivor.SourceMissingAt,
+		"a deferred unavailable root must not change source state")
 	kept, err := database.GetSession(t.Context(), "claude-kept")
 	require.NoError(t, err)
 	assert.NotNil(t, kept)
 	deleted, err := database.GetSession(t.Context(), "claude-deleted")
 	require.NoError(t, err)
-	assert.Nil(t, deleted,
-		"a genuine deletion under a present root must still tombstone")
+	assert.NotNil(t, deleted,
+		"a missing source under a present root must remain browsable")
 	archived, err := database.GetSessionFull(t.Context(), "claude-deleted")
 	require.NoError(t, err)
 	require.NotNil(t, archived)
-	require.NotNil(t, archived.DeletionCause)
-	assert.Equal(t, "source_missing", *archived.DeletionCause)
+	assert.Nil(t, archived.DeletedAt)
+	assert.Nil(t, archived.DeletionCause)
+	assert.NotNil(t, archived.SourceMissingAt,
+		"a genuine deletion under a present root must update source state")
 }
 
 // A configured root can nest inside another configured root of the same
@@ -3369,4 +3517,77 @@ func TestSyncWatchBatchDirectoryRenameDefersUnavailableProviderRoots(t *testing.
 	require.NoError(t, err)
 	assert.NotNil(t, synced,
 		"the available root must still reconcile the rename authoritatively")
+}
+
+// TestOpenCodeSQLiteOnlyRootKeepsItsPollingFallback is the regression that a
+// coverage-unit split can introduce silently. A SQLite-layout OpenCode root
+// never grows a storage/ directory, so a polling obligation probed on that
+// path could never be satisfied, and an unsatisfiable probe defers every other
+// obligation sharing the configured dir. The root would then have neither
+// native coverage nor polling.
+func TestOpenCodeSQLiteOnlyRootKeepsItsPollingFallback(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "opencode")
+	require.NoError(t, os.MkdirAll(root, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "opencode.db"), []byte("db"), 0o600,
+	))
+	require.NoDirExists(t, filepath.Join(root, "storage"))
+
+	cfg := config.Config{AgentDirs: map[parser.AgentType][]string{
+		parser.AgentOpenCode: {root},
+	}}
+	roots, unwatched, symlinkGated, persistentDirAgents := collectWatchRoots(cfg)
+
+	// Degraded coverage is the only reason this root needs polling at all.
+	// Registration skips a unit that does not exist, so its result stays
+	// zero-valued.
+	results := make([]agentsync.RecursiveWatchResult, len(roots))
+	for i := range results {
+		if roots[i].exists {
+			results[i] = agentsync.RecursiveWatchResult{Unwatched: 1}
+		}
+	}
+	obligations := watchPollingObligations(
+		roots, results, unwatched, persistentDirAgents,
+	)
+	obligations = append(obligations, symlinkPollingObligations(symlinkGated)...)
+
+	local := make([]pollingObligation, 0, len(obligations))
+	for _, obligation := range obligations {
+		local = append(local, syncObligationToPoller(obligation))
+	}
+	scopes := availableUnwatchedPollScopes(local)
+	assert.Equal(t, []string{root}, scopes[parser.AgentOpenCode],
+		"degraded coverage on a SQLite-only root must still reach polling")
+}
+
+// TestOpenCodeAbsentRootPollsTheConfiguredDir covers the cold-start layout:
+// nothing is installed yet, so the plan must leave one satisfiable probe on
+// the configured dir rather than a deeper path that appears only afterwards.
+func TestOpenCodeAbsentRootPollsTheConfiguredDir(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "not-installed")
+	cfg := config.Config{AgentDirs: map[parser.AgentType][]string{
+		parser.AgentOpenCode: {root},
+	}}
+	roots, unwatched, symlinkGated, persistentDirAgents := collectWatchRoots(cfg)
+
+	obligations := watchPollingObligations(
+		roots, make([]agentsync.RecursiveWatchResult, len(roots)),
+		unwatched, persistentDirAgents,
+	)
+	obligations = append(obligations, symlinkPollingObligations(symlinkGated)...)
+	require.NotEmpty(t, obligations)
+	for _, obligation := range obligations {
+		assert.Equal(t, filepath.Clean(root), filepath.Clean(obligation.Probe),
+			"no obligation may be probed on a path deeper than the configured dir")
+	}
+
+	require.NoError(t, os.MkdirAll(root, 0o755))
+	local := make([]pollingObligation, 0, len(obligations))
+	for _, obligation := range obligations {
+		local = append(local, syncObligationToPoller(obligation))
+	}
+	scopes := availableUnwatchedPollScopes(local)
+	assert.Equal(t, []string{root}, scopes[parser.AgentOpenCode],
+		"the dir must become pollable as soon as it appears")
 }

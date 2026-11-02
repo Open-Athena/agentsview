@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -57,11 +57,19 @@ type DiscoveredFile struct {
 	Machine     string    // source machine override; empty = engine default
 	SourceSize  int64     // source object size for s3:// sources
 	SourceMtime int64     // source object mtime for s3:// sources, UnixNano
+	// TranscriptSize and TranscriptMtime retain the primary JSONL object's
+	// metadata when SourceSize and SourceMtime include persisted-result sidecars.
+	TranscriptSize  int64
+	TranscriptMtime int64
 	// SourceFingerprint is a durable object fingerprint for s3:// sources.
 	SourceFingerprint string
-	ForceParse        bool       // caller requires a full source reparse
-	ProviderSource    *SourceRef // provider-owned source identity, when known
-	ProviderProcess   bool       // true when this caller may parse via ProviderSource
+	ForceParse        bool // caller requires freshness bypass
+	// ForceFullParse also disables append-only processing so a materialized
+	// replacement cannot be mistaken for bytes appended to the stored source.
+	// A durable skip-cache entry may suppress it after a previous attempt.
+	ForceFullParse  bool
+	ProviderSource  *SourceRef // provider-owned source identity, when known
+	ProviderProcess bool       // true when this caller may parse via ProviderSource
 }
 
 // OpenCodeSourceMode identifies the usable OpenCode storage
@@ -339,8 +347,9 @@ func OpenCodeSQLiteVirtualPath(
 func openCodeSessionProject(path string) string {
 	data, err := os.ReadFile(path)
 	if err == nil {
-		if cwd := gjson.GetBytes(data, "directory").Str; cwd != "" {
-			if project := ExtractProjectFromCwd(cwd); project != "" {
+		cwd := gjson.GetBytes(data, "directory").Str
+		if resolved, resolveErr := resolveOpenCodeStorageWorktree(path, cwd); resolveErr == nil {
+			if project := ExtractProjectFromCwd(resolved); project != "" {
 				return project
 			}
 		}
@@ -422,8 +431,31 @@ func ResolveCodexShallowWatchRoots(root string) []string {
 // expansion. The name carries no legacy entrypoint verb so the
 // provider can call it without shimming a Discover* free function.
 func ClaudeProjectSessionFiles(projectsDir string) []DiscoveredFile {
+	return projectJSONLSessionFiles(projectsDir, AgentClaude, claudeS3Scanner)
+}
+
+// IcodemateCLIProjectSessionFiles enumerates a terminal CLI projects root in
+// the same Claude-layout terms as ClaudeProjectSessionFiles, labeling every
+// discovered transcript with AgentIcodemate and scanning s3:// roots against
+// the icodemate provider segment (.../raw/icodemate) so machine metadata and
+// source labeling match the owning agent instead of Claude's.
+func IcodemateCLIProjectSessionFiles(projectsDir string) []DiscoveredFile {
+	return projectJSONLSessionFiles(projectsDir, AgentIcodemate, icodemateCLIS3Scanner)
+}
+
+// projectJSONLSessionFiles walks one Claude-layout projects root
+// (<root>/<project>/*.jsonl plus nested subagents trees) labeling each
+// DiscoveredFile with the owning agent, and routes s3:// roots through the
+// agent's own S3 scanner so the provider segment and agent metadata match.
+// Transient read errors on individual projects are skipped: a project
+// directory echoed by a concurrent watch may disappear mid-walk.
+func projectJSONLSessionFiles(
+	projectsDir string,
+	agent AgentType,
+	scanner func() S3SessionScanner,
+) []DiscoveredFile {
 	if strings.HasPrefix(projectsDir, "s3://") {
-		return discoverClaudeS3(projectsDir)
+		return s3PrefixScan(projectsDir, scanner())
 	}
 	entries, err := os.ReadDir(projectsDir)
 	if err != nil {
@@ -457,7 +489,7 @@ func ClaudeProjectSessionFiles(projectsDir string) []DiscoveredFile {
 			files = append(files, DiscoveredFile{
 				Path:    filepath.Join(projDir, name),
 				Project: entry.Name(),
-				Agent:   AgentClaude,
+				Agent:   agent,
 			})
 		}
 
@@ -487,7 +519,7 @@ func ClaudeProjectSessionFiles(projectsDir string) []DiscoveredFile {
 					files = append(files, DiscoveredFile{
 						Path:    path,
 						Project: entry.Name(),
-						Agent:   AgentClaude,
+						Agent:   agent,
 					})
 					return nil
 				},
@@ -772,6 +804,23 @@ func IsValidSessionID(id string) bool {
 	}
 	for _, c := range id {
 		if !isAlphanumOrDashUnderscore(c) {
+			return false
+		}
+	}
+	return true
+}
+
+// IsValidQoderSessionID reports whether id is a valid Qoder session
+// identifier. Qoder session IDs use the same alphanumeric/dash/underscore
+// charset as other agents, but the SharedClientCache layout (see
+// qoder_paths.go) appends dotted suffixes such as
+// "task-<uuid>.session.execution", so periods are also accepted here.
+func IsValidQoderSessionID(id string) bool {
+	if id == "" {
+		return false
+	}
+	for _, c := range id {
+		if !isAlphanum(c) && c != '-' && c != '_' && c != '.' {
 			return false
 		}
 	}

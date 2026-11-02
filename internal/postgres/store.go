@@ -15,11 +15,6 @@ import (
 // Compile-time check: *Store satisfies db.Store.
 var _ db.Store = (*Store)(nil)
 
-// deletionCauseSourceMissing mirrors the recoverable watcher-tombstone cause
-// written by the SQLite archive (internal/db). Kept package-local because the
-// db package does not export it.
-const deletionCauseSourceMissing = "source_missing"
-
 // NewStore opens a PostgreSQL connection using the shared Open()
 // helper and returns a Store.
 // When allowInsecure is true, non-loopback connections without
@@ -411,16 +406,14 @@ func (s *Store) SetSessionPrivate(_ string, _ bool) error {
 	return db.ErrReadOnly
 }
 
-// SoftDeleteSession moves a session to user trash, including conversion from
-// a recoverable source-missing tombstone.
+// SoftDeleteSession moves a session to user trash.
 func (s *Store) SoftDeleteSession(id string) error {
 	_, err := s.pg.Exec(
 		`UPDATE sessions
 		 SET deleted_at = NOW(),
 		     deletion_cause = NULL,
 		     updated_at = NOW()
-		 WHERE id = $1
-		   AND (deleted_at IS NULL OR deletion_cause = '`+deletionCauseSourceMissing+`')`,
+		 WHERE id = $1 AND deleted_at IS NULL`,
 		id,
 	)
 	if err != nil {
@@ -431,8 +424,7 @@ func (s *Store) SoftDeleteSession(id string) error {
 	return nil
 }
 
-// SoftDeleteSessions moves multiple sessions to user trash, including
-// conversion from recoverable source-missing tombstones.
+// SoftDeleteSessions moves multiple sessions to user trash.
 func (s *Store) SoftDeleteSessions(ids []string) (int, error) {
 	if len(ids) == 0 {
 		return 0, nil
@@ -452,8 +444,7 @@ func (s *Store) SoftDeleteSessions(ids []string) (int, error) {
 			     deletion_cause = NULL,
 			     updated_at = NOW()
 			 WHERE id IN (`+strings.Join(placeholders, ",")+
-				`)
-			   AND (deleted_at IS NULL OR deletion_cause = '`+deletionCauseSourceMissing+`')`,
+				`) AND deleted_at IS NULL`,
 			pb.args...,
 		)
 		if err != nil {
@@ -468,16 +459,17 @@ func (s *Store) SoftDeleteSessions(ids []string) (int, error) {
 	return total, nil
 }
 
-// RestoreSession restores a trashed session.
+// RestoreSession restores a trashed session and invalidates source freshness
+// so changes made while it was trashed are parsed.
 func (s *Store) RestoreSession(id string) (int64, error) {
 	res, err := s.pg.Exec(
 		`UPDATE sessions
 		 SET deleted_at = NULL,
 		     deletion_cause = NULL,
+		     data_version = $2,
 		     updated_at = NOW()
-		 WHERE id = $1 AND deleted_at IS NOT NULL
-		   AND deletion_cause IS NULL`,
-		id,
+		 WHERE id = $1 AND deleted_at IS NOT NULL`,
+		id, max(db.CurrentDataVersion()-1, 0),
 	)
 	if err != nil {
 		return 0, mapPGWriteError(
@@ -507,7 +499,7 @@ func (s *Store) DeleteSessionIfTrashed(
 
 	sessionIDs, excludedIDs, err := readPGTrashedSessionExclusions(
 		ctx, tx,
-		"s.id = $1 AND s.deleted_at IS NOT NULL AND s.deletion_cause IS NULL",
+		"s.id = $1 AND s.deleted_at IS NOT NULL",
 		id,
 	)
 	if err != nil {
@@ -554,7 +546,6 @@ func (s *Store) ListTrashedSessions(
 	rows, err := s.pg.QueryContext(ctx,
 		"SELECT "+pgSessionCols+
 			" FROM sessions WHERE deleted_at IS NOT NULL"+
-			" AND deletion_cause IS NULL"+
 			" ORDER BY deleted_at DESC LIMIT 500",
 	)
 	if err != nil {
@@ -574,7 +565,7 @@ func (s *Store) EmptyTrash() (int, error) {
 	defer func() { _ = tx.Rollback() }()
 
 	sessionIDs, excludedIDs, err := readPGTrashedSessionExclusions(
-		ctx, tx, "s.deleted_at IS NOT NULL AND s.deletion_cause IS NULL",
+		ctx, tx, "s.deleted_at IS NOT NULL",
 	)
 	if err != nil {
 		return 0, mapPGWriteError("locking trashed sessions", err)
@@ -674,8 +665,7 @@ func deletePGTrashedSessionRows(
 	}
 	res, err := tx.ExecContext(ctx,
 		`DELETE FROM sessions
-		 WHERE id = ANY($1) AND deleted_at IS NOT NULL
-		   AND deletion_cause IS NULL`,
+		 WHERE id = ANY($1) AND deleted_at IS NOT NULL`,
 		ids,
 	)
 	if err != nil {

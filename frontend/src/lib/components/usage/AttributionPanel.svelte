@@ -102,11 +102,11 @@
 
   function handleSelect(id: string) {
     if (groupBy === "project") {
-      usage.toggleProjectKey(id);
+      usage.toggleProjectKey(id, { preserveTimeRange: true });
     } else if (groupBy === "agent") {
-      usage.toggleAgent(id);
+      usage.toggleAgent(id, { preserveTimeRange: true });
     } else {
-      usage.toggleModel(id);
+      usage.toggleModel(id, { preserveTimeRange: true });
     }
   }
 

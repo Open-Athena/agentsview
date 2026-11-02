@@ -106,6 +106,7 @@ use local SQLite unless `--pg` is supplied.
 | `--json`                     | Alias for `--format json`.                       |
 | `--server <url>`             | Explicit daemon URL for HTTP-backed operations.  |
 | `--server-token-file <path>` | Bearer token file for an explicit `--server` URL. |
+| `--machine <value>`          | Filter bare Codebuff/Freebuff timestamp resolution to a single machine identity (`local`, a name, or `*`). Default `local`. `session get` only; canonical IDs and other agents are unaffected. |
 | `--pg`                       | Read from configured PostgreSQL instead of SQLite. |
 
 ## Shared metadata endpoints
@@ -150,6 +151,34 @@ Return session metadata plus computed signal fields. Shape matches
 
 ```bash
 agentsview session get <id> [--format json]
+```
+
+**Bare timestamps on remote stores.** Codebuff/Freebuff sessions live as
+`<agent>:<project>:<timestamp>` canonical IDs; a bare timestamp
+(e.g. `2026-07-16T00-09-00.236Z`) is not a canonical ID. Against the
+local archive the CLI resolves a bare timestamp to its canonical ID
+by walking the configured codebuff/freebuff roots, gated by
+`--machine` (default `local`). Against a remote store (`--server`,
+`--pg`) a bare Codebuff/Freebuff timestamp is rejected with an
+explicit error pointing at `session list`, because a bare timestamp is
+intrinsically ambiguous across machines and projects.
+The rejection is scoped to the Codebuff/Freebuff timestamp shape;
+bare IDs that are not timestamps (Codex / Copilot / Gemini UUIDs,
+etc.) are unaffected and continue to resolve via the registered
+agent prefix retry on remote reads, the same way they do locally.
+Always pass the full canonical ID on remote reads when one is
+known:
+
+```bash
+# Local reads: bare timestamp OK (--machine=local by default).
+agentsview session get 2026-07-16T00-09-00.236Z
+agentsview session get 2026-07-16T00-09-00.236Z --machine=*
+
+# Remote reads: pass the canonical ID from `session list`.
+agentsview session get codebuff:myproject:1704067200 --pg
+agentsview session get freebuff:myproject:1704067200 --pg
+agentsview session get host~codebuff:myproject:1704067200 --server http://remote
+agentsview session get host~freebuff:myproject:1704067200 --server http://remote
 ```
 
 ```json
@@ -852,7 +881,13 @@ summary totals, breakdowns, and contributing sessions.
 
 ```http
 GET /api/v1/activity/report
+GET /api/v1/activity/report/{report_id}/sessions
 ```
+
+Session-page responses omit the complete report by default so browser sorting,
+bucket filtering, and pagination stay page-bounded. Stateless clients can add
+`include_report=true`; a `refresh_required` response includes its complete
+replacement report regardless.
 
 Activity includes one-shot sessions by default. Automated sessions
 are also included by default and can be filtered with the
@@ -860,6 +895,11 @@ are also included by default and can be filtered with the
 
 The JSON response shares the same `schema_version`, `pricing`, and `projects`
 metadata contract as `agentsview activity report --json`.
+
+The report route negotiates its response with `Accept`. Ordinary clients receive
+plain JSON. Clients requesting `text/event-stream` receive throttled `progress`
+events followed by one terminal `report` event. Both forms use the long-running
+route and are not subject to the ordinary 30-second operation timeout.
 
 | Query param | Notes |
 |-------------|-------|
@@ -875,11 +915,19 @@ metadata contract as `agentsview activity report --json`.
 | `machine` | Filter by machine |
 | `automation` | `all`, `interactive`, or `automated`; default `all` |
 
+Project, branch, agent, and machine filters are limited to 1,024 UTF-8 bytes
+each and 3,072 bytes combined. The fully encoded signed report ID is also
+validated before aggregation so JSON escaping cannot overflow the session-page
+URL token.
+
 Response excerpt:
 
 ```json
 {
-  "schema_version": 5,
+  "schema_version": 6,
+  "report_id": "v1.eyJ2IjoxLC4uLn0.signature",
+  "sessions_total": 18,
+  "sessions_next_cursor": "v1.eyJvZmZzZXQiOjIwMH0.signature",
   "pricing": {
     "source": "fetched",
     "table_version": "litellm-398a0b15378c",
@@ -894,28 +942,36 @@ Response excerpt:
     },
     "models": {
       "gpt-5.4": {
-        "matched_pattern": "gpt-5.4",
-        "input_cost_per_mtok": {"microdollars": 2500000},
-        "output_cost_per_mtok": {"microdollars": 15000000},
-        "cache_write_cost_per_mtok": {"microdollars": 0},
-        "cache_read_cost_per_mtok": {"microdollars": 250000},
         "cost_source": "computed",
-        "bands": [
+        "resolutions": [
           {
-            "above_input_tokens": 272000,
-            "input_cost_per_mtok": {"microdollars": 5000000},
-            "output_cost_per_mtok": {"microdollars": 22500000},
+            "priced_model": "gpt-5.4",
+            "matched_pattern": "gpt-5.4",
+            "input_cost_per_mtok": {"microdollars": 2500000},
+            "output_cost_per_mtok": {"microdollars": 15000000},
             "cache_write_cost_per_mtok": {"microdollars": 0},
-            "cache_read_cost_per_mtok": {"microdollars": 500000}
+            "cache_write_1h_cost_per_mtok": {"microdollars": 0},
+            "cache_read_cost_per_mtok": {"microdollars": 250000},
+            "cost_source": "computed",
+            "bands": [
+              {
+                "above_input_tokens": 272000,
+                "input_cost_per_mtok": {"microdollars": 5000000},
+                "output_cost_per_mtok": {"microdollars": 22500000},
+                "cache_write_cost_per_mtok": {"microdollars": 0},
+                "cache_write_1h_cost_per_mtok": {"microdollars": 0},
+                "cache_read_cost_per_mtok": {"microdollars": 500000}
+              }
+            ],
+            "application": {
+              "base_request_count": 14,
+              "aggregate_row_count": 0,
+              "bands": [
+                {"above_input_tokens": 272000, "request_count": 2}
+              ]
+            }
           }
-        ],
-        "application": {
-          "base_request_count": 14,
-          "aggregate_row_count": 0,
-          "bands": [
-            {"above_input_tokens": 272000, "request_count": 2}
-          ]
-        }
+        ]
       }
     }
   },
@@ -980,13 +1036,6 @@ Response excerpt:
       "timing_quality": "timed",
       "is_automated": false
     }
-  ],
-  "intervals": [
-    {
-      "session_id": "codex:abc",
-      "start": "2026-06-20T15:04:00Z",
-      "end": "2026-06-20T15:38:00Z"
-    }
   ]
 }
 ```
@@ -995,6 +1044,15 @@ Breakdown rows include total, automated, and interactive minutes and
 costs. Session rows with no reliable timestamped activity use
 `"timing_quality": "untimed"` and `agent_minutes: null`; they can
 still contribute cost and output tokens when usage rows exist.
+
+Schema v6 returns at most the first 200 session rows in `by_session` and no
+longer returns raw activity intervals. Fetch later pages, alternate sorts, or a
+bucket drill-down through the sessions endpoint. It accepts `limit` (default
+200, maximum 500), `cursor`, `sort`, `direction`, and the zero-based half-open
+range `bucket_start` and `bucket_end`. Both range bounds must be present.
+If the archive changed since the signed `report_id` was created, the response
+sets `refresh_required` and includes a complete replacement `report` so clients
+never combine different report generations.
 
 ---
 

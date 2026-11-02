@@ -14,7 +14,7 @@ import (
 // specs/per-session-redaction.md). Local/admin only; the deployed snapshot
 // Worker exposes no such mutation.
 func (s *Server) registerSessionPrivateRoute(group routeGroup) {
-	patch(s, group, "/sessions/{id}/private", "Set session private", s.humaSetSessionPrivate)
+	s.patch(group, "/sessions/{id}/private", "Set session private", s.humaSetSessionPrivate)
 }
 
 type setPrivateInput struct {

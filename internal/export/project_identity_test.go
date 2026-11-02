@@ -3,10 +3,11 @@ package export
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -503,7 +504,15 @@ func TestIsAutomountNamespacePath(t *testing.T) {
 		{"darwin prefix collision homework", "darwin", "/homework/repo", false},
 		{"darwin prefix collision netdata", "darwin", "/netdata", false},
 		{"darwin regular path", "darwin", "/Users/user/repo", false},
+		{"darwin data volume home", "darwin", "/System/Volumes/Data/home/user/repo", true},
+		{"darwin data volume net", "darwin", "/System/Volumes/Data/net/host", true},
+		{"darwin mixed case home", "darwin", "/HOME/user/repo", true},
+		{"darwin mixed case network servers", "darwin", "/network/SERVERS/x", true},
+		{"darwin mixed case data volume", "darwin", "/system/Volumes/DATA/home/user", true},
+		{"darwin data volume users is real", "darwin", "/System/Volumes/Data/Users/user/repo", false},
+		{"darwin data volume root is real", "darwin", "/System/Volumes/Data", false},
 		{"linux home is real", "linux", "/home/user/repo", false},
+		{"linux data volume ignored", "linux", "/System/Volumes/Data/home/user", false},
 		{"windows never matches", "windows", "/home/user", false},
 	}
 	for _, tt := range tests {
@@ -511,6 +520,339 @@ func TestIsAutomountNamespacePath(t *testing.T) {
 			assert.Equal(t, tt.want, IsAutomountNamespacePath(tt.goos, tt.path))
 		})
 	}
+}
+
+func TestIsProtectedUserDataPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the predicate compares POSIX home paths built with filepath")
+	}
+	const home = "/Users/tester"
+	tests := []struct {
+		name string
+		goos string
+		home string
+		path string
+		want bool
+	}{
+		{"documents child", "darwin", home, home + "/Documents/proj", true},
+		{"documents root", "darwin", home, home + "/Documents", true},
+		{"downloads child", "darwin", home, home + "/Downloads/repo", true},
+		{"desktop child", "darwin", home, home + "/Desktop/repo", true},
+		{"pictures child", "darwin", home, home + "/Pictures/scan", true},
+		{"dropbox child", "darwin", home, home + "/Dropbox/code/app", true},
+		{
+			"cloud storage child", "darwin", home,
+			home + "/Library/CloudStorage/Dropbox-Personal/app", true,
+		},
+		{
+			"icloud drive child", "darwin", home,
+			home + "/Library/Mobile Documents/com~apple~CloudDocs/app", true,
+		},
+		{
+			"case folded child", "darwin", home,
+			home + "/documents/proj", true,
+		},
+		{
+			"data volume documents", "darwin", home,
+			"/System/Volumes/Data" + home + "/Documents/proj", true,
+		},
+		{
+			"data volume home form", "darwin",
+			"/System/Volumes/Data" + home, home + "/Documents/proj", true,
+		},
+		{
+			"data volume unprotected", "darwin", home,
+			"/System/Volumes/Data" + home + "/src/app", false,
+		},
+		{
+			"mixed case data volume documents", "darwin", home,
+			"/system/volumes/data" + home + "/Documents/proj", true,
+		},
+		{"unprotected home child", "darwin", home, home + "/src/app", false},
+		{"library sibling", "darwin", home, home + "/Library/Caches/x", false},
+		{
+			"prefix collision documentation", "darwin", home,
+			home + "/Documentation/proj", false,
+		},
+		{"another user documents", "darwin", home, "/Users/other/Documents", false},
+		{"outside home", "darwin", home, "/opt/src/app", false},
+		{"relative path", "darwin", home, "Documents/proj", false},
+		{"empty home", "darwin", "", home + "/Documents/proj", false},
+		{"linux never matches", "linux", home, home + "/Documents/proj", false},
+		{"windows never matches", "windows", home, home + "/Documents/proj", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want,
+				IsProtectedUserDataPath(tt.goos, tt.home, tt.path))
+		})
+	}
+}
+
+// TestIsCanonicalAutomountNamespacePath pins that the canonical predicate
+// accepts only the exact spellings the parser's resolved-autofs probe
+// examines: alternate spellings the broad predicate recognizes must not
+// inherit that vetting.
+func TestIsCanonicalAutomountNamespacePath(t *testing.T) {
+	tests := []struct {
+		name string
+		goos string
+		path string
+		want bool
+	}{
+		{"canonical home", "darwin", "/home/user/repo", true},
+		{"canonical net", "darwin", "/net/host/share", true},
+		{"canonical network servers", "darwin", "/Network/Servers/x", true},
+		{"data volume spelling", "darwin", "/System/Volumes/Data/home/user", false},
+		{"case folded spelling", "darwin", "/HOME/user", false},
+		{"lowercase network servers", "darwin", "/network/servers/x", false},
+		{"regular path", "darwin", "/Users/user/repo", false},
+		{"linux never matches", "linux", "/home/user/repo", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want,
+				IsCanonicalAutomountNamespacePath(tt.goos, tt.path))
+		})
+	}
+}
+
+// TestRegisteredAutomountPrefixes pins that autofs mounts discovered from
+// the host's mount table classify as automount alongside the fixed
+// namespaces: the broad predicate accepts alternate spellings, the canonical
+// predicate only the mount table's exact form, and the classification walk
+// refuses a symlink into a custom mount without Lstat-ing inside it.
+func TestRegisteredAutomountPrefixes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the predicate compares POSIX home paths built with filepath")
+	}
+	orig := RegisteredAutomountPrefixes()
+	t.Cleanup(func() { RegisterAutomountPrefixes(orig) })
+	RegisterAutomountPrefixes([]string{"/corp/home/"})
+
+	assert.True(t, IsAutomountNamespacePath("darwin", "/corp/home/user"),
+		"a custom autofs mount must classify as automount")
+	assert.True(t, IsAutomountNamespacePath("darwin", "/corp/home"),
+		"the custom mount root itself must classify as automount")
+	assert.True(t, IsAutomountNamespacePath("darwin", "/CORP/Home/user"),
+		"case-folded spellings of a custom mount must match")
+	assert.True(t, IsAutomountNamespacePath(
+		"darwin", "/System/Volumes/Data/corp/home/user",
+	), "the data-volume spelling of a custom mount must match")
+	assert.False(t, IsAutomountNamespacePath("darwin", "/corp/homework"),
+		"prefix matching must respect component boundaries")
+	assert.False(t, IsAutomountNamespacePath("linux", "/corp/home/user"),
+		"custom mounts are darwin-only like the fixed namespaces")
+
+	assert.True(t, IsCanonicalAutomountNamespacePath(
+		"darwin", "/corp/home/user",
+	), "the canonical predicate accepts the mount table's exact form")
+	assert.False(t, IsCanonicalAutomountNamespacePath(
+		"darwin", "/CORP/home/user",
+	), "the canonical predicate must not accept case-folded forms")
+
+	home := t.TempDir()
+	require.NoError(t, os.Symlink(
+		"/corp/home/user", filepath.Join(home, "tocorp"),
+	))
+	origLstat := osLstat
+	t.Cleanup(func() { osLstat = origLstat })
+	osLstat = func(path string) (os.FileInfo, error) {
+		if path == "/corp" || strings.HasPrefix(path, "/corp/") {
+			assert.Fail(t, "custom automount must not be walked", path)
+		}
+		return origLstat(path)
+	}
+	assert.Equal(t, LocalPathProbeAutomountNamespace, ClassifyLocalPathProbe(
+		"darwin", home, filepath.Join(home, "tocorp", "repo"), false,
+	), "a symlink into a custom mount must stop the walk")
+}
+
+// TestClassifyLocalPathProbe pins the tri-state classification, including
+// working directories that only reach a protected folder through a symlink,
+// which the lexical predicates alone cannot see.
+func TestClassifyLocalPathProbe(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the predicate compares POSIX home paths built with filepath")
+	}
+	home := t.TempDir()
+	require.NoError(t, os.MkdirAll(
+		filepath.Join(home, "Documents", "proj"), 0o755,
+	))
+	require.NoError(t, os.MkdirAll(filepath.Join(home, "src", "app"), 0o755))
+	require.NoError(t, os.Symlink(
+		filepath.Join(home, "Documents"), filepath.Join(home, "code"),
+	))
+	require.NoError(t, os.Symlink("./Documents", filepath.Join(home, "rel")))
+	require.NoError(t, os.Symlink(
+		filepath.Join(home, "loop"), filepath.Join(home, "loop"),
+	))
+	outside := t.TempDir()
+	require.NoError(t, os.Symlink(outside, filepath.Join(home, "out")))
+
+	tests := []struct {
+		name string
+		goos string
+		home string
+		path string
+		want LocalPathProbeClass
+	}{
+		{"lexically protected", "darwin", home, filepath.Join(home, "Documents", "proj"), LocalPathProbeProtectedUserData},
+		{"absolute symlink into protected", "darwin", home, filepath.Join(home, "code", "proj"), LocalPathProbeProtectedUserData},
+		{"relative symlink into protected", "darwin", home, filepath.Join(home, "rel", "proj"), LocalPathProbeProtectedUserData},
+		{"link loop fails protected", "darwin", home, filepath.Join(home, "loop", "proj"), LocalPathProbeProtectedUserData},
+		{"automount namespace", "darwin", home, "/home/user/repo", LocalPathProbeAutomountNamespace},
+		{"automount without home", "darwin", "", "/net/host/share", LocalPathProbeAutomountNamespace},
+		{"data volume protected", "darwin", home, "/System/Volumes/Data" + home + "/Documents/proj", LocalPathProbeProtectedUserData},
+		{"data volume automount", "darwin", home, "/System/Volumes/Data/home/user/repo", LocalPathProbeAutomountNamespace},
+		{"plain unprotected", "darwin", home, filepath.Join(home, "src", "app"), LocalPathProbeSafe},
+		{"symlink to unprotected", "darwin", home, filepath.Join(home, "out", "app"), LocalPathProbeSafe},
+		{"missing unprotected path", "darwin", home, filepath.Join(home, "src", "gone", "deep"), LocalPathProbeSafe},
+		{"empty home protected miss", "darwin", "", filepath.Join(home, "Documents", "proj"), LocalPathProbeSafe},
+		{"linux never restricts", "linux", home, filepath.Join(home, "code", "proj"), LocalPathProbeSafe},
+		{"relative path", "darwin", home, "code/proj", LocalPathProbeSafe},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want,
+				ClassifyLocalPathProbe(tt.goos, tt.home, tt.path, false))
+		})
+	}
+}
+
+// TestClassifyLocalPathProbeSkipsAutomountNamespace pins that classification
+// never Lstats inside a macOS automounter namespace, whether the input names
+// it directly or a symlink hops into it mid-walk, and that the namespace is
+// reported as its own class rather than as protected user data — the
+// protected-path opt-in must not become permission to wake automountd.
+func TestClassifyLocalPathProbeSkipsAutomountNamespace(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the predicate compares POSIX home paths built with filepath")
+	}
+	home := t.TempDir()
+	require.NoError(t, os.Symlink("/home", filepath.Join(home, "tohome")))
+	orig := osLstat
+	t.Cleanup(func() { osLstat = orig })
+	osLstat = func(path string) (os.FileInfo, error) {
+		if path == "/home" || strings.HasPrefix(path, "/home/") {
+			assert.Fail(t, "automount namespace must not be walked", path)
+		}
+		return orig(path)
+	}
+
+	assert.Equal(t, LocalPathProbeAutomountNamespace, ClassifyLocalPathProbe(
+		"darwin", home, "/home/user/repo", false), "a direct automount path must classify as automount")
+	assert.Equal(t, LocalPathProbeAutomountNamespace, ClassifyLocalPathProbe(
+		"darwin", home, filepath.Join(home, "tohome", "user", "repo"), false), "a symlink into the automount namespace must stop the walk")
+}
+
+// TestClassifyLocalPathProbeDotDotTraversalOrder pins that ".." resolves in
+// traversal order, after the components before it: collapsing it lexically
+// would drop an unresolved symlink component and classify a path as safe
+// while real filesystem resolution reaches a protected location through it.
+func TestClassifyLocalPathProbeDotDotTraversalOrder(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the predicate compares POSIX home paths built with filepath")
+	}
+	home := t.TempDir()
+	require.NoError(t, os.MkdirAll(
+		filepath.Join(home, "Documents", "sub"), 0o755,
+	))
+	require.NoError(t, os.MkdirAll(filepath.Join(home, "src", "app"), 0o755))
+	// q links into Documents; home/q/../x resolves through Documents.
+	require.NoError(t, os.Symlink(
+		filepath.Join(home, "Documents", "sub"), filepath.Join(home, "q"),
+	))
+	// Chained relative target: l1 -> "l2/../safe" where l2 links into
+	// Documents; the kernel resolves l2 before applying "..".
+	require.NoError(t, os.Symlink(
+		filepath.Join(home, "Documents", "sub"), filepath.Join(home, "l2"),
+	))
+	require.NoError(t, os.Symlink("l2/../safe", filepath.Join(home, "l1")))
+
+	tests := []struct {
+		name string
+		path string
+		want LocalPathProbeClass
+	}{
+		{"dotdot after symlink into protected", filepath.Join(home, "q") + "/../x", LocalPathProbeProtectedUserData},
+		{"chained relative target with dotdot", filepath.Join(home, "l1"), LocalPathProbeProtectedUserData},
+		{"dotdot through protected midpoint", home + "/Documents/../src/app", LocalPathProbeProtectedUserData},
+		{"dotdot through automount", "/home/../tmp/x", LocalPathProbeAutomountNamespace},
+		{"dotdot through safe components", home + "/src/app/../app", LocalPathProbeSafe},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want,
+				ClassifyLocalPathProbe("darwin", home, tt.path, false))
+		})
+	}
+}
+
+// TestClassifyLocalPathProbeOptInStillRefusesAutomount pins that the
+// protected-folder opt-in continues resolution through protected prefixes:
+// a symlink hidden inside ~/Documents that leads into an automounter
+// namespace must classify as automount, because the opt-in lifts consent
+// prompts, never automountd wakeups. Without the opt-in the walk still
+// stops at the protected prefix untouched.
+func TestClassifyLocalPathProbeOptInStillRefusesAutomount(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the predicate compares POSIX home paths built with filepath")
+	}
+	home := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(home, "Documents"), 0o755))
+	require.NoError(t, os.Symlink(
+		"/home/user", filepath.Join(home, "Documents", "tohome"),
+	))
+	hidden := filepath.Join(home, "Documents", "tohome", "repo")
+
+	assert.Equal(t, LocalPathProbeAutomountNamespace,
+		ClassifyLocalPathProbe("darwin", home, hidden, true),
+		"opt-in must keep resolving and find the automount target")
+	assert.Equal(t, LocalPathProbeProtectedUserData,
+		ClassifyLocalPathProbe("darwin", home,
+			filepath.Join(home, "Documents", "proj"), true),
+		"a protected-only path stays protected under the opt-in")
+
+	orig := osLstat
+	t.Cleanup(func() { osLstat = orig })
+	osLstat = func(path string) (os.FileInfo, error) {
+		if strings.HasPrefix(path, filepath.Join(home, "Documents")) {
+			assert.Fail(t, "opt-out must not Lstat inside protected", path)
+		}
+		return orig(path)
+	}
+	assert.Equal(t, LocalPathProbeProtectedUserData,
+		ClassifyLocalPathProbe("darwin", home, hidden, false),
+		"without the opt-in the walk stops at the protected prefix")
+}
+
+// TestClassifyLocalPathProbeAutomountHomeNeverResolved pins that resolving
+// the home directory for lexical comparison never touches an automounter
+// namespace: a home under /home (autofs user homes) or reached through a
+// /net link must not wake automountd on every classification call.
+func TestClassifyLocalPathProbeAutomountHomeNeverResolved(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the predicate compares POSIX home paths built with filepath")
+	}
+	outside := t.TempDir()
+	linkedHome := filepath.Join(outside, "nethome")
+	require.NoError(t, os.Symlink("/net/host/users/x", linkedHome))
+	orig := osLstat
+	t.Cleanup(func() { osLstat = orig })
+	osLstat = func(path string) (os.FileInfo, error) {
+		for _, ns := range []string{"/home", "/net", "/Network/Servers"} {
+			if path == ns || strings.HasPrefix(path, ns+"/") {
+				assert.Fail(t, "automount namespace must not be walked", path)
+			}
+		}
+		return orig(path)
+	}
+
+	assert.Equal(t, LocalPathProbeSafe, ClassifyLocalPathProbe(
+		"darwin", "/home/user", filepath.Join(outside, "elsewhere"), false), "an automount home must not derail classifying an unrelated path")
+	assert.Equal(t, LocalPathProbeSafe, ClassifyLocalPathProbe(
+		"darwin", linkedHome, filepath.Join(outside, "elsewhere"), false), "resolving a home linked through /net must abort, not follow")
 }
 
 // TestNormalizeStoredRootPathSkipsAutomountNamespace pins that on macOS a

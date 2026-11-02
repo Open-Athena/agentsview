@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"strings"
@@ -29,6 +29,10 @@ const (
 	// unit reaches it.
 	maxUnitDistillCalls = 256
 )
+
+// ErrPassRunning reports that an explicit lifecycle action could not acquire
+// the manager's pass lock. Callers retry after the current extraction pass.
+var ErrPassRunning = errors.New("recall extraction pass is running")
 
 // ManagerConfig assembles one extraction configuration. Its identity-bearing
 // parts (Identity, Segmenter, Prompts, Client.Request) are fingerprinted at
@@ -803,8 +807,7 @@ func (m *Manager) extractSession(
 				return outcome, markErr
 			}
 			outcome.failed = true
-			var transient *transientError
-			if errors.As(err, &transient) {
+			if _, ok := errors.AsType[*transientError](err); ok {
 				// An exhausted retry ladder means the endpoint is down or
 				// saturated, not that this unit is poisoned: every
 				// remaining session would burn its own full ladder
@@ -1156,26 +1159,44 @@ func (m *Manager) maybeActivate(ctx context.Context) (bool, error) {
 // has produced nothing: an empty active generation would serve an empty
 // corpus while looking healthy.
 func (m *Manager) Activate(ctx context.Context) error {
+	if !m.passMu.TryLock() {
+		return ErrPassRunning
+	}
+	defer m.passMu.Unlock()
+
 	stats, err := m.cfg.DB.ExtractProgressStats(ctx, m.fingerprint)
 	if err != nil {
 		return err
 	}
 	if stats.Done == 0 {
 		return fmt.Errorf(
-			"refusing to activate generation %s: no completed sessions",
-			m.fingerprint,
+			"refusing to activate generation %s: no completed sessions: %w",
+			m.fingerprint, db.ErrExtractActivationBlocked,
 		)
 	}
 	if stats.Entries == 0 {
 		return fmt.Errorf(
 			"refusing to activate generation %s: no extracted entries — "+
-				"activating would serve an empty corpus", m.fingerprint,
+				"activating would serve an empty corpus: %w", m.fingerprint,
+			db.ErrExtractActivationBlocked,
 		)
 	}
 	return m.cfg.DB.ActivateExtractGeneration(
 		ctx, m.fingerprint, []string{secrets.RulesVersion()},
 		time.Now().Add(-m.cfg.QuietPeriod),
 	)
+}
+
+// Retire marks a non-active extraction generation retired. The manager never
+// exposes the database force option: retiring the served generation would
+// leave no machine-distilled corpus active.
+func (m *Manager) Retire(ctx context.Context, fingerprint string) error {
+	if !m.passMu.TryLock() {
+		return ErrPassRunning
+	}
+	defer m.passMu.Unlock()
+
+	return m.cfg.DB.RetireExtractGeneration(ctx, fingerprint, false)
 }
 
 // Status reports this generation's coverage and the current backlog.

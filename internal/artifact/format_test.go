@@ -1,7 +1,8 @@
 package artifact
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -39,7 +40,7 @@ func TestCanonicalManifestGolden(t *testing.T) {
 	ordinal := 2
 	parent := "parent-1"
 	name := "Fixture"
-	raw := rawSourceRef{
+	raw := RawSourceRef{
 		Hash:      "raw123",
 		Size:      4096,
 		MediaType: "application/jsonl",
@@ -177,7 +178,7 @@ func TestCanonicalMessageSegmentGolden(t *testing.T) {
 			Timestamp:        "2026-06-14T01:02:05Z",
 			HasToolUse:       true,
 			Model:            "claude-test",
-			TokenUsage:       json.RawMessage(`{"output":2,"input":1}`),
+			TokenUsage:       jsontext.Value(`{"output":2,"input":1}`),
 			OutputTokens:     2,
 			HasOutputTokens:  true,
 			ClaudeMessageID:  "msg-1",
@@ -260,7 +261,7 @@ func TestEncodeSegmentPreservesPromptSource(t *testing.T) {
 func TestCanonicalMetadataEventGolden(t *testing.T) {
 	t.Parallel()
 
-	value := json.RawMessage(`{"display_name":"Renamed session"}`)
+	value := jsontext.Value(`{"display_name":"Renamed session"}`)
 	note := "remember this"
 	event := metadataEvent{
 		Version:    metadataEventFormatVersion,

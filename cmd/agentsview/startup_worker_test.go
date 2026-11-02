@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
@@ -71,6 +71,53 @@ func TestStartupWorkerPathOpensWatcherDispatch(t *testing.T) {
 	case <-opened:
 	case <-time.After(2 * time.Second):
 		require.FailNow(t, "watcher dispatch did not open after worker handshake")
+	}
+}
+
+func TestCompleteWorkerStartupReconciliationLogsLifecycle(t *testing.T) {
+	tests := []struct {
+		name        string
+		roots       []string
+		err         error
+		wantOutcome string
+		wantQueued  bool
+	}{
+		{name: "no roots", wantOutcome: "completed"},
+		{
+			name:        "failed reconciliation",
+			roots:       []string{"/sessions"},
+			err:         errors.New("reconciliation failed"),
+			wantOutcome: "failed",
+			wantQueued:  true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureLogOutput(t)
+			reconcileCalls := 0
+			queued := false
+			var recordedErr error
+			completeWorkerStartupReconciliation(
+				t.Context(), tc.roots, syncpkg.SyncStats{},
+				func(context.Context, []string, bool) error {
+					reconcileCalls++
+					return tc.err
+				},
+				func(syncpkg.WatchBatch) { queued = true },
+				func(_ syncpkg.SyncStats, errorValue error) { recordedErr = errorValue },
+			)
+
+			output := logs.String()
+			assert.Contains(t, output,
+				"startup gap reconciliation started: roots="+fmt.Sprint(len(tc.roots)))
+			assert.Contains(t, output, "startup gap reconciliation finished:")
+			assert.Contains(t, output, "duration=")
+			assert.Contains(t, output, "outcome="+tc.wantOutcome)
+			assert.Equal(t, len(tc.roots) > 0, reconcileCalls > 0)
+			assert.Equal(t, tc.wantQueued, queued)
+			assert.Equal(t, tc.err, recordedErr)
+		})
 	}
 }
 
