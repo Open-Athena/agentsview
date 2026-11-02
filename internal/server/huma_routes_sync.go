@@ -186,6 +186,7 @@ func (s *Server) syncEngineForLocal(local *db.DB) *syncpkg.Engine {
 	}
 	s.onDemandEngine = syncpkg.NewEngine(local, syncpkg.EngineConfig{
 		AgentDirs:               s.cfg.AgentDirs,
+		SourceMachines:          s.cfg.SourceMachines,
 		IncludeCwdPrefixes:      s.cfg.SyncIncludeCwdPrefixes,
 		Machine:                 s.cfg.LocalMachineName,
 		BlockedResultCategories: s.cfg.ResultContentBlockedCategories,
@@ -827,6 +828,9 @@ func (s *Server) humaSyncSession(
 	if (in.Body.Path == "" && in.Body.ID == "") ||
 		(in.Body.Path != "" && in.Body.ID != "") {
 		return nil, apiError(http.StatusBadRequest, "exactly one of 'path' or 'id' is required")
+	}
+	if in.Body.Subagents && in.Body.ID == "" {
+		return nil, apiError(http.StatusBadRequest, "'subagents' requires 'id'")
 	}
 	if err := s.resyncBeforeSessionSync(ctx); err != nil {
 		if errors.Is(err, context.Canceled) {

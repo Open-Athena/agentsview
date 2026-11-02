@@ -1008,9 +1008,9 @@ func TestMigration_ToolResultEventsTable(t *testing.T) {
 		"expected tool_result_events table after reopen")
 }
 
-func TestCurrentDataVersionCopilotToolTiming(t *testing.T) {
-	assert.Equal(t, 76, CurrentDataVersion(),
-		"Copilot tool execution timing requires a data version bump")
+func TestCurrentDataVersionUsageReparses(t *testing.T) {
+	assert.Equal(t, 82, CurrentDataVersion(),
+		"Pi cacheWrite usage and Claude web-search accounting require sequential backfills")
 }
 
 func TestInsertMessages_PreservesToolResultEvents(t *testing.T) {
@@ -1283,6 +1283,35 @@ func TestSessionParentSessionID(t *testing.T) {
 		assert.Equal(t, "parent-uuid", *got.ParentSessionID,
 			"parent_session_id")
 	})
+}
+
+func TestUpsertSessionRefreshesParserParentSessionID(t *testing.T) {
+	d := testDB(t)
+	s := Session{
+		ID:              "kid",
+		Project:         "proj",
+		Machine:         defaultMachine,
+		Agent:           defaultAgent,
+		ParentSessionID: Ptr("first-parent"),
+	}
+	require.NoError(t, d.UpsertSession(s), "insert session")
+
+	assertParserParent := func(want string) {
+		t.Helper()
+		var got sql.NullString
+		err := d.getReader().QueryRow(
+			`SELECT parser_parent_session_id FROM sessions WHERE id = ?`,
+			"kid",
+		).Scan(&got)
+		require.NoError(t, err, "query parser parent")
+		require.True(t, got.Valid, "parser parent must be set")
+		assert.Equal(t, want, got.String, "parser parent")
+	}
+
+	assertParserParent("first-parent")
+	s.ParentSessionID = Ptr("second-parent")
+	require.NoError(t, d.UpsertSession(s), "update session")
+	assertParserParent("second-parent")
 }
 
 func TestGetChildSessions(t *testing.T) {
@@ -5588,7 +5617,7 @@ func TestCopySyncStateFrom_NoSourceTable(t *testing.T) {
 	assert.Equal(t, "marker-123", got)
 }
 
-func TestCopySyncStateFrom_OnlyCopiesDurablePGKeys(t *testing.T) {
+func TestCopySyncStateFrom_OnlyCopiesDurableKeys(t *testing.T) {
 	dir := t.TempDir()
 
 	srcPath := filepath.Join(dir, "src.db")
@@ -5601,6 +5630,11 @@ func TestCopySyncStateFrom_OnlyCopiesDurablePGKeys(t *testing.T) {
 		"seed source started")
 	require.NoError(t, srcDB.SetSyncState("last_sync_finished_at", "old-finish"),
 		"seed source finished")
+	require.NoError(t, srcDB.QueueSubagentParentRepairs([]string{"queued-child"}),
+		"seed durable hierarchy repair")
+	require.NoError(t, srcDB.QueueSubagentParentCleanupRepairs(
+		[]string{"queued-former-child"},
+	), "seed durable hierarchy cleanup")
 	require.NoError(t, srcDB.UpsertSession(Session{
 		ID: "queued-session", Project: "p", Machine: "local", Agent: "claude",
 	}), "seed source queued session")
@@ -5628,6 +5662,21 @@ func TestCopySyncStateFrom_OnlyCopiesDurablePGKeys(t *testing.T) {
 
 	assert.Contains(t, artifactExportQueueIDs(t, dstDB), "queued-session",
 		"artifact export queue rows must survive the copy")
+
+	var queuedRepairs int
+	require.NoError(t, dstDB.Reader().QueryRow(`
+		SELECT count(*) FROM subagent_parent_repair_queue
+		WHERE session_id = 'queued-child'`,
+	).Scan(&queuedRepairs), "query copied subagent repair queue")
+	assert.Equal(t, 1, queuedRepairs,
+		"pending hierarchy repairs must survive an archive rebuild")
+	var queuedCleanups int
+	require.NoError(t, dstDB.Reader().QueryRow(`
+		SELECT count(*) FROM subagent_parent_cleanup_queue
+		WHERE session_id = 'queued-former-child'`,
+	).Scan(&queuedCleanups), "query copied subagent cleanup queue")
+	assert.Equal(t, 1, queuedCleanups,
+		"pending destructive cleanup intent must survive an archive rebuild")
 
 	gotStarted, err := dstDB.GetSyncState("last_sync_started_at")
 	require.NoError(t, err, "GetSyncState last_sync_started_at")
@@ -5799,8 +5848,10 @@ func TestCopySessionMetadataPreservesWorktreeProjectMappings(t *testing.T) {
 	for _, m := range got {
 		projects[m.PathPrefix] = m.Project
 	}
-	require.Equal(t, "src_repo", projects[srcPrefix], "source mapping project")
-	require.Equal(t, "src_conflict", projects[dstPrefix], "destination mapping project")
+	require.Equal(t, "src_repo", projects[filepath.ToSlash(srcPrefix)],
+		"source mapping project")
+	require.Equal(t, "src_conflict", projects[filepath.ToSlash(dstPrefix)],
+		"destination mapping project")
 }
 
 func TestCopySessionMetadataPreservesClears(t *testing.T) {
@@ -6610,6 +6661,48 @@ func TestFileIdentityChanged(t *testing.T) {
 		FilePath: new(legacyPath),
 	}), "upsert legacy")
 	assert.False(t, d.FileIdentityChanged(legacyPath, 1, 1), "missing stored identity changed")
+}
+
+func TestGetSessionForIncrementalReturnsImmutableSourceProject(t *testing.T) {
+	d := testDB(t)
+	for _, tc := range []struct {
+		name          string
+		sessionID     string
+		filePath      string
+		sourceProject string
+	}{
+		{
+			name:          "snapshot present",
+			sessionID:     "incremental-source-present",
+			filePath:      "/tmp/incremental-source-present.jsonl",
+			sourceProject: "parser-source",
+		},
+		{
+			name:      "snapshot absent",
+			sessionID: "incremental-source-absent",
+			filePath:  "/tmp/incremental-source-absent.jsonl",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, d.UpsertSessionWithProjectIdentity(
+				Session{
+					ID: tc.sessionID, Project: "mapped-target", Machine: "laptop",
+					Agent: "claude", Cwd: "/tmp/worktree",
+					FilePath: new(tc.filePath), FileSize: new(int64(128)),
+				},
+				export.ProjectIdentityObservation{
+					SessionID: tc.sessionID, Project: "mapped-target",
+					Machine: "laptop", RootPath: "/tmp/worktree",
+				},
+				tc.sourceProject,
+			))
+
+			info, ok := d.GetSessionForIncremental(tc.filePath)
+			require.True(t, ok)
+			assert.Equal(t, "mapped-target", info.Project)
+			assert.Equal(t, tc.sourceProject, info.SourceProject)
+		})
+	}
 }
 
 func TestUpdateSessionIncremental(t *testing.T) {
@@ -7760,6 +7853,40 @@ func TestCopySessionMetadataKeepsIdentityRevisionMonotonic(t *testing.T) {
 	after, err := fresh.ProjectIdentityPublicationRevision(ctx)
 	requireNoError(t, err, "revision after copy")
 	assert.GreaterOrEqual(t, after, before)
+}
+
+func TestCopySessionMetadataKeepsWorktreeMappingRevisionMonotonic(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	oldPath := filepath.Join(dir, "old.db")
+	oldDB, err := Open(oldPath)
+	requireNoError(t, err, "open old")
+	_, err = oldDB.rawWriter().Exec(`
+		INSERT INTO archive_metadata (key, value)
+		VALUES (?, '1')
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		archiveMetadataWorktreeMappingRevisionKey,
+	)
+	requireNoError(t, err, "set old revision")
+	requireNoError(t, oldDB.Close(), "close old")
+
+	fresh := testDB(t)
+	_, err = fresh.rawWriter().Exec(`
+		INSERT INTO archive_metadata (key, value)
+		VALUES (?, '5')
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		archiveMetadataWorktreeMappingRevisionKey,
+	)
+	requireNoError(t, err, "set fresh revision")
+	before, err := fresh.WorktreeMappingPublicationRevision(ctx)
+	requireNoError(t, err, "revision before copy")
+	require.Equal(t, int64(5), before)
+
+	requireNoError(t, fresh.CopySessionMetadataFrom(oldPath), "copy")
+	after, err := fresh.WorktreeMappingPublicationRevision(ctx)
+	requireNoError(t, err, "revision after copy")
+	assert.GreaterOrEqual(t, after, before,
+		"resync copy must not regress the worktree mapping publication revision")
 }
 
 func TestCopySessionMetadataPreservesFirstConclusiveSessionSnapshot(t *testing.T) {

@@ -122,19 +122,19 @@ func resolveRawSessionID(
 	return input, false
 }
 
-// agentHasDiskSourceLookup reports whether a session source can be located by
-// raw ID via the provider facade's FindSource path. This covers file-backed
-// agents plus Devin's provider-owned virtual session paths.
+// agentHasDiskSourceLookup reports whether a provider-authoritative session
+// source can be located by raw ID through the provider facade's FindSource path.
 func agentHasDiskSourceLookup(def parser.AgentDef) bool {
-	if !def.FileBased && def.Type != parser.AgentDevin {
-		return false
-	}
 	if parser.ProviderMigrationModes()[def.Type] !=
 		parser.ProviderMigrationProviderAuthoritative {
 		return false
 	}
-	_, ok := parser.ProviderFactoryByType(def.Type)
-	return ok
+	factory, ok := parser.ProviderFactoryByType(def.Type)
+	if !ok {
+		return false
+	}
+	return factory.Capabilities().Source.FindSource ==
+		parser.CapabilitySupported
 }
 
 // findAgentSourceFile resolves a raw agent session ID to an on-disk source path
@@ -244,7 +244,7 @@ func sessionUsageData(sessionID string) (*sessionUsageOutput, int, error) {
 		appCfg,
 		archiveQueryPolicy{
 			AutoStart:            true,
-			ReadOnlyDaemon:       archiveQueryRejectReadOnlyDaemon,
+			ReadOnlyDaemon:       archiveQueryUseReadOnlyDaemon,
 			DirectReadOnlyAction: "refresh session usage directly",
 		},
 	)
@@ -252,5 +252,5 @@ func sessionUsageData(sessionID string) (*sessionUsageOutput, int, error) {
 		return nil, tokenUseExitErr, err
 	}
 	defer closeArchiveQueryBackend(cleanup)
-	return backend.SessionUsage(ctx, sessionID)
+	return backend.SessionUsage(ctx, sessionUsageQuery{SessionID: sessionID})
 }

@@ -64,6 +64,76 @@ func TestFmtCost(t *testing.T) {
 	}
 }
 
+func TestPrintUsageStatuslineJSON(t *testing.T) {
+	tests := []struct {
+		name  string
+		agent string
+		cost  string
+		want  usageStatuslineReport
+	}{
+		{
+			name: "no agent filter omits the agent field",
+			cost: "9.61",
+			want: usageStatuslineReport{
+				Date: "2026-08-04",
+				Cost: money.Money{Microdollars: 9_610_000},
+			},
+		},
+		{
+			name:  "agent filter is reported",
+			agent: "claude",
+			cost:  "6.42",
+			want: usageStatuslineReport{
+				Date:  "2026-08-04",
+				Cost:  money.Money{Microdollars: 6_420_000},
+				Agent: "claude",
+			},
+		},
+		{
+			name: "an empty day still reports a zero cost",
+			cost: "0",
+			want: usageStatuslineReport{
+				Date: "2026-08-04",
+				Cost: money.Money{},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := db.DailyUsageResult{
+				Totals: db.UsageTotals{
+					TotalCost: money.MustParseDollars(tc.cost),
+				},
+			}
+			out := captureStdout(t, func() {
+				printUsageStatuslineJSON(result, tc.agent, "2026-08-04")
+			})
+
+			var got usageStatuslineReport
+			require.NoError(t, json.Unmarshal([]byte(out), &got))
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// The documented budget check reads .cost.microdollars, so the cost has to
+// stay an exact integer: a formatted or rounded value would make a threshold
+// comparison silently wrong.
+func TestPrintUsageStatuslineJSONKeepsExactMicrodollars(t *testing.T) {
+	result := db.DailyUsageResult{
+		Totals: db.UsageTotals{
+			TotalCost: money.Money{Microdollars: 25_000_001},
+		},
+	}
+
+	out := captureStdout(t, func() {
+		printUsageStatuslineJSON(result, "", "2026-08-04")
+	})
+
+	assert.Contains(t, out, `"microdollars": 25000001`)
+	assert.NotContains(t, out, "25.000001")
+}
+
 func TestUsageDailyGolden(t *testing.T) {
 	setupExportGoldenDataDir(t)
 
@@ -86,7 +156,7 @@ func TestUsageDailyGolden(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(stdout), &report))
 	assert.Equal(t, export.UsageDailySchemaVersion, report.SchemaVersion)
 
-	assertGoldenBytes(t, "usage_daily_v4.json", []byte(stdout))
+	assertGoldenBytes(t, "usage_daily_v5.json", []byte(stdout))
 }
 
 func TestUsageDailyBreakdownGolden(t *testing.T) {
@@ -116,7 +186,7 @@ func TestUsageDailyBreakdownGolden(t *testing.T) {
 		assert.Equal(t, "golden-host", daily.MachineBreakdowns[0].MachineName)
 	}
 
-	assertGoldenBytes(t, "usage_daily_breakdown_v4.json", []byte(stdout))
+	assertGoldenBytes(t, "usage_daily_breakdown_v5.json", []byte(stdout))
 }
 
 func setupExportGoldenDataDir(t *testing.T) string {
@@ -1450,7 +1520,7 @@ func TestNewUsageCursorCommandExplicitMemberFilterDoesNotReuseConfigSibling(t *t
 // sampleDailyUsageJSON is a full usage summary body with a single day and
 // non-zero totals, shared by the HTTP and daemon usage tests.
 const sampleDailyUsageJSON = `{
-	"schema_version": 4,
+	"schema_version": 5,
 	"from": "2026-06-01",
 	"to": "2026-06-02",
 	"pricing": {

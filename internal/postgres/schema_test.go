@@ -46,6 +46,7 @@ type schemaProbeState struct {
 	syncMetadataKeys    map[string]bool
 	maxDataVersion      int
 	maxDataVersionErr   error
+	execErrors          []schemaProbeQueryError
 	queryErrors         []schemaProbeQueryError
 }
 
@@ -133,6 +134,14 @@ func (c *schemaProbeConn) ExecContext(
 			c.state.mu.Unlock()
 		}
 	}
+	for _, execErr := range c.state.execErrors {
+		if strings.Contains(
+			normalized,
+			strings.ToLower(execErr.contains),
+		) {
+			return nil, execErr.err
+		}
+	}
 	return driver.RowsAffected(0), nil
 }
 
@@ -213,6 +222,14 @@ func (c *schemaProbeConn) QueryContext(
 		return &schemaProbeRows{
 			columns: []string{"max"},
 			values:  [][]driver.Value{{int64(c.state.maxDataVersion)}},
+		}, nil
+	case strings.Contains(normalized, "agentsview_json_integer"):
+		return &schemaProbeRows{
+			columns: []string{
+				"output", "web_search", "malformed",
+				"malformed_scoped_output", "malformed_scoped_web_search",
+			},
+			values: [][]driver.Value{{"42", "2", "7", "42", "2"}},
 		}, nil
 	case strings.Contains(normalized, "select id, first_message"):
 		return &schemaProbeRows{
@@ -364,6 +381,43 @@ func TestEnsureSchemaBatchesColumnIntrospection(t *testing.T) {
 
 	assert.Equal(t, 1, state.informationQueryCount(),
 		"information_schema.columns queries")
+}
+
+func TestEnsureSchemaFallsBackWhenPLpgSQLUsageHelperIsUnsupported(
+	t *testing.T,
+) {
+	pg, state := newSchemaProbeDB(t, map[string][]string{
+		"sessions": {
+			"has_total_output_tokens",
+			"has_peak_context_tokens",
+		},
+		"messages": {
+			"has_context_tokens",
+			"has_output_tokens",
+		},
+	})
+	state.syncMetadataKeys = map[string]bool{
+		tokenCoverageRepairMetadataKey:        true,
+		sourceCurationBackfillMetadataKey:     true,
+		projectIdentityRemoteScrubMetadataKey: true,
+	}
+	state.execErrors = []schemaProbeQueryError{{
+		contains: "language plpgsql",
+		err: errors.New(
+			`ERROR: unimplemented: PL/pgSQL exception blocks (SQLSTATE 0A000)`,
+		),
+	}}
+
+	require.NoError(t, EnsureSchema(t.Context(), pg, "agentsview"))
+
+	executed := strings.ToLower(state.executedSQL())
+	primary := strings.Index(executed, "language plpgsql")
+	fallback := strings.Index(executed, "language sql")
+	require.NotEqual(t, -1, primary, "must feature-probe PL/pgSQL helper")
+	require.NotEqual(t, -1, fallback, "must install SQL fallback")
+	assert.Less(t, primary, fallback, "fallback must follow failed probe")
+	assert.Contains(t, executed, "json_valid(raw_value)")
+	assert.Contains(t, state.queriedSQL(), "agentsview_json_integer")
 }
 
 func TestEnsureSchemaMigratesSessionDeletionCause(t *testing.T) {
@@ -529,12 +583,16 @@ func TestEnsureSchemaChecksDataVersionBeforeDDL(t *testing.T) {
 func TestSyncEnsureSchemaSkipsDDLWhenSchemaCompatible(t *testing.T) {
 	pg, state := newSchemaProbeDB(t, nil)
 	state.existingTables = map[string]bool{
-		"model_pricing":                             true,
-		"model_pricing_bands":                       true,
-		"source_archives":                           true,
-		"source_project_identity_observations":      true,
-		"source_session_project_identity_snapshots": true,
-		"cursor_usage_events":                       true,
+		"model_pricing":                                   true,
+		"model_pricing_bands":                             true,
+		"source_archives":                                 true,
+		"source_project_identity_observations":            true,
+		"source_project_identity_observation_scopes":      true,
+		"source_session_project_identity_snapshots":       true,
+		"source_session_project_identity_snapshot_scopes": true,
+		"source_worktree_project_mappings":                true,
+		"source_worktree_project_mapping_scopes":          true,
+		"cursor_usage_events":                             true,
 	}
 	state.existingIndexes = map[string]bool{
 		"idx_cursor_usage_events_dedup": true,
@@ -559,12 +617,16 @@ func TestSyncEnsureSchemaSkipsDDLWhenSchemaCompatible(t *testing.T) {
 func TestEnsureSchemaScrubsProjectIdentityGitRemoteCredentials(t *testing.T) {
 	pg, state := newSchemaProbeDB(t, nil)
 	state.existingTables = map[string]bool{
-		"model_pricing":                             true,
-		"model_pricing_bands":                       true,
-		"source_archives":                           true,
-		"source_project_identity_observations":      true,
-		"source_session_project_identity_snapshots": true,
-		"cursor_usage_events":                       true,
+		"model_pricing":                                   true,
+		"model_pricing_bands":                             true,
+		"source_archives":                                 true,
+		"source_project_identity_observations":            true,
+		"source_project_identity_observation_scopes":      true,
+		"source_session_project_identity_snapshots":       true,
+		"source_session_project_identity_snapshot_scopes": true,
+		"source_worktree_project_mappings":                true,
+		"source_worktree_project_mapping_scopes":          true,
+		"cursor_usage_events":                             true,
 	}
 	state.existingIndexes = map[string]bool{
 		"idx_cursor_usage_events_dedup": true,
@@ -598,6 +660,20 @@ func TestCheckSchemaCompatIgnoresPushOnlySchema(t *testing.T) {
 		"read compatibility must not require push-only schema")
 }
 
+func TestCheckSchemaCompatRequiresUsageJSONHelper(t *testing.T) {
+	pg, state := newSchemaProbeDB(t, nil)
+	state.queryErrors = []schemaProbeQueryError{{
+		contains: "agentsview_json_integer",
+		err: errors.New(
+			`ERROR: function agentsview_json_integer does not exist (SQLSTATE 42883)`),
+	}}
+
+	err := CheckSchemaCompat(t.Context(), pg)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "usage JSON helper missing or incompatible")
+}
+
 func TestCheckSchemaCompatRequiresCurationBaselineColumns(t *testing.T) {
 	pg, state := newSchemaProbeDB(t, nil)
 	state.queryErrors = []schemaProbeQueryError{{
@@ -618,6 +694,20 @@ func TestCheckSchemaCompatRequiresDeletionCause(t *testing.T) {
 		contains: "deletion_cause",
 		err: errors.New(
 			`ERROR: column "deletion_cause" does not exist (SQLSTATE 42703)`),
+	}}
+
+	err := CheckSchemaCompat(t.Context(), pg)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "sessions table missing required columns")
+}
+
+func TestCheckSchemaCompatRequiresParserParentSessionID(t *testing.T) {
+	pg, state := newSchemaProbeDB(t, nil)
+	state.queryErrors = []schemaProbeQueryError{{
+		contains: "parser_parent_session_id",
+		err: errors.New(
+			`ERROR: column "parser_parent_session_id" does not exist (SQLSTATE 42703)`),
 	}}
 
 	err := CheckSchemaCompat(t.Context(), pg)
@@ -758,6 +848,36 @@ func TestCheckSchemaCompatRequiresSourceArchives(t *testing.T) {
 		"source_archives table missing required columns")
 }
 
+func TestCheckSchemaCompatRequiresSessionProvenanceColumns(t *testing.T) {
+	pg, state := newSchemaProbeDB(t, nil)
+	state.queryErrors = []schemaProbeQueryError{{
+		contains: "source_archive_id, source_database_generation, file_path",
+		err: errors.New(
+			`ERROR: column "source_archive_id" does not exist (SQLSTATE 42703)`),
+	}}
+
+	err := CheckSchemaCompat(context.Background(), pg)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(),
+		"sessions table missing provenance columns")
+}
+
+func TestCheckSchemaCompatRequiresWorktreeProjectMappings(t *testing.T) {
+	pg, state := newSchemaProbeDB(t, nil)
+	state.queryErrors = []schemaProbeQueryError{{
+		contains: "from source_worktree_project_mappings",
+		err: errors.New(
+			`ERROR: relation "source_worktree_project_mappings" does not exist (SQLSTATE 42P01)`),
+	}}
+
+	err := CheckSchemaCompat(context.Background(), pg)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(),
+		"source_worktree_project_mappings table missing required columns")
+}
+
 func TestSyncEnsureSchemaRunsDDLWhenPushMetadataMissing(t *testing.T) {
 	pg, state := newSchemaProbeDB(t, map[string][]string{
 		"sessions": {
@@ -818,6 +938,42 @@ func TestSyncEnsureSchemaRunsDDLWhenPushTableMissing(t *testing.T) {
 	assert.Contains(t, strings.ToLower(state.executedSQL()),
 		"create table",
 		"fallback must create missing push tables")
+}
+
+func TestSyncEnsureSchemaRunsDDLWhenMappingTableMissing(t *testing.T) {
+	pg, state := newSchemaProbeDB(t, map[string][]string{
+		"sessions": {
+			"has_total_output_tokens",
+			"has_peak_context_tokens",
+		},
+		"messages": {
+			"has_context_tokens",
+			"has_output_tokens",
+		},
+	})
+	// Read-compatible with every other push table and the dedup index
+	// present, but source_worktree_project_mappings is absent: the push
+	// fast path must fall back to EnsureSchema so mapping publication has
+	// a table to write into.
+	state.existingTables = map[string]bool{
+		"model_pricing":                             true,
+		"source_archives":                           true,
+		"source_project_identity_observations":      true,
+		"source_session_project_identity_snapshots": true,
+		"cursor_usage_events":                       true,
+	}
+	state.existingIndexes = map[string]bool{
+		"idx_cursor_usage_events_dedup": true,
+	}
+	syncer := &Sync{pg: pg, schema: "agentsview"}
+
+	require.NoError(t, syncer.EnsureSchema(context.Background()))
+
+	assert.Greater(t, state.execCount(), 0,
+		"missing mapping table must fall back to migration DDL")
+	assert.Contains(t, strings.ToLower(state.executedSQL()),
+		"create table",
+		"fallback must create the missing mapping table")
 }
 
 func TestSyncEnsureSchemaRunsDDLWhenDedupIndexMissing(t *testing.T) {

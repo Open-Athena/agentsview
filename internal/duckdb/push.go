@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -329,6 +330,7 @@ func (s *Sync) syncCursorUsageEvents(ctx context.Context) error {
 // IdentityRevision.
 func (s *Sync) syncProjectIdentityObservations(
 	ctx context.Context, priorRevision int64, force bool,
+	refreshSessionIDs []string,
 ) (int64, error) {
 	revision, err := s.local.ProjectIdentityPublicationRevision(ctx)
 	if err != nil {
@@ -349,14 +351,16 @@ func (s *Sync) syncProjectIdentityObservations(
 		if err != nil {
 			return 0, err
 		}
-		if present {
+		if present && len(refreshSessionIDs) == 0 {
 			return revision, nil
 		}
-		fullPublication = true
+		if !present {
+			fullPublication = true
+		}
 	}
 
 	observations, snapshots, delta, err := s.loadIdentityPublicationScope(
-		ctx, fullPublication, priorRevision, revision,
+		ctx, fullPublication, priorRevision, revision, refreshSessionIDs,
 	)
 	if err != nil {
 		return 0, err
@@ -367,7 +371,7 @@ func (s *Sync) syncProjectIdentityObservations(
 	}
 	if err := s.writeIdentityPublication(
 		ctx, archiveID, archiveSalt, databaseGeneration,
-		fullPublication, delta, observations, snapshots,
+		fullPublication, delta, observations, snapshots, refreshSessionIDs,
 	); err != nil {
 		return 0, err
 	}
@@ -391,6 +395,7 @@ func (s *Sync) identityArchivePresent(
 // for (priorRevision, revision], depending on fullPublication.
 func (s *Sync) loadIdentityPublicationScope(
 	ctx context.Context, fullPublication bool, priorRevision, revision int64,
+	refreshSessionIDs []string,
 ) (
 	observations, snapshots []export.ProjectIdentityObservation,
 	delta db.ProjectIdentityPublicationDelta, err error,
@@ -399,18 +404,44 @@ func (s *Sync) loadIdentityPublicationScope(
 		delta, err = s.local.LoadProjectIdentityPublicationDelta(
 			ctx, priorRevision, revision, s.projects, s.excludeProjects,
 		)
-		return delta.Observations, delta.Snapshots, delta, err
+		if err != nil {
+			return nil, nil, delta, err
+		}
+		observations = delta.Observations
+		snapshots = delta.Snapshots
+	} else {
+		observations, err = s.local.ListProjectIdentityObservations(ctx, nil)
+		if err != nil {
+			return nil, nil, delta, fmt.Errorf(
+				"loading project identity observations: %w", err,
+			)
+		}
+		observations = filterIdentityScope(
+			observations, s.projects, s.excludeProjects,
+		)
+		snapshots, err =
+			s.local.ListPublishableSessionProjectIdentitySnapshots(
+				ctx, nil, s.projects, s.excludeProjects,
+			)
+		if err != nil {
+			return nil, nil, delta, fmt.Errorf(
+				"loading session project identity snapshots: %w", err,
+			)
+		}
 	}
-	observations, err = s.local.ListProjectIdentityObservations(ctx, nil)
-	if err != nil {
-		return nil, nil, delta, fmt.Errorf("loading project identity observations: %w", err)
+	if len(refreshSessionIDs) > 0 {
+		refreshSnapshots, loadErr :=
+			s.local.ListPublishableSessionProjectIdentitySnapshots(
+				ctx, refreshSessionIDs, s.projects, s.excludeProjects,
+			)
+		if loadErr != nil {
+			return nil, nil, delta, fmt.Errorf(
+				"loading refreshed session project identity snapshots: %w",
+				loadErr,
+			)
+		}
+		snapshots = mergeProjectIdentitySnapshots(snapshots, refreshSnapshots)
 	}
-	observations = filterIdentityScope(observations, s.projects, s.excludeProjects)
-	snapshots, err = s.local.ListSessionProjectIdentitySnapshots(ctx)
-	if err != nil {
-		return nil, nil, delta, fmt.Errorf("loading session project identity snapshots: %w", err)
-	}
-	snapshots = filterIdentityScope(snapshots, s.projects, s.excludeProjects)
 	return observations, snapshots, delta, nil
 }
 
@@ -445,6 +476,7 @@ func (s *Sync) writeIdentityPublication(
 	fullPublication bool,
 	delta db.ProjectIdentityPublicationDelta,
 	observations, snapshots []export.ProjectIdentityObservation,
+	refreshSessionIDs []string,
 ) error {
 	tx, err := s.duck.BeginTx(ctx, nil)
 	if err != nil {
@@ -468,14 +500,22 @@ func (s *Sync) writeIdentityPublication(
 		return s.execMutation(ctx, tx, stmt, args...)
 	}
 	if fullPublication {
-		if err := deleteProjectIdentityScope(
-			execDelta, archiveID, s.projects, s.excludeProjects,
+		// Rebuild the archive from the mirror's own rows so a filtered
+		// publication removes stale out-of-scope identity without carrying
+		// excluded-project tombstones.
+		if err := deleteProjectIdentityArchive(
+			execDelta, archiveID,
 		); err != nil {
 			return err
 		}
 	} else if err := deleteProjectIdentityDelta(
 		execDelta, archiveID, databaseGeneration,
 		delta.ObservationDeletes, delta.SnapshotDeletes,
+	); err != nil {
+		return err
+	}
+	if err := deleteSessionProjectIdentitySnapshotsBySessionID(
+		execDelta, archiveID, refreshSessionIDs,
 	); err != nil {
 		return err
 	}
@@ -513,6 +553,26 @@ func (s *Sync) writeIdentityPublication(
 		return fmt.Errorf("committing duckdb project identity sync: %w", err)
 	}
 	return nil
+}
+
+func mergeProjectIdentitySnapshots(
+	base, refresh []export.ProjectIdentityObservation,
+) []export.ProjectIdentityObservation {
+	merged := make(map[string]export.ProjectIdentityObservation, len(base)+len(refresh))
+	for _, snapshot := range base {
+		merged[snapshot.SessionID] = snapshot
+	}
+	for _, snapshot := range refresh {
+		merged[snapshot.SessionID] = snapshot
+	}
+	out := make([]export.ProjectIdentityObservation, 0, len(merged))
+	for _, snapshot := range merged {
+		out = append(out, snapshot)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].SessionID < out[j].SessionID
+	})
+	return out
 }
 
 func duckFallbackPricingRows() []db.ModelPricing {
@@ -938,7 +998,7 @@ func (s *Sync) upsertSession(
 	query := `
 		INSERT INTO sessions (
 			id, project, machine, agent,
-			agent_label, entrypoint,
+			agent_label, entrypoint, session_kind,
 			first_message, display_name, session_name, started_at, ended_at,
 			message_count, user_message_count,
 			file_path, file_size, file_mtime, file_inode, file_device,
@@ -959,12 +1019,12 @@ func (s *Sync) upsertSession(
 			cwd, git_branch, source_session_id, source_version, transcript_fidelity,
 			parser_malformed_lines, is_truncated, deleted_at, deletion_cause, created_at,
 			termination_status, secret_leak_count, secrets_rules_version,
-			agentsview_push_fingerprint
+			agentsview_push_fingerprint, source_archive_id
 		) VALUES (
-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 		)`
 	query += `
 		ON CONFLICT(id) DO UPDATE SET
@@ -973,6 +1033,7 @@ func (s *Sync) upsertSession(
 			agent = excluded.agent,
 			agent_label = excluded.agent_label,
 			entrypoint = excluded.entrypoint,
+			session_kind = excluded.session_kind,
 			first_message = excluded.first_message,
 			display_name = excluded.display_name,
 			session_name = excluded.session_name,
@@ -1033,10 +1094,11 @@ func (s *Sync) upsertSession(
 			termination_status = excluded.termination_status,
 			secret_leak_count = excluded.secret_leak_count,
 			secrets_rules_version = excluded.secrets_rules_version,
-			agentsview_push_fingerprint = excluded.agentsview_push_fingerprint`
+			agentsview_push_fingerprint = excluded.agentsview_push_fingerprint,
+			source_archive_id = excluded.source_archive_id`
 
 	args := sessionInsertArgs(
-		sess, mirroredSessionMachine(sess, s.machine), fingerprint,
+		sess, s.machine, s.archiveID, fingerprint,
 	)
 	if err := s.execMutation(ctx, exec, query, args...); err != nil {
 		return fmt.Errorf("writing duckdb session %s: %w", sess.ID, err)
@@ -1044,10 +1106,16 @@ func (s *Sync) upsertSession(
 	return nil
 }
 
-func sessionInsertArgs(sess db.Session, machine, fingerprint string) []any {
+func sessionInsertArgs(
+	sess db.Session,
+	fallbackMachine string,
+	archiveID string,
+	fingerprint string,
+) []any {
 	return []any{
-		sess.ID, sess.Project, machine, sess.Agent,
-		sess.AgentLabel, sess.Entrypoint,
+		sess.ID, sess.Project,
+		mirroredSessionMachine(sess, fallbackMachine), sess.Agent,
+		sess.AgentLabel, sess.Entrypoint, sess.SessionKind,
 		nilString(sess.FirstMessage), nilString(sess.DisplayName),
 		nilString(sess.SessionName),
 		nilTime(sess.StartedAt), nilTime(sess.EndedAt),
@@ -1078,15 +1146,18 @@ func sessionInsertArgs(sess db.Session, machine, fingerprint string) []any {
 		sess.IsTruncated, nilTime(sess.DeletedAt), nilString(sess.DeletionCause),
 		timeValue(sess.CreatedAt), nilString(sess.TerminationStatus),
 		sess.SecretLeakCount, sess.SecretsRulesVersion,
-		nilEmpty(fingerprint),
+		nilEmpty(fingerprint), archiveID,
 	}
 }
 
-func mirroredSessionMachine(sess db.Session, pushMachine string) string {
-	if sess.Machine == "" || sess.Machine == "local" {
-		return pushMachine
+// mirroredSessionMachine preserves the source archive's machine identity.
+// "local" and empty are local-only sentinels, so only those use the machine
+// configured for this mirror push.
+func mirroredSessionMachine(sess db.Session, fallbackMachine string) string {
+	if sess.Machine != "" && sess.Machine != "local" {
+		return sess.Machine
 	}
-	return sess.Machine
+	return fallbackMachine
 }
 
 func insertMessages(
@@ -1099,9 +1170,9 @@ func insertMessages(
 				timestamp, has_thinking, has_tool_use, content_length,
 				is_system, model, token_usage, context_tokens, output_tokens,
 				has_context_tokens, has_output_tokens, claude_message_id,
-				claude_request_id, source_type, source_subtype, source_uuid,
+				claude_request_id, source_type, source_subtype, prompt_source, source_uuid,
 				source_parent_uuid, is_sidechain, is_compact_boundary
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			m.ID, m.SessionID, m.Ordinal, m.Role, m.Content,
 			m.ThinkingText, timeValue(m.Timestamp),
 			m.HasThinking, m.HasToolUse, m.ContentLength,
@@ -1109,7 +1180,7 @@ func insertMessages(
 			m.ContextTokens, m.OutputTokens,
 			m.HasContextTokens, m.HasOutputTokens,
 			m.ClaudeMessageID, m.ClaudeRequestID,
-			m.SourceType, m.SourceSubtype, m.SourceUUID,
+			m.SourceType, m.SourceSubtype, m.PromptSource, m.SourceUUID,
 			m.SourceParentUUID, m.IsSidechain, m.IsCompactBoundary,
 		); err != nil {
 			return fmt.Errorf("inserting duckdb message %s/%d: %w", m.SessionID, m.Ordinal, err)

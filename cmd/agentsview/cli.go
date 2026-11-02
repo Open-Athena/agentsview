@@ -297,6 +297,10 @@ func newOpenAPICommand() *cobra.Command {
 }
 
 func newSyncCommand() *cobra.Command {
+	return newSyncCommandWithRunner(runSync)
+}
+
+func newSyncCommandWithRunner(run func(SyncConfig)) *cobra.Command {
 	var cfg SyncConfig
 	cmd := &cobra.Command{
 		Use:   "sync",
@@ -316,6 +320,9 @@ func newSyncCommand() *cobra.Command {
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
 		PreRunE: func(cmd *cobra.Command, _ []string) error {
+			if err := validateArtifactSyncConfig(cfg); err != nil {
+				return err
+			}
 			if cfg.Host == "" {
 				if cmd.Flags().Changed("user") ||
 					cmd.Flags().Changed("port") {
@@ -327,7 +334,7 @@ func newSyncCommand() *cobra.Command {
 			return nil
 		},
 		Run: func(cmd *cobra.Command, args []string) {
-			runSync(cfg)
+			run(cfg)
 		},
 	}
 	cmd.Flags().BoolVar(
@@ -337,6 +344,12 @@ func newSyncCommand() *cobra.Command {
 	cmd.Flags().StringVar(
 		&cfg.Host, "host", "",
 		"SSH hostname for deprecated remote sync",
+	)
+	cmd.Flags().StringVar(
+		&cfg.Target,
+		"target",
+		"",
+		"Exchange normalized session artifacts with a trusted folder",
 	)
 	cmd.Flags().StringVar(
 		&cfg.User, "user", "",
@@ -626,9 +639,11 @@ func newUsageStatuslineCommand() *cobra.Command {
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
+			cfg.JSON = outputFormat(cmd) == "json"
 			runUsageStatusline(cfg)
 		},
 	}
+	registerFormatFlags(cmd.Flags())
 	cmd.Flags().StringVar(&cfg.Agent, "agent", "", "Filter by agent name")
 	cmd.Flags().BoolVar(&cfg.Offline, "offline", false, "Use fallback pricing only")
 	cmd.Flags().BoolVar(&cfg.NoSync, "no-sync", false, "Skip on-demand sync before querying")

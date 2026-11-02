@@ -32,6 +32,7 @@ const (
 	AgentTrae           AgentType = "trae"
 	AgentVSCopilot      AgentType = "visualstudio-copilot"
 	AgentPi             AgentType = "pi"
+	AgentPrimeAgent     AgentType = "prime-agent"
 	AgentOMP            AgentType = "omp"
 	AgentQwen           AgentType = "qwen"
 	AgentCommandCode    AgentType = "commandcode"
@@ -47,6 +48,7 @@ const (
 	AgentCortex         AgentType = "cortex"
 	AgentHermes         AgentType = "hermes"
 	AgentGrok           AgentType = "grok"
+	AgentGoose          AgentType = "goose"
 	AgentWorkBuddy      AgentType = "workbuddy"
 	AgentForge          AgentType = "forge"
 	AgentDevin          AgentType = "devin"
@@ -421,6 +423,15 @@ var Registry = []AgentDef{
 		FileBased:   true,
 	},
 	{
+		Type:        AgentPrimeAgent,
+		DisplayName: "Prime Agent",
+		EnvVar:      "PRIME_AGENT_SESSION_DIR",
+		ConfigKey:   "prime_agent_dirs",
+		DefaultDirs: []string{".prime/agent/sessions"},
+		IDPrefix:    "prime-agent:",
+		FileBased:   true,
+	},
+	{
 		Type:        AgentOMP,
 		DisplayName: "OhMyPi",
 		EnvVar:      "OMP_DIR",
@@ -581,6 +592,19 @@ var Registry = []AgentDef{
 		DefaultDirs: []string{".grok/sessions"},
 		IDPrefix:    "grok:",
 		FileBased:   true,
+	},
+	{
+		Type:              AgentGoose,
+		DisplayName:       "Goose",
+		EnvVar:            "GOOSE_PATH_ROOT",
+		ConfigKey:         "goose_dirs",
+		DefaultDirs:       gooseDefaultDirs(),
+		IDPrefix:          "goose:",
+		FileBased:         false,
+		PeriodicReconcile: true,
+		Usage: UsageCapabilities{
+			NoPerMessageTokenData: true,
+		},
 	},
 	{
 		Type:        AgentWorkBuddy,
@@ -1045,12 +1069,16 @@ type FileInfo struct {
 
 // ParsedSession holds session metadata extracted from a JSONL file.
 type ParsedSession struct {
-	ID               string
-	Project          string
-	Machine          string
-	Agent            AgentType
-	AgentLabel       string
-	Entrypoint       string
+	ID         string
+	Project    string
+	Machine    string
+	Agent      AgentType
+	AgentLabel string
+	Entrypoint string
+	// SessionKind is the top-level Claude Code session-kind marker
+	// (e.g. "bg" for background/headless sessions); empty for
+	// interactive sessions and for agents that do not emit it.
+	SessionKind      string
 	ParentSessionID  string
 	RelationshipType RelationshipType
 	Cwd              string
@@ -1174,8 +1202,13 @@ type ParsedMessage struct {
 	ClaudeMessageID string
 	ClaudeRequestID string
 
-	SourceType        string
-	SourceSubtype     string
+	SourceType    string
+	SourceSubtype string
+	// PromptSource is the Claude Code per-entry prompt-origin marker
+	// on user turns (e.g. "typed", "queued", "system", "sdk"); empty
+	// on older transcripts that predate the field and for agents that
+	// do not emit it.
+	PromptSource      string
 	SourceUUID        string
 	SourceParentUUID  string
 	IsSidechain       bool

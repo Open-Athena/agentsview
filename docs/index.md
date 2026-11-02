@@ -64,6 +64,7 @@ across every project, model, and tool.
   <a class="agent-chip" data-agent="kilo-legacy" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">KL</span><span class="agent-chip__name">Kilo (legacy)</span></a>
   <a class="agent-chip" data-agent="kimi" href="https://www.kimi.com" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">Km</span><span class="agent-chip__name">Kimi</span></a>
   <a class="agent-chip" data-agent="kimi-work" href="https://www.kimi.com" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">Kw</span><span class="agent-chip__name">Kimi Work</span></a>
+  <a class="agent-chip" data-agent="omnigent" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Og</span><span class="agent-chip__name">Omnigent</span></a>
   <a class="agent-chip" data-agent="kiro" href="https://kiro.dev" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">Kr</span><span class="agent-chip__name">Kiro</span></a>
   <a class="agent-chip" data-agent="openhands" href="https://github.com/All-Hands-AI/OpenHands" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">OH</span><span class="agent-chip__name">OpenHands</span></a>
   <a class="agent-chip" data-agent="zcode" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Zc</span><span class="agent-chip__name">ZCode</span></a>
@@ -71,6 +72,7 @@ across every project, model, and tool.
   <a class="agent-chip" data-agent="commandcode" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Cc</span><span class="agent-chip__name">Command Code</span></a>
   <a class="agent-chip" data-agent="cortex-code" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Cx</span><span class="agent-chip__name">Cortex Code</span></a>
   <a class="agent-chip" data-agent="forge" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Fo</span><span class="agent-chip__name">Forge</span></a>
+  <a class="agent-chip" data-agent="goose" href="https://goose-docs.ai/" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">Go</span><span class="agent-chip__name">Goose</span></a>
   <a class="agent-chip" data-agent="grok" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Gr</span><span class="agent-chip__name">Grok</span></a>
   <a class="agent-chip" data-agent="hermes" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">He</span><span class="agent-chip__name">Hermes</span></a>
   <a class="agent-chip" data-agent="iflow" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">iF</span><span class="agent-chip__name">iFlow</span></a>
@@ -78,6 +80,7 @@ across every project, model, and tool.
   <a class="agent-chip" data-agent="omp" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Om</span><span class="agent-chip__name">OhMyPi</span></a>
   <a class="agent-chip" data-agent="openclaw" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Oc</span><span class="agent-chip__name">OpenClaw</span></a>
   <a class="agent-chip" data-agent="pi" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">&#960;</span><span class="agent-chip__name">Pi</span></a>
+  <a class="agent-chip" data-agent="prime-agent" href="https://github.com/PrimeIntellect-ai/prime-agent" target="_blank" rel="noopener"><span class="agent-chip__glyph agent-chip__glyph--mono">Pr</span><span class="agent-chip__name">Prime Agent</span></a>
   <a class="agent-chip" data-agent="piebald" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Pb</span><span class="agent-chip__name">Piebald</span></a>
   <a class="agent-chip" data-agent="poolside" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Po</span><span class="agent-chip__name">Poolside</span></a>
   <a class="agent-chip" data-agent="qclaw" href="/configuration/#session-discovery"><span class="agent-chip__glyph agent-chip__glyph--mono">Qc</span><span class="agent-chip__name">QClaw</span></a>
@@ -185,8 +188,9 @@ See [Activity](/activity/) for the full reference.
 AgentsView reads the session files that your
 [AI coding agents](/configuration/#session-discovery) leave on your machine and
 gives you a local-first desktop and web app to work with them. By default
-everything stays on your machine. Optionally, [PostgreSQL sync](/pg-sync/) can
-push session data to a shared database for team or multi-machine setups.
+everything stays on your machine. For multi-machine use, a primary viewer can
+read [out-of-band filesystem copies](/filesystem-sync/), or
+[PostgreSQL sync](/pg-sync/) can push session data to a shared database.
 
 <div class="grid cards" markdown>
 
@@ -204,6 +208,12 @@ push session data to a shared database for team or multi-machine setups.
     responses, thinking blocks, and tool calls. Filter by
     project, agent, date, or message count.
 
+-   **Manage Project Data**
+
+    Inspect the archive-wide [project inventory](/data/), open
+    observed folders, preview reclassification impact, and manage
+    per-machine worktree mapping rules from one workspace.
+
 -   **Search Everything**
 
     Full-text search across all message content. Find that
@@ -212,6 +222,12 @@ push session data to a shared database for team or multi-machine setups.
     Opt-in [semantic search](/semantic-search/) matches by
     meaning when you don't remember the exact words, and every
     match cites the conversation unit it came from.
+
+-   **Browse Recall**
+
+    Explore the experimental [Recall corpus](/recall/) with extraction
+    coverage, filters, expandable entries, and evidence links back to
+    source transcripts.
 
 -   **Recent Edits**
 
@@ -254,11 +270,11 @@ push session data to a shared database for team or multi-machine setups.
 
     Works with [dozens of AI coding session sources](/configuration/#session-discovery)
     including Claude Code, OpenClaude, Codex, Copilot, Cursor,
-    Gemini, OpenHands, Aider, Claude Cowork, DeepSeek TUI, gptme,
-    Grok, Kilo, Kilo (legacy), MiMoCode, Mistral Vibe, OhMyPi,
-    Poolside, QwenPaw, Reasonix, RooCode, Shelley, Trae, Visual
-    Studio Copilot, and ZCode. Auto-discovers session directories
-    so there's nothing to configure.
+    Gemini, OpenHands, Aider, Claude Cowork, DeepSeek TUI, Goose,
+    gptme, Grok, Kilo, Kilo (legacy), Kimi Work, MiMoCode, Mistral Vibe,
+    OhMyPi, Omnigent, Poolside, Prime Agent, QwenPaw, Reasonix, RooCode, Shelley,
+    Trae, Visual Studio Copilot, and ZCode. Auto-discovers session
+    directories so there's nothing to configure.
 
 -   **Import Chat History**
 

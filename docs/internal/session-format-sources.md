@@ -92,9 +92,79 @@ Grok section and remove the explicit registry exception in the coverage test.
 - **Usage and cost:** Assistant messages persist input, output, cache-creation,
   and cache-read tokens. Model IDs are present. No authoritative persisted USD
   cost field is consumed; Agentsview prices the tokens from its catalog.
+- **Server tool use (web search):** Anthropic bills server-side web search at
+  $10 per 1,000 requests on top of tokens and reports the count in
+  `message.usage.server_tool_use.web_search_requests`, which Claude Code
+  persists verbatim inside the stored usage object. Verified 2026-07-30
+  against two local web-search sessions: when the search is driven by the
+  **CLI's** `WebSearch` tool, every assistant record carries
+  `server_tool_use: {"web_search_requests": 0, "web_fetch_requests": 0}` —
+  the search itself runs in an out-of-band side call that is **not written to
+  the transcript at all**. The only surviving evidence is the tool-result
+  record's `toolUseResult` object
+  (`{query, results, durationSeconds, searchCount}`), whose `searchCount`
+  matched the wire-billed `web_search_requests` (1 == 1) in both sessions.
+  Agentsview therefore credits the assistant message that issued the
+  `WebSearch` `tool_use` with its linked result's `searchCount`, and uses the
+  message's own counter instead whenever that counter is nonzero (which is
+  what sessions driving the API directly report), so a search is never
+  counted twice. **Known undercount:** the side call's own token usage — tens
+  of thousands of input tokens on `claude-haiku-4-5` per search — is not
+  persisted anywhere in the transcript and is not recoverable, so it is
+  neither recorded nor estimated. `web_fetch_requests` is recorded when
+  present but is not priced. Data version 82 reparses existing Claude archives
+  so persisted side-call counts receive the flat fee.
+- **Subagent attribution:** Task-tool subagents are written to their own
+  transcripts under `<project>/<parent-session-id>/subagents/`, named
+  `agent-<id>.jsonl` (nested one more level under `workflows/<workflow-id>/`
+  for workflow tools) with an `agent-<id>.meta.json` sidecar. Every record in
+  those files carries `isSidechain: true` and the **parent's** `sessionId`,
+  and assistant records carry the same full per-message `usage` object as a
+  root transcript, so subagent spend is real billed spend that the parent's
+  own file does not record. Agentsview ingests each file as its own session
+  (id = filename stem) linked to the parent with
+  `relationship_type = 'subagent'`, and attributes it to the parent at
+  presentation time only — `session usage` and `?subagents=true` combine them,
+  while daily and activity aggregates keep counting the child sessions
+  directly. Fork branches created inside a subagent subtree remain delegated
+  usage and are included in that presentation-time total; root-level forks are
+  still traversed only to discover nested subagents. Verified 2026-07-30
+  against wire-captured billing for three local Claude Code sessions: parents
+  with subagents under-reported cost by 45-77% before the presentation-time
+  rollup. Reverified 2026-07-30 with Claude Code 2.1.220: a streaming tool turn
+  can persist several assistant records with one `(message.id, requestId)` pair
+  while `usage.output_tokens` grows from an early partial count to the final
+  billed count (observed examples included `5` then `631` and `6` then `798`).
+  Usage reporting therefore keeps the greatest output-token snapshot for each
+  message/request identity across the included sessions, attributes it to the
+  earliest transcript, and then applies cross-session replay deduplication.
+  Session-owned dimensions and display metadata also come from that earliest
+  transcript. Numeric-string token values remain accepted as compatibility
+  input and are normalized before snapshot comparison on every backend. The
+  SQLite and PostgreSQL read the exact top-level token path and nested
+  server-tool path even in supported malformed legacy JSON. Reverified
+  2026-08-06 with end-truncated objects containing earlier nested decoy keys;
+  PostgreSQL and its Cockroach-compatible helper repair the truncated object
+  before extracting the requested path, while irreparable input contributes no
+  counter rather than an ambiguously scoped value.
+  Equal snapshots are selected deterministically by timestamp, session id, and
+  message ordinal; equivalent RFC3339 spellings use the semantic tie-breakers
+  rather than raw timestamp text. Reverified 2026-08-04 against the
+  cross-backend stored-usage fixtures.
+  Replaying the three captured sessions after this correction matched all
+  transcript-visible output; each full-wire total remained 15 output tokens
+  higher because Claude Code's separate session-title request is not persisted.
+  Reverified 2026-08-06 that session-summary export loads matching snapshots
+  across excluded sessions and pagination before applying the same snapshot,
+  attribution, web-search, and generic deduplication rules. These accounting
+  semantics are exposed by usage, activity, and session-summary schema version
+  5 and reporting schema version 2; reporting version 1 retains its frozen
+  first-seen, token-only semantics. Reverified 2026-08-06 that DuckDB records a
+  web-search-only flat fee as computed pricing provenance, so combining it with
+  a provider-reported cost is labeled `mixed` like the SQLite archive.
 - **Agentsview:** `internal/parser/claude.go` and
-  `internal/parser/claude_provider.go`; local observations and fixtures are the
-  implementation evidence for fields not documented upstream. Reverified
+  `internal/parser/claude_provider.go`; local observations and fixtures are
+  the implementation evidence for fields not documented upstream. Reverified
   2026-07-22 against local CLI transcripts: `type=attachment` records with
   `attachment.type=queued_command` are written mid-stream, in file order
   between consecutive `assistant` records that share one `message.id`, so a
@@ -103,6 +173,13 @@ Grok section and remove the explicit registry exception in the coverage test.
   in [#1238](https://github.com/kenn-io/agentsview/issues/1238): Claude Code
   for VS Code writes standalone `user` records wrapped in `ide_opened_file` or
   `ide_selection` tags for editor context rather than operator prompts.
+  Reverified 2026-07-24 against local CLI transcripts: current transcripts
+  carry two top-level launch/prompt-provenance keys that the parser now
+  captures — `sessionKind` (session-level, e.g. `"bg"`; present on
+  background/headless sessions and absent on interactive ones) and
+  `promptSource` (per user turn, e.g. `"typed"`, `"queued"`, `"system"`,
+  `"sdk"`). Neither key is documented upstream or covered by the codeburn
+  notes; the evidence remains local observation under `no-public-source`.
 
 ## OpenClaude (`openclaude`)
 
@@ -115,13 +192,14 @@ Grok section and remove the explicit registry exception in the coverage test.
   `1ddb7d68399a2cd5028d4c5f487676f941879eae`; see the pinned
   [session JSONL writer](https://github.com/Gitlawb/openclaude/blob/1ddb7d68399a2cd5028d4c5f487676f941879eae/src/utils/sessionStorage.ts),
 
-  [project-directory resolver](https://github.com/Gitlawb/openclaude/blob/1ddb7d68399a2cd5028d4c5f487676f941879eae/src/utils/envUtils.ts),
-  and
-  [assistant message type](https://github.com/Gitlawb/openclaude/blob/1ddb7d68399a2cd5028d4c5f487676f941879eae/src/types/message.ts).
+    [project-directory resolver](https://github.com/Gitlawb/openclaude/blob/1ddb7d68399a2cd5028d4c5f487676f941879eae/src/utils/envUtils.ts),
+    and
+    [assistant message type](https://github.com/Gitlawb/openclaude/blob/1ddb7d68399a2cd5028d4c5f487676f941879eae/src/types/message.ts).
 
 - **Usage and cost:** Claude-style input, output, cache-creation, and cache-read
-  tokens are persisted in each assistant message's API usage object. Agentsview
-  derives money from its pricing catalog; no provider-reported cost is consumed.
+  tokens are persisted in each assistant message's API usage object.
+  Agentsview derives money from its pricing catalog; no provider-reported cost
+  is consumed.
 
 - **Agentsview:** `internal/parser/openclaude.go` plus the shared Claude parsing
   code in `internal/parser/claude.go`; the producer writes the same
@@ -129,9 +207,9 @@ Grok section and remove the explicit registry exception in the coverage test.
 
 - **Project-directory layout reverified 2026-07-23:** the pinned session writer
   creates project directories itself with `mkdir(recursive: true)` under
-  `<config home>/projects/<sanitized cwd>` and never creates symlinks. Symlinked
-  project directories are therefore a user-side arrangement, and streaming
-  discovery follows them only to match the legacy `Discover` walk
+  `<config home>/projects/<sanitized cwd>` and never creates symlinks.
+  Symlinked project directories are therefore a user-side arrangement, and
+  streaming discovery follows them only to match the legacy `Discover` walk
   (`isDirOrSymlink`), not because the producer emits them.
 
 ## Cowork (`cowork`)
@@ -141,9 +219,9 @@ Grok section and remove the explicit registry exception in the coverage test.
 - **Evidence:** `no-public-source`.
 - **Upstream:** Anthropic's moving
   [Cowork documentation](https://support.anthropic.com/en/collections/14464166-cowork)
-  and the public Claude Code repository were checked 2026-07-19. They explain
-  the product but do not publish a Cowork disk schema, so the local layout and
-  transcript fields remain implementation evidence.
+  and the public Claude Code repository were checked 2026-07-19. They
+  explain the product but do not publish a Cowork disk schema, so the local
+  layout and transcript fields remain implementation evidence.
 - **Usage and cost:** Nested assistant records carry Claude-style input, output,
   cache-creation, and cache-read tokens with model IDs. Agentsview
   catalog-prices them; no persisted USD total is consumed.
@@ -176,10 +254,11 @@ Grok section and remove the explicit registry exception in the coverage test.
   defines `save-all` (the default) and `none`.
 - **Usage and cost:** `token_count` records include total and last usage with
   input, cached input, cache-write input, output, reasoning output, and total
-  tokens. Agentsview currently consumes input, cached input, and output only: it
-  subtracts cached input from upstream's inclusive input total, maps cached
+  tokens. Agentsview currently consumes input, cached input, and output only:
+  it subtracts cached input from upstream's inclusive input total, maps cached
   input to cache-read, and ignores cache-write and reasoning-output fields.
-  Catalog pricing therefore covers only the normalized fields the parser emits.
+  Catalog pricing therefore covers only the normalized fields the parser
+  emits.
 - **Agentsview:** `internal/parser/codex.go` and
   `internal/parser/codex_provider.go`; usage is taken from the last-turn
   counters rather than repeatedly counting cumulative totals. Reverified
@@ -210,9 +289,10 @@ Grok section and remove the explicit registry exception in the coverage test.
   `~/.copilot/session-state/` and the derived `~/.copilot/session-store.db`,
   including reindex behavior, but not the event or database schema. The
   [configuration-directory reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference)
-  further identifies `events.jsonl` and workspace artifacts. No producer-side
-  serializer is public. For independent legacy CLI and sibling Copilot-store
-  observations, clone `https://github.com/getagentseal/codeburn.git` at
+  further identifies `events.jsonl` and workspace artifacts. No
+  producer-side serializer is public. For independent legacy CLI and sibling
+  Copilot-store observations, clone
+  `https://github.com/getagentseal/codeburn.git` at
   `3472885629c41725b40c19c0780ecce148b067bf` and inspect its
   [Copilot format notes](https://github.com/getagentseal/codeburn/blob/3472885629c41725b40c19c0780ecce148b067bf/docs/providers/copilot.md)
   and
@@ -291,7 +371,8 @@ Grok section and remove the explicit registry exception in the coverage test.
   attaches an errored result event to `tool:"invalid"` parts so tool health
   counts them as failures (verified 2026-07-24; see #1254).
 - **Bash exit codes:** The `bash` tool declares a structured output of
-  `{exit, truncated, timeout}` and returns the child process exit code as `exit`
+  `{exit, truncated, timeout}` and returns the child process exit code as
+  `exit`
   ([bash.ts](https://github.com/anomalyco/opencode/blob/67caf894e0843ee370e72839e8265e483233479b/packages/core/src/tool/bash.ts)
   at the pinned commit). That structured output is persisted as the tool
   part's `state.metadata`, so `state.metadata.exit` is the authoritative
@@ -307,6 +388,80 @@ Grok section and remove the explicit registry exception in the coverage test.
   counts as a failure, matching the existing `exit status N` heuristic, and a
   timed-out command records `timeout: true` with no `exit` key, so it is not
   detected here. See #1256.
+- **Change detection (SQLite layout):** every session in a root shares one
+  physical `opencode.db`, so the container's own size and mtime move whenever
+  any single session is written and cannot discriminate between sessions.
+  Agentsview instead builds a per-session composite from
+  `session.time_updated`, `project.time_updated`, `MAX(message.time_updated)`,
+  and `MAX(part.time_updated)` (`openCodeCompositeMtimeExpr`), and omits the
+  container size from the per-session fingerprint. Verified 2026-07-27 against
+  an isolated clone of a production container (13.5 GB, 5,981 sessions, 104k
+  messages, 508k parts): 432,779 of 508,400 parts (86%) carry
+  `time_updated != time_created`, so in-place child edits do move the signal;
+  437 sessions have `MAX(part.time_updated) > session.time_updated`, so the
+  session row alone is insufficient; and no project's `time_updated` falls
+  within 5s of its newest session, so folding `project` in tracks genuine
+  worktree/metadata changes rather than ordinary session activity. The child
+  scans cost ~0.6s warm on that container because `part.data` lives in SQLite
+  overflow pages, so scanning `(session_id, time_updated)` does not read
+  transcript bytes. A MAX over timestamps cannot see a deletion: on that
+  container 5,758 of 5,981 sessions (96%) carry a session or project timestamp
+  at or above every child, so removing a message or part leaves the max
+  untouched. The fingerprint hash therefore carries a per-session digest of
+  the watermark plus the child row counts, and freshness compares it
+  (`FingerprintHashRequiredForFreshness`). An earlier revision of this entry
+  claimed a revert stays detectable because it lowers the max; that is wrong for
+  the 96% above, and the row counts are what actually cover deletions. Known
+  gap: a write that leaves the watermark, the message count and the part count
+  all unchanged is not attributed to any session, which requires an in-place
+  edit that does not stamp `time_updated`. Containers whose schema lacks the
+  child `time_updated` columns (older OpenCode, Kilo, MiMoCode, ICodeMate)
+  fall back to the session-only mtime plus the container size and emit an
+  empty digest, preserving prior behavior. Watcher events do not pay the child
+  scan at all: changed-path classification lists sessions through a bounded
+  session-row watermark (`MAX(session.time_updated, project.time_updated)`,
+  `ForEachOpenCodeSessionWatermarkMeta`, ordered by session id), compares it
+  per session and like-for-like against the stored session/project metadata
+  watermark recovered from the persisted child digest
+  (`OpenCodeChildDigestMetadataWatermarkNS`; rows without a parseable digest
+  fall back to the stored composite), merged in ascending virtual-path order
+  against a paged stored-freshness cursor
+  (`ListVirtualContainerMemberFreshnessPage` through
+  `storedMemberFreshnessPager` and `changedWatermarkSources`), and drops
+  covered sessions during the stream — only the changed batch is ever
+  materialized, peak memory per event is one stored page plus that batch, and
+  the surviving sources resolve the full composite and digest through the
+  indexed per-session lookup. The merge trusts stored authority only while a
+  container capture taken before the listing still matches a recapture
+  afterwards; a stale capture re-lists unfiltered and leaves the decision to
+  the per-file gates. The comparison must be like-for-like: the stored
+  composite can be dominated by a newer child timestamp, and comparing the
+  session-row watermark against it would hide a metadata update (title,
+  directory, worktree rename) whose stamp lands below that child maximum. A
+  session or project row that advances past its own stored metadata watermark
+  is always a candidate, wherever other sessions' watermarks or its own child
+  timestamps sit. Periodic full passes and streamed reconciliation passes over
+  a container whose captured state still matches the last fully verified pass
+  also list the watermark form (`SQLiteContainerUnchangedSinceTrust`): every
+  member gate-skips before fingerprinting, so the child identity scan would be
+  archive-sized work nothing reads; any write breaks that trust and the next
+  pass carries the complete digest again. Watermark-only skips additionally
+  require the pass's container capture to still be valid
+  (`sqliteContainerPassCaptureValid`) — a container that changes between
+  listing and the recapture check resolves full per-session digests instead,
+  so a concurrent child-only write cannot hide beneath an unchanged metadata
+  watermark. The trade is explicit: any child-only write that leaves the
+  session and project rows untouched — wherever its timestamps land relative
+  to the stored composite — is invisible to a watcher pass and is reconciled
+  by the next full-discovery pass over the now-untrusted container, whose
+  digest still catches it; on the production container above, 96% of sessions
+  carry a session/project timestamp at or above every child, and actively
+  watched sessions bypass this entirely via the per-session composite poll.
+  Per-event work is bounded by the changed batch plus one O(session-count)
+  scan of small fixed-width rows (the session table and the paged
+  stored-member reads); that floor is irreducible without a watermark index,
+  which OpenCode's schema does not have and which is not agentsview's to add —
+  but only the changed batch and one stored page are ever held in memory.
 - **Agentsview:** `internal/parser/opencode.go`,
   `internal/parser/opencode_provider.go`, and
   `internal/parser/opencode_storage_state.go`; legacy and database layouts are
@@ -350,9 +505,9 @@ Grok section and remove the explicit registry exception in the coverage test.
   RooCode-style ID/token/cost wiring; token and cost totals are derived from
   the transcript itself.
 - **Agentsview:** `internal/parser/kilo_legacy.go` and
-  `internal/parser/kilo_legacy_provider.go`; the parser borrows RooCode's Cline
-  message handling (tool-call pairing, reasoning, compact boundaries, error
-  linking). New sessions stopped after the OpenCode migration.
+  `internal/parser/kilo_legacy_provider.go`; the parser borrows RooCode's
+  Cline message handling (tool-call pairing, reasoning, compact boundaries,
+  error linking). New sessions stopped after the OpenCode migration.
 
 ## Roo Code (`roocode`)
 
@@ -395,8 +550,8 @@ Grok section and remove the explicit registry exception in the coverage test.
 - **Usage and cost:** `base_state.json` persists per-model prompt, completion,
   cache-read, cache-write, reasoning, context-window, per-call and accumulated
   token data, plus per-call and accumulated cost. Agentsview currently reads
-  transcript events only and exposes none of those persisted metrics; that is a
-  parser limitation.
+  transcript events only and exposes none of those persisted metrics; that is
+  a parser limitation.
 - **Agentsview:** `internal/parser/openhands.go` and
   `internal/parser/openhands_provider.go`; `TASKS.json` is legacy supplemental
   state rather than a requirement of the pinned current producer.
@@ -408,12 +563,12 @@ Grok section and remove the explicit registry exception in the coverage test.
 - **Evidence:** `documentation`.
 - **Upstream:** Cursor's first-party
   [history documentation](https://docs.cursor.com/en/agent/chat/history)
-  confirms local chat persistence and the separate SQLite history index. Cursor
-  support on the official forum documents the
+  confirms local chat persistence and the separate SQLite history index.
+  Cursor support on the official forum documents the
   [`~/.cursor/projects/<project>/agent-transcripts` layout](https://forum.cursor.com/t/chat-history-gone-after-pc-restart-agent-transcripts-files-emptied-how-to-recover/158251/5)
-  and identifies `state.vscdb` as metadata. Cursor's public GitHub organization
-  was also searched 2026-07-19; no transcript schema or producer source was
-  found.
+  and identifies `state.vscdb` as metadata. Cursor's public GitHub
+  organization was also searched 2026-07-19; no transcript schema or producer
+  source was found.
 - **Usage and cost:** The consumed text/JSONL transcripts have no reliable
   per-message token, cache, reasoning, credit, or monetary-cost fields.
 - **Agentsview:** `internal/parser/cursor.go`,
@@ -425,8 +580,8 @@ Grok section and remove the explicit registry exception in the coverage test.
 - **Format:** One JSON thread document per session.
 - **Evidence:** `no-public-source`.
 - **Upstream:** The first-party [Amp manual](https://ampcode.com/manual) and
-  public Sourcegraph/Amp repositories were searched 2026-07-19; no session-file
-  producer or authoritative disk schema was found.
+  public Sourcegraph/Amp repositories were searched 2026-07-19; no
+  session-file producer or authoritative disk schema was found.
 - **Usage and cost:** The consumed thread documents do not expose token, cache,
   reasoning, credit, or USD fields to Agentsview.
 - **Agentsview:** `internal/parser/amp.go` and
@@ -457,14 +612,14 @@ Grok section and remove the explicit registry exception in the coverage test.
 - **Upstream:** The first-party
   [Windsurf documentation](https://docs.windsurf.com/) and public Codeium
   repositories were searched 2026-07-19; no producer source or authoritative
-  workspace-state schema was found. For a reproducible independent reader, clone
-  `https://github.com/veverke/chatwizard.git` at
+  workspace-state schema was found. For a reproducible independent reader,
+  clone `https://github.com/veverke/chatwizard.git` at
   `d5d4eebb610da04cdd656be83016973281d82eff`; its pinned
   [workspace discovery](https://github.com/veverke/chatwizard/blob/d5d4eebb610da04cdd656be83016973281d82eff/src/readers/windsurfWorkspace.ts)
   and
   [`cascade.sessionData` parser](https://github.com/veverke/chatwizard/blob/d5d4eebb610da04cdd656be83016973281d82eff/src/parsers/windsurf.ts)
-  document the cross-platform `state.vscdb` locations and a directly observed
-  key/value shape. This is consumer evidence, not Windsurf authority.
+  document the cross-platform `state.vscdb` locations and a directly
+  observed key/value shape. This is consumer evidence, not Windsurf authority.
 - **Usage and cost:** The consumed state exposes no reliable token, cache,
   reasoning, or USD fields. Windsurf credit accounting is not converted to
   monetary cost.
@@ -485,8 +640,8 @@ Grok section and remove the explicit registry exception in the coverage test.
   neither source publishes the `state.vscdb` key or an authoritative session
   schema.
 - **Usage and cost:** The consumed session list provides optional model identity
-  but no token, cache, reasoning, credit, or USD fields. Agentsview leaves usage
-  and cost unavailable rather than estimating them.
+  but no token, cache, reasoning, credit, or USD fields. Agentsview leaves
+  usage and cost unavailable rather than estimating them.
 - **Agentsview:** `internal/parser/trae_provider.go`; the storage key and JSON
   shape are based on observed local databases and controlled fixtures.
 
@@ -504,8 +659,8 @@ Grok section and remove the explicit registry exception in the coverage test.
   on-disk configuration are not public.
 - **Usage and cost:** Spans persist `gen_ai.usage.input_tokens` and
   `gen_ai.usage.output_tokens`, with model attributes when emitted. Cache and
-  reasoning splits are absent in the consumed data. Copilot credits are not USD;
-  Agentsview does not synthesize a currency value from them.
+  reasoning splits are absent in the consumed data. Copilot credits are not
+  USD; Agentsview does not synthesize a currency value from them.
 - **Agentsview:** `internal/parser/visualstudio_copilot.go`,
   `internal/parser/visualstudio_copilot_provider.go`, and
   `docs/internal/visual-studio-copilot-traces.md`.
@@ -522,10 +677,57 @@ Grok section and remove the explicit registry exception in the coverage test.
   [session manager](https://github.com/earendil-works/pi/blob/f1c587dde39025c75d7397bc14532d8fa5c001d9/packages/coding-agent/src/core/session-manager.ts).
 - **Usage and cost:** Assistant messages persist input and output tokens plus
   cache-read and cache-write/creation values in nested or historical flat
-  shapes. Model IDs are present. Agentsview catalog-prices the tokens.
+  shapes. Model IDs are present. Agentsview catalog-prices the tokens. Data
+  version 81 reparses existing Pi-family archives after adding the flat
+  `cacheWrite` spelling.
 - **Agentsview:** `internal/parser/pi.go` and `internal/parser/pi_provider.go`;
   alternate branches remain in the file but only the active ancestry is a
   conversation.
+
+## Prime Agent (`prime-agent`)
+
+- **Format:** Pi-family, tree-structured JSONL with current saved sessions
+  stored directly under a flat session directory.
+
+- **Evidence:** `source`.
+
+- **Upstream:** Clone `https://github.com/PrimeIntellect-ai/prime-agent.git` at
+  `0e0d23391bcd879f1aea70dbda4d07dda7970b34`; see the pinned
+
+    [session format](https://github.com/PrimeIntellect-ai/prime-agent/blob/0e0d23391bcd879f1aea70dbda4d07dda7970b34/packages/coding-agent/docs/session-format.md),
+
+    [session types and persistence](https://github.com/PrimeIntellect-ai/prime-agent/blob/0e0d23391bcd879f1aea70dbda4d07dda7970b34/packages/coding-agent/src/core/session-manager.ts),
+    and
+    [configuration paths](https://github.com/PrimeIntellect-ai/prime-agent/blob/0e0d23391bcd879f1aea70dbda4d07dda7970b34/packages/coding-agent/src/config.ts).
+
+- **Usage and cost:** Assistant messages persist input, output, cache-read, and
+  cache-write tokens with model IDs. `child_usage_attributed` entries replace
+  a target assistant message's usage with the persisted aggregate that
+  includes RLM child work. Agentsview consumes that aggregate and
+  catalog-prices the normalized tokens rather than trusting the producer's
+  persisted cost object. Attribution is applied in file order: records for an
+  unknown target are ignored, and the last aggregate for a known target wins.
+  Prime Agent full parses replace stored messages because a later append can
+  retroactively update an earlier assistant message.
+
+- **Agentsview:** Prime Agent is registered through the Pi-family parser in
+  `internal/parser/pi.go` and `internal/parser/pi_provider.go`, with its own
+  flat-root discovery, `prime-agent:` session identity, and `parentSession`
+  path handling. Reverified 2026-08-06 against a live Prime Agent v0.7.0
+  session: the flat transcript filename UUID can differ from the session
+  header UUID, so canonical ID lookup falls back to scanning session headers.
+  Stored file and fingerprint hints remain advisory during identity-based
+  lookup: Agentsview accepts one only when its header identity matches the
+  requested Prime Agent session. Parent lineage accepts both POSIX and Windows
+  separators and resolves the referenced sibling transcript's header UUID from
+  the configured session root before trying the original persisted path; when
+  neither file is available, the filename UUID remains the explicit fallback.
+  Upstream defines `parentSession` for sessions derived through `/fork`,
+  `/clone`, or `newSession({ parentSession })`, so Agentsview records that
+  lineage as a fork. The same artifact persisted OpenAI Codex model identity
+  and per-message input and output usage in the documented Pi-family fields.
+  Support targets v0.7.0's current flat layout; that producer migrates older
+  per-project sessions before normal session listing.
 
 ## Oh My Pi (`omp`)
 
@@ -538,9 +740,9 @@ Grok section and remove the explicit registry exception in the coverage test.
   `39c95e5e29b1c8b082059f57421ce445c3dffdd4`; see
   [session-entries.ts](https://github.com/can1357/oh-my-pi/blob/39c95e5e29b1c8b082059f57421ce445c3dffdd4/packages/coding-agent/src/session/session-entries.ts),
 
-  [session-persistence.ts](https://github.com/can1357/oh-my-pi/blob/39c95e5e29b1c8b082059f57421ce445c3dffdd4/packages/coding-agent/src/session/session-persistence.ts),
-  and
-  [usage.ts](https://github.com/can1357/oh-my-pi/blob/39c95e5e29b1c8b082059f57421ce445c3dffdd4/packages/ai/src/usage.ts).
+    [session-persistence.ts](https://github.com/can1357/oh-my-pi/blob/39c95e5e29b1c8b082059f57421ce445c3dffdd4/packages/coding-agent/src/session/session-persistence.ts),
+    and
+    [usage.ts](https://github.com/can1357/oh-my-pi/blob/39c95e5e29b1c8b082059f57421ce445c3dffdd4/packages/ai/src/usage.ts).
 
 - **Usage and cost:** Pi-family usage persists input, output, cache-read, and
   cache-write tokens with a model. Agentsview derives monetary cost from the
@@ -573,8 +775,8 @@ Grok section and remove the explicit registry exception in the coverage test.
   and public GitHub repositories were checked 2026-07-19. Clone the official
   `https://github.com/CommandCodeAI/command-code.git` repository at
   `a774fe8cbe71697d115d4660de299c9c1b286cea`; it contains product and issue
-  material only, not the CLI implementation. No authoritative persistence source
-  or disk schema was public.
+  material only, not the CLI implementation. No authoritative persistence
+  source or disk schema was public.
 - **Usage and cost:** The consumed records provide transcript and metadata but
   no token, cache, reasoning, credit, or USD accounting to Agentsview.
 - **Agentsview:** `internal/parser/commandcode.go` and
@@ -592,10 +794,10 @@ Grok section and remove the explicit registry exception in the coverage test.
   and
   [message/content-block schema](https://github.com/Hmbown/DeepSeek-TUI/blob/7e845f3bf409d2eb06a2f4764c0b332b4190b0c3/crates/tui/src/models.rs).
 - **Usage and cost:** Session metadata persists aggregate `total_tokens`, model
-  and provider identity, plus separate parent-session and subagent USD/CNY cost
-  snapshots and displayed high-water marks. It does not persist a dependable
-  input/output/cache/reasoning token split. Agentsview currently emits no usage
-  event from this metadata; that is a parser limitation.
+  and provider identity, plus separate parent-session and subagent USD/CNY
+  cost snapshots and displayed high-water marks. It does not persist a
+  dependable input/output/cache/reasoning token split. Agentsview currently
+  emits no usage event from this metadata; that is a parser limitation.
 - **Agentsview:** `internal/parser/deepseek_tui.go` and
   `internal/parser/deepseek_tui_provider.go`; both `.codewhale` and legacy
   `.deepseek` roots are intentional.
@@ -644,13 +846,14 @@ Grok section and remove the explicit registry exception in the coverage test.
   `4a550effdfcb29a25a5d325bf935296cc50cd417`; see
   [session.py](https://github.com/MoonshotAI/kimi-cli/blob/4a550effdfcb29a25a5d325bf935296cc50cd417/src/kimi_cli/session.py),
 
-  [wire-mode.md](https://github.com/MoonshotAI/kimi-cli/blob/4a550effdfcb29a25a5d325bf935296cc50cd417/docs/en/customization/wire-mode.md),
-  and the
-  [Kimi provider usage mapping](https://github.com/MoonshotAI/kimi-cli/blob/4a550effdfcb29a25a5d325bf935296cc50cd417/packages/kosong/src/kosong/chat_provider/kimi.py).
+    [wire-mode.md](https://github.com/MoonshotAI/kimi-cli/blob/4a550effdfcb29a25a5d325bf935296cc50cd417/docs/en/customization/wire-mode.md),
+    and the
+    [Kimi provider usage mapping](https://github.com/MoonshotAI/kimi-cli/blob/4a550effdfcb29a25a5d325bf935296cc50cd417/packages/kosong/src/kosong/chat_provider/kimi.py).
 
 - **Usage and cost:** Native usage distinguishes uncached/other input, output,
-  cache read, and cache creation. The aggregate fallback exposes only output and
-  is therefore a lower bound. Agentsview catalog-prices usage with a model.
+  cache read, and cache creation. The aggregate fallback exposes only output
+  and is therefore a lower bound. Agentsview catalog-prices usage with a
+  model.
 
 - **Agentsview:** `internal/parser/kimi.go` and
   `internal/parser/kimi_provider.go`.
@@ -661,24 +864,32 @@ Grok section and remove the explicit registry exception in the coverage test.
   Kimi Code kernel session with a `wire.jsonl` transcript. Current files use
   `<workspace>/conv-*/agents/<agent>/wire.jsonl`; the legacy
   `<workspace>/conv-*/wire.jsonl` layout is also accepted. Sibling `ctitle-*`,
-  `sklsum-*`, and `dvlt-*` runtime sessions are internal work and are excluded.
+  `sklsum-*`, and `dvlt-*` runtime sessions are internal work and are
+  excluded.
 - **Evidence:** `no-public-source`.
 - **Upstream:** Kimi's first-party
   [Kimi Work overview](https://www.kimi.com/en-cn/help/kimi-work/overview) was
-  checked 2026-07-27. It confirms that Kimi Work is the local agent in the macOS
-  and Windows desktop client and uses Kimi Code as its agent kernel, but it does
-  not publish the desktop persistence schema or pin the embedded kernel
-  revision. The pinned Kimi CLI producer sources in the `kimi` entry establish
-  the shared wire-format family, while observed Kimi Work artifacts establish
-  the desktop directory wrapper and auxiliary-session prefixes.
+  checked 2026-07-27. It confirms that Kimi Work is the local agent in the
+  macOS and Windows desktop client and uses Kimi Code as its agent kernel, but
+  it does not publish the desktop persistence schema or pin the embedded
+  kernel revision. The pinned Kimi CLI producer sources in the `kimi` entry
+  establish the shared wire-format family, while observed Kimi Work artifacts
+  establish the desktop directory wrapper and auxiliary-session prefixes.
 - **Usage and cost:** The shared wire records expose input, output, cache-read,
   and cache-creation token counts. Kimi Work can report the internal model
-  aliases `daimon-kimi-code`, `daimon-kimi-messages`, and `k3-agent`; Agentsview
-  catalog-prices those tokens. The date-ambiguous `daimon-*` aliases resolve to
-  K2.6 before the 2026-07-19 UTC cutoff and K3 at or after it. When a transcript
-  omits model metadata, Agentsview uses the date-ambiguous `daimon-kimi-code`
-  alias so the same timestamp rule applies instead of assuming one model era. No
-  authoritative persisted USD cost is consumed.
+  aliases `daimon-kimi-code`, `daimon-kimi-messages`, `k2d6-agent`, and
+  `k3-agent`; Agentsview catalog-prices those tokens. The explicit
+  `k2d6-agent` alias resolves to K2.6. The date-ambiguous `daimon-*` aliases
+  resolve to K2.6 before the 2026-07-19 UTC cutoff and K3 at or after it. When
+  a transcript omits model metadata, Agentsview uses the date-ambiguous
+  `daimon-kimi-code` alias so the same timestamp rule applies instead of
+  assuming one model era. No authoritative persisted USD cost is consumed.
+- **Event ordering reverified 2026-08-03:** observed protocol-1.4 transcripts
+  can persist `tool.call`, then `tool.result`, then `step.end` for one model
+  step. The following `usage.record` repeats the same native usage values.
+  Agentsview keeps the assistant tool-call message as the pending usage target
+  across the user-role tool result, attaches the trailing `step.end` usage,
+  and treats `usage.record` only as a fallback so the step is counted once.
 - **Agentsview:** `internal/parser/kimi_work_provider.go` constrains discovery
   to user conversations, delegates wire decoding to `internal/parser/kimi.go`,
   and rewrites the provider identity and aggregate usage-event keys to
@@ -690,8 +901,8 @@ Grok section and remove the explicit registry exception in the coverage test.
 - **Evidence:** `documentation`.
 - **Upstream:** Anthropic's first-party
   [data export instructions](https://support.anthropic.com/en/articles/9450526-how-can-i-export-my-claude-ai-data)
-  were checked 2026-07-19. They establish the export artifact but do not publish
-  its complete JSON schema.
+  were checked 2026-07-19. They establish the export artifact but do not
+  publish its complete JSON schema.
 - **Usage and cost:** The export contains conversation content and timestamps,
   not authoritative token, cache, reasoning, credit, or USD accounting.
 - **Agentsview:** `internal/parser/claude_ai.go`; this is an import format, not
@@ -707,7 +918,8 @@ Grok section and remove the explicit registry exception in the coverage test.
   were checked 2026-07-19. The help page does not publish a versioned JSON
   schema.
 - **Usage and cost:** Export messages may include `model_slug`, but the artifact
-  does not provide authoritative token, cache, reasoning, credit, or cost data.
+  does not provide authoritative token, cache, reasoning, credit, or cost
+  data.
 - **Agentsview:** `internal/parser/chatgpt.go`; graph ancestry is flattened for
   display and the importer does not claim billing completeness.
 
@@ -720,23 +932,23 @@ Grok section and remove the explicit registry exception in the coverage test.
 
 - **Upstream:** Kiro's first-party [license page](https://kiro.dev/license/) and
   [conversation-persistence documentation](https://kiro.dev/docs/cli/chat/#conversation-persistence)
-  were checked 2026-07-19: current Kiro CLI is proprietary. The documentation
-  confirms automatic per-directory database persistence, resume-by-ID, and
-  manual JSON save/load, but does not publish either database generation's
-  schema. The open-source predecessor can be cloned from
+  were checked 2026-07-19: current Kiro CLI is proprietary. The
+  documentation confirms automatic per-directory database persistence,
+  resume-by-ID, and manual JSON save/load, but does not publish either
+  database generation's schema. The open-source predecessor can be cloned from
   `https://github.com/aws/amazon-q-developer-cli.git` at
   `15cc8f3cd18c4272925ce1c7053268eedff1ea0a`, but its pinned
   [conversation migration](https://github.com/aws/amazon-q-developer-cli/blob/15cc8f3cd18c4272925ce1c7053268eedff1ea0a/crates/chat-cli/src/database/sqlite_migrations/007_conversations_table.sql)
-  does not establish either Kiro generation. Useful independent format evidence
-  can be cloned from `https://github.com/ingo-eichhorst/Irrlicht.git` at
-  `12375a273a289c131a45b4fd3eb1ad6483b4e9d4`; see its pinned
+  does not establish either Kiro generation. Useful independent format
+  evidence can be cloned from `https://github.com/ingo-eichhorst/Irrlicht.git`
+  at `12375a273a289c131a45b4fd3eb1ad6483b4e9d4`; see its pinned
   [Kiro JSONL parser](https://github.com/ingo-eichhorst/Irrlicht/blob/12375a273a289c131a45b4fd3eb1ad6483b4e9d4/core/adapters/inbound/agents/kirocli/parser.go),
 
-  [sidecar metrics reader](https://github.com/ingo-eichhorst/Irrlicht/blob/12375a273a289c131a45b4fd3eb1ad6483b4e9d4/core/adapters/inbound/agents/kirocli/sidecar_metrics.go),
-  and recorded
-  [token-accounting assessment](https://github.com/ingo-eichhorst/Irrlicht/blob/12375a273a289c131a45b4fd3eb1ad6483b4e9d4/replaydata/agents/kiro-cli/scenarios/5-1_token-accounting/metadata.json).
-  These are consumer observations, not Kiro producer authority, and they do not
-  cover the newer `conversations_v2` writer.
+    [sidecar metrics reader](https://github.com/ingo-eichhorst/Irrlicht/blob/12375a273a289c131a45b4fd3eb1ad6483b4e9d4/core/adapters/inbound/agents/kirocli/sidecar_metrics.go),
+    and recorded
+    [token-accounting assessment](https://github.com/ingo-eichhorst/Irrlicht/blob/12375a273a289c131a45b4fd3eb1ad6483b4e9d4/replaydata/agents/kiro-cli/scenarios/5-1_token-accounting/metadata.json).
+    These are consumer observations, not Kiro producer authority, and they do
+    not cover the newer `conversations_v2` writer.
 
 - **Usage and cost:** JSONL events contain no model, token, cache, credit, or
   USD fields. The companion state can contain model/window metadata, context
@@ -772,9 +984,10 @@ Grok section and remove the explicit registry exception in the coverage test.
 - **Upstream:** Snowflake's first-party
   [CoCo session-replay guide](https://www.snowflake.com/en/developers/guides/create-shareable-coco-session-replays-with-cortex-replay/)
   was checked 2026-07-19 and documents automatic JSON transcript storage at
-  `~/.snowflake/cortex/conversations/<session-id>.json`. It links an independent
-  open-source reader: clone `https://github.com/dataprofessor/cortex-replay.git`
-  at `d61d46a7acbe55b3367f695a04e56eca24871320` and inspect the pinned
+  `~/.snowflake/cortex/conversations/<session-id>.json`. It links an
+  independent open-source reader: clone
+  `https://github.com/dataprofessor/cortex-replay.git` at
+  `d61d46a7acbe55b3367f695a04e56eca24871320` and inspect the pinned
   [session parser](https://github.com/dataprofessor/cortex-replay/blob/d61d46a7acbe55b3367f695a04e56eca24871320/src/parser.mjs).
   Snowflake does not publish the producer or a versioned schema, and the
   independent reader does not cover the newer split-history generation.
@@ -794,9 +1007,9 @@ Grok section and remove the explicit registry exception in the coverage test.
   and
   [usage_pricing.py](https://github.com/NousResearch/hermes-agent/blob/299e409f15aa5615a8a64be488580be92cda351e/agent/usage_pricing.py).
 - **Usage and cost:** State records distinguish input, output, cache-read,
-  cache-write, and reasoning tokens and can retain estimated or actual cost with
-  status/source metadata. Agentsview uses provider-reported cost when it is
-  meaningfully identified; otherwise it falls back to catalog pricing.
+  cache-write, and reasoning tokens and can retain estimated or actual cost
+  with status/source metadata. Agentsview uses provider-reported cost when it
+  is meaningfully identified; otherwise it falls back to catalog pricing.
 - **Agentsview:** `internal/parser/hermes.go` and
   `internal/parser/hermes_provider.go`; database and file generations are both
   recognized.
@@ -820,18 +1033,25 @@ Grok section and remove the explicit registry exception in the coverage test.
 ## Devin CLI (`devin`)
 
 - **Format:** `cli/sessions.db` for session metadata plus transcript JSON
-  artifacts.
+  artifacts. The `sessions.created_at`, `sessions.last_activity_at`, and
+  `message_nodes.created_at` columns are Unix epoch seconds (not
+  milliseconds). Verified against a live Devin CLI database 2026-07-31, and
+  reverified independently against CLI 3000.3.22 the same day. Because the
+  unit is observed rather than documented, the parser rejects values outside
+  the nanosecond-representable epoch-second range instead of converting them,
+  so a future unit change surfaces as missing timestamps rather than as a
+  silently overflowed far-future mtime that would wedge resync.
 - **Evidence:** `no-public-source`.
 - **Upstream:** Cognition's first-party
   [Devin documentation](https://docs.devin.ai/) and public repositories were
   searched 2026-07-19; no CLI database schema or transcript serializer was
   published. The transcript generation follows the public Agent Trajectory
-  Interchange Format: clone `https://github.com/harbor-framework/harbor.git` at
-  `071281b3d931aafd6a5375fa7d5933e23054d784` and see the pinned
+  Interchange Format: clone `https://github.com/harbor-framework/harbor.git`
+  at `071281b3d931aafd6a5375fa7d5933e23054d784` and see the pinned
   [ATIF specification](https://github.com/harbor-framework/harbor/blob/071281b3d931aafd6a5375fa7d5933e23054d784/rfcs/0001-trajectory-format.md).
-  Devin-specific field aliases and the SQLite enrichment store are independently
-  documented by `https://github.com/getagentseal/codeburn.git` at
-  `3472885629c41725b40c19c0780ecce148b067bf` in its
+  Devin-specific field aliases and the SQLite enrichment store are
+  independently documented by `https://github.com/getagentseal/codeburn.git`
+  at `3472885629c41725b40c19c0780ecce148b067bf` in its
   [Devin format notes](https://github.com/getagentseal/codeburn/blob/3472885629c41725b40c19c0780ecce148b067bf/docs/providers/devin.md).
   The pinned
   [Devin parser](https://github.com/getagentseal/codeburn/blob/3472885629c41725b40c19c0780ecce148b067bf/src/providers/devin.ts)
@@ -839,8 +1059,8 @@ Grok section and remove the explicit registry exception in the coverage test.
   producer source.
 - **Usage and cost:** Message or aggregate metrics can persist prompt,
   completion, and cached tokens. The parser handles multiple observed field
-  names; no authoritative provider-reported USD value is consumed, so pricing is
-  catalog-derived when model attribution is possible.
+  names; no authoritative provider-reported USD value is consumed, so pricing
+  is catalog-derived when model attribution is possible.
 - **Agentsview:** `internal/parser/devin.go` and
   `internal/parser/devin_provider.go`; metric aliases are implementation
   evidence because the upstream schema is unavailable.
@@ -855,12 +1075,12 @@ Grok section and remove the explicit registry exception in the coverage test.
   [Piebald analyzer](https://github.com/Piebald-AI/splitrail/blob/e2f195906dc7bf80d0faf16281cf9544e6413d01/src/analyzers/piebald.rs)
   defines the database location, `chats`/`projects`/`messages` joins, token
   columns, service-tier joins, and normalization. This is a read-only
-  first-party schema consumer rather than the application serializer, but it is
-  maintained by the product company and directly targets the current store.
+  first-party schema consumer rather than the application serializer, but it
+  is maintained by the product company and directly targets the current store.
 - **Usage and cost:** Messages can persist input, output, reasoning, cache-read,
-  cache-write, model, and service-tier data. The official analyzer derives price
-  from those fields; it does not read a persisted provider USD total. Agentsview
-  likewise normalizes the counters and catalog-prices the result.
+  cache-write, model, and service-tier data. The official analyzer derives
+  price from those fields; it does not read a persisted provider USD total.
+  Agentsview likewise normalizes the counters and catalog-prices the result.
 - **Agentsview:** `internal/parser/piebald.go`.
 
 ## Warp (`warp`)
@@ -874,15 +1094,15 @@ Grok section and remove the explicit registry exception in the coverage test.
   `69ce3728acae0b01c2f457b65a90c144664686aa`; see the pinned
   [agent conversation migration](https://github.com/warpdotdev/warp/blob/69ce3728acae0b01c2f457b65a90c144664686aa/crates/persistence/migrations/2025-06-09-013710_create_agent_conversations_table/up.sql),
 
-  [persistence writer](https://github.com/warpdotdev/warp/blob/69ce3728acae0b01c2f457b65a90c144664686aa/app/src/persistence/agent.rs),
-  and
-  [conversation usage types](https://github.com/warpdotdev/warp/blob/69ce3728acae0b01c2f457b65a90c144664686aa/crates/persistence/src/model.rs).
+    [persistence writer](https://github.com/warpdotdev/warp/blob/69ce3728acae0b01c2f457b65a90c144664686aa/app/src/persistence/agent.rs),
+    and
+    [conversation usage types](https://github.com/warpdotdev/warp/blob/69ce3728acae0b01c2f457b65a90c144664686aa/crates/persistence/src/model.rs).
 
 - **Usage and cost:** The consumed metadata has aggregate `warp_tokens` and
   `byok_tokens` by model and category, plus custom-endpoint tokens and credit
   fields upstream. Agentsview consumes only the Warp/BYOK aggregates; they are
-  not attributable per-request billing tokens, cache splits, or reasoning, so it
-  reports them as session metrics and does not derive USD from them.
+  not attributable per-request billing tokens, cache splits, or reasoning, so
+  it reports them as session metrics and does not derive USD from them.
 
 - **Agentsview:** `internal/parser/warp.go` and `internal/parser/warp_paths.go`.
 
@@ -913,12 +1133,13 @@ Grok section and remove the explicit registry exception in the coverage test.
   [posit-dev GitHub organization](https://github.com/posit-dev) were searched
   2026-07-19. Clone the public Positron repository
   `https://github.com/posit-dev/positron.git` at
-  `61345078cc1833b740fda2b1fe1aabc8472d2249`; its current tree includes an older
+  `61345078cc1833b740fda2b1fe1aabc8472d2249`; its current tree includes an
+  older
   [Copilot conversation store](https://github.com/posit-dev/positron/blob/61345078cc1833b740fda2b1fe1aabc8472d2249/extensions/copilot/src/extension/conversationStore/node/conversationStore.ts),
   but contains no producer for `.posit/assistant/workspaces`,
   `conversation.json`, or `lm-messages.jsonl`. Demo and feedback repositories
-  were also public, but no matching producer or authoritative persisted-session
-  schema was found.
+  were also public, but no matching producer or authoritative
+  persisted-session schema was found.
 - **Usage and cost:** Language-model messages can persist input, output,
   cache-read, and cache-write tokens with model identity. Agentsview
   catalog-prices these values; no provider-reported USD total is consumed.
@@ -932,9 +1153,9 @@ Grok section and remove the explicit registry exception in the coverage test.
 - **Upstream:** Z Code's first-party product pages, documentation, and public
   GitHub organization surfaces were searched 2026-07-19. Its
   [usage documentation](https://zcode.z.ai/en/docs/usage-stats) confirms that
-  the application reads local ZCode session records and presents token, session,
-  message, and model totals, but does not publish the database schema. For a
-  reproducible independent schema observation, clone
+  the application reads local ZCode session records and presents token,
+  session, message, and model totals, but does not publish the database
+  schema. For a reproducible independent schema observation, clone
   `https://github.com/getagentseal/codeburn.git` at
   `3472885629c41725b40c19c0780ecce148b067bf` and inspect the pinned
   [ZCode format notes](https://github.com/getagentseal/codeburn/blob/3472885629c41725b40c19c0780ecce148b067bf/docs/providers/zcode.md)
@@ -947,6 +1168,46 @@ Grok section and remove the explicit registry exception in the coverage test.
   provider-reported USD value.
 - **Agentsview:** `internal/parser/zcode.go`; table and column semantics remain
   reverse-engineered implementation evidence.
+
+## Goose (`goose`)
+
+- **Format:** A shared SQLite `sessions.db`. Schema version 15 stores session
+  metadata in `sessions`, ordered role messages with tagged JSON content in
+  `messages`, and request-scoped token and cost records in `usage_ledger`.
+
+- **Evidence:** `source`.
+
+- **Upstream:** Clone `https://github.com/aaif-goose/goose.git` at
+  `5ab0e6df34e69444f6f2016de40717a9f54bf816`; see the pinned
+
+    [session manager](https://github.com/aaif-goose/goose/blob/5ab0e6df34e69444f6f2016de40717a9f54bf816/crates/goose/src/session/session_manager.rs),
+
+    [message model](https://github.com/aaif-goose/goose/blob/5ab0e6df34e69444f6f2016de40717a9f54bf816/crates/goose-provider-types/src/conversation/message.rs),
+
+    [tool-result serialization](https://github.com/aaif-goose/goose/blob/5ab0e6df34e69444f6f2016de40717a9f54bf816/crates/goose-provider-types/src/conversation/tool_result_serde.rs),
+    and
+    [path resolution](https://github.com/aaif-goose/goose/blob/5ab0e6df34e69444f6f2016de40717a9f54bf816/crates/goose/src/config/paths.rs).
+
+    `Paths::data_dir()` uses etcetera 0.11 `choose_app_strategy` (XDG on macOS and
+    Linux; the Windows strategy appends a `data` subfolder under
+    `%APPDATA%\Block\goose\`), and `GOOSE_PATH_ROOT` overrides it with
+    `<root>/data`. The first-party
+    [session-management guide](https://goose-docs.ai/docs/guides/sessions/session-management/)
+    and an isolated observed schema-version-15 database were also checked
+    2026-08-03.
+
+- **Usage and cost:** `usage_ledger` rows provide model, input, output,
+  cache-read, cache-write, compaction, cost, and cost-source data without a
+  stable message ordinal. Agentsview emits them as `goose-request`
+  request-scoped usage events so aggregate reporting reads the ledger token
+  columns without attaching rows to arbitrary messages, and preserves reported
+  or estimated costs. Older schemas without the ledger fall back to the
+  session's accumulated counters and cost.
+
+- **Agentsview:** `internal/parser/goose.go` and
+  `internal/parser/goose_provider.go`; the provider uses per-session content
+  fingerprints and bounded SQLite row cursors for watcher events, while a
+  periodic full reconciliation covers metadata-only edits and row deletes.
 
 ## Zed (`zed`)
 
@@ -973,8 +1234,8 @@ Grok section and remove the explicit registry exception in the coverage test.
 - **Upstream:** Google's first-party Antigravity product and documentation
   surfaces and public repositories were searched 2026-07-19; no application
   database schema or protobuf definition for `gen_metadata` was published. For
-  an independent implementation that queries Antigravity's local language-server
-  RPC and documents the protobuf-derived token fields, clone
+  an independent implementation that queries Antigravity's local
+  language-server RPC and documents the protobuf-derived token fields, clone
   `https://github.com/getagentseal/codeburn.git` at
   `3472885629c41725b40c19c0780ecce148b067bf` and inspect its
   [Antigravity format notes](https://github.com/getagentseal/codeburn/blob/3472885629c41725b40c19c0780ecce148b067bf/docs/providers/antigravity.md)
@@ -997,9 +1258,9 @@ Grok section and remove the explicit registry exception in the coverage test.
 - **Upstream:** Google's Antigravity product documentation and public
   repositories were searched 2026-07-19; no CLI persistence source, encryption
   specification, or authoritative protobuf schema was found. The independent
-  CodeBurn evidence pinned in the `antigravity` entry also covers CLI discovery,
-  live RPC metadata, and the shorter capture window, but not the encrypted
-  producer format.
+  CodeBurn evidence pinned in the `antigravity` entry also covers CLI
+  discovery, live RPC metadata, and the shorter capture window, but not the
+  encrypted producer format.
 - **Usage and cost:** Sidecar generator metadata can carry input, output,
   thinking-output, cache-read, and model fields; output already includes
   thinking. Agentsview avoids double counting and catalog-prices usage. No
@@ -1025,11 +1286,11 @@ Grok section and remove the explicit registry exception in the coverage test.
   which records discovery paths and delegates the observed wire shape to its
   Gemini-family parser.
 - **Usage and cost:** Although records may resemble Claude streaming events,
-  Agentsview does not expose token, cache, reasoning, credit, or USD accounting
-  for iFlow.
+  Agentsview does not expose token, cache, reasoning, credit, or USD
+  accounting for iFlow.
 - **Agentsview:** `internal/parser/iflow.go` and
-  `internal/parser/iflow_provider.go`; field interpretation is based on observed
-  files rather than upstream authority.
+  `internal/parser/iflow_provider.go`; field interpretation is based on
+  observed files rather than upstream authority.
 
 ## ICodeMate (`icodemate`)
 
@@ -1054,19 +1315,19 @@ Grok section and remove the explicit registry exception in the coverage test.
 - **Upstream:** WorkBuddy's first-party product site, documentation, and public
   repositories were searched 2026-07-19; no authoritative persistence producer
   or versioned schema was found. For reproducible independent format and
-  accounting evidence, clone `https://github.com/mm7894215/TokenTracker.git` at
-  `eaf6048b07729f3ae1224def6011ea22f80cd035` and inspect its pinned
+  accounting evidence, clone `https://github.com/mm7894215/TokenTracker.git`
+  at `eaf6048b07729f3ae1224def6011ea22f80cd035` and inspect its pinned
   [WorkBuddy reader](https://github.com/mm7894215/TokenTracker/blob/eaf6048b07729f3ae1224def6011ea22f80cd035/src/lib/rollout.js),
   which documents the recursive JSONL layout, raw usage variants, cache and
   reasoning normalization, model fallback, and newer `workbuddy.db` aggregate
   fallback. These are consumer observations, not Tencent authority.
 - **Usage and cost:** Usage may contain input, output, cache, and reasoning
-  counters. Upstream prompt totals include cache, so Agentsview subtracts cache
-  to obtain uncached input and keeps reasoning separate. Monetary cost is
-  catalog-derived.
+  counters. Upstream prompt totals include cache, so Agentsview subtracts
+  cache to obtain uncached input and keeps reasoning separate. Monetary cost
+  is catalog-derived.
 - **Agentsview:** `internal/parser/workbuddy.go` and
-  `internal/parser/workbuddy_provider.go`; counter semantics are implementation
-  evidence.
+  `internal/parser/workbuddy_provider.go`; counter semantics are
+  implementation evidence.
 
 ## Zencoder (`zencoder`)
 
@@ -1075,9 +1336,9 @@ Grok section and remove the explicit registry exception in the coverage test.
 - **Upstream:** The first-party
   [Zencoder documentation](https://docs.zencoder.ai/) and public repositories
   were searched 2026-07-19. Zencoder publishes an organization-level
-  [Analytics API](https://docs.zencoder.ai/features/analytics-api), but it does
-  not document the local JSONL transcript or its fields. No local transcript
-  serializer or authoritative schema was found.
+  [Analytics API](https://docs.zencoder.ai/features/analytics-api), but it
+  does not document the local JSONL transcript or its fields. No local
+  transcript serializer or authoritative schema was found.
 - **Usage and cost:** The consumed JSONL exposes no reliable token, cache,
   reasoning, credit, or monetary-cost fields to Agentsview.
 - **Agentsview:** `internal/parser/zencoder.go` and
@@ -1107,9 +1368,10 @@ Grok section and remove the explicit registry exception in the coverage test.
 - **Upstream:** The first-party [Qoder documentation](https://docs.qoder.com/)
   and public repositories were searched 2026-07-19; no producer-side session
   serializer or authoritative local schema was found. The official scoped npm
-  package currently names a GitHub repository that is not publicly clonable. For
-  independent reproducible evidence, clone `https://github.com/chenhg5/tape.git`
-  at `c40d46d16a32295da63221629293a000b0675df2` and inspect its pinned
+  package currently names a GitHub repository that is not publicly clonable.
+  For independent reproducible evidence, clone
+  `https://github.com/chenhg5/tape.git` at
+  `c40d46d16a32295da63221629293a000b0675df2` and inspect its pinned
   [Qoder source adapter](https://github.com/chenhg5/tape/blob/c40d46d16a32295da63221629293a000b0675df2/internal/source/qoder/qoder.go),
   which documents the transcript/metadata pair and shared Qwen `ChatRecord`
   shape.
@@ -1131,8 +1393,8 @@ Grok section and remove the explicit registry exception in the coverage test.
   [history implementation](https://github.com/agentscope-ai/QwenPaw/blob/a15a69fca73e67c17dc47326e933eaa259fa0d8d/src/qwenpaw/agents/context/scroll/history.py).
 - **Usage and cost:** The consumed session memory contains messages and content
   blocks but no per-message billing usage. QwenPaw has separate token-usage
-  services, but Agentsview does not join that accounting store to session files;
-  cache, reasoning totals, and USD cost are therefore absent.
+  services, but Agentsview does not join that accounting store to session
+  files; cache, reasoning totals, and USD cost are therefore absent.
 - **Agentsview:** `internal/parser/qwenpaw.go` and
   `internal/parser/qwenpaw_provider.go`.
 
@@ -1144,8 +1406,8 @@ Grok section and remove the explicit registry exception in the coverage test.
 - **Upstream:** The first-party
   [Shelley launch and storage documentation](https://blog.exe.dev/shelley) was
   checked 2026-07-19 and identifies the SQLite store at
-  `~/.config/shelley/shelley.db`. No public migration, table schema, or producer
-  source was found, so column-level details remain observed evidence.
+  `~/.config/shelley/shelley.db`. No public migration, table schema, or
+  producer source was found, so column-level details remain observed evidence.
 - **Usage and cost:** `usage_data` can persist input, cache-creation,
   cache-read, output, model, and exact `cost_usd`. Agentsview intentionally
   ignores `cost_usd` while emitting token usage, avoiding mixed/double cost
@@ -1167,6 +1429,10 @@ Grok section and remove the explicit registry exception in the coverage test.
   context/last-turn/total statistics, without per-message cache or cost data.
   Agentsview emits one aggregate usage event and catalog-prices it when model
   identity is available.
+- **Project identity:** Metadata records `session_id`, `git_branch`, and
+  `environment.working_directory`. Agentsview recovers those independent
+  fields even when another optional metadata field is malformed, so a partial
+  parse cannot replace repository classification with generic fallbacks.
 - **Agentsview:** `internal/parser/vibe.go` and
   `internal/parser/vibe_provider.go`.
 
@@ -1181,8 +1447,9 @@ Grok section and remove the explicit registry exception in the coverage test.
   and the first-party
   [usage documentation](https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/website/docs/usage.md).
 - **Usage and cost:** The Markdown transcript does not persist authoritative
-  per-message tokens, cache, reasoning, credits, or USD cost. Aider may display
-  runtime cost elsewhere, but Agentsview does not infer it from this history.
+  per-message tokens, cache, reasoning, credits, or USD cost. Aider may
+  display runtime cost elsewhere, but Agentsview does not infer it from this
+  history.
 - **Agentsview:** `internal/parser/aider.go` and
   `internal/parser/aider_provider.go`; roles and run boundaries are
   reconstructed from Markdown.

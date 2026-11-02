@@ -54,6 +54,7 @@ cursor_secret = "base64-encoded-secret"
 require_auth = true
 cursor_admin_api_key = "key_xxxxx"
 daemon_idle_timeout = "20m"
+chart_palette = "agentsview"
 ```
 
 | Field                               | Description                                                                                                                                                                                                                                          |
@@ -70,6 +71,7 @@ daemon_idle_timeout = "20m"
 | `public_url`                        | Public URL for hostname/proxy access and origin validation                                                                                                                                                                                           |
 | `public_origins`                    | Array of additional trusted CORS origins                                                                                                                                                                                                             |
 | `daemon_idle_timeout`               | Idle timeout for detached writable daemons; set to `"0s"` to keep them alive                                                                                                                                                                         |
+| `chart_palette`                     | Server-wide categorical chart colors: `"agentsview"` (default) or `"matplotlib"`; also configurable under **Settings > Appearance**                                                                                                                  |
 | `[proxy]`                           | Managed proxy configuration table — see [Remote Access](/remote-access/)                                                                                                                                                                             |
 | `disable_update_check`              | Disable the automatic update check (see [Privacy](#privacy-and-telemetry))                                                                                                                                                                           |
 | `[pg]`                              | PostgreSQL sync configuration — see [PostgreSQL Sync](/pg-sync/)                                                                                                                                                                                     |
@@ -77,6 +79,7 @@ daemon_idle_timeout = "20m"
 | `[vector]`                          | Opt-in semantic-search index; model settings live in `[vector.embeddings]`, named endpoints in `[vector.embeddings.servers.<name>]`, embedding schedule in `[vector.embed]` — see [Semantic Search](/semantic-search/#enabling-vector) for every key |
 | `[recall.extract]`                  | Opt-in model-backed recall extraction; named endpoints in `[recall.extract.servers.<name>]`, prompt selection in `[recall.extract.prompts]`, request overrides in `[recall.extract.request]` — see [Recall](/recall/#automatic-extraction)           |
 | `[[remote_hosts]]`                  | Remote machines synced by a bare `agentsview sync` — see [CLI Reference](/commands/#agentsview-sync)                                                                                                                                                 |
+| `[[session_sources]]`               | Additional filesystem session roots with per-root machine labels — see [Filesystem Session Sync](/filesystem-sync/)                                                                                                                                  |
 | `[automated]`                       | Custom automated-session patterns — see [Automated Session Detection](#automated-session-detection)                                                                                                                                                  |
 | `[custom_model_pricing]`            | Per-model price overrides for usage reports — see [Custom Model Pricing](/token-usage/#custom-model-pricing)                                                                                                                                         |
 
@@ -248,6 +251,7 @@ can still be parsed.
 | DeepSeek TUI          | `~/.codewhale/sessions/` and `~/.deepseek/sessions/`                             | JSON per session                                                                                                                |
 | Forge                 | `~/.forge/`                                                                      | SQLite database (`.forge.db`)                                                                                                   |
 | Gemini CLI            | `~/.gemini/`                                                                     | JSONL in `tmp/` subdirectory                                                                                                    |
+| Goose                 | (platform-specific, see below)                                                   | SQLite `sessions.db` with transcripts, tool activity, relationships, usage, and recorded costs                                  |
 | gptme                 | `~/.local/share/gptme/logs/`                                                     | JSONL logs                                                                                                                      |
 | Grok                  | `~/.grok/sessions/`                                                              | `summary.json` + optional `signals.json` + `chat_history.jsonl` transcript when present                                         |
 | Hermes Agent          | `~/.hermes/sessions/`                                                            | JSONL / JSON per session                                                                                                        |
@@ -266,6 +270,7 @@ can still be parsed.
 | OpenHands CLI         | `~/.openhands/conversations/`                                                    | Per-conversation `base_state.json` + `events/*.json`                                                                            |
 | Omnigent              | `~/.omnigent/`                                                                   | SQLite `chat.db`, one session per conversation                                                                                  |
 | Pi                    | `~/.pi/agent/sessions/`                                                          | JSONL per session                                                                                                               |
+| Prime Agent           | `~/.prime/agent/sessions/`                                                       | Flat Pi-family JSONL sessions                                                                                                   |
 | Poolside              | `~/Library/Application Support/poolside/trajectories/` (macOS), `~/.local/state/poolside/trajectories/` (Linux), `%APPDATA%\\poolside\\trajectories\\` (Windows) | NDJSON trajectory files                                                                                                         |
 | Piebald               | `~/.local/share/piebald/`                                                        | SQLite database (`app.db`)                                                                                                      |
 | Posit Assistant       | `~/.posit/assistant/workspaces/`                                                 | Per-conversation `conversation.json` tree plus `lm-messages.jsonl` transcript                                                   |
@@ -287,12 +292,27 @@ can still be parsed.
 | Zed                   | (platform-specific, see below)                                                   | SQLite database (`threads/threads.db`)                                                                                          |
 | Zencoder              | `~/.zencoder/sessions/`                                                          | JSONL per session                                                                                                               |
 
+Prime Agent support targets the current flat session layout in v0.7.0. That
+release migrates the older per-project layout when Prime Agent opens its
+session store, so open the current Prime Agent once before syncing a legacy
+archive with AgentsView.
+
 Grok sessions are read from `summary.json` (title, timestamps, project),
 optional `signals.json` (token counters), and `chat_history.jsonl` when
 present for the full transcript (user turns, assistant replies, thinking,
 and tool calls). If `chat_history.jsonl` is missing, AgentsView falls back
 to summary-only mode. Set `GROK_DIR` or `grok_dirs` to override the default
 directory.
+
+**Goose default directories** are:
+
+- **macOS and Linux:** `~/.local/share/goose/sessions/`
+- **Windows:** `%APPDATA%/Block/goose/data/sessions/`
+
+`GOOSE_PATH_ROOT` follows Goose's own path-root convention and resolves
+`<root>/data/sessions/sessions.db`. A `goose_dirs` entry may instead point
+directly to that sessions directory, its parent data directory, or the
+database file.
 
 Omnigent sessions are read from `~/.omnigent/chat.db`. Set `OMNIGENT_DIR` or
 `omnigent_dirs` to override the default directory. AgentsView creates one
@@ -581,6 +601,7 @@ export CURSOR_PROJECTS_DIR=~/custom/cursor
 export DEEPSEEK_TUI_SESSIONS_DIR=~/custom/deepseek/sessions
 export FORGE_DIR=~/custom/forge
 export GEMINI_DIR=~/custom/gemini
+export GOOSE_PATH_ROOT=~/custom/goose
 export GPTME_DIR=~/custom/gptme/logs
 export GROK_DIR=~/custom/grok/sessions
 export HERMES_SESSIONS_DIR=~/custom/hermes
@@ -640,11 +661,11 @@ The corresponding fields are `aider_dirs`, `amp_dirs`, `antigravity_dirs`,
 `antigravity_cli_dirs`, `claude_project_dirs`, `openclaude_project_dirs`,
 `cowork_dirs`, `devin_dirs`, `codex_sessions_dirs`, `commandcode_project_dirs`,
 `copilot_dirs`, `cortex_dirs`, `cursor_project_dirs`,
-`deepseek_tui_sessions_dirs`, `forge_dirs`, `gemini_dirs`, `gptme_dirs`,
-`grok_dirs`, `hermes_sessions_dirs`, `iflow_dirs`, `kilo_dirs`,
+`deepseek_tui_sessions_dirs`, `forge_dirs`, `gemini_dirs`, `goose_dirs`,
+`gptme_dirs`, `grok_dirs`, `hermes_sessions_dirs`, `iflow_dirs`, `kilo_dirs`,
 `kilo_legacy_dirs`, `kimi_dirs`, `kimi_work_dirs`, `kiro_dirs`, `kiro_ide_dirs`,
 `mimocode_dirs`, `vibe_session_dirs`, `omp_dirs`, `openclaw_dirs`,
-`opencode_dirs`, `openhands_dirs`, `pi_dirs`, `piebald_dirs`,
+`opencode_dirs`, `openhands_dirs`, `pi_dirs`, `prime_agent_dirs`, `piebald_dirs`,
 `posit_assistant_dirs`, `positron_dirs`, `qclaw_dirs`, `qoder_project_dirs`,
 `qwen_project_dirs`, `qwenpaw_dirs`, `reasonix_dirs`, `roocode_dirs`,
 `shelley_dirs`, `visualstudio_copilot_dirs`, `vscode_copilot_dirs`,
@@ -654,6 +675,32 @@ these take precedence over the single-directory environment variable and the
 default path.
 
 All listed directories are discovered, watched, and synced independently.
+
+### Machine-Labeled Filesystem Sources
+
+Use `[[session_sources]]` when a root was produced on another machine and
+transported to this AgentsView host:
+
+```toml
+[[session_sources]]
+agent = "copilot"
+dir = "/srv/session-archive/buildbox/copilot"
+machine = "buildbox"
+```
+
+The fields are `agent`, `dir`, and optional `machine`. Entries are additive to
+the per-agent arrays, defaults, and environment variables above. Equivalent
+roots are deduplicated; a structured entry supplies the machine label when it
+duplicates a shorthand root. An omitted `machine` uses the local hostname.
+
+Machine attribution is captured when each session is first ingested. Changing
+an entry's `machine` value affects newly discovered sessions but does not
+relabel existing sessions during ordinary syncs or `agentsview sync --full`.
+Changing attribution for existing sessions is not currently supported.
+
+See [Filesystem Session Sync](/filesystem-sync/) for multi-machine examples,
+transport safety, ID deduplication, watcher behavior, and the comparison with
+PostgreSQL.
 
 ### S3-Compatible Session Sources
 
@@ -720,27 +767,43 @@ manual sync, and the periodic directory scan.
 
 ### Worktree Project Mappings
 
-The parser infers a session's project from its `cwd`, which works for standard
-layouts but not custom worktree conventions like
-`~/code/{project}.worktrees/feat/<branch>/` — those sessions otherwise group
-under `<branch>` rather than `{project}`. As of 0.29.0, you can register manual
-**path-prefix → project** rules from the **Worktree Project Mappings** section
-in Settings:
+The parser infers a session's project from its `cwd`. It recognizes common
+worktree manager layouts, including the generic
+`worktrees/github.com/<owner>/<repository>/<worktree>` convention, where the
+repository segment becomes the project. Layouts it does not recognize — such
+as `~/code/{project}.worktrees/feat/<branch>/` — otherwise group sessions
+under `<branch>` rather than `{project}`. For those, register manual
+**path-prefix → project** rules from the **Rules** view on the
+[Data page](/data/#rules), or let the
+[mapping editor](/data/#create-a-project-mapping) create one from a project's
+observed session folders:
 
-![Worktree Project Mappings settings section](/assets/generated/screenshots/worktree-mappings.png)
+![Worktree mapping rules on the Data page](/assets/generated/screenshots/worktree-mappings.png)
 
 - Mappings are explicit; there is no auto-discovery.
+- Each rule is scoped to one machine. The machine selector manages rules for
+  the local machine and for any remotely synced machine. Rules live in the
+  writable archive that ingests that machine's sessions, which may be the
+  source machine's local SQLite archive or a separate collector archive.
 - Each rule applies whenever a session's `cwd` falls under the configured
   prefix, on both new sessions as they sync and (via the **Apply** button)
-  already-imported sessions.
+  already-imported sessions. Prefixes match on directory boundaries, so
+  `/worktrees/service` does not match `/worktrees/service-old`.
+- Enabled mappings run after parser inference, so an explicit rule always wins
+  when the two disagree.
 - The default `explicit` layout maps every matching path to the project name
   stored on the rule. The `repo_dot_worktrees` layout derives the project from
   the first path segment under the prefix when it is named `<repo>.worktrees`,
   so a path like `/code/agentsview.worktrees/feature/frontend` resolves to
   project `agentsview`.
-- Rules are stored in a `worktree_project_mappings` SQLite table scoped to the
-  host machine, so a mapping created on one machine does not leak into another
-  machine's view of synced sessions.
+- Rules created from the Data mapping editor record the mislabeled
+  project they corrected, shown as the rule's **original label**. The value is
+  informational and set once; to manually revert a reclassification, edit the
+  rule's target back to that original label and apply again.
+- Disabling or deleting a rule does not rewrite sessions by itself. Sessions
+  whose source files still exist revert to parser-derived names on a later
+  reparse or full resync, while orphaned sessions keep their stored
+  classification.
 - Excluded, trashed, and skipped session files are left alone.
 
 Mappings only mutate the session's `project` field; the rest of the session

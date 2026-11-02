@@ -32,7 +32,8 @@ it's also dramatically faster on large histories (see
 
     **As of 0.34.0**, usage totals are populated when the source session includes
     token metadata for **Claude Code**, **Codex**, **Copilot CLI**, **OpenCode** and
-    OpenCode-format forks such as **Kilo** and **MiMoCode**, **Pi**, **Gemini**,
+    OpenCode-format forks such as **Kilo** and **MiMoCode**, **Pi**, **Prime
+    Agent**, **Gemini**,
     **Qwen Code**, **OpenClaw**, **QClaw**, **Hermes**, **WorkBuddy**, **Forge**,
     **Piebald**, **Antigravity IDE/CLI**, **Zed**, **VS Code Copilot**, **Visual
     Studio Copilot**, **Mistral Vibe**, and **gptme**.
@@ -335,6 +336,25 @@ both fetched and embedded catalogs. Processing variants such as Batch, Flex,
 Priority, regional, and one-hour cache pricing are not inferred when the stored
 usage does not identify that service tier.
 
+### Anthropic Web Search Fee
+
+Anthropic charges a flat
+[$10 per 1,000 server-side web search requests](https://docs.claude.com/en/docs/agents-and-tools/tool-use/web-search-tool)
+on top of tokens. That fee is not a per-token rate, so it lives outside the
+`model_pricing` catalog as a fixed $0.01 per request. AgentsView adds it to any
+usage row whose stored `token_usage` reports
+`server_tool_use.web_search_requests`, and `session usage --format json`
+reports the per-row count as `web_search_requests` so the charge is auditable.
+A row that carries an authoritative reported cost is left alone, since that
+cost already settles the whole row.
+
+Claude Code runs each `WebSearch` in an out-of-band side call and writes a zero
+counter on the assistant message, so AgentsView takes the count from the linked
+tool result instead. That side call's own tokens — tens of thousands of input
+tokens on a Haiku model per search — are not written to the transcript at all
+and are therefore a known undercount: AgentsView records the fee, not the
+hidden tokens.
+
 As of 0.32.0, the embedded fallback includes `claude-opus-4-7` at the same Opus
 tier used for 4.6 and 4.8, so offline reports and fresh installs price Opus 4.7
 sessions without waiting for a live LiteLLM fetch. 0.33.0 adds `claude-fable-5`
@@ -506,7 +526,8 @@ existing report).
 Beyond raw speed, `agentsview usage`:
 
 - **Works beyond Claude Code** — coverage includes Claude Code, Codex, Copilot
-  CLI, OpenCode-format tools, Pi, Gemini, Qwen Code, OpenClaw/QClaw, Hermes,
+  CLI, OpenCode-format tools, Pi, Prime Agent, Gemini, Qwen Code,
+  OpenClaw/QClaw, Hermes,
   WorkBuddy, Forge, Piebald, Antigravity, Zed, VS Code Copilot, Visual Studio
   Copilot, Mistral Vibe, and gptme from the same database and command whenever
   those sessions log token metadata. Filter with `--agent <name>` when you want
@@ -549,7 +570,7 @@ to X" still works.
 
 ```json
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "pricing": {
     "source": "fetched",
     "table_version": "2026-07-03T12:00:00Z",
@@ -671,11 +692,13 @@ session-summary v1 contract shipped in 0.37.1. Releases 0.38.0 and 0.38.1
 emitted the substantially revised project-evidence shape while still reporting
 version 1. Version 2 corrected those markers, version 3 introduced exact
 microdollar money objects, and version 4 adds resolved-model pricing provenance
-with request-pricing bands and application counts. Version 4 is a contract bump
-because band selection changes pricing semantics and bands participate in digest
-canonicalization, not merely because fields were added. The two transitional
-releases must not be treated as v1-compatible. The commands do not provide an
-earlier-version output mode. Consumers should require the expected
+with request-pricing bands and application counts. Version 5 selects complete
+Claude snapshots before generic deduplication and charges the maximum observed
+server-side web-search count. Versions 4 and 5 are contract bumps because
+version 4 changed band-selection pricing semantics and digest canonicalization,
+while version 5 changes snapshot and server-tool accounting. The two
+transitional releases must not be treated as v1-compatible. The commands do not
+provide an earlier-version output mode. Consumers should require the expected
 `schema_version` and ignore unknown additive fields.
 
 | Change                                                                                | Requires `schema_version` bump? |
@@ -720,7 +743,7 @@ after their tokens and costs have been aggregated.
 
 When no catalog bands or applied bands exist, their canonical JSON value is
 `null`, not `[]`. Consumers should accept future additive fields but can rely on
-that null-versus-nonempty-array representation within schema version 4.
+that null-versus-nonempty-array representation within schema version 5.
 
 Ordinary models have one resolution whose `priced_model` is the reported model.
 Timestamp-aware aliases can have more than one resolution in a report. For
@@ -731,7 +754,7 @@ canonicalization and produces one self-resolution. Fallback provenance also
 lists reported model names.
 
 `cost_source` is a closed enum everywhere it appears: `computed`, `reported`, or
-`mixed`. It was established in schema version 2 and is unchanged in version 4.
+`mixed`. It was established in schema version 2 and is unchanged in version 5.
 `computed` means AgentsView derived cost from token counts and the effective
 pricing resolver. `reported` means a source supplied explicit cost, such as
 Cursor Admin API billing data; those amounts may not be derivable from tokens
@@ -814,6 +837,8 @@ agentsview usage statusline [flags]
 
 | Flag        | Default | Description                        |
 | ----------- | ------- | ---------------------------------- |
+| `--format`  | `human` | Output format: `human` or `json`   |
+| `--json`    | `false` | Alias for `--format json`          |
 | `--agent`   |         | Filter by agent name               |
 | `--offline` | `false` | Use embedded fallback pricing only |
 | `--no-sync` | `false` | Skip on-demand sync                |
@@ -829,6 +854,20 @@ With `--agent claude`:
 ```
 $6.42 today (claude)
 ```
+
+With `--json`, the same facts are emitted for scripts, with the cost as exact
+microdollars rather than a formatted string:
+
+```json
+{
+  "date": "2026-08-04",
+  "cost": {
+    "microdollars": 9610000
+  }
+}
+```
+
+`agent` is included when `--agent` filtered the query.
 
 The command always scopes to the current local-time day. Use
 `agentsview usage daily --since $(date +%Y-%m-%d)` if you want the full row
@@ -896,11 +935,14 @@ for prompt modules that must stay snappy.
 
 **Monthly spend for the current month:**
 
+Costs are reported as `money` objects, so read `.microdollars` and divide when
+you want dollars:
+
 ```bash
 agentsview usage daily \
   --since "$(date +%Y-%m-01)" \
   --json \
-  | jq '.totals.totalCost'
+  | jq '.totals.totalCost.microdollars / 1000000'
 ```
 
 **Per-agent totals for the last 7 days:**
@@ -917,7 +959,7 @@ for a in claude codex copilot gemini; do
     --since "$since" \
     --agent "$a" \
     --json 2>/dev/null \
-    | jq '.totals.totalCost')
+    | jq -r '.totals.totalCost.microdollars / 1000000 | tostring')
   printf "%-8s  \$%s\n" "$a" "$total"
 done
 ```
@@ -926,13 +968,20 @@ done
 
 The script writes to stderr and exits non-zero so you can wire it into whatever
 notifier fits your OS — cron's `MAILTO`, launchd's `StandardErrorPath`, a
-systemd timer's journal, or a Windows Task Scheduler action:
+systemd timer's journal, or a Windows Task Scheduler action.
+
+`--json` reports the cost as exact microdollars, so the threshold is an integer
+comparison instead of a parse of the formatted line. `jq -e` fails the script
+when the value is missing, so a broken read cannot pass for an under-budget
+day:
 
 ```bash
-today=$(agentsview usage statusline --offline --no-sync \
-  | tr -dc '0-9.')
-if awk -v t="$today" 'BEGIN {exit !(t+0 > 25)}'; then
-  echo "AgentsView: AI spend \$$today today (> \$25)" >&2
+budget_usd=25
+spent=$(agentsview usage statusline --json --offline --no-sync \
+  | jq -e '.cost.microdollars') || exit 1
+if [ "$spent" -gt $((budget_usd * 1000000)) ]; then
+  printf 'AgentsView: $%d.%02d today (over $%d)\n' \
+    $((spent / 1000000)) $((spent % 1000000 / 10000)) "$budget_usd" >&2
   exit 1
 fi
 ```

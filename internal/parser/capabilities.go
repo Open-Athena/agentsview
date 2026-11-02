@@ -54,6 +54,7 @@ type SourceCapabilities struct {
 	WatchRoots           CapabilitySupport
 	ActivityHints        CapabilitySupport
 	ClassifyChangedPath  CapabilitySupport
+	ChangedPathRelevance CapabilitySupport
 	StoredSourceHints    CapabilitySupport
 	FindSource           CapabilitySupport
 	CompositeFingerprint CapabilitySupport

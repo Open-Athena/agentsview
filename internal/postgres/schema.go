@@ -27,6 +27,95 @@ type columnMigration struct {
 	desc   string
 }
 
+// fallback_key remains in the installed signature so CREATE OR REPLACE can
+// upgrade existing databases; extraction is deliberately governed by
+// json_path for both valid and supported malformed values.
+const postgresUsageJSONHelperDDL = `
+CREATE OR REPLACE FUNCTION agentsview_json_integer(
+    raw_value TEXT, json_path TEXT[], fallback_key TEXT
+) RETURNS TEXT
+LANGUAGE PLpgSQL
+IMMUTABLE
+AS $function$
+DECLARE
+    parsed JSONB;
+    counter TEXT;
+    repaired TEXT;
+BEGIN
+    parsed := raw_value::JSONB;
+    counter := parsed #>> json_path;
+    IF counter ~ '^-?[0-9]+$' THEN
+        RETURN counter;
+    END IF;
+    RETURN NULL;
+EXCEPTION WHEN OTHERS THEN
+    BEGIN
+        repaired := raw_value || repeat('}', GREATEST(
+            length(raw_value) - length(replace(raw_value, '{', '')) -
+            (length(raw_value) - length(replace(raw_value, '}', ''))),
+            0));
+        parsed := repaired::JSONB;
+        counter := parsed #>> json_path;
+        IF counter ~ '^-?[0-9]+$' THEN
+            RETURN counter;
+        END IF;
+        RETURN NULL;
+    EXCEPTION WHEN OTHERS THEN
+        RETURN NULL;
+    END;
+END;
+$function$;`
+
+// cockroachUsageJSONHelperDDL avoids PL/pgSQL exception blocks, which older
+// CockroachDB releases reject. json_valid guards the JSONB cast; end-truncated
+// legacy objects are balanced before the exact requested path is extracted.
+const cockroachUsageJSONHelperDDL = `
+CREATE OR REPLACE FUNCTION agentsview_json_integer(
+    raw_value TEXT, json_path TEXT[], fallback_key TEXT
+) RETURNS TEXT
+LANGUAGE SQL
+IMMUTABLE
+AS $function$
+SELECT CASE
+    WHEN json_valid(candidate_value) THEN
+        CASE
+            WHEN (candidate_value::JSONB #>> json_path) ~ '^-?[0-9]+$'
+                THEN candidate_value::JSONB #>> json_path
+            ELSE NULL
+        END
+    ELSE NULL
+END
+FROM (
+    SELECT CASE
+        WHEN json_valid(raw_value) THEN raw_value
+        ELSE raw_value || repeat('}', GREATEST(
+            length(raw_value) - length(replace(raw_value, '{', '')) -
+            (length(raw_value) - length(replace(raw_value, '}', ''))),
+            0))
+        END AS candidate_value
+) repaired
+$function$;`
+
+const usageJSONHelperProbe = `
+SELECT
+    agentsview_json_integer(
+        '{"metadata":{"output_tokens":900},"output_tokens":"42"}',
+        ARRAY['output_tokens'], 'output_tokens'),
+    agentsview_json_integer(
+        '{"metadata":{"web_search_requests":9},"server_tool_use":{"web_search_requests":"2"}}',
+        ARRAY['server_tool_use', 'web_search_requests'],
+        'web_search_requests'),
+    agentsview_json_integer(
+        '{"output_tokens":"7"',
+        ARRAY['output_tokens'], 'output_tokens'),
+    agentsview_json_integer(
+        '{"metadata":{"output_tokens":900},"output_tokens":"42"',
+        ARRAY['output_tokens'], 'output_tokens'),
+    agentsview_json_integer(
+        '{"metadata":{"web_search_requests":9},"server_tool_use":{"web_search_requests":"2"',
+        ARRAY['server_tool_use', 'web_search_requests'],
+        'web_search_requests')`
+
 // coreDDL creates the tables and indexes. It uses unqualified
 // names because Open() sets search_path to the target schema.
 //
@@ -50,6 +139,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     agent              TEXT NOT NULL,
     agent_label        TEXT NOT NULL DEFAULT '',
     entrypoint         TEXT NOT NULL DEFAULT '',
+    session_kind       TEXT NOT NULL DEFAULT '',
     first_message      TEXT,
     display_name       TEXT,
     source_display_name TEXT,
@@ -63,6 +153,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     message_count      INT NOT NULL DEFAULT 0,
     user_message_count INT NOT NULL DEFAULT 0,
     parent_session_id  TEXT,
+    parser_parent_session_id TEXT,
     relationship_type  TEXT NOT NULL DEFAULT '',
     total_output_tokens INT NOT NULL DEFAULT 0,
     peak_context_tokens INT NOT NULL DEFAULT 0,
@@ -93,6 +184,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     runaway_tool_loop_count   INT NOT NULL DEFAULT 0,
     termination_status        TEXT,
     transcript_revision       TEXT NOT NULL DEFAULT '0',
+    source_archive_id          TEXT NOT NULL DEFAULT '',
+    source_database_generation TEXT NOT NULL DEFAULT '',
+    file_path                  TEXT,
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -121,6 +215,7 @@ CREATE TABLE IF NOT EXISTS messages (
     claude_request_id  TEXT NOT NULL DEFAULT '',
     source_type        TEXT NOT NULL DEFAULT '',
     source_subtype     TEXT NOT NULL DEFAULT '',
+    prompt_source      TEXT NOT NULL DEFAULT '',
     source_uuid        TEXT NOT NULL DEFAULT '',
     source_parent_uuid TEXT NOT NULL DEFAULT '',
     is_sidechain       BOOLEAN NOT NULL DEFAULT FALSE,
@@ -287,6 +382,29 @@ CREATE TABLE IF NOT EXISTS source_project_identity_observations (
 CREATE INDEX IF NOT EXISTS idx_source_project_identity_observations_project
     ON source_project_identity_observations (project);
 
+CREATE TABLE IF NOT EXISTS source_project_identity_observation_scopes (
+    source_archive_id TEXT NOT NULL,
+    project           TEXT NOT NULL,
+    machine           TEXT NOT NULL,
+    root_path         TEXT NOT NULL DEFAULT '',
+    git_remote        TEXT NOT NULL DEFAULT '',
+    publication_scope TEXT NOT NULL,
+    PRIMARY KEY (
+        source_archive_id, project, machine, root_path, git_remote,
+        publication_scope
+    ),
+    FOREIGN KEY (
+        source_archive_id, project, machine, root_path, git_remote
+    ) REFERENCES source_project_identity_observations (
+        source_archive_id, project, machine, root_path, git_remote
+    ) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_project_identity_observation_scopes_scope
+    ON source_project_identity_observation_scopes (
+        source_archive_id, publication_scope
+    );
+
 CREATE TABLE IF NOT EXISTS source_session_project_identity_snapshots (
     source_archive_id          TEXT NOT NULL,
     source_database_generation TEXT NOT NULL,
@@ -316,6 +434,59 @@ CREATE TABLE IF NOT EXISTS source_session_project_identity_snapshots (
 CREATE INDEX IF NOT EXISTS idx_source_session_project_identity_snapshots_project
     ON source_session_project_identity_snapshots (
         source_archive_id, project
+    );
+
+CREATE TABLE IF NOT EXISTS source_session_project_identity_snapshot_scopes (
+    source_archive_id          TEXT NOT NULL,
+    source_database_generation TEXT NOT NULL,
+    source_session_id          TEXT NOT NULL,
+    publication_scope          TEXT NOT NULL,
+    PRIMARY KEY (
+        source_archive_id, source_database_generation, source_session_id,
+        publication_scope
+    ),
+    FOREIGN KEY (
+        source_archive_id, source_database_generation, source_session_id
+    ) REFERENCES source_session_project_identity_snapshots (
+        source_archive_id, source_database_generation, source_session_id
+    ) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_session_project_identity_snapshot_scopes_scope
+    ON source_session_project_identity_snapshot_scopes (
+        source_archive_id, publication_scope
+    );
+
+CREATE TABLE IF NOT EXISTS source_worktree_project_mappings (
+    source_archive_id TEXT NOT NULL,
+    machine           TEXT NOT NULL,
+    path_prefix       TEXT NOT NULL,
+    layout            TEXT NOT NULL DEFAULT 'explicit',
+    project           TEXT NOT NULL DEFAULT '',
+    original_project  TEXT NOT NULL DEFAULT '',
+    enabled           BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_at        TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (source_archive_id, machine, path_prefix)
+);
+
+CREATE TABLE IF NOT EXISTS source_worktree_project_mapping_scopes (
+    source_archive_id TEXT NOT NULL,
+    machine           TEXT NOT NULL,
+    path_prefix       TEXT NOT NULL,
+    publication_scope TEXT NOT NULL,
+    PRIMARY KEY (
+        source_archive_id, machine, path_prefix, publication_scope
+    ),
+    FOREIGN KEY (
+        source_archive_id, machine, path_prefix
+    ) REFERENCES source_worktree_project_mappings (
+        source_archive_id, machine, path_prefix
+    ) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_worktree_project_mapping_scopes_scope
+    ON source_worktree_project_mapping_scopes (
+        source_archive_id, publication_scope
     );
 
 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -645,6 +816,60 @@ func rekeyMigratedCursorUsageEventsPG(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
+func probeUsageJSONHelper(ctx context.Context, db *sql.DB) error {
+	var outputTokens, webSearchRequests, malformedOutput string
+	var malformedScopedOutput, malformedScopedWebSearch string
+	if err := db.QueryRowContext(ctx, usageJSONHelperProbe).Scan(
+		&outputTokens, &webSearchRequests, &malformedOutput,
+		&malformedScopedOutput, &malformedScopedWebSearch,
+	); err != nil {
+		return err
+	}
+	if outputTokens != "42" || webSearchRequests != "2" ||
+		malformedOutput != "7" || malformedScopedOutput != "42" ||
+		malformedScopedWebSearch != "2" {
+		return fmt.Errorf(
+			"unexpected extraction results: output=%q web_search=%q "+
+				"malformed=%q malformed_scoped_output=%q "+
+				"malformed_scoped_web_search=%q",
+			outputTokens, webSearchRequests, malformedOutput,
+			malformedScopedOutput, malformedScopedWebSearch,
+		)
+	}
+	return nil
+}
+
+func ensureUsageJSONHelper(ctx context.Context, db *sql.DB) error {
+	_, primaryErr := db.ExecContext(ctx, postgresUsageJSONHelperDDL)
+	if primaryErr == nil {
+		primaryErr = probeUsageJSONHelper(ctx, db)
+		if primaryErr == nil {
+			return nil
+		}
+	}
+
+	if _, err := db.ExecContext(ctx, cockroachUsageJSONHelperDDL); err != nil {
+		return fmt.Errorf(
+			"creating usage JSON helper: PL/pgSQL implementation failed: %v; "+
+				"SQL fallback failed: %w",
+			primaryErr, err,
+		)
+	}
+	if err := probeUsageJSONHelper(ctx, db); err != nil {
+		return fmt.Errorf(
+			"validating Cockroach-compatible usage JSON helper "+
+				"after PL/pgSQL implementation failed (%v): %w",
+			primaryErr, err,
+		)
+	}
+	log.Printf(
+		"pg schema: using Cockroach-compatible SQL usage JSON helper "+
+			"after PL/pgSQL probe failed: %v",
+		primaryErr,
+	)
+	return nil
+}
+
 // EnsureSchema creates the schema (if needed), then runs
 // idempotent CREATE TABLE / ALTER TABLE statements. The schema
 // parameter is the unquoted schema name (e.g. "agentsview").
@@ -678,6 +903,14 @@ func EnsureSchema(
 	}
 	log.Printf(
 		"pg schema: core DDL step completed in %s",
+		time.Since(step).Round(time.Millisecond),
+	)
+	step = time.Now()
+	if err := ensureUsageJSONHelper(ctx, db); err != nil {
+		return err
+	}
+	log.Printf(
+		"pg schema: usage JSON helper step completed in %s",
 		time.Since(step).Round(time.Millisecond),
 	)
 
@@ -717,6 +950,11 @@ func EnsureSchema(
 			"sessions", "deletion_cause",
 			`deletion_cause TEXT`,
 			"adding sessions.deletion_cause",
+		},
+		{
+			"sessions", "parser_parent_session_id",
+			`parser_parent_session_id TEXT`,
+			"adding sessions.parser_parent_session_id",
 		},
 		{
 			"sessions", "total_output_tokens",
@@ -964,6 +1202,11 @@ func EnsureSchema(
 			"adding messages.source_subtype",
 		},
 		{
+			"messages", "prompt_source",
+			`prompt_source TEXT NOT NULL DEFAULT ''`,
+			"adding messages.prompt_source",
+		},
+		{
 			"messages", "source_uuid",
 			`source_uuid TEXT NOT NULL DEFAULT ''`,
 			"adding messages.source_uuid",
@@ -1019,6 +1262,11 @@ func EnsureSchema(
 			"adding sessions.entrypoint",
 		},
 		{
+			"sessions", "session_kind",
+			`session_kind TEXT NOT NULL DEFAULT ''`,
+			"adding sessions.session_kind",
+		},
+		{
 			"source_project_identity_observations", "source_archive_id",
 			`source_archive_id TEXT NOT NULL DEFAULT ''`,
 			"adding source_project_identity_observations.source_archive_id",
@@ -1062,6 +1310,21 @@ func EnsureSchema(
 			"model_pricing", "cache_creation_1h_microdollars_per_mtok",
 			`cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0`,
 			"adding model_pricing.cache_creation_1h_microdollars_per_mtok",
+		},
+		{
+			"sessions", "source_archive_id",
+			`source_archive_id TEXT NOT NULL DEFAULT ''`,
+			"adding sessions.source_archive_id",
+		},
+		{
+			"sessions", "source_database_generation",
+			`source_database_generation TEXT NOT NULL DEFAULT ''`,
+			"adding sessions.source_database_generation",
+		},
+		{
+			"sessions", "file_path",
+			`file_path TEXT`,
+			"adding sessions.file_path",
 		},
 	}
 	step = time.Now()
@@ -2106,6 +2369,13 @@ func pgHasIndex(ctx context.Context, db *sql.DB, name string) bool {
 func CheckSchemaCompat(
 	ctx context.Context, db *sql.DB,
 ) error {
+	if err := probeUsageJSONHelper(ctx, db); err != nil {
+		return fmt.Errorf(
+			"usage JSON helper missing or incompatible: %w",
+			err,
+		)
+	}
+
 	rows, err := db.QueryContext(ctx,
 		`SELECT updated_at, `+pgSessionCols+`
 		 FROM sessions LIMIT 0`)
@@ -2162,7 +2432,7 @@ func CheckSchemaCompat(
 			context_tokens, output_tokens,
 			has_context_tokens, has_output_tokens,
 			claude_message_id, claude_request_id,
-			source_type, source_subtype, source_uuid,
+			source_type, source_subtype, prompt_source, source_uuid,
 			source_parent_uuid, is_sidechain,
 			is_compact_boundary
 		 FROM messages LIMIT 0`)
@@ -2354,13 +2624,34 @@ func CheckSchemaCompat(
 		)
 	}
 	rows.Close()
+	rows, err = db.QueryContext(ctx,
+		`SELECT source_archive_id, source_database_generation, file_path
+		 FROM sessions LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"sessions table missing provenance columns: %w", err,
+		)
+	}
+	rows.Close()
+	rows, err = db.QueryContext(ctx,
+		`SELECT source_archive_id, machine, path_prefix, layout, project,
+			original_project, enabled, updated_at
+		 FROM source_worktree_project_mappings LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"source_worktree_project_mappings table missing required columns: %w",
+			err,
+		)
+	}
+	rows.Close()
 	return nil
 }
 
 // checkPushSchemaCompat verifies schema elements that only push needs. PG serve
-// never reads sync_metadata or owner_marker, so they live outside
-// CheckSchemaCompat (which gates read-only serve startup) and are checked only
-// on the push fast path.
+// never reads sync_metadata or sessions.owner_marker, so they live outside
+// CheckSchemaCompat (which gates read-only serve startup and now probes the
+// serve-read sessions.source_archive_id/file_path provenance columns itself)
+// and are checked only on the push fast path.
 func checkPushSchemaCompat(ctx context.Context, db *sql.DB) error {
 	rows, err := db.QueryContext(ctx,
 		`SELECT key, value FROM sync_metadata LIMIT 0`)
@@ -2400,7 +2691,11 @@ func pushSchemaCurrent(ctx context.Context, db *sql.DB) bool {
 		!pgHasTable(ctx, db, "model_pricing_bands") ||
 		!pgHasTable(ctx, db, "source_archives") ||
 		!pgHasTable(ctx, db, "source_project_identity_observations") ||
+		!pgHasTable(ctx, db, "source_project_identity_observation_scopes") ||
 		!pgHasTable(ctx, db, "source_session_project_identity_snapshots") ||
+		!pgHasTable(ctx, db, "source_session_project_identity_snapshot_scopes") ||
+		!pgHasTable(ctx, db, "source_worktree_project_mappings") ||
+		!pgHasTable(ctx, db, "source_worktree_project_mapping_scopes") ||
 		!pgHasTable(ctx, db, "cursor_usage_events") {
 		return false
 	}

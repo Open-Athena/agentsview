@@ -173,6 +173,7 @@ func (c *usageProbeConn) QueryContext(
 				"ts",
 				"model",
 				"token_usage",
+				"web_search_requests",
 				"input_tokens",
 				"output_tokens",
 				"cache_creation_input_tokens",
@@ -206,6 +207,7 @@ func usageProbeUsageRow(
 		ts,
 		"claude-sonnet",
 		`{"input_tokens":100,"output_tokens":50}`,
+		int64(0),
 		int64(0),
 		int64(0),
 		int64(0),
@@ -318,6 +320,7 @@ func TestPGUsageAmountsPreserveSessionSummaryUsageEventTokens(t *testing.T) {
 func TestPGDailyUsageAmountsPricingBandRequestScope(t *testing.T) {
 	tests := []struct {
 		name           string
+		usageSource    string
 		messageOrdinal sql.NullInt64
 		wantCost       int64
 		wantAggregate  int
@@ -325,12 +328,20 @@ func TestPGDailyUsageAmountsPricingBandRequestScope(t *testing.T) {
 	}{
 		{
 			name:           "ordinal-bound request uses band",
+			usageSource:    "usage-event",
 			messageOrdinal: sql.NullInt64{Int64: 1, Valid: true},
 			wantCost:       600_000,
 			wantBand:       1,
 		},
 		{
+			name:        "Goose request uses band without message ordinal",
+			usageSource: "goose-request",
+			wantCost:    600_000,
+			wantBand:    1,
+		},
+		{
 			name:          "unbound aggregate uses base",
+			usageSource:   "usage-event",
 			wantCost:      300_000,
 			wantAggregate: 1,
 		},
@@ -340,7 +351,7 @@ func TestPGDailyUsageAmountsPricingBandRequestScope(t *testing.T) {
 			resolver := pgPricingBandTestResolver()
 			_, _, _, _, cost, _, err := pgDailyUsageAmounts(pgDailyUsageScanRow{
 				messageOrdinal: tt.messageOrdinal,
-				usageSource:    "usage-event",
+				usageSource:    tt.usageSource,
 				model:          "banded-model",
 				inputTokens:    300_000,
 			}, resolver)
@@ -530,8 +541,9 @@ func TestPGMatchingUsageRowsSQLForBoundsRelaxesTokenEligibility(t *testing.T) {
 func TestPGTopSessionsUsageRowQueryUsesNarrowScan(t *testing.T) {
 	pb := &paramBuilder{}
 	query := pgTopSessionsUsageRowQuery(pb, db.UsageFilter{
-		From: "2024-06-01",
-		To:   "2024-06-30",
+		From:     "2024-06-01",
+		To:       "2024-06-30",
+		Timezone: "America/New_York",
 	})
 
 	normalized := strings.ToLower(query)
@@ -556,9 +568,13 @@ func TestPGTopSessionsUsageRowQueryUsesNarrowScan(t *testing.T) {
 		"ue.occurred_at is null\n\tand s.started_at >= $1::timestamptz")
 	assert.Contains(t, normalized, "m.timestamp <= $2::timestamptz")
 	assert.Contains(t, normalized, "ue.occurred_at <= $2::timestamptz")
-	require.Len(t, pb.args, 2)
+	assert.Contains(t, normalized, "u.ts >= $3::timestamptz")
+	assert.Contains(t, normalized, "u.ts < $4::timestamptz")
+	require.Len(t, pb.args, 4)
 	assert.Equal(t, "2024-05-31T10:00:00Z", pb.args[0])
 	assert.Equal(t, "2024-07-01T13:59:59Z", pb.args[1])
+	assert.Equal(t, time.Date(2024, 6, 1, 4, 0, 0, 0, time.UTC), pb.args[2])
+	assert.Equal(t, time.Date(2024, 7, 1, 4, 0, 0, 0, time.UTC), pb.args[3])
 }
 
 func TestPGSessionRowCostIncludesReasoningOnlyRows(t *testing.T) {

@@ -40,6 +40,10 @@ func TestProviderSyncSemanticsDeclarations(t *testing.T) {
 		AgentGemini: {
 			FingerprintHashRequiredForFreshness: true,
 		},
+		AgentGoose: {
+			FingerprintHashInCacheKey:           true,
+			FingerprintHashRequiredForFreshness: true,
+		},
 		AgentZed: {
 			UnchangedResults: UnchangedResultMTime,
 		},
@@ -55,17 +59,26 @@ func TestProviderSyncSemanticsDeclarations(t *testing.T) {
 		AgentShelley: {
 			UnchangedResults: UnchangedResultMTimeAndHash,
 		},
+		// The OpenCode family shares one physical container per root, so
+		// freshness consults the per-session child digest: it is the only
+		// signal that sees a deleted message or part, which a MAX over
+		// timestamps cannot. Containers without composite support emit an
+		// empty hash, which the gate treats as no constraint.
 		AgentOpenCode: {
-			UnchangedResults: UnchangedResultMTimeAndHash,
+			UnchangedResults:                    UnchangedResultMTimeAndHash,
+			FingerprintHashRequiredForFreshness: true,
 		},
 		AgentKilo: {
-			UnchangedResults: UnchangedResultMTimeAndHash,
+			UnchangedResults:                    UnchangedResultMTimeAndHash,
+			FingerprintHashRequiredForFreshness: true,
 		},
 		AgentMiMoCode: {
-			UnchangedResults: UnchangedResultMTimeAndHash,
+			UnchangedResults:                    UnchangedResultMTimeAndHash,
+			FingerprintHashRequiredForFreshness: true,
 		},
 		AgentIcodemate: {
-			UnchangedResults: UnchangedResultMTimeAndHash,
+			UnchangedResults:                    UnchangedResultMTimeAndHash,
+			FingerprintHashRequiredForFreshness: true,
 		},
 		AgentOmnigent: {
 			FingerprintHashInCacheKey:           true,

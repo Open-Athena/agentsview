@@ -246,6 +246,7 @@ export CURSOR_PROJECTS_DIR=~/custom/cursor/projects
 export DEEPSEEK_TUI_SESSIONS_DIR=~/custom/deepseek/sessions
 export FORGE_DIR=~/custom/forge
 export GEMINI_DIR=~/custom/gemini
+export GOOSE_PATH_ROOT=~/custom/goose
 export GPTME_DIR=~/custom/gptme/logs
 export GROK_DIR=~/custom/grok/sessions
 export HERMES_SESSIONS_DIR=~/custom/hermes

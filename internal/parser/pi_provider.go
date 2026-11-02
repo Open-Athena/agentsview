@@ -23,7 +23,7 @@ func (f piProviderFactory) Definition() AgentDef {
 }
 
 func (f piProviderFactory) Capabilities() Capabilities {
-	return piProviderCapabilities()
+	return piProviderCapabilities(f.def.Type)
 }
 
 func (f piProviderFactory) NewProvider(cfg ProviderConfig) Provider {
@@ -31,7 +31,7 @@ func (f piProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	return &piProvider{
 		ProviderBase: ProviderBase{
 			Def:    cloneAgentDef(f.def),
-			Caps:   piProviderCapabilities(),
+			Caps:   piProviderCapabilities(f.def.Type),
 			Config: cfg,
 		},
 		sources: newPiSourceSet(f.def.Type, cfg.Roots),
@@ -97,14 +97,29 @@ func (p *piProvider) FindSource(
 		if source, ok, err := p.sources.sourceForPath(ctx, path); err != nil {
 			return SourceRef{}, false, err
 		} else if ok {
-			return source, true, nil
+			if p.Def.Type != AgentPrimeAgent || req.RawSessionID == "" {
+				return source, true, nil
+			}
+			src, isJSONL := source.Opaque.(JSONLSource)
+			if !isJSONL {
+				continue
+			}
+			headerID, valid := piSessionHeaderID(src.Path)
+			if valid && (headerID == req.RawSessionID ||
+				(headerID == "" &&
+					piSessionIDFromPath("", src.Path) == req.RawSessionID)) {
+				return source, true, nil
+			}
 		}
 	}
 	if req.RawSessionID == "" || !IsValidSessionID(req.RawSessionID) {
 		return SourceRef{}, false, nil
 	}
+	if p.Def.Type == AgentPrimeAgent {
+		return p.sourceForPrimeSessionID(ctx, req.RawSessionID)
+	}
 	if p.Def.Type == AgentOMP {
-		return p.sourceForOMPHeaderSessionID(ctx, req.RawSessionID)
+		return p.sourceForHeaderSessionID(ctx, req.RawSessionID)
 	}
 	for _, root := range p.Config.Roots {
 		source, ok, err := p.sourceForSessionID(ctx, root, req.RawSessionID)
@@ -115,11 +130,41 @@ func (p *piProvider) FindSource(
 	return SourceRef{}, false, nil
 }
 
+func (p *piProvider) sourceForPrimeSessionID(
+	ctx context.Context,
+	sessionID string,
+) (SourceRef, bool, error) {
+	for _, root := range p.Config.Roots {
+		direct := filepath.Join(root, sessionID+".jsonl")
+		source, ok, err := p.sources.sourceForPath(ctx, direct)
+		if err != nil {
+			return SourceRef{}, false, err
+		}
+		if !ok {
+			continue
+		}
+		src, ok := source.Opaque.(JSONLSource)
+		if !ok {
+			continue
+		}
+		headerID, valid := piSessionHeaderID(src.Path)
+		if valid && (headerID == "" || headerID == sessionID) {
+			return source, true, nil
+		}
+	}
+	return p.sourceForHeaderSessionID(ctx, sessionID)
+}
+
 func (p *piProvider) sourceForSessionID(
 	ctx context.Context,
 	root string,
 	sessionID string,
 ) (SourceRef, bool, error) {
+	direct := filepath.Join(root, sessionID+".jsonl")
+	if source, ok, err := p.sources.sourceForPath(ctx, direct); err != nil || ok {
+		return source, ok, err
+	}
+
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return SourceRef{}, false, nil
@@ -144,7 +189,7 @@ func (p *piProvider) sourceForSessionID(
 	return SourceRef{}, false, nil
 }
 
-func (p *piProvider) sourceForOMPHeaderSessionID(
+func (p *piProvider) sourceForHeaderSessionID(
 	ctx context.Context,
 	sessionID string,
 ) (SourceRef, bool, error) {
@@ -160,7 +205,7 @@ func (p *piProvider) sourceForOMPHeaderSessionID(
 		if !ok {
 			continue
 		}
-		headerID, ok := ompSessionHeaderID(src.Path)
+		headerID, ok := piSessionHeaderID(src.Path)
 		if !ok {
 			continue
 		}
@@ -216,6 +261,7 @@ func (p *piProvider) Parse(
 			DataVersion: DataVersionCurrent,
 		}},
 		ResultSetComplete: true,
+		ForceReplace:      p.Def.Type == AgentPrimeAgent,
 	}, nil
 }
 
@@ -232,6 +278,19 @@ func (p *piProvider) filterDiscoveredSources(sources []SourceRef) []SourceRef {
 }
 
 func newPiSourceSet(agent AgentType, roots []string) JSONLSourceSet {
+	// Prime Agent writes current sessions directly under its flat sessions
+	// root. Its producer migrates the older per-project layout before normal
+	// session listing, so discovery mirrors the current persisted boundary.
+	if agent == AgentPrimeAgent {
+		return NewJSONLSourceSet(agent, roots,
+			WithFollowSymlinkFiles(),
+			WithIncludePath(isPiSourcePath),
+			WithProjectHint(func(root, path string) string { return "" }),
+			WithSessionIDFromPath(piSessionIDFromPath),
+			WithContentHashing(),
+		)
+	}
+
 	// OMP nests subagent transcripts one directory deeper than the main
 	// session (<project>/<session>/<agent>.jsonl), so it cannot use the
 	// strict two-segment DirectoryJSONLSourceSet layout the other pi-family
@@ -293,7 +352,7 @@ func piSessionIDFromPath(root, path string) string {
 	return strings.TrimSuffix(filepath.Base(path), ".jsonl")
 }
 
-func piProviderCapabilities() Capabilities {
+func piProviderCapabilities(agent AgentType) Capabilities {
 	caps := Capabilities{
 		Source: jsonlFileProviderSourceCapabilities(),
 		Content: ContentCapabilities{
@@ -309,5 +368,8 @@ func piProviderCapabilities() Capabilities {
 		},
 	}
 	caps.Source.StreamingDiscovery = CapabilitySupported
+	if agent == AgentPrimeAgent {
+		caps.Source.ForceReplaceOnParse = CapabilitySupported
+	}
 	return caps
 }
