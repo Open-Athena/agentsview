@@ -18,11 +18,20 @@ func BuildUsageSourceFilter(f UsageFilter, b *QueryBuilder, modelCol string) []s
 
 // BuildUsageSessionFilter preserves label arrays and the session-stage argument order.
 func BuildUsageSessionFilter(f UsageFilter, b *QueryBuilder, sessionID string) []string {
+	return BuildUsageSessionFilterWithProject(f, b, sessionID, "s.project")
+}
+
+// BuildUsageSessionFilterWithProject is BuildUsageSessionFilter with the
+// expression project include, exclude, and branch filters match against. A
+// backend that attributes usage to a project other than s.project passes the
+// same expression it groups by, so a project filter selects exactly the usage
+// the breakdown shows under that project.
+func BuildUsageSessionFilterWithProject(f UsageFilter, b *QueryBuilder, sessionID, projectCol string) []string {
 	var preds []string
 	for _, item := range []struct {
 		col    string
 		values []string
-	}{{"s.agent", CSVFilterValues(f.Agent)}, {"s.project", f.ProjectFilterLabels()}} {
+	}{{"s.agent", CSVFilterValues(f.Agent)}, {projectCol, f.ProjectFilterLabels()}} {
 		if pred := b.ValuesPredicate(item.col, item.values, true); pred != "" {
 			preds = append(preds, pred)
 		}
@@ -31,12 +40,12 @@ func BuildUsageSessionFilter(f UsageFilter, b *QueryBuilder, sessionID string) [
 		preds = append(preds, b.MachinePredicate("s.id", "s.machine", values))
 	}
 	if f.GitBranch != "" {
-		preds = append(preds, BranchPairPredicate("s.project", "s.git_branch", f.GitBranch, func(v string) string { return b.Add(v) }))
+		preds = append(preds, BranchPairPredicate(projectCol, "s.git_branch", f.GitBranch, func(v string) string { return b.Add(v) }))
 	}
 	for _, item := range []struct {
 		col    string
 		values []string
-	}{{"s.project", f.ExcludedProjectFilterLabels()}, {"s.agent", CSVFilterValues(f.ExcludeAgent)}} {
+	}{{projectCol, f.ExcludedProjectFilterLabels()}, {"s.agent", CSVFilterValues(f.ExcludeAgent)}} {
 		if pred := b.ValuesPredicate(item.col, item.values, false); pred != "" {
 			preds = append(preds, pred)
 		}

@@ -163,7 +163,9 @@ func (f UsageFilter) appendUsageSessionFilterClauses(
 	where string, args []any,
 ) (string, []any) {
 	b := NewQueryBuilder(SQLiteQueryDialect(), 0)
-	preds := BuildUsageSessionFilter(f, b, "")
+	// Subagents are attributed to their parent's project (rollupProjectExpr),
+	// so project filters match that same attribution.
+	preds := BuildUsageSessionFilterWithProject(f, b, "", "("+rollupProjectExpr+")")
 	where = AppendUsagePredicates(where, preds, "\t")
 	return where, append(args, b.Args()...)
 }
