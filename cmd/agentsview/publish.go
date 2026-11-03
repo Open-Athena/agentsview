@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -28,7 +29,6 @@ type PublishConfig struct {
 	Visibility  string
 	NoDirenv    bool
 	DenyList    string
-	JSON        bool
 }
 
 func newPublishCommand() *cobra.Command {
@@ -54,16 +54,15 @@ func newPublishCommand() *cobra.Command {
 		Args:         cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if cfg.Preview == (cfg.Out != "") {
-				return fmt.Errorf("pass exactly one of --preview or --out")
+				return errors.New("pass exactly one of --preview or --out")
 			}
-			return runPublish(cmd.Context(), cmd.OutOrStdout(), args, cfg)
+			return runPublish(cmd.Context(), cmd.OutOrStdout(), args, cfg, outputFormat(cmd) == "json")
 		},
 	}
 	cmd.Flags().StringVarP(&cfg.Contributor, "contributor", "c", "",
 		"Contributor email stamped into manifest.json (default $AGENTSVIEW_CONTRIBUTOR)")
 	cmd.Flags().StringVarP(&cfg.DenyList, "deny", "d", "",
 		"Deny-list file of terms to flag (default <data dir>/publish-deny.txt)")
-	cmd.Flags().BoolVarP(&cfg.JSON, "json", "j", false, "Print the report as JSON")
 	cmd.Flags().BoolVarP(&cfg.NoDirenv, "no-direnv", "D", false,
 		"Read .envrc files instead of resolving each directory through direnv")
 	cmd.Flags().StringVarP(&cfg.Out, "out", "o", "", "Write the redacted snapshot to this (empty or new) directory")
@@ -74,10 +73,11 @@ func newPublishCommand() *cobra.Command {
 		"Only sessions that ended on or after YYYY-MM-DD")
 	cmd.Flags().StringVarP(&cfg.Visibility, "visibility", "v", "draft",
 		"Visibility stamped on each session: "+strings.Join(publish.Visibilities, ", "))
+	registerFormatFlags(cmd.Flags())
 	return cmd
 }
 
-func runPublish(ctx context.Context, w io.Writer, projects []string, cfg PublishConfig) error {
+func runPublish(ctx context.Context, w io.Writer, projects []string, cfg PublishConfig, asJSON bool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -111,7 +111,7 @@ func runPublish(ctx context.Context, w io.Writer, projects []string, cfg Publish
 	if err != nil {
 		return err
 	}
-	if cfg.JSON {
+	if asJSON {
 		b, err := json.Marshal(rep, json.Deterministic(true), jsontext.WithIndent("  "))
 		if err != nil {
 			return err

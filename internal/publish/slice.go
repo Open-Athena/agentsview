@@ -46,23 +46,8 @@ func copySessions(ctx context.Context, archive, out string, ids []string) error 
 		return fmt.Errorf("publish: attach archive: %w", err)
 	}
 
-	rows, err := conn.QueryContext(ctx, `
-		SELECT type, name, sql FROM src.sqlite_master
-		WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'`)
+	objs, err := readSchema(ctx, conn)
 	if err != nil {
-		return fmt.Errorf("publish: read archive schema: %w", err)
-	}
-	var objs []schemaObject
-	for rows.Next() {
-		var o schemaObject
-		if err := rows.Scan(&o.kind, &o.name, &o.sql); err != nil {
-			rows.Close()
-			return err
-		}
-		objs = append(objs, o)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
 		return err
 	}
 
@@ -128,6 +113,26 @@ func copySessions(ctx context.Context, archive, out string, ids []string) error 
 		return fmt.Errorf("publish: detach archive: %w", err)
 	}
 	return nil
+}
+
+// readSchema lists the attached archive's schema objects.
+func readSchema(ctx context.Context, conn *sql.DB) ([]schemaObject, error) {
+	rows, err := conn.QueryContext(ctx, `
+		SELECT type, name, sql FROM src.sqlite_master
+		WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'`)
+	if err != nil {
+		return nil, fmt.Errorf("publish: read archive schema: %w", err)
+	}
+	defer rows.Close()
+	var objs []schemaObject
+	for rows.Next() {
+		var o schemaObject
+		if err := rows.Scan(&o.kind, &o.name, &o.sql); err != nil {
+			return nil, err
+		}
+		objs = append(objs, o)
+	}
+	return objs, rows.Err()
 }
 
 func tableColumns(ctx context.Context, conn *sql.DB, table string) ([]string, error) {

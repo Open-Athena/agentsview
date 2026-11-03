@@ -8,7 +8,6 @@ import (
 	"encoding/json/v2"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -121,7 +120,7 @@ func TestPublishPreviewReportsWithoutWriting(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	assert.Equal(t, "", rep.Out)
+	assert.Empty(t, rep.Out)
 	assert.Equal(t, 1, rep.SessionCount)
 	assert.Equal(t, EnvReport{Dirs: 1, FileOnly: 1, Values: 3}, rep.Env)
 	assert.Equal(t, []string{"laptop"}, rep.Machines)
@@ -185,7 +184,7 @@ export DEBUG=true
 		b, err := os.ReadFile(filepath.Join(out, e.Name()))
 		require.NoError(t, err)
 		for _, v := range []string{r2Secret, r2KeyID, apiToken, fooToken} {
-			assert.False(t, strings.Contains(string(b), v), "%s leaks a value", e.Name())
+			assert.NotContains(t, string(b), v, "%s leaks a value", e.Name())
 		}
 	}
 

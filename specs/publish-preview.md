@@ -63,7 +63,7 @@ Keep the hub-specific parts out of core. The `publish` command, the env-value de
 
 ### Phase 1: done (CLI preview and `--out`)
 
-`agentsview publish <project>... (--preview | --out <dir>)`, in `internal/publish` and `cmd/agentsview/publish.go`. Flags: `-S/--session` (repeatable; includes subagents), `-s/--since`, `-c/--contributor` (default `$AGENTSVIEW_CONTRIBUTOR`), `-v/--visibility` (`draft`|`oa`|`link`, default `draft`), `-D/--no-direnv`, `-d/--deny`, `-j/--json`.
+`agentsview publish <project>... (--preview | --out <dir>)`, in `internal/publish` and `cmd/agentsview/publish.go`. Flags: `-S/--session` (repeatable; includes subagents), `-s/--since`, `-c/--contributor` (default `$AGENTSVIEW_CONTRIBUTOR`), `-v/--visibility` (`draft`|`oa`|`link`, default `draft`), `-D/--no-direnv`, `-d/--deny`, and the repo-wide `--format human|json` / `--json` pair.
 
 How it works:
 1. **Select**: the projects' sessions plus subagent children, narrowed by `--session` / `--since`.

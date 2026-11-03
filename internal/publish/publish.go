@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -117,7 +118,7 @@ type sessionMeta struct {
 // (preview) or writes the redacted snapshot to opts.OutDir.
 func Run(ctx context.Context, opts Options) (*Report, error) {
 	if len(opts.Projects) == 0 {
-		return nil, fmt.Errorf("publish: at least one project is required")
+		return nil, errors.New("publish: at least one project is required")
 	}
 	if opts.Visibility == "" {
 		opts.Visibility = "draft"
@@ -142,7 +143,7 @@ func Run(ctx context.Context, opts Options) (*Report, error) {
 		return nil, err
 	}
 	if len(metas) == 0 {
-		return nil, fmt.Errorf("publish: no sessions match")
+		return nil, errors.New("publish: no sessions match")
 	}
 	ids := make([]string, len(metas))
 	var dirs, machines []string
