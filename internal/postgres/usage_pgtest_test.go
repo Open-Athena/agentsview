@@ -564,7 +564,7 @@ func TestPGSnapshotRankedDailyUsageRowsOrdersTimestamps(t *testing.T) {
 					 'msg-tie', 'req-tie')`, tc.aTimestamp)
 			require.NoError(t, err)
 			pb := &paramBuilder{}
-			rowsSQL := pgUsageRowsSQLWithWhere(pgUsageMessageEligibility, pgUsageEventEligibility)
+			rowsSQL := pgUsageRowsSQLWithWhere(pgUsageMessageEligibility, pgUsageEventEligibility, db.PostgresQueryDialect())
 			ranked := pgSnapshotRankedDailyUsageRowsSQL(pb, rowsSQL, db.UsageFilter{}, db.PostgresQueryDialect())
 			var sessionID, attributionSessionID, tokenJSON string
 			err = store.DB().QueryRow(`

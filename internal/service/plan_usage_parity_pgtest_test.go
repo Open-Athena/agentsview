@@ -9,6 +9,7 @@ package service_test
 
 import (
 	"context"
+	"maps"
 	"os"
 	"path/filepath"
 	"testing"
@@ -167,46 +168,7 @@ func TestPlanUsageCountsParity(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, duck.Close()) })
 	stores["duckdb"] = duck
-
-	if pgURL := os.Getenv("TEST_PG_URL"); pgURL != "" {
-		dropSchema := func() {
-			store, err := postgresstore.NewStore(pgURL, planUsageParitySchema, true)
-			require.NoError(t, err)
-			defer func() { require.NoError(t, store.Close()) }()
-			_, err = store.DB().ExecContext(context.WithoutCancel(ctx), "DROP SCHEMA IF EXISTS "+planUsageParitySchema+" CASCADE")
-			require.NoError(t, err)
-		}
-		dropSchema()
-		t.Cleanup(dropSchema)
-		syncer, err := postgresstore.New(pgURL, planUsageParitySchema, local,
-			"parity-machine", true, storage.PusherOptions{})
-		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, syncer.Close()) })
-		require.NoError(t, syncer.EnsureSchema(ctx))
-		res, err := syncer.Push(ctx, false, nil)
-		require.NoError(t, err)
-		require.Equal(t, sessions, res.SessionsPushed)
-		pg, err := postgresstore.NewStore(pgURL, planUsageParitySchema, true)
-		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, pg.Close()) })
-		stores["postgres"] = pg
-	}
-
-	if os.Getenv("TEST_CLICKHOUSE_URL") != "" {
-		dsn, database := chtest.FreshDatabase(t)
-		target := clickhousestore.Target{URL: dsn, Database: database}
-		syncer, err := clickhousestore.New(ctx, target, local, "parity-machine",
-			storage.PusherOptions{})
-		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, syncer.Close()) })
-		res, err := syncer.Push(ctx, true, nil)
-		require.NoError(t, err)
-		require.Equal(t, sessions, res.SessionsPushed)
-		ch, err := clickhousestore.NewStore(ctx, target)
-		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, ch.Close()) })
-		stores["clickhouse"] = ch
-	}
+	maps.Copy(stores, pushParityReplicas(t, local, planUsageParitySchema, sessions))
 
 	for _, tc := range []struct {
 		name string
@@ -292,4 +254,60 @@ func TestPlanUsageCountsParity(t *testing.T) {
 		require.NotNil(t, got, name)
 		assert.Equal(t, wantRow.PlanUsage, got.PlanUsage, name)
 	}
+}
+
+func init() {
+	usageParityReplicaStores = pushParityReplicas
+}
+
+// pushParityReplicas pushes local into every configured replica and returns
+// their stores by backend name: PostgreSQL in schema when TEST_PG_URL is set,
+// and a fresh ClickHouse database when TEST_CLICKHOUSE_URL is set. Each push
+// must publish exactly sessions sessions.
+func pushParityReplicas(
+	t *testing.T, local *db.DB, schema string, sessions int,
+) map[string]db.Store {
+	t.Helper()
+	ctx := t.Context()
+	stores := map[string]db.Store{}
+	if pgURL := os.Getenv("TEST_PG_URL"); pgURL != "" {
+		dropSchema := func() {
+			store, err := postgresstore.NewStore(pgURL, schema, true)
+			require.NoError(t, err)
+			defer func() { require.NoError(t, store.Close()) }()
+			_, err = store.DB().ExecContext(context.WithoutCancel(ctx), "DROP SCHEMA IF EXISTS "+schema+" CASCADE")
+			require.NoError(t, err)
+		}
+		dropSchema()
+		t.Cleanup(dropSchema)
+		syncer, err := postgresstore.New(pgURL, schema, local,
+			"parity-machine", true, storage.PusherOptions{})
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, syncer.Close()) })
+		require.NoError(t, syncer.EnsureSchema(ctx))
+		res, err := syncer.Push(ctx, false, nil)
+		require.NoError(t, err)
+		require.Equal(t, sessions, res.SessionsPushed)
+		pg, err := postgresstore.NewStore(pgURL, schema, true)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, pg.Close()) })
+		stores["postgres"] = pg
+	}
+
+	if os.Getenv("TEST_CLICKHOUSE_URL") != "" {
+		dsn, database := chtest.FreshDatabase(t)
+		target := clickhousestore.Target{URL: dsn, Database: database}
+		syncer, err := clickhousestore.New(ctx, target, local, "parity-machine",
+			storage.PusherOptions{})
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, syncer.Close()) })
+		res, err := syncer.Push(ctx, true, nil)
+		require.NoError(t, err)
+		require.Equal(t, sessions, res.SessionsPushed)
+		ch, err := clickhousestore.NewStore(ctx, target)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, ch.Close()) })
+		stores["clickhouse"] = ch
+	}
+	return stores
 }

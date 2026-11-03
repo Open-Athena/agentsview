@@ -81,6 +81,19 @@ type QueryDialect struct {
 	// orphanPredicate renders the "parent row is missing" test used by
 	// BuildCanonicalRootWhere. Nil uses the configured parent relation.
 	orphanPredicate func(sessionAlias, parentAlias string) string
+	// usageRollupProject renders UsageRollupProjectExpr for a session alias.
+	// Nil uses the correlated parent_session_id lookup SQLite, PostgreSQL,
+	// and DuckDB share. ClickHouse has no correlated subqueries; hosted
+	// PostgreSQL resolves raw-projection parents through their links.
+	usageRollupProject func(sessionAlias string) string
+}
+
+// WithUsageRollupProject overrides how UsageRollupProjectExpr attributes a
+// session's usage to a project. The expression it returns must be scalar
+// and non-null.
+func (d QueryDialect) WithUsageRollupProject(rollup func(sessionAlias string) string) QueryDialect {
+	d.usageRollupProject = rollup
+	return d
 }
 
 // Position renders substring position syntax and panics for unsupported dialects.
@@ -334,7 +347,26 @@ func ClickHouseQueryDialect() QueryDialect {
 			return "(" + sessionAlias + ".parent_session_id IS NULL OR " +
 				sessionAlias + ".parent_session_id NOT IN (SELECT id FROM sessions))"
 		},
+		usageRollupProject: clickhouseUsageRollupProject,
 	}
+}
+
+// clickhouseUsageParentProjects is an uncorrelated scalar subquery holding
+// the IDs and non-empty projects of every session some subagent names as its
+// parent. ClickHouse evaluates it once per query, and transform() then looks
+// each row's parent up in a hash table built from the two constant arrays.
+const clickhouseUsageParentProjects = `(SELECT tuple(groupArray(id), groupArray(project))
+		FROM sessions
+		WHERE project != ''
+			AND id IN (SELECT parent_session_id FROM sessions WHERE relationship_type = 'subagent'))`
+
+// clickhouseUsageRollupProject is UsageRollupProjectExpr without a
+// correlated subquery: a subagent whose parent has a project bills to it,
+// and every other session keeps its own project.
+func clickhouseUsageRollupProject(a string) string {
+	return "if(" + a + ".relationship_type = 'subagent', ifNull(nullIf(transform(ifNull(" + a + ".parent_session_id, ''), " +
+		"tupleElement(" + clickhouseUsageParentProjects + ", 1), " +
+		"tupleElement(" + clickhouseUsageParentProjects + ", 2), ''), ''), " + a + ".project), " + a + ".project)"
 }
 
 func clickhouseTimestampParam(ph string) string {

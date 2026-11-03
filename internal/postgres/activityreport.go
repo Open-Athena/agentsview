@@ -141,7 +141,7 @@ func (s *Store) GetSessionUsageRows(
 	err = pgQueryChunked(ids, func(chunk []string) error {
 		pb := &paramBuilder{}
 		ph := pgInPlaceholders(chunk, pb)
-		query := pgUsageRowSelect() + " AND u.session_id IN " + ph
+		query := pgUsageRowSelect(s.sessionDialect()) + " AND u.session_id IN " + ph
 		rows, queryErr := s.pg.QueryContext(ctx, query, pb.args...)
 		if queryErr != nil {
 			return fmt.Errorf("querying pg session usage rows: %w", queryErr)
@@ -657,7 +657,8 @@ func (s *Store) activityReportUsage(
 						AND COALESCE(m.timestamp, s.started_at) >= `+peerLower+`::timestamptz
 						AND COALESCE(m.timestamp, s.started_at) <= `+peerUpper+`::timestamptz
 				))`,
-		pgUsageEventEligibility+" AND ue.session_id = ANY("+eventSessions+")")
+		pgUsageEventEligibility+" AND ue.session_id = ANY("+eventSessions+")",
+		s.sessionDialect())
 	query := pgDailyUsageRowSelectFromRows(rowsSQL) + `
 		AND u.ts >= ` + lower + `::timestamptz
 		AND u.ts <= ` + upper + `::timestamptz`

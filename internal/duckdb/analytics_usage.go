@@ -433,11 +433,18 @@ func appendDuckUsageSourceFilterClauses(
 	return where, append(args, b.Args()...)
 }
 
+// duckUsageProjectSQL is the project a usage row of session s bills to:
+// a subagent's usage rolls up to its parent's project, as on SQLite.
+var duckUsageProjectSQL = db.UsageRollupProjectExpr(db.DuckDBQueryDialect(), "s")
+
+// appendDuckUsageSessionFilterClauses filters on the rolled-up project, so a
+// project filter selects exactly the usage the breakdown shows under it.
 func appendDuckUsageSessionFilterClauses(
 	where string, args []any, f db.UsageFilter, sessionID string,
 ) (string, []any) {
 	b := db.NewQueryBuilder(db.DuckDBQueryDialect(), 0)
-	preds := db.BuildUsageSessionFilter(f, b, sessionID)
+	preds := db.BuildUsageSessionFilterWithProject(
+		f, b, sessionID, "("+duckUsageProjectSQL+")")
 	where = db.AppendUsagePredicates(where, preds, "\t\t\t")
 	return where, append(args, b.Args()...)
 }
@@ -543,7 +550,7 @@ func duckUsageRawSQL(f db.UsageFilter, sessionID string) (string, []any) {
 				0 AS cache_create, 0 AS cache_read,
 				COALESCE(TRY_CAST(json_extract_string(m.token_usage, '$.reasoning_tokens') AS BIGINT), 0) AS reasoning_tokens,
 				NULL AS cost_microdollars, '' AS cost_source,
-			s.project AS project, s.agent AS agent, s.machine AS machine,
+			%[3]s AS project, s.agent AS agent, s.machine AS machine,
 			s.user_message_count AS user_message_count, s.is_automated AS is_automated,
 			COALESCE(s.display_name, s.session_name, s.first_message, s.project, s.id) AS display_name,
 			s.group_key AS group_key, COALESCE(s.session_name, '') AS session_name,
@@ -551,7 +558,7 @@ func duckUsageRawSQL(f db.UsageFilter, sessionID string) (string, []any) {
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS activity_at
 		FROM messages m
 		JOIN sessions s ON s.id = m.session_id
-		WHERE %s
+		WHERE %[1]s
 		UNION ALL
 		SELECT ue.session_id AS session_id, ue.message_ordinal AS message_ordinal,
 			ue.source AS source, COALESCE(ue.occurred_at, s.started_at) AS ts,
@@ -569,7 +576,7 @@ func duckUsageRawSQL(f db.UsageFilter, sessionID string) (string, []any) {
 				ue.reasoning_tokens AS reasoning_tokens,
 				ue.cost_microdollars AS cost_microdollars,
 				ue.cost_source AS cost_source,
-			s.project AS project, s.agent AS agent, s.machine AS machine,
+			%[3]s AS project, s.agent AS agent, s.machine AS machine,
 			s.user_message_count AS user_message_count, s.is_automated AS is_automated,
 			COALESCE(s.display_name, s.session_name, s.first_message, s.project, s.id) AS display_name,
 			s.group_key AS group_key, COALESCE(s.session_name, '') AS session_name,
@@ -577,8 +584,8 @@ func duckUsageRawSQL(f db.UsageFilter, sessionID string) (string, []any) {
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS activity_at
 		FROM usage_events ue
 		JOIN sessions s ON s.id = ue.session_id
-		WHERE %s`,
-		messageWhere, eventWhere)
+		WHERE %[2]s`,
+		messageWhere, eventWhere, duckUsageProjectSQL)
 	args := make([]any, 0, len(messageArgs)+len(eventArgs))
 	args = append(args, messageArgs...)
 	args = append(args, eventArgs...)
@@ -822,7 +829,7 @@ func duckUsageCTEFromRaw(
 				ranked.snapshot_attribution_session_id AS session_id,
 				ranked.snapshot_web_search_requests AS web_search_requests_norm,
 				CASE WHEN attributed.id IS NULL THEN ranked.project
-					ELSE attributed.project END AS project,
+					ELSE ` + db.UsageRollupProjectExpr(db.DuckDBQueryDialect(), "attributed") + ` END AS project,
 				CASE WHEN attributed.id IS NULL THEN ranked.agent
 					ELSE attributed.agent END AS agent,
 				CASE WHEN attributed.id IS NULL THEN ranked.machine

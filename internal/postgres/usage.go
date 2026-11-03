@@ -64,11 +64,22 @@ func appendPGUsageSourceFilterClauses(
 	return where
 }
 
+// pgUsageProjectSQL is the project a usage row of session alias bills to: a
+// subagent's usage rolls up to its parent's project, as on SQLite. The
+// dialect carries the hosted parent lookup (see Store.sessionDialect), which
+// reads the same tenant-scoped tables as the outer query.
+func pgUsageProjectSQL(dialect db.QueryDialect, alias string) string {
+	return db.UsageRollupProjectExpr(dialect, alias)
+}
+
+// appendPGUsageSessionFilterClauses filters on the rolled-up project, so a
+// project filter selects exactly the usage the breakdown shows under it.
 func appendPGUsageSessionFilterClauses(
 	where string, pb *paramBuilder, f db.UsageFilter, dialect db.QueryDialect,
 ) string {
 	b := db.NewQueryBuilder(dialect, pb.n)
-	preds := db.BuildUsageSessionFilter(f, b, "")
+	preds := db.BuildUsageSessionFilterWithProject(
+		f, b, "", "("+pgUsageProjectSQL(dialect, "s")+")")
 	where = db.AppendUsagePredicates(where, preds, "\t")
 	pb.args = append(pb.args, b.Args()...)
 	pb.n += len(b.Args())
@@ -97,7 +108,7 @@ SELECT
 	m.claude_request_id,
 	m.source_uuid,
 	'' AS usage_dedup_key,
-	s.project,
+	%[3]s AS project,
 	s.agent,
 	s.machine,
 	s.user_message_count,
@@ -107,7 +118,7 @@ SELECT
 	s.started_at
 FROM messages m
 JOIN sessions s ON m.session_id = s.id
-WHERE %s
+WHERE %[1]s
 
 UNION ALL
 
@@ -135,7 +146,7 @@ SELECT
 		WHEN ue.dedup_key != '' THEN ue.session_id || ':' || ue.source || ':' || ue.dedup_key
 		ELSE ue.session_id || ':' || ue.source || ':id:' || ue.id
 	END AS usage_dedup_key,
-	s.project,
+	%[3]s AS project,
 	s.agent,
 	s.machine,
 	s.user_message_count,
@@ -145,15 +156,16 @@ SELECT
 	s.started_at
 FROM usage_events ue
 JOIN sessions s ON s.id = ue.session_id
-WHERE %s`
+WHERE %[2]s`
 
 func pgUsageRowsSQLWithWhere(
-	messageWhere, usageEventWhere string,
+	messageWhere, usageEventWhere string, dialect db.QueryDialect,
 ) string {
 	return fmt.Sprintf(
 		pgUsageRowsSQLTemplate,
 		messageWhere,
 		usageEventWhere,
+		pgUsageProjectSQL(dialect, "s"),
 	)
 }
 
@@ -178,12 +190,12 @@ SELECT
 	m.claude_request_id,
 	m.source_uuid,
 	'' AS usage_dedup_key,
-	s.project,
+	%[3]s AS project,
 	s.agent,
 	s.machine
 FROM messages m
 JOIN sessions s ON m.session_id = s.id
-WHERE %s
+WHERE %[1]s
 
 UNION ALL
 
@@ -210,12 +222,12 @@ SELECT
 		WHEN ue.dedup_key != '' THEN ue.session_id || ':' || ue.source || ':' || ue.dedup_key
 		ELSE ue.session_id || ':' || ue.source || ':id:' || ue.id
 	END AS usage_dedup_key,
-	s.project,
+	%[3]s AS project,
 	s.agent,
 	s.machine
 FROM usage_events ue
 JOIN sessions s ON s.id = ue.session_id
-WHERE %s`
+WHERE %[2]s`
 
 const pgDailyUsageMessageRowsSQLTemplate = `
 SELECT
@@ -238,12 +250,12 @@ SELECT
 	m.claude_request_id,
 	m.source_uuid,
 	'' AS usage_dedup_key,
-	s.project,
+	%[3]s AS project,
 	s.agent,
 	s.machine
-FROM %s m
+FROM %[1]s m
 JOIN sessions s ON m.session_id = s.id
-WHERE %s`
+WHERE %[2]s`
 
 const pgDailyUsageEventRowsSQLTemplate = `
 SELECT
@@ -269,20 +281,21 @@ SELECT
 		WHEN ue.dedup_key != '' THEN ue.session_id || ':' || ue.source || ':' || ue.dedup_key
 		ELSE ue.session_id || ':' || ue.source || ':id:' || ue.id
 	END AS usage_dedup_key,
-	s.project,
+	%[3]s AS project,
 	s.agent,
 	s.machine
-FROM %s ue
+FROM %[1]s ue
 JOIN sessions s ON s.id = ue.session_id
-WHERE %s`
+WHERE %[2]s`
 
 func pgDailyUsageRowsSQLWithWhere(
-	messageWhere, usageEventWhere string,
+	messageWhere, usageEventWhere string, dialect db.QueryDialect,
 ) string {
 	return fmt.Sprintf(
 		pgDailyUsageRowsSQLTemplate,
 		messageWhere,
 		usageEventWhere,
+		pgUsageProjectSQL(dialect, "s"),
 	)
 }
 
@@ -290,7 +303,9 @@ func pgDailyUsageRowsSQLWithTimestampCTEs(
 	messageTimestampWhere, eventTimestampWhere string,
 	messageTimestampJoinWhere, eventTimestampJoinWhere string,
 	messageFallbackWhere, eventFallbackWhere string,
+	dialect db.QueryDialect,
 ) string {
+	project := pgUsageProjectSQL(dialect, "s")
 	return `
 WITH
 message_timestamp_rows AS MATERIALIZED (
@@ -331,6 +346,7 @@ usage_event_timestamp_rows AS MATERIALIZED (
 		pgDailyUsageMessageRowsSQLTemplate,
 		"message_timestamp_rows",
 		messageTimestampJoinWhere,
+		project,
 	) + `
 
 UNION ALL
@@ -339,6 +355,7 @@ UNION ALL
 		pgDailyUsageEventRowsSQLTemplate,
 		"usage_event_timestamp_rows",
 		eventTimestampJoinWhere,
+		project,
 	) + `
 
 UNION ALL
@@ -347,6 +364,7 @@ UNION ALL
 		pgDailyUsageMessageRowsSQLTemplate,
 		"messages",
 		messageFallbackWhere,
+		project,
 	) + `
 
 UNION ALL
@@ -355,6 +373,7 @@ UNION ALL
 		pgDailyUsageEventRowsSQLTemplate,
 		"usage_events",
 		eventFallbackWhere,
+		project,
 	)
 }
 
@@ -478,10 +497,11 @@ FROM (` + rowsSQL + `) u
 WHERE 1=1`
 }
 
-func pgUsageRowSelect() string {
+func pgUsageRowSelect(dialect db.QueryDialect) string {
 	return pgUsageRowSelectFromRows(pgUsageRowsSQLWithWhere(
 		pgUsageMessageEligibility,
 		pgUsageEventEligibility,
+		dialect,
 	))
 }
 
@@ -492,20 +512,28 @@ func pgDailyUsageRowSelectFromRows(rowsSQL string) string {
 func pgDailyUsageRowSelectFromRowsWithMachine(
 	rowsSQL string, includeMachine bool,
 ) string {
+	// Without attribution the rows keep their own rolled-up project column,
+	// so the dialect is not consulted.
 	return pgDailyUsageRowSelectFromRowsWithSession(
-		rowsSQL, includeMachine, "u.session_id", false, false)
+		rowsSQL, includeMachine, "u.session_id", false, false,
+		db.PostgresQueryDialect())
 }
 
 func pgDailyUsageRowSelectFromSnapshotRowsWithMachine(
-	rowsSQL string, includeMachine bool,
+	rowsSQL string, includeMachine bool, dialect db.QueryDialect,
 ) string {
 	return pgDailyUsageRowSelectFromRowsWithSession(
-		rowsSQL, includeMachine, "u.snapshot_attribution_session_id", true, false)
+		rowsSQL, includeMachine, "u.snapshot_attribution_session_id", true, false,
+		dialect)
 }
 
+// pgDailyUsageRowSelectFromRowsWithSession reads rows produced by the usage
+// row templates. With reloadSessionMetadata, a row takes the project, agent,
+// and machine of the session its Claude request is attributed to; the
+// project is that session's rolled-up project under dialect.
 func pgDailyUsageRowSelectFromRowsWithSession(
 	rowsSQL string, includeMachine bool, sessionColumn string,
-	reloadSessionMetadata, includeSessionGroups bool,
+	reloadSessionMetadata, includeSessionGroups bool, dialect db.QueryDialect,
 ) string {
 	projectColumn := "u.project"
 	agentColumn := "u.agent"
@@ -524,7 +552,8 @@ func pgDailyUsageRowSelectFromRowsWithSession(
 		metadataJoin = `
 LEFT JOIN sessions attributed
 	ON attributed.id = u.snapshot_attribution_session_id`
-		projectColumn = "CASE WHEN attributed.id IS NULL THEN u.project ELSE attributed.project END"
+		projectColumn = "CASE WHEN attributed.id IS NULL THEN u.project ELSE " +
+			pgUsageProjectSQL(dialect, "attributed") + " END"
 		agentColumn = "CASE WHEN attributed.id IS NULL THEN u.agent ELSE attributed.agent END"
 		machineColumnExpr = "CASE WHEN attributed.id IS NULL THEN u.machine ELSE attributed.machine END"
 		webSearchColumn = "u.snapshot_web_search_requests"
@@ -615,7 +644,7 @@ func pgDailyUsageRowsSQLForBounds(
 		eventWhere := appendPGUsageBranchFilterClauses(
 			pgUsageEventEligibility, pb, f, "ue.model", dialect,
 		)
-		return pgDailyUsageRowsSQLWithWhere(messageWhere, eventWhere)
+		return pgDailyUsageRowsSQLWithWhere(messageWhere, eventWhere, dialect)
 	}
 
 	return pgBoundedDailyUsageRowsSQL(
@@ -674,6 +703,7 @@ func pgBoundedDailyUsageRowsSQL(
 		eventTimestampJoinWhere,
 		messageFallbackWhere,
 		eventFallbackWhere,
+		dialect,
 	)
 }
 
@@ -772,7 +802,7 @@ func pgDailyUsageRowQuery(pb *paramBuilder, f db.UsageFilter, hasCursorTable boo
 	}
 	rowsSQL = pgSnapshotRankedDailyUsageRowsSQL(pb, rowsSQL, f, dialect)
 	return pgDailyUsageRowSelectFromSnapshotRowsWithMachine(
-		rowsSQL, f.Breakdowns)
+		rowsSQL, f.Breakdowns, dialect)
 }
 
 func pgTopSessionsUsageRowQuery(pb *paramBuilder, f db.UsageFilter, includeSessionGroups bool, dialect db.QueryDialect) string {
@@ -781,7 +811,7 @@ func pgTopSessionsUsageRowQuery(pb *paramBuilder, f db.UsageFilter, includeSessi
 		pb, pgUsageSnapshotInputFilter(f), bounds, dialect,
 	)
 	rowsSQL = pgSnapshotRankedDailyUsageRowsSQL(pb, rowsSQL, f, dialect)
-	return pgDailyUsageRowSelectFromRowsWithSession(rowsSQL, false, "u.snapshot_attribution_session_id", true, includeSessionGroups)
+	return pgDailyUsageRowSelectFromRowsWithSession(rowsSQL, false, "u.snapshot_attribution_session_id", true, includeSessionGroups, dialect)
 }
 
 func pgUsageSnapshotInputFilter(f db.UsageFilter) db.UsageFilter {
@@ -1297,18 +1327,20 @@ func (s *Store) loadPGTopSessionMetadata(
 	for _, id := range sessionIDs {
 		placeholders = append(placeholders, pb.add(id))
 	}
+	// A top session reports the project its usage bills to, so a subagent
+	// shows its parent's project, as the SQLite archive does.
 	query := `
 SELECT
-	id,
-	COALESCE(NULLIF(COALESCE(display_name, session_name), ''), NULLIF(first_message, ''), NULLIF(project, ''), id) AS display_name,
-	agent,
-	project,
-	started_at,
-	machine,
-	group_key,
-	COALESCE(session_name, '')
-FROM sessions
-WHERE id IN (` + strings.Join(placeholders, ",") + `)`
+	s.id,
+	COALESCE(NULLIF(COALESCE(s.display_name, s.session_name), ''), NULLIF(s.first_message, ''), NULLIF(s.project, ''), s.id) AS display_name,
+	s.agent,
+	` + pgUsageProjectSQL(s.sessionDialect(), "s") + ` AS project,
+	s.started_at,
+	s.machine,
+	s.group_key,
+	COALESCE(s.session_name, '')
+FROM sessions s
+WHERE s.id IN (` + strings.Join(placeholders, ",") + `)`
 	rows, err := s.pg.QueryContext(ctx, query, pb.args...)
 	if err != nil {
 		return nil, fmt.Errorf("querying pg top session metadata: %w", err)
@@ -1364,7 +1396,7 @@ func (s *Store) GetSessionUsage(
 	rateResolver := export.NewPricingResolver(pricing)
 
 	pb := &paramBuilder{}
-	query := pgUsageRowSelect() + " AND u.session_id = " +
+	query := pgUsageRowSelect(s.sessionDialect()) + " AND u.session_id = " +
 		pb.add(sessionID) + ` ORDER BY u.ts ASC, u.session_id ASC,
 		COALESCE(u.message_ordinal, -1) ASC,
 		u.usage_source ASC,

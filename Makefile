@@ -447,7 +447,7 @@ test-postgres: pricing-snapshot ensure-embed-dir postgres-up
 	TEST_PG_URL="postgres://agentsview_test:agentsview_test_password@localhost:5433/agentsview_test?sslmode=disable" \
 	CGO_ENABLED=1 go test -p 1 -tags "fts5,pgtest" -v ./internal/postgres/... ./internal/activity/... -count=1 -timeout=20m
 	TEST_PG_URL="postgres://agentsview_test:agentsview_test_password@localhost:5433/agentsview_test?sslmode=disable" \
-	CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/service -run '^TestPlanUsageCountsParity$$' -count=1
+	CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/service -run '^(TestPlanUsageCountsParity|TestUsageSubagentRollupParity)$$' -count=1
 
 # PostgreSQL integration tests for CI (postgres already running as service)
 POSTGRES_CORE_HEAVY_TEST := TestRawProjectionProofLookupsStayBounded
@@ -465,7 +465,7 @@ test-postgres-core-ci:
 # cleanup must finish before another package starts using the same database.
 test-postgres-core-fast-ci: pricing-snapshot ensure-embed-dir
 	CGO_ENABLED=1 go test -p 1 -tags "fts5,pgtest" -v ./internal/postgres/... ./internal/activity/... -skip '^$(POSTGRES_CORE_HEAVY_TEST)$$' -count=1 -timeout=20m
-	CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/service -run '^TestPlanUsageCountsParity$$' -count=1
+	CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/service -run '^(TestPlanUsageCountsParity|TestUsageSubagentRollupParity)$$' -count=1
 
 test-postgres-core-heavy-ci: pricing-snapshot ensure-embed-dir
 	CGO_ENABLED=1 go test -tags "fts5,pgtest" ./internal/postgres/... -list '^$(POSTGRES_CORE_HEAVY_TEST)$$' | grep -Fx '$(POSTGRES_CORE_HEAVY_TEST)'
@@ -486,12 +486,12 @@ test-clickhouse: pricing-snapshot ensure-embed-dir clickhouse-up
 	TEST_CLICKHOUSE_URL="clickhouse://localhost:19000/default" \
 		CGO_ENABLED=1 go test -tags "fts5,chtest" -v ./internal/clickhouse/... ./internal/activity/... -count=1 -timeout=20m
 	TEST_CLICKHOUSE_URL="clickhouse://localhost:19000/default" \
-		CGO_ENABLED=1 go test -tags "fts5,chtest" -v ./internal/service -run '^TestPlanUsageCountsParity$$' -count=1
+		CGO_ENABLED=1 go test -tags "fts5,chtest" -v ./internal/service -run '^(TestPlanUsageCountsParity|TestUsageSubagentRollupParity)$$' -count=1
 
 # ClickHouse integration tests for CI (clickhouse already running as service)
 test-clickhouse-ci: pricing-snapshot ensure-embed-dir
 	CGO_ENABLED=1 go test -tags "fts5,chtest" -v ./internal/clickhouse/... ./internal/activity/... -count=1 -timeout=20m
-	CGO_ENABLED=1 go test -tags "fts5,chtest" -v ./internal/service -run '^TestPlanUsageCountsParity$$' -count=1
+	CGO_ENABLED=1 go test -tags "fts5,chtest" -v ./internal/service -run '^(TestPlanUsageCountsParity|TestUsageSubagentRollupParity)$$' -count=1
 
 # S3 discovery integration tests. testcontainers starts and tears down a
 # rustfs (S3-compatible) container automatically, so only a working Docker

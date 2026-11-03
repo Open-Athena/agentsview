@@ -84,3 +84,9 @@ func TestUsageProjectFilterMatchesRollupAttribution(t *testing.T) {
 	assert.Equal(t, []projectTokens{{"display", 20, 200}}, dailyProjectTokens(t, d, "display"))
 	assert.Empty(t, dailyProjectTokens(t, d, "path_sibling"))
 }
+
+// The SQLite templates embed rollupProjectExpr as a constant; the other
+// backends render the same attribution through UsageRollupProjectExpr.
+func TestUsageRollupProjectExprMatchesSQLiteConstant(t *testing.T) {
+	assert.Equal(t, rollupProjectExpr, UsageRollupProjectExpr(SQLiteQueryDialect(), "s"))
+}

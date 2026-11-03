@@ -116,6 +116,11 @@ The latest release is
 
 **Bug fixes**
 
+- Usage reports served from PostgreSQL (including hosted), DuckDB and ClickHouse
+  now bill a subagent's cost to the project of the session that started it, as
+  the local archive does. Per-project totals, session counts, top sessions and
+  project filters agree across every backend. A hosted subagent whose parent
+  matches more than one session keeps its own project.
 - Hosted PostgreSQL searches and session reads stay available while raw captures
   arrive and transcripts are published. Each hosted read uses one database
   snapshot for its content, public identities and related data.

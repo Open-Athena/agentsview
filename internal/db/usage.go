@@ -3602,6 +3602,9 @@ func MirrorPricingRows(
 // rollupProjectExpr attributes a subagent session's usage to its parent
 // session's project, so spend lands where the work was requested. Sessions
 // without a subagent parent (or whose parent has no project) keep their own.
+// It is UsageRollupProjectExpr(SQLiteQueryDialect(), "s") as a constant, so
+// the SQLite query templates can stay constants; a test pins the two
+// together.
 const rollupProjectExpr = `COALESCE(
 	NULLIF((SELECT ps.project FROM sessions ps
 	        WHERE ps.id = s.parent_session_id

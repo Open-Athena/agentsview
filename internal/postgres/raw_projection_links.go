@@ -95,9 +95,21 @@ func (s *Store) sessionDialect() db.QueryDialect {
 		return d
 	}
 	d = d.WithMachinePredicate(hostedMachinePredicate)
+	d = d.WithUsageRollupProject(hostedUsageRollupProjectSQL)
 	return d.WithParentRelation(func(child, parent string) string {
 		return "((" + child + ".provenance_kind='legacy' AND " + child + ".parent_session_id=" + parent + ".id) OR (" + child + ".provenance_kind='raw' AND EXISTS(SELECT 1 " + hostedLinkFromSQL + " AND e.kind='parent' AND owner.session_id=" + child + ".id AND target.session_id=" + parent + ".id)))"
 	})
+}
+
+// hostedUsageRollupProjectSQL bills a subagent's usage to its parent's
+// project through the same relation sessionDialect uses: a legacy row names
+// its parent's physical ID, while a raw projection resolves its parent alias
+// through raw_session_links within the tenant. A raw parent that resolves to
+// more than one session yields no parent, so ambiguous usage keeps the
+// subagent's own project instead of picking one. Only subagent rows evaluate
+// the lookup.
+func hostedUsageRollupProjectSQL(child string) string {
+	return "COALESCE(NULLIF(CASE WHEN " + child + ".relationship_type='subagent' THEN (CASE WHEN " + child + ".provenance_kind='raw' THEN (SELECT CASE WHEN count(DISTINCT target_session.id)=1 THEN max(target_session.project) END " + hostedLinkFromSQL + " AND e.kind='parent' AND owner.session_id=" + child + ".id) ELSE (SELECT ps.project FROM sessions ps WHERE ps.id=" + child + ".parent_session_id) END) END, ''), " + child + ".project)"
 }
 
 // Resolve the same contextual parent relation once, before sidebar root and

@@ -21,6 +21,27 @@ func BuildUsageSessionFilter(f UsageFilter, b *QueryBuilder, sessionID string) [
 	return BuildUsageSessionFilterWithProject(f, b, sessionID, "s.project")
 }
 
+// UsageRollupProjectExpr renders the project a usage row bills to for the
+// session aliased sessionAlias: a subagent's parent's project when the parent
+// has one, otherwise the session's own. Every backend groups and filters
+// usage by this attribution, so spend lands where the work was requested.
+// SQLite, PostgreSQL, and DuckDB evaluate the correlated primary-key lookup
+// below; ClickHouse and hosted PostgreSQL supply their own form through
+// WithUsageRollupProject. Every lookup reads the tables visible to the query,
+// so a hosted tenant's schema and row security bound it like the outer read.
+func UsageRollupProjectExpr(d QueryDialect, sessionAlias string) string {
+	a := sessionAlias
+	if d.usageRollupProject != nil {
+		return d.usageRollupProject(a)
+	}
+	return `COALESCE(
+	NULLIF((SELECT ps.project FROM sessions ps
+	        WHERE ps.id = ` + a + `.parent_session_id
+	          AND ` + a + `.relationship_type = 'subagent'), ''),
+	` + a + `.project
+)`
+}
+
 // BuildUsageSessionFilterWithProject is BuildUsageSessionFilter with the
 // expression project include, exclude, and branch filters match against. A
 // backend that attributes usage to a project other than s.project passes the

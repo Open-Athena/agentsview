@@ -125,11 +125,18 @@ func appendChUsageSourceFilterClauses(
 	return where, append(args, b.Args()...)
 }
 
+// chUsageProjectSQL is the project a usage row of session s bills to: a
+// subagent's usage rolls up to its parent's project, as on SQLite.
+var chUsageProjectSQL = db.UsageRollupProjectExpr(db.ClickHouseQueryDialect(), "s")
+
+// appendChUsageSessionFilterClauses filters on the rolled-up project, so a
+// project filter selects exactly the usage the breakdown shows under it.
 func appendChUsageSessionFilterClauses(
 	where string, args []any, f db.UsageFilter, sessionID string,
 ) (string, []any) {
 	b := db.NewQueryBuilder(db.ClickHouseQueryDialect(), 0)
-	preds := db.BuildUsageSessionFilter(f, b, sessionID)
+	preds := db.BuildUsageSessionFilterWithProject(
+		f, b, sessionID, "("+chUsageProjectSQL+")")
 	where = db.AppendUsagePredicates(where, preds, "\t\t\t")
 	return where, append(args, b.Args()...)
 }
@@ -259,7 +266,7 @@ func chUsageRawSQLFromWheres(
 				JSONExtractInt(m.token_usage, 'cache_creation', 'ephemeral_1h_input_tokens') AS cache_create_1h,
 				JSONExtractInt(m.token_usage, 'server_tool_use', 'web_search_requests') AS web_search_requests,
 				CAST(NULL AS Nullable(Int64)) AS cost_microdollars, '' AS cost_source,
-			s.project AS project, s.agent AS agent, s.machine AS machine,
+			%[4]s AS project, s.agent AS agent, s.machine AS machine,
 			s.user_message_count AS user_message_count, s.is_automated AS is_automated,
 			ifNull(COALESCE(s.display_name, s.session_name, s.first_message, s.project, s.id), '') AS display_name,
 			s.group_key AS group_key, ifNull(s.session_name, '') AS session_name,
@@ -286,7 +293,7 @@ func chUsageRawSQLFromWheres(
 				toInt64(0) AS cache_create_1h, toInt64(0) AS web_search_requests,
 				ue.cost_microdollars AS cost_microdollars,
 				ue.cost_source AS cost_source,
-			s.project AS project, s.agent AS agent, s.machine AS machine,
+			%[4]s AS project, s.agent AS agent, s.machine AS machine,
 			s.user_message_count AS user_message_count, s.is_automated AS is_automated,
 			ifNull(COALESCE(s.display_name, s.session_name, s.first_message, s.project, s.id), '') AS display_name,
 			s.group_key AS group_key, ifNull(s.session_name, '') AS session_name,
@@ -295,7 +302,7 @@ func chUsageRawSQLFromWheres(
 		FROM usage_events ue
 		%[1]s sessions s ON s.id = ue.session_id
 		WHERE %[3]s`,
-		sessionJoin, messageWhere, eventWhere)
+		sessionJoin, messageWhere, eventWhere, chUsageProjectSQL)
 	args := make([]any, 0, len(messageArgs)+len(eventArgs))
 	args = append(args, messageArgs...)
 	args = append(args, eventArgs...)
@@ -450,7 +457,7 @@ func chPreparedUsageRawSQL(state preparedUsageState, f db.UsageFilter, sessionID
 			p.cache_create_1h_norm AS cache_create_1h,
 			p.web_search_requests_norm AS web_search_requests,
 			p.cost_microdollars AS cost_microdollars, p.cost_source AS cost_source,
-			s.project AS project, s.agent AS agent, s.machine AS machine,
+			` + chUsageProjectSQL + ` AS project, s.agent AS agent, s.machine AS machine,
 			s.user_message_count AS user_message_count, s.is_automated AS is_automated,
 			ifNull(COALESCE(s.display_name, s.session_name, s.first_message, s.project, s.id), '') AS display_name,
 			s.group_key AS group_key, ifNull(s.session_name, '') AS session_name,
@@ -848,7 +855,7 @@ func chUsageCTEFromRawSource(
 				ranked.price_model,
 				ranked.price_key,` + passthrough.String() + `
 				ranked.snapshot_deduplicated_output_tokens,
-				if(attributed.id = '', ranked.project, attributed.project) AS project,
+				if(attributed.id = '', ranked.project, ` + db.UsageRollupProjectExpr(db.ClickHouseQueryDialect(), "attributed") + `) AS project,
 				if(attributed.id = '', ranked.agent, attributed.agent) AS agent,
 				if(attributed.id = '', ranked.machine, attributed.machine) AS machine,
 				if(attributed.id = '', ranked.user_message_count, attributed.user_message_count) AS user_message_count,
