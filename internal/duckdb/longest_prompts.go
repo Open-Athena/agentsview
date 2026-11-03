@@ -59,7 +59,7 @@ func (s *Store) GetLongestUserPrompts(
 		}
 	}
 
-	query += ` ORDER BY m.content_length DESC, m.id DESC LIMIT ?`
+	query += ` ORDER BY m.content_length DESC, m.session_id ASC, m.ordinal ASC LIMIT ?`
 	args = append(args, limit)
 
 	rows, err := s.duck.QueryContext(ctx, query, args...)

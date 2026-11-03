@@ -2436,7 +2436,7 @@ func (s *Store) GetLongestUserPrompts(
 			m.content_length,
 			substring(m.content FROM 1 FOR ` +
 		pb.add(previewChars) + `) AS preview,
-			COALESCE(m.timestamp, '') AS timestamp
+			m.timestamp
 		FROM messages m
 		JOIN sessions sess ON sess.id = m.session_id
 		WHERE m.role = 'user'
@@ -2467,7 +2467,7 @@ func (s *Store) GetLongestUserPrompts(
 		}
 	}
 
-	query += " ORDER BY m.content_length DESC, m.id DESC LIMIT " +
+	query += " ORDER BY m.content_length DESC, m.session_id ASC, m.ordinal ASC LIMIT " +
 		pb.add(limit)
 
 	rows, err := s.pg.QueryContext(ctx, query, pb.args...)
@@ -2481,13 +2481,17 @@ func (s *Store) GetLongestUserPrompts(
 	var out []db.LongestUserPrompt
 	for rows.Next() {
 		var p db.LongestUserPrompt
+		var ts *time.Time
 		if err := rows.Scan(
 			&p.SessionID, &p.Project, &p.Ordinal,
-			&p.ContentLength, &p.Preview, &p.Timestamp,
+			&p.ContentLength, &p.Preview, &ts,
 		); err != nil {
 			return nil, fmt.Errorf(
 				"scanning longest prompt row: %w", err,
 			)
+		}
+		if ts != nil {
+			p.Timestamp = FormatISO8601(*ts)
 		}
 		out = append(out, p)
 	}
