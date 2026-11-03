@@ -38,8 +38,12 @@ const idChunkSize = 400
 var baseTables = []string{"sessions", "messages", "tool_calls"}
 
 // ftsObjects are emitted as DDL only (no data) — the messages_ai trigger
-// rebuilds the index as the loader inserts message rows.
+// rebuilds the index as the loader inserts message rows. The
+// message_search_content view is the external-content table messages_fts
+// reads for snippet() and full-row selects, so it must precede the table.
+// Sources with an older FTS schema lack the view and skip it.
 var ftsObjects = []string{
+	"message_search_content",
 	"messages_fts",
 	"messages_ai",
 	"messages_ad",

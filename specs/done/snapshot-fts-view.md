@@ -26,3 +26,7 @@ An export-snapshot test that loads the produced `schema.sql` plus data into a fr
 ## Hub workaround (until this lands)
 
 `~/c/oa/transcripts/scripts/load.py` (`FTS_VIEW`) creates `CREATE VIEW IF NOT EXISTS message_search_content …` after loading. Drop it there once exports include the view.
+
+## Status
+
+Done. `ftsObjects` now leads with `message_search_content`, and `TestExportedSchemaSupportsSnippetSearch` (`internal/snapshot/fts_test.go`) loads an export into a fresh DB and runs the snapshot server's `snippet(messages_fts, …)` `MATCH` query. Before the fix it failed with `SQL logic error`. `TestExportProjectScope` now expects the view in `schema.sql`. The hub's `FTS_VIEW` workaround can go once its snapshots are re-exported.
