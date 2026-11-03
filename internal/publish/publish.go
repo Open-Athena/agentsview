@@ -385,6 +385,9 @@ func writePublishManifest(dir string, opts Options, metas []sessionMeta, rep *Re
 	if err := json.Unmarshal(b, &manifest); err != nil {
 		return fmt.Errorf("publish: read manifest: %w", err)
 	}
+	if manifest == nil {
+		return errors.New("publish: manifest.json is not an object")
+	}
 	info := publishInfo{
 		Contributor: opts.Contributor,
 		Machines:    rep.Machines,
