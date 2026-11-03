@@ -173,12 +173,7 @@ export default defineConfig(({ command }) => {
     },
     test: {
       environment: "jsdom",
-      exclude: [
-        "e2e/**",
-        "e2e-snapshot/**",
-        "e2e-snapshot-public/**",
-        "node_modules/**",
-      ],
+      exclude: ["e2e/**", "e2e-snapshot/**", "e2e-snapshot-public/**", "node_modules/**"],
       setupFiles: ["./src/vitest-setup.ts"],
       server: {
         deps: {

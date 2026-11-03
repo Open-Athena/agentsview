@@ -1605,8 +1605,7 @@ class UsageStore {
     } catch (e) {
       if (this.versions.longestPrompts === v) {
         if (this.longestPrompts === null) {
-          this.errors.longestPrompts =
-            e instanceof Error ? e.message : "Failed to load";
+          this.errors.longestPrompts = e instanceof Error ? e.message : "Failed to load";
         } else {
           console.warn("usage.fetchLongestPrompts refetch failed:", e);
         }

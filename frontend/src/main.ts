@@ -17,11 +17,7 @@ resolveViewToken();
 
 // Snapshots default to dark; apply it before mount to avoid a light flash.
 // An explicit stored preference still wins.
-if (
-  SNAPSHOT &&
-  typeof localStorage !== "undefined" &&
-  !localStorage.getItem("theme")
-) {
+if (SNAPSHOT && typeof localStorage !== "undefined" && !localStorage.getItem("theme")) {
   // Non-persisted pre-mount dark default for snapshot embeds: setThemeMode
   // would writeStored() a preference and initTheme has no default-mode hook,
   // so the theme store can't express "default dark unless the user chose

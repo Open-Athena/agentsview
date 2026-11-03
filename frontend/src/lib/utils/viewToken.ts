@@ -12,9 +12,5 @@ export function resolveViewToken(): void {
   if (!t) return;
   setAuthToken(t);
   url.searchParams.delete("t");
-  window.history.replaceState(
-    null,
-    "",
-    url.pathname + url.search + url.hash,
-  );
+  window.history.replaceState(null, "", url.pathname + url.search + url.hash);
 }

@@ -9,9 +9,7 @@ test("a public view loads with no access prompt", async ({ page }) => {
   await expect(page.locator(".header-title")).toContainText("public stats");
 });
 
-test("stats-only view shows aggregate cost but redacts sessions + prompts", async ({
-  page,
-}) => {
+test("stats-only view shows aggregate cost but redacts sessions + prompts", async ({ page }) => {
   await page.goto("/usage");
   // No login prompt (public).
   await expect(page.locator(".auth-overlay")).toHaveCount(0);

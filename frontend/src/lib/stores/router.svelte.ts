@@ -242,9 +242,7 @@ export class RouterStore {
     window.history.replaceState(null, "", url);
   }
 
-  navigateFromSession(
-    params: Record<string, string> = {},
-  ) {
+  navigateFromSession(params: Record<string, string> = {}) {
     // A ?msg target only makes sense inside a session detail; strip it on
     // exit so preserving it across in-session filter rewrites can never
     // leak the scroll target into the list view.

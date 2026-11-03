@@ -31,9 +31,23 @@ function djb2(s: string): number {
 // not in any org keep the hash-based palette.
 
 const COLOR_HUES: Record<string, number> = {
-  red: 0, orange: 30, amber: 45, yellow: 55, lime: 90, green: 140,
-  emerald: 155, teal: 170, cyan: 190, sky: 205, blue: 220, indigo: 250,
-  violet: 270, purple: 285, fuchsia: 305, magenta: 320, pink: 335,
+  red: 0,
+  orange: 30,
+  amber: 45,
+  yellow: 55,
+  lime: 90,
+  green: 140,
+  emerald: 155,
+  teal: 170,
+  cyan: 190,
+  sky: 205,
+  blue: 220,
+  indigo: 250,
+  violet: 270,
+  purple: 285,
+  fuchsia: 305,
+  magenta: 320,
+  pink: 335,
 };
 
 export interface OrgTheme {

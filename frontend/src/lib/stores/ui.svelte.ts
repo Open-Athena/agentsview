@@ -15,7 +15,6 @@ import {
   clampStoredSidebarWidth,
   clampStoredVitalsWidth,
 } from "../components/layout/sidebar-width.js";
-import { SNAPSHOT } from "../utils/snapshot.js";
 
 type Theme = "light" | "dark";
 export type MessageLayout = "default" | "compact" | "stream" | "skim";
