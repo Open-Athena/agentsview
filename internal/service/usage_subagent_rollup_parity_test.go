@@ -9,6 +9,7 @@ package service_test
 
 import (
 	"fmt"
+	"maps"
 	"path/filepath"
 	"testing"
 
@@ -28,6 +29,7 @@ import (
 var usageParityReplicaStores = func(
 	t *testing.T, local *db.DB, schema string, sessions int,
 ) map[string]db.Store {
+	t.Helper()
 	return nil
 }
 
@@ -184,11 +186,9 @@ func TestUsageSubagentRollupParity(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, duck.Close()) })
 	stores["duckdb"] = duck
-	for name, store := range usageParityReplicaStores(
+	maps.Copy(stores, usageParityReplicaStores(
 		t, local, "agentsview_subagent_rollup_parity_test", sessions,
-	) {
-		stores[name] = store
-	}
+	))
 
 	// Costs in microdollars. Parent: 10 in / 100 out = 1010. Subagent:
 	// 20 in / 200 out = 2020, plus the shared request (7 in / 60 out = 607),
