@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/server"
 )
 
 // TestSessionUsagePlanOnlyFlagsFalse checks that a codex-cloud session
@@ -73,4 +74,37 @@ func TestSessionUsagePlanOnlyFlagsFalse(t *testing.T) {
 			"last_capture_at": "2026-10-01T12:30:00Z", "uncaptured_turns": uncaptured,
 		}, got["capture_coverage"], path)
 	}
+}
+
+// BuildUsageSummary, which the snapshot exporter uses to precompute the usage
+// page, reports the same plan-usage session counts as the live usage API.
+func TestBuildUsageSummaryCarriesPlanUsageCounts(t *testing.T) {
+	te := setup(t)
+	const id = "codex-cloud:thread-plan"
+	te.seedSession(t, id, "my-project", 2, func(s *db.Session) {
+		s.Agent = "codex-cloud"
+	})
+	te.seedMessages(t, id, 2, func(i int, m *db.Message) {
+		if i == 1 {
+			m.Role = "assistant"
+			m.Model = "gpt-5-codex"
+		}
+	})
+	require.NoError(t, te.db.ReplaceSessionPlanUsage(t.Context(), id, &db.SessionPlanUsage{
+		HasPlanUsage: true, DataAsOf: "2026-10-02T09:30:00Z", DataStatus: "available",
+		UsageSource: "wham", WeeklyPercent: new(2.25), Credits: new("0"),
+		Final: true, HasCoverage: true, LastCaptureAt: "2026-10-01T12:30:00Z",
+		UncapturedTurns: 2,
+	}))
+
+	f := db.UsageFilter{Timezone: "UTC"}
+	want, err := te.db.GetPlanUsageSessionCounts(t.Context(), f)
+	require.NoError(t, err)
+	require.Equal(t, 1, want.PlanOnly, "fixture must have a plan-only session")
+
+	got, err := server.BuildUsageSummary(t.Context(), te.db, f)
+	require.NoError(t, err)
+	assert.Equal(t,
+		[2]int{want.PlanOnly, want.PartlyCaptured},
+		[2]int{got.PlanOnlySessions, got.PartlyCapturedSessions})
 }

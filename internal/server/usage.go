@@ -199,7 +199,11 @@ func BuildUsageSummary(
 	if err != nil {
 		return UsageSummaryResponse{}, err
 	}
-	summary, err := service.BuildUsageSummaryResult(f, result)
+	planUsage, err := store.GetPlanUsageSessionCounts(ctx, f)
+	if err != nil {
+		return UsageSummaryResponse{}, err
+	}
+	summary, err := service.BuildUsageSummaryResult(f, result, planUsage)
 	if err != nil {
 		return UsageSummaryResponse{}, err
 	}

@@ -453,13 +453,15 @@ func defaultUsagePairwiseSelection(summary *UsageSummaryResult) (leftDimension, 
 	}
 }
 
-// BuildUsageSummaryResult assembles a usage summary from a filter and a daily
-// usage result. Exported for the snapshot exporter, which builds the summary
-// outside the SessionService backends and has no plan-usage counts.
+// BuildUsageSummaryResult assembles a usage summary from a filter, a daily
+// usage result, and the matching plan-usage session counts. Exported for the
+// snapshot exporter, which builds the summary outside the SessionService
+// backends.
 func BuildUsageSummaryResult(
 	f db.UsageFilter, result db.DailyUsageResult,
+	planUsage db.PlanUsageSessionCounts,
 ) (*UsageSummaryResult, error) {
-	return buildUsageSummary(f, result, db.PlanUsageSessionCounts{})
+	return buildUsageSummary(f, result, planUsage)
 }
 
 // buildUsageSummary assembles a UsageSummaryResult from a daily-usage
