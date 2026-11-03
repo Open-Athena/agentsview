@@ -117,6 +117,7 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(newTokenUseCommand())
 	root.AddCommand(newImportCommand())
 	root.AddCommand(newExportSnapshotCommand())
+	root.AddCommand(newPublishCommand())
 	root.AddCommand(newChromeCommand())
 	root.AddCommand(newChromeHostCommand())
 	root.AddCommand(newExportCommand())

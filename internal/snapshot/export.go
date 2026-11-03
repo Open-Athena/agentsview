@@ -77,6 +77,10 @@ type Options struct {
 	// and no messages), but its transcript is elided. Combined with any session
 	// flagged private in the DB. See specs/per-session-redaction.md.
 	PrivateSessions []string
+	// OnlySessions, when non-nil, restricts both the data and analytics scopes
+	// to these session IDs (a publish of selected sessions, not whole
+	// projects). Callers include any subagent children they want kept.
+	OnlySessions []string
 	// Gated marks the view as token-required: the Worker serves only
 	// view/meta without a valid grant token.
 	Gated bool
@@ -203,6 +207,10 @@ func Export(
 	analyticsIDs, err := selectSessionIDs(ctx, src, analyticsScope)
 	if err != nil {
 		return nil, err
+	}
+	if opts.OnlySessions != nil {
+		dataIDs = intersectIDs(dataIDs, opts.OnlySessions)
+		analyticsIDs = intersectIDs(analyticsIDs, opts.OnlySessions)
 	}
 
 	// Private sessions (DB-flagged or explicitly listed) within the data scope
@@ -419,6 +427,21 @@ func selectPrivateIDs(
 
 // subtractIDs returns the elements of ids not present in remove, order
 // preserved.
+// intersectIDs keeps the IDs (in their sorted order) that also appear in keep.
+func intersectIDs(ids, keep []string) []string {
+	set := make(map[string]struct{}, len(keep))
+	for _, id := range keep {
+		set[id] = struct{}{}
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := set[id]; ok {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 func subtractIDs(ids []string, remove map[string]struct{}) []string {
 	if len(remove) == 0 {
 		return ids

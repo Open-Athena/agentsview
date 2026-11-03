@@ -58,3 +58,31 @@ Keep the hub-specific parts out of core. The `publish` command, the env-value de
 - **Env detector**: a fixture session that `cat`s a temp `.envrc` gets every secret-named value redacted. A non-secret ID (`*_ACCOUNT_ID`) and a bucket name (`*_BUCKET`) are left alone.
 - **High-entropy filter**: `FOO_TOKEN=<random>` is redacted. `PYTHON=/usr/bin/python3` and a bare hex hash are not.
 - **Round trip**: the redacted NDJSON parses line by line, and no collected value survives anywhere in the output dir. Assert exact counts per kind.
+
+## Status
+
+### Phase 1: done (CLI preview and `--out`)
+
+`agentsview publish <project>... (--preview | --out <dir>)`, in `internal/publish` and `cmd/agentsview/publish.go`. Flags: `-S/--session` (repeatable; includes subagents), `-s/--since`, `-c/--contributor` (default `$AGENTSVIEW_CONTRIBUTOR`), `-v/--visibility` (`draft`|`oa`|`link`, default `draft`), `-D/--no-direnv`, `-d/--deny`, `-j/--json`.
+
+How it works:
+1. **Select**: the projects' sessions plus subagent children, narrowed by `--session` / `--since`.
+2. **Slice**: copy just those sessions into a scratch DB (a Go port of `slice.py`, reading the archive `mode=ro`) and open it with `db.Open`, which migrates it. An archive written by an older agentsview therefore still exports. Before this, a real archive from a June build failed on a renamed `model_pricing` column. `TestPublishOlderArchiveSchema` covers that case.
+3. **Export** with `export-snapshot`'s code (`snapshot.Options.OnlySessions` is new), into `--out` or a temporary directory for `--preview`.
+4. **Scan** every string value of every NDJSON row, token by token, so numbers and names pass through verbatim. Detectors, in order:
+   - collected env values (raw and JSON-escaped, longest first) → redact;
+   - the full scanner ruleset. Definite matches, `jwt`, `basic-auth-url` and `private-key-block` → redact. `high-entropy-assignment` → redact only when the variable name looks secret (the `redact.py` name rules), otherwise counted as ignored. Other candidates → flag;
+   - deny-list terms (case-insensitive) → flag.
+5. **Report**: per session, the kinds, actions, counts and message ordinals. Findings in analytics bodies (the longest-prompts panel repeats prompt text) are reported separately. Titles in the report are scrubbed.
+6. **`--out` only**: rewrite the redacted files, then **fail closed** if any collected value survives anywhere in the directory. `manifest.json` gains a `publish` key holding `contributor`, `machines`, per-session `visibility`, and redaction/flag totals.
+
+Deviations from the spec above:
+- The deny-list lives at `<data dir>/publish-deny.txt` (default `~/.agentsview/publish-deny.txt`), next to the archive, instead of `~/.config/agentsview/`.
+- The scan runs over the export, not over `secret_findings`. That covers exactly what would be published, and nothing needs `agentsview secrets scan` first. Content the export omits (for example `tool_result_events`) is never published, so it isn't scanned.
+
+On disky (587 sessions, 69k messages), from a scratch copy, the preview takes about a minute: slice 10s, export 20s, env 11s, scan 23s. It reports 1,445 redactions, made up of 1,387 secret-named assignments, 19 `basic-auth-url`, 7 `jwt`, and 32 env values (R2, Cloudflare, Pulumi, Discord, Slack, GCS). It ignores 56,622 high-entropy candidates.
+
+### Phase 2: not started (review UI and decisions)
+
+- `/publish/<project>` in the local daemon: the session view with findings highlighted, plus per-session toggles (exclude, mark `private`, keep a finding).
+- A local decisions table keyed by session plus finding fingerprint, applied by both `--preview` and `--out`.
