@@ -2,8 +2,9 @@ package server
 
 import (
 	"context"
-	"github.com/danielgtaylor/huma/v2"
 	"net/http"
+
+	"github.com/danielgtaylor/huma/v2"
 
 	"go.kenn.io/agentsview/internal/db"
 )

@@ -328,7 +328,7 @@ type usageProjectsResult struct {
 	Total    usageProjectTotal   `json:"total"`
 }
 
-func runUsageProjects(cfg UsageProjectsConfig) {
+func runUsageProjects(cfg UsageProjectsConfig) error {
 	tz := cfg.Timezone
 	if tz == "" {
 		tz = localTimezone()
@@ -360,15 +360,13 @@ func runUsageProjects(cfg UsageProjectsConfig) {
 		DirectReadOnlyAction: "refresh usage directly",
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 	defer closeArchiveQueryBackend(cleanup)
 
 	result, err := backend.DailyUsage(ctx, query)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 
 	filter = displayFilter
@@ -395,13 +393,13 @@ func runUsageProjects(cfg UsageProjectsConfig) {
 	if cfg.JSON {
 		enc := jsontext.NewEncoder(os.Stdout, jsontext.WithIndent("  "))
 		if err := json.MarshalEncode(enc, out); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
+			return err
 		}
-		return
+		return nil
 	}
 
 	printProjectsTable(out)
+	return nil
 }
 
 // foldProjectsFromDaily aggregates per-day project breakdowns
@@ -476,20 +474,18 @@ type UsageLongestPromptsConfig struct {
 	NoSync  bool
 }
 
-func runUsageLongestPrompts(cfg UsageLongestPromptsConfig) {
+func runUsageLongestPrompts(cfg UsageLongestPromptsConfig) error {
 	// Longest-prompts is a read-only query the archive-query backend
 	// interface does not expose, so open the local archive read-only
 	// directly. A running daemon keeps the file synced; this reader sees
 	// committed rows via WAL without taking the write lock.
 	appCfg, err := config.LoadMinimal()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "loading config: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("loading config: %w", err)
 	}
 	database, err := openReadOnlyDB(context.Background(), appCfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 	defer database.Close()
 
@@ -502,17 +498,15 @@ func runUsageLongestPrompts(cfg UsageLongestPromptsConfig) {
 		context.Background(), limit, cfg.Project,
 	)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 
 	if cfg.JSON {
 		enc := jsontext.NewEncoder(os.Stdout, jsontext.WithIndent("  "))
 		if err := json.MarshalEncode(enc, rows); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
+			return err
 		}
-		return
+		return nil
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
@@ -533,6 +527,7 @@ func runUsageLongestPrompts(cfg UsageLongestPromptsConfig) {
 			p.ContentLength, p.Project, short, p.Ordinal, preview)
 	}
 	w.Flush()
+	return nil
 }
 
 type UsageStatuslineConfig struct {

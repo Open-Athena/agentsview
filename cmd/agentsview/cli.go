@@ -658,9 +658,9 @@ func newUsageLongestPromptsCommand() *cobra.Command {
 		Short:        "Show your N longest user prompts by character count",
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
-		Run: func(cmd *cobra.Command, args []string) {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg.JSON = outputFormat(cmd) == "json"
-			runUsageLongestPrompts(cfg)
+			return runUsageLongestPrompts(cfg)
 		},
 	}
 	registerFormatFlags(cmd.Flags())
@@ -677,9 +677,9 @@ func newUsageProjectsCommand() *cobra.Command {
 		Short:        "Cost breakdown by project",
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
-		Run: func(cmd *cobra.Command, args []string) {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg.JSON = outputFormat(cmd) == "json"
-			runUsageProjects(cfg)
+			return runUsageProjects(cfg)
 		},
 	}
 	registerFormatFlags(cmd.Flags())

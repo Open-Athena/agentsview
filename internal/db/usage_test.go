@@ -1697,13 +1697,12 @@ func TestParseUsageTokenCounters(t *testing.T) {
 	assert.Equal(t, 300, cacheRead)
 
 	// The reasoning variant additionally extracts reasoning_tokens.
-	in, out, cacheCreate, cacheRead, reasoning :=
-		parseUsageTokenCountersWithReasoning(
-			`{"input_tokens":100,"output_tokens":50,` +
-				`"cache_creation_input_tokens":20,` +
-				`"cache_read_input_tokens":300,` +
-				`"reasoning_tokens":75}`,
-		)
+	in, out, cacheCreate, cacheRead, reasoning := parseUsageTokenCountersWithReasoning(
+		`{"input_tokens":100,"output_tokens":50,` +
+			`"cache_creation_input_tokens":20,` +
+			`"cache_read_input_tokens":300,` +
+			`"reasoning_tokens":75}`,
+	)
 	assert.Equal(t, 100, in)
 	assert.Equal(t, 50, out)
 	assert.Equal(t, 20, cacheCreate)
@@ -4972,7 +4971,7 @@ func TestGetDailyUsage_RollsUpSubagentToParentProject(t *testing.T) {
 			row.sid, usage, row.mid, row.rid)
 	}
 
-	result, err := d.GetDailyUsage(context.Background(), UsageFilter{
+	result, err := d.GetDailyUsage(t.Context(), UsageFilter{
 		From: "2026-04-10", To: "2026-04-10", Timezone: "UTC",
 		Breakdowns: true,
 	})

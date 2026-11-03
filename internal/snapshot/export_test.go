@@ -2,7 +2,6 @@ package snapshot
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -104,7 +103,7 @@ func routeBody(t *testing.T, path, route string) string {
 			return body
 		}
 	}
-	t.Fatalf("route %q not found in %s", route, path)
+	require.Failf(t, "route not found", "route %q not found in %s", route, path)
 	return ""
 }
 
@@ -128,7 +127,7 @@ func TestExportProjectScope(t *testing.T) {
 	src := seedSource(t)
 	out := filepath.Join(t.TempDir(), "snap")
 
-	m, err := Export(context.Background(), src, out, Options{
+	m, err := Export(t.Context(), src, out, Options{
 		FullProjects: []string{"alpha"},
 		GeneratedAt:  "2026-06-17T00:00:00Z",
 	})
@@ -182,7 +181,7 @@ func TestExportAllProjects(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "snap")
 
 	// No projects => full, unfiltered export of every session.
-	m, err := Export(context.Background(), src, out, Options{
+	m, err := Export(t.Context(), src, out, Options{
 		GeneratedAt: "2026-06-17T00:00:00Z",
 	})
 	require.NoError(t, err, "Export (all)")
@@ -200,7 +199,7 @@ func TestExportStatsTierRedacted(t *testing.T) {
 
 	// alpha is full; gamma (s-other) is stats-only — its sessions/messages
 	// must NOT appear in the exported data, but it still feeds analytics.
-	m, err := Export(context.Background(), src, out, Options{
+	m, err := Export(t.Context(), src, out, Options{
 		FullProjects:  []string{"alpha"},
 		StatsProjects: []string{"gamma"},
 		GeneratedAt:   "2026-06-17T00:00:00Z",
@@ -262,7 +261,7 @@ func TestExportPrivateSessionElided(t *testing.T) {
 
 	// Baseline: export with nothing marked private.
 	base := filepath.Join(t.TempDir(), "base")
-	_, err := Export(context.Background(), src, base, opts)
+	_, err := Export(t.Context(), src, base, opts)
 	require.NoError(t, err, "baseline export")
 	baseCache := filepath.Join(base, "analytics_cache.ndjson")
 	// s-main's prompts appear in messages/longest here, making the "absent
@@ -273,11 +272,11 @@ func TestExportPrivateSessionElided(t *testing.T) {
 	// Now flag s-main private via the DB and re-export.
 	d, err := db.Open(t.Context(), src)
 	require.NoError(t, err, "reopen source")
-	require.NoError(t, d.SetSessionPrivate(context.Background(), "s-main", true), "flag private")
+	require.NoError(t, d.SetSessionPrivate(t.Context(), "s-main", true), "flag private")
 	require.NoError(t, d.Close(), "close source")
 
 	out := filepath.Join(t.TempDir(), "snap")
-	m, err := Export(context.Background(), src, out, opts)
+	m, err := Export(t.Context(), src, out, opts)
 	require.NoError(t, err, "Export")
 	assert.Equal(t, 1, m.PrivateCount, "one private session")
 	// The ghost row is still counted as an exported session.
@@ -295,7 +294,7 @@ func TestExportPrivateSessionElided(t *testing.T) {
 		"private title scrubbed")
 	assert.Equal(t, "[redacted]", byID["s-main"]["display_name"],
 		"private display_name scrubbed")
-	assert.Equal(t, float64(1), byID["s-main"]["private"], "marked private")
+	assert.InDelta(t, 1, byID["s-main"]["private"], 0, "marked private")
 	// The non-private session keeps its real content.
 	assert.NotEqual(t, "[redacted]", byID["s-sub"]["first_message"],
 		"non-private session unscrubbed")
@@ -325,7 +324,7 @@ func TestExportAllStatsNoData(t *testing.T) {
 
 	// Public stats view: every project stats-only — analytics over all, but
 	// zero raw sessions/messages exported.
-	m, err := Export(context.Background(), src, out, Options{
+	m, err := Export(t.Context(), src, out, Options{
 		AllStats:    true,
 		GeneratedAt: "2026-06-17T00:00:00Z",
 	})
@@ -369,7 +368,7 @@ func TestViewConfigExport(t *testing.T) {
 	assert.Equal(t, "public", vc.Name)
 
 	out := filepath.Join(dir, "snap")
-	m, err := Export(context.Background(), src, out,
+	m, err := Export(t.Context(), src, out,
 		vc.Options("2026-06-18T00:00:00Z"))
 	require.NoError(t, err, "Export (view)")
 	assert.True(t, m.AllStats)
@@ -391,7 +390,7 @@ func TestLoadViewConfigErrors(t *testing.T) {
 	missingName := filepath.Join(dir, "a.json")
 	require.NoError(t, os.WriteFile(missingName, []byte(`{"allStats": true}`), 0o644))
 	_, err := LoadViewConfig(missingName)
-	assert.ErrorContains(t, err, "name is required")
+	require.ErrorContains(t, err, "name is required")
 
 	unknownField := filepath.Join(dir, "b.json")
 	require.NoError(t, os.WriteFile(unknownField, []byte(`{"name":"x","bogus":1}`), 0o644))
@@ -489,13 +488,13 @@ func TestExportDateWindowScopesUsage(t *testing.T) {
 	src := seedDatedSource(t)
 
 	fullOut := t.TempDir()
-	_, err := Export(context.Background(), src, fullOut, Options{
+	_, err := Export(t.Context(), src, fullOut, Options{
 		GeneratedAt: "2026-04-01T00:00:00Z",
 	})
 	require.NoError(t, err, "export full span")
 
 	winOut := t.TempDir()
-	m, err := Export(context.Background(), src, winOut, Options{
+	m, err := Export(t.Context(), src, winOut, Options{
 		From: "2026-02-01", To: "2026-02-28",
 		GeneratedAt: "2026-04-01T00:00:00Z",
 	})
