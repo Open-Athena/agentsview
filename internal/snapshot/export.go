@@ -15,7 +15,8 @@ package snapshot
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"os"
@@ -116,12 +117,12 @@ type viewMeta struct {
 type Manifest struct {
 	FullProjects    []string `json:"fullProjects,omitempty"`
 	StatsProjects   []string `json:"statsProjects,omitempty"`
-	AllStats        bool     `json:"allStats,omitempty"`
+	AllStats        bool     `json:"allStats,omitzero"`
 	From            string   `json:"from,omitempty"`
 	To              string   `json:"to,omitempty"`
 	GeneratedAt     string   `json:"generatedAt"`
 	SessionCount    int      `json:"sessionCount"`
-	PrivateCount    int      `json:"privateCount,omitempty"`
+	PrivateCount    int      `json:"privateCount,omitzero"`
 	MessageCount    int      `json:"messageCount"`
 	ToolCallCount   int      `json:"toolCallCount"`
 	AnalyticsRoutes int      `json:"analyticsRoutes"`
@@ -276,7 +277,7 @@ func Export(
 		Orgs:        opts.Orgs,
 		GeneratedAt: opts.GeneratedAt,
 	}
-	metaBody, err := json.Marshal(meta)
+	metaBody, err := json.Marshal(meta, jsonOpts)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot: marshal view meta: %w", err)
 	}
@@ -485,9 +486,8 @@ func writeAnalyticsCache(path string, routes []analyticsRoute) error {
 		return err
 	}
 	defer f.Close()
-	enc := json.NewEncoder(f)
 	for _, r := range routes {
-		if err := enc.Encode(r); err != nil {
+		if err := writeJSONLine(f, r); err != nil {
 			return err
 		}
 	}
@@ -548,7 +548,6 @@ func dumpRows(
 	if err != nil {
 		return 0, err
 	}
-	enc := json.NewEncoder(w)
 	n := 0
 	for rows.Next() {
 		vals := make([]any, len(cols))
@@ -570,7 +569,7 @@ func dumpRows(
 		if hook != nil {
 			hook(obj)
 		}
-		if err := enc.Encode(obj); err != nil {
+		if err := writeJSONLine(w, obj); err != nil {
 			return 0, err
 		}
 		n++
@@ -578,8 +577,21 @@ func dumpRows(
 	return n, rows.Err()
 }
 
+// jsonOpts keeps snapshot artifacts as encoding/json v1 wrote them: map keys sorted, so re-exports are byte-identical,
+// and invalid UTF-8 in transcript text replaced rather than rejected.
+var jsonOpts = json.JoinOptions(json.Deterministic(true), jsontext.AllowInvalidUTF8(true))
+
+// writeJSONLine writes v as one NDJSON line.
+func writeJSONLine(w io.Writer, v any) error {
+	if err := json.MarshalWrite(w, v, jsonOpts); err != nil {
+		return err
+	}
+	_, err := io.WriteString(w, "\n")
+	return err
+}
+
 func writeManifest(path string, m *Manifest) error {
-	b, err := json.MarshalIndent(m, "", "  ")
+	b, err := json.Marshal(m, jsonOpts, jsontext.WithIndent("  "))
 	if err != nil {
 		return err
 	}

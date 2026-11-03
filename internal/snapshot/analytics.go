@@ -3,7 +3,7 @@ package snapshot
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -88,7 +88,7 @@ func precomputeAnalytics(
 		if err != nil {
 			return fmt.Errorf("snapshot: analytics %s: %w", route, err)
 		}
-		body, err := json.Marshal(v)
+		body, err := json.Marshal(v, jsonOpts)
 		if err != nil {
 			return fmt.Errorf("snapshot: marshal %s: %w", route, err)
 		}

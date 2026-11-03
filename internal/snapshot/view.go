@@ -1,8 +1,7 @@
 package snapshot
 
 import (
-	"bytes"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 )
@@ -21,7 +20,7 @@ type ViewConfig struct {
 	// Stats projects contribute to analytics aggregates only.
 	Stats []string `json:"stats,omitempty"`
 	// AllStats treats every non-full project as stats tier (public view).
-	AllStats bool `json:"allStats,omitempty"`
+	AllStats bool `json:"allStats,omitzero"`
 	// Access is "public" (default) or "token" (gated: a grant token is
 	// required to read anything beyond the view's metadata).
 	Access string `json:"access,omitempty"`
@@ -47,9 +46,7 @@ func LoadViewConfig(path string) (*ViewConfig, error) {
 		return nil, fmt.Errorf("view config: %w", err)
 	}
 	var v ViewConfig
-	dec := json.NewDecoder(bytes.NewReader(b))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&v); err != nil {
+	if err := json.Unmarshal(b, &v, json.RejectUnknownMembers(true), json.MatchCaseInsensitiveNames(true)); err != nil {
 		return nil, fmt.Errorf("view config %s: %w", path, err)
 	}
 	if v.Name == "" {
