@@ -32,7 +32,7 @@ Connected assistants gain eight read-only MCP tools for the same archive.
 
 ## About this fork
 
-This is [`runsascoded/agentsview`](https://github.com/runsascoded/agentsview), a
+This is [`Open-Athena/agentsview`](https://github.com/Open-Athena/agentsview), a
 fork of [`kenn-io/agentsview`](https://github.com/kenn-io/agentsview) that tracks
 upstream and adds:
 

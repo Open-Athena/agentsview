@@ -19,7 +19,7 @@ capability-token auth model from `~/c/rac/mortgage-viz`.
 
 ## Decisions (locked)
 
-- **Fork/home**: `runsascoded/agentsview` (public personal fork). Branch
+- **Fork/home**: `Open-Athena/agentsview` (public fork). Branch
   `cache-1h-and-projects` pushed to remote `r`.
 - **Auth**: capability tokens (mortgage-viz model) — owner secret + grant
   tokens (`view`) → session cookies, instant revoke. No accounts. Public views
